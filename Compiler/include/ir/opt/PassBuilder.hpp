@@ -1,0 +1,21 @@
+#pragma once
+#include "ir/opt/NewPassManager.hpp"
+
+//PassBuilder
+
+enum class OptimizationLevel{
+    O0 = 0,
+    O1 = 1,
+    O2 = 2
+};
+
+
+class PassBuilder{
+    public:
+    explicit PassBuilder() = default;
+    //AnalysisPass注册相关函数
+    void registerModuleAnalyses(ModuleAnalysisPassManager &MAM);
+    void registerFunctionAnalyses(FunctionAnalysisPassManager &FAM);
+    //Pipeline Building
+    ModulePassManager buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM);
+};

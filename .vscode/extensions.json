@@ -1,0 +1,31 @@
+{
+  "recommendations": [
+    //  C/C++ 开发环境
+    "llvm-vs-code-extensions.vscode-clangd",
+    "ms-vscode.cpptools",
+    "ms-vscode.cpptools-extension-pack",
+    "ms-vscode.cpptools-themes",
+    "twxs.cmake",
+    "ms-vscode.cmake-tools",
+    "xaver.clang-format",
+
+    // 调试器 LLDB 我们完全不使用微软套件
+    "vadimcn.vscode-lldb",
+
+    //  Markdown & LaTeX
+    "yzhang.markdown-all-in-one",
+    "shd101wyy.markdown-preview-enhanced",
+    "hancel.markdown-image",
+    "james-yu.latex-workshop",
+
+    //  Git 可视化 & 项目管理
+    "mhutchie.git-graph",
+    "gruntfuggly.todo-tree",
+    "liangxioa.workspace-mange",
+
+    //  实用增强
+    "ms-ceintl.vscode-language-pack-zh-hans",
+    "yfzhao.hscopes-booster",
+    "yfzhao.ultra-math-preview"
+  ]
+}

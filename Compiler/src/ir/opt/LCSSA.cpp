@@ -1,0 +1,375 @@
+#include "ir/opt/LCSSA.hpp"
+#include "ir/analysis/BasicAliasAnalysis.hpp"
+#include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/PostDominant.hpp"
+#include "ir/analysis/SideEffect.hpp"
+#include <functional>
+#include <queue>
+#include <set>
+
+bool LCSSAPass::isLCSSAForm(Loop *L) {
+    if (!L) {
+        return false;
+    }
+
+    std::vector<BasicBlock*> ExitBlocks = L->getExitBlocks();
+    std::set<BasicBlock *> ExitSet(ExitBlocks.begin(), ExitBlocks.end());
+    for (BasicBlock *BB : L->getBlocks()) {
+        for (auto It = BB->begin(); It != BB->end(); ++It) {
+            Instruction *Def = *It;
+            for (auto Uit = Def->getUseList().begin(); Uit != Def->getUseList().end(); ++Uit) {
+                Use *U = *Uit;
+                auto *UserInst = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
+                if (!UserInst) {
+                    continue;
+                }
+
+                auto *UserPhi = dynamic_cast<PhiInst *>(UserInst);
+                BasicBlock *UseBlock = nullptr;
+                if (UserPhi) {
+                    int OpIdx = UserInst->getUserIndex(U);
+                    if (OpIdx < 0 || (OpIdx % 2) != 0) {
+                        continue;
+                    }
+                    UseBlock = UserPhi->getIncomingBlock(static_cast<unsigned>(OpIdx / 2));
+                } else {
+                    UseBlock = UserInst->getParent();
+                }
+
+                if (!UseBlock || L->contains(UseBlock)) {
+                    continue;
+                }
+
+                if (!UserPhi) {
+                    return false;
+                }
+                BasicBlock *PhiBB = UserPhi->getParent();
+                if (!PhiBB || ExitSet.find(PhiBB) == ExitSet.end()) {
+                    return false;
+                }
+                if (!L->contains(UseBlock)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+//BFS遍历计算可达块
+std::unordered_set<BasicBlock *> LCSSAPass::computeReachableBlocks(Function &F) {
+    std::unordered_set<BasicBlock *> Reachable;
+    BasicBlock *Entry = F.front();
+    if (!Entry) return Reachable;
+
+    std::queue<BasicBlock *> Q;
+    Reachable.insert(Entry);
+    Q.push(Entry);
+
+    while (!Q.empty()) {
+        BasicBlock *BB = Q.front();
+        Q.pop();
+
+        for (BasicBlock *Succ : BB->getSuccessors()) {
+            if (Succ && Reachable.insert(Succ).second) {
+                Q.push(Succ);
+            }
+        }
+    }
+
+    return Reachable;
+}
+
+Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
+                                   Instruction *InstDef,
+                                   const Loop &L,
+                                   const DominatorTree &DT,
+                                   std::unordered_map<BasicBlock *, Value *> &MapValue,
+                                   std::queue<Instruction *> &WorkList,
+                                   std::unordered_set<Instruction *> &InWorkList,
+                                   bool &Changed) {
+    //1,避免重复计算
+    auto It = MapValue.find(BB);
+    if (It != MapValue.end()) return It->second;
+
+    // 2. 递归基底：如果回溯到了循环内部，直接返回原始定义
+    if (L.contains(BB)) {
+        // 安全检查：确保定义点确实支配这个内部块
+        if (DT.dominates(InstDef->getParent(), BB)) {
+            return MapValue[BB] = InstDef;
+        } else {
+            return MapValue[BB] = UndefValue::NewUndefValue(InstDef->getIRType());
+        }
+    }
+
+    // 3. 获取直接支配块 (IDom)
+    BasicBlock *IDom = DT.getIDom(BB);
+    if (!IDom) {
+        return MapValue[BB] = UndefValue::NewUndefValue(InstDef->getIRType());
+    }
+
+    // 4. IDom 在循环外：说明控制流在到达 BB 之前并没有发生新的汇合，
+    // BB 的值必然来自于支配它的 IDom，所以这里是直线回溯的情况，我们直接递归向 IDom 要值即可
+    if (!L.contains(IDom)) {
+        Value *Val = getValueForBlock(IDom, InstDef, L, DT, MapValue, WorkList, InWorkList, Changed);
+        return MapValue[BB] = Val;
+    }
+
+    // 5. IDom 在循环内：这是最核心的情况！
+    // 此时 BB 一定是一个汇合点，它的前驱来自不同的出口。
+    // 我们必须在这里原生地新建一个 PHI 节点，来收拢它的各个前驱路径。
+    auto *BridgePhi = new PhiInst(InstDef->getIRType());
+    BridgePhi->setIdent(BridgePhi->getIdent() + ".lcssa");
+
+    MapValue[BB] = BridgePhi;
+
+    for (BasicBlock *Pred : BB->getPredecessors()) {
+        if (!Pred) continue;
+        // 递归向每一个前驱要值
+        Value *Incoming = getValueForBlock(Pred, InstDef, L, DT, MapValue, WorkList, InWorkList, Changed);
+        if (!Incoming) {
+            Incoming = UndefValue::NewUndefValue(InstDef->getIRType());
+        }
+        BridgePhi->addIncoming(Incoming, Pred);
+    }
+
+    if (BridgePhi->getNumIncomingValues() == 0) {
+        delete BridgePhi;
+        MapValue.erase(BB);
+        return UndefValue::NewUndefValue(InstDef->getIRType());
+    }
+
+    BB->push_front(BridgePhi);
+    Changed = true;
+
+    // 将新生成的桥接 PHI 加入队列，触发可能的链式反应
+    if (InWorkList.insert(BridgePhi).second) {
+        WorkList.push(BridgePhi);
+    }
+
+    return BridgePhi;
+}
+
+bool LCSSAPass::runLCSSA(Instruction *I,
+                                   Function &F,
+                                   const LoopInfo &LI,
+                                   const DominatorTree &DT,
+                                   const std::unordered_set<BasicBlock *> &Reachable,
+                                   std::queue<Instruction *> &WorkList,
+                                   std::unordered_set<Instruction *> &InWorkList) {
+    if (!I) return false;
+    if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
+        // 幂等性保护：LCSSA 自己生成的桥接/出口 PHI 不再重复参与构造。
+        if (Phi->getIdent().find(".lcssa") != std::string::npos) {
+            return false;
+        }
+    }
+    BasicBlock *DefBB = I->getParent();
+    if (!DefBB) return false;
+    if (I->getUseList().is_empty()) return false;
+
+    Loop *L = LI.getLoopFor(DefBB);
+    if (!L) return false;
+    //第一步：收集所有的ExitingBlock，如果没有（死循环），直接返回
+    auto ExitBlocks = L->getExitBlocks();
+    if (ExitBlocks.empty()) {
+        return false;
+    }
+    //第一步：下面处理有ExitingBlock的情况
+    bool Changed = false;
+
+    //第二步，寻找这条指令在循环外部的Uses
+    std::vector<Use *> Uses;
+    for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
+        Use *U = *It;
+        if (U) Uses.push_back(U);
+    }
+    //定义在循环外部的Use集合
+    std::vector<ExternalUse> Boundaries;
+    for (Use *U : Uses) {
+        if (!U || U->getValue() != I) continue;
+
+        auto *UserInst = dynamic_cast<Instruction *>(U->getUser());
+        if (!UserInst) continue;
+        //情况1：如果User是Phi，那我们就收集这个Phi所在块的前驱块
+        auto *UserPhi = dynamic_cast<PhiInst *>(UserInst);
+        BasicBlock *UseBlock = nullptr;
+
+        if (UserPhi) {
+            int OpIndex = UserInst->getUserIndex(U);
+            if (OpIndex < 0 || (OpIndex % 2) != 0) {
+                continue;
+            }
+            UseBlock = UserPhi->getIncomingBlock(static_cast<unsigned>(OpIndex / 2));
+        } else {
+            //情况2：如果正常指令，它的UseBlock就是它所在的基本块
+            UseBlock = UserInst->getParent();
+        }
+
+        if (!UseBlock) continue;
+
+        //情况3：处理不可达块
+        if (Reachable.find(UseBlock) == Reachable.end()) {
+            // 幂等性保护：已经是 undef 时，不要重复替换成新的 undef 实例。
+            if (!dynamic_cast<UndefValue *>(U->getValue())) {
+                Changed |= U->replaceUseeWith(UndefValue::NewUndefValue(I->getIRType()));
+            }
+            continue;
+        }
+        //如果上述收集的使用块在循环之外，就是我们要找的循环边界
+        if (!L->contains(UseBlock)) {
+            Boundaries.push_back({U, UserInst, UserPhi, UseBlock});
+        }
+    }
+
+    if (Boundaries.empty()) return Changed;
+
+    std::unordered_map<BasicBlock *, Value *> MapValue;
+
+    // 第三步：在出口块插入最初的 LCSSA PHI 节点
+    for (BasicBlock *ExitBB : ExitBlocks) {
+        if (!ExitBB) continue;
+        //情况1：指令所在块不支配ExitingBlock
+        if (!DT.dominates(DefBB, ExitBB)) continue;
+        //情况2：已经为ExitingBlock插入过值了
+        if (MapValue.count(ExitBB)) continue;
+
+        auto *LCPhi = new PhiInst(I->getIRType());
+        LCPhi->setIdent(LCPhi->getIdent() + ".lcssa");
+        bool HasIncoming = false;
+
+        for (BasicBlock *Pred : ExitBB->getPredecessors()) {
+            if (!Pred) continue;
+            if (L->contains(Pred)) {
+                //正常情况：指令所在块支配ExitingBlock，插入LCSSA
+                LCPhi->addIncoming(I, Pred);
+                HasIncoming = true;
+            } else {
+                //特殊情况：指令所在块不支配ExitingBlock，插入UndefValue占位
+                LCPhi->addIncoming(UndefValue::NewUndefValue(I->getIRType()), Pred);
+            }
+        }
+
+        if (!HasIncoming) {
+            delete LCPhi;
+            continue;
+        }
+
+        ExitBB->push_front(LCPhi);
+        MapValue[ExitBB] = LCPhi; // 将出口 PHI 存入缓存，作为递归的终点
+        Changed = true;
+
+        if (InWorkList.insert(LCPhi).second) {
+            WorkList.push(LCPhi);
+        }
+    }
+
+    // 第四步：外部 Use 重写
+    for (const ExternalUse &EU : Boundaries) {
+        if (!EU.U || EU.U->getValue() != I) continue;
+
+        Value *Replacement = getValueForBlock(EU.UseBlock, I, *L, DT, MapValue, WorkList, InWorkList, Changed);
+
+        if (!Replacement) {
+            Replacement = UndefValue::NewUndefValue(I->getIRType());
+        }
+
+        Changed |= EU.U->replaceUseeWith(Replacement);
+    }
+
+    return Changed;
+}
+
+PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+    auto &DT = FAM.getResult<DominantAnalysis>(F);
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+    // 计算可达块
+    auto Reachable = computeReachableBlocks(F);
+
+    std::queue<Instruction *> WorkList;
+    std::unordered_set<Instruction *> InWorkList;
+    bool Changed = false;
+
+    //1：获取所有的循环，并按照后序遍历 (Post-Order) 的顺序排列
+    std::vector<Loop*> PostOrderLoops;
+    std::function<void(Loop*)> buildPostOrder = [&](Loop *L) {
+        for (Loop *Sub : L->getSubLoops()) {
+            buildPostOrder(Sub);
+        }
+        PostOrderLoops.push_back(L);
+    };
+
+    //根据顶层循环
+    for (Loop *TopL : LI.getTopLevelLoops()) {
+        buildPostOrder(TopL);
+    }
+
+    //2：按后序遍历的顺序，逐个处理循环
+    for (Loop *L : PostOrderLoops) {
+        auto ExitBlocks = L->getExitBlocks();
+        if (ExitBlocks.empty()) continue; // 死循环直接跳过
+
+        std::unordered_set<BasicBlock*> ExitDominatingBlocks;
+        std::vector<BasicBlock*> BBWorkList(ExitBlocks.begin(), ExitBlocks.end());
+
+        while (!BBWorkList.empty()) {
+            BasicBlock *Curr = BBWorkList.back();
+            BBWorkList.pop_back();
+
+            // 如果爬到了循环头，停止向上爬，因为 Header 支配循环内所有块
+            if (Curr == L->getHeader()) continue;
+
+            // 获取当前块在支配树上的“父亲”（直接支配节点 IDom）
+            BasicBlock *IDomBB = DT.getIDom(Curr);
+
+            if (!IDomBB) continue;
+
+            // 如果这个 IDom 是属于当前循环的，说明它是一个合法的支配块
+            if (L->contains(IDomBB)) {
+                if (ExitDominatingBlocks.insert(IDomBB).second) {
+                    BBWorkList.push_back(IDomBB); // 继续向上爬
+                }
+            }
+        }
+
+        //我们直接遍历这些支配ExitingBlock，并且在循环中的基本块的这些指令即可
+        for (BasicBlock *BB : ExitDominatingBlocks) {
+
+            if (LI.getLoopFor(BB) != L) continue;
+
+            for (Instruction *Inst : *BB) {
+                if (!Inst) continue;
+                if (Inst->getUseList().is_empty()) continue;
+                if (auto *Phi = dynamic_cast<PhiInst *>(Inst)) {
+                    if (Phi->getIdent().find(".lcssa") != std::string::npos) continue;
+                }
+
+                if (InWorkList.insert(Inst).second) {
+                    WorkList.push(Inst);
+                }
+            }
+        }
+
+        // 4：局部收敛处理
+        while (!WorkList.empty()) {
+            Instruction *I = WorkList.front();
+            WorkList.pop();
+            InWorkList.erase(I);
+            Changed |= runLCSSA(I, F, LI, DT, Reachable, WorkList, InWorkList);
+        }
+    }
+
+    if (!Changed) {
+        return PreservationStatus::all();
+    }
+
+    PreservationStatus PA;
+    PA.keep<DominantAnalysis>();
+    PA.keep<PostDominantAnalysis>();
+    PA.keep<LoopAnalysis>();
+    PA.keep<BasicAliasAnalysis>();
+    PA.keep<SideEffectAnalysis>();
+    return PA;
+}

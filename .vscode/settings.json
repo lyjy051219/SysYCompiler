@@ -1,0 +1,142 @@
+{
+    // IntelliSense 设置 —— 禁用微软引擎，完全交给 clangd 管理
+    "C_Cpp.intelliSenseEngine": "Disabled",        // 禁用微软 IntelliSense，避免冲突
+    "C_Cpp.autocomplete": "disabled",              // 禁用微软补全功能
+    "clangd.path": "/usr/bin/clangd",              // clangd 可执行文件路径
+
+    // clangd 语言服务器参数
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/Compiler/build", // 指定 CMake 输出的 compile_commands.json 目录
+        "--background-index",                              // 后台索引，提高智能补全速度
+        "--suggest-missing-includes",                      // 自动提示缺失的 include
+        "--clang-tidy",                                    // 启用 clang-tidy 检查
+        "--clang-tidy-checks=cppcoreguidelines-*,performance-*,bugprone-*,portability-*,modernize-*,google-*", // 检查规则
+        "--all-scopes-completion",                         // 全作用域符号提示
+        "--header-insertion=iwyu",                         // 智能 include 插入
+        "--header-insertion-decorators",                   // 标记未包含头文件的符号
+        "--cross-file-rename",                             // 支持跨文件重命名
+        "--pch-storage=disk",                              // 预编译头存储在磁盘，避免重复构建
+        "--function-arg-placeholders=false",               // 禁用函数参数占位符（清爽输入）
+        "--enable-config"                                  // 启用 .clang-format / .clang-tidy 配置读取
+    ],
+
+    // 格式化控制 —— 由 clang-format 接管
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format",   // 使用 xaver.clang-format 插件
+        "editor.formatOnSave": true,                       // 保存时自动格式化
+        "editor.formatOnPaste": true,                      // 粘贴时自动格式化
+        "editor.formatOnType": false                       // 输入时不格式化
+    },
+    "[c]": {
+        "editor.defaultFormatter": "xaver.clang-format",
+        "editor.formatOnSave": true,
+        "editor.formatOnPaste": true,
+        "editor.formatOnType": false
+    },
+
+    // clang-format 相关配置
+    "clang-format.style": "file",                          // 优先读取项目内的 .clang-format 文件
+    "clang-format.fallbackStyle": "LLVM",                  // 若无 .clang-format，则使用 LLVM 风格
+
+    //  文件与编码风格
+    "files.eol": "\n",                                     // 统一使用 LF
+    "files.encoding": "utf8",                              // 文件编码 UTF-8
+    "files.trimTrailingWhitespace": true,                  // 移除行尾空格
+    "files.trimFinalNewlines": true,                       // 删除多余结尾空行
+
+    // clangd 行为
+    "clangd.checkUpdates": true,                           // 自动检查 clangd 插件更新
+    "clangd.onConfigChanged": "restart",                   // 改配置后自动重启语言服务器
+
+    //  搜索与排除项
+    "search.exclude": {
+        "**/build": true,
+        "**/.git": true,
+        "**/.vscode": true
+    },
+
+    //  调试与断点显示
+    "cppdbg.breakpoints.useInlineValues": true,            // 在代码行内显示变量值
+    "debug.internalConsoleOptions": "neverOpen",           // 调试时不弹出内部控制台
+
+    //  编辑器行为
+    "editor.tabSize": 4,                                   // Tab = 4 空格
+    "editor.insertSpaces": true,                           // Tab 键插入空格
+    "editor.detectIndentation": false,                     // 禁止自动检测缩进风格
+    "editor.suggest.snippetsPreventQuickSuggestions": false,// snippet 与智能提示可共存
+
+    "files.associations": {
+        "iostream": "cpp",
+        "array": "cpp",
+        "atomic": "cpp",
+        "bit": "cpp",
+        "cctype": "cpp",
+        "clocale": "cpp",
+        "cmath": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "cstdarg": "cpp",
+        "cstddef": "cpp",
+        "cstdint": "cpp",
+        "cstdio": "cpp",
+        "cstdlib": "cpp",
+        "cwchar": "cpp",
+        "cwctype": "cpp",
+        "deque": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "vector": "cpp",
+        "exception": "cpp",
+        "algorithm": "cpp",
+        "functional": "cpp",
+        "iterator": "cpp",
+        "memory": "cpp",
+        "memory_resource": "cpp",
+        "numeric": "cpp",
+        "random": "cpp",
+        "string_view": "cpp",
+        "system_error": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp",
+        "initializer_list": "cpp",
+        "iosfwd": "cpp",
+        "istream": "cpp",
+        "limits": "cpp",
+        "new": "cpp",
+        "numbers": "cpp",
+        "ostream": "cpp",
+        "stdexcept": "cpp",
+        "streambuf": "cpp",
+        "typeinfo": "cpp",
+        "list": "cpp",
+        "map": "cpp",
+        "cinttypes": "cpp",
+        "bitset": "cpp",
+        "cstring": "cpp",
+        "set": "cpp",
+        "unordered_set": "cpp",
+        "*.def": "cpp",
+        "chrono": "cpp",
+        "condition_variable": "cpp",
+        "ctime": "cpp",
+        "ratio": "cpp",
+        "mutex": "cpp",
+        "semaphore": "cpp",
+        "shared_mutex": "cpp",
+        "sstream": "cpp",
+        "stop_token": "cpp",
+        "thread": "cpp",
+        "*.h": "cpp",
+        "*.hpp": "cpp",
+        "*.hh": "cpp",
+        "*.hxx": "cpp",
+        "any": "cpp",
+        "forward_list": "cpp",
+        "optional": "cpp",
+        "fstream": "cpp",
+        "variant": "cpp",
+        "*.inc": "cpp"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}

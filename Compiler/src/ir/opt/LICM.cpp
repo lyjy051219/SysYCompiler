@@ -1,0 +1,478 @@
+#include "ir/opt/LICM.hpp"
+#include "ir/analysis/PostDominant.hpp"
+#include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/LCSSA.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+
+using ExitValueKey = std::pair<BasicBlock *, Value *>;
+
+struct ExitValueKeyHash {
+	std::size_t operator()(const ExitValueKey &K) const {
+		auto A = reinterpret_cast<std::uintptr_t>(K.first);
+		auto B = reinterpret_cast<std::uintptr_t>(K.second);
+		return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
+	}
+};
+
+// 1) 检查所有 user 是否都在循环外
+static bool isAllUsersOutLoop(Instruction *I, const Loop &L) {
+	for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
+		Use *U = *It;
+		if (!U || U->getValue() != I) continue;
+		auto *UI = dynamic_cast<Instruction *>(U->getUser());
+		if (!UI) continue;
+		BasicBlock *UBB = UI->getParent();
+		if (UBB && L.contains(UBB)) return false;
+	}
+	return true;
+}
+
+// 2)循环不变量
+static bool isInvariant(
+	Instruction *I,
+	const Loop &L,
+	const DominatorTree &DT,
+	const std::unordered_set<Instruction *> &InvariantSet) {
+	if (!I || !I->getParent()) return false;
+	for (auto &U : I->getUserList()) {
+		if (!U) continue;
+		Value *V = U->getValue();
+		if (!V) return false;
+
+		if (dynamic_cast<ConstantSystem *>(V) ||
+			dynamic_cast<Function *>(V) ||
+			dynamic_cast<BuildInFunction *>(V) ||
+			dynamic_cast<BasicBlock *>(V) ||
+			dynamic_cast<Variable *>(V)) {
+			continue;
+		}
+
+		auto *DefI = dynamic_cast<Instruction *>(V);
+		if (!DefI || !DefI->getParent()) return false;
+		if (!L.contains(DefI->getParent())) continue;
+
+		if (InvariantSet.count(DefI) == 0) return false;
+		if (!DT.dominates(DefI->getParent(), I->getParent())) return false;
+	}
+	return true;
+}
+
+// 2.1) 构建当前循环（不含子循环）的 RPO 基本块序列
+static std::vector<BasicBlock *> getLoopBlocksInRPO(const Loop &L) {
+	std::vector<BasicBlock *> PostOrder;
+	std::unordered_set<BasicBlock *> Visited;
+	std::unordered_set<BasicBlock *> InLoop;
+
+	for (BasicBlock *BB : L.getBlocks()) {
+		if (BB) InLoop.insert(BB);
+	}
+
+	std::function<void(BasicBlock *)> Dfs = [&](BasicBlock *BB) {
+		if (!BB) return;
+		if (InLoop.count(BB) == 0) return;
+		if (!Visited.insert(BB).second) return;
+
+		for (BasicBlock *Succ : BB->getSuccessors()) {
+			if (InLoop.count(Succ)) Dfs(Succ);
+		}
+		PostOrder.push_back(BB);
+	};
+
+	Dfs(L.getHeader());
+	for (BasicBlock *BB : L.getBlocks()) Dfs(BB);
+
+	std::reverse(PostOrder.begin(), PostOrder.end());
+	return PostOrder;
+}
+
+// 3) 指令能否安全移动（基于别名/副作用 + 指令类别规则）
+static bool isSideEffect(
+	Instruction *I,
+	const Loop &L,
+	const DominatorTree &DT,
+	const std::vector<BasicBlock *> &ExitBlocks,
+	const std::vector<BasicBlock *> &Latches,
+	const std::vector<Instruction *> &LoopInsts,
+	BasicAAResult &AA,
+	const LoopInfo &LI,
+	FunctionAnalysisPassManager &FAM,
+	bool ForSink,
+	bool AggressiveHoist) {
+	if (!I) return false;
+	if (!I->getParent()) return false;
+
+	// 绝对不能移动
+	switch (I->instType) {
+		case Instruction::RET:
+		case Instruction::BR:
+		case Instruction::PHI:
+		case Instruction::ALLOCA:
+			return false;
+		case Instruction::SDIV:
+		case Instruction::FDIV:
+		case Instruction::SREM:
+		case Instruction::FREM: {
+			auto &UL = I->getUserList();
+			if (UL.size() < 2 || !UL[1]) return false;
+			Value *Divisor = UL[1]->getValue();
+			if (!Divisor) return false;
+			if (!dynamic_cast<ConstantSystem *>(Divisor)) return false;
+			if (Divisor->isConstZero()) return false;
+			break;
+		}
+		default:
+			break;
+	}
+
+	// 普通 Binary（排除上面的四个危险算术）可移动
+	if (dynamic_cast<BinaryInst *>(I)) return true;
+
+	// LOAD：循环内任一指令若可能 Mod 该地址，则不可移动
+	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
+		auto &UL = LIst->getUserList();
+		if (UL.empty() || !UL[0]) return false;
+		Value *Ptr = UL[0]->getValue();
+		for (Instruction *J : LoopInsts) {
+			if (!J || J == I) continue;
+			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+			if (isModSet(MRI)) return false;
+		}
+		return true;
+	}
+
+    // STORE：Hoist 直接禁止；Sink 需证明“最后一次写”
+	if (auto *SI = dynamic_cast<StoreInst *>(I)) {
+		if (!ForSink && AggressiveHoist) return false;
+		auto &UL = SI->getUserList();
+		if (UL.size() < 2 || !UL[1]) return false;
+		Value *Ptr = UL[1]->getValue();
+
+		BasicBlock *SBB = SI->getParent();
+		if (!SBB) return false;
+
+		for (BasicBlock *ExitBB : ExitBlocks)
+			if (!DT.dominates(SBB, ExitBB)) return false;
+		for (BasicBlock *LatchBB : Latches)
+			if (!DT.dominates(SBB, LatchBB)) return false;
+
+		for (Instruction *J : LoopInsts) {
+			if (!J || J == SI) continue;
+
+			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+			if (!isModSet(MRI) && !isRefSet(MRI)) continue;
+
+			BasicBlock *JBB = J->getParent();
+			if (!JBB) return false;
+
+			if (JBB == SBB) {
+				std::vector<Instruction *> Seq;
+				for (auto *K : *SBB) Seq.push_back(K);
+				bool seenSI = false;
+				for (Instruction *K : Seq) {
+					if (K == SI) {
+						seenSI = true;
+						continue;
+					}
+					if (!seenSI) continue;
+					if (K == J) return false;
+				}
+			} else if (DT.dominates(SBB, JBB)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// CALL：副作用分析 + ModRef + untracked + RefSet 逐点核对
+	if (auto *CI = dynamic_cast<CallInst *>(I)) {
+		auto &UL = CI->getUserList();
+		if (UL.empty() || !UL[0]) return false;
+		Value *Callee = UL[0]->getValue();
+		auto *CalleeFunc = dynamic_cast<Function *>(Callee);
+		if (!CalleeFunc) return false;
+
+		const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
+		if (SEI.hasBuiltin) return false;
+		for (const auto &KV : SEI.ptrMap)
+			if (KV.second.untracked) return false;
+
+		ModRefInfo FMRI = getFunctionModRefInfo(SEI);
+		if (!(FMRI == ModRefInfo::NoModRef || FMRI == ModRefInfo::Ref)) return false;
+		if (!SEI.ModSet.empty()) return false;
+
+		if (!SEI.RefSet.empty()) {
+			auto &Params = CalleeFunc->getParams();
+			std::vector<Value *> ReadPtrs;
+
+			for (Value *RV : SEI.RefSet) {
+				auto *Var = dynamic_cast<Variable *>(RV);
+				if (!Var) continue;
+				if (Var->isGlobal()) {
+					ReadPtrs.push_back(RV);
+					continue;
+				}
+				if (!Var->isParam()) continue;
+
+				for (size_t i = 0; i < Params.size(); ++i) {
+					if (Params[i].get() != RV) continue;
+					if (i + 1 >= UL.size() || !UL[i + 1]) break;
+					Value *Arg = UL[i + 1]->getValue();
+					if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) break;
+					ReadPtrs.push_back(Arg);
+					break;
+				}
+			}
+
+			for (Value *Ptr : ReadPtrs) {
+				for (Instruction *J : LoopInsts) {
+					if (!J || J == CI) continue;
+					ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+					if (isModSet(MRI)) return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	return true;
+}
+
+PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+	auto &DT = FAM.getResult<DominantAnalysis>(F);
+	auto &LI = FAM.getResult<LoopAnalysis>(F);
+	auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+	bool Changed = false;
+	std::unordered_map<ExitValueKey, PhiInst *, ExitValueKeyHash> ExitPhiCache;
+
+	std::function<bool(Loop *)> processLoop = [&](Loop *L) -> bool {
+		if (!L) return false;
+		bool LocalChanged = false;
+
+		// 后序处理子循环
+		for (Loop *Sub : L->getSubLoops()) {
+			LocalChanged |= processLoop(Sub);
+		}
+
+		// 前置检查
+		if (!LCSSAPass::isLCSSAForm(L)) return LocalChanged;
+		BasicBlock *PreHeader = nullptr;
+		BasicBlock *Latch = nullptr;
+		if (!L->getLoopSimplifyForm(PreHeader, Latch)) return LocalChanged;
+		if (!PreHeader || !Latch) return LocalChanged;
+
+		auto ExitBlocks = L->getExitBlocks();
+		if (ExitBlocks.empty()) return LocalChanged;
+		auto Latches = L->getBackedgeSrcs();
+
+		auto collectLiveLoopInsts = [&]() {
+			std::vector<Instruction *> Insts;
+			std::function<void(Loop *)> collectFromLoop = [&](Loop *Cur) {
+				if (!Cur) return;
+				for (BasicBlock *BB : Cur->getBlocks()) {
+					if (!BB) continue;
+					for (auto *II : *BB) Insts.push_back(II);
+				}
+				for (Loop *Sub : Cur->getSubLoops()) collectFromLoop(Sub);
+			};
+			collectFromLoop(L);
+			return Insts;
+		};
+
+		// Sink：后序块 + 逆序指令
+		std::unordered_set<Instruction *> SinkInvariant;
+		auto SinkBlocksRPO = getLoopBlocksInRPO(*L);
+		for (auto BIt = SinkBlocksRPO.rbegin(); BIt != SinkBlocksRPO.rend(); ++BIt) {
+			BasicBlock *BB = *BIt;
+			if (!BB) continue;
+
+			std::vector<Instruction *> Insts;
+			for (auto *I : *BB) Insts.push_back(I);
+
+			for (auto IIt = Insts.rbegin(); IIt != Insts.rend(); ++IIt) {
+				Instruction *I = *IIt;
+				if (!I || I->getParent() != BB) continue;
+				auto LoopInsts = collectLiveLoopInsts();
+
+				if (!isSideEffect(
+						I,
+						*L,
+						DT,
+						ExitBlocks,
+						Latches,
+						LoopInsts,
+						AA,
+						LI,
+						FAM,
+						/*ForSink=*/true,
+						/*AggressiveHoist=*/false)) {
+					continue;
+				}
+
+				if (!isAllUsersOutLoop(I, *L)) {
+					if (isInvariant(I, *L, DT, SinkInvariant)) SinkInvariant.insert(I);
+					continue;
+				}
+
+				if (!isInvariant(I, *L, DT, SinkInvariant)) continue;
+
+				BasicBlock *DefBB = I->getParent();
+				std::unordered_map<BasicBlock *, Instruction *> ExitClone;
+
+				for (BasicBlock *ExitBB : ExitBlocks) {
+					if (!ExitBB || !DT.dominates(DefBB, ExitBB)) continue;
+					Instruction *Cloned = I->clone({});
+					if (!Cloned) {
+						continue;
+					}
+
+					for (auto &U : Cloned->getUserList()) {
+						if (!U) continue;
+						Value *OldOp = U->getValue();
+						if (!OldOp) continue;
+
+						auto *DefOpI = dynamic_cast<Instruction *>(OldOp);
+						if (!DefOpI || !DefOpI->getParent() || !L->contains(DefOpI->getParent())) continue;
+
+						ExitValueKey Key{ExitBB, OldOp};
+						PhiInst *Bridge = nullptr;
+						auto It = ExitPhiCache.find(Key);
+						if (It != ExitPhiCache.end()) {
+							Bridge = It->second;
+						} else {
+							Bridge = new PhiInst(OldOp->getIRType());
+							Bridge->setIdent(Bridge->getIdent() + ".lcssa");
+							for (BasicBlock *Pred : ExitBB->getPredecessors()) {
+								if (!Pred || !L->contains(Pred)) continue;
+								Value *Incoming = DT.dominates(DefOpI->getParent(), Pred)
+													  ? OldOp
+													  : UndefValue::NewUndefValue(OldOp->getIRType());
+								Bridge->addIncoming(Incoming, Pred);
+							}
+							if (Bridge->getNumIncomingValues() == 0) {
+								delete Bridge;
+								Bridge = nullptr;
+							} else {
+								ExitBB->push_front(Bridge);
+								ExitPhiCache[Key] = Bridge;
+							}
+						}
+
+						if (Bridge) U->replaceUseeWith(Bridge);
+					}
+
+					auto InsIt = ExitBB->begin();
+					while (InsIt != ExitBB->end() && dynamic_cast<PhiInst *>(*InsIt)) ++InsIt;
+					if (InsIt == ExitBB->end()) ExitBB->push_back(Cloned);
+					else InsIt.insertBefore(Cloned);
+					ExitClone[ExitBB] = Cloned;
+				}
+
+				if (ExitClone.empty()) continue;
+
+				bool RewriteOK = true;
+				std::vector<Use *> Uses;
+				for (auto Uit = I->getUseList().begin(); Uit != I->getUseList().end(); ++Uit) {
+					Use *U = *Uit;
+					if (U && U->getValue() == I) Uses.push_back(U);
+				}
+
+				for (Use *U : Uses) {
+					auto *UI = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
+					if (!UI || !UI->getParent()) continue;
+					BasicBlock *UseBB = UI->getParent();
+
+					Instruction *Rep = nullptr;
+					int hit = 0;
+					for (auto &KV : ExitClone) {
+						if (DT.dominates(KV.first, UseBB)) {
+							Rep = KV.second;
+							++hit;
+						}
+					}
+					if (hit != 1 || !Rep) {
+						RewriteOK = false;
+						break;
+					}
+					U->replaceUseeWith(Rep);
+				}
+
+				if (!RewriteOK) continue;
+
+				I->EraseFromParent();
+				delete I;
+				LocalChanged = true;
+			}
+		}
+
+		// Hoist：RPO 块 + 正序指令
+		std::unordered_set<Instruction *> HoistInvariant;
+		auto HoistBlocksRPO = getLoopBlocksInRPO(*L);
+		for (BasicBlock *BB : HoistBlocksRPO) {
+			if (!BB) continue;
+			std::vector<Instruction *> Insts;
+			for (auto *I : *BB) Insts.push_back(I);
+
+			for (Instruction *I : Insts) {
+				if (!I || I->getParent() != BB) continue;
+				auto LoopInsts = collectLiveLoopInsts();
+
+				bool Aggressive = true;
+				for (BasicBlock *ExitBB : ExitBlocks)
+					if (!DT.dominates(BB, ExitBB)) Aggressive = false;
+				for (BasicBlock *LatchBB : Latches)
+					if (!DT.dominates(BB, LatchBB)) Aggressive = false;
+
+				if (!isSideEffect(
+						I,
+						*L,
+						DT,
+						ExitBlocks,
+						Latches,
+						LoopInsts,
+						AA,
+						LI,
+						FAM,
+						/*ForSink=*/false,
+						/*AggressiveHoist=*/Aggressive)) {
+					continue;
+				}
+
+				if (!isInvariant(I, *L, DT, HoistInvariant)) continue;
+
+				auto TermIt = PreHeader->begin();
+				while (TermIt != PreHeader->end() && *TermIt != PreHeader->back()) ++TermIt;
+				if (TermIt == PreHeader->end()) continue;
+
+				I->EraseFromParent();
+				TermIt.insertBefore(I);
+				HoistInvariant.insert(I);
+				LocalChanged = true;
+			}
+		}
+
+		return LocalChanged;
+	};
+
+	for (Loop *TopL : LI.getTopLevelLoops()) {
+		Changed |= processLoop(TopL);
+	}
+
+	if (!Changed) return PreservationStatus::all();
+
+	PreservationStatus PA;
+	PA.keep<DominantAnalysis>();
+	PA.keep<PostDominantAnalysis>();
+	PA.keep<LoopAnalysis>();
+	PA.discard<BasicAliasAnalysis>();
+	PA.discard<SideEffectAnalysis>();
+	return PA;
+}
