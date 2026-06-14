@@ -2,6 +2,9 @@
 #include "./include/lib/ASTPrinter.hpp"
 #include "./include/lib/IRGenerator.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
+#ifdef ENABLE_RISCV_BACKEND
+#include "./include/riscv/Target.hpp"
+#endif
 #include <iostream>
 #include <string>
 #include <memory>
@@ -26,8 +29,6 @@ int main(int argc, const char *argv[]) {
     //1.文件读取->词法分析->语法分析
     std::string outputPath = argv[3];
     yyin = fopen(argv[4],"r");
-    //重定向：用于IR生成调试
-    freopen(outputPath.c_str(), "w", stdout);
     yy::parser parser;
     // parser.set_debug_level(1);  //觉得语法分析有错误的时候再开这个
     parser.parse();
@@ -89,6 +90,20 @@ int main(int argc, const char *argv[]) {
     std::cout << "\n";
 */
 
+#ifdef ENABLE_RISCV_BACKEND
+    try {
+        std::ofstream asmOut(outputPath);
+        if (!asmOut.is_open()) {
+            std::cerr << "Error: Cannot open output file " << outputPath << std::endl;
+            return 1;
+        }
+        riscv::emitAssembly(*ModuleIR, asmOut);
+    } catch (const riscv::BackendError &error) {
+        std::cerr << "RISC-V backend error: " << error.message() << std::endl;
+        return 1;
+    }
+#else
+    freopen(outputPath.c_str(), "w", stdout);
     //4.运行时库注入到.ll最前面（lli 测试需要）
     std::ifstream runtimeFile(RUNTIME_PATH);
     if (!runtimeFile.is_open()) {
@@ -103,6 +118,7 @@ int main(int argc, const char *argv[]) {
     //5.输出生成的IR（追加在运行时库之后）
     ModuleIR->dumpIR();
     fclose(stdout);
+#endif
     return 0;
 }
 

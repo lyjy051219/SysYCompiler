@@ -103,5 +103,9 @@ else()
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/backend)
 
     add_executable(compiler main.cpp)
+    target_compile_definitions(compiler PRIVATE
+        RUNTIME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        ENABLE_RISCV_BACKEND=1
+    )
     target_link_libraries(compiler Lib Yacc Opt Analysis Backend)
 endif()

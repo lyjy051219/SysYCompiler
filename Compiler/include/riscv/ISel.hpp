@@ -1,1 +1,20 @@
-//指令选择，lower作用和指令选择优化，负责将中间的IR映射到机器层IR
+#pragma once
+
+#include "MIR.hpp"
+#include "../lib/CFG.hpp"
+
+namespace riscv {
+
+class IRLowering {
+  Module &module_;
+
+public:
+  explicit IRLowering(Module &module);
+  MachineModule lowerModule();
+
+private:
+  void lowerGlobals(MachineModule &mm);
+  MachineFunction lowerFunction(Function &function);
+};
+
+} // namespace riscv
