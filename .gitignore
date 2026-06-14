@@ -12,6 +12,7 @@ Compiler/output.ll
 Compiler/input.ll
 Compiler/test.in
 Compiler/test.s
+Compiler/test.sy
 Compiler/test_exe
 Compiler/WA&TIME
 Compiler/standard.ll
