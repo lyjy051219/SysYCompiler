@@ -6,7 +6,7 @@
 
     // clangd 语言服务器参数
     "clangd.arguments": [
-        "--compile-commands-dir=${workspaceFolder}/Compiler/build", // 指定 CMake 输出的 compile_commands.json 目录
+        "--compile-commands-dir=${workspaceFolder}/Compiler/build_middle", // 指定 CMake 输出的 compile_commands.json 目录
         "--background-index",                              // 后台索引，提高智能补全速度
         "--suggest-missing-includes",                      // 自动提示缺失的 include
         "--clang-tidy",                                    // 启用 clang-tidy 检查
