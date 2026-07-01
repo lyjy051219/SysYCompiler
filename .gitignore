@@ -12,6 +12,7 @@ Compiler/output.ll
 Compiler/input.ll
 Compiler/test.in
 Compiler/test.s
+Compiler/test.sy
 Compiler/test_exe
 Compiler/WA&TIME
 Compiler/standard.ll
@@ -23,3 +24,5 @@ Compiler/testcases2
 Compiler/testcases25
 Compiler/test_postdom.ipynb
 Compiler/build_middle_asan
+Compiler/build-riscv
+Compiler/backend_test_work
