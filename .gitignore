@@ -27,3 +27,4 @@ Compiler/build_middle_asan
 Compiler/build-riscv
 Compiler/backend_test_work
 Compiler/build_asan
+Compiler/testcases26

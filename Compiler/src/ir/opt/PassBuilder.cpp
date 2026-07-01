@@ -100,11 +100,27 @@ static FunctionPassManager buildLoopPipeline() {
 }
 
 // 4. 晚期清理与后端准备 Pipeline
+// 4.1 晚期控制流收敛 Pipeline
+// LoopRotate/LICM/IfConversion 之后经常暴露新的常量分支、空块和可合并块。
+// 这段只做控制流/指令局部收敛，避免把 ConstantHoist/UnifyFuncExits 放进不动点。
+static FunctionPassManager buildLateControlFlowPipeline() {
+    FunctionPassManager FPM;
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(IfConversionPass());
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(DCEPass());
+    FPM.addPass(CFGSimplifyPass());
+    return FPM;
+}
+
 // 将 IR 规范化为后端代码生成器(CodeGen)最喜欢的形态
 static FunctionPassManager buildLatePipeline() {
     FunctionPassManager LateFPM;
-    LateFPM.addPass(CFGSimplifyPass());
-    LateFPM.addPass(InstSimplifyPass());
+    LateFPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        buildLateControlFlowPipeline(), 3));
     LateFPM.addPass(DCEPass());
     // 大整数常量提升（放在 InstSimplify 和 DCE 之后，免得 add 0,c 被折掉）
     LateFPM.addPass(ConstantHoistPass());

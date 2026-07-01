@@ -250,6 +250,7 @@ public:
     PreservationStatus run(IRUnitT &IR, AnalysisManagerT &AM){
         PreservationStatus OverallPA = PreservationStatus::all();
         int Iter = 0;
+        bool ReachedFixedPoint = false;
         const bool TraceFP = (std::getenv("LYJY_FP_TRACE") != nullptr);
 
         while (Iter < MaxIterations) {
@@ -271,11 +272,12 @@ public:
             // 【核心退出条件】：如果这一整轮 Pipeline 下来，所有的 Pass 都返回了 "allKept"
             // 说明没有任何一个 Pass 对 IR 进行了实质性修改，我们完美达到了不动点！
             if (IterPA.areAllKept()) {
+                ReachedFixedPoint = true;
                 break;
             }
         }
 
-        if (TraceFP && Iter == MaxIterations && !OverallPA.areAllKept()) {
+        if (TraceFP && Iter == MaxIterations && !ReachedFixedPoint) {
             std::cerr << "[FixedPoint] Warning: Reached MaxIterations (" << MaxIterations
                       << ") without reaching fixed point.\n";
         }
