@@ -1,0 +1,210 @@
+#include "ir/opt/DeadFunctionElimination.hpp"
+
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace {
+
+static bool isKnownRuntimeName(const std::string &Name) {
+	static const std::unordered_set<std::string> SysyLibNames = {
+		"getint", "getch", "getfloat", "getarray", "getfarray",
+		"putint", "putch", "putfloat", "putarray", "putfarray", "putf",
+		"starttime", "stoptime", "_sysy_starttime", "_sysy_stoptime"
+	};
+
+	if (SysyLibNames.count(Name)) return true;
+	if (Name.find("_sysy_") != std::string::npos) return true;
+	if (Name.find("memcpy") != std::string::npos) return true;
+	if (Name.find("llvm.") == 0) return true;
+	return false;
+}
+
+} // namespace
+
+bool DeadFunctionEliminationPass::isExternalRoot(Function *F) {
+	if (!F) return true;
+
+	const std::string Name = F->getIdent();
+	if (Name == "main") return true;
+	if (isKnownRuntimeName(Name)) return true;
+
+	// 目前 Function 构造时通常自带入口块；这里仍保留 declaration 判断，
+	// 以后若支持仅声明函数，不能把 ABI 可见声明删掉。
+	if (F->front() == nullptr) return true;
+
+	return false;
+}
+
+Function *DeadFunctionEliminationPass::getParentFunction(Instruction *I) {
+	if (!I) return nullptr;
+	BasicBlock *BB = I->getParent();
+	if (!BB) return nullptr;
+	return BB->getParent();
+}
+
+void DeadFunctionEliminationPass::collectReachableBlocks(
+	Function *F,
+	std::unordered_set<BasicBlock *> &Reachable)
+{
+	Reachable.clear();
+	if (!F || !F->front()) return;
+
+	std::vector<BasicBlock *> WorkList;
+	WorkList.push_back(F->front());
+	Reachable.insert(F->front());
+
+	// 只扫描 CFG 可达块，避免不可达块里的旧 call 把死函数错误保活。
+	while (!WorkList.empty()) {
+		BasicBlock *BB = WorkList.back();
+		WorkList.pop_back();
+		if (!BB) continue;
+
+		for (BasicBlock *Succ : BB->getSuccessors()) {
+			if (Succ && Reachable.insert(Succ).second) {
+				WorkList.push_back(Succ);
+			}
+		}
+	}
+}
+
+void DeadFunctionEliminationPass::dropAllReferences(Function *F) {
+	if (!F) return;
+
+	// 删除 Function 前，先断开函数体内所有 operand use。
+	// 这样 Function / BasicBlock / Instruction 析构时不会沿 use-list 递归删除
+	// 其它待删函数里的 call，更不会误碰仍然存活的 IR。
+	for (BasicBlock *BB : *F) {
+		if (!BB) continue;
+		for (Instruction *I : *BB) {
+			if (!I) continue;
+			I->getUserList().clear();
+		}
+	}
+}
+
+PreservationStatus DeadFunctionEliminationPass::run(
+	Module &M,
+	ModuleAnalysisPassManager &MAM)
+{
+	(void)MAM;
+
+	auto &Functions = M.getFunctions();
+	if (Functions.empty()) return PreservationStatus::all();
+
+	std::unordered_set<Function *> InModule;
+	InModule.reserve(Functions.size() * 2 + 1);
+	for (auto &FPtr : Functions) {
+		if (FPtr) InModule.insert(FPtr.get());
+	}
+
+	std::unordered_set<Function *> Live;
+	Live.reserve(Functions.size() * 2 + 1);
+	std::vector<Function *> WorkList;
+	WorkList.reserve(Functions.size());
+
+	auto markLive = [&](Function *F) {
+		if (!F || !InModule.count(F)) return;
+		if (Live.insert(F).second) {
+			WorkList.push_back(F);
+		}
+	};
+
+	// ---------- Mark roots ----------
+	// main、运行库/外部 ABI 名称、以及不在任何函数体内的函数引用都作为根。
+	for (auto &FPtr : Functions) {
+		Function *F = FPtr.get();
+		if (!F) continue;
+		if (isExternalRoot(F)) {
+			markLive(F);
+		}
+	}
+
+	for (auto &FPtr : Functions) {
+		Function *F = FPtr.get();
+		if (!F) continue;
+
+		for (auto UIt = F->getUseList().begin(); UIt != F->getUseList().end(); ++UIt) {
+			Use *U = *UIt;
+			if (!U) continue;
+
+			auto *I = dynamic_cast<Instruction *>(U->getUser());
+			if (!I) {
+				markLive(F);
+				continue;
+			}
+
+			// 如果函数值被挂在无父函数的游离指令上，保守当作外部可见。
+			if (!getParentFunction(I)) {
+				markLive(F);
+			}
+		}
+	}
+
+	// ---------- Mark transitive callees / escaped functions ----------
+	// 每个 live 函数最多扫描一次；扫描时只看 CFG 可达块，复杂度为 O(可达 IR 大小)。
+	std::unordered_set<BasicBlock *> ReachableBlocks;
+	while (!WorkList.empty()) {
+		Function *F = WorkList.back();
+		WorkList.pop_back();
+		if (!F) continue;
+
+		collectReachableBlocks(F, ReachableBlocks);
+
+		for (BasicBlock *BB : *F) {
+			if (!BB || !ReachableBlocks.count(BB)) continue;
+
+			for (Instruction *I : *BB) {
+				if (!I) continue;
+
+				auto &Operands = I->getUserList();
+				for (auto &UsePtr : Operands) {
+					if (!UsePtr) continue;
+					auto *Target = dynamic_cast<Function *>(UsePtr->getValue());
+					if (!Target || !InModule.count(Target)) continue;
+
+					// 直接调用会让 callee 可达；函数值作为普通操作数出现时，
+					// 说明地址在 live 代码里逃逸，也必须保守保留。
+					markLive(Target);
+				}
+			}
+		}
+	}
+
+	std::unordered_set<Function *> Dead;
+	Dead.reserve(Functions.size());
+	for (auto &FPtr : Functions) {
+		Function *F = FPtr.get();
+		if (!F) continue;
+		if (!Live.count(F)) {
+			Dead.insert(F);
+		}
+	}
+
+	if (Dead.empty()) return PreservationStatus::all();
+
+	// ---------- Sweep ----------
+	// DFE 不修改任何存活函数的 CFG，因此不能清空整个 FAM。只在函数对象
+	// 仍有效时移除待删函数的缓存，既避免悬空 Function* key，也保留存活
+	// 函数的分析结果，防止无关分析被重建并扰动后续流水线。
+	for (Function *F : Dead) {
+		FAM.invalidate(*F, PreservationStatus::none());
+	}
+
+	// 先统一断引用，再统一 erase。这样删除互相递归的死函数 SCC 也是线性的，
+	// 不会在析构某个 Function 时沿 use-list 反复触发递归删除。
+	for (Function *F : Dead) {
+		dropAllReferences(F);
+	}
+
+	for (auto It = Functions.begin(); It != Functions.end(); ) {
+		Function *F = It->get();
+		if (F && Dead.count(F)) {
+			It = Functions.erase(It);
+		} else {
+			++It;
+		}
+	}
+
+	return PreservationStatus::none();
+}

@@ -1,6 +1,7 @@
 #include "ir/opt/PassBuilder.hpp"
 #include "ir/opt/Mem2Reg.hpp"
 #include "ir/opt/DAE.hpp"
+#include "ir/opt/DeadFunctionElimination.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/DSE.hpp"
 #include "ir/opt/LoadElimination.hpp"
@@ -108,6 +109,8 @@ static FunctionPassManager buildLatePipeline() {
     // 大整数常量提升（放在 InstSimplify 和 DCE 之后，免得 add 0,c 被折掉）
     LateFPM.addPass(ConstantHoistPass());
     // LateFPM.addPass(Select2BranchPass());
+    //LateFPM.addPass(CFGSimplifyPass());
+    //LateFPM.addPass(BreakCriticalEdgesPass());
     LateFPM.addPass(UnifyFuncExitsPass());
     return LateFPM;
 }
@@ -149,6 +152,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     // Phase 2: Interprocedural Optimization (IPO，过程间优化)
     MPM.addPass(createModuleFunctionBridge(TailRecursionEliminationPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
+    // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
@@ -160,6 +165,9 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     // 内联后会暴露出大量新的常数折叠、死代码和 Alloca 机会，再做一次轻量清理
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLightCleanupPipeline(), FAM), 2));
+
+    // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
 
     // 清理只写不读的全局变量 store，给后续内存优化减负
     MPM.addPass(StoreOnlyGlobalEliminationPass(FAM));
@@ -175,6 +183,9 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLoopPipeline(), FAM), 3));
 
+    // 循环 DCE/CFG 清理后做最终函数图收敛，避免 late/backend 继续处理死函数体。
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
+
     // O2 及以上可以跑更多激进的后端准备优化，目前 O1 和 O2 复用流水线
     if (Level == OptimizationLevel::O2) {
         // 保留给未来更加激进的优化 (如 Auto-Vectorization 等)
@@ -182,6 +193,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 
     // Phase 5: Late CFG / Backend Prep (晚期清理与后端准备)
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));
+    // Late DCE 仍可能删掉最后一个纯调用，最终再收一次，保证输出 IR 不残留死函数体。
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
 
     return MPM;
 }
