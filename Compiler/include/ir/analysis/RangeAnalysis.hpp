@@ -12,6 +12,8 @@
 #include <limits>
 #include <algorithm>
 
+class Loop;
+
 // =====================================================================
 // RangeAnalysis — 值范围分析
 //
@@ -335,18 +337,17 @@ struct FloatRange {
 };
 
 // ---------------------------------------------------------------------
-// 循环归纳变量信息（SCEV 接口占位）
-// 等 SCEV 分析 pass 实现后，由 SCEV 填充此结构，本 pass 读取并用于
-// 推断循环变量的保守范围。
-// 当前版本不使用，但留出接口避免以后改签名。
+// SCEV/RangeAnalysis 共享的简单整数归纳变量摘要。
+// RangeAnalysis 只消费带有限 trip-count 的结果，并把它限制在循环体局部上下文。
 // ---------------------------------------------------------------------
 struct LoopInductionInfo {
+    const Loop *RecLoop; // 所属循环；用于把范围限制在循环体上下文中
     int64_t initial;     // 初始值
     int64_t step;        // 每轮增量
     bool hasUpperBound;  // 是否已知上界
     int64_t upperBound;  // 上界（有效当且仅当 hasUpperBound）
 
-    LoopInductionInfo() : initial(0), step(0),
+    LoopInductionInfo() : RecLoop(nullptr), initial(0), step(0),
                           hasUpperBound(false), upperBound(0) {}
 };
 
@@ -359,6 +360,8 @@ public:
     std::unordered_map<Value*, IntRange> GlobalRanges;
     // 整数 per-block contextual 范围
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> ContextualRanges;
+    // 只在精确 ctxBlock 生效的局部范围提示；不沿支配树继承
+    std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> BlockLocalRanges;
 
     // 浮点全局范围
     std::unordered_map<Value*, FloatRange> FloatGlobalRanges;
@@ -369,9 +372,8 @@ public:
     std::unordered_map<Value*, KnownBits> GlobalBits;
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, KnownBits>> ContextualBits;
 
-    // SCEV 接口占位：循环归纳变量信息
-    // 外部（未来的 SCEV pass）通过 setLoopInduction 填充，
-    // solver 在处理 PHI 时查询此表优先采用 SCEV 推断的范围
+    // SCEV 归纳变量信息。RangeAnalysis 当前只把它作为查询期的局部上下文提示，
+    // 不用它覆盖 PHI 的全局范围。
     std::unordered_map<Value*, LoopInductionInfo> LoopInductions;
 
     // 查询整数范围：在 ctxBlock 上下文中查询 val 的范围
@@ -400,7 +402,7 @@ public:
     KnownBits queryBitsOnEdge(Value *val, BasicBlock *predBB, BasicBlock *succBB,
                               const DominatorTree &DT) const;
 
-    // SCEV 接口：填充循环归纳变量信息（供未来 SCEV pass 调用）
+    // SCEV 接口：保留手动填充归纳变量信息的入口
     void setLoopInduction(Value *v, const LoopInductionInfo &info) {
         LoopInductions[v] = info;
     }

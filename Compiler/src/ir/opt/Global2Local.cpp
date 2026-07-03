@@ -6,6 +6,7 @@
 #include "lib/CFG.hpp"
 #include "lib/TypeSystem.hpp"
 
+#include <algorithm>
 #include <queue>
 #include <utility>
 
@@ -15,6 +16,7 @@ struct CandidateInfo {
 	Variable *GV = nullptr;
 	std::shared_ptr<IRType> ElemTy;
 	std::vector<Use *> MainUses;
+	bool HasNonEntryStore = false;
 };
 
 static Instruction *insertAllocaAfterEntryPhis(Function *F, AllocaInst *AI) {
@@ -187,7 +189,6 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	Function *Main = M->getMainFunction();
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
-	BasicBlock *MainEntry = Main->front();
 
 	auto CallGraph = buildCallGraph(*M);
 	auto ReachableFromMain = computeReachableFrom(Main, CallGraph);
@@ -213,6 +214,8 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		bool ScalarHasStore = false;
 		bool ScalarHasLoopMemUse = false;
 		bool ScalarAllUsesInEntry = true;
+		bool ScalarHasNonEntryStore = false;
+		BasicBlock *MainEntry = Main->front();
 
 		for (auto it = GV->getUseList().begin(); it != GV->getUseList().end(); ++it) {
 			Use *U = *it;
@@ -244,23 +247,33 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 				}
 
 				auto *UserI = dynamic_cast<Instruction *>(U->getUser());
-				BasicBlock *UBB = UserI ? UserI->getParent() : nullptr;
-				if (!UBB || UBB != MainEntry) {
-					ScalarAllUsesInEntry = false;
-				}
-				if (UBB && LI.getLoopFor(UBB) != nullptr) {
-					if (dynamic_cast<LoadInst *>(UserI) || dynamic_cast<StoreInst *>(UserI)) {
-						ScalarHasLoopMemUse = true;
+				auto *SI = dynamic_cast<StoreInst *>(UserI);
+				if (RelaxScalarUses) {
+					if (SI && SI->getUserIndex(U) == 1) {
+						BasicBlock *SBB = SI->getParent();
+						if (SBB && SBB != MainEntry) {
+							ScalarHasNonEntryStore = true;
+						}
 					}
-				}
+				} else {
+					BasicBlock *UBB = UserI ? UserI->getParent() : nullptr;
+					if (!UBB || UBB != MainEntry) {
+						ScalarAllUsesInEntry = false;
+					}
+					if (UBB && LI.getLoopFor(UBB) != nullptr) {
+						if (dynamic_cast<LoadInst *>(UserI) ||
+							dynamic_cast<StoreInst *>(UserI)) {
+							ScalarHasLoopMemUse = true;
+						}
+					}
 
-				auto *SI = dynamic_cast<StoreInst *>(U->getUser());
-				if (SI && SI->getUserIndex(U) == 1) {
-					ScalarHasStore = true;
-					BasicBlock *SBB = SI->getParent();
-					if (!SBB || LI.getLoopFor(SBB) != nullptr) {
-						CanPromote = false;
-						break;
+					if (SI && SI->getUserIndex(U) == 1) {
+						ScalarHasStore = true;
+						BasicBlock *SBB = SI->getParent();
+						if (!SBB || LI.getLoopFor(SBB) != nullptr) {
+							CanPromote = false;
+							break;
+						}
 					}
 				}
 			}
@@ -268,16 +281,41 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			MainUses.push_back(U);
 		}
 
-		if (!IsArray && ScalarHasStore && ScalarHasLoopMemUse) {
+		if (!RelaxScalarUses && !IsArray && ScalarHasStore &&
+			ScalarHasLoopMemUse) {
 			CanPromote = false;
 		}
-		if (!IsArray && ScalarHasStore && !ScalarAllUsesInEntry) {
+		if (!RelaxScalarUses && !IsArray && ScalarHasStore &&
+			!ScalarAllUsesInEntry) {
 			CanPromote = false;
 		}
 
 		if (!CanPromote || MainUses.empty()) continue;
 
-		WorkList.push_back(CandidateInfo{GV, ElemTy, std::move(MainUses)});
+		WorkList.push_back(
+			CandidateInfo{
+				GV, ElemTy, std::move(MainUses), ScalarHasNonEntryStore});
+	}
+
+	if (RelaxScalarUses) {
+		const size_t NonEntryStoredScalarCount = static_cast<size_t>(std::count_if(
+			WorkList.begin(), WorkList.end(), [](const CandidateInfo &C) {
+				return C.HasNonEntryStore;
+			}));
+
+		// The current late CFG cleanup cannot yet safely converge several
+		// independently promoted loop-carried globals in deeply nested loops
+		// (functional/28_while_test3 is the minimal suite witness).  Continue
+		// promoting entry-written/loop-read globals, but defer all loop-written
+		// scalars when more than one such state variable exists.
+		if (NonEntryStoredScalarCount > 1) {
+			WorkList.erase(
+				std::remove_if(WorkList.begin(), WorkList.end(),
+					[](const CandidateInfo &C) {
+						return C.HasNonEntryStore;
+					}),
+				WorkList.end());
+		}
 	}
 
 	if (WorkList.empty()) return PreservationStatus::all();

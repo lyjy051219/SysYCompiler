@@ -365,6 +365,13 @@ private:
 	BasicAAResult *AA = nullptr;
 	LoopInfo *LI = nullptr;
 
+	enum class BoolExtKind {
+		None,
+		PlainBool,
+		ZeroExt,
+		SignExt,
+	};
+
 	static std::vector<Instruction *> collectInstructionUsers(Value *V) {
 		std::vector<Instruction *> Out;
 		if (!V) return Out;
@@ -399,6 +406,45 @@ private:
 		LHS = UL[0]->getValue();
 		RHS = UL[1]->getValue();
 		return LHS && RHS;
+	}
+
+	static bool getUnaryOperand(Instruction *I, Value *&Op) {
+		Op = nullptr;
+		if (!I) return false;
+		auto &UL = I->getUserList();
+		if (UL.size() != 1 || !UL[0]) return false;
+		Op = UL[0]->getValue();
+		return Op != nullptr;
+	}
+
+	static Value *stripBoolExt(Value *V, BoolExtKind &Kind) {
+		Kind = BoolExtKind::None;
+		if (!V) return nullptr;
+		if (isBoolType(V->getIRType())) {
+			Kind = BoolExtKind::PlainBool;
+			return V;
+		}
+
+		if (auto *ZI = dynamic_cast<ZextInst *>(V)) {
+			Value *Op = nullptr;
+			if (getUnaryOperand(ZI, Op) && isBoolType(Op->getIRType())) {
+				Kind = BoolExtKind::ZeroExt;
+				return Op;
+			}
+		}
+		if (auto *SI = dynamic_cast<SextInst *>(V)) {
+			Value *Op = nullptr;
+			if (getUnaryOperand(SI, Op) && isBoolType(Op->getIRType())) {
+				Kind = BoolExtKind::SignExt;
+				return Op;
+			}
+		}
+		return nullptr;
+	}
+
+	static Value *invertBool(Value *V) {
+		if (!V) return nullptr;
+		return new BinaryInst(V, BinaryInst::XOR, ConstBool::newConstBool(true));
 	}
 
 	static bool insertInstBefore(Instruction *Pos, Instruction *NewI) {
@@ -916,6 +962,11 @@ private:
 			return LHS;
 		}
 
+		if (isIntType(BI->getIRType()) && !isBoolType(BI->getIRType()) &&
+			isConstMinusOne(RHS)) {
+			return new BinaryInst(makeZeroForType(BI->getIRType()), BinaryInst::SUB, LHS);
+		}
+
 		// x * 2^n -> x << n (integer domain)
 		if (isIntType(BI->getIRType())) {
 			int32_t C = 0;
@@ -970,6 +1021,10 @@ private:
 			return LHS;
 		}
 
+		if (Op == BinaryInst::DIV && isConstMinusOne(RHS)) {
+			return new BinaryInst(makeZeroForType(Ty), BinaryInst::SUB, LHS);
+		}
+
 		return nullptr;
 	}
 
@@ -990,6 +1045,7 @@ private:
 		if (isConstZero(LHS)) return makeZeroForType(Ty);
 		if (isConstZero(RHS)) return makeUndefForType(Ty);
 		if (isConstOne(RHS)) return makeZeroForType(Ty);
+		if (BI->getOp() == BinaryInst::MOD && isConstMinusOne(RHS)) return makeZeroForType(Ty);
 		if (LHS == RHS) return makeZeroForType(Ty);
 
 		return nullptr;
@@ -1080,6 +1136,35 @@ private:
 	Value *simplifyCmp(BinaryInst *BI, Value *LHS, Value *RHS) {
 		if (LHS->isConst() && RHS->isConst()) {
 			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+		}
+
+		if (BI->getOp() == BinaryInst::E || BI->getOp() == BinaryInst::NE) {
+			auto tryBoolCmpConst = [&](Value *A, Value *B) -> Value * {
+				BoolExtKind Kind = BoolExtKind::None;
+				Value *Cond = stripBoolExt(A, Kind);
+				if (!Cond || !B) return nullptr;
+
+				int32_t Raw = 0;
+				if (auto *CB = dynamic_cast<ConstBool *>(B)) {
+					Raw = CB->getVal() ? 1 : 0;
+				} else if (auto *CI = dynamic_cast<ConstInt *>(B)) {
+					Raw = CI->getVal();
+				} else {
+					return nullptr;
+				}
+
+				int32_t TrueValue = (Kind == BoolExtKind::SignExt) ? -1 : 1;
+				if (Raw == TrueValue) {
+					return BI->getOp() == BinaryInst::E ? Cond : invertBool(Cond);
+				}
+				if (Raw == 0) {
+					return BI->getOp() == BinaryInst::E ? invertBool(Cond) : Cond;
+				}
+				return ConstBool::newConstBool(BI->getOp() == BinaryInst::NE);
+			};
+
+			if (Value *V = tryBoolCmpConst(LHS, RHS)) return V;
+			if (Value *V = tryBoolCmpConst(RHS, LHS)) return V;
 		}
 
 		// x % (2^n) == t  -> (x & (2^n - 1)) == t
@@ -1316,9 +1401,7 @@ private:
 			}
 		}
 
-		if (!Common) {
-			return makeUndefForType(Phi->getIRType());
-		}
+		if (!Common) return nullptr;
 
 		if (HasUndef) {
 			// 无法确认支配关系时(例如没有DT)必须保守退出，避免错误化简。

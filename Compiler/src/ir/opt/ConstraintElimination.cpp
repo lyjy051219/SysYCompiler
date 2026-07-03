@@ -49,7 +49,114 @@ struct Constraint {
     // 如果 bound 是 ConstInt，记住它的值方便蕴含检查
     bool boundIsConst;
     int64_t boundVal;
+    // 表示 val op (bound + boundOffset)。bound 是常量时等价于常量整体偏移；
+    // bound 是 SSA 值时只在两条约束引用同一个 bound 时做偏移比较。
+    int64_t boundOffset;
 };
+
+struct OffsetExpr {
+    Value *Base = nullptr;
+    int64_t Offset = 0;
+    bool Valid = false;
+};
+
+static bool addI32(int64_t A, int64_t B, int64_t &Out) {
+    Out = A + B;
+    return Out >= (int64_t)INT32_MIN && Out <= (int64_t)INT32_MAX;
+}
+
+static OffsetExpr decomposeOffset(Value *V, int depth = 2) {
+    if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
+        return {};
+    if (depth <= 0)
+        return {V, 0, true};
+
+    auto *BI = dynamic_cast<BinaryInst *>(V);
+    if (!BI)
+        return {V, 0, true};
+
+    auto &UL = BI->getUserList();
+    if (UL.size() < 2)
+        return {V, 0, true};
+    Value *lhs = UL[0]->getValue();
+    Value *rhs = UL[1]->getValue();
+    if (!lhs || !rhs)
+        return {V, 0, true};
+
+    if (BI->getOp() == BinaryInst::ADD) {
+        if (auto *C = dynamic_cast<ConstInt *>(lhs)) {
+            OffsetExpr E = decomposeOffset(rhs, depth - 1);
+            int64_t NewOffset = 0;
+            if (E.Valid && addI32(E.Offset, C->getVal(), NewOffset))
+                return {E.Base, NewOffset, true};
+        }
+        if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
+            OffsetExpr E = decomposeOffset(lhs, depth - 1);
+            int64_t NewOffset = 0;
+            if (E.Valid && addI32(E.Offset, C->getVal(), NewOffset))
+                return {E.Base, NewOffset, true};
+        }
+    } else if (BI->getOp() == BinaryInst::SUB) {
+        if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
+            OffsetExpr E = decomposeOffset(lhs, depth - 1);
+            int64_t NewOffset = 0;
+            if (E.Valid && addI32(E.Offset, -(int64_t)C->getVal(), NewOffset))
+                return {E.Base, NewOffset, true};
+        }
+    }
+
+    return {V, 0, true};
+}
+
+static bool rewriteOffsetConstraint(Value *lhs, Value *rhs,
+                                    BinaryInst::Operation op,
+                                    Constraint &out) {
+    OffsetExpr L = decomposeOffset(lhs);
+    OffsetExpr R = decomposeOffset(rhs);
+    if (!L.Valid || !R.Valid || !L.Base || !R.Base) return false;
+
+    int64_t Delta = R.Offset - L.Offset;
+    BinaryInst::Operation NewOp = op;
+    bool ok = false;
+
+    switch (op) {
+        case BinaryInst::L:
+            if (Delta == 0) { NewOp = BinaryInst::L; ok = true; }
+            else if (Delta == 1) { NewOp = BinaryInst::LE; ok = true; }
+            break;
+        case BinaryInst::LE:
+            if (Delta == 0) { NewOp = BinaryInst::LE; ok = true; }
+            else if (Delta == -1) { NewOp = BinaryInst::L; ok = true; }
+            break;
+        case BinaryInst::G:
+            if (Delta == 0) { NewOp = BinaryInst::G; ok = true; }
+            else if (Delta == -1) { NewOp = BinaryInst::GE; ok = true; }
+            break;
+        case BinaryInst::GE:
+            if (Delta == 0) { NewOp = BinaryInst::GE; ok = true; }
+            else if (Delta == 1) { NewOp = BinaryInst::G; ok = true; }
+            break;
+        case BinaryInst::E:
+        case BinaryInst::NE:
+            if (Delta == 0) { NewOp = op; ok = true; }
+            break;
+        default:
+            break;
+    }
+    if (!ok) return false;
+
+    out.val = L.Base;
+    out.op = NewOp;
+    out.bound = R.Base;
+    out.boundIsConst = false;
+    out.boundVal = 0;
+    out.boundOffset = 0;
+    if (auto *CI = dynamic_cast<ConstInt *>(out.bound)) {
+        out.boundIsConst = true;
+        out.boundVal = CI->getVal();
+    }
+    return true;
+}
 
 // 从条件分支的 icmp 提取约束
 // 如果是 br(icmp op lhs rhs, trueBB, falseBB)，
@@ -63,6 +170,20 @@ static BinaryInst::Operation negateOp(BinaryInst::Operation op) {
         case BinaryInst::E:  return BinaryInst::NE;
         case BinaryInst::NE: return BinaryInst::E;
         default: return op;
+    }
+}
+
+static BinaryInst::Operation reverseOp(BinaryInst::Operation op) {
+    switch (op) {
+        case BinaryInst::L:  return BinaryInst::G;
+        case BinaryInst::LE: return BinaryInst::GE;
+        case BinaryInst::G:  return BinaryInst::L;
+        case BinaryInst::GE: return BinaryInst::LE;
+        case BinaryInst::E:
+        case BinaryInst::NE:
+            return op;
+        default:
+            return op;
     }
 }
 
@@ -131,6 +252,7 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
                             out.bound = ConstInt::newConstInt((int)newBound);
                             out.boundIsConst = true;
                             out.boundVal = newBound;
+                            out.boundOffset = 0;
                             return true;
                         }
                     }
@@ -148,6 +270,7 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
                             out.bound = ConstInt::newConstInt((int)newBound);
                             out.boundIsConst = true;
                             out.boundVal = newBound;
+                            out.boundOffset = 0;
                             return true;
                         }
                     } else if (laConst) {
@@ -168,6 +291,7 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
                             out.bound = ConstInt::newConstInt((int)newBound);
                             out.boundIsConst = true;
                             out.boundVal = newBound;
+                            out.boundOffset = 0;
                             return true;
                         }
                     }
@@ -176,15 +300,41 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
         }
     }
 
+    if (rewriteOffsetConstraint(lhs, rhs, op, out))
+        return true;
+
     out.val = val;
     out.op = op;
     out.bound = bound;
     out.boundIsConst = false;
+    out.boundVal = 0;
+    out.boundOffset = 0;
     if (auto *CI = dynamic_cast<ConstInt *>(out.bound)) {
         out.boundIsConst = true;
         out.boundVal = CI->getVal();
     }
     return true;
+}
+
+static bool addNoOverflow(int64_t A, int64_t B, int64_t &Out) {
+    if ((B > 0 && A > INT64_MAX - B) || (B < 0 && A < INT64_MIN - B))
+        return false;
+    Out = A + B;
+    return true;
+}
+
+static bool comparableBoundValues(const Constraint &A, const Constraint &B,
+                                  int64_t &AV, int64_t &BV) {
+    if (A.boundIsConst && B.boundIsConst) {
+        return addNoOverflow(A.boundVal, A.boundOffset, AV) &&
+               addNoOverflow(B.boundVal, B.boundOffset, BV);
+    }
+    if (!A.boundIsConst && !B.boundIsConst && A.bound == B.bound) {
+        AV = A.boundOffset;
+        BV = B.boundOffset;
+        return true;
+    }
+    return false;
 }
 
 // 检查已知约束 known 是否蕴含目标约束 target
@@ -193,20 +343,12 @@ static bool implies(const Constraint &known, const Constraint &target) {
     // 必须是同一个值
     if (known.val != target.val) return false;
 
-    // 如果 bound 不是同一个值，只有都是常量才能比较
-    if (known.bound != target.bound) {
-        if (!known.boundIsConst || !target.boundIsConst) return false;
-    }
-
-    // 同一个 bound（或常量可比较）
-    int64_t kB = known.boundIsConst ? known.boundVal : 0;
-    int64_t tB = target.boundIsConst ? target.boundVal : 0;
-    // sameBound 的语义：两条约束的 bound 在"代表同一个数值"意义下相等。
-    // 两端都是常量时看 boundVal 是否相等（不靠 Value* 指针 —— interning 不一定能保证）；
-    // 非常量看 Value* 指针。
-    bool sameBound = (known.boundIsConst && target.boundIsConst)
-        ? (kB == tB)
-        : (known.bound == target.bound);
+    // 同一个 bound（或常量）允许携带不同偏移：x < y、x <= y+1
+    // 这类约束可以直接按偏移大小比较。
+    int64_t kB = 0;
+    int64_t tB = 0;
+    bool comparableBound = comparableBoundValues(known, target, kB, tB);
+    bool sameBound = comparableBound && kB == tB;
 
     // 蕴含规则表：
     // 已知 val < kB:
@@ -230,10 +372,7 @@ static bool implies(const Constraint &known, const Constraint &target) {
 
     if (sameBound && known.op == target.op) return true;
 
-    if (!known.boundIsConst || !target.boundIsConst) {
-        // 非常量 bound 只能判断完全相同的约束
-        return sameBound && known.op == target.op;
-    }
+    if (!comparableBound) return false;
 
     switch (known.op) {
         case BinaryInst::L: // val < kB
@@ -289,6 +428,17 @@ static bool implies(const Constraint &known, const Constraint &target) {
 static bool isImplied(const std::vector<Constraint> &stack, const Constraint &target) {
     for (auto &known : stack) {
         if (implies(known, target)) return true;
+        if (!known.boundIsConst && !target.boundIsConst &&
+            known.boundOffset == 0 && target.boundOffset == 0) {
+            Constraint reversed;
+            reversed.val = known.bound;
+            reversed.op = reverseOp(known.op);
+            reversed.bound = known.val;
+            reversed.boundIsConst = false;
+            reversed.boundVal = 0;
+            reversed.boundOffset = 0;
+            if (implies(reversed, target)) return true;
+        }
     }
     return false;
 }
@@ -302,7 +452,11 @@ static bool isImplied(const std::vector<Constraint> &stack, const Constraint &ta
 // 受支配树深度限制，实际很小。
 static bool impliesTransitive(const std::vector<Constraint> &stack,
                               const Constraint &target) {
-    if (!target.boundIsConst) return false;
+    int64_t checkedTargetConst = 0;
+    if (!target.boundIsConst ||
+        !addNoOverflow(target.boundVal, target.boundOffset, checkedTargetConst))
+        return false;
+    (void)checkedTargetConst;
 
     // 先找所有"target.val op m"形式的约束，m 不是 target.bound
     for (auto &k1 : stack) {
@@ -343,7 +497,9 @@ static bool impliesTransitive(const std::vector<Constraint> &stack,
             synthesized.op = combined;
             synthesized.bound = k2.bound;
             synthesized.boundIsConst = true;
-            synthesized.boundVal = k2.boundVal;
+            if (!addNoOverflow(k2.boundVal, k2.boundOffset, synthesized.boundVal))
+                continue;
+            synthesized.boundOffset = 0;
             if (implies(synthesized, target)) return true;
         }
     }
@@ -454,11 +610,13 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                                     lo.bound = ConstInt::newConstInt((int)vr.min);
                                     lo.boundIsConst = true;
                                     lo.boundVal = vr.min;
+                                    lo.boundOffset = 0;
                                     hi.val = target.val;
                                     hi.op = BinaryInst::LE;
                                     hi.bound = ConstInt::newConstInt((int)vr.max);
                                     hi.boundIsConst = true;
                                     hi.boundVal = vr.max;
+                                    hi.boundOffset = 0;
                                     constraintStack.push_back(lo);
                                     constraintStack.push_back(hi);
                                 }

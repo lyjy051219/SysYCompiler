@@ -28,3 +28,6 @@ Compiler/build-riscv
 Compiler/backend_test_work
 Compiler/build_asan
 Compiler/testcases26
+Compiler/analysis_out
+Compiler/tools
+Compiler/midend_eval

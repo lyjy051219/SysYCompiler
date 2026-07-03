@@ -33,8 +33,13 @@
 #include "ir/opt/GepOpt.hpp"
 #include "ir/opt/StoreOnlyGlobalElimination.hpp"
 #include "ir/opt/ConstantHoist.hpp"
+#include "ir/opt/LateDeadGlobalCleanup.hpp"
+#include "ir/opt/LatePhiCleanup.hpp"
+#include "ir/opt/LateStrengthReduce.hpp"
+#include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
+#include "ir/analysis/SCEV.hpp"
 
 // Pipeline 阶段构建器 (Phase Builders)
 // 1. 轻量级清理 Pipeline
@@ -99,6 +104,22 @@ static FunctionPassManager buildLoopPipeline() {
     return FPM;
 }
 
+// 3.1 Loop 后收敛 Pipeline
+// LoopRotate/LICM/LoopDeletion 会暴露新的局部代数机会和 LCSSA/exit PHI。
+// 这里刻意不用完整 RangeAware/Constraint/GVN/内存清理，避免 late CFG 上的
+// 路径范围误判；只做控制流中性、可局部证明正确的收敛。
+static FunctionPassManager buildPostLoopCleanupPipeline() {
+    FunctionPassManager FPM;
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(LateStrengthReducePass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(DCEPass());
+    FPM.addPass(LatePhiCleanupPass());
+    FPM.addPass(CFGSimplifyPass());
+    return FPM;
+}
+
 // 4. 晚期清理与后端准备 Pipeline
 // 4.1 晚期控制流收敛 Pipeline
 // LoopRotate/LICM/IfConversion 之后经常暴露新的常量分支、空块和可合并块。
@@ -128,6 +149,9 @@ static FunctionPassManager buildLatePipeline() {
     //LateFPM.addPass(CFGSimplifyPass());
     //LateFPM.addPass(BreakCriticalEdgesPass());
     LateFPM.addPass(UnifyFuncExitsPass());
+    LateFPM.addPass(LatePhiCleanupPass());
+    LateFPM.addPass(CFGSimplifyPass());
+    LateFPM.addPass(LatePhiCleanupPass());
     return LateFPM;
 }
 
@@ -170,6 +194,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
     // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
+    // 早期仍使用保守模式，避免把循环携带的全局状态提前暴露给
+    // Range/Constraint 链；晚期会在这些分析全部结束后做放宽版局部化。
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
@@ -181,6 +207,14 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     // 内联后会暴露出大量新的常数折叠、死代码和 Alloca 机会，再做一次轻量清理
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLightCleanupPipeline(), FAM), 2));
+
+    // Front-end array initialization is represented as constant-global memcpy
+    // plus element accesses. Forward same-block constant elements and delete
+    // non-escaping local aggregates whose contents are never observed. Tiny
+    // constant-indexed arrays may be scalarized here; the existing late
+    // Mem2Reg phase will promote the resulting scalar allocas without adding
+    // an extra early CFG perturbation point.
+    MPM.addPass(createModuleFunctionBridge(LocalAggregateSimplifyPass(), FAM));
 
     // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
@@ -199,6 +233,10 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLoopPipeline(), FAM), 3));
 
+    // Phase 4.5: Post-loop cleanup
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(buildPostLoopCleanupPipeline(), FAM), 1));
+
     // 循环 DCE/CFG 清理后做最终函数图收敛，避免 late/backend 继续处理死函数体。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
 
@@ -208,7 +246,18 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     }
 
     // Phase 5: Late CFG / Backend Prep (晚期清理与后端准备)
+    // 范围和循环变换已经结束，此时可安全放宽标量 Global2Local：
+    // 只要全局标量不逃逸、仅由 main 直接 load/store，就允许跨块和
+    // 循环使用；随后立即 Mem2Reg，使循环状态成为 PHI。
+    MPM.addPass(createModuleFunctionBridge(Global2LocalPass(
+        /*RelaxScalarUses=*/true), FAM));
+    MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));
+    MPM.addPass(LateDeadGlobalCleanupPass());
     // Late DCE 仍可能删掉最后一个纯调用，最终再收一次，保证输出 IR 不残留死函数体。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
 

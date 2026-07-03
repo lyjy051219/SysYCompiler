@@ -231,11 +231,6 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 		// 6.1) 常规循环删除前检查循环级副作用
 		if (LoopSideEffect(*L, AA, LI, FAM)) continue;
 
-		// 6.1) SCEV 回边次数检查预留（SCEV 尚未实现，先注释）
-		// const auto& S = FAM.getResult<SCEVAnalysis>(F);
-		// auto BTC = S.getMaxBackedgeTakenCount(*L);
-		// if (!BTC.isComputed()) continue;
-
 		// 6.2) 执行删除（与 4.2 同逻辑）
 		if (PreHeader->Size() > 0) {
 			if (Instruction* OldTerm = PreHeader->back()) {

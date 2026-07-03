@@ -2918,7 +2918,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
         遍历循环体内的所有指令，进行循环级副作用分析，如果有副作用直接返回
 
-        DFS遍历这个循环，**获取SCEV分析结果当前循环的最大回边执行次数**，如果算不出来直接返回
+        DFS遍历这个循环
 
         经过上述检验的可以执行下述的删除
 
@@ -3338,29 +3338,9 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
   实现用**延迟删除集合**（`deleted`、`toDelete`）避免遍历中 delete 导致悬空指针。
 
   ```
-  for GEP in F.geps:
-      if GEP in deleted: continue
-      base = GEP.operand[0]
-      if base not GetElementPtrInst: continue
-      if base in deleted: continue
-      if countUses(base) > 1: continue        // 单 use 检查
-
-      firstIdx     = GEP.operand[1]
-      baseLastIdx  = base.operands.back()
-
-      if firstIdx is const(0):
-          newIndices = base.indices + GEP.indices[1:]
-          replaceGEPOperands(GEP, base.baseOp, newIndices)
-          toDelete.append(base); deleted.insert(base)
-      elif baseLastIdx is const(0):
-          newIndices = base.indices[:-1] + GEP.indices
-          replaceGEPOperands(...)
-      elif firstIdx is const(c1) and baseLastIdx is const(c2):
-          combined = base.indices[:-1] + [const(c1+c2)] + GEP.indices[1:]
-          if nonZeroCount(combined) <= 1:
-              replaceGEPOperands(...)
+  for GEP in F.geps:    if GEP in deleted: continue    base = GEP.operand[0]    if base not GetElementPt找出SCEV一共实现了几种rInst: continue    if base in deleted: continue    if countUses(base) > 1: continue        // 单 use 检查    firstIdx     = GEP.operand[1]    baseLastIdx  = base.operands.back()    if firstIdx is const(0):        newIndices = base.indices + GEP.indices[1:]        replaceGEPOperands(GEP, base.baseOp, newIndices)        toDelete.append(base); deleted.insert(base)    elif baseLastIdx is const(0):        newIndices = base.indices[:-1] + GEP.indices        replaceGEPOperands(...)    elif firstIdx is const(c1) and baseLastIdx is const(c2):        combined = base.indices[:-1] + [const(c1+c2)] + GEP.indices[1:]        if nonZeroCount(combined) <= 1:            replaceGEPOperands(...)
   ```
-
+  
 - **Part 2: PHI 中 GEP 提取**
 
   如果 PHI 的所有 incoming value 都是结构相同的 GEP（共享同一个 base，只在一个索引位置不同），把 GEP 提到 merge 块，不同的索引位置换成新 PHI：

@@ -1,5 +1,6 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/SCEV.hpp"
 
 #include <queue>
 #include <algorithm>
@@ -309,6 +310,13 @@ IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
                 runner = DT.getIDom(runner);
             }
         }
+
+        auto lIt = BlockLocalRanges.find(val);
+        if (lIt != BlockLocalRanges.end()) {
+            auto bIt = lIt->second.find(ctxBlock);
+            if (bIt != lIt->second.end())
+                range = range.intersectWith(bIt->second);
+        }
     }
 
     return range;
@@ -496,6 +504,7 @@ struct RangeSolver {
 
     // 上下文范围（条件分支收窄）
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>> ContextualRanges;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>> BlockLocalRanges;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, FloatRange>> FloatContextualRanges;
 
     // KnownBits：和 IntRange 并列的位级 lattice（forward/narrowing 语义
@@ -770,13 +779,12 @@ struct RangeSolver {
 
     // --- 指令访问者 ---
 
-    // SCEV 接口占位：当未来 SCEV pass 实现后，可以在这里先查询 SCEV
-    // 推断的循环归纳变量范围，作为 PHI 的优先结果。
-    // 目前 ScevInductions 永远为空，此分支不会命中。
-    std::unordered_map<Value *, LoopInductionInfo> *ScevInductions = nullptr;
+    // SCEV 接口占位：不在 visitPhi 中直接覆盖 global range。
+    // SCEV 事实只在 solve 尾部作为循环体 contextual range 写入，避免把
+    // header/exit 路径也误收窄。
+    const std::unordered_map<Value *, LoopInductionInfo> *ScevInductions = nullptr;
 
-    // 根据循环归纳变量信息推断范围
-    // 等 SCEV pass 接入后，这个函数会被实际使用
+    // 根据 SCEV 归纳变量信息推断活动迭代范围
     IntRange rangeFromInduction(const LoopInductionInfo &info) const {
         if (!info.hasUpperBound) return IntRange(); // Top
         if (info.step > 0)
@@ -784,6 +792,76 @@ struct RangeSolver {
         if (info.step < 0)
             return IntRange(info.upperBound, info.initial);
         return IntRange(info.initial);
+    }
+
+    std::vector<BasicBlock *> collectLoopBlocksForHint(const Loop *L) const {
+        std::vector<BasicBlock *> blocks;
+        std::vector<const Loop *> stack;
+        std::unordered_set<BasicBlock *> seen;
+        if (L) stack.push_back(L);
+
+        while (!stack.empty()) {
+            const Loop *cur = stack.back();
+            stack.pop_back();
+            if (!cur) continue;
+            for (BasicBlock *BB : cur->getBlocks()) {
+                if (BB && seen.insert(BB).second)
+                    blocks.push_back(BB);
+            }
+            for (Loop *sub : cur->getSubLoops()) {
+                if (sub) stack.push_back(sub);
+            }
+        }
+        return blocks;
+    }
+
+    bool isLoopExitingBlockForHint(const Loop *L, BasicBlock *BB) const {
+        if (!L || !BB || !L->contains(BB)) return false;
+        for (BasicBlock *Succ : BB->getSuccessors()) {
+            if (Succ && !L->contains(Succ))
+                return true;
+        }
+        return false;
+    }
+
+    void applySCEVContextHints(SCEVResult *SCEV) {
+        if (!SCEV) return;
+
+        const auto &inductions = SCEV->getLoopInductions();
+        ScevInductions = &inductions;
+
+        for (const auto &entry : inductions) {
+            Value *V = entry.first;
+            const LoopInductionInfo &info = entry.second;
+            if (!V || !info.RecLoop) continue;
+            if (!V->getIRType() || V->getIRType()->getEnum() != IR_INT) continue;
+
+            IntRange activeRange = rangeFromInduction(info);
+            if (activeRange.isTop() || activeRange.isBottom()) continue;
+            if (activeRange.min < IntRange::I32_MIN ||
+                activeRange.max > IntRange::I32_MAX)
+                continue;
+
+            BasicBlock *header = info.RecLoop->getHeader();
+            for (BasicBlock *BB : collectLoopBlocksForHint(info.RecLoop)) {
+                // Header PHI can also take the first value that leaves the loop
+                // through the header condition, so the active-iteration range is
+                // intentionally limited to safe, non-exiting body blocks.
+                if (!BB || BB == header) continue;
+                if (isLoopExitingBlockForHint(info.RecLoop, BB)) continue;
+
+                IntRange cur = IntRange();
+                auto it = BlockLocalRanges.find(V);
+                if (it != BlockLocalRanges.end()) {
+                    auto bit = it->second.find(BB);
+                    if (bit != it->second.end())
+                        cur = bit->second;
+                }
+                IntRange narrowed = cur.intersectWith(activeRange);
+                if (!narrowed.isBottom())
+                    BlockLocalRanges[V][BB] = narrowed;
+            }
+        }
     }
 
     void visitPhi(PhiInst *Phi) {
@@ -1664,7 +1742,7 @@ struct RangeSolver {
 
     // --- 主求解入口 ---
 
-    RangeInfo solve(Function &F) {
+    RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr) {
         CurFunc = &F;
 
         // Step 1: Forward 不动点（widening）
@@ -1681,14 +1759,21 @@ struct RangeSolver {
         // Step 3: Narrowing（backward constraint propagation）
         runNarrowing(F);
 
+        // Step 4: 用 SCEV 证明出的有限归纳变量范围补充循环体上下文信息。
+        // 只写 non-header loop blocks，保留 header/exit 判断的保守性。
+        applySCEVContextHints(SCEV);
+
         // Step 5: 构建结果
         RangeInfo info;
         info.GlobalRanges = std::move(ValueRanges);
         info.ContextualRanges = std::move(ContextualRanges);
+        info.BlockLocalRanges = std::move(BlockLocalRanges);
         info.FloatGlobalRanges = std::move(FloatValueRanges);
         info.FloatContextualRanges = std::move(FloatContextualRanges);
         info.GlobalBits = std::move(ValueBits);
         info.ContextualBits = std::move(ContextualBits);
+        if (ScevInductions)
+            info.LoopInductions = *ScevInductions;
         return info;
     }
 };
@@ -1703,6 +1788,7 @@ PassID RangeAnalysis::Key;
 
 RangeAnalysis::Result RangeAnalysis::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) const {
+    auto &SCEV = FAM.getResult<SCEVAnalysis>(F);
     RangeSolver solver;
-    return solver.solve(F);
+    return solver.solve(F, &SCEV);
 }
