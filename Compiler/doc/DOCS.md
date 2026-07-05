@@ -2926,6 +2926,411 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 
 
+##### LoopUnroll循环展开
+
+依赖的AnalysisPass：LoopInfo，SCEV
+
+实现了四种展开形式：
+
+1. Fully Unroll完全展开
+2. Partial Unroll部分展开
+3. Runtime Unroll运行时展开
+4. Peeling循环剥离
+
+本来还想实现Bounded Unroll，但是发现测试样例中没有和其匹配的循环形式，所以就直接放弃了
+
+- 算法流程：函数级Pass
+
+  1. 先拿到LoopInfo，如果拿不到就直接返回（没LoopInfo就是没循环）
+  2. 前置需要运行的Transform Pass：需要在LoopSimplify，LCSSA后面进行运行，即检查是否符合LoopSimplify以及LCSSA形式
+  3. 主循环：对每个Loop进行while(!Worklist.empty())循环
+  4. 最后按照pass具体执行情况决定保留哪些AnalysisPass
+
+  - 主循环：
+
+    1. 收益模型
+
+    2. #### 1. 外层循环：按照展开因子复制循环体
+
+       对于展开因子为 `Count` 的循环，原始循环体本身可以看作第 0 份，因此执行层只需要额外复制 `Count - 1` 份循环体。外层循环从第 1 份开始，到第 `Count - 1` 份结束。
+
+       其整体流程如下：
+
+       ```
+       for i = 1 to Count - 1:
+           创建当前展开副本的 BasicBlock 映射表
+           创建当前展开副本的 Instruction / Value 映射表
+           遍历原循环中的所有 BasicBlock
+           复制当前 BasicBlock
+           复制其中的指令
+           记录旧 BasicBlock 到新 BasicBlock 的映射
+           记录旧 Instruction 到新 Instruction 的映射
+           修复当前副本中的 PHI 和操作数引用
+           记录当前副本的 Header 和 Latch
+           记录当前副本中可能跳出循环的 ExitingBlock
+       ```
+
+       这里从 `1` 开始复制，是因为第 0 份循环体就是原循环本身。例如展开因子为 4 时，最终执行效果相当于：
+
+       ```
+       原循环体       -> 第 0 份
+       复制出的副本 1 -> 第 1 份
+       复制出的副本 2 -> 第 2 份
+       复制出的副本 3 -> 第 3 份
+       ```
+
+       复制完成后，执行层会将每一份循环体串联起来，使第 0 份的 latch 跳到第 1 份的 header，第 1 份的 latch 跳到第 2 份的 header，直到最后一份 latch 再跳回原 header，形成新的部分展开循环结构。
+
+       #### 2. 内层循环：复制当前副本中的 BasicBlock
+
+       在每一轮外层循环中，内层循环会按照循环块的 CFG 顺序遍历原循环中的所有 BasicBlock，并为当前展开副本复制对应的新 BasicBlock。
+
+       其主要流程如下：
+
+       ```
+       for BB in LoopBlocks:
+           NewBB = cloneBasicBlock(BB)
+           将 NewBB 插入到函数中
+           记录 BMap[BB][i] = NewBB
+       
+           for Inst in BB:
+               NewInst = cloneInstruction(Inst)
+               将 NewInst 插入 NewBB
+               记录 IMap[Inst][i] = NewInst
+       ```
+
+       其中，`BMap` 用于记录原基本块和新基本块之间的映射关系，`IMap` 用于记录原指令和新指令之间的映射关系。后续修复 CFG 边、PHI 节点和指令操作数时，都需要依赖这两个映射表。
+
+       复制 basic block 时，不能只简单复制指令，还需要处理 SSA 关系。因为 clone 出来的指令一开始可能仍然引用原循环中的值，需要在复制完成后将这些 operand 替换成当前展开副本中对应的新值。
+
+       #### 3. Header PHI 的特殊处理
+
+       循环 header 中通常包含归纳变量或 loop-carried value 的 PHI 节点，例如：
+
+       ```
+       i = phi [init, preheader], [i.next, latch]
+       ```
+
+       在展开后的第 1 份、第 2 份等副本中，header 的 PHI 不能直接保留。原因是每个 clone 出来的 header 实际上只会从上一份循环体的 latch 进入，因此这些 PHI 可以被上一份循环体计算出的回边值替代。
+
+       因此，对于 clone 出来的 header block，需要执行以下处理：
+
+       ```
+       如果当前复制的是 Header:
+           遍历原 Header 中的所有 PHI
+           找到该 PHI 从原 Latch 传入的 incoming value
+           如果当前不是第 1 份副本，则将 incoming value 替换成上一份副本中的对应值
+           在当前副本中，用这个 incoming value 替换 clone 出来的 PHI
+           删除 clone 出来的 PHI
+       ```
+
+       例如部分展开 4 倍时，原本的回边值是：
+
+       ```
+       i.next
+       ```
+
+       展开后，最后回到原 header 的值应该变成：
+
+       ```
+       i.next.3
+       ```
+
+       也就是第 3 份展开副本中计算出的归纳变量更新值。
+
+       因此，Header PHI 修复是循环展开中最核心的 SSA 修复步骤之一。
+
+       #### 4. 操作数重映射
+
+       复制完当前展开副本的所有 BasicBlock 和 Instruction 后，需要统一修复 clone 指令中的操作数引用。
+
+       其流程如下：
+
+       ```
+       for NewInst in 当前展开副本:
+           for Operand in NewInst:
+               如果 Operand 是原循环中的值:
+                   将 Operand 替换为当前副本或上一副本中的对应新值
+       ```
+
+       例如原循环中有：
+
+       ```
+       x = add i, 1
+       ```
+
+       复制到第 1 份副本后，应该变成：
+
+       ```
+       x.1 = add i.1, 1
+       ```
+
+       而不是继续引用原来的 `i`。这个过程依赖前面维护的 `IMap` 或 `LastValueMap`。
+
+       其中，`LastValueMap` 的作用是记录“某个原始值目前最新的一份展开副本中的对应值”。它对于多份展开副本之间传递 loop-carried value 非常重要。
+
+       #### 5. Exit PHI 的修复
+
+       如果原循环中的某个 basic block 会跳出循环，那么它的 clone 版本也可能跳出循环。此时，exit block 中的 PHI 节点需要新增来自 clone block 的 incoming value。
+
+       其流程如下：
+
+       ```
+       for Succ in BB.successors:
+           if Succ 不在当前循环中:
+               for Phi in Succ.phis:
+                   找到 Phi 中原来来自 BB 的 incoming value
+                   如果该 incoming value 在当前副本中有新值，则替换为新值
+                   给 Phi 添加 [new incoming value, NewBB]
+       ```
+
+       例如原来 exit block 中有：
+
+       ```
+       x.lcssa = phi [x, exiting]
+       ```
+
+       展开后需要变成：
+
+       ```
+       x.lcssa = phi [x, exiting],
+                     [x.1, exiting.1],
+                     [x.2, exiting.2],
+                     [x.3, exiting.3]
+       ```
+
+       如果不修复 exit PHI，循环外使用循环内定义值时，SSA 形式就会被破坏。
+
+       #### 6. 记录 Header、Latch 和 ExitingBlock
+
+       在复制每一份循环体时，需要记录当前副本中的 header、latch 和 exiting block：
+
+       ```
+       如果当前复制的是 Header:
+           Headers.push_back(NewBB)
+       
+       如果当前复制的是 Latch:
+           Latches.push_back(NewBB)
+       
+       如果当前复制的是 ExitingBlock:
+           ExitingBlocks.push_back(NewBB)
+       ```
+
+       这些信息用于后续修复 CFG：
+
+       ```
+       Latch[0] -> Header[1]
+       Latch[1] -> Header[2]
+       ...
+       Latch[Count - 2] -> Header[Count - 1]
+       Latch[Count - 1] -> Header[0]
+       ```
+
+       也就是说，展开后的多份循环体会被串联成一个更大的循环体，最后一份 latch 再跳回原 header，继续下一轮展开后的循环迭代。
+
+       #### 7. 修复原 Header PHI
+
+       当所有副本复制完成后，还需要修复原 header 中的 PHI 节点。对于部分展开来说，原 header 仍然存在，但它的回边来源不再是原 latch，而是最后一份展开副本的 latch。
+
+       因此需要执行：
+
+       ```
+       for Phi in 原 Header.phis:
+           删除 Phi 中来自原 Latch 的 incoming
+           找到该 incoming value 在最后一份副本中的对应值
+           添加新的 incoming：
+               [最后一份副本中的对应值, 最后一份 Latch]
+       ```
+
+       例如：
+
+       ```
+       原来：
+       i = phi [0, preheader], [i.next, latch]
+       
+       展开 4 倍后：
+       i = phi [0, preheader], [i.next.3, latch.3]
+       ```
+
+       这样才能保证下一轮展开后的循环迭代从正确的归纳变量值继续执行。
+
+  #### 1. Full Unroll
+
+  Full Unroll 用于 Trip Count 是较小常量，并且循环可以被完全展开的情况。它会调用公共执行核心复制循环体，但在复制完成后不再保留原循环回边。
+
+  整体流程如下：
+
+  ```
+  executeFullUnroll:
+      1. 获取展开因子 Count，通常 Count 等于常量 Trip Count。
+      2. 调用 cloneUnrolledBodyCore(L, Count)，复制 Count - 1 份循环体。
+      3. 将第 0 份 latch 连接到第 1 份 header。
+      4. 将第 1 份 latch 连接到第 2 份 header。
+      5. 依次连接所有展开副本。
+      6. 最后一份 latch 不再跳回原 header，而是跳向原 exit block。
+      7. 删除原 header 中的 PHI。
+      8. 用来自 preheader 的初始值替换 header PHI 的所有使用。
+      9. 删除原循环回边。
+      10. 删除不可达循环控制块，或交给后续 SimplifyCFG / DCE 清理。
+      11. 标记 LoopInfo、DominatorTree、SCEV 等分析失效。
+      12. 返回 FullyUnrolled。
+  ```
+
+  Full Unroll 的关键特化点是：
+
+  ```
+  1. 最后一份 latch 不回到原 header。
+  2. 原 header PHI 被删除。
+  3. 原循环控制结构被消除。
+  4. 返回结果是 FullyUnrolled。
+  ```
+
+  #### 2. Partial Unroll
+
+  Partial Unroll 用于 Trip Count 可以被展开因子整除，或者至少当前策略决定不需要单独生成 remainder loop 的情况。它会调用公共执行核心复制循环体，并保留原循环结构。
+
+  整体流程如下：
+
+  ```
+  executePartialUnroll:
+      1. 获取展开因子 Count。
+      2. 调用 cloneUnrolledBodyCore(L, Count)，复制 Count - 1 份循环体。
+      3. 将第 0 份 latch 的回边从 Header0 改为 Header1。
+      4. 将第 1 份 latch 的回边从 Header1 改为 Header2。
+      5. 依次连接所有展开副本。
+      6. 将最后一份 latch 的回边改为 Header0。
+      7. 修复原 header 中的 PHI。
+      8. 删除原 header PHI 中来自原 latch 的 incoming。
+      9. 找到该 incoming value 在最后一份副本中的对应值。
+      10. 添加新的 incoming：[最后一份副本中的值, 最后一份 latch]。
+      11. 标记 LoopInfo、DominatorTree、SCEV 等分析失效。
+      12. 返回 PartiallyUnrolled。
+  ```
+
+  Partial Unroll 的关键特化点是：
+
+  ```
+  1. 最后一份 latch 仍然回到原 header。
+  2. 原 header PHI 保留。
+  3. 原 header PHI 的回边 incoming 改成最后一份副本产生的值。
+  4. 原循环仍然存在，只是循环体变大。
+  ```
+
+  例如：
+
+  ```
+  原来：
+  i = phi [0, preheader], [i.next, latch]
+  
+  展开 4 倍后：
+  i = phi [0, preheader], [i.next.3, latch.3]
+  ```
+
+  #### 3. Partial With Remainder
+
+  Partial With Remainder 用于 Trip Count 是常量，但不能被展开因子整除的情况。它会调用公共执行核心展开主循环，同时额外生成 remainder loop 处理剩余迭代。
+
+  整体流程如下：
+
+  ```
+  executePartialWithRemainder:
+      1. 获取展开因子 Count。
+      2. 通过 SCEV 获取 remainder 信息。
+      3. 计算 Remainder = TripCount % Count。
+      4. 计算 MainTripCount = TripCount - Remainder。
+      5. 修改主循环退出条件，使主循环只执行 MainTripCount 次。
+      6. 调用 cloneUnrolledBodyCore(L, Count)，复制主循环中的 Count - 1 份循环体。
+      7. 按 Partial Unroll 的方式连接主循环内部的 headers 和 latches。
+      8. 修复主循环原 header PHI，使其回边来自最后一份主循环副本。
+      9. 生成 remainder loop。
+      10. remainder loop 的初始归纳变量使用主循环结束后的归纳变量值。
+      11. remainder loop 使用原始循环边界作为退出条件。
+      12. 将主展开循环的 exit 连接到 remainder loop。
+      13. 将 remainder loop 的 exit 连接到原 exit block。
+      14. 修复 main loop、remainder loop 和原 exit block 之间的 PHI。
+      15. 标记 LoopInfo、DominatorTree、SCEV 等分析失效。
+      16. 返回 PartiallyUnrolled。
+  ```
+
+  Partial With Remainder 的关键特化点是：
+
+  ```
+  1. 公共核心只用于展开主循环。
+  2. 主循环执行 TripCount - Remainder 次。
+  3. 额外生成 remainder loop 执行剩余 Remainder 次。
+  4. 需要修复 main loop -> remainder loop -> exit 之间的 PHI。
+  ```
+
+  #### 4. Runtime Unroll
+
+  Runtime Unroll 用于 Trip Count 不是编译期常量，但 SCEV 能够表示运行时 Trip Count 的情况。它会先生成运行时主循环边界和 remainder 逻辑，然后调用公共执行核心展开主循环。
+
+  整体流程如下：
+
+  ```
+  executeRuntimeUnroll:
+      1. 获取展开因子 Count。
+      2. 通过 SCEV 获取运行时 TripCount 表达式。
+      3. 将 TripCount 表达式物化为 IR Value。
+      4. 生成 Remainder = TripCount % Count。
+      5. 生成 MainTripCount = TripCount - Remainder。
+      6. 生成 runtime guard：
+           如果 TripCount < Count，则直接跳到 remainder loop；
+           否则进入主展开循环。
+      7. 修改主循环退出条件，使主循环只执行 MainTripCount 次。
+      8. 调用 cloneUnrolledBodyCore(L, Count)，复制主循环中的 Count - 1 份循环体。
+      9. 按 Partial Unroll 的方式连接主循环内部的 headers 和 latches。
+      10. 修复主循环原 header PHI，使其回边来自最后一份主循环副本。
+      11. 生成 runtime remainder loop。
+      12. remainder loop 从主循环结束后的归纳变量值开始执行。
+      13. remainder loop 使用原始循环边界作为退出条件。
+      14. 将主循环 exit 连接到 remainder loop。
+      15. 将 remainder loop exit 连接到原 exit block。
+      16. 修复 guard、main loop、remainder loop 和 exit block 之间的 PHI。
+      17. 标记 LoopInfo、DominatorTree、SCEV 等分析失效。
+      18. 返回 PartiallyUnrolled。
+  ```
+
+  Runtime Unroll 的关键特化点是：
+
+  ```
+  1. 公共核心只用于展开主循环。
+  2. TripCount、Remainder、MainTripCount 都需要在运行时生成 IR 计算。
+  3. 需要额外生成 runtime guard。
+  4. 需要生成 runtime remainder loop。
+  5. 返回结果仍然是 PartiallyUnrolled。
+  ```
+
+  #### 5. 调用关系总结
+
+  ```
+  executeFullUnroll
+      -> cloneUnrolledBodyCore
+      -> full CFG 收尾
+  
+  executePartialUnroll
+      -> cloneUnrolledBodyCore
+      -> partial CFG 收尾
+  
+  executePartialWithRemainder
+      -> 修改主循环边界
+      -> cloneUnrolledBodyCore
+      -> 生成 remainder loop
+      -> 修复 PHI
+  
+  executeRuntimeUnroll
+      -> 物化 runtime TripCount
+      -> 生成 runtime guard
+      -> 修改主循环边界
+      -> cloneUnrolledBodyCore
+      -> 生成 runtime remainder loop
+      -> 修复 PHI
+  ```
+
+- 运行完之后需要运行我们的清理类pipeline进行深度清理
+
+
+
 ##### ADCE--激进死代码消除
 
 依赖 AnalysisPass：PostDominant，SideEffect
@@ -3937,8 +4342,6 @@ todo：浮点 wrapper 的实际收益依赖后端对 `ConstFloat` use 的 loweri
 
 
 https://gemini.google.com/app/2937246d3292e3d5
-
-
 
 
 

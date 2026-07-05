@@ -50,6 +50,7 @@ static const char *kindName(SCEVExprKind K) {
     case SCEVExprKind::Sub: return "sub";
     case SCEVExprKind::Mul: return "mul";
     case SCEVExprKind::Div: return "div";
+    case SCEVExprKind::Mod: return "mod";
     case SCEVExprKind::Min: return "min";
     case SCEVExprKind::Max: return "max";
     case SCEVExprKind::Cast: return "cast";
@@ -344,6 +345,17 @@ const SCEVExpr *SCEVResult::div(const SCEVExpr *L, const SCEVExpr *R) {
     return makeBinary(SCEVExprKind::Div, L, R);
 }
 
+const SCEVExpr *SCEVResult::mod(const SCEVExpr *L, const SCEVExpr *R) {
+    if (!L || !R) return nullptr;
+    if (R->isConstant(0)) return nullptr;
+    if (L->isConstant(0)) return makeConstant(0, L->Ty ? L->Ty : R->Ty);
+    if (auto LC = asConstant(L)) {
+        if (auto RC = asConstant(R))
+            return makeConstant(*LC % *RC, L->Ty ? L->Ty : R->Ty);
+    }
+    return makeBinary(SCEVExprKind::Mod, L, R);
+}
+
 const SCEVExpr *SCEVResult::getSCEV(Value *V) {
     if (!V) return nullptr;
     auto It = ValueCache.find(V);
@@ -409,6 +421,8 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
     case BinaryInst::MUL: return mul(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::DIV:
     case BinaryInst::UDIV: return div(getSCEV(LHS), getSCEV(RHS));
+    case BinaryInst::MOD:
+    case BinaryInst::UREM: return mod(getSCEV(LHS), getSCEV(RHS));
     default: break;
     }
     return makeUnknown(BI);
@@ -558,6 +572,24 @@ bool SCEVResult::isLoopInvariant(Value *V, const Loop *L) const {
     return !BB || !L->contains(BB);
 }
 
+bool SCEVResult::isLoopInvariantExpr(const SCEVExpr *E,
+                                     const Loop *L) const {
+    if (!E || !L) return true;
+    if (isRecKind(E->Kind) && E->RecLoop == L) return false;
+    if (E->Kind == SCEVExprKind::Unknown)
+        return isLoopInvariant(E->RawValue, L);
+    for (const SCEVExpr *Op : E->Operands)
+        if (!isLoopInvariantExpr(Op, L)) return false;
+    return true;
+}
+
+bool SCEVResult::isDirectLoopBlock(const Loop *L, BasicBlock *BB) const {
+    if (!L || !BB) return false;
+    if (LI) return LI->getLoopFor(BB) == L;
+    const auto &Blocks = L->getBlocks();
+    return std::find(Blocks.begin(), Blocks.end(), BB) != Blocks.end();
+}
+
 const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
     Value *Cond = operand(Sel, 0);
     Value *TrueV = operand(Sel, 1);
@@ -683,6 +715,20 @@ std::vector<BasicBlock *> SCEVResult::collectLoopBlocks(const Loop *L) const {
     return Blocks;
 }
 
+std::vector<BasicBlock *>
+SCEVResult::collectDirectLoopBlocks(const Loop *L) const {
+    std::vector<BasicBlock *> Blocks;
+    if (!L) return Blocks;
+
+    for (BasicBlock *BB : L->getBlocks()) {
+        if (!BB) continue;
+        if (LI && LI->getLoopFor(BB) != L) continue;
+        Blocks.push_back(BB);
+    }
+
+    return Blocks;
+}
+
 BinaryInst::Operation SCEVResult::invertPredicate(BinaryInst::Operation Op) const {
     switch (Op) {
     case BinaryInst::E: return BinaryInst::NE;
@@ -709,9 +755,12 @@ const SCEVExpr *SCEVResult::getTripCount(const Loop *L) {
     if (!L) return nullptr;
     auto It = TripCountCache.find(L);
     if (It != TripCountCache.end()) return It->second;
-    const SCEVExpr *TC = computeTripCount(L);
-    if (TC) TripCountCache[L] = TC;
-    return TC;
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info || !Info->TripCount) return nullptr;
+    TripCountCache[L] = Info->TripCount;
+    if (Info->BackedgeTakenCount)
+        BackedgeCountCache[L] = Info->BackedgeTakenCount;
+    return Info->TripCount;
 }
 
 const SCEVExpr *SCEVResult::getBackedgeTakenCount(const Loop *L) {
@@ -719,80 +768,128 @@ const SCEVExpr *SCEVResult::getBackedgeTakenCount(const Loop *L) {
     auto It = BackedgeCountCache.find(L);
     if (It != BackedgeCountCache.end()) return It->second;
 
-    const SCEVExpr *TC = getTripCount(L);
-    if (!TC) return nullptr;
-
-    const SCEVExpr *BE = nullptr;
-    if (auto C = asConstant(TC)) {
-        BE = makeConstant(*C <= 0 ? 0 : *C - 1, TC->Ty);
-    } else {
-        BE = makeBinary(SCEVExprKind::Max, makeConstant(0, TC->Ty),
-                        sub(TC, makeConstant(1, TC->Ty)), TC->Ty);
-    }
-    BackedgeCountCache[L] = BE;
-    return BE;
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info || !Info->BackedgeTakenCount) return nullptr;
+    if (Info->TripCount) TripCountCache[L] = Info->TripCount;
+    BackedgeCountCache[L] = Info->BackedgeTakenCount;
+    return Info->BackedgeTakenCount;
 }
 
 const SCEVExpr *SCEVResult::computeTripCount(const Loop *L) {
-    BasicBlock *Exiting = nullptr;
-    bool ContinueOnTrue = true;
-
-    for (BasicBlock *BB : collectLoopBlocks(L)) {
-        auto *Br = BB ? BB->getBranchTerminator() : nullptr;
-        if (!BasicBlock::isCondBr(Br)) continue;
-        auto &Ops = Br->getUserList();
-        BasicBlock *TrueBB = dynamic_cast<BasicBlock *>(Ops[1]->getValue());
-        BasicBlock *FalseBB = dynamic_cast<BasicBlock *>(Ops[2]->getValue());
-        bool TrueIn = TrueBB && L->contains(TrueBB);
-        bool FalseIn = FalseBB && L->contains(FalseBB);
-        if (TrueIn == FalseIn) continue;
-        if (Exiting && Exiting != BB) return nullptr;
-        Exiting = BB;
-        ContinueOnTrue = TrueIn;
-    }
-
-    if (!Exiting) return nullptr;
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Latch = nullptr;
-    if (L->getLoopSimplifyForm(PreHeader, Latch) && DT &&
-        !DT->dominates(Exiting, Latch)) {
-        return nullptr;
-    }
-
-    auto *Br = Exiting->getBranchTerminator();
-    Value *Cond = operand(Br, 0);
-    auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
-    if (!Cmp || !isCmpOp(Cmp->getOp())) return nullptr;
-    return tripFromComparison(L, Cmp, ContinueOnTrue);
+    auto Info = analyzeLoopTripCount(L);
+    return Info ? Info->TripCount : nullptr;
 }
 
 const SCEVExpr *SCEVResult::tripFromComparison(const Loop *L, BinaryInst *Cmp,
                                                bool ContinueOnTrue) {
-    BinaryInst::Operation Pred = ContinueOnTrue ? Cmp->getOp()
-                                                : invertPredicate(Cmp->getOp());
+    LoopTripCountInfo Info;
+    Info.L = L;
+    Info.ExitCmp = Cmp;
+    Info.ContinueOnTrue = ContinueOnTrue;
+    if (!fillTripCountFromComparison(Info)) return nullptr;
+    return Info.TripCount;
+}
+
+std::optional<LoopTripCountInfo>
+SCEVResult::analyzeLoopTripCount(const Loop *L) {
+    if (!L) return std::nullopt;
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch)) return std::nullopt;
+    BasicBlock *Header = L->getHeader();
+    if (!PreHeader || !Header || !Latch) return std::nullopt;
+
+    LoopTripCountInfo Info;
+    Info.L = L;
+    Info.PreHeader = PreHeader;
+    Info.Header = Header;
+    Info.Latch = Latch;
+
+    for (BasicBlock *BB : collectDirectLoopBlocks(L)) {
+        if (!BB) continue;
+
+        bool HasOutsideSucc = false;
+        for (BasicBlock *Succ : BB->getSuccessors()) {
+            if (Succ && !L->contains(Succ)) {
+                HasOutsideSucc = true;
+                break;
+            }
+        }
+        if (!HasOutsideSucc) continue;
+
+        if (Info.ExitingBlock && Info.ExitingBlock != BB)
+            return std::nullopt;
+
+        auto *Br = BB->getBranchTerminator();
+        if (!BasicBlock::isCondBr(Br)) return std::nullopt;
+        auto &Ops = Br->getUserList();
+        if (Ops.size() < 3 || !Ops[1] || !Ops[2]) return std::nullopt;
+
+        BasicBlock *TrueBB = dynamic_cast<BasicBlock *>(Ops[1]->getValue());
+        BasicBlock *FalseBB = dynamic_cast<BasicBlock *>(Ops[2]->getValue());
+        bool TrueIn = TrueBB && L->contains(TrueBB);
+        bool FalseIn = FalseBB && L->contains(FalseBB);
+        if (TrueIn == FalseIn) return std::nullopt;
+
+        BasicBlock *ThisExit = TrueIn ? FalseBB : TrueBB;
+        if (!ThisExit || L->contains(ThisExit)) return std::nullopt;
+        if (Info.ExitBlock && Info.ExitBlock != ThisExit)
+            return std::nullopt;
+
+        Info.ExitingBlock = BB;
+        Info.ExitBlock = ThisExit;
+        Info.ContinueOnTrue = TrueIn;
+    }
+
+    if (!Info.ExitingBlock) return std::nullopt;
+    if (DT && !DT->dominates(Info.ExitingBlock, Latch)) return std::nullopt;
+
+    auto *Br = Info.ExitingBlock->getBranchTerminator();
+    Value *Cond = operand(Br, 0);
+    auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
+    if (!Cmp || !isCmpOp(Cmp->getOp())) return std::nullopt;
+
+    Info.ExitCmp = Cmp;
+    if (!fillTripCountFromComparison(Info)) return std::nullopt;
+    Info.Valid = true;
+    return Info;
+}
+
+bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
+    const Loop *L = Info.L;
+    BinaryInst *Cmp = Info.ExitCmp;
+    if (!L || !Cmp) return false;
+
+    BinaryInst::Operation Pred = Info.ContinueOnTrue ? Cmp->getOp()
+                                                     : invertPredicate(Cmp->getOp());
     Value *LHSVal = operand(Cmp, 0);
     Value *RHSVal = operand(Cmp, 1);
-    if (!LHSVal || !RHSVal) return nullptr;
+    if (!LHSVal || !RHSVal) return false;
 
     const SCEVExpr *LHS = getSCEV(LHSVal);
     const SCEVExpr *RHS = getSCEV(RHSVal);
     auto Affine = getAffine(LHS);
 
-    if ((!Affine || Affine->RecLoop != L) && !mentionsLoop(LHS, L)) {
+    if (!Affine || Affine->RecLoop != L) {
+        if (!isLoopInvariantExpr(LHS, L)) return false;
         auto RHSAffine = getAffine(RHS);
         if (RHSAffine && RHSAffine->RecLoop == L) {
             std::swap(LHS, RHS);
             std::swap(LHSVal, RHSVal);
             Pred = swapPredicate(Pred);
             Affine = RHSAffine;
+        } else {
+            return false;
         }
     }
 
-    if (!Affine || Affine->RecLoop != L) return nullptr;
-    if (mentionsLoop(RHS, L)) return nullptr;
+    if (!Affine || Affine->RecLoop != L) return false;
+    if (!isLoopInvariantExpr(RHS, L)) return false;
 
     auto StepC = Affine->ConstantStep;
-    if (!StepC || *StepC == 0) return nullptr;
+    if (!StepC || *StepC == 0) return false;
+    if (*StepC == std::numeric_limits<int64_t>::min()) return false;
 
     const SCEVExpr *Start = Affine->Start;
     const SCEVExpr *Bound = RHS;
@@ -802,19 +899,19 @@ const SCEVExpr *SCEVResult::tripFromComparison(const Loop *L, BinaryInst *Cmp,
 
     switch (Pred) {
     case BinaryInst::L:
-        if (Step <= 0) return nullptr;
+        if (Step <= 0) return false;
         Distance = sub(Bound, Start);
         break;
     case BinaryInst::LE:
-        if (Step <= 0) return nullptr;
+        if (Step <= 0) return false;
         Distance = sub(add(Bound, makeConstant(1, Bound->Ty)), Start);
         break;
     case BinaryInst::G:
-        if (Step >= 0) return nullptr;
+        if (Step >= 0) return false;
         Distance = sub(Start, Bound);
         break;
     case BinaryInst::GE:
-        if (Step >= 0) return nullptr;
+        if (Step >= 0) return false;
         Distance = sub(Start, sub(Bound, makeConstant(1, Bound->Ty)));
         break;
     case BinaryInst::NE:
@@ -822,20 +919,300 @@ const SCEVExpr *SCEVResult::tripFromComparison(const Loop *L, BinaryInst *Cmp,
         else Distance = sub(Start, Bound);
         break;
     default:
-        return nullptr;
+        return false;
     }
 
-    if (auto D = asConstant(Distance))
-        return makeConstant(ceilDivPositive(*D, AbsStep), Distance->Ty);
+    if (!Distance) return false;
 
-    const SCEVExpr *Raw = nullptr;
-    if (AbsStep == 1) {
-        Raw = Distance;
+    const SCEVExpr *TC = nullptr;
+    if (auto D = asConstant(Distance)) {
+        if (Pred == BinaryInst::NE) {
+            if (*D < 0 || (*D % AbsStep) != 0) return false;
+            TC = makeConstant(*D / AbsStep, Distance->Ty);
+        } else {
+            TC = makeConstant(ceilDivPositive(*D, AbsStep), Distance->Ty);
+        }
     } else {
-        Raw = div(add(Distance, makeConstant(AbsStep - 1, Distance->Ty)),
-                  makeConstant(AbsStep, Distance->Ty));
+        // For !=, a runtime distance is only safe if exact reachability can be
+        // proven.  This compact SCEV does not do symbolic divisibility proofs.
+        if (Pred == BinaryInst::NE) return false;
+
+        const SCEVExpr *Raw = nullptr;
+        if (AbsStep == 1) {
+            Raw = Distance;
+        } else {
+            Raw = div(add(Distance, makeConstant(AbsStep - 1, Distance->Ty)),
+                      makeConstant(AbsStep, Distance->Ty));
+        }
+        if (!Raw) return false;
+        TC = makeBinary(SCEVExprKind::Max, makeConstant(0, Raw->Ty), Raw, Raw->Ty);
     }
-    return makeBinary(SCEVExprKind::Max, makeConstant(0, Raw->Ty), Raw, Raw->Ty);
+
+    if (!TC) return false;
+
+    // A latch test observes the value after the current iteration.  The
+    // comparison therefore counts taken backedges, while TripCount includes
+    // the first iteration that reached the latch.
+    if (Info.ExitingBlock && Info.ExitingBlock != Info.Header) {
+        TC = add(TC, makeConstant(1, TC->Ty));
+        if (!TC) return false;
+    }
+
+    Info.Start = Start;
+    Info.Step = Affine->Step;
+    Info.Bound = Bound;
+    Info.TripCount = TC;
+    Info.ConstantTripCount = asConstant(TC);
+    Info.IsRuntime = !Info.ConstantTripCount.has_value();
+    Info.MayBeZeroTrip = !Info.ConstantTripCount || *Info.ConstantTripCount == 0;
+    Info.IndVar = findPhiForAffineRec(L, *Affine);
+
+    if (Info.ConstantTripCount) {
+        int64_t BE = *Info.ConstantTripCount <= 0 ? 0 : *Info.ConstantTripCount - 1;
+        Info.BackedgeTakenCount = makeConstant(BE, TC->Ty);
+        Info.ConstantBackedgeTakenCount = BE;
+    } else {
+        Info.BackedgeTakenCount =
+            makeBinary(SCEVExprKind::Max, makeConstant(0, TC->Ty),
+                       sub(TC, makeConstant(1, TC->Ty)), TC->Ty);
+        Info.ConstantBackedgeTakenCount = asConstant(Info.BackedgeTakenCount);
+    }
+
+    return Info.BackedgeTakenCount != nullptr;
+}
+
+PhiInst *SCEVResult::findPhiForAddRec(const Loop *L,
+                                      const SCEVExpr *AddRec) {
+    if (!L || !AddRec || AddRec->Kind != SCEVExprKind::AddRec)
+        return nullptr;
+    BasicBlock *Header = L->getHeader();
+    if (!Header) return nullptr;
+
+    PhiInst *Found = nullptr;
+    for (Instruction *I : *Header) {
+        auto *Phi = dynamic_cast<PhiInst *>(I);
+        if (!Phi) break;
+        const SCEVExpr *PhiSCEV = getSCEV(Phi);
+        if (!sameExpr(PhiSCEV, AddRec)) continue;
+        if (Found && Found != Phi) return nullptr;
+        Found = Phi;
+    }
+    return Found;
+}
+
+PhiInst *SCEVResult::findPhiForAffineRec(const Loop *L,
+                                         const SCEVAffineInfo &Affine) {
+    if (!L) return nullptr;
+
+    BasicBlock *Header = L->getHeader();
+    if (!Header) return nullptr;
+
+    PhiInst *Found = nullptr;
+    for (Instruction *I : *Header) {
+        auto *Phi = dynamic_cast<PhiInst *>(I);
+        if (!Phi) break;
+
+        auto PhiAff = getAffine(Phi);
+        if (!PhiAff || PhiAff->RecLoop != L) continue;
+
+        // Match the canonical header PHI for expressions such as i + c by
+        // requiring the same step and rejecting ambiguous same-step PHIs.
+        if (!sameExpr(PhiAff->Step, Affine.Step)) continue;
+        if (Found && Found != Phi) return nullptr;
+        Found = Phi;
+    }
+
+    return Found;
+}
+
+std::optional<int64_t>
+SCEVResult::getSmallConstantTripCount(const Loop *L) {
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info) return std::nullopt;
+    return Info->ConstantTripCount;
+}
+
+std::optional<int64_t>
+SCEVResult::getSmallConstantBackedgeTakenCount(const Loop *L) {
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info) return std::nullopt;
+    return Info->ConstantBackedgeTakenCount;
+}
+
+std::optional<int64_t>
+SCEVResult::getSmallConstantTripMultiple(const Loop *L) {
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info) return std::nullopt;
+    if (!Info->ConstantTripCount) return 1;
+
+    int64_t C = *Info->ConstantTripCount;
+    if (C == 0) return 1;
+    if (C == std::numeric_limits<int64_t>::min()) return std::nullopt;
+    return C < 0 ? -C : C;
+}
+
+bool SCEVResult::isTripCountMultipleOf(const Loop *L, int64_t Factor) {
+    if (Factor <= 0) return false;
+    auto Info = analyzeLoopTripCount(L);
+    if (!Info || !Info->ConstantTripCount) return false;
+    return (*Info->ConstantTripCount % Factor) == 0;
+}
+
+std::optional<LoopRemainderInfo>
+SCEVResult::getRemainderInfo(const Loop *L, int64_t Factor) {
+    if (!L || Factor <= 1) return std::nullopt;
+    auto TCInfo = analyzeLoopTripCount(L);
+    if (!TCInfo || !TCInfo->TripCount) return std::nullopt;
+
+    LoopRemainderInfo Info;
+    Info.L = L;
+    Info.Factor = Factor;
+    Info.TripCount = TCInfo->TripCount;
+    Info.ConstantTripCount = TCInfo->ConstantTripCount;
+
+    if (Info.ConstantTripCount) {
+        int64_t Rem = *Info.ConstantTripCount % Factor;
+        int64_t Main = *Info.ConstantTripCount - Rem;
+        Info.RemainderCount = makeConstant(Rem, Info.TripCount->Ty);
+        Info.MainTripCount = makeConstant(Main, Info.TripCount->Ty);
+        Info.ConstantRemainderCount = Rem;
+        Info.ConstantMainTripCount = Main;
+        Info.NeedRemainderLoop = Rem != 0;
+        Info.IsRuntimeRemainder = false;
+        Info.Valid = Info.RemainderCount && Info.MainTripCount;
+        return Info.Valid ? std::optional<LoopRemainderInfo>(Info) : std::nullopt;
+    }
+
+    const SCEVExpr *FactorExpr = makeConstant(Factor, Info.TripCount->Ty);
+    Info.RemainderCount = mod(Info.TripCount, FactorExpr);
+    Info.MainTripCount = sub(Info.TripCount, Info.RemainderCount);
+    if (!Info.RemainderCount || !Info.MainTripCount) return std::nullopt;
+
+    Info.NeedRemainderLoop = true;
+    Info.IsRuntimeRemainder = true;
+    Info.Valid = true;
+    return Info;
+}
+
+std::optional<InductionDescriptor>
+SCEVResult::getCanonicalInduction(const Loop *L) {
+    auto TCInfo = analyzeLoopTripCount(L);
+    if (!TCInfo || !TCInfo->IndVar) return std::nullopt;
+
+    PhiInst *Phi = TCInfo->IndVar;
+    Value *StartValue = nullptr;
+    Value *UpdateValue = nullptr;
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        Value *V = Phi->getIncomingValue(I);
+        BasicBlock *Pred = Phi->getIncomingBlock(I);
+        if (!V || !Pred) return std::nullopt;
+        if (L->contains(Pred)) {
+            if (UpdateValue && UpdateValue != V) return std::nullopt;
+            UpdateValue = V;
+        } else {
+            if (StartValue && StartValue != V) return std::nullopt;
+            StartValue = V;
+        }
+    }
+
+    if (!StartValue || !UpdateValue) return std::nullopt;
+
+    auto PhiAff = getAffine(Phi);
+    if (!PhiAff || PhiAff->RecLoop != L) return std::nullopt;
+
+    InductionDescriptor Desc;
+    Desc.Phi = Phi;
+    Desc.L = L;
+    Desc.StartValue = StartValue;
+    Desc.UpdateValue = UpdateValue;
+    Desc.Start = PhiAff->Start;
+    Desc.Step = PhiAff->Step;
+    Desc.ConstantStart = PhiAff->ConstantStart;
+    Desc.ConstantStep = PhiAff->ConstantStep;
+    Desc.Valid = Desc.Start && Desc.Step;
+    return Desc.Valid ? std::optional<InductionDescriptor>(Desc) : std::nullopt;
+}
+
+const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
+                                               const SCEVExpr *Iter,
+                                               const Loop *L) {
+    if (!E) return nullptr;
+
+    switch (E->Kind) {
+    case SCEVExprKind::Constant:
+    case SCEVExprKind::Unknown:
+        return E;
+    case SCEVExprKind::Add:
+    case SCEVExprKind::Sub:
+    case SCEVExprKind::Mul:
+    case SCEVExprKind::Div:
+    case SCEVExprKind::Mod:
+    case SCEVExprKind::Min:
+    case SCEVExprKind::Max: {
+        if (E->Operands.size() != 2) return nullptr;
+        const SCEVExpr *LHS = getSCEVAtIteration(E->Operands[0], Iter, L);
+        const SCEVExpr *RHS = getSCEVAtIteration(E->Operands[1], Iter, L);
+        if (!LHS || !RHS) return nullptr;
+        switch (E->Kind) {
+        case SCEVExprKind::Add: return add(LHS, RHS);
+        case SCEVExprKind::Sub: return sub(LHS, RHS);
+        case SCEVExprKind::Mul: return mul(LHS, RHS);
+        case SCEVExprKind::Div: return div(LHS, RHS);
+        case SCEVExprKind::Mod: return mod(LHS, RHS);
+        case SCEVExprKind::Min:
+        case SCEVExprKind::Max:
+            return makeBinary(E->Kind, LHS, RHS, E->Ty);
+        default:
+            return nullptr;
+        }
+    }
+    case SCEVExprKind::Cast:
+        if (E->Operands.size() != 1) return nullptr;
+        return makeCast(E->CastKind,
+                        getSCEVAtIteration(E->Operands[0], Iter, L), E->Ty);
+    case SCEVExprKind::Compare:
+        if (E->Operands.size() != 2) return nullptr;
+        return makeCompare(E->Predicate,
+                           getSCEVAtIteration(E->Operands[0], Iter, L),
+                           getSCEVAtIteration(E->Operands[1], Iter, L));
+    case SCEVExprKind::AddRec:
+        if (E->Operands.size() != 2) return nullptr;
+        if (E->RecLoop != L) return E;
+        if (!Iter) return nullptr;
+        return add(getSCEVAtIteration(E->Operands[0], Iter, L),
+                   mul(Iter, getSCEVAtIteration(E->Operands[1], Iter, L)));
+    case SCEVExprKind::MulRec:
+    case SCEVExprKind::DivRec:
+        return E;
+    }
+    return nullptr;
+}
+
+void SCEVResult::forgetValue(Value *) {
+    clear();
+}
+
+void SCEVResult::forgetLoop(const Loop *) {
+    clear();
+}
+
+void SCEVResult::forgetAllLoops() {
+    clear();
+}
+
+void SCEVResult::clear() {
+    // IR rewrites invalidate every previously returned SCEVExpr pointer.
+    // Keep the first version simple and flush the whole interned expression
+    // arena instead of trying to maintain fine-grained dependencies.
+    ExprStorage.clear();
+    Interned.clear();
+
+    ValueCache.clear();
+    ActiveValues.clear();
+    TripCountCache.clear();
+    BackedgeCountCache.clear();
+    LoopInductions.clear();
+    LoopInductionsReady = false;
 }
 
 const std::unordered_map<Value *, LoopInductionInfo> &
@@ -887,6 +1264,8 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
         return "(" + format(E->Operands[0]) + " * " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Div:
         return "(" + format(E->Operands[0]) + " / " + format(E->Operands[1]) + ")";
+    case SCEVExprKind::Mod:
+        return "(" + format(E->Operands[0]) + " % " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Min:
         return "min(" + format(E->Operands[0]) + ", " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Max:
