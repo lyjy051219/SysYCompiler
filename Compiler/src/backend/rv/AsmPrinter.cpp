@@ -87,14 +87,14 @@ constexpr std::array<PhysReg, 8> kFprScratchRegs{
     PhysReg::FT4, PhysReg::FT5, PhysReg::FT6, PhysReg::FT7};
 
 constexpr std::array<PhysReg, 11> kNonLeafGprScratchRegs{
-    PhysReg::S1, PhysReg::S2,  PhysReg::S3,  PhysReg::S4,
-    PhysReg::S5, PhysReg::S6,  PhysReg::S7,  PhysReg::S8,
+    PhysReg::S1, PhysReg::S2,  PhysReg::S3, PhysReg::S4,
+    PhysReg::S5, PhysReg::S6,  PhysReg::S7, PhysReg::S8,
     PhysReg::S9, PhysReg::S10, PhysReg::S11};
 
 constexpr std::array<PhysReg, 12> kNonLeafFprScratchRegs{
-    PhysReg::FS0, PhysReg::FS1,  PhysReg::FS2,  PhysReg::FS3,
-    PhysReg::FS4, PhysReg::FS5,  PhysReg::FS6,  PhysReg::FS7,
-    PhysReg::FS8, PhysReg::FS9,  PhysReg::FS10, PhysReg::FS11};
+    PhysReg::FS0, PhysReg::FS1, PhysReg::FS2,  PhysReg::FS3,
+    PhysReg::FS4, PhysReg::FS5, PhysReg::FS6,  PhysReg::FS7,
+    PhysReg::FS8, PhysReg::FS9, PhysReg::FS10, PhysReg::FS11};
 
 bool functionContainsCall(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
@@ -175,8 +175,7 @@ std::vector<PhysReg> usedCalleeSavedRegs(const MachineFunction &function,
   return regs;
 }
 
-std::vector<PhysReg> gprCalleeSavedRegsToSave(
-    const MachineFunction &function) {
+std::vector<PhysReg> gprCalleeSavedRegsToSave(const MachineFunction &function) {
   std::vector<PhysReg> regs = usedCalleeSavedRegs(function, false);
   if (!regs.empty() || !functionContainsCall(function)) {
     return regs;
@@ -188,8 +187,7 @@ std::vector<PhysReg> gprCalleeSavedRegsToSave(
   return regs;
 }
 
-std::vector<PhysReg> fprCalleeSavedRegsToSave(
-    const MachineFunction &function) {
+std::vector<PhysReg> fprCalleeSavedRegsToSave(const MachineFunction &function) {
   std::vector<PhysReg> regs = usedCalleeSavedRegs(function, true);
   if (!regs.empty() || !functionContainsCall(function)) {
     return regs;
@@ -250,7 +248,8 @@ bool isZeroInitializer(Value *value, const std::shared_ptr<IRType> &type) {
   auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
   if (!arrayType) {
     for (Value *element : *init) {
-      if (!isZeroInitializer(element, element ? element->getIRType() : nullptr)) {
+      if (!isZeroInitializer(element,
+                             element ? element->getIRType() : nullptr)) {
         return false;
       }
     }
@@ -398,9 +397,12 @@ void AsmPrinter::emitFunction(const MachineFunction &function) {
   out_ << "    .type " << function.name << ", @function\n";
   out_ << function.name << ":\n";
   emitStackAdjust(-function.frameSize);
-  if (hasCall) {
-    int64_t offset = function.frameSize - 8;
-    emitSpRelative(out_, "sd", PhysReg::RA, offset);
+  if (hasCall || !savedGprs.empty() || !savedFprs.empty()) {
+    int64_t offset = function.frameSize;
+    if (hasCall) {
+      offset -= 8;
+      emitSpRelative(out_, "sd", PhysReg::RA, offset);
+    }
     for (PhysReg reg : savedGprs) {
       offset -= 8;
       emitSpRelative(out_, "sd", reg, offset);
@@ -500,9 +502,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       if (!fitsSigned12(offset)) {
         throw BackendError("immediate add offset out of signed 12-bit range");
       }
-      out_ << "    " << (instr.opcode == Opcode::ADDI ? "addi" : "addiw")
-           << ' ' << operandReg(instr.defs.front()) << ", " << base << ", "
-           << offset << '\n';
+      out_ << "    " << (instr.opcode == Opcode::ADDI ? "addi" : "addiw") << ' '
+           << operandReg(instr.defs.front()) << ", " << base << ", " << offset
+           << '\n';
       releaseScratchGpr(scratch);
     }
     return;
@@ -701,8 +703,7 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     out_ << byteStart << ":\n";
     out_ << "    li " << regName(kReservedGprScratch) << ", " << byteCount
          << '\n';
-    out_ << "    beqz " << regName(kReservedGprScratch) << ", " << done
-         << '\n';
+    out_ << "    beqz " << regName(kReservedGprScratch) << ", " << done << '\n';
     out_ << byteLoop << ":\n";
     out_ << "    lbu " << regName(kReservedMemcpyTmp) << ", 0("
          << regName(kReservedMemcpySrc) << ")\n";
@@ -720,14 +721,22 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     return;
   }
   case Opcode::RET:
-    if (currentFunction_ && functionContainsCall(*currentFunction_)) {
-      int64_t offset = currentFunction_->frameSize - 8;
-      emitSpRelative(out_, "ld", PhysReg::RA, offset);
-      for (PhysReg reg : gprCalleeSavedRegsToSave(*currentFunction_)) {
+    if (currentFunction_) {
+      const bool containsCall = functionContainsCall(*currentFunction_);
+      const std::vector<PhysReg> savedGprs =
+          gprCalleeSavedRegsToSave(*currentFunction_);
+      const std::vector<PhysReg> savedFprs =
+          fprCalleeSavedRegsToSave(*currentFunction_);
+      int64_t offset = currentFunction_->frameSize;
+      if (containsCall) {
+        offset -= 8;
+        emitSpRelative(out_, "ld", PhysReg::RA, offset);
+      }
+      for (PhysReg reg : savedGprs) {
         offset -= 8;
         emitSpRelative(out_, "ld", reg, offset);
       }
-      for (PhysReg reg : fprCalleeSavedRegsToSave(*currentFunction_)) {
+      for (PhysReg reg : savedFprs) {
         offset -= 8;
         emitSpRelative(out_, "fld", reg, offset);
       }
@@ -914,8 +923,9 @@ void AsmPrinter::emitStackAdjust(int64_t amount) {
 }
 
 void AsmPrinter::emitMemoryInstr(const MachineInstr &instr) {
-  const bool isStore = instr.opcode == Opcode::SB || instr.opcode == Opcode::SW ||
-                       instr.opcode == Opcode::SD || instr.opcode == Opcode::FSW;
+  const bool isStore =
+      instr.opcode == Opcode::SB || instr.opcode == Opcode::SW ||
+      instr.opcode == Opcode::SD || instr.opcode == Opcode::FSW;
   const char *mnemonic = "";
   switch (instr.opcode) {
   case Opcode::LBU:

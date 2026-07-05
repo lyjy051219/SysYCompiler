@@ -5,113 +5,123 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace riscv {
 namespace {
 
-using VRegSet = std::unordered_set<uint32_t>;
+using VRegSet = std::set<uint32_t>;
+using Node = uint32_t;
 
-constexpr PhysReg kLeafGprColors[] = {
-    PhysReg::T0, PhysReg::T1, PhysReg::T2, PhysReg::T3,
-    PhysReg::T4, PhysReg::T5, PhysReg::A0, PhysReg::A1,
-    PhysReg::A2, PhysReg::A3, PhysReg::A4, PhysReg::A5,
-    PhysReg::A6, PhysReg::A7};
-
-constexpr PhysReg kNonLeafGprColors[] = {
-    PhysReg::S1, PhysReg::S2,  PhysReg::S3,  PhysReg::S4,
-    PhysReg::S5, PhysReg::S6,  PhysReg::S7,  PhysReg::S8,
-    PhysReg::S9, PhysReg::S10, PhysReg::S11};
-
-constexpr PhysReg kNonLeafCallerGprColors[] = {
-    PhysReg::T0, PhysReg::T1, PhysReg::T2, PhysReg::T3,
-    PhysReg::T4, PhysReg::T5};
-
-constexpr PhysReg kLeafFprColors[] = {
-    PhysReg::FT0, PhysReg::FT1,  PhysReg::FT2,  PhysReg::FT3,
-    PhysReg::FT4, PhysReg::FT5,  PhysReg::FT6,  PhysReg::FT7,
-    PhysReg::FT8, PhysReg::FT9,  PhysReg::FT10, PhysReg::FT11,
-    PhysReg::FA0, PhysReg::FA1,  PhysReg::FA2,  PhysReg::FA3,
-    PhysReg::FA4, PhysReg::FA5,  PhysReg::FA6,  PhysReg::FA7};
-
-constexpr PhysReg kNonLeafFprColors[] = {
-    PhysReg::FS0, PhysReg::FS1,  PhysReg::FS2,  PhysReg::FS3,
-    PhysReg::FS4, PhysReg::FS5,  PhysReg::FS6,  PhysReg::FS7,
-    PhysReg::FS8, PhysReg::FS9,  PhysReg::FS10, PhysReg::FS11};
-
-constexpr PhysReg kNonLeafCallerFprColors[] = {
-    PhysReg::FT0, PhysReg::FT1,  PhysReg::FT2,  PhysReg::FT3,
-    PhysReg::FT4, PhysReg::FT5,  PhysReg::FT6,  PhysReg::FT7,
-    PhysReg::FT8, PhysReg::FT9,  PhysReg::FT10, PhysReg::FT11};
-
-constexpr int kMaxSpillIterations = 32;
+constexpr Node kPhysicalNodeBase = 0x80000000U;
+constexpr int kEmergencyRoundLimit = 128;
 
 bool isVirtualReg(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical;
 }
 
-bool containsCall(const MachineFunction &mf) {
-  for (const MachineBasicBlock &block : mf.blocks) {
-    for (const MachineInstr &instr : block.instrs) {
-      if (instr.opcode == Opcode::CALL) {
-        return true;
-      }
-    }
-  }
-  return false;
+bool isPhysicalReg(const MachineOperand &operand) {
+  return operand.kind == OperandKind::Reg && operand.regValue.physical;
 }
 
-void rememberClass(std::unordered_map<uint32_t, RegClass> &classes,
-                   MachineReg reg) {
+bool isFloatClass(RegClass rc) { return rc == RegClass::FPR32; }
+
+bool sameBank(RegClass lhs, RegClass rhs) {
+  return isFloatClass(lhs) == isFloatClass(rhs);
+}
+
+bool sameBank(RegClass rc, PhysReg reg) {
+  return isFloatClass(rc) == getRegisterInfo(reg).isFloat;
+}
+
+std::vector<PhysReg> allocationColors(RegClass rc) {
+  std::vector<PhysReg> result;
+  for (PhysReg reg : allocatableRegs(rc)) {
+    switch (reg) {
+    case PhysReg::A0:
+    case PhysReg::A1:
+    case PhysReg::A2:
+    case PhysReg::A3:
+    case PhysReg::A4:
+    case PhysReg::A5:
+    case PhysReg::A6:
+    case PhysReg::A7:
+    case PhysReg::FA0:
+    case PhysReg::FA1:
+    case PhysReg::FA2:
+    case PhysReg::FA3:
+    case PhysReg::FA4:
+    case PhysReg::FA5:
+    case PhysReg::FA6:
+    case PhysReg::FA7:
+      break;
+    default:
+      result.push_back(reg);
+      break;
+    }
+  }
+  return result;
+}
+
+Node physicalNode(PhysReg reg) {
+  return kPhysicalNodeBase + static_cast<Node>(reg);
+}
+
+bool isPhysicalNode(Node node) { return node >= kPhysicalNodeBase; }
+
+PhysReg nodePhysicalReg(Node node) {
+  return static_cast<PhysReg>(node - kPhysicalNodeBase);
+}
+
+void rememberClass(std::map<uint32_t, RegClass> &classes, MachineReg reg) {
   auto [it, inserted] = classes.emplace(reg.id, reg.rc);
   if (!inserted && it->second != reg.rc) {
     throw BackendError("virtual register used with inconsistent classes");
   }
 }
 
-void collectVRegs(const MachineFunction &mf,
-                  std::unordered_map<uint32_t, RegClass> &classes) {
+std::map<uint32_t, RegClass> collectVRegs(const MachineFunction &mf) {
+  std::map<uint32_t, RegClass> classes;
   for (const MachineBasicBlock &block : mf.blocks) {
     for (const MachineInstr &instr : block.instrs) {
-      for (const MachineOperand &def : instr.defs) {
-        if (isVirtualReg(def)) {
-          rememberClass(classes, def.regValue);
+      for (const MachineOperand &operand : instr.defs) {
+        if (isVirtualReg(operand)) {
+          rememberClass(classes, operand.regValue);
         }
       }
-      for (const MachineOperand &use : instr.uses) {
-        if (isVirtualReg(use)) {
-          rememberClass(classes, use.regValue);
+      for (const MachineOperand &operand : instr.uses) {
+        if (isVirtualReg(operand)) {
+          rememberClass(classes, operand.regValue);
         }
       }
     }
   }
+  return classes;
 }
 
-void addSet(VRegSet &dst, const VRegSet &src) {
-  for (uint32_t value : src) {
-    dst.insert(value);
-  }
-}
-
-std::vector<uint32_t> instrUses(const MachineInstr &instr) {
+std::vector<uint32_t> virtualUses(const MachineInstr &instr) {
   std::vector<uint32_t> result;
-  for (const MachineOperand &use : instr.uses) {
-    if (isVirtualReg(use)) {
-      result.push_back(use.regValue.id);
+  for (const MachineOperand &operand : instr.uses) {
+    if (isVirtualReg(operand)) {
+      result.push_back(operand.regValue.id);
     }
   }
   return result;
 }
 
-std::vector<uint32_t> instrDefs(const MachineInstr &instr) {
+std::vector<uint32_t> virtualDefs(const MachineInstr &instr) {
   std::vector<uint32_t> result;
-  for (const MachineOperand &def : instr.defs) {
-    if (isVirtualReg(def)) {
-      result.push_back(def.regValue.id);
+  for (const MachineOperand &operand : instr.defs) {
+    if (isVirtualReg(operand)) {
+      result.push_back(operand.regValue.id);
     }
   }
   return result;
@@ -132,15 +142,15 @@ Liveness computeLiveness(const MachineFunction &mf) {
   live.liveIn.resize(blockCount);
   live.liveOut.resize(blockCount);
 
-  for (std::size_t i = 0; i < blockCount; ++i) {
-    for (const MachineInstr &instr : mf.blocks[i].instrs) {
-      for (uint32_t use : instrUses(instr)) {
-        if (live.defs[i].find(use) == live.defs[i].end()) {
-          live.uses[i].insert(use);
+  for (std::size_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
+    for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
+      for (uint32_t use : virtualUses(instr)) {
+        if (live.defs[blockIndex].count(use) == 0) {
+          live.uses[blockIndex].insert(use);
         }
       }
-      for (uint32_t def : instrDefs(instr)) {
-        live.defs[i].insert(def);
+      for (uint32_t def : virtualDefs(instr)) {
+        live.defs[blockIndex].insert(def);
       }
     }
   }
@@ -148,380 +158,822 @@ Liveness computeLiveness(const MachineFunction &mf) {
   bool changed = true;
   while (changed) {
     changed = false;
-    for (std::size_t reverseIndex = 0; reverseIndex < blockCount;
-         ++reverseIndex) {
-      const std::size_t i = blockCount - reverseIndex - 1;
-
+    for (std::size_t reverse = 0; reverse < blockCount; ++reverse) {
+      const std::size_t blockIndex = blockCount - reverse - 1;
       VRegSet newOut;
-      for (int succ : mf.blocks[i].succs) {
+      for (int succ : mf.blocks[blockIndex].succs) {
         if (succ < 0 || succ >= static_cast<int>(blockCount)) {
-          throw BackendError("invalid CFG successor during register allocation");
+          throw BackendError(
+              "invalid CFG successor during register allocation");
         }
-        addSet(newOut, live.liveIn[static_cast<std::size_t>(succ)]);
+        const VRegSet &succIn = live.liveIn[static_cast<std::size_t>(succ)];
+        newOut.insert(succIn.begin(), succIn.end());
       }
 
-      VRegSet newIn = live.uses[i];
+      VRegSet newIn = live.uses[blockIndex];
       for (uint32_t value : newOut) {
-        if (live.defs[i].find(value) == live.defs[i].end()) {
+        if (live.defs[blockIndex].count(value) == 0) {
           newIn.insert(value);
         }
       }
+      if (newIn != live.liveIn[blockIndex] ||
+          newOut != live.liveOut[blockIndex]) {
+        live.liveIn[blockIndex] = std::move(newIn);
+        live.liveOut[blockIndex] = std::move(newOut);
+        changed = true;
+      }
+    }
+  }
+  return live;
+}
 
-      if (newIn != live.liveIn[i] || newOut != live.liveOut[i]) {
-        live.liveIn[i] = std::move(newIn);
-        live.liveOut[i] = std::move(newOut);
+std::vector<int> computeLoopDepth(const MachineFunction &mf) {
+  const std::size_t count = mf.blocks.size();
+  std::vector<int> depth(count, 0);
+  if (count == 0) {
+    return depth;
+  }
+
+  std::vector<std::set<int>> dominators(count);
+  std::set<int> all;
+  for (std::size_t i = 0; i < count; ++i) {
+    all.insert(static_cast<int>(i));
+  }
+  dominators[0].insert(0);
+  for (std::size_t i = 1; i < count; ++i) {
+    dominators[i] = all;
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (std::size_t i = 1; i < count; ++i) {
+      std::set<int> next;
+      bool firstPred = true;
+      for (int pred : mf.blocks[i].preds) {
+        if (pred < 0 || pred >= static_cast<int>(count)) {
+          throw BackendError(
+              "invalid CFG predecessor during register allocation");
+        }
+        if (firstPred) {
+          next = dominators[static_cast<std::size_t>(pred)];
+          firstPred = false;
+        } else {
+          std::set<int> intersection;
+          std::set_intersection(
+              next.begin(), next.end(),
+              dominators[static_cast<std::size_t>(pred)].begin(),
+              dominators[static_cast<std::size_t>(pred)].end(),
+              std::inserter(intersection, intersection.begin()));
+          next = std::move(intersection);
+        }
+      }
+      if (firstPred) {
+        next.clear();
+      }
+      next.insert(static_cast<int>(i));
+      if (next != dominators[i]) {
+        dominators[i] = std::move(next);
         changed = true;
       }
     }
   }
 
-  return live;
-}
+  for (std::size_t from = 0; from < count; ++from) {
+    for (int succ : mf.blocks[from].succs) {
+      if (succ < 0 || succ >= static_cast<int>(count) ||
+          dominators[from].count(succ) == 0) {
+        continue;
+      }
 
-using Interference = std::unordered_map<uint32_t, VRegSet>;
-using ForbiddenColors = std::unordered_map<uint32_t, std::set<PhysReg>>;
-
-void addInterference(Interference &graph,
-                     const std::unordered_map<uint32_t, RegClass> &classes,
-                     uint32_t lhs, uint32_t rhs) {
-  const bool lhsFpr = classes.at(lhs) == RegClass::FPR32;
-  const bool rhsFpr = classes.at(rhs) == RegClass::FPR32;
-  if (lhs == rhs || lhsFpr != rhsFpr) {
-    return;
-  }
-  graph[lhs].insert(rhs);
-  graph[rhs].insert(lhs);
-}
-
-struct AllocationGraph {
-  Interference interference;
-  ForbiddenColors forbiddenColors;
-  VRegSet liveAcrossCall;
-};
-
-struct ColoringResult {
-  std::unordered_map<uint32_t, PhysReg> allocation;
-  std::vector<uint32_t> spills;
-};
-
-void forbidColors(ForbiddenColors &forbidden,
-                  const std::vector<uint32_t> &vregs,
-                  const std::vector<PhysReg> &regs) {
-  for (uint32_t vreg : vregs) {
-    for (PhysReg reg : regs) {
-      forbidden[vreg].insert(reg);
+      // 回边源到支配头之间的反向可达块构成自然循环。
+      std::set<int> members{succ, static_cast<int>(from)};
+      std::vector<int> work{static_cast<int>(from)};
+      while (!work.empty()) {
+        int block = work.back();
+        work.pop_back();
+        for (int pred : mf.blocks[static_cast<std::size_t>(block)].preds) {
+          if (members.insert(pred).second && pred != succ) {
+            work.push_back(pred);
+          }
+        }
+      }
+      for (int block : members) {
+        ++depth[static_cast<std::size_t>(block)];
+      }
     }
   }
+  return depth;
 }
 
-AllocationGraph buildAllocationGraph(
-    const MachineFunction &mf,
-    const std::unordered_map<uint32_t, RegClass> &classes,
-    const Liveness &live) {
-  AllocationGraph result;
-  Interference graph;
-  for (const auto &[id, rc] : classes) {
-    (void)rc;
-    graph.emplace(id, VRegSet{});
+struct ProgramInfo {
+  std::map<uint32_t, RegClass> classes;
+  std::map<uint32_t, uint64_t> heat;
+  std::map<uint32_t, MachineInstr> rematerializable;
+  std::set<uint32_t> generatedBySpill;
+};
+
+ProgramInfo analyzeProgram(const MachineFunction &mf,
+                           const std::set<uint32_t> &generatedBySpill) {
+  ProgramInfo info;
+  info.classes = collectVRegs(mf);
+  info.generatedBySpill = generatedBySpill;
+  std::map<uint32_t, int> defCount;
+  std::map<uint32_t, MachineInstr> candidates;
+  const std::vector<int> loopDepth = computeLoopDepth(mf);
+
+  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
+       ++blockIndex) {
+    uint64_t blockHeat = 1;
+    for (int i = 0; i < std::min(loopDepth[blockIndex], 3); ++i) {
+      blockHeat *= 10;
+    }
+    for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
+      for (uint32_t use : virtualUses(instr)) {
+        info.heat[use] += 2 * blockHeat;
+      }
+      for (uint32_t def : virtualDefs(instr)) {
+        info.heat[def] += blockHeat;
+        ++defCount[def];
+        if ((instr.opcode == Opcode::LI || instr.opcode == Opcode::LA) &&
+            instr.defs.size() == 1) {
+          candidates[def] = instr;
+        }
+      }
+    }
+  }
+
+  for (const auto &[id, candidate] : candidates) {
+    if (defCount[id] == 1) {
+      info.rematerializable.emplace(id, candidate);
+    }
+  }
+  return info;
+}
+
+enum class MoveState { WorkList, Active, Coalesced, Constrained, Frozen };
+
+struct Move {
+  Node dst = 0;
+  Node src = 0;
+  MoveState state = MoveState::WorkList;
+};
+
+struct AllocationGraph {
+  bool floatBank = false;
+  bool containsCall = false;
+  int colorCount = 0;
+  std::set<Node> precolored;
+  std::set<Node> initial;
+  std::map<Node, std::set<Node>> adjacency;
+  std::map<Node, int> degree;
+  std::map<Node, std::set<std::size_t>> moveList;
+  std::vector<Move> moves;
+
+  bool hasEdge(Node lhs, Node rhs) const {
+    auto found = adjacency.find(lhs);
+    return found != adjacency.end() && found->second.count(rhs) != 0;
+  }
+
+  void addEdge(Node lhs, Node rhs, bool updateDegree) {
+    if (lhs == rhs || hasEdge(lhs, rhs)) {
+      return;
+    }
+    adjacency[lhs].insert(rhs);
+    adjacency[rhs].insert(lhs);
+    if (updateDegree) {
+      if (precolored.count(lhs) == 0) {
+        ++degree[lhs];
+      }
+      if (precolored.count(rhs) == 0) {
+        ++degree[rhs];
+      }
+    }
+  }
+};
+
+bool nodeMatchesBank(Node node, bool floatBank,
+                     const std::map<uint32_t, RegClass> &classes) {
+  if (isPhysicalNode(node)) {
+    return getRegisterInfo(nodePhysicalReg(node)).isFloat == floatBank;
+  }
+  auto found = classes.find(node);
+  return found != classes.end() && isFloatClass(found->second) == floatBank;
+}
+
+std::vector<Node>
+instructionVirtualNodes(const std::vector<MachineOperand> &operands,
+                        bool floatBank,
+                        const std::map<uint32_t, RegClass> &classes) {
+  std::vector<Node> result;
+  for (const MachineOperand &operand : operands) {
+    if (isVirtualReg(operand) &&
+        nodeMatchesBank(operand.regValue.id, floatBank, classes)) {
+      result.push_back(operand.regValue.id);
+    }
+  }
+  return result;
+}
+
+std::vector<Node>
+instructionPhysicalNodes(const std::vector<MachineOperand> &operands,
+                         bool floatBank) {
+  std::vector<Node> result;
+  for (const MachineOperand &operand : operands) {
+    if (!isPhysicalReg(operand)) {
+      continue;
+    }
+    const RegisterInfo &regInfo = getRegisterInfo(operand.regValue.phys);
+    if (regInfo.allocatable && regInfo.isFloat == floatBank) {
+      result.push_back(physicalNode(operand.regValue.phys));
+    }
+  }
+  return result;
+}
+
+void appendImplicitDefs(const MachineInstr &instr, bool floatBank,
+                        std::vector<Node> &defs) {
+  for (PhysReg reg : instr.implicitDefs) {
+    const RegisterInfo &info = getRegisterInfo(reg);
+    if (info.allocatable && info.isFloat == floatBank) {
+      defs.push_back(physicalNode(reg));
+    }
+  }
+  if (instr.opcode == Opcode::CALL) {
+    const RegClass rc = floatBank ? RegClass::FPR32 : RegClass::GPR64;
+    for (PhysReg reg : callerSavedRegs(rc)) {
+      const RegisterInfo &info = getRegisterInfo(reg);
+      if (info.allocatable) {
+        defs.push_back(physicalNode(reg));
+      }
+    }
+  }
+  std::sort(defs.begin(), defs.end());
+  defs.erase(std::unique(defs.begin(), defs.end()), defs.end());
+}
+
+bool isCopyForBank(const MachineInstr &instr, bool floatBank) {
+  return floatBank ? instr.opcode == Opcode::F_COPY
+                   : instr.opcode == Opcode::COPY;
+}
+
+AllocationGraph buildAllocationGraph(const MachineFunction &mf,
+                                     const ProgramInfo &info,
+                                     const Liveness &live, bool floatBank) {
+  AllocationGraph graph;
+  graph.floatBank = floatBank;
+  const RegClass bankClass = floatBank ? RegClass::FPR32 : RegClass::GPR64;
+  for (PhysReg reg : allocatableRegs(bankClass)) {
+    Node node = physicalNode(reg);
+    graph.precolored.insert(node);
+    graph.adjacency[node];
+  }
+  graph.colorCount = static_cast<int>(allocationColors(bankClass).size());
+
+  for (const auto &[id, rc] : info.classes) {
+    if (isFloatClass(rc) == floatBank) {
+      graph.initial.insert(id);
+      graph.adjacency[id];
+    }
   }
 
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
-    VRegSet currentLive = live.liveOut[blockIndex];
+    std::set<Node> currentLive;
+    for (uint32_t value : live.liveOut[blockIndex]) {
+      if (nodeMatchesBank(value, floatBank, info.classes)) {
+        currentLive.insert(value);
+      }
+    }
+
     const MachineBasicBlock &block = mf.blocks[blockIndex];
     for (auto it = block.instrs.rbegin(); it != block.instrs.rend(); ++it) {
       if (it->opcode == Opcode::CALL) {
-        addSet(result.liveAcrossCall, currentLive);
+        graph.containsCall = true;
       }
-      const std::vector<uint32_t> defs = instrDefs(*it);
-      const std::vector<uint32_t> uses = instrUses(*it);
-
-      if (!it->implicitDefs.empty()) {
-        std::vector<uint32_t> protectedVRegs = uses;
-        protectedVRegs.insert(protectedVRegs.end(), defs.begin(), defs.end());
-        protectedVRegs.insert(protectedVRegs.end(), currentLive.begin(),
-                              currentLive.end());
-        std::sort(protectedVRegs.begin(), protectedVRegs.end());
-        protectedVRegs.erase(
-            std::unique(protectedVRegs.begin(), protectedVRegs.end()),
-            protectedVRegs.end());
-        forbidColors(result.forbiddenColors, protectedVRegs, it->implicitDefs);
-      }
-
-      for (uint32_t def : defs) {
-        for (uint32_t liveReg : currentLive) {
-          addInterference(graph, classes, def, liveReg);
+      std::vector<Node> virtualDefs =
+          instructionVirtualNodes(it->defs, floatBank, info.classes);
+      std::vector<Node> virtualUses =
+          instructionVirtualNodes(it->uses, floatBank, info.classes);
+      std::vector<Node> physicalDefs =
+          instructionPhysicalNodes(it->defs, floatBank);
+      std::vector<Node> physicalUses =
+          instructionPhysicalNodes(it->uses, floatBank);
+      appendImplicitDefs(*it, floatBank, physicalDefs);
+      for (PhysReg reg : it->implicitUses) {
+        const RegisterInfo &regInfo = getRegisterInfo(reg);
+        if (regInfo.allocatable && regInfo.isFloat == floatBank) {
+          physicalUses.push_back(physicalNode(reg));
         }
       }
-      for (uint32_t def : defs) {
+
+      const bool copy =
+          isCopyForBank(*it, floatBank) && it->defs.size() == 1 &&
+          it->uses.size() == 1 && it->defs[0].kind == OperandKind::Reg &&
+          it->uses[0].kind == OperandKind::Reg &&
+          sameBank(it->defs[0].regValue.rc, it->uses[0].regValue.rc) &&
+          (!it->defs[0].regValue.physical ||
+           getRegisterInfo(it->defs[0].regValue.phys).allocatable) &&
+          (!it->uses[0].regValue.physical ||
+           getRegisterInfo(it->uses[0].regValue.phys).allocatable);
+      if (copy) {
+        Node dst = it->defs[0].regValue.physical
+                       ? physicalNode(it->defs[0].regValue.phys)
+                       : it->defs[0].regValue.id;
+        Node src = it->uses[0].regValue.physical
+                       ? physicalNode(it->uses[0].regValue.phys)
+                       : it->uses[0].regValue.id;
+        if (nodeMatchesBank(dst, floatBank, info.classes) &&
+            nodeMatchesBank(src, floatBank, info.classes)) {
+          currentLive.erase(src);
+          const std::size_t moveIndex = graph.moves.size();
+          graph.moves.push_back(Move{dst, src, MoveState::WorkList});
+          graph.moveList[dst].insert(moveIndex);
+          graph.moveList[src].insert(moveIndex);
+        }
+      }
+
+      // 隐式破坏可能发生在伪指令内部，因此同时保护本条指令的输入和输出。
+      std::set<Node> protectedValues = currentLive;
+      protectedValues.insert(virtualUses.begin(), virtualUses.end());
+      protectedValues.insert(virtualDefs.begin(), virtualDefs.end());
+      for (Node def : physicalDefs) {
+        for (Node value : protectedValues) {
+          graph.addEdge(def, value, false);
+        }
+      }
+
+      std::vector<Node> allDefs = virtualDefs;
+      allDefs.insert(allDefs.end(), physicalDefs.begin(), physicalDefs.end());
+      for (Node def : allDefs) {
+        for (Node value : currentLive) {
+          graph.addEdge(def, value, false);
+        }
+      }
+      for (Node def : virtualDefs) {
         currentLive.erase(def);
       }
-      for (uint32_t use : uses) {
-        currentLive.insert(use);
+      for (Node def : physicalDefs) {
+        currentLive.erase(def);
+      }
+      currentLive.insert(virtualUses.begin(), virtualUses.end());
+      currentLive.insert(physicalUses.begin(), physicalUses.end());
+    }
+  }
+
+  for (Node node : graph.initial) {
+    graph.degree[node] = static_cast<int>(graph.adjacency[node].size());
+  }
+  for (Node node : graph.precolored) {
+    graph.degree[node] = std::numeric_limits<int>::max() / 4;
+  }
+  return graph;
+}
+
+struct ColoringResult {
+  std::map<uint32_t, PhysReg> colors;
+  std::vector<uint32_t> spills;
+  std::vector<uint32_t> potentialSpills;
+  uint64_t coalescedMoves = 0;
+  std::map<uint32_t, std::set<uint32_t>> spillConflicts;
+};
+
+class IRCAllocator {
+public:
+  IRCAllocator(AllocationGraph graph, const ProgramInfo &info)
+      : graph_(std::move(graph)), info_(info) {
+    for (Node node : graph_.precolored) {
+      colors_[node] = nodePhysicalReg(node);
+    }
+  }
+
+  ColoringResult run() {
+    makeWorkLists();
+    while (!simplifyWorkList_.empty() || hasWorkListMove() ||
+           !freezeWorkList_.empty() || !spillWorkList_.empty()) {
+      if (!simplifyWorkList_.empty()) {
+        simplify();
+      } else if (hasWorkListMove()) {
+        coalesce();
+      } else if (!freezeWorkList_.empty()) {
+        freeze();
+      } else {
+        selectSpill();
       }
     }
-  }
+    assignColors();
 
-  result.interference = std::move(graph);
-  return result;
-}
-
-std::vector<PhysReg> colorsFor(RegClass rc, bool hasCall,
-                               bool liveAcrossCall) {
-  if (rc == RegClass::FPR32) {
-    if (!hasCall) {
-      return std::vector<PhysReg>(std::begin(kLeafFprColors),
-                                  std::end(kLeafFprColors));
+    ColoringResult result;
+    for (const auto &[node, color] : colors_) {
+      if (!isPhysicalNode(node)) {
+        result.colors.emplace(node, color);
+      }
     }
-    std::vector<PhysReg> colors(std::begin(kNonLeafFprColors),
-                                std::end(kNonLeafFprColors));
-    if (!liveAcrossCall) {
-      colors.insert(colors.end(), std::begin(kNonLeafCallerFprColors),
-                    std::end(kNonLeafCallerFprColors));
+    result.spills.assign(spilledNodes_.begin(), spilledNodes_.end());
+    for (Node node : graph_.initial) {
+      if (spilledNodes_.count(node) == 0 &&
+          info_.generatedBySpill.count(node) == 0 &&
+          info_.rematerializable.count(node) == 0) {
+        result.potentialSpills.push_back(node);
+      }
     }
-    return colors;
-  }
-
-  if (!hasCall) {
-    return std::vector<PhysReg>(std::begin(kLeafGprColors),
-                                std::end(kLeafGprColors));
-  }
-  std::vector<PhysReg> colors(std::begin(kNonLeafGprColors),
-                              std::end(kNonLeafGprColors));
-  if (!liveAcrossCall) {
-    colors.insert(colors.end(), std::begin(kNonLeafCallerGprColors),
-                  std::end(kNonLeafCallerGprColors));
-  }
-  return colors;
-}
-
-std::vector<PhysReg> colorsForNode(RegClass rc, bool hasCall,
-                                   bool liveAcrossCall, uint32_t node,
-                                   const ForbiddenColors &forbiddenColors) {
-  std::vector<PhysReg> colors = colorsFor(rc, hasCall, liveAcrossCall);
-  auto forbidden = forbiddenColors.find(node);
-  if (forbidden == forbiddenColors.end()) {
-    return colors;
-  }
-  colors.erase(std::remove_if(colors.begin(), colors.end(), [&](PhysReg reg) {
-                 return forbidden->second.find(reg) != forbidden->second.end();
-               }),
-               colors.end());
-  return colors;
-}
-
-int remainingDegree(const Interference &graph,
-                    const std::unordered_set<uint32_t> &remaining,
-                    uint32_t node) {
-  int degree = 0;
-  auto found = graph.find(node);
-  if (found == graph.end()) {
-    return degree;
-  }
-  for (uint32_t neighbor : found->second) {
-    if (remaining.find(neighbor) != remaining.end()) {
-      ++degree;
+    std::sort(result.potentialSpills.begin(), result.potentialSpills.end(),
+              [&](uint32_t lhs, uint32_t rhs) {
+                const uint64_t lhsHeat =
+                    info_.heat.count(lhs) != 0 ? info_.heat.at(lhs) : 1;
+                const uint64_t rhsHeat =
+                    info_.heat.count(rhs) != 0 ? info_.heat.at(rhs) : 1;
+                const uint64_t lhsDegree =
+                    std::max<std::size_t>(1, graph_.adjacency[lhs].size());
+                const uint64_t rhsDegree =
+                    std::max<std::size_t>(1, graph_.adjacency[rhs].size());
+                const uint64_t lhsScore = lhsHeat * 1024U / lhsDegree;
+                const uint64_t rhsScore = rhsHeat * 1024U / rhsDegree;
+                return lhsScore != rhsScore ? lhsScore < rhsScore : lhs < rhs;
+              });
+    for (Node node : graph_.initial) {
+      for (Node neighbor : graph_.adjacency[node]) {
+        if (!isPhysicalNode(neighbor)) {
+          result.spillConflicts[node].insert(neighbor);
+        }
+      }
     }
-  }
-  return degree;
-}
-
-ColoringResult colorClass(
-    RegClass rc, bool hasCall, const std::vector<uint32_t> &classNodes,
-    const Interference &graph, const VRegSet &liveAcrossCall,
-    const ForbiddenColors &forbiddenColors, const std::string &functionName) {
-  ColoringResult result;
-  if (classNodes.empty()) {
+    result.coalescedMoves = coalescedMoveCount_;
     return result;
   }
 
-  std::unordered_set<uint32_t> remaining(classNodes.begin(), classNodes.end());
-  std::unordered_map<uint32_t, int> degree;
-  std::unordered_map<uint32_t, int> colorLimit;
-  std::vector<uint32_t> simplifiable;
-  simplifiable.reserve(classNodes.size());
-  for (uint32_t node : classNodes) {
-    const std::vector<PhysReg> colors = colorsForNode(
-        rc, hasCall, liveAcrossCall.find(node) != liveAcrossCall.end(), node,
-        forbiddenColors);
-    colorLimit[node] = static_cast<int>(colors.size());
-    degree[node] = remainingDegree(graph, remaining, node);
-    if (degree[node] < colorLimit[node]) {
-      simplifiable.push_back(node);
+private:
+  AllocationGraph graph_;
+  const ProgramInfo &info_;
+  std::set<Node> simplifyWorkList_;
+  std::set<Node> freezeWorkList_;
+  std::set<Node> spillWorkList_;
+  std::set<Node> spilledNodes_;
+  std::set<Node> coalescedNodes_;
+  std::set<Node> coloredNodes_;
+  std::set<Node> stackNodes_;
+  std::vector<Node> selectStack_;
+  std::map<Node, Node> alias_;
+  std::map<Node, PhysReg> colors_;
+  std::set<PhysReg> newlyUsedCalleeSaved_;
+  uint64_t coalescedMoveCount_ = 0;
+
+  bool hasWorkListMove() const {
+    return std::any_of(
+        graph_.moves.begin(), graph_.moves.end(),
+        [](const Move &move) { return move.state == MoveState::WorkList; });
+  }
+
+  std::size_t firstWorkListMove() const {
+    for (std::size_t i = 0; i < graph_.moves.size(); ++i) {
+      if (graph_.moves[i].state == MoveState::WorkList) {
+        return i;
+      }
+    }
+    throw BackendError("missing register coalescing worklist move");
+  }
+
+  std::set<Node> adjacent(Node node) const {
+    std::set<Node> result;
+    auto found = graph_.adjacency.find(node);
+    if (found == graph_.adjacency.end()) {
+      return result;
+    }
+    for (Node neighbor : found->second) {
+      if (stackNodes_.count(neighbor) == 0 &&
+          coalescedNodes_.count(neighbor) == 0) {
+        result.insert(neighbor);
+      }
+    }
+    return result;
+  }
+
+  std::set<std::size_t> nodeMoves(Node node) const {
+    std::set<std::size_t> result;
+    auto found = graph_.moveList.find(node);
+    if (found == graph_.moveList.end()) {
+      return result;
+    }
+    for (std::size_t index : found->second) {
+      MoveState state = graph_.moves[index].state;
+      if (state == MoveState::WorkList || state == MoveState::Active) {
+        result.insert(index);
+      }
+    }
+    return result;
+  }
+
+  bool moveRelated(Node node) const { return !nodeMoves(node).empty(); }
+
+  Node getAlias(Node node) {
+    auto found = alias_.find(node);
+    if (coalescedNodes_.count(node) == 0 || found == alias_.end()) {
+      return node;
+    }
+    found->second = getAlias(found->second);
+    return found->second;
+  }
+
+  void makeWorkLists() {
+    for (Node node : graph_.initial) {
+      if (graph_.degree[node] >= graph_.colorCount) {
+        spillWorkList_.insert(node);
+      } else if (moveRelated(node)) {
+        freezeWorkList_.insert(node);
+      } else {
+        simplifyWorkList_.insert(node);
+      }
     }
   }
 
-  std::vector<uint32_t> stack;
-  while (!remaining.empty()) {
-    uint32_t selected = 0;
-
-    while (!simplifiable.empty()) {
-      uint32_t candidate = simplifiable.back();
-      simplifiable.pop_back();
-      if (remaining.find(candidate) == remaining.end()) {
-        continue;
-      }
-      if (degree[candidate] < colorLimit[candidate]) {
-        selected = candidate;
-        break;
-      }
-    }
-
-    if (selected == 0) {
-      selected = *std::max_element(
-          remaining.begin(), remaining.end(), [&](uint32_t lhs, uint32_t rhs) {
-            return degree[lhs] < degree[rhs];
-          });
-    }
-
-    stack.push_back(selected);
-    remaining.erase(selected);
-
-    auto neighbors = graph.find(selected);
-    if (neighbors == graph.end()) {
-      continue;
-    }
-    for (uint32_t neighbor : neighbors->second) {
-      if (remaining.find(neighbor) == remaining.end()) {
-        continue;
-      }
-      int &neighborDegree = degree[neighbor];
-      if (neighborDegree > 0) {
-        --neighborDegree;
-      }
-      if (neighborDegree < colorLimit[neighbor]) {
-        simplifiable.push_back(neighbor);
-      }
-    }
-  }
-
-  while (!stack.empty()) {
-    uint32_t node = stack.back();
-    stack.pop_back();
-
-    const std::vector<PhysReg> colors = colorsForNode(
-        rc, hasCall, liveAcrossCall.find(node) != liveAcrossCall.end(), node,
-        forbiddenColors);
-    if (colors.empty()) {
-      result.spills.push_back(node);
-      continue;
-    }
-
-    std::set<PhysReg> usedColors;
-    auto neighbors = graph.find(node);
-    if (neighbors != graph.end()) {
-      for (uint32_t neighbor : neighbors->second) {
-        auto colored = result.allocation.find(neighbor);
-        if (colored != result.allocation.end()) {
-          usedColors.insert(colored->second);
+  void enableMoves(const std::set<Node> &nodes) {
+    for (Node node : nodes) {
+      for (std::size_t moveIndex : nodeMoves(node)) {
+        if (graph_.moves[moveIndex].state == MoveState::Active) {
+          graph_.moves[moveIndex].state = MoveState::WorkList;
         }
       }
     }
-
-    auto color = std::find_if(colors.begin(), colors.end(), [&](PhysReg reg) {
-      return usedColors.find(reg) == usedColors.end();
-    });
-    if (color == colors.end()) {
-      (void)functionName;
-      result.spills.push_back(node);
-      continue;
-    }
-    result.allocation.emplace(node, *color);
   }
 
-  return result;
-}
+  void decrementDegree(Node node) {
+    if (graph_.precolored.count(node) != 0) {
+      return;
+    }
+    const int oldDegree = graph_.degree[node];
+    --graph_.degree[node];
+    if (oldDegree == graph_.colorCount) {
+      std::set<Node> affected = adjacent(node);
+      affected.insert(node);
+      enableMoves(affected);
+      spillWorkList_.erase(node);
+      if (moveRelated(node)) {
+        freezeWorkList_.insert(node);
+      } else {
+        simplifyWorkList_.insert(node);
+      }
+    }
+  }
 
-ColoringResult colorGraph(
-    const std::unordered_map<uint32_t, RegClass> &classes,
-    const Interference &graph, const VRegSet &liveAcrossCall,
-    const ForbiddenColors &forbiddenColors, bool hasCall,
-    const std::string &functionName) {
-  std::vector<uint32_t> gprs;
-  std::vector<uint32_t> fprs;
-  for (const auto &[id, rc] : classes) {
-    if (rc == RegClass::FPR32) {
-      fprs.push_back(id);
+  void simplify() {
+    Node node = *simplifyWorkList_.begin();
+    simplifyWorkList_.erase(node);
+    selectStack_.push_back(node);
+    stackNodes_.insert(node);
+    for (Node neighbor : adjacent(node)) {
+      decrementDegree(neighbor);
+    }
+  }
+
+  bool ok(Node neighbor, Node precolored) const {
+    return graph_.degree.at(neighbor) < graph_.colorCount ||
+           graph_.precolored.count(neighbor) != 0 ||
+           graph_.hasEdge(neighbor, precolored);
+  }
+
+  bool conservative(const std::set<Node> &nodes) const {
+    int highDegree = 0;
+    for (Node node : nodes) {
+      auto found = graph_.degree.find(node);
+      if (found != graph_.degree.end() && found->second >= graph_.colorCount) {
+        ++highDegree;
+      }
+    }
+    return highDegree < graph_.colorCount;
+  }
+
+  void addWorkList(Node node) {
+    if (graph_.precolored.count(node) == 0 && !moveRelated(node) &&
+        graph_.degree[node] < graph_.colorCount) {
+      freezeWorkList_.erase(node);
+      simplifyWorkList_.insert(node);
+    }
+  }
+
+  void combine(Node keep, Node removed) {
+    freezeWorkList_.erase(removed);
+    spillWorkList_.erase(removed);
+    simplifyWorkList_.erase(removed);
+    coalescedNodes_.insert(removed);
+    alias_[removed] = keep;
+    graph_.moveList[keep].insert(graph_.moveList[removed].begin(),
+                                 graph_.moveList[removed].end());
+    enableMoves({removed});
+
+    for (Node neighbor : adjacent(removed)) {
+      graph_.addEdge(neighbor, keep, true);
+      decrementDegree(neighbor);
+    }
+    if (graph_.degree[keep] >= graph_.colorCount &&
+        freezeWorkList_.count(keep) != 0) {
+      freezeWorkList_.erase(keep);
+      spillWorkList_.insert(keep);
+    }
+  }
+
+  void coalesce() {
+    const std::size_t moveIndex = firstWorkListMove();
+    Move &move = graph_.moves[moveIndex];
+    Node x = getAlias(move.dst);
+    Node y = getAlias(move.src);
+    Node keep = x;
+    Node removed = y;
+    if (graph_.precolored.count(y) != 0) {
+      keep = y;
+      removed = x;
+    }
+
+    if (keep == removed) {
+      move.state = MoveState::Coalesced;
+      ++coalescedMoveCount_;
+      addWorkList(keep);
+      return;
+    }
+    if (graph_.precolored.count(removed) != 0 ||
+        graph_.hasEdge(keep, removed)) {
+      move.state = MoveState::Constrained;
+      addWorkList(keep);
+      addWorkList(removed);
+      return;
+    }
+
+    // 浮点参数和返回值 COPY 还承担栈上传参与 fa0-fa7 之间的顺序隔离。
+    // 在当前 MIR 中将其与预着色节点合并会丢失该顺序信息。
+    if (graph_.floatBank) {
+      move.state = MoveState::Frozen;
+      addWorkList(keep);
+      addWorkList(removed);
+      return;
+    }
+
+    // 当前流水线在分配前把 PHI 展开为带临时值的 COPY。
+    // 虚拟节点直接合并会绕过该临时值承担的并行复制隔离，因此只保留同色亲和性。
+    if (graph_.precolored.count(keep) == 0) {
+      move.state = MoveState::Frozen;
+      addWorkList(keep);
+      addWorkList(removed);
+      return;
+    }
+
+    bool canCombine = false;
+    if (graph_.precolored.count(keep) != 0) {
+      canCombine = true;
+      for (Node neighbor : adjacent(removed)) {
+        if (!ok(neighbor, keep)) {
+          canCombine = false;
+          break;
+        }
+      }
     } else {
-      gprs.push_back(id);
+      std::set<Node> neighbors = adjacent(keep);
+      const std::set<Node> removedNeighbors = adjacent(removed);
+      neighbors.insert(removedNeighbors.begin(), removedNeighbors.end());
+      canCombine = conservative(neighbors);
+    }
+
+    if (canCombine) {
+      move.state = MoveState::Coalesced;
+      ++coalescedMoveCount_;
+      combine(keep, removed);
+      addWorkList(keep);
+    } else {
+      move.state = MoveState::Active;
     }
   }
-  std::sort(gprs.begin(), gprs.end());
-  std::sort(fprs.begin(), fprs.end());
 
-  ColoringResult result =
-      colorClass(RegClass::GPR64, hasCall, gprs, graph, liveAcrossCall,
-                 forbiddenColors, functionName);
-  ColoringResult fprResult =
-      colorClass(RegClass::FPR32, hasCall, fprs, graph, liveAcrossCall,
-                 forbiddenColors, functionName);
-  result.allocation.insert(fprResult.allocation.begin(),
-                           fprResult.allocation.end());
-  result.spills.insert(result.spills.end(), fprResult.spills.begin(),
-                       fprResult.spills.end());
-  return result;
-}
-
-void rewriteOperand(
-    MachineOperand &operand, const std::unordered_map<uint32_t, PhysReg> &colors) {
-  if (!isVirtualReg(operand)) {
-    return;
-  }
-  const MachineReg oldReg = operand.regValue;
-  auto color = colors.find(oldReg.id);
-  if (color == colors.end()) {
-    throw BackendError("uncolored virtual register after graph coloring");
-  }
-  operand.regValue = MachineReg::preg(color->second, oldReg.rc);
-}
-
-void rewriteFunction(MachineFunction &mf,
-                     const std::unordered_map<uint32_t, PhysReg> &colors) {
-  for (MachineBasicBlock &block : mf.blocks) {
-    for (MachineInstr &instr : block.instrs) {
-      for (MachineOperand &def : instr.defs) {
-        rewriteOperand(def, colors);
-      }
-      for (MachineOperand &use : instr.uses) {
-        rewriteOperand(use, colors);
+  void freezeMoves(Node node) {
+    for (std::size_t moveIndex : nodeMoves(node)) {
+      Move &move = graph_.moves[moveIndex];
+      Node dst = getAlias(move.dst);
+      Node src = getAlias(move.src);
+      Node other = src == getAlias(node) ? dst : src;
+      move.state = MoveState::Frozen;
+      if (freezeWorkList_.count(other) != 0 && !moveRelated(other) &&
+          graph_.degree[other] < graph_.colorCount) {
+        freezeWorkList_.erase(other);
+        simplifyWorkList_.insert(other);
       }
     }
   }
-}
 
-void recordUsedCalleeSaved(
-    MachineFunction &mf, const std::unordered_map<uint32_t, PhysReg> &colors) {
-  std::set<PhysReg> used;
-  for (const auto &[id, reg] : colors) {
-    (void)id;
-    if (getRegisterInfo(reg).calleeSaved) {
-      used.insert(reg);
-    }
+  void freeze() {
+    Node node = *freezeWorkList_.begin();
+    freezeWorkList_.erase(node);
+    simplifyWorkList_.insert(node);
+    freezeMoves(node);
   }
 
-  for (const MachineBasicBlock &block : mf.blocks) {
-    for (const MachineInstr &instr : block.instrs) {
-      for (const MachineOperand &def : instr.defs) {
-        if (def.kind == OperandKind::Reg && def.regValue.physical &&
-            getRegisterInfo(def.regValue.phys).calleeSaved) {
-          used.insert(def.regValue.phys);
+  std::tuple<int, uint64_t, uint32_t> spillKey(Node node) const {
+    const bool rematerializable = info_.rematerializable.count(node) != 0;
+    const bool generated = info_.generatedBySpill.count(node) != 0;
+    const uint64_t heat = info_.heat.count(node) != 0 ? info_.heat.at(node) : 1;
+    const uint64_t degree =
+        static_cast<uint64_t>(std::max(1, graph_.degree.at(node)));
+    const uint64_t score = generated ? std::numeric_limits<uint64_t>::max()
+                                     : (heat * 1024U) / degree;
+    return std::make_tuple(rematerializable ? 0 : 1, score, node);
+  }
+
+  void selectSpill() {
+    Node selected = *spillWorkList_.begin();
+    for (Node node : spillWorkList_) {
+      if (spillKey(node) < spillKey(selected)) {
+        selected = node;
+      }
+    }
+    spillWorkList_.erase(selected);
+    simplifyWorkList_.insert(selected);
+    freezeMoves(selected);
+  }
+
+  std::vector<PhysReg> availableColors(Node node) {
+    const RegClass rc = info_.classes.at(node);
+    std::vector<PhysReg> available = allocationColors(rc);
+    for (Node neighbor : graph_.adjacency[node]) {
+      Node representative = getAlias(neighbor);
+      auto color = colors_.find(representative);
+      if (color == colors_.end()) {
+        continue;
+      }
+      available.erase(
+          std::remove(available.begin(), available.end(), color->second),
+          available.end());
+    }
+    return available;
+  }
+
+  PhysReg chooseColor(Node node, const std::vector<PhysReg> &available) {
+    std::set<PhysReg> affinity;
+    for (std::size_t moveIndex : graph_.moveList[node]) {
+      const Move &move = graph_.moves[moveIndex];
+      Node other = getAlias(move.dst == node ? move.src : move.dst);
+      auto color = colors_.find(other);
+      if (color != colors_.end()) {
+        affinity.insert(color->second);
+      }
+    }
+
+    auto choose = [&](auto predicate) -> PhysReg {
+      for (PhysReg reg : available) {
+        if (predicate(reg)) {
+          return reg;
         }
       }
-      for (const MachineOperand &use : instr.uses) {
-        if (use.kind == OperandKind::Reg && use.regValue.physical &&
-            getRegisterInfo(use.regValue.phys).calleeSaved) {
-          used.insert(use.regValue.phys);
-        }
+      return PhysReg::NoReg;
+    };
+
+    PhysReg color = PhysReg::NoReg;
+    if (!(graph_.floatBank && graph_.containsCall)) {
+      color = choose([&](PhysReg reg) { return affinity.count(reg) != 0; });
+    }
+    if (color != PhysReg::NoReg) {
+      return color;
+    }
+    if (graph_.floatBank && graph_.containsCall) {
+      color =
+          choose([](PhysReg reg) { return getRegisterInfo(reg).calleeSaved; });
+    } else {
+      color =
+          choose([](PhysReg reg) { return getRegisterInfo(reg).callerSaved; });
+    }
+    if (color != PhysReg::NoReg) {
+      return color;
+    }
+    color = choose(
+        [&](PhysReg reg) { return newlyUsedCalleeSaved_.count(reg) != 0; });
+    return color != PhysReg::NoReg ? color : available.front();
+  }
+
+  void assignColors() {
+    while (!selectStack_.empty()) {
+      Node node = selectStack_.back();
+      selectStack_.pop_back();
+      const std::vector<PhysReg> available = availableColors(node);
+      if (available.empty()) {
+        spilledNodes_.insert(node);
+        continue;
+      }
+      PhysReg color = chooseColor(node, available);
+      colors_[node] = color;
+      coloredNodes_.insert(node);
+      if (getRegisterInfo(color).calleeSaved) {
+        newlyUsedCalleeSaved_.insert(color);
+      }
+    }
+
+    for (Node node : coalescedNodes_) {
+      Node representative = getAlias(node);
+      auto color = colors_.find(representative);
+      if (color == colors_.end()) {
+        spilledNodes_.insert(node);
+      } else {
+        colors_[node] = color->second;
       }
     }
   }
+};
 
-  mf.usedCalleeSaved.assign(used.begin(), used.end());
-}
-
-int64_t spillSize(RegClass rc) {
-  return rc == RegClass::GPR64 ? 8 : 4;
-}
+int64_t spillSize(RegClass rc) { return rc == RegClass::GPR64 ? 8 : 4; }
 
 Opcode spillLoadOpcode(RegClass rc) {
   if (rc == RegClass::FPR32) {
@@ -556,47 +1008,150 @@ MachineInstr makeSpillStore(MachineReg src, int frameIndex) {
   return store;
 }
 
-void spillVirtualRegisters(
-    MachineFunction &mf, const std::unordered_map<uint32_t, RegClass> &classes,
-    const std::vector<uint32_t> &spills) {
-  std::unordered_map<uint32_t, int> spillSlots;
-  for (uint32_t id : spills) {
-    if (spillSlots.find(id) != spillSlots.end()) {
-      continue;
+struct SpillRewriteResult {
+  std::set<uint32_t> generated;
+  uint64_t loads = 0;
+  uint64_t stores = 0;
+  uint64_t rematerializations = 0;
+  uint64_t slots = 0;
+};
+
+std::map<uint32_t, int>
+allocateSpillSlots(MachineFunction &mf, const ProgramInfo &info,
+                   const std::vector<uint32_t> &ordinarySpills,
+                   const std::map<uint32_t, std::set<uint32_t>> &conflicts) {
+  struct Slot {
+    int frameIndex = -1;
+    int64_t size = 0;
+    bool floatBank = false;
+    std::set<uint32_t> owners;
+  };
+
+  std::vector<uint32_t> ordered = ordinarySpills;
+  std::sort(ordered.begin(), ordered.end(), [&](uint32_t lhs, uint32_t rhs) {
+    const std::size_t lhsDegree =
+        conflicts.count(lhs) != 0 ? conflicts.at(lhs).size() : 0;
+    const std::size_t rhsDegree =
+        conflicts.count(rhs) != 0 ? conflicts.at(rhs).size() : 0;
+    return lhsDegree != rhsDegree ? lhsDegree > rhsDegree : lhs < rhs;
+  });
+
+  std::vector<Slot> slots;
+  std::map<uint32_t, int> allocation;
+  for (uint32_t id : ordered) {
+    const int64_t size = spillSize(info.classes.at(id));
+    const bool floatBank = isFloatClass(info.classes.at(id));
+    int chosen = -1;
+    for (std::size_t slotIndex = 0; slotIndex < slots.size(); ++slotIndex) {
+      if (slots[slotIndex].size != size ||
+          slots[slotIndex].floatBank != floatBank) {
+        continue;
+      }
+      bool collides = false;
+      for (uint32_t owner : slots[slotIndex].owners) {
+        auto found = conflicts.find(id);
+        if (found != conflicts.end() && found->second.count(owner) != 0) {
+          collides = true;
+          break;
+        }
+      }
+      if (!collides) {
+        chosen = static_cast<int>(slotIndex);
+        break;
+      }
     }
-    RegClass rc = classes.at(id);
-    spillSlots[id] = mf.createStackObject(spillSize(rc), spillSize(rc),
-                                          "spill." + std::to_string(id));
+    if (chosen < 0) {
+      const int frameIndex =
+          mf.createStackObject(size, size, "spill." + std::to_string(id));
+      slots.push_back(Slot{frameIndex, size, floatBank, {}});
+      chosen = static_cast<int>(slots.size() - 1);
+    }
+    slots[static_cast<std::size_t>(chosen)].owners.insert(id);
+    allocation[id] = slots[static_cast<std::size_t>(chosen)].frameIndex;
   }
+  return allocation;
+}
+
+SpillRewriteResult
+rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
+              const std::vector<uint32_t> &spills,
+              const std::map<uint32_t, std::set<uint32_t>> &conflicts) {
+  SpillRewriteResult result;
+  std::set<uint32_t> spillSet(spills.begin(), spills.end());
+  std::set<uint32_t> rematerialized;
+  std::vector<uint32_t> ordinary;
+  for (uint32_t id : spills) {
+    if (info.rematerializable.count(id) != 0) {
+      rematerialized.insert(id);
+    } else {
+      ordinary.push_back(id);
+    }
+  }
+  const std::map<uint32_t, int> spillSlots =
+      allocateSpillSlots(mf, info, ordinary, conflicts);
+  std::set<int> uniqueSlots;
+  for (const auto &[id, slot] : spillSlots) {
+    (void)id;
+    uniqueSlots.insert(slot);
+  }
+  result.slots = uniqueSlots.size();
 
   for (MachineBasicBlock &block : mf.blocks) {
     std::vector<MachineInstr> rewritten;
     for (MachineInstr instr : block.instrs) {
+      bool removeDefinition = false;
+      for (const MachineOperand &def : instr.defs) {
+        if (isVirtualReg(def) && rematerialized.count(def.regValue.id) != 0) {
+          removeDefinition = true;
+        }
+      }
+      if (removeDefinition) {
+        continue;
+      }
+
+      std::map<uint32_t, MachineReg> replacements;
       for (MachineOperand &use : instr.uses) {
-        if (!isVirtualReg(use)) {
+        if (!isVirtualReg(use) || spillSet.count(use.regValue.id) == 0) {
           continue;
         }
-        auto slot = spillSlots.find(use.regValue.id);
-        if (slot == spillSlots.end()) {
-          continue;
+        const uint32_t id = use.regValue.id;
+        auto replacement = replacements.find(id);
+        if (replacement == replacements.end()) {
+          MachineReg temp = mf.createVReg(use.regValue.rc);
+          replacements[id] = temp;
+          result.generated.insert(temp.id);
+          if (rematerialized.count(id) != 0) {
+            MachineInstr clone = info.rematerializable.at(id);
+            clone.defs[0] = MachineOperand::reg(temp);
+            rewritten.push_back(std::move(clone));
+            ++result.rematerializations;
+          } else {
+            rewritten.push_back(makeSpillLoad(temp, spillSlots.at(id)));
+            ++result.loads;
+          }
+          replacement = replacements.find(id);
         }
-        MachineReg tmp = mf.createVReg(use.regValue.rc);
-        rewritten.push_back(makeSpillLoad(tmp, slot->second));
-        use.regValue = tmp;
+        use.regValue = replacement->second;
       }
 
       std::vector<MachineInstr> stores;
       for (MachineOperand &def : instr.defs) {
-        if (!isVirtualReg(def)) {
+        if (!isVirtualReg(def) || spillSlots.count(def.regValue.id) == 0) {
           continue;
         }
-        auto slot = spillSlots.find(def.regValue.id);
-        if (slot == spillSlots.end()) {
-          continue;
+        const uint32_t id = def.regValue.id;
+        MachineReg temp;
+        auto replacement = replacements.find(id);
+        if (replacement != replacements.end()) {
+          temp = replacement->second;
+        } else {
+          temp = mf.createVReg(def.regValue.rc);
+          replacements[id] = temp;
+          result.generated.insert(temp.id);
         }
-        MachineReg tmp = mf.createVReg(def.regValue.rc);
-        def.regValue = tmp;
-        stores.push_back(makeSpillStore(tmp, slot->second));
+        def.regValue = temp;
+        stores.push_back(makeSpillStore(temp, spillSlots.at(id)));
+        ++result.stores;
       }
 
       rewritten.push_back(std::move(instr));
@@ -604,39 +1159,181 @@ void spillVirtualRegisters(
     }
     block.instrs = std::move(rewritten);
   }
+  return result;
 }
 
-void allocateRegistersImpl(MachineFunction &mf, int depth) {
-  if (depth > kMaxSpillIterations) {
-    throw BackendError("register allocation spill iteration limit exceeded in " +
-                       mf.name);
-  }
-
-  std::unordered_map<uint32_t, RegClass> classes;
-  collectVRegs(mf, classes);
-  if (classes.empty()) {
+void rewriteOperand(MachineOperand &operand,
+                    const std::map<uint32_t, PhysReg> &colors) {
+  if (!isVirtualReg(operand)) {
     return;
   }
-
-  const Liveness live = computeLiveness(mf);
-  const AllocationGraph graph = buildAllocationGraph(mf, classes, live);
-  const ColoringResult colors =
-      colorGraph(classes, graph.interference, graph.liveAcrossCall,
-                 graph.forbiddenColors, containsCall(mf), mf.name);
-  if (!colors.spills.empty()) {
-    spillVirtualRegisters(mf, classes, colors.spills);
-    allocateRegistersImpl(mf, depth + 1);
-    return;
+  auto color = colors.find(operand.regValue.id);
+  if (color == colors.end()) {
+    throw BackendError("uncolored virtual register after graph coloring");
   }
-
-  recordUsedCalleeSaved(mf, colors.allocation);
-  rewriteFunction(mf, colors.allocation);
+  operand.regValue = MachineReg::preg(color->second, operand.regValue.rc);
 }
 
-} // namespace
+void rewriteFunction(MachineFunction &mf,
+                     const std::map<uint32_t, PhysReg> &colors) {
+  for (MachineBasicBlock &block : mf.blocks) {
+    std::vector<MachineInstr> rewritten;
+    for (MachineInstr instr : block.instrs) {
+      for (MachineOperand &def : instr.defs) {
+        rewriteOperand(def, colors);
+      }
+      for (MachineOperand &use : instr.uses) {
+        rewriteOperand(use, colors);
+      }
+      const bool redundantCopy =
+          (instr.opcode == Opcode::COPY || instr.opcode == Opcode::F_COPY) &&
+          instr.defs.size() == 1 && instr.uses.size() == 1 &&
+          instr.defs[0].kind == OperandKind::Reg &&
+          instr.uses[0].kind == OperandKind::Reg &&
+          instr.defs[0].regValue.physical && instr.uses[0].regValue.physical &&
+          instr.defs[0].regValue.phys == instr.uses[0].regValue.phys;
+      if (!redundantCopy) {
+        rewritten.push_back(std::move(instr));
+      }
+    }
+    block.instrs = std::move(rewritten);
+  }
+}
+
+void recordUsedCalleeSaved(MachineFunction &mf,
+                           const std::map<uint32_t, PhysReg> &colors) {
+  std::set<PhysReg> used;
+  for (const auto &[id, reg] : colors) {
+    (void)id;
+    if (getRegisterInfo(reg).calleeSaved) {
+      used.insert(reg);
+    }
+  }
+  for (const MachineBasicBlock &block : mf.blocks) {
+    for (const MachineInstr &instr : block.instrs) {
+      for (const MachineOperand &operand : instr.defs) {
+        if (isPhysicalReg(operand) &&
+            getRegisterInfo(operand.regValue.phys).calleeSaved) {
+          used.insert(operand.regValue.phys);
+        }
+      }
+      for (const MachineOperand &operand : instr.uses) {
+        if (isPhysicalReg(operand) &&
+            getRegisterInfo(operand.regValue.phys).calleeSaved) {
+          used.insert(operand.regValue.phys);
+        }
+      }
+    }
+  }
+  mf.usedCalleeSaved.assign(used.begin(), used.end());
+}
+
+std::string allocationSignature(const MachineFunction &mf,
+                                const std::vector<uint32_t> &spills) {
+  std::string signature = std::to_string(mf.nextVReg) + ":" +
+                          std::to_string(mf.stackObjects.size());
+  for (const MachineBasicBlock &block : mf.blocks) {
+    signature += ":" + std::to_string(block.instrs.size());
+  }
+  signature += "|";
+  for (uint32_t id : spills) {
+    signature += std::to_string(id) + ",";
+  }
+  return signature;
+}
+
+void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
+  std::set<uint32_t> generatedBySpill;
+  std::string previousSignature;
+  int repeatedSignature = 0;
+
+  for (int round = 0; round < kEmergencyRoundLimit; ++round) {
+    if (stats != nullptr) {
+      ++stats->rounds;
+    }
+    ProgramInfo info = analyzeProgram(mf, generatedBySpill);
+    if (info.classes.empty()) {
+      return;
+    }
+    const Liveness live = computeLiveness(mf);
+
+    ColoringResult gpr =
+        IRCAllocator(buildAllocationGraph(mf, info, live, false), info).run();
+    ColoringResult fpr =
+        IRCAllocator(buildAllocationGraph(mf, info, live, true), info).run();
+
+    std::map<uint32_t, PhysReg> colors = gpr.colors;
+    colors.insert(fpr.colors.begin(), fpr.colors.end());
+    std::vector<uint32_t> spills = gpr.spills;
+    spills.insert(spills.end(), fpr.spills.begin(), fpr.spills.end());
+    if (!spills.empty()) {
+      // 高压函数若逐轮只挑出一个常量，会退化为与常量数成正比的重分配轮次。
+      // 既然 LI/LA 无需栈槽，可在首次确认压力后批量缩短其生命周期。
+      for (const auto &[id, definition] : info.rematerializable) {
+        (void)definition;
+        spills.push_back(id);
+      }
+      if (info.classes.size() > 64 || round >= 1) {
+        std::vector<uint32_t> batch;
+        const std::size_t batchLimit = info.classes.size() > 64 ? 8 : 64;
+        const std::size_t gprCount =
+            std::min<std::size_t>(batchLimit, gpr.potentialSpills.size());
+        batch.insert(batch.end(), gpr.potentialSpills.begin(),
+                     gpr.potentialSpills.begin() + gprCount);
+        const std::size_t remaining = batchLimit - batch.size();
+        const std::size_t fprCount =
+            std::min<std::size_t>(remaining, fpr.potentialSpills.size());
+        batch.insert(batch.end(), fpr.potentialSpills.begin(),
+                     fpr.potentialSpills.begin() + fprCount);
+        spills.insert(spills.end(), batch.begin(), batch.end());
+      }
+    }
+    std::sort(spills.begin(), spills.end());
+    spills.erase(std::unique(spills.begin(), spills.end()), spills.end());
+
+    if (stats != nullptr) {
+      stats->coalescedMoves += gpr.coalescedMoves + fpr.coalescedMoves;
+    }
+    if (spills.empty()) {
+      recordUsedCalleeSaved(mf, colors);
+      rewriteFunction(mf, colors);
+      return;
+    }
+
+    std::map<uint32_t, std::set<uint32_t>> conflicts = gpr.spillConflicts;
+    for (const auto &[id, neighbors] : fpr.spillConflicts) {
+      conflicts[id].insert(neighbors.begin(), neighbors.end());
+    }
+    const std::string signature = allocationSignature(mf, spills);
+    repeatedSignature =
+        signature == previousSignature ? repeatedSignature + 1 : 0;
+    if (repeatedSignature >= 2) {
+      throw BackendError("register allocation made no progress in " + mf.name);
+    }
+    previousSignature = signature;
+
+    SpillRewriteResult rewrite = rewriteSpills(mf, info, spills, conflicts);
+    generatedBySpill.insert(rewrite.generated.begin(), rewrite.generated.end());
+    if (stats != nullptr) {
+      stats->spilledVRegs += spills.size();
+      stats->spillLoads += rewrite.loads;
+      stats->spillStores += rewrite.stores;
+      stats->rematerializations += rewrite.rematerializations;
+      stats->spillSlots += rewrite.slots;
+    }
+  }
+  throw BackendError("register allocation emergency round limit exceeded in " +
+                     mf.name);
+}
+
+} // anonymous namespace
 
 void allocateRegisters(MachineFunction &mf) {
-  allocateRegistersImpl(mf, 0);
+  allocateRegistersImpl(mf, nullptr);
+}
+
+void allocateRegisters(MachineFunction &mf, RegAllocStats *stats) {
+  allocateRegistersImpl(mf, stats);
 }
 
 } // namespace riscv
