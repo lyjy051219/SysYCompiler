@@ -32,8 +32,8 @@ bool hasCall(const MachineFunction &mf) {
 }
 
 bool isLoad(Opcode opcode) {
-  return opcode == Opcode::LBU || opcode == Opcode::LW || opcode == Opcode::LD ||
-         opcode == Opcode::FLW;
+  return opcode == Opcode::LBU || opcode == Opcode::LW ||
+         opcode == Opcode::LD || opcode == Opcode::FLW;
 }
 
 bool isFprVirtualReg(const MachineOperand &operand) {
@@ -126,15 +126,18 @@ void FrameLowering::assignFrameLayout(MachineFunction &mf) {
   }
 
   offset = alignTo(offset, 16);
-  if (hasCall(mf)) {
+  const bool containsCall = hasCall(mf);
+  if (containsCall || !mf.usedCalleeSaved.empty()) {
     offset = alignTo(offset, 8);
-    offset += 8; // ra
+    if (containsCall) {
+      offset += 8; // 返回地址
+    }
     if (!mf.usedCalleeSaved.empty()) {
       offset += static_cast<int64_t>(mf.usedCalleeSaved.size()) * 8;
-    } else {
-      offset += 8 * 11; // s1-s11 used by the temporary non-leaf mapper.
+    } else if (containsCall) {
+      offset += 8 * 11; // 临时非叶映射器使用 s1-s11。
       if (usesFprVirtualRegs(mf)) {
-        offset += 8 * 12; // fs0-fs11 used for non-leaf floating-point values.
+        offset += 8 * 12; // 非叶浮点临时值使用 fs0-fs11。
       }
     }
   }
