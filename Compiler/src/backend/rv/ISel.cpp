@@ -220,7 +220,11 @@ MachineReg materializeFloat(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
-  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT);
+  // IR_POINTER 也是标量类型，PHI 节点可能产生指针类型结果
+  // 修复 fft/sl/2024-* 等用例的 "unsupported operand type=3 inst=PHI" 错误
+  return type && (type->getEnum() == IR_INT ||
+                  type->getEnum() == IR_FLOAT ||
+                  type->getEnum() == IR_POINTER);
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
