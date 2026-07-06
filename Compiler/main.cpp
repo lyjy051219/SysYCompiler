@@ -63,32 +63,6 @@ int main(int argc, const char *argv[]) {
     //运行优化--传入ModuleIR和ModuleAnalysisPassManager
     MPM.run(*ModuleIR, MAM);
 
-/*
-    //备选方案：运行时库声明
-    //使用qemu模拟RISC-V环境下进行测试的时候用这个
-    // 1. 打印 Target Triple
-    std::cout << "target datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n64-S128\"\n";
-    std::cout << "target triple = \"riscv64-linux-gnu\"\n";
-    std::cout << "\n";
-
-    // 2. 运行时库函数声明
-
-    std::cout << "declare i32 @getint()\n";
-    std::cout << "declare i32 @getch()\n";
-    std::cout << "declare float @getfloat()\n";
-    std::cout << "declare i32 @getarray(i32*)\n";
-    std::cout << "declare i32 @getfarray(float*)\n";
-    std::cout << "declare void @putint(i32)\n";
-    std::cout << "declare void @putch(i32)\n";
-    std::cout << "declare void @putfloat(float)\n";
-    std::cout << "declare void @putarray(i32, i32*)\n";
-    std::cout << "declare void @putfarray(i32, float*)\n";
-    std::cout << "declare void @putf(i8*, ...)\n";
-    std::cout << "declare void @_sysy_starttime(i32)\n";
-    std::cout << "declare void @_sysy_stoptime(i32)\n";
-    std::cout << "declare void @llvm.memset.p0.i32(i8*, i8, i32, i1)\n";
-    std::cout << "\n";
-*/
 
 #ifdef ENABLE_RISCV_BACKEND
     try {
