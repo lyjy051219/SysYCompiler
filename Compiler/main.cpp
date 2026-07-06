@@ -20,8 +20,28 @@
 //全局变量，用来作为AST根节点
 std::unique_ptr<CompUnit> ASTRoot = nullptr;
 std::unique_ptr<Module> ModuleIR = std::make_unique<Module>();
+#if 0
 const std::string RUNTIME_PATH = std::string(RUNTIME_DIR) + "/runtime.ll";
+#endif
 extern FILE *yyin;
+
+static void dumpRuntimeDeclarationsForExternalLink() {
+    std::cout << "declare i32 @getint()\n";
+    std::cout << "declare i32 @getch()\n";
+    std::cout << "declare float @getfloat()\n";
+    std::cout << "declare i32 @getarray(i32*)\n";
+    std::cout << "declare i32 @getfarray(float*)\n";
+    std::cout << "declare void @putint(i32)\n";
+    std::cout << "declare void @putch(i32)\n";
+    std::cout << "declare void @putfloat(float)\n";
+    std::cout << "declare void @putarray(i32, i32*)\n";
+    std::cout << "declare void @putfarray(i32, float*)\n";
+    std::cout << "declare void @putf(i8*, ...)\n";
+    std::cout << "declare void @_sysy_starttime(i32)\n";
+    std::cout << "declare void @_sysy_stoptime(i32)\n\n";
+    std::cout << "declare void @llvm.memcpy.p0.p0.i32(ptr, ptr, i32, i1)\n\n";
+}
+
 int main(int argc, const char *argv[]) {
     (void)argc;
     //./Compiler -S -o program.s/.ll文件 program.sy
@@ -79,6 +99,8 @@ int main(int argc, const char *argv[]) {
 #else
     freopen(outputPath.c_str(), "w", stdout);
     //4.运行时库注入到.ll最前面（lli 测试需要）
+    // llc + qemu 测试链路会在链接阶段使用 runtime/sylib.c，暂时不要把 runtime.ll 拼进 IR。
+#if 0
     std::ifstream runtimeFile(RUNTIME_PATH);
     if (!runtimeFile.is_open()) {
         std::cerr << "Error: Cannot open runtime.ll at " << RUNTIME_PATH << std::endl;
@@ -87,9 +109,11 @@ int main(int argc, const char *argv[]) {
         std::cout << "\n";
         runtimeFile.close();
     }
+#endif
 
 
     //5.输出生成的IR（追加在运行时库之后）
+    dumpRuntimeDeclarationsForExternalLink();
     ModuleIR->dumpIR();
     fclose(stdout);
 #endif

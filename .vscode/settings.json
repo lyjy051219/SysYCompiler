@@ -139,5 +139,8 @@
         "*.inc": "cpp"
     },
     "C_Cpp.errorSquiggles": "disabled",
-    "cmake.sourceDirectory": "/home/lyjy/Compiler/Compiler"
+    "cmake.sourceDirectory": "/home/lyjy/Compiler/Compiler",
+
+    // Notebook 默认使用这个 conda 环境，避免 VS Code 一直卡在连接 kernel。
+    "python.defaultInterpreterPath": "/home/lyjy/miniconda3/envs/LYJYCompiler_test/bin/python"
 }
