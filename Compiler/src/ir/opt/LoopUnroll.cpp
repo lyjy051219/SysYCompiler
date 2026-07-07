@@ -57,20 +57,6 @@ std::string makeUnrollBlockIdent(Function *F,
     return makeUniqueBlockIdent(F, Base);
 }
 
-std::string makePeelBlockIdent(Function *F,
-                               BasicBlock *BB,
-                               int Iter,
-                               int PeelSerial) {
-    std::string Base = BB ? BB->getIdent() : "bb";
-
-    Base += ".peel";
-    Base += std::to_string(PeelSerial);
-    Base += ".";
-    Base += std::to_string(Iter);
-
-    return makeUniqueBlockIdent(F, Base);
-}
-
 std::vector<BasicBlock *> collectAllLoopBlocks(Loop *L) {
     std::vector<BasicBlock *> Blocks;
     if (!L) return Blocks;
@@ -301,16 +287,6 @@ struct UnrolledBodyCore {
     std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
 };
 
-struct PeeledBodyCore {
-    LoopExecutionShape Shape;
-    int PeelCount = 0;
-    std::vector<std::vector<BasicBlock *>> IterBlocks;
-    std::vector<BasicBlock *> Headers;
-    std::vector<BasicBlock *> Latches;
-    std::vector<BasicBlock *> Exitings;
-    std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
-};
-
 std::optional<LoopExecutionShape>
 getLoopExecutionShape(Loop *L, SCEVResult &SE) {
     if (!L) return std::nullopt;
@@ -409,19 +385,6 @@ Value *mapDataValueAtIteration(Value *V,
                                const UnrolledBodyCore &Core) {
     if (!V) return nullptr;
     if (Iter > 0 && Iter < static_cast<int>(Core.ValueMaps.size())) {
-        auto It = Core.ValueMaps[Iter].find(V);
-        if (It != Core.ValueMaps[Iter].end()) {
-            return isDataValue(It->second) ? It->second : nullptr;
-        }
-    }
-    return isDataValue(V) ? V : nullptr;
-}
-
-Value *mapDataValueAtPeelIteration(Value *V,
-                                   int Iter,
-                                   const PeeledBodyCore &Core) {
-    if (!V) return nullptr;
-    if (Iter >= 0 && Iter < static_cast<int>(Core.ValueMaps.size())) {
         auto It = Core.ValueMaps[Iter].find(V);
         if (It != Core.ValueMaps[Iter].end()) {
             return isDataValue(It->second) ? It->second : nullptr;
@@ -551,48 +514,6 @@ bool removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
     return true;
 }
 
-bool removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
-    if (Iter < 0 || Iter >= Core.PeelCount) return false;
-
-    BasicBlock *OrigHeader = Core.Shape.Header;
-    BasicBlock *OrigLatch = Core.Shape.Latch;
-    BasicBlock *PreHeader = Core.Shape.PreHeader;
-    BasicBlock *ClonedHeader = Core.Headers[Iter];
-    if (!OrigHeader || !OrigLatch || !PreHeader || !ClonedHeader) {
-        return false;
-    }
-
-    auto OrigPhis = OrigHeader->collectPhiNodes();
-    auto ClonedPhis = ClonedHeader->collectPhiNodes();
-    if (ClonedPhis.size() < OrigPhis.size()) return false;
-
-    for (size_t I = 0; I < OrigPhis.size(); ++I) {
-        PhiInst *OrigPhi = OrigPhis[I];
-        PhiInst *ClonedPhi = ClonedPhis[I];
-        if (!OrigPhi || !ClonedPhi) return false;
-
-        Value *Replacement = nullptr;
-        if (Iter == 0) {
-            Replacement = OrigPhi->getIncomingFromPred(PreHeader);
-        } else {
-            Value *BackedgeValue = OrigPhi->getIncomingFromPred(OrigLatch);
-            if (!BackedgeValue) return false;
-            Replacement =
-                mapDataValueAtPeelIteration(BackedgeValue, Iter - 1, Core);
-        }
-
-        if (!isValueCompatibleWithPhi(Replacement, ClonedPhi)) {
-            return false;
-        }
-
-        ClonedPhi->replaceAllUsesWith(Replacement);
-        Core.ValueMaps[Iter][OrigPhi] = Replacement;
-        delete ClonedPhi;
-    }
-
-    return true;
-}
-
 std::optional<UnrolledBodyCore>
 cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
     if (!L || Count < 2 || hasSubLoops(L)) return std::nullopt;
@@ -663,81 +584,6 @@ cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
         }
 
         if (!removeClonedHeaderPhis(Core, Iter)) {
-            return std::nullopt;
-        }
-    }
-
-    return Core;
-}
-
-std::optional<PeeledBodyCore>
-clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
-    if (!L || PeelCount <= 0 || hasSubLoops(L)) return std::nullopt;
-
-    auto Shape = getLoopExecutionShape(L, SE);
-    if (!Shape || !Shape->Header || !Shape->PreHeader || !Shape->Latch ||
-        !Shape->Exiting || !Shape->Exit || !Shape->Header->getParent()) {
-        return std::nullopt;
-    }
-
-    std::vector<BasicBlock *> LoopBlocks = collectLoopBlocksInFunctionOrder(L);
-    if (LoopBlocks.empty() || !canCloneAllInstructions(LoopBlocks)) {
-        return std::nullopt;
-    }
-
-    Function *F = Shape->Header->getParent();
-    int PeelSerial = nextUnrollSerial();
-    PeeledBodyCore Core;
-    Core.Shape = *Shape;
-    Core.PeelCount = PeelCount;
-    Core.IterBlocks.resize(PeelCount);
-    Core.Headers.resize(PeelCount);
-    Core.Latches.resize(PeelCount);
-    Core.Exitings.resize(PeelCount);
-    Core.ValueMaps.resize(PeelCount);
-
-    for (int Iter = 0; Iter < PeelCount; ++Iter) {
-        auto &VMap = Core.ValueMaps[Iter];
-        std::unordered_map<BasicBlock *, BasicBlock *> BlockMap;
-
-        for (BasicBlock *BB : LoopBlocks) {
-            auto *NewBB = new BasicBlock();
-            NewBB->setIdent(makePeelBlockIdent(F, BB, Iter, PeelSerial));
-            F->pushBlock(NewBB);
-            VMap[BB] = NewBB;
-            BlockMap[BB] = NewBB;
-            Core.IterBlocks[Iter].push_back(NewBB);
-        }
-
-        Core.Headers[Iter] = BlockMap[Shape->Header];
-        Core.Latches[Iter] = BlockMap[Shape->Latch];
-        Core.Exitings[Iter] = BlockMap[Shape->Exiting];
-        if (!Core.Headers[Iter] || !Core.Latches[Iter] ||
-            !Core.Exitings[Iter]) {
-            return std::nullopt;
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
-
-            for (Instruction *I : *BB) {
-                Instruction *NewI = I->clone(VMap);
-                if (!NewI) return std::nullopt;
-                NewBB->push_back(NewI);
-                VMap[I] = NewI;
-            }
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
-            for (Instruction *I : *NewBB) {
-                replaceOperandsUsingMap(I, VMap);
-            }
-        }
-
-        if (!removePeeledHeaderPhis(Core, Iter)) {
             return std::nullopt;
         }
     }
@@ -830,86 +676,6 @@ bool rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
     }
     for (const PhiRewritePlan &Plan : Plans) {
         delete Plan.OldPhi;
-    }
-
-    return true;
-}
-
-bool rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core) {
-    BasicBlock *Header = Core.Shape.Header;
-    BasicBlock *PreHeader = Core.Shape.PreHeader;
-    BasicBlock *OrigLatch = Core.Shape.Latch;
-    int LastIter = Core.PeelCount - 1;
-    BasicBlock *LastPeeledLatch =
-        LastIter >= 0 && LastIter < static_cast<int>(Core.Latches.size())
-            ? Core.Latches[LastIter]
-            : nullptr;
-
-    if (!Header || !PreHeader || !OrigLatch || !LastPeeledLatch) {
-        return false;
-    }
-
-    auto HeaderPhis = Header->collectPhiNodes();
-    for (PhiInst *Phi : HeaderPhis) {
-        if (!Phi) continue;
-
-        auto Incoming = Phi->collectIncomingEdges();
-        std::vector<PhiInst::IncomingEdge> NewIncoming;
-        NewIncoming.reserve(Incoming.size());
-
-        Value *BackedgeValue = nullptr;
-        for (const auto &Edge : Incoming) {
-            if (Edge.Pred == PreHeader) {
-                continue;
-            }
-
-            if (Edge.Pred == OrigLatch) {
-                BackedgeValue = Edge.V;
-            }
-
-            NewIncoming.push_back(Edge);
-        }
-
-        if (!BackedgeValue) return false;
-
-        Value *NewInitial =
-            mapDataValueAtPeelIteration(BackedgeValue, LastIter, Core);
-        if (!isValueCompatibleWithPhi(NewInitial, Phi)) {
-            return false;
-        }
-
-        NewIncoming.push_back({NewInitial, LastPeeledLatch});
-
-        if (!rebuildPhiFromIncomingChecked(Phi, NewIncoming)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &Core) {
-    BasicBlock *Exit = Core.Shape.Exit;
-    if (!Exit) return false;
-
-    std::unordered_set<BasicBlock *> RemovedPreds;
-    for (BasicBlock *BB : Core.Exitings) {
-        if (BB) RemovedPreds.insert(BB);
-    }
-
-    for (PhiInst *Phi : Exit->collectPhiNodes()) {
-        if (!Phi) continue;
-
-        std::vector<PhiInst::IncomingEdge> Incoming;
-        for (const auto &Edge : Phi->collectIncomingEdges()) {
-            if (!RemovedPreds.count(Edge.Pred)) {
-                Incoming.push_back(Edge);
-            }
-        }
-
-        if (!rebuildPhiFromIncomingChecked(Phi, Incoming)) {
-            return false;
-        }
     }
 
     return true;
@@ -2498,111 +2264,11 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     SCEVResult &SE,
     LoopInfo &LI,
     DominatorTree &DT) {
+    (void)L;
+    (void)Decision;
+    (void)SE;
     (void)LI;
     (void)DT;
-
-    if (!L || Decision.Count <= 0) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    int PeelCount = Decision.Count;
-    if (hasSubLoops(L)) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    std::vector<BasicBlock *> ExitBlocks = L->getExitBlocks();
-    if (ExitBlocks.size() != 1 || !ExitBlocks.front()) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    std::unordered_set<BasicBlock *> ExitingBlocks;
-    for (BasicBlock *BB : collectAllLoopBlocks(L)) {
-        if (isLoopExitingBlock(L, BB)) {
-            ExitingBlocks.insert(BB);
-        }
-    }
-    if (ExitingBlocks.size() != 1) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    auto TCI = SE.analyzeLoopTripCount(L);
-    if (!TCI || !TCI->Valid || !TCI->ConstantTripCount ||
-        *TCI->ConstantTripCount <= PeelCount) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    auto ShapeOpt = getLoopExecutionShape(L, SE);
-    if (!ShapeOpt || !ShapeOpt->PreHeader || !ShapeOpt->Header ||
-        !ShapeOpt->Latch || !ShapeOpt->Exiting || !ShapeOpt->Exit) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    bool LatchExiting = ShapeOpt->Exiting == ShapeOpt->Latch;
-    bool HeaderExiting = ShapeOpt->Exiting == ShapeOpt->Header;
-    if (!LatchExiting && !HeaderExiting) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    std::vector<BasicBlock *> LoopBlocks = collectLoopBlocksInFunctionOrder(L);
-    if (LoopBlocks.empty() || !canCloneAllInstructions(LoopBlocks)) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    auto Core = clonePeeledIterations(L, PeelCount, SE);
-    if (!Core) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    if (LatchExiting) {
-        for (int Iter = 0; Iter < PeelCount; ++Iter) {
-            BasicBlock *Target =
-                Iter + 1 < PeelCount ? Core->Headers[Iter + 1]
-                                     : Core->Shape.Header;
-
-            if (!Core->Exitings[Iter] || !Target ||
-                !BasicBlock::replaceCondBrWithUncond(Core->Exitings[Iter],
-                                                     Target)) {
-                return LoopUnrollResult::Unmodified;
-            }
-        }
-    } else if (HeaderExiting) {
-        for (int Iter = 0; Iter < PeelCount; ++Iter) {
-            BasicBlock *Body =
-                getNonExitSuccessor(Core->Headers[Iter], Core->Shape.Exit);
-            if (!Body ||
-                !BasicBlock::replaceCondBrWithUncond(Core->Headers[Iter],
-                                                     Body)) {
-                return LoopUnrollResult::Unmodified;
-            }
-
-            BasicBlock *Target =
-                Iter + 1 < PeelCount ? Core->Headers[Iter + 1]
-                                     : Core->Shape.Header;
-
-            if (!Core->Latches[Iter] || !Target ||
-                !BasicBlock::redirectBranchTarget(Core->Latches[Iter],
-                                                  Core->Headers[Iter],
-                                                  Target)) {
-                return LoopUnrollResult::Unmodified;
-            }
-        }
-    }
-
-    if (Core->Headers.empty() || !Core->Headers[0] ||
-        !BasicBlock::redirectBranchTarget(Core->Shape.PreHeader,
-                                          Core->Shape.Header,
-                                          Core->Headers[0])) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    if (!rewriteOriginalHeaderPhisAfterPeeling(*Core)) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    if (!removeIncomingFromExitPhisForPeeledBlocks(*Core)) {
-        return LoopUnrollResult::Unmodified;
-    }
-
-    SE.clear();
-    return LoopUnrollResult::PartiallyUnrolled;
+    // TODO: implement initial-iteration peeling and PHI repair.
+    return LoopUnrollResult::Unmodified;
 }
