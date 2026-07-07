@@ -328,6 +328,20 @@ void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
 
 } // namespace
 
+void MachineFunctionPassManager::addPass(Pass pass) {
+  if (pass) {
+    passes_.push_back(pass);
+  }
+}
+
+bool MachineFunctionPassManager::run(MachineFunction &mf) const {
+  bool changed = false;
+  for (Pass pass : passes_) {
+    changed = pass(mf) || changed;
+  }
+  return changed;
+}
+
 void rebuildCFG(MachineFunction &mf) {
   for (MachineBasicBlock &block : mf.blocks) {
     block.preds.clear();
@@ -455,31 +469,14 @@ void lowerSelectPseudo(MachineFunction &mf) {
 }
 
 void runPreRAOptimizations(MachineFunction &mf) {
-  (void)mf;
+  MachineFunctionPassManager pipeline;
+  (void)pipeline.run(mf);
 }
 
 void runPostRAOptimizations(MachineFunction &mf) {
-  for (MachineBasicBlock &block : mf.blocks) {
-    block.instrs.erase(
-        std::remove_if(block.instrs.begin(), block.instrs.end(),
-                       [](const MachineInstr &instr) {
-                         if (instr.opcode != Opcode::COPY &&
-                             instr.opcode != Opcode::F_COPY &&
-                             instr.opcode != Opcode::PARALLEL_COPY) {
-                           return false;
-                         }
-                         if (instr.defs.size() != 1 || instr.uses.size() != 1 ||
-                             instr.defs.front().kind != OperandKind::Reg ||
-                             instr.uses.front().kind != OperandKind::Reg) {
-                           return false;
-                         }
-                         const MachineReg def = instr.defs.front().regValue;
-                         const MachineReg use = instr.uses.front().regValue;
-                         return def.physical == use.physical &&
-                                def.id == use.id && def.phys == use.phys;
-                       }),
-        block.instrs.end());
-  }
+  MachineFunctionPassManager pipeline;
+  pipeline.addPass(runPostRAPeephole);
+  (void)pipeline.run(mf);
 }
 
 } // namespace riscv
