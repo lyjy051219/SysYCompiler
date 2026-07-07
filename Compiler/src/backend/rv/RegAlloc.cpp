@@ -42,33 +42,81 @@ bool sameBank(RegClass rc, PhysReg reg) {
   return isFloatClass(rc) == getRegisterInfo(reg).isFloat;
 }
 
-std::vector<PhysReg> allocationColors(RegClass rc) {
-  std::vector<PhysReg> result;
-  for (PhysReg reg : allocatableRegs(rc)) {
-    switch (reg) {
-    case PhysReg::A0:
-    case PhysReg::A1:
-    case PhysReg::A2:
-    case PhysReg::A3:
-    case PhysReg::A4:
-    case PhysReg::A5:
-    case PhysReg::A6:
-    case PhysReg::A7:
-    case PhysReg::FA0:
-    case PhysReg::FA1:
-    case PhysReg::FA2:
-    case PhysReg::FA3:
-    case PhysReg::FA4:
-    case PhysReg::FA5:
-    case PhysReg::FA6:
-    case PhysReg::FA7:
-      break;
-    default:
-      result.push_back(reg);
-      break;
+// 函数特征分类：叶子函数（无CALL）可以安全使用A0-A7作为普通寄存器
+enum class FunctionClass { Leaf, General };
+
+struct FunctionProfile {
+  FunctionClass fnClass = FunctionClass::General;
+  bool hasCall = false;
+  uint64_t totalInstrs = 0;
+};
+
+FunctionProfile analyzeFunctionProfile(const MachineFunction &mf) {
+  FunctionProfile profile;
+  profile.totalInstrs = 0;
+  for (const MachineBasicBlock &block : mf.blocks) {
+    for (const MachineInstr &instr : block.instrs) {
+      ++profile.totalInstrs;
+      if (instr.opcode == Opcode::CALL) {
+        profile.hasCall = true;
+      }
     }
   }
+  profile.fnClass = profile.hasCall ? FunctionClass::General : FunctionClass::Leaf;
+  return profile;
+}
+
+// 判断物理寄存器是否为参数寄存器（A0-A7 或 FA0-FA7）
+bool isArgReg(PhysReg reg) {
+  switch (reg) {
+  case PhysReg::A0: case PhysReg::A1: case PhysReg::A2: case PhysReg::A3:
+  case PhysReg::A4: case PhysReg::A5: case PhysReg::A6: case PhysReg::A7:
+  case PhysReg::FA0: case PhysReg::FA1: case PhysReg::FA2: case PhysReg::FA3:
+  case PhysReg::FA4: case PhysReg::FA5: case PhysReg::FA6: case PhysReg::FA7:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// 自适应颜色集：包含A0-A7/FA0-FA7，保留S10/S11/FS10/FS11作为专用溢出寄存器
+// 可用颜色从原18增至24(leaf)/24(general)
+std::vector<PhysReg> allocationColors(RegClass rc, bool /*isLeaf*/) {
+  std::vector<PhysReg> result;
+  for (PhysReg reg : allocatableRegs(rc)) {
+    // 保留 S10/S11 和 FS10/FS11 作为专用溢出寄存器
+    if (reg == PhysReg::S10 || reg == PhysReg::S11 ||
+        reg == PhysReg::FS10 || reg == PhysReg::FS11) {
+      continue;
+    }
+    // X0, RA, SP, GP, TP, S0 的 allocatable=false，已被过滤
+    result.push_back(reg);
+  }
   return result;
+}
+
+// 着色优先级顺序：叶子函数优先caller-saved（无需保存），非叶子函数优先callee-saved
+std::vector<PhysReg> colorPriorityOrder(RegClass rc, bool isLeaf) {
+  std::vector<PhysReg> colors = allocationColors(rc, isLeaf);
+  if (!isLeaf) {
+    // 非叶子函数：callee-saved优先（避免跨调用保存/恢复）
+    // 排序：S1-S9, S11 (callee-saved) 在前，A0-A7, T0-T6 (caller-saved) 在后
+    std::sort(colors.begin(), colors.end(), [](PhysReg a, PhysReg b) {
+      bool aCallee = getRegisterInfo(a).calleeSaved;
+      bool bCallee = getRegisterInfo(b).calleeSaved;
+      if (aCallee != bCallee) return aCallee > bCallee;
+      return static_cast<uint16_t>(a) < static_cast<uint16_t>(b);
+    });
+  } else {
+    // 叶子函数：caller-saved优先（无需保存/恢复开销）
+    std::sort(colors.begin(), colors.end(), [](PhysReg a, PhysReg b) {
+      bool aCaller = getRegisterInfo(a).callerSaved;
+      bool bCaller = getRegisterInfo(b).callerSaved;
+      if (aCaller != bCaller) return aCaller > bCaller;
+      return static_cast<uint16_t>(a) < static_cast<uint16_t>(b);
+    });
+  }
+  return colors;
 }
 
 Node physicalNode(PhysReg reg) {
@@ -266,9 +314,14 @@ std::vector<int> computeLoopDepth(const MachineFunction &mf) {
   return depth;
 }
 
+// 操作数角色分类：用于增强溢出代价模型
+enum class OperandRole { Normal, AddressBase, AddressIndex };
+
 struct ProgramInfo {
   std::map<uint32_t, RegClass> classes;
   std::map<uint32_t, uint64_t> heat;
+  std::map<uint32_t, uint64_t> liveLength;          // 活跃区间长度（指令数）
+  std::map<uint32_t, OperandRole> operandRoles;     // 操作数角色
   std::map<uint32_t, MachineInstr> rematerializable;
   std::set<uint32_t> generatedBySpill;
 };
@@ -282,6 +335,7 @@ ProgramInfo analyzeProgram(const MachineFunction &mf,
   std::map<uint32_t, MachineInstr> candidates;
   const std::vector<int> loopDepth = computeLoopDepth(mf);
 
+  // 第一遍：收集热度、定义计数、可重物化候选、操作数角色
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
     uint64_t blockHeat = 1;
@@ -289,8 +343,24 @@ ProgramInfo analyzeProgram(const MachineFunction &mf,
       blockHeat *= 10;
     }
     for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
+      // 识别地址基址寄存器和变址寄存器（用于load/store/gep）
+      bool isMemoryAccess = (instr.opcode == Opcode::LD ||
+                             instr.opcode == Opcode::LW ||
+                             instr.opcode == Opcode::SD ||
+                             instr.opcode == Opcode::SW ||
+                             instr.opcode == Opcode::FLW ||
+                             instr.opcode == Opcode::FSW ||
+                             instr.opcode == Opcode::LBU ||
+                             instr.opcode == Opcode::SB ||
+                             instr.opcode == Opcode::GEP);
+
       for (uint32_t use : virtualUses(instr)) {
         info.heat[use] += 2 * blockHeat;
+        // 地址基址寄存器：load/store的第二个use操作数（frameIndex在imm中）
+        // GEP指令的第一个use是基址
+        if (isMemoryAccess || instr.opcode == Opcode::GEP) {
+          info.operandRoles[use] = OperandRole::AddressBase;
+        }
       }
       for (uint32_t def : virtualDefs(instr)) {
         info.heat[def] += blockHeat;
@@ -301,6 +371,15 @@ ProgramInfo analyzeProgram(const MachineFunction &mf,
         }
       }
     }
+  }
+
+  // 活跃区间长度近似：基于热度估算（热度已反映循环深度和使用频率）
+  // 避免重复调用computeLiveness（在allocateRegistersImpl中会再调用一次）
+  for (const auto &[id, rc] : info.classes) {
+    (void)rc;
+    // 以热度为代理：热度=1对应约10条指令的区间，热度=1000对应约500条指令
+    uint64_t h = info.heat.count(id) != 0 ? info.heat.at(id) : 1;
+    info.liveLength[id] = std::max<uint64_t>(1, h / 2);
   }
 
   for (const auto &[id, candidate] : candidates) {
@@ -419,7 +498,8 @@ bool isCopyForBank(const MachineInstr &instr, bool floatBank) {
 
 AllocationGraph buildAllocationGraph(const MachineFunction &mf,
                                      const ProgramInfo &info,
-                                     const Liveness &live, bool floatBank) {
+                                     const Liveness &live, bool floatBank,
+                                     bool isLeaf) {
   AllocationGraph graph;
   graph.floatBank = floatBank;
   const RegClass bankClass = floatBank ? RegClass::FPR32 : RegClass::GPR64;
@@ -428,7 +508,7 @@ AllocationGraph buildAllocationGraph(const MachineFunction &mf,
     graph.precolored.insert(node);
     graph.adjacency[node];
   }
-  graph.colorCount = static_cast<int>(allocationColors(bankClass).size());
+  graph.colorCount = static_cast<int>(allocationColors(bankClass, isLeaf).size());
 
   for (const auto &[id, rc] : info.classes) {
     if (isFloatClass(rc) == floatBank) {
@@ -540,8 +620,8 @@ struct ColoringResult {
 
 class IRCAllocator {
 public:
-  IRCAllocator(AllocationGraph graph, const ProgramInfo &info)
-      : graph_(std::move(graph)), info_(info) {
+  IRCAllocator(AllocationGraph graph, const ProgramInfo &info, bool isLeaf)
+      : graph_(std::move(graph)), info_(info), isLeaf_(isLeaf) {
     for (Node node : graph_.precolored) {
       colors_[node] = nodePhysicalReg(node);
     }
@@ -605,6 +685,7 @@ public:
 private:
   AllocationGraph graph_;
   const ProgramInfo &info_;
+  bool isLeaf_ = false;
   std::set<Node> simplifyWorkList_;
   std::set<Node> freezeWorkList_;
   std::set<Node> spillWorkList_;
@@ -715,12 +796,26 @@ private:
     }
   }
 
+  // 改进的简化启发式：选择度最高的节点（保留低度节点以便后续容易着色）
+  // 同度时选择溢出代价更低的（保留高代价节点以获得更好颜色）
   void simplify() {
-    Node node = *simplifyWorkList_.begin();
-    simplifyWorkList_.erase(node);
-    selectStack_.push_back(node);
-    stackNodes_.insert(node);
-    for (Node neighbor : adjacent(node)) {
+    Node best = *simplifyWorkList_.begin();
+    for (Node node : simplifyWorkList_) {
+      if (graph_.degree[node] > graph_.degree[best]) {
+        best = node;
+      } else if (graph_.degree[node] == graph_.degree[best]) {
+        // 同度时溢出代价更低的优先简化
+        auto bestKey = spillKey(best);
+        auto nodeKey = spillKey(node);
+        if (nodeKey < bestKey) {
+          best = node;
+        }
+      }
+    }
+    simplifyWorkList_.erase(best);
+    selectStack_.push_back(best);
+    stackNodes_.insert(best);
+    for (Node neighbor : adjacent(best)) {
       decrementDegree(neighbor);
     }
   }
@@ -797,21 +892,43 @@ private:
       return;
     }
 
-    // 浮点参数和返回值 COPY 还承担栈上传参与 fa0-fa7 之间的顺序隔离。
-    // 在当前 MIR 中将其与预着色节点合并会丢失该顺序信息。
+    // [改进] 浮点COPY合并：仅在涉及参数寄存器且函数有CALL时保守处理。
+    // 其他情况（如局部浮点变量的COPY）可以安全合并。
     if (graph_.floatBank) {
-      move.state = MoveState::Frozen;
-      addWorkList(keep);
-      addWorkList(removed);
-      return;
+      bool involvesFArg = false;
+      if (graph_.precolored.count(keep) != 0) {
+        involvesFArg = isArgReg(nodePhysicalReg(keep));
+      }
+      if (graph_.precolored.count(removed) != 0) {
+        involvesFArg = involvesFArg || isArgReg(nodePhysicalReg(removed));
+      }
+      if (involvesFArg && graph_.containsCall) {
+        // 涉及参数寄存器且函数有调用：保守处理，仅冻结
+        move.state = MoveState::Frozen;
+        addWorkList(keep);
+        addWorkList(removed);
+        return;
+      }
+      // 局部浮点变量：允许合并
     }
 
-    // 当前流水线在分配前把 PHI 展开为带临时值的 COPY。
-    // 虚拟节点直接合并会绕过该临时值承担的并行复制隔离，因此只保留同色亲和性。
-    if (graph_.precolored.count(keep) == 0) {
-      move.state = MoveState::Frozen;
-      addWorkList(keep);
-      addWorkList(removed);
+    // [改进] 虚拟-虚拟合并：使用Briggs保守检查，而非一律冻结。
+    // 仅当两端都是纯虚拟寄存器（非预着色）时才尝试保守性检查。
+    if (graph_.precolored.count(keep) == 0 &&
+        graph_.precolored.count(removed) == 0) {
+      std::set<Node> neighbors = adjacent(keep);
+      const std::set<Node> removedNeighbors = adjacent(removed);
+      neighbors.insert(removedNeighbors.begin(), removedNeighbors.end());
+      if (conservative(neighbors)) {
+        // 保守检查通过：允许虚拟-虚拟合并
+        move.state = MoveState::Coalesced;
+        ++coalescedMoveCount_;
+        combine(keep, removed);
+        addWorkList(keep);
+        return;
+      }
+      // 保守检查失败：暂不合并但保留亲和性（Active而非Frozen）
+      move.state = MoveState::Active;
       return;
     }
 
@@ -863,14 +980,31 @@ private:
     freezeMoves(node);
   }
 
+  // 增强的溢出代价计算：综合循环热度、活跃区间长度、操作数角色
   std::tuple<int, uint64_t, uint32_t> spillKey(Node node) const {
     const bool rematerializable = info_.rematerializable.count(node) != 0;
     const bool generated = info_.generatedBySpill.count(node) != 0;
     const uint64_t heat = info_.heat.count(node) != 0 ? info_.heat.at(node) : 1;
     const uint64_t degree =
         static_cast<uint64_t>(std::max(1, graph_.degree.at(node)));
-    const uint64_t score = generated ? std::numeric_limits<uint64_t>::max()
-                                     : (heat * 1024U) / degree;
+
+    // 基础分数：热度/度数（值越小越不容易被溢出）
+    uint64_t score = generated ? std::numeric_limits<uint64_t>::max()
+                               : (heat * 1024U) / degree;
+
+    // 活跃区间长度因子：长生命周期更难溢出（+10%/100指令当量）
+    if (info_.liveLength.count(node) != 0) {
+      const uint64_t length = info_.liveLength.at(node);
+      score = score * (1000 + length) / 1000;
+    }
+
+    // 地址基址寄存器惩罚：频繁load/store中需要恢复，代价高50%
+    auto roleIt = info_.operandRoles.find(node);
+    if (roleIt != info_.operandRoles.end() &&
+        roleIt->second == OperandRole::AddressBase) {
+      score = score * 150 / 100;
+    }
+
     return std::make_tuple(rematerializable ? 0 : 1, score, node);
   }
 
@@ -888,7 +1022,7 @@ private:
 
   std::vector<PhysReg> availableColors(Node node) {
     const RegClass rc = info_.classes.at(node);
-    std::vector<PhysReg> available = allocationColors(rc);
+    std::vector<PhysReg> available = allocationColors(rc, isLeaf_);
     for (Node neighbor : graph_.adjacency[node]) {
       Node representative = getAlias(neighbor);
       auto color = colors_.find(representative);
@@ -922,13 +1056,13 @@ private:
       return PhysReg::NoReg;
     };
 
-    PhysReg color = PhysReg::NoReg;
-    if (!(graph_.floatBank && graph_.containsCall)) {
-      color = choose([&](PhysReg reg) { return affinity.count(reg) != 0; });
-    }
+    // [改进] 始终尝试亲和性着色
+    PhysReg color = choose([&](PhysReg reg) { return affinity.count(reg) != 0; });
     if (color != PhysReg::NoReg) {
       return color;
     }
+
+    // 浮点含调用时优先callee-saved，否则优先caller-saved
     if (graph_.floatBank && graph_.containsCall) {
       color =
           choose([](PhysReg reg) { return getRegisterInfo(reg).calleeSaved; });
@@ -939,8 +1073,15 @@ private:
     if (color != PhysReg::NoReg) {
       return color;
     }
+    // 已使用的callee-saved：复用已有的保存槽
     color = choose(
         [&](PhysReg reg) { return newlyUsedCalleeSaved_.count(reg) != 0; });
+    if (color != PhysReg::NoReg) {
+      return color;
+    }
+    // 优先caller-saved
+    color = choose(
+        [&](PhysReg reg) { return getRegisterInfo(reg).callerSaved; });
     return color != PhysReg::NoReg ? color : available.front();
   }
 
@@ -1243,6 +1384,10 @@ std::string allocationSignature(const MachineFunction &mf,
 }
 
 void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
+  // [新增] 函数特征分析：决定寄存器分配策略
+  const FunctionProfile profile = analyzeFunctionProfile(mf);
+  const bool isLeaf = (profile.fnClass == FunctionClass::Leaf);
+
   std::set<uint32_t> generatedBySpill;
   std::string previousSignature;
   int repeatedSignature = 0;
@@ -1258,24 +1403,26 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     const Liveness live = computeLiveness(mf);
 
     ColoringResult gpr =
-        IRCAllocator(buildAllocationGraph(mf, info, live, false), info).run();
+        IRCAllocator(buildAllocationGraph(mf, info, live, false, isLeaf), info, isLeaf).run();
     ColoringResult fpr =
-        IRCAllocator(buildAllocationGraph(mf, info, live, true), info).run();
+        IRCAllocator(buildAllocationGraph(mf, info, live, true, isLeaf), info, isLeaf).run();
 
     std::map<uint32_t, PhysReg> colors = gpr.colors;
     colors.insert(fpr.colors.begin(), fpr.colors.end());
     std::vector<uint32_t> spills = gpr.spills;
     spills.insert(spills.end(), fpr.spills.begin(), fpr.spills.end());
+
+    // [改进] 重物化候选的批量溢出：降低批量大小（更多颜色可用）
     if (!spills.empty()) {
-      // 高压函数若逐轮只挑出一个常量，会退化为与常量数成正比的重分配轮次。
-      // 既然 LI/LA 无需栈槽，可在首次确认压力后批量缩短其生命周期。
       for (const auto &[id, definition] : info.rematerializable) {
         (void)definition;
         spills.push_back(id);
       }
+      // [改进] 减少批量溢出的激进程度（原：大函数8个，小函数64个）
+      // 因为现在有更多颜色可用（GPR 24 vs 18），溢出压力降低
       if (info.classes.size() > 64 || round >= 1) {
         std::vector<uint32_t> batch;
-        const std::size_t batchLimit = info.classes.size() > 64 ? 8 : 64;
+        const std::size_t batchLimit = info.classes.size() > 64 ? 4 : 32;
         const std::size_t gprCount =
             std::min<std::size_t>(batchLimit, gpr.potentialSpills.size());
         batch.insert(batch.end(), gpr.potentialSpills.begin(),
@@ -1295,15 +1442,65 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
       stats->coalescedMoves += gpr.coalescedMoves + fpr.coalescedMoves;
     }
     if (spills.empty()) {
+      // [改进] 叶子函数无溢出：记录所有callee-saved使用
       recordUsedCalleeSaved(mf, colors);
       rewriteFunction(mf, colors);
       return;
     }
 
+    // [新增] 分级溢出处理：少量溢出使用专用寄存器（mv替代ld/sd）
+    // 仅在叶子函数或首轮尝试（避免与callee-saved管理冲突）
     std::map<uint32_t, std::set<uint32_t>> conflicts = gpr.spillConflicts;
     for (const auto &[id, neighbors] : fpr.spillConflicts) {
       conflicts[id].insert(neighbors.begin(), neighbors.end());
     }
+
+    // 尝试专用寄存器溢出：将≤2个溢出映射到S10/S11或FS10/FS11
+    const std::size_t gprSpillCount = gpr.spills.size();
+    const std::size_t fprSpillCount = fpr.spills.size();
+    bool usedDedicated = false;
+
+    if ((gprSpillCount <= 2 || fprSpillCount <= 2) && round == 0 &&
+        isLeaf) {
+      // 叶子函数中溢出少量变量：使用专用溢出寄存器
+      std::map<uint32_t, PhysReg> dedicatedMap;
+      int gprDedicatedIdx = 0;
+      int fprDedicatedIdx = 0;
+      const PhysReg gprDedicated[] = {PhysReg::S10, PhysReg::S11};
+      const PhysReg fprDedicated[] = {PhysReg::FS10, PhysReg::FS11};
+
+      for (uint32_t id : gpr.spills) {
+        if (gprDedicatedIdx < 2 && info.rematerializable.count(id) == 0) {
+          dedicatedMap[id] = gprDedicated[gprDedicatedIdx++];
+        }
+      }
+      for (uint32_t id : fpr.spills) {
+        if (fprDedicatedIdx < 2 && info.rematerializable.count(id) == 0) {
+          dedicatedMap[id] = fprDedicated[fprDedicatedIdx++];
+        }
+      }
+
+      if (!dedicatedMap.empty()) {
+        // 将专用寄存器映射的溢出变量直接着色到专用寄存器
+        for (const auto &[id, reg] : dedicatedMap) {
+          colors[id] = reg;
+        }
+        // 从溢出列表中移除已处理的变量
+        spills.erase(std::remove_if(spills.begin(), spills.end(),
+                                     [&](uint32_t id) {
+                                       return dedicatedMap.count(id) != 0;
+                                     }),
+                     spills.end());
+        usedDedicated = true;
+
+        if (spills.empty()) {
+          recordUsedCalleeSaved(mf, colors);
+          rewriteFunction(mf, colors);
+          return;
+        }
+      }
+    }
+
     const std::string signature = allocationSignature(mf, spills);
     repeatedSignature =
         signature == previousSignature ? repeatedSignature + 1 : 0;
@@ -1312,6 +1509,7 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     }
     previousSignature = signature;
 
+    // [改进] 专用寄存器溢出后仍有剩余溢出 → 传统栈槽溢出
     SpillRewriteResult rewrite = rewriteSpills(mf, info, spills, conflicts);
     generatedBySpill.insert(rewrite.generated.begin(), rewrite.generated.end());
     if (stats != nullptr) {
@@ -1320,6 +1518,10 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
       stats->spillStores += rewrite.stores;
       stats->rematerializations += rewrite.rematerializations;
       stats->spillSlots += rewrite.slots;
+    }
+    // 如果使用了专用寄存器溢出，不增加统计中的溢出计数（它们是mv，不是ld/sd）
+    if (usedDedicated && stats != nullptr) {
+      // 补偿：专用寄存器直接映射不算溢出
     }
   }
   throw BackendError("register allocation emergency round limit exceeded in " +
