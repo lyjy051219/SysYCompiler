@@ -1,7 +1,6 @@
 #include "../../include/lib/CFG.hpp"
 #include "../../include/lib/BaseManager.hpp"
 #include "CFG.hpp"
-#include <cmath>
 #include <sstream>
 #include <map>
 #include <queue>
@@ -1320,26 +1319,8 @@ void Initializer::Var2Store(BasicBlock *bb, const std::string &name, std::vector
     }
 }
 
-static bool isAllZeroInitializer(Value *value) {
-    if (auto *init = dynamic_cast<Initializer *>(value)) {
-        for (Value *element : *init) {
-            if (!isAllZeroInitializer(element)) return false;
-        }
-        return true;
-    }
-    if (auto *valueInt = dynamic_cast<ConstInt *>(value))
-        return valueInt->getVal() == 0;
-    if (auto *valueBool = dynamic_cast<ConstBool *>(value))
-        return !valueBool->getVal();
-    if (auto *valueFloat = dynamic_cast<ConstFloat *>(value)) {
-        const float number = valueFloat->getVal();
-        return number == 0.0f && !std::signbit(number);
-    }
-    return dynamic_cast<ConstPtr *>(value) != nullptr;
-}
-
 void Initializer::dumpIR(){
-    if(isAllZeroInitializer(this)){
+    if(size() == 0){
         std::cout << "zeroinitializer";
         return;
     }

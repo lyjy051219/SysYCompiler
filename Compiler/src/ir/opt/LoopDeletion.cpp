@@ -42,8 +42,6 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
     //TopLevel+后序遍历所有循环
 	for (Loop* L : PostOrderLoops) {
 		if (!L || !L->getHeader()) continue;
-		if (L->getHeader()->getParent() != &F) continue;
-		if (!L->getSubLoops().empty()) continue;
 
 		// 1) 必须满足 LCSSA
 		if (!LCSSAPass::isLCSSAForm(L)) continue;
@@ -150,8 +148,7 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 				Stack.pop_back();
 				if (!Cur) continue;
 				for (BasicBlock* BB : Cur->getBlocks()) {
-					if (BB && BB->getParent() == &F &&
-						Seen.insert(BB).second) {
+					if (BB && Seen.insert(BB).second) {
 						LoopBlocks.push_back(BB);
 					}
 				}
@@ -199,7 +196,7 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 			}
 
 			Changed = true;
-			break;
+			continue;
 		}
 
 		// 5) 多出口的情况：直接返回（跳过该循环）
@@ -269,8 +266,7 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 			Stack.pop_back();
 			if (!Cur) continue;
 			for (BasicBlock* BB : Cur->getBlocks()) {
-				if (BB && BB->getParent() == &F &&
-					Seen.insert(BB).second) {
+				if (BB && Seen.insert(BB).second) {
 					LoopBlocks.push_back(BB);
 				}
 			}
@@ -318,7 +314,6 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 		}
 
 		Changed = true;
-		break;
 	}
 
 	(void)DT;
@@ -330,6 +325,6 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 	PA.discard<LoopAnalysis>();
 	PA.discard<BasicAliasAnalysis>();
 	PA.discard<SideEffectAnalysis>();
-	PA.discard<SCEVAnalysis>();
+	// SCEVAnalysis 尚未实现，待补齐后在此处添加失效处理。
 	return PA;
 }

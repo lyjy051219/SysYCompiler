@@ -14,7 +14,6 @@
 #include "ir/opt/LoopRotate.hpp"
 #include "ir/opt/LICM.hpp"
 #include "ir/opt/LoopDeletion.hpp"
-#include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/TailRecursionElimination.hpp"
 #include "ir/opt/Reassociate.hpp"
 #include "ir/opt/Local2Global.hpp"
@@ -37,7 +36,6 @@
 #include "ir/opt/LateDeadGlobalCleanup.hpp"
 #include "ir/opt/LatePhiCleanup.hpp"
 #include "ir/opt/LateStrengthReduce.hpp"
-#include "ir/opt/LoopStrengthReduction.hpp"
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
@@ -91,26 +89,6 @@ static FunctionPassManager buildHeavyMemoryPipeline() {
     return FPM;
 }
 
-// 2.5 展开后深度清理 Pipeline
-// LoopUnroll 会复制控制流、扩大基本块并暴露退化 PHI / 常量分支 / 死副本。
-// 这里使用偏局部、确定性的清理组合，收敛展开带来的直接噪声，再把循环形态
-// 修回 LoopSimplify + LCSSA，供后续 LICM / LSR 继续消费。
-static FunctionPassManager buildPostUnrollCleanupPipeline() {
-    FunctionPassManager FPM;
-    FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(InstSimplifyPass());
-    FPM.addPass(SCCPPass());
-    FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(DCEPass());
-    FPM.addPass(LatePhiCleanupPass());
-    FPM.addPass(InstSimplifyPass());
-    FPM.addPass(DCEPass());
-    FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(LoopSimplifyPass());
-    FPM.addPass(LCSSAPass());
-    return FPM;
-}
-
 // 3. 循环优化 Pipeline
 // 针对循环结构的深度优化，限制迭代次数，防止编译挂起
 static FunctionPassManager buildLoopPipeline() {
@@ -118,19 +96,9 @@ static FunctionPassManager buildLoopPipeline() {
     FPM.addPass(BreakCriticalEdgesPass());
     FPM.addPass(LoopSimplifyPass());
     FPM.addPass(LCSSAPass());
-
-    // 先旋转/规范化，再重新建立 LoopSimplify + LCSSA，让 Unroll 看到更稳定的
-    // trip-count 和 latch/header 形态。
     FPM.addPass(LoopRotatePass());
-    FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(LoopSimplifyPass());
-    FPM.addPass(LCSSAPass());
     FPM.addPass(LICMPass());         // 循环不变量外提
     FPM.addPass(LoopDeletionPass()); // 消除死循环或无用循环
-    FPM.addPass(LoopStrengthReductionPass()); // GEP 地址归纳变量强度削弱
-    FPM.addPass(LoopUnrollPass());
-    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
-        buildPostUnrollCleanupPipeline(), 2));
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     return FPM;
@@ -144,13 +112,7 @@ static FunctionPassManager buildPostLoopCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(GepCombinePass());
-    FPM.addPass(GepEvaluatePass());
-    FPM.addPass(DCEPass());
     FPM.addPass(LateStrengthReducePass());
-    FPM.addPass(InstSimplifyPass());
-    FPM.addPass(GepCombinePass());
-    FPM.addPass(GepEvaluatePass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LatePhiCleanupPass());
