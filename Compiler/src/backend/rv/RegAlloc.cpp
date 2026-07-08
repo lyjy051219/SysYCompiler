@@ -43,32 +43,7 @@ bool sameBank(RegClass rc, PhysReg reg) {
 }
 
 std::vector<PhysReg> allocationColors(RegClass rc) {
-  std::vector<PhysReg> result;
-  for (PhysReg reg : allocatableRegs(rc)) {
-    switch (reg) {
-    case PhysReg::A0:
-    case PhysReg::A1:
-    case PhysReg::A2:
-    case PhysReg::A3:
-    case PhysReg::A4:
-    case PhysReg::A5:
-    case PhysReg::A6:
-    case PhysReg::A7:
-    case PhysReg::FA0:
-    case PhysReg::FA1:
-    case PhysReg::FA2:
-    case PhysReg::FA3:
-    case PhysReg::FA4:
-    case PhysReg::FA5:
-    case PhysReg::FA6:
-    case PhysReg::FA7:
-      break;
-    default:
-      result.push_back(reg);
-      break;
-    }
-  }
-  return result;
+  return allocatableRegs(rc);
 }
 
 Node physicalNode(PhysReg reg) {
@@ -923,19 +898,11 @@ private:
     };
 
     PhysReg color = PhysReg::NoReg;
-    if (!(graph_.floatBank && graph_.containsCall)) {
-      color = choose([&](PhysReg reg) { return affinity.count(reg) != 0; });
-    }
+    color = choose([&](PhysReg reg) { return affinity.count(reg) != 0; });
     if (color != PhysReg::NoReg) {
       return color;
     }
-    if (graph_.floatBank && graph_.containsCall) {
-      color =
-          choose([](PhysReg reg) { return getRegisterInfo(reg).calleeSaved; });
-    } else {
-      color =
-          choose([](PhysReg reg) { return getRegisterInfo(reg).callerSaved; });
-    }
+    color = choose([](PhysReg reg) { return getRegisterInfo(reg).callerSaved; });
     if (color != PhysReg::NoReg) {
       return color;
     }

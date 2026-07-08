@@ -112,6 +112,30 @@ bool isFprVirtualReg(const MachineOperand &operand) {
          operand.regValue.rc == RegClass::FPR32;
 }
 
+bool isGprVirtualReg(const MachineOperand &operand) {
+  return operand.kind == OperandKind::Reg && !operand.regValue.physical &&
+         (operand.regValue.rc == RegClass::GPR32 ||
+          operand.regValue.rc == RegClass::GPR64);
+}
+
+bool functionUsesGprVirtualRegs(const MachineFunction &function) {
+  for (const MachineBasicBlock &block : function.blocks) {
+    for (const MachineInstr &instr : block.instrs) {
+      for (const MachineOperand &def : instr.defs) {
+        if (isGprVirtualReg(def)) {
+          return true;
+        }
+      }
+      for (const MachineOperand &use : instr.uses) {
+        if (isGprVirtualReg(use)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool functionUsesFprVirtualRegs(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -180,7 +204,7 @@ std::vector<PhysReg> gprCalleeSavedRegsToSave(const MachineFunction &function) {
   if (!regs.empty() || !functionContainsCall(function)) {
     return regs;
   }
-  if (function.usedCalleeSaved.empty()) {
+  if (function.usedCalleeSaved.empty() && functionUsesGprVirtualRegs(function)) {
     return std::vector<PhysReg>(kNonLeafGprScratchRegs.begin(),
                                 kNonLeafGprScratchRegs.end());
   }
