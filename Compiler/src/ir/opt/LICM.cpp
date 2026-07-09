@@ -12,16 +12,6 @@
 #include <vector>
 
 
-using ExitValueKey = std::pair<BasicBlock *, Value *>;
-
-struct ExitValueKeyHash {
-	std::size_t operator()(const ExitValueKey &K) const {
-		auto A = reinterpret_cast<std::uintptr_t>(K.first);
-		auto B = reinterpret_cast<std::uintptr_t>(K.second);
-		return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
-	}
-};
-
 // 1) 检查所有 user 是否都在循环外
 static bool isAllUsersOutLoop(Instruction *I, const Loop &L) {
 	for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
@@ -140,8 +130,20 @@ static bool isSideEffect(
 		auto &UL = LIst->getUserList();
 		if (UL.empty() || !UL[0]) return false;
 		Value *Ptr = UL[0]->getValue();
+		bool UseIndexRange = LIst->getIRType() &&
+			LIst->getIRType()->getEnum() != IR_FLOAT;
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == I) continue;
+			if (UseIndexRange) {
+				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
+					auto &SUL = SI->getUserList();
+					if (SUL.size() < 2 || !SUL[1]) return false;
+					Value *StorePtr = SUL[1]->getValue();
+					if (AA.aliasWithIndexRange(Ptr, StorePtr, LI) == AliasInfo::NoAlias)
+						continue;
+					return false;
+				}
+			}
 			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
 			if (isModSet(MRI)) return false;
 		}

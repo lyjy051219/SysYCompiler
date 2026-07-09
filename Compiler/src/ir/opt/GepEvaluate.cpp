@@ -24,11 +24,8 @@
 // 拆分不改变地址计算语义：两个 GEP 串联的偏移等价于原始单个 GEP。
 // =====================================================================
 
-namespace {
-
 static bool isConstZero(Value *V) {
-    auto *CI = dynamic_cast<ConstInt *>(V);
-    return CI && CI->getVal() == 0;
+    return V && V->isConstIntZero();
 }
 
 static bool evaluateGEP(Function &F) {
@@ -91,9 +88,7 @@ static bool evaluateGEP(Function &F) {
                 auto *frontGEP = new GetElementPtrInst(Base, frontIndices);
                 frontGEP->updateType();
 
-                auto it = BB->begin();
-                while (*it != GEP && *it != nullptr) ++it;
-                it.insertBefore(frontGEP);
+                GEP->insertBefore(frontGEP);
 
                 std::vector<Value *> backIndices;
                 backIndices.push_back(ConstInt::newConstInt(0));
@@ -112,8 +107,6 @@ static bool evaluateGEP(Function &F) {
 
     return changed;
 }
-
-} // namespace
 
 PreservationStatus GepEvaluatePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = evaluateGEP(F);

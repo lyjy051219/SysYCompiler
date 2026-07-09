@@ -25,8 +25,6 @@
 //              自然判定 S1 为 dead。不需要单个 store 后支配 S1。
 // =====================================================================
 
-namespace {
-
 // =====================================================================
 // 块染色结果
 // =====================================================================
@@ -96,53 +94,6 @@ bool eliminateInBlock(BasicBlock *BB) {
 // Phase 2: 全局 DSE — Forward Kill Coverage
 // =====================================================================
 
-// isLocalPointer: P 指向的内存在函数返回后对 caller 不可见。
-// 只追溯到 AllocaInst 返回 true。
-// 不是通用 escape analysis，不用于证明"call 不会读到"。
-// 仅用于 exit 可见性判断。
-static bool isLocalPointer(Value *P) {
-    Value *base = P;
-    while (base) {
-        if (dynamic_cast<AllocaInst *>(base)) {
-            return true;
-        }
-        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(base)) {
-            if (GEP->getUserList().empty()) return false;
-            base = GEP->getUserList()[0]->getValue();
-            continue;
-        }
-        if (auto *BC = dynamic_cast<BitCastInst *>(base)) {
-            if (BC->getUserList().empty()) return false;
-            base = BC->getUserList()[0]->getValue();
-            continue;
-        }
-        // Global, Param, or anything else → not local
-        return false;
-    }
-    return false;
-}
-
-// callMayAliasPointer: 保守检查 — 如果 CallInst 传递了任何可能 alias P 的指针参数，
-// 返回 true。这是对 getInstModRefInfo 的补充安全网。
-// 原因：SideEffectAnalysis 对自递归调用会跳过 (SideEffect.cpp:277)，
-// 导致 getInstModRefInfo 可能对递归调用返回 NoModRef，但实际上调用会修改 P。
-static bool callMayAliasPointer(
-    CallInst *CI, Value *P,
-    BasicAAResult &AA, const LoopInfo &LI)
-{
-    auto &UL = CI->getUserList();
-    // UL[0] = callee, UL[1..] = arguments
-    for (size_t i = 1; i < UL.size(); ++i) {
-        Value *Arg = UL[i] ? UL[i]->getValue() : nullptr;
-        if (!Arg) continue;
-        if (!Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) continue;
-        if (AA.alias(P, Arg, LI) != AliasInfo::NoAlias) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // classifyBlock: 扫描整个块，确定该块对指针 P 的第一个相关事件。
 //
 // 【假设】当前 IR 中 MustAlias 隐含完整覆盖（同类型同宽度）。
@@ -169,7 +120,7 @@ static BlockColor classifyBlock(
         // 这是对 getInstModRefInfo 的补充，因为 SideEffectAnalysis
         // 对自递归调用可能返回不完整的 ModRef 信息。
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (callMayAliasPointer(CI, P, AA, LI)) {
+            if (AA.callMayAliasPointer(CI, P, LI)) {
                 return BlockColor::CLOBBER;
             }
         }
@@ -218,7 +169,7 @@ static BlockColor classifyBlockPartial(
 
         // CallInst 安全网（同 classifyBlock 中的逻辑）
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (callMayAliasPointer(CI, P, AA, LI)) {
+            if (AA.callMayAliasPointer(CI, P, LI)) {
                 return BlockColor::CLOBBER;
             }
         }
@@ -265,7 +216,7 @@ static bool isStoreDead(
     {
         auto b1Succs = B1->getSuccessors();
         if (b1Succs.empty()) {
-            if (isLocalPointer(P)) {
+            if (Value::isLocalStackPointer(P)) {
                 return true;   // 局部变量，返回后无人读，store 可删
             } else {
                 return false;  // 非局部指针，caller 可能读 → S1 alive
@@ -321,7 +272,7 @@ static bool isStoreDead(
             // exit 块：函数即将返回。
             // 只有 P 是栈内存（返回后对 caller 不可见）时才可忽略此 exit。
             // 非局部指针（global/param）在函数返回后 caller 可能读 → S1 alive。
-            if (isLocalPointer(P)) {
+            if (Value::isLocalStackPointer(P)) {
                 continue;
             } else {
                 return false;
@@ -336,8 +287,6 @@ static bool isStoreDead(
     // BFS 完成，所有路径都被 KILL 挡住或走到了安全 exit
     return true;
 }
-
-} // namespace
 
 // =====================================================================
 // DSEPass::run

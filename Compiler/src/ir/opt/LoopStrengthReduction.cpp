@@ -7,6 +7,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -19,93 +20,17 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
 constexpr int kUnsupportedMaterializeCost = 1000000;
 constexpr int64_t kMaxOffsetRange = 16;
 constexpr int kMaxPointerIVsPerInnerLoop = 8;
 constexpr int kMaxPointerIVsPerOuterLoop = 4;
 
-struct IndexComponent {
-    Value *Raw = nullptr;
-    const SCEVExpr *Expr = nullptr;
-};
-
-struct LSRCandidate {
-    GetElementPtrInst *OldGEP = nullptr;
-    Value *Base = nullptr;
-    Value *Index = nullptr;
-    const SCEVExpr *Start = nullptr;
-    std::optional<int64_t> StartConst;
-    std::vector<IndexComponent> Prefix;
-    Loop *L = nullptr;
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Header = nullptr;
-    BasicBlock *Latch = nullptr;
-    int64_t Step = 0;
-    int64_t LastIndexStride = 0;
-    bool HasLeadingZero = false;
-    bool Used = false;
-};
-
-struct LSRGroup {
-    size_t Order = 0;
-    std::vector<LSRCandidate *> Items;
-    Value *Base = nullptr;
-    const SCEVExpr *Start = nullptr;
-    std::optional<int64_t> StartConst;
-    Loop *L = nullptr;
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Header = nullptr;
-    BasicBlock *Latch = nullptr;
-    int64_t Step = 0;
-    int64_t LastIndexStride = 0;
-    std::vector<IndexComponent> Prefix;
-    std::shared_ptr<IRType> ResultTy;
-};
-
-struct OffsetReuseGroup {
-    size_t Order = 0;
-    std::vector<LSRCandidate *> Items;
-    Value *Base = nullptr;
-    Loop *L = nullptr;
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Header = nullptr;
-    BasicBlock *Latch = nullptr;
-    int64_t Step = 0;
-    int64_t LastIndexStride = 0;
-    int64_t AnchorStart = 0;
-    int64_t MaxStart = 0;
-    std::vector<IndexComponent> Prefix;
-    std::shared_ptr<IRType> ResultTy;
-};
-
-struct PointerIV {
-    GetElementPtrInst *Start = nullptr;
-    PhiInst *Phi = nullptr;
-    GetElementPtrInst *Next = nullptr;
-};
-
-struct AddressGEPNode {
-    GetElementPtrInst *GEP = nullptr;
-    int64_t Offset = 0;
-};
-
-static bool isConstZero(Value *V) {
-    auto *CI = dynamic_cast<ConstInt *>(V);
-    return CI && CI->getVal() == 0;
-}
-
 static bool isSCEVConstZero(const SCEVExpr *E) {
     return E && E->Kind == SCEVExprKind::Constant && E->ConstValue == 0;
 }
 
-static bool isPowerOfTwo(int64_t V) {
-    return V > 0 && (V & (V - 1)) == 0;
-}
-
 static bool hasCostlyElementStride(int64_t Stride) {
-    return Stride > 0 && !isPowerOfTwo(Stride);
+    return Stride > 0 && !IRMath::isPowerOf2(Stride);
 }
 
 static bool isRecKind(SCEVExprKind K) {
@@ -167,43 +92,6 @@ static std::vector<BasicBlock *> collectLoopBlocks(Loop *L) {
         }
     }
     return Blocks;
-}
-
-static void insertBeforeTerminator(BasicBlock *BB, Instruction *I) {
-    if (!BB || !I) return;
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        Instruction *Current = *It;
-        if (!Current) break;
-        if (Current->instType == Instruction::BR ||
-            Current->instType == Instruction::RET) {
-            It.insertBefore(I);
-            return;
-        }
-    }
-    BB->push_back(I);
-}
-
-static void insertAfterPhiNodes(BasicBlock *BB, Instruction *I) {
-    if (!BB || !I) return;
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        if (!dynamic_cast<PhiInst *>(*It)) {
-            It.insertBefore(I);
-            return;
-        }
-    }
-    BB->push_back(I);
-}
-
-static bool insertBeforeInstruction(Instruction *Position, Instruction *I) {
-    if (!Position || !I || !Position->getParent()) return false;
-    BasicBlock *BB = Position->getParent();
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        if (*It == Position) {
-            It.insertBefore(I);
-            return true;
-        }
-    }
-    return false;
 }
 
 static bool canUseInPreheader(Value *V, BasicBlock *PreHeader,
@@ -342,7 +230,7 @@ static Value *materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
     }
 
     if (!NewI) return nullptr;
-    insertBeforeTerminator(PreHeader, NewI);
+    PreHeader->insertBeforeTerminator(NewI);
     return NewI;
 }
 
@@ -480,36 +368,6 @@ static bool collectAddressGEPFamily(
     return HasSupportedUse;
 }
 
-static std::optional<int64_t> getLastIndexStride(GetElementPtrInst *GEP) {
-    if (!GEP) return std::nullopt;
-    auto &Operands = GEP->getUserList();
-    if (Operands.size() < 2 || !Operands.front()) return std::nullopt;
-
-    Value *Base = Operands.front()->getValue();
-    if (!Base || !Base->getIRType()) return std::nullopt;
-
-    std::shared_ptr<IRType> CurrentTy = Base->getIRType();
-    int64_t LastStride = 0;
-    for (size_t I = 1; I < Operands.size(); ++I) {
-        std::shared_ptr<IRType> ElementTy;
-        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
-            ElementTy = PtrTy->getPointerType();
-        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurrentTy)) {
-            ElementTy = ArrTy->getElementType();
-        } else {
-            return std::nullopt;
-        }
-        if (!ElementTy ||
-            ElementTy->getSize() >
-                static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-            return std::nullopt;
-        }
-        LastStride = static_cast<int64_t>(ElementTy->getSize());
-        CurrentTy = ElementTy;
-    }
-    return LastStride;
-}
-
 static bool isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
     if (NumIndices != 1 || !Base) return false;
     auto PtrTy = std::dynamic_pointer_cast<POINTERType>(Base->getIRType());
@@ -520,30 +378,67 @@ static bool isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
 static bool matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
                      Value *&Base, Value *&Index,
                      std::vector<IndexComponent> &Prefix,
-                     bool &HasLeadingZero) {
+                     std::vector<IndexComponent> &Suffix,
+                     int64_t &ActiveIndexStride,
+                     int64_t &FinalPointeeStride,
+                     bool &HasLeadingZero,
+                     bool &AllowOffsetReuse) {
     Base = nullptr;
     Index = nullptr;
     Prefix.clear();
+    Suffix.clear();
+    ActiveIndexStride = 0;
+    FinalPointeeStride = 0;
     HasLeadingZero = false;
+    AllowOffsetReuse = false;
     if (!GEP || !L) return false;
 
-    auto &Operands = GEP->getUserList();
-    if (Operands.size() < 2) return false;
+    std::vector<Value *> Indices;
+    if (!GEP->flattenZeroBasedChain(Base, Indices)) return false;
+    if (Indices.empty()) return false;
 
-    Base = Operands.front()->getValue();
-    Index = Operands.back()->getValue();
-    if (!Base || !Index) return false;
-    if (isSingleIndexArrayStep(Base, Operands.size() - 1)) return false;
-
-    for (size_t I = 1; I + 1 < Operands.size(); ++I) {
-        Value *Raw = Operands[I]->getValue();
-        if (!Raw) return false;
-        const SCEVExpr *Expr = SE.getSCEV(Raw);
-        if (!Expr || mentionsLoop(Expr, L)) return false;
-        Prefix.push_back({Raw, Expr});
+    std::vector<int64_t> IndexStrides;
+    if (!GetElementPtrInst::getIndexStrides(Base, Indices, IndexStrides,
+                                            FinalPointeeStride)) {
+        return false;
     }
 
-    HasLeadingZero = !Prefix.empty() && isConstZero(Prefix.front().Raw);
+    int ActivePos = -1;
+    std::vector<IndexComponent> Components;
+    Components.reserve(Indices.size());
+    for (size_t I = 0; I < Indices.size(); ++I) {
+        Value *Raw = Indices[I];
+        if (!Raw) return false;
+        const SCEVExpr *Expr = SE.getSCEV(Raw);
+        if (!Expr) return false;
+        bool Varies = mentionsLoop(Expr, L);
+        if (Varies) {
+            if (ActivePos != -1) return false;
+            ActivePos = static_cast<int>(I);
+        }
+        Components.push_back({Raw, Expr});
+    }
+    if (ActivePos == -1) return false;
+
+    Index = Components[ActivePos].Raw;
+    ActiveIndexStride = IndexStrides[ActivePos];
+    AllowOffsetReuse = ActivePos == static_cast<int>(Indices.size() - 1) &&
+                       ActiveIndexStride == FinalPointeeStride;
+
+    for (int I = 0; I < ActivePos; ++I)
+        Prefix.push_back(Components[I]);
+    for (size_t I = static_cast<size_t>(ActivePos + 1);
+         I < Components.size(); ++I) {
+        if (mentionsLoop(Components[I].Expr, L)) return false;
+        Suffix.push_back(Components[I]);
+    }
+
+    if (ActiveIndexStride <= 0 || FinalPointeeStride <= 0 ||
+        ActiveIndexStride % FinalPointeeStride != 0) {
+        return false;
+    }
+    HasLeadingZero = !Prefix.empty() && Prefix.front().Raw &&
+                     Prefix.front().Raw->isConstIntZero();
     return true;
 }
 
@@ -600,15 +495,16 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
                 Value *Base = nullptr;
                 Value *Index = nullptr;
                 std::vector<IndexComponent> Prefix;
+                std::vector<IndexComponent> Suffix;
+                int64_t ActiveIndexStride = 0;
+                int64_t FinalPointeeStride = 0;
                 bool HasLeadingZero = false;
-                if (!matchGEP(GEP, L, SE, Base, Index, Prefix,
-                              HasLeadingZero)) {
+                bool AllowOffsetReuse = false;
+                if (!matchGEP(GEP, L, SE, Base, Index, Prefix, Suffix,
+                              ActiveIndexStride, FinalPointeeStride,
+                              HasLeadingZero, AllowOffsetReuse)) {
                     continue;
                 }
-
-                std::optional<int64_t> LastIndexStride =
-                    getLastIndexStride(GEP);
-                if (!LastIndexStride || *LastIndexStride <= 0) continue;
 
                 auto Affine = SE.getAffine(Index);
                 if (!Affine || Affine->RecLoop != L || !Affine->Start ||
@@ -621,11 +517,29 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
                     Step > std::numeric_limits<int>::max()) {
                     continue;
                 }
+                int64_t AddressScale = ActiveIndexStride / FinalPointeeStride;
+                if (AddressScale <= 0) continue;
+                if ((Step > 0 &&
+                     AddressScale >
+                         std::numeric_limits<int64_t>::max() / Step) ||
+                    (Step < 0 &&
+                     AddressScale >
+                         std::numeric_limits<int64_t>::max() / -Step)) {
+                    continue;
+                }
+                int64_t AddressStep = Step * AddressScale;
+                if (AddressStep < std::numeric_limits<int>::min() ||
+                    AddressStep > std::numeric_limits<int>::max()) {
+                    continue;
+                }
                 if (!canUseInPreheader(Base, PreHeader, DT)) continue;
 
                 int PrefixCost =
                     estimatePrefixMaterializeCost(Prefix, L, PreHeader, DT);
                 if (PrefixCost >= kUnsupportedMaterializeCost) continue;
+                int SuffixCost =
+                    estimatePrefixMaterializeCost(Suffix, L, PreHeader, DT);
+                if (SuffixCost >= kUnsupportedMaterializeCost) continue;
 
                 std::optional<int64_t> StartConst = Affine->ConstantStart;
                 if (StartConst &&
@@ -646,6 +560,9 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
 
                 for (const AddressGEPNode &Node : Family) {
                     std::optional<int64_t> NodeStartConst;
+                    if (!AllowOffsetReuse && Node.Offset != 0) {
+                        continue;
+                    }
                     if (StartConst) {
                         if ((Node.Offset > 0 &&
                              *StartConst >
@@ -669,8 +586,9 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
 
                     Candidates.push_back(
                         {Node.GEP, Base, Index, Affine->Start,
-                         NodeStartConst, Prefix, L, PreHeader, Header, Latch,
-                         Step, *LastIndexStride, HasLeadingZero, false});
+                         NodeStartConst, Prefix, Suffix, L, PreHeader,
+                         Header, Latch, AddressStep, ActiveIndexStride,
+                         HasLeadingZero, AllowOffsetReuse, false});
                 }
             }
         }
@@ -689,6 +607,9 @@ static std::string candidateShapeKey(const LSRCandidate &C,
         << ";PrefixN=" << C.Prefix.size();
     for (const IndexComponent &Component : C.Prefix)
         Key << ";P=" << scevKey(Component.Expr);
+    Key << ";SuffixN=" << C.Suffix.size();
+    for (const IndexComponent &Component : C.Suffix)
+        Key << ";S=" << scevKey(Component.Expr);
     if (IncludeStart) {
         if (C.StartConst)
             Key << ";StartConst=" << *C.StartConst;
@@ -704,7 +625,7 @@ buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
     std::unordered_map<std::string, size_t> GroupIndex;
 
     for (LSRCandidate &C : Candidates) {
-        if (C.Used || !C.StartConst) continue;
+        if (C.Used || !C.StartConst || !C.AllowOffsetReuse) continue;
         std::string Key = candidateShapeKey(C, false);
         auto It = GroupIndex.find(Key);
         if (It == GroupIndex.end()) {
@@ -785,6 +706,7 @@ buildExactGroups(std::vector<LSRCandidate> &Candidates) {
             Group.Step = C.Step;
             Group.LastIndexStride = C.LastIndexStride;
             Group.Prefix = C.Prefix;
+            Group.Suffix = C.Suffix;
             Group.ResultTy = C.OldGEP ? C.OldGEP->getIRType() : nullptr;
             Groups.push_back(std::move(Group));
             It = GroupIndex.find(Key);
@@ -930,13 +852,16 @@ static bool shouldRewriteExactGroup(const LSRGroup &Group,
 
     int PrefixCost = estimatePrefixMaterializeCost(
         Group.Prefix, Group.L, Group.PreHeader, DT);
+    int SuffixCost = estimatePrefixMaterializeCost(
+        Group.Suffix, Group.L, Group.PreHeader, DT);
     int StartCost =
         Group.StartConst
             ? 0
             : estimateMaterializeCost(Group.Start, Group.L, Group.PreHeader,
                                       DT);
     int MaxMaterializeCost = CostlyStride ? 2 : 1;
-    if (PrefixCost > MaxMaterializeCost || StartCost > MaxMaterializeCost)
+    if (PrefixCost > MaxMaterializeCost || SuffixCost > MaxMaterializeCost ||
+        StartCost > MaxMaterializeCost)
         return false;
 
     if (Group.Items.size() == 1) {
@@ -1004,7 +929,7 @@ static PointerIV createPointerIV(Value *Base,
     std::vector<Value *> Indices = StartIndices;
     Result.Start = new GetElementPtrInst(Base, Indices);
     Result.Start->updateType();
-    insertBeforeTerminator(PreHeader, Result.Start);
+    PreHeader->insertBeforeTerminator(Result.Start);
 
     Result.Phi = new PhiInst(ResultTy);
     Header->push_front(Result.Phi);
@@ -1014,7 +939,7 @@ static PointerIV createPointerIV(Value *Base,
         ConstInt::newConstInt(static_cast<int>(Step)));
     Result.Next = new GetElementPtrInst(Result.Phi, NextIndices);
     Result.Next->updateType();
-    insertBeforeTerminator(Latch, Result.Next);
+    Latch->insertBeforeTerminator(Result.Next);
 
     Result.Phi->addIncoming(Result.Start, PreHeader);
     Result.Phi->addIncoming(Result.Next, Latch);
@@ -1036,6 +961,10 @@ static bool rewriteExactGroup(LSRGroup &Group, const DominatorTree &DT,
                                          Group.PreHeader, DT);
     if (!StartValue) return false;
     StartIndices.push_back(StartValue);
+    if (!materializePrefix(Group.Suffix, Group.L, Group.PreHeader, DT,
+                           StartIndices)) {
+        return false;
+    }
 
     PointerIV IV = createPointerIV(
         Group.Base, StartIndices, Group.Step, Group.ResultTy,
@@ -1112,8 +1041,8 @@ static bool rewriteOffsetGroup(OffsetReuseGroup &Group,
                 }
             }
         }
-        if (!insertBeforeInstruction(InsertBefore, OffsetGEP))
-            insertAfterPhiNodes(Group.Header, OffsetGEP);
+        if (!Instruction::insertBefore(InsertBefore, OffsetGEP))
+            Group.Header->insertAfterPhiNodes(OffsetGEP);
         OffsetValues.emplace(Offset, OffsetGEP);
     }
 
@@ -1167,8 +1096,6 @@ static bool AddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
     cleanupDeadIndexChains(DeadSeeds);
     return Changed;
 }
-
-} // namespace
 
 PreservationStatus LoopStrengthReductionPass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {

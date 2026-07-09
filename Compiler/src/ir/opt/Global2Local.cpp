@@ -10,70 +10,19 @@
 #include <queue>
 #include <utility>
 
-namespace {
-
-struct CandidateInfo {
-	Variable *GV = nullptr;
-	std::shared_ptr<IRType> ElemTy;
-	std::vector<Use *> MainUses;
-	bool HasNonEntryStore = false;
-};
-
 static Instruction *insertAllocaAfterEntryPhis(Function *F, AllocaInst *AI) {
 	if (!F || !AI) return nullptr;
 	BasicBlock *Entry = F->front();
 	if (!Entry) return nullptr;
 
-	Instruction *lastPhi = nullptr;
-	for (Instruction *I : *Entry) {
-		if (dynamic_cast<PhiInst *>(I)) {
-			lastPhi = I;
-		} else {
-			break;
-		}
-	}
-
-	if (!Entry->front()) {
-		Entry->push_back(AI);
-		return AI;
-	}
-
-	if (!lastPhi) {
-		auto it = Entry->begin();
-		it.insertBefore(AI);
-		return AI;
-	}
-
-	for (auto it = Entry->begin(); it != Entry->end(); ++it) {
-		if (*it != lastPhi) continue;
-		it.insertAfter(AI);
-		return AI;
-	}
-
-	Entry->push_front(AI);
-	return AI;
+	return Entry->insertAfterPhiNodes(AI) ? AI : nullptr;
 }
 
 static Instruction *insertAllocaAfter(Function *F, AllocaInst *AI, Instruction *AfterI) {
 	if (!F || !AI || !AfterI) return nullptr;
 	BasicBlock *Entry = F->front();
 	if (!Entry) return nullptr;
-	for (auto it = Entry->begin(); it != Entry->end(); ++it) {
-		if (*it != AfterI) continue;
-		it.insertAfter(AI);
-		return AI;
-	}
-	return nullptr;
-}
-
-static void insertInstAfter(BasicBlock *BB, Instruction *Anchor, Instruction *NewI) {
-	if (!BB || !Anchor || !NewI) return;
-	for (auto it = BB->begin(); it != BB->end(); ++it) {
-		if (*it != Anchor) continue;
-		it.insertAfter(NewI);
-		return;
-	}
-	BB->push_back(NewI);
+	return AfterI->getParent() == Entry && AfterI->insertAfter(AI) ? AI : nullptr;
 }
 
 // For scalar globals, only allow very simple load/store users in main.
@@ -89,20 +38,16 @@ static bool isSafeScalarUseInMain(Use *U, Variable *GV) {
 
 	if (auto *SI = dynamic_cast<StoreInst *>(UserI)) {
 		// Only allow direct stores where GV is the destination pointer.
-		return SI->getUserIndex(U) == 1;
+		return SI->getPointerOperand() == GV;
 	}
 
 	return false;
 }
 
-} // namespace
-
 bool Global2LocalPass::isMemcpyLikeCall(CallInst *CI) {
 	if (!CI) return false;
-	auto &UL = CI->getUserList();
-	if (UL.empty() || !UL[0]) return false;
 
-	Value *Callee = UL[0]->getValue();
+	Value *Callee = CI->getCallee();
 	if (!Callee) return false;
 
 	if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
@@ -141,10 +86,7 @@ Global2LocalPass::buildCallGraph(Module &M) {
 				auto *CI = dynamic_cast<CallInst *>(I);
 				if (!CI) continue;
 
-				auto &UL = CI->getUserList();
-				if (UL.empty() || !UL[0]) continue;
-
-				auto *Callee = dynamic_cast<Function *>(UL[0]->getValue());
+				auto *Callee = dynamic_cast<Function *>(CI->getCallee());
 				if (!Callee) continue;
 				Adj.push_back(Callee);
 			}
@@ -193,7 +135,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	auto CallGraph = buildCallGraph(*M);
 	auto ReachableFromMain = computeReachableFrom(Main, CallGraph);
 
-	std::vector<CandidateInfo> WorkList;
+	std::vector<Global2LocalCandidateInfo> WorkList;
 
 	for (auto &GVPtr : M->getGlobalVar()) {
 		auto *GV = GVPtr.get();
@@ -249,7 +191,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 				auto *UserI = dynamic_cast<Instruction *>(U->getUser());
 				auto *SI = dynamic_cast<StoreInst *>(UserI);
 				if (RelaxScalarUses) {
-					if (SI && SI->getUserIndex(U) == 1) {
+					if (SI && SI->getPointerOperand() == GV) {
 						BasicBlock *SBB = SI->getParent();
 						if (SBB && SBB != MainEntry) {
 							ScalarHasNonEntryStore = true;
@@ -267,7 +209,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 						}
 					}
 
-					if (SI && SI->getUserIndex(U) == 1) {
+					if (SI && SI->getPointerOperand() == GV) {
 						ScalarHasStore = true;
 						BasicBlock *SBB = SI->getParent();
 						if (!SBB || LI.getLoopFor(SBB) != nullptr) {
@@ -293,25 +235,21 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		if (!CanPromote || MainUses.empty()) continue;
 
 		WorkList.push_back(
-			CandidateInfo{
+			Global2LocalCandidateInfo{
 				GV, ElemTy, std::move(MainUses), ScalarHasNonEntryStore});
 	}
 
 	if (RelaxScalarUses) {
 		const size_t NonEntryStoredScalarCount = static_cast<size_t>(std::count_if(
-			WorkList.begin(), WorkList.end(), [](const CandidateInfo &C) {
+			WorkList.begin(), WorkList.end(), [](const Global2LocalCandidateInfo &C) {
 				return C.HasNonEntryStore;
 			}));
 
-		// The current late CFG cleanup cannot yet safely converge several
-		// independently promoted loop-carried globals in deeply nested loops
-		// (functional/28_while_test3 is the minimal suite witness).  Continue
-		// promoting entry-written/loop-read globals, but defer all loop-written
-		// scalars when more than one such state variable exists.
+
 		if (NonEntryStoredScalarCount > 1) {
 			WorkList.erase(
 				std::remove_if(WorkList.begin(), WorkList.end(),
-					[](const CandidateInfo &C) {
+					[](const Global2LocalCandidateInfo &C) {
 						return C.HasNonEntryStore;
 					}),
 				WorkList.end());
@@ -321,7 +259,6 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	if (WorkList.empty()) return PreservationStatus::all();
 
 	bool Changed = false;
-	BasicBlock *Entry = Main->front();
 	Instruction *AllocaInsertTail = nullptr;
 
 	for (auto &C : WorkList) {
@@ -355,7 +292,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 			auto *MemcpyCall =
 				new CallInst(BuildInFunction::genBuildInFunction("llvm.memcpy.p0.p0.i32"), Args);
-			insertInstAfter(Entry, LastInitInst, MemcpyCall);
+			LastInitInst->insertAfter(MemcpyCall);
 			LastInitInst = MemcpyCall;
 		} else {
 			if (!Init) {
@@ -369,7 +306,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			}
 
 			auto *SI = new StoreInst(Init, Alloca);
-			insertInstAfter(Entry, LastInitInst, SI);
+			LastInitInst->insertAfter(SI);
 			LastInitInst = SI;
 		}
 

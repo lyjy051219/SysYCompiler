@@ -2,6 +2,20 @@
 #include <iostream>
 //IRType
 int IRType::getScope(){ return 0; }
+bool IRType::isInt() const { return getEnum() == IR_INT; }
+bool IRType::isFloat() const { return getEnum() == IR_FLOAT; }
+bool IRType::isPointer() const { return getEnum() == IR_POINTER; }
+bool IRType::isArray() const { return getEnum() == IR_ARRAY; }
+bool IRType::isBool() const {
+    auto *IT = dynamic_cast<const INTType *>(this);
+    return IT && IT->getIsBool();
+}
+int IRType::getIntegerBitWidth(int DefaultBits) const {
+    if (!isInt()) return DefaultBits;
+    int Bits = static_cast<int>(getSize() * 8);
+    return Bits > 0 ? Bits : DefaultBits;
+}
+
 std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){
  switch (type) {
         case IR_INT:

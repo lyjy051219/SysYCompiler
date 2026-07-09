@@ -1,86 +1,20 @@
 #include "ir/opt/DeadFunctionElimination.hpp"
 
-#include <string>
 #include <unordered_set>
 #include <vector>
-
-namespace {
-
-static bool isKnownRuntimeName(const std::string &Name) {
-	static const std::unordered_set<std::string> SysyLibNames = {
-		"getint", "getch", "getfloat", "getarray", "getfarray",
-		"putint", "putch", "putfloat", "putarray", "putfarray", "putf",
-		"starttime", "stoptime", "_sysy_starttime", "_sysy_stoptime"
-	};
-
-	if (SysyLibNames.count(Name)) return true;
-	if (Name.find("_sysy_") != std::string::npos) return true;
-	if (Name.find("memcpy") != std::string::npos) return true;
-	if (Name.find("llvm.") == 0) return true;
-	return false;
-}
-
-} // namespace
 
 bool DeadFunctionEliminationPass::isExternalRoot(Function *F) {
 	if (!F) return true;
 
 	const std::string Name = F->getIdent();
 	if (Name == "main") return true;
-	if (isKnownRuntimeName(Name)) return true;
+	if (BuildInFunction::isKnownRuntimeName(Name)) return true;
 
 	// 目前 Function 构造时通常自带入口块；这里仍保留 declaration 判断，
 	// 以后若支持仅声明函数，不能把 ABI 可见声明删掉。
 	if (F->front() == nullptr) return true;
 
 	return false;
-}
-
-Function *DeadFunctionEliminationPass::getParentFunction(Instruction *I) {
-	if (!I) return nullptr;
-	BasicBlock *BB = I->getParent();
-	if (!BB) return nullptr;
-	return BB->getParent();
-}
-
-void DeadFunctionEliminationPass::collectReachableBlocks(
-	Function *F,
-	std::unordered_set<BasicBlock *> &Reachable)
-{
-	Reachable.clear();
-	if (!F || !F->front()) return;
-
-	std::vector<BasicBlock *> WorkList;
-	WorkList.push_back(F->front());
-	Reachable.insert(F->front());
-
-	// 只扫描 CFG 可达块，避免不可达块里的旧 call 把死函数错误保活。
-	while (!WorkList.empty()) {
-		BasicBlock *BB = WorkList.back();
-		WorkList.pop_back();
-		if (!BB) continue;
-
-		for (BasicBlock *Succ : BB->getSuccessors()) {
-			if (Succ && Reachable.insert(Succ).second) {
-				WorkList.push_back(Succ);
-			}
-		}
-	}
-}
-
-void DeadFunctionEliminationPass::dropAllReferences(Function *F) {
-	if (!F) return;
-
-	// 删除 Function 前，先断开函数体内所有 operand use。
-	// 这样 Function / BasicBlock / Instruction 析构时不会沿 use-list 递归删除
-	// 其它待删函数里的 call，更不会误碰仍然存活的 IR。
-	for (BasicBlock *BB : *F) {
-		if (!BB) continue;
-		for (Instruction *I : *BB) {
-			if (!I) continue;
-			I->getUserList().clear();
-		}
-	}
 }
 
 PreservationStatus DeadFunctionEliminationPass::run(
@@ -135,7 +69,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 			}
 
 			// 如果函数值被挂在无父函数的游离指令上，保守当作外部可见。
-			if (!getParentFunction(I)) {
+			if (!I->getParentFunction()) {
 				markLive(F);
 			}
 		}
@@ -149,7 +83,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 		WorkList.pop_back();
 		if (!F) continue;
 
-		collectReachableBlocks(F, ReachableBlocks);
+		F->collectReachableBlocks(ReachableBlocks);
 
 		for (BasicBlock *BB : *F) {
 			if (!BB || !ReachableBlocks.count(BB)) continue;
@@ -194,7 +128,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 	// 先统一断引用，再统一 erase。这样删除互相递归的死函数 SCC 也是线性的，
 	// 不会在析构某个 Function 时沿 use-list 反复触发递归删除。
 	for (Function *F : Dead) {
-		dropAllReferences(F);
+		F->dropAllReferences();
 	}
 
 	for (auto It = Functions.begin(); It != Functions.end(); ) {

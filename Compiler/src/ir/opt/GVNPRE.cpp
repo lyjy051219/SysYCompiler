@@ -6,8 +6,6 @@
 #include <queue>
 #include <utility>
 
-namespace gvnpre_detail {
-
 static bool isInstInBlock(Instruction *I, BasicBlock *BB) {
     return I && BB && I->getParent() == BB;
 }
@@ -1287,14 +1285,12 @@ void GVNPRESolver::domTreeDFS(BasicBlock *BB,
     }
 }
 
-} // namespace gvnpre_detail
-
 PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
 
-    gvnpre_detail::GVNPRESolver Solver(F, FAM, DT, LI, AA);
+    GVNPRESolver Solver(F, FAM, DT, LI, AA);
     bool Changed = Solver.run();
 
     if (!Changed) {

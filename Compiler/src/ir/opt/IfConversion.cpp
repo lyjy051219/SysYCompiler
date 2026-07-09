@@ -7,23 +7,9 @@
 
 #include <vector>
 
-namespace {
-
-struct IfConvMatch {
-	BasicBlock *Pred = nullptr;
-	BasicBlock *TrueBB = nullptr;
-	BasicBlock *ElseBB = nullptr;
-	BasicBlock *Succ = nullptr;
-	BrInst *PredBr = nullptr;
-	Value *Cond = nullptr;
-	bool HasElse = false;
-	bool CondTrueToTrueBB = false;
-};
-
 static bool isConstCond(Value *V) {
-	return dynamic_cast<ConstBool *>(V) ||
-		   dynamic_cast<ConstInt *>(V) ||
-		   dynamic_cast<ConstFloat *>(V);
+	bool Out = false;
+	return V && V->tryGetBoolConst(Out);
 }
 
 static bool isForbiddenInst(const Instruction *I) {
@@ -191,8 +177,6 @@ static bool matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	M.CondTrueToTrueBB = CondTrueToTrueBB;
 	return true;
 }
-
-} // namespace
 
 bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 	IfConvMatch M;

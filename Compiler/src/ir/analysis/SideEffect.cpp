@@ -24,11 +24,6 @@ bool BaseAddressInfo::merge(const BaseAddressInfo& Other) {
     return changed;
 }
 
-static bool isExternalVar(Value* V) {
-    auto* Var = dynamic_cast<Variable*>(V);
-    return Var && (Var->isGlobal() || Var->isParam());
-}
-
 static void ensureInitialized(Value* V, BaseAddressInfoMap& Map) {
     if (!V || Map.count(V)) return;
     if (auto* Var = dynamic_cast<Variable*>(V))
@@ -42,7 +37,7 @@ static void collectExternalBases(
     std::unordered_set<Value*>& Dest)
 {
     for (auto* B : Info.bases)
-        if (isExternalVar(B)) Dest.insert(B);
+        if (B && B->isExternalVariable()) Dest.insert(B);
 }
 
 IntrinsicID getIntrinsicID(BuildInFunction* BIF) {
@@ -61,7 +56,7 @@ BaseAddressInfoMap buildBaseAddressInfoMap(Function& F) {
     //1.遍历所有形参，拿到所有指针，并创建它们的BaseAddressInfo
     for (auto& P : F.getParams()) {
         Value* V = P.get();
-        if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_POINTER) continue;
+        if (!V || !V->isPointerValue()) continue;
         Map[V].bases.insert(V);
     }
     //2.遍历函数内所有Alloca（局部变量）：创建它们的BaseAddressInfo
@@ -80,7 +75,7 @@ BaseAddressInfoMap buildBaseAddressInfoMap(Function& F) {
                 Instruction* I = *IIt;
                 //跳过Alloca：因为已经处理过了
                 if (dynamic_cast<AllocaInst*>(I)) continue;
-                if (!I || !I->getIRType() || I->getIRType()->getEnum() != IR_POINTER) continue;
+                if (!I || !I->isPointerValue()) continue;
 
                 BaseAddressInfo NewInfo;
                 auto& UL = I->getUserList();
@@ -178,7 +173,7 @@ static void processBuiltinCall(
             if (!Arg) return;
             auto it = CallerPtrMap.find(Arg);
             if (it != CallerPtrMap.end()) collectExternalBases(it->second, Dest);
-            else if (isExternalVar(Arg))   Dest.insert(Arg);
+            else if (Arg && Arg->isExternalVariable())   Dest.insert(Arg);
         };
         if (Args.size() >= 1) addArgBases(Args[0], Info.ModSet);
         if (Args.size() >= 2) addArgBases(Args[1], Info.RefSet);
@@ -195,12 +190,12 @@ static void processBuiltinCall(
 
     if (DoMod || DoRef) {
         for (auto* Arg : Args) {
-            if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) continue;
+            if (!Arg || !Arg->isPointerValue()) continue;
             auto it = CallerPtrMap.find(Arg);
             if (it != CallerPtrMap.end()) {
                 if (DoMod) collectExternalBases(it->second, Info.ModSet);
                 if (DoRef) collectExternalBases(it->second, Info.RefSet);
-            } else if (isExternalVar(Arg)) {
+            } else if (Arg->isExternalVariable()) {
                 if (DoMod) Info.ModSet.insert(Arg);
                 if (DoRef) Info.RefSet.insert(Arg);
             }
@@ -211,12 +206,12 @@ static void processBuiltinCall(
 
     //处理Untracked的情况：标记为Mod和Ref
     for (auto* Arg : Args) {
-        if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) continue;
+        if (!Arg || !Arg->isPointerValue()) continue;
         auto it = CallerPtrMap.find(Arg);
         if (it != CallerPtrMap.end()) {
             collectExternalBases(it->second, Info.ModSet);
             collectExternalBases(it->second, Info.RefSet);
-        } else if (isExternalVar(Arg)) {
+        } else if (Arg->isExternalVariable()) {
             Info.ModSet.insert(Arg);
             Info.RefSet.insert(Arg);
         }
@@ -243,7 +238,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                     auto it = Info.ptrMap.find(Ptr);
                     if (it != Info.ptrMap.end())
                         collectExternalBases(it->second, Info.RefSet);
-                    else if (isExternalVar(Ptr))
+                    else if (Ptr && Ptr->isExternalVariable())
                         Info.RefSet.insert(Ptr);
                 }
                 continue;
@@ -257,7 +252,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                     auto it = Info.ptrMap.find(Ptr);
                     if (it != Info.ptrMap.end())
                         collectExternalBases(it->second, Info.ModSet);
-                    else if (isExternalVar(Ptr))
+                    else if (Ptr && Ptr->isExternalVariable())
                         Info.ModSet.insert(Ptr);
                 }
                 continue;
@@ -265,13 +260,13 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
 
             //2.3 CALL:
             if (I->instType == Instruction::CALL) {
-                auto& UL = I->getUserList();
-                if (UL.empty()) continue;
-                Value* Callee = UL[0]->getValue();
+                auto *CI = dynamic_cast<CallInst *>(I);
+                if (!CI) continue;
+                Value* Callee = CI->getCallee();
 
                 std::vector<Value*> Args;
-                for (size_t i = 1; i < UL.size(); ++i)
-                    Args.push_back(UL[i] ? UL[i]->getValue() : nullptr);
+                for (unsigned i = 0; i < CI->getArgCount(); ++i)
+                    Args.push_back(CI->getArg(i));
 
                 //2.3.1如果这个Callee是用户写的函数
                 if (auto* CalleeFunc = dynamic_cast<Function*>(Callee)) {
@@ -293,7 +288,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                                 auto it = Info.ptrMap.find(Args[i]);
                                 if (it != Info.ptrMap.end())
                                     collectExternalBases(it->second, Dest);
-                                else if (isExternalVar(Args[i]))
+                                else if (Args[i] && Args[i]->isExternalVariable())
                                     Dest.insert(Args[i]);
                                 break;
                             }
@@ -349,13 +344,13 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
 
     // CALL
     if (I->instType == Instruction::CALL) {
-        auto& UL = I->getUserList();
-        if (UL.empty()) return ModRefInfo::NoModRef;
+        auto *CI = dynamic_cast<CallInst *>(I);
+        if (!CI) return ModRefInfo::NoModRef;
 
-        Value* Callee = UL[0]->getValue();
+        Value* Callee = CI->getCallee();
         std::vector<Value*> Args;
-        for (size_t i = 1; i < UL.size(); ++i)
-            Args.push_back(UL[i] ? UL[i]->getValue() : nullptr);
+        for (unsigned i = 0; i < CI->getArgCount(); ++i)
+            Args.push_back(CI->getArg(i));
 
         // 1. 内置函数
         if (auto* BIF = dynamic_cast<BuildInFunction*>(Callee)) {
@@ -379,7 +374,7 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
 
             if (DoMod || DoRef) {
                 for (auto* Arg : Args) {
-                    if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER)
+                    if (!Arg || !Arg->isPointerValue())
                         continue;
                     if (overlaps(Arg)) {
                         if (DoMod) Result = unionModRef(Result, ModRefInfo::Mod);
@@ -478,26 +473,6 @@ ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI)
     return Result;
 }
 
-static Value* stripPointerCastsAndGEP(Value* V) {
-    std::unordered_set<Value*> Visited;
-    while (V && Visited.insert(V).second) {
-        if (auto* GEP = dynamic_cast<GetElementPtrInst*>(V)) {
-            auto& UL = GEP->getUserList();
-            if (UL.empty() || !UL[0]) return nullptr;
-            V = UL[0]->getValue();
-            continue;
-        }
-        if (auto* BC = dynamic_cast<BitCastInst*>(V)) {
-            auto& UL = BC->getUserList();
-            if (UL.empty() || !UL[0]) return nullptr;
-            V = UL[0]->getValue();
-            continue;
-        }
-        break;
-    }
-    return V;
-}
-
 bool BasicBlockSideEffect(BasicBlock* BB,
                                const Loop& L,
                                BasicAAResult& AA,
@@ -515,10 +490,10 @@ bool BasicBlockSideEffect(BasicBlock* BB,
         }
 
         if (I->instType == Instruction::CALL) {
-            auto& UL = I->getUserList();
-            if (UL.empty() || !UL[0]) return true;
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (!CI || !CI->getCallee()) return true;
 
-            Value* Callee = UL[0]->getValue();
+            Value* Callee = CI->getCallee();
             if (dynamic_cast<BuildInFunction*>(Callee)) {
                 return true;
             }
@@ -543,7 +518,7 @@ bool BasicBlockSideEffect(BasicBlock* BB,
             if (UL.size() < 2 || !UL[1]) return true;
 
             Value* Ptr = UL[1]->getValue();
-            Value* Base = stripPointerCastsAndGEP(Ptr);
+            Value* Base = Value::stripPointerCastsAndGEP(Ptr);
 
             // 按需求：只允许写局部变量（alloca）
             if (auto* Var = dynamic_cast<Variable*>(Base)) {

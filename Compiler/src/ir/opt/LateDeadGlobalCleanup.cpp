@@ -10,26 +10,13 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-static bool isScalarGlobal(Variable *G) {
-    if (!G || G->vartag != Variable::GlobalVariable) return false;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(G->getIRType());
-    if (!PtrTy) return false;
-    auto ElemTy = PtrTy->getPointerType();
-    if (!ElemTy) return false;
-    return ElemTy->getEnum() == IR_INT || ElemTy->getEnum() == IR_FLOAT;
-}
-
 static bool getDirectStoreToGlobal(Use *U, Variable *G, StoreInst *&SI) {
     SI = nullptr;
     if (!U || !G || U->getValue() != G) return false;
     auto *Store = dynamic_cast<StoreInst *>(U->getUser());
     if (!Store) return false;
 
-    auto &UL = Store->getUserList();
-    if (UL.size() < 2 || !UL[1]) return false;
-    if (UL[1]->getValue() != G) return false;
+    if (Store->getPointerOperand() != G) return false;
 
     SI = Store;
     return true;
@@ -37,7 +24,7 @@ static bool getDirectStoreToGlobal(Use *U, Variable *G, StoreInst *&SI) {
 
 static bool collectDeadStoresForGlobal(Variable *G,
                                        std::vector<StoreInst *> &Stores) {
-    if (!isScalarGlobal(G)) return false;
+    if (!G || !G->isScalarGlobal()) return false;
     if (G->getUseList().is_empty()) return false;
 
     std::vector<StoreInst *> LocalStores;
@@ -51,8 +38,6 @@ static bool collectDeadStoresForGlobal(Variable *G,
     Stores.insert(Stores.end(), LocalStores.begin(), LocalStores.end());
     return true;
 }
-
-} // namespace
 
 PreservationStatus LateDeadGlobalCleanupPass::run(
     Module &M, ModuleAnalysisPassManager &MAM) {

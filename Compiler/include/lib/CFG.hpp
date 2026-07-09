@@ -5,7 +5,10 @@
 #include <vector>
 #include <string>
 #include "BaseManager.hpp"
+#include <cstdint>
+#include <optional>
 #include <set>
+#include <unordered_set>
 class Value;
 class Function;
 class BasicBlock;
@@ -36,6 +39,12 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     virtual void dumpIR() = 0;
     virtual Value* getOprand();
     static Function* getUserFunction(Use* U);
+    Function* getParentFunction();
+    static Function* getParentFunction(Instruction *I);
+    static bool insertBefore(Instruction *Pos, Instruction *NewI);
+    static bool insertAfter(Instruction *Pos, Instruction *NewI);
+    bool insertBefore(Instruction *NewI);
+    bool insertAfter(Instruction *NewI);
 
     virtual Instruction* clone(const std::unordered_map<Value*, Value*>&) { return nullptr; }
 
@@ -67,6 +76,14 @@ class BinaryInst : public Instruction{
     BinaryInst(std::shared_ptr<IRType> irtype);
     BinaryInst(Value* x,Operation op,Value* y);
     Operation getOp() const { return op; }
+    bool getOperands(Value *&LHS, Value *&RHS) const;
+    bool setOperands(Value *LHS, Value *RHS);
+    static bool isCompareOp(Operation Op);
+    static bool isAssociativeOp(Operation Op);
+    static bool isCommutativeOp(Operation Op);
+    static bool isReassociateOp(Operation Op);
+    static Operation negatePredicate(Operation Op);
+    static Operation reversePredicate(Operation Op);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
@@ -131,6 +148,7 @@ class Variable : public User{
     virtual bool isGlobal() final;
     //是不是函数形参
     virtual bool isParam() final;
+    bool isScalarGlobal();
 
     Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident);
     void dumpIR();
@@ -161,6 +179,9 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     //Inst插入
     void InsertAlloca(AllocaInst* ptr);
     bool isReachable(BasicBlock* BB);
+    void collectReachableBlocks(std::unordered_set<BasicBlock *> &Reachable);
+    std::vector<BasicBlock *> getReachableBlocks();
+    void dropAllReferences();
     //调试信息打印
     void dumpIR();
     std::string getIdent(){ return ident;}
@@ -173,6 +194,7 @@ class BuildInFunction : public Value{
     public:
     //virtual BuildInFunction* clone(std::unordered_map<Value*,Value*>&)override{return this;}
     static BuildInFunction* genBuildInFunction(std::string);
+    static bool isKnownRuntimeName(const std::string &Name);
     std::string getIdent(){ return ident;}
 };
 
@@ -251,6 +273,8 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     BasicBlock* genBlock();
     BasicBlock* genBlock(std::string ident);
     bool hasTerminator();
+    bool insertBeforeTerminator(Instruction *I);
+    bool insertAfterPhiNodes(Instruction *I);
     void clear();
 
     /*目前用不到
@@ -313,6 +337,8 @@ class StoreInst : public Instruction{
     StoreInst(Value* val,Value* ptr);
     StoreInst(std::shared_ptr<IRType> irtype);
     Value* getOprand()final;
+    Value* getValueOperand() const;
+    Value* getPointerOperand() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 
@@ -323,6 +349,7 @@ class LoadInst : public Instruction{
     public:
     LoadInst(Value* v);
     LoadInst(std::shared_ptr<IRType> irtype);
+    Value* getPointerOperand() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
@@ -336,6 +363,14 @@ class GetElementPtrInst : public Instruction{
     GetElementPtrInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     void updateType();
+    std::optional<int64_t> getLastIndexStride();
+    bool flattenZeroBasedChain(Value *&Base, std::vector<Value *> &Indices);
+    static bool flattenZeroBasedChain(Value *V, Value *&Base,
+                                      std::vector<Value *> &Indices);
+    static bool getIndexStrides(Value *Base,
+                                const std::vector<Value *> &Indices,
+                                std::vector<int64_t> &Strides,
+                                int64_t &FinalPointeeStride);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
@@ -352,6 +387,9 @@ class CallInst : public Instruction{
     void dumpIR() override;
     bool isTailCall() const { return tailCall; }
     void setTailCall(bool v) { tailCall = v; }
+    Value *getCallee() const;
+    Value *getArg(unsigned Index) const;
+    unsigned getArgCount() const;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 

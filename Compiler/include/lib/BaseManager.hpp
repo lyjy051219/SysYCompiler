@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <iostream>
+#include <cstdint>
 #include "TypeSystem.hpp"
 
 
@@ -139,6 +140,25 @@ class Value{
    std::string getIdent(){ return ident;}
    UseList& getUseList(){return useList;}
    bool isConstZero();
+   bool isConstIntZero();
+   bool isConstOne();
+   bool isConstMinusOne();
+   bool tryGetBoolConst(bool &Out);
+   bool tryGetIntConst(int32_t &Out);
+   bool tryGetFloatConst(float &Out);
+   int integerBitWidth(int DefaultBits = 32);
+   int countUses();
+   int countInstructionUses(Instruction **SingleUser = nullptr);
+   bool hasUses();
+   bool hasExactlyOneUse();
+   bool isPointerValue();
+   bool isExternalVariable();
+   static Value *stripPointerCastsAndGEP(Value *V);
+   static bool isLocalStackPointer(Value *V);
+   static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty);
+   static Value *makeOneForType(const std::shared_ptr<IRType> &Ty);
+   static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty);
+   static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty);
    void replaceAllUsesWith(Value* val){
         this->useList.size = 0;
         Use* head = this->useList.getHead();
@@ -177,6 +197,10 @@ class User : public Value{
    User(std::shared_ptr<IRType> irtype);
 
     std::vector<std::unique_ptr<Use>>& getUserList(){return this->userList;}
+    size_t getNumOperands() const;
+    Value *getOperand(size_t Index) const;
+    bool getOperand(size_t Index, Value *&Out) const;
+    bool replaceOperand(size_t Index, Value *V);
     //获得在UserList中的索引
     int getUserIndex(Use* u);
 

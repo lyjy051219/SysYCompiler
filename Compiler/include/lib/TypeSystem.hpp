@@ -4,6 +4,7 @@
 #include <map>
 #include <utility>
 #include <string>
+#include <cstdint>
 
 /*ARRAY获取所有维度和获取总元素数量的接口有待观察*/
 
@@ -32,6 +33,12 @@ class IRType{
     //这两个函数子类都不用实现，直接调用基类的就可以返回相应的类型
     TypeSystem getEnum() const {return ts;}
     size_t getSize() const {return size;}
+    bool isInt() const;
+    bool isFloat() const;
+    bool isBool() const;
+    bool isPointer() const;
+    bool isArray() const;
+    int getIntegerBitWidth(int DefaultBits = 32) const;
     //这个版本的不包括Function，Pointer，Array
     static std::shared_ptr<IRType> NewTypeByTypeSystem(TypeSystem type);
 

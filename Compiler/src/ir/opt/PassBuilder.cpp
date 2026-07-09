@@ -151,6 +151,7 @@ static FunctionPassManager buildPostLoopCleanupPipeline() {
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
+    FPM.addPass(LoadEliminationPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LatePhiCleanupPass());
@@ -246,12 +247,7 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLightCleanupPipeline(), FAM), 2));
 
-    // Front-end array initialization is represented as constant-global memcpy
-    // plus element accesses. Forward same-block constant elements and delete
-    // non-escaping local aggregates whose contents are never observed. Tiny
-    // constant-indexed arrays may be scalarized here; the existing late
-    // Mem2Reg phase will promote the resulting scalar allocas without adding
-    // an extra early CFG perturbation point.
+
     MPM.addPass(createModuleFunctionBridge(LocalAggregateSimplifyPass(), FAM));
 
     // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。

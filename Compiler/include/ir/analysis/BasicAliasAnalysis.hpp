@@ -1,11 +1,13 @@
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
 
 class LoopInfo;
+class Loop;
 
 //别名分析：采用即时计算两个指针的关系
 //如果实现了select指令，那么需要补全aliasSelect函数
@@ -28,8 +30,12 @@ public:
     BasicAAResult& operator=(const BasicAAResult&) = delete;
     bool invalidate(Function &F, const PreservationStatus &PA);
 
+    void addObjectNoAliasFact(Value* V1, Value* V2);
+
     //即时查询指针两者之间的别名关系
     AliasInfo alias(Value* V1, Value* V2, const LoopInfo& LI);
+    AliasInfo aliasWithIndexRange(Value* V1, Value* V2, const LoopInfo& LI);
+    bool callMayAliasPointer(CallInst *CI, Value *P, const LoopInfo &LI);
 
 private:
     struct ValuePairHash {
@@ -48,12 +54,29 @@ private:
     };
 
     std::unordered_map<std::pair<Value*, Value*>, AliasInfo, ValuePairHash> AliasCache;
+    std::unordered_set<std::pair<Value*, Value*>, ValuePairHash> ObjectNoAlias;
+
+    struct AdditiveDecomposition {
+        Value* Base = nullptr;
+        long long Offset = 0;
+        bool Valid = true;
+    };
+
+    struct PositivePhiRecurrence {
+        Value* Start = nullptr;
+        long long Step = 0;
+        const Loop* L = nullptr;
+    };
 
     Value* stripBaseInst(Value* V) const;
     Value* getBaseAddress(Value* V) const;
     bool isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const;
+    bool hasObjectNoAlias(Value* V1, Value* V2) const;
 
-    AliasInfo aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI);
+    AliasInfo aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
+                        bool UseIndexRange);
+    AliasInfo aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI,
+                       bool UseIndexRange);
     AliasInfo mergePhiAlias(AliasInfo A, AliasInfo B) const;
     std::pair<Value*, Value*> makeCanonicalPair(Value* A, Value* B) const;
 
@@ -61,7 +84,20 @@ private:
     LinearGEP fillLinearGEP(Value* V) const;
 
     //分析两个GEP的偏移量关系
-    AliasInfo aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2);
+    AliasInfo aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2,
+                       const LoopInfo& LI, bool UseIndexRange);
+
+    std::size_t getPointeeAccessSize(Value* V) const;
+    AdditiveDecomposition decomposeAdditive(Value* V) const;
+    std::optional<long long> getAdditiveOffsetFrom(Value* V, Value* Base) const;
+    std::optional<PositivePhiRecurrence> getPositivePhiRecurrence(PhiInst* Phi,
+                                                                  const LoopInfo& LI) const;
+    bool isLoopInvariant(Value* V, const Loop* L) const;
+    std::optional<long long> lowerBoundDiff(Value* Greater, Value* Lesser,
+                                            const LoopInfo& LI) const;
+    AliasInfo aliasGEPByIndexDistance(
+        const std::unordered_map<Value*, long long>& DiffVars,
+        long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const;
 };
 
 

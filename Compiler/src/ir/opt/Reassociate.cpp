@@ -15,55 +15,14 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
 using RankMap = std::unordered_map<Value *, uint32_t>;
-
-static bool isAssociativeOp(BinaryInst::Operation Op) {
-	return Op == BinaryInst::ADD || Op == BinaryInst::MUL ||
-			Op == BinaryInst::AND || Op == BinaryInst::OR || Op == BinaryInst::XOR;
-}
-
-static bool isCommutativeOp(BinaryInst::Operation Op) {
-	return Op == BinaryInst::ADD || Op == BinaryInst::MUL ||
-			Op == BinaryInst::AND || Op == BinaryInst::OR || Op == BinaryInst::XOR;
-}
-
-static bool isReassociateOp(BinaryInst::Operation Op) {
-	return Op == BinaryInst::ADD || Op == BinaryInst::SUB || Op == BinaryInst::MUL ||
-			Op == BinaryInst::AND || Op == BinaryInst::OR || Op == BinaryInst::XOR;
-}
 
 static bool isConstLike(Value *V) {
 	return dynamic_cast<ConstantSystem *>(V) != nullptr;
 }
 
-static bool isIntegerType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->getEnum() == IR_INT;
-}
-
 static bool isIntegerValue(Value *V) {
-	return V && isIntegerType(V->getIRType());
-}
-
-static bool isConstZero(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == 0;
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) return !CB->getVal();
-	return false;
-}
-
-static bool isConstOne(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == 1;
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) return CB->getVal();
-	return false;
-}
-
-static bool isConstMinusOne(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == -1;
-	return false;
+	return V && V->getIRType() && V->getIRType()->isInt();
 }
 
 static Value *makeIntConst(int Val) {
@@ -74,57 +33,9 @@ static Value *makeIntConst(int Val, const std::shared_ptr<IRType> &Ty) {
 	return ConstInt::newConstInt(Val, Ty ? Ty->getSize() : 4);
 }
 
-static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty) {
-	return makeIntConst(0, Ty);
-}
-
-static bool getBinaryOperands(BinaryInst *BI, Value *&LHS, Value *&RHS) {
-	LHS = nullptr;
-	RHS = nullptr;
-	if (!BI) return false;
-	auto &UL = BI->getUserList();
-	if (UL.size() < 2) return false;
-	LHS = UL[0] ? UL[0]->getValue() : nullptr;
-	RHS = UL[1] ? UL[1]->getValue() : nullptr;
-	return LHS && RHS;
-}
-
-static bool setBinaryOperands(BinaryInst *BI, Value *LHS, Value *RHS) {
-	if (!BI || !LHS || !RHS) return false;
-	auto &UL = BI->getUserList();
-	if (UL.size() < 2 || !UL[0] || !UL[1]) return false;
-	bool Changed = false;
-	if (UL[0]->getValue() != LHS) Changed |= UL[0]->replaceUseeWith(LHS);
-	if (UL[1]->getValue() != RHS) Changed |= UL[1]->replaceUseeWith(RHS);
-	return Changed;
-}
-
-static int countInstructionUses(Value *V, Instruction **SingleUser = nullptr) {
-	if (SingleUser) *SingleUser = nullptr;
-	if (!V) return 0;
-
-	int Cnt = 0;
-	Instruction *OnlyInstUser = nullptr;
-	for (auto It = V->getUseList().begin(); It != V->getUseList().end(); ++It) {
-		Use *U = *It;
-		if (!U || U->getValue() != V) continue;
-		auto *InstUser = dynamic_cast<Instruction *>(U->getUser());
-		if (!InstUser) continue;
-		++Cnt;
-		if (Cnt == 1) {
-			OnlyInstUser = InstUser;
-		} else {
-			OnlyInstUser = nullptr;
-		}
-	}
-
-	if (SingleUser && Cnt == 1) *SingleUser = OnlyInstUser;
-	return Cnt;
-}
-
 static bool isDeadInstForReassociate(Instruction *I, FunctionAnalysisPassManager &FAM) {
 	if (!I) return false;
-	if (countInstructionUses(I) > 0) return false;
+	if (I->countInstructionUses() > 0) return false;
 
 	if (I->instType == Instruction::RET || I->instType == Instruction::BR ||
 		I->instType == Instruction::PHI || I->instType == Instruction::STORE) {
@@ -144,21 +55,7 @@ static bool evalConst(BinaryInst::Operation Op, Value *L, Value *R, Value *&Out)
 
 	int LI = 0;
 	int RI = 0;
-	if (auto *LCI = dynamic_cast<ConstInt *>(L)) {
-		LI = LCI->getVal();
-	} else if (auto *LCB = dynamic_cast<ConstBool *>(L)) {
-		LI = LCB->getVal() ? 1 : 0;
-	} else {
-		return false;
-	}
-
-	if (auto *RCI = dynamic_cast<ConstInt *>(R)) {
-		RI = RCI->getVal();
-	} else if (auto *RCB = dynamic_cast<ConstBool *>(R)) {
-		RI = RCB->getVal() ? 1 : 0;
-	} else {
-		return false;
-	}
+	if (!L->tryGetIntConst(LI) || !R->tryGetIntConst(RI)) return false;
 
 	switch (Op) {
 	case BinaryInst::ADD: Out = ConstInt::newConstInt(LI + RI); return true;
@@ -181,7 +78,7 @@ static bool isAlreadyBuilt(Instruction *I, BinaryInst::Operation Op, const std::
 
 		Value *L = nullptr;
 		Value *R = nullptr;
-		if (!getBinaryOperands(BI, L, R)) return false;
+		if (!BI->getOperands(L, R)) return false;
 
 		if (i == Ops.size() - 2) {
 			return (L == Ops[i] && R == Ops[i + 1]) || (L == Ops[i + 1] && R == Ops[i]);
@@ -266,7 +163,8 @@ private:
 				bool ShouldSkip = false;
 				if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
 					BinaryInst::Operation Op = BI->getOp();
-					ShouldSkip = isIntegerType(I->getIRType()) && isReassociateOp(Op);
+					ShouldSkip = I->getIRType() && I->getIRType()->isInt() &&
+						BinaryInst::isReassociateOp(Op);
 				}
 
 				if (ShouldSkip) continue;
@@ -287,7 +185,8 @@ private:
 	void stampRank(Instruction *I) {
 		if (!I) return;
 		if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
-			if (isIntegerType(I->getIRType()) && isReassociateOp(BI->getOp())) {
+			if (I->getIRType() && I->getIRType()->isInt() &&
+				BinaryInst::isReassociateOp(BI->getOp())) {
 				// Keep reassociate nodes at neutral rank to avoid reorder oscillation.
 				Ranks.erase(I);
 				return;
@@ -332,8 +231,7 @@ private:
 
 		auto *NI = new BinaryInst(LHS, Op, RHS);
 		// O(1) insertion: avoid scanning the whole block on every rebuild step.
-		auto It = decltype(BB->begin())(Pos);
-		It.insertBefore(NI);
+		Pos->insertBefore(NI);
 		stampRank(NI);
 		pushTodo(NI);
 		return NI;
@@ -341,13 +239,14 @@ private:
 
 	bool flattenMulFactors(Value *V, std::vector<Value *> &Factors) {
 		auto *BI = dynamic_cast<BinaryInst *>(V);
-		if (!BI || BI->getOp() != BinaryInst::MUL || countInstructionUses(BI) != 1) {
+		if (!BI || BI->getOp() != BinaryInst::MUL ||
+			BI->countInstructionUses() != 1) {
 			Factors.push_back(V);
 			return false;
 		}
 		Value *L = nullptr;
 		Value *R = nullptr;
-		if (!getBinaryOperands(BI, L, R)) {
+		if (!BI->getOperands(L, R)) {
 			Factors.push_back(V);
 			return false;
 		}
@@ -440,12 +339,12 @@ private:
 		if (!BI || BI->getOp() != BinaryInst::MUL) return false;
 		Value *L = nullptr;
 		Value *R = nullptr;
-		if (!getBinaryOperands(BI, L, R)) return false;
-		if (isConstMinusOne(L)) {
+		if (!BI->getOperands(L, R)) return false;
+		if (L->isConstMinusOne()) {
 			X = R;
 			return true;
 		}
-		if (isConstMinusOne(R)) {
+		if (R->isConstMinusOne()) {
 			X = L;
 			return true;
 		}
@@ -504,9 +403,9 @@ private:
 		if (Ops.empty()) return TotalConst;
 
 		if (TotalConst) {
-			if (Op == BinaryInst::MUL && isConstZero(TotalConst)) return TotalConst;
-			if (!((Op == BinaryInst::ADD && isConstZero(TotalConst)) ||
-				(Op == BinaryInst::MUL && isConstOne(TotalConst)))) {
+			if (Op == BinaryInst::MUL && TotalConst->isConstZero()) return TotalConst;
+			if (!((Op == BinaryInst::ADD && TotalConst->isConstZero()) ||
+				(Op == BinaryInst::MUL && TotalConst->isConstOne()))) {
 				Ops.push_back(TotalConst);
 			}
 		}
@@ -586,7 +485,7 @@ private:
 						if (!Removed[i]) NewOps.push_back(Ops[i]);
 					}
 					Ops.swap(NewOps);
-					if (Ops.empty()) return makeZeroForType(Root->getIRType());
+					if (Ops.empty()) return Value::makeZeroForType(Root->getIRType());
 					if (Ops.size() == 1) return Ops[0];
 				}
 			}
@@ -690,14 +589,14 @@ private:
 
 		auto *BI = dynamic_cast<BinaryInst *>(I);
 		if (!BI) return false;
-		if (!isIntegerType(I->getIRType())) return false;
+		if (!I->getIRType() || !I->getIRType()->isInt()) return false;
 
 		BinaryInst::Operation Op = BI->getOp();
-		if (!isReassociateOp(Op)) return false;
+		if (!BinaryInst::isReassociateOp(Op)) return false;
 
 		Value *LHS = nullptr;
 		Value *RHS = nullptr;
-		if (!getBinaryOperands(BI, LHS, RHS)) return false;
+		if (!BI->getOperands(LHS, RHS)) return false;
 		if (!isIntegerValue(LHS) || !isIntegerValue(RHS)) {
 			return false;
 		}
@@ -712,10 +611,10 @@ private:
 			return true;
 		}
 
-		if (!isAssociativeOp(Op)) return false;
+		if (!BinaryInst::isAssociativeOp(Op)) return false;
 
 		Instruction *OnlyUser = nullptr;
-		if (countInstructionUses(I, &OnlyUser) == 1) {
+		if (I->countInstructionUses(&OnlyUser) == 1) {
 			if (OnlyUser && OnlyUser != I && OnlyUser->getParent() == I->getParent()) {
 				auto *UBI = dynamic_cast<BinaryInst *>(OnlyUser);
 				if (UBI && UBI->getOp() == Op) {
@@ -741,13 +640,14 @@ private:
 				continue;
 			}
 			auto *CurBI = dynamic_cast<BinaryInst *>(Cur);
-			if (!CurBI || CurBI->getOp() != Op || countInstructionUses(Cur) != 1) {
+			if (!CurBI || CurBI->getOp() != Op ||
+				Cur->countInstructionUses() != 1) {
 				Ops.push_back(Cur);
 				continue;
 			}
 			Value *A = nullptr;
 			Value *B = nullptr;
-			if (!getBinaryOperands(CurBI, A, B)) {
+			if (!CurBI->getOperands(A, B)) {
 				Ops.push_back(Cur);
 				continue;
 			}
@@ -812,8 +712,6 @@ private:
 		return true;
 	}
 };
-
-} // namespace
 
 PreservationStatus ReassociatePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	ReassociateEngine Engine(F, FAM);

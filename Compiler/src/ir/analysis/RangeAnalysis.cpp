@@ -463,16 +463,8 @@ bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
 // 需要 pipeline 级多轮不动点迭代，复杂度不值得现在上。
 // =====================================================================
 
-namespace {
-
-struct InterprocCache {
-    // 每个函数的返回值 range：所有 RetInst 操作数的 union
-    std::unordered_map<Function*, IntRange> RetRanges;
-    std::unordered_map<Function*, FloatRange> FloatRetRanges;
-};
-
-static InterprocCache& getInterprocCache() {
-    static InterprocCache cache;
+static InterprocRangeCache& getInterprocCache() {
+    static InterprocRangeCache cache;
     return cache;
 }
 
@@ -491,7 +483,8 @@ static InterprocCache& getInterprocCache() {
 //     backward 推导（z = x + y ⟹ x = z - y），把过宽的结果收回来
 // =====================================================================
 
-struct RangeSolver {
+class RangeSolver {
+public:
     // 和 SCCP 相同的可达性追踪
     std::unordered_set<BasicBlock *> ExecutableBlocks;
     std::set<std::pair<BasicBlock *, BasicBlock *>> FeasibleEdges;
@@ -1400,7 +1393,7 @@ struct RangeSolver {
         // 后，函数会被用偏紧的参数分析，返回值可能被低估；修这个需要 pipeline
         // 级不动点迭代，超出单次 analysis 的范围）
         if (auto *F = dynamic_cast<Function *>(callee)) {
-            InterprocCache &cache = getInterprocCache();
+            InterprocRangeCache &cache = getInterprocCache();
             auto callTy = CI->getIRType();
             if (callTy && callTy->getEnum() == IR_INT) {
                 auto it = cache.RetRanges.find(F);
@@ -1428,12 +1421,6 @@ struct RangeSolver {
     }
 
     void visitGEP(GetElementPtrInst *GEP) {
-        // GEP 数组边界推断：对每个 ARRAYType 维度，索引必然在 [0, count-1]。
-        // 理由：SysY 程序（假设无 UB）若执行到该 GEP，其索引必在数组边界内。
-        // 由于 SSA：同一 Value 在不同点值相同，所以可以在 GEP 块上加 contextual
-        // 约束，该约束通过 dominator 查询对被 GEP 块支配的所有使用生效。
-        // 对同块 GEP 之前的 use：按 SSA 语义 value 不变；如果执行到了 GEP，
-        // value 就在 bound 内，对 pre-GEP use 施加 bound 不会引入错误。
         auto &UL = GEP->getUserList();
         if (UL.size() < 2) return;
         Value *basePtr = UL[0]->getValue();
@@ -1614,7 +1601,7 @@ struct RangeSolver {
     // 扫描本函数所有 RetInst，把返回值 range 的 union 写入跨函数 cache
     // 下次分析其他调用本函数的函数时能直接查到
     void publishReturnRange(Function &F) {
-        InterprocCache &cache = getInterprocCache();
+        InterprocRangeCache &cache = getInterprocCache();
         IntRange retR = IntRange::bottom();
         FloatRange fretR = FloatRange::bottom();
         bool hasInt = false, hasFloat = false;
@@ -1777,8 +1764,6 @@ struct RangeSolver {
         return info;
     }
 };
-
-} // namespace
 
 // =====================================================================
 // RangeAnalysis Pass

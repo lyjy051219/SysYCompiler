@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(BasicAliasAnalysis::ID())) {
@@ -12,6 +13,44 @@ bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
     (void)F;
     AliasCache.clear();
     return true;
+}
+
+void BasicAAResult::addObjectNoAliasFact(Value* V1, Value* V2) {
+    if (!V1 || !V2 || V1 == V2) {
+        return;
+    }
+    ObjectNoAlias.insert(makeCanonicalPair(V1, V2));
+}
+
+bool BasicAAResult::hasObjectNoAlias(Value* V1, Value* V2) const {
+    if (!V1 || !V2 || V1 == V2) {
+        return false;
+    }
+    return ObjectNoAlias.find(makeCanonicalPair(V1, V2)) != ObjectNoAlias.end();
+}
+
+bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
+                                        const LoopInfo &LI) {
+    if (!CI || !P) return false;
+    for (unsigned I = 0; I < CI->getArgCount(); ++I) {
+        Value *Arg = CI->getArg(I);
+        if (!Arg || !Arg->isPointerValue()) continue;
+        if (alias(P, Arg, LI) != AliasInfo::NoAlias) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::size_t BasicAAResult::getPointeeAccessSize(Value* V) const {
+    if (!(V && V->getIRType() && V->getIRType()->isPointer())) {
+        return 0;
+    }
+    auto Ptr = std::dynamic_pointer_cast<POINTERType>(V->getIRType());
+    if (!Ptr || !Ptr->getPointerType()) {
+        return 0;
+    }
+    return Ptr->getPointerType()->getSize();
 }
 
 Value* BasicAAResult::stripBaseInst(Value* V) const {
@@ -190,7 +229,205 @@ BasicAAResult::LinearGEP BasicAAResult::fillLinearGEP(Value* V) const {
     return Expr;
 }
 
-AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2) {
+BasicAAResult::AdditiveDecomposition
+BasicAAResult::decomposeAdditive(Value* V) const {
+    AdditiveDecomposition Result;
+    Result.Base = V;
+    std::unordered_set<Value*> Visited;
+
+    while (Result.Base && Visited.insert(Result.Base).second) {
+        auto *BI = dynamic_cast<BinaryInst*>(Result.Base);
+        if (!BI) {
+            return Result;
+        }
+
+        Value* LHS = BI->getOperand(0);
+        Value* RHS = BI->getOperand(1);
+        auto *LC = dynamic_cast<ConstInt*>(LHS);
+        auto *RC = dynamic_cast<ConstInt*>(RHS);
+
+        if (BI->getOp() == BinaryInst::ADD) {
+            if (RC) {
+                Result.Offset += RC->getVal();
+                Result.Base = LHS;
+                continue;
+            }
+            if (LC) {
+                Result.Offset += LC->getVal();
+                Result.Base = RHS;
+                continue;
+            }
+        } else if (BI->getOp() == BinaryInst::SUB && RC) {
+            Result.Offset -= RC->getVal();
+            Result.Base = LHS;
+            continue;
+        }
+
+        return Result;
+    }
+
+    Result.Valid = false;
+    return Result;
+}
+
+std::optional<long long>
+BasicAAResult::getAdditiveOffsetFrom(Value* V, Value* Base) const {
+    if (!V || !Base) {
+        return std::nullopt;
+    }
+    if (V == Base) {
+        return 0;
+    }
+
+    auto Dec = decomposeAdditive(V);
+    if (!Dec.Valid) {
+        return std::nullopt;
+    }
+    if (Dec.Base == Base) {
+        return Dec.Offset;
+    }
+    return std::nullopt;
+}
+
+bool BasicAAResult::isLoopInvariant(Value* V, const Loop* L) const {
+    if (!V || !L) {
+        return true;
+    }
+    if (V->isConst()) {
+        return true;
+    }
+    if (auto *Var = dynamic_cast<Variable*>(V)) {
+        return Var->isParam() || Var->isGlobal();
+    }
+    auto *I = dynamic_cast<Instruction*>(V);
+    if (!I) {
+        return true;
+    }
+    BasicBlock* BB = I->getParent();
+    return !BB || !L->contains(BB);
+}
+
+std::optional<BasicAAResult::PositivePhiRecurrence>
+BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
+                                        const LoopInfo& LI) const {
+    if (!Phi || !Phi->getParent()) {
+        return std::nullopt;
+    }
+
+    Loop* L = LI.getLoopFor(Phi->getParent());
+    if (!L || L->getHeader() != Phi->getParent()) {
+        return std::nullopt;
+    }
+
+    Value* Start = nullptr;
+    Value* Update = nullptr;
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        Value* V = Phi->getIncomingValue(I);
+        BasicBlock* Pred = Phi->getIncomingBlock(I);
+        if (!V || !Pred) {
+            return std::nullopt;
+        }
+        if (L->contains(Pred)) {
+            if (Update && Update != V) {
+                return std::nullopt;
+            }
+            Update = V;
+        } else {
+            if (Start && Start != V) {
+                return std::nullopt;
+            }
+            Start = V;
+        }
+    }
+
+    auto Step = getAdditiveOffsetFrom(Update, Phi);
+    if (!Start || !Step || *Step <= 0) {
+        return std::nullopt;
+    }
+    return PositivePhiRecurrence{Start, *Step, L};
+}
+
+std::optional<long long>
+BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
+                              const LoopInfo& LI) const {
+    if (!Greater || !Lesser) {
+        return std::nullopt;
+    }
+
+    if (auto Direct = getAdditiveOffsetFrom(Greater, Lesser)) {
+        if (*Direct >= 0) {
+            return *Direct;
+        }
+    }
+
+    auto Dec = decomposeAdditive(Greater);
+    if (!Dec.Valid) {
+        return std::nullopt;
+    }
+
+    auto *Phi = dynamic_cast<PhiInst*>(Dec.Base);
+    auto Rec = getPositivePhiRecurrence(Phi, LI);
+    if (!Rec) {
+        return std::nullopt;
+    }
+
+    if (!isLoopInvariant(Lesser, Rec->L)) {
+        return std::nullopt;
+    }
+
+    auto StartOff = getAdditiveOffsetFrom(Rec->Start, Lesser);
+    if (!StartOff) {
+        return std::nullopt;
+    }
+
+    long long LB = *StartOff + Dec.Offset;
+    if (LB < 0) {
+        return std::nullopt;
+    }
+    return LB;
+}
+
+AliasInfo BasicAAResult::aliasGEPByIndexDistance(
+    const std::unordered_map<Value*, long long>& DiffVars,
+    long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
+    if (DiffVars.size() != 2) {
+        return AliasInfo::MayAlias;
+    }
+
+    auto It = DiffVars.begin();
+    Value* A = It->first;
+    long long Scale = It->second;
+    ++It;
+    Value* B = It->first;
+    long long OtherScale = It->second;
+
+    if (Scale == 0 || Scale != -OtherScale) {
+        return AliasInfo::MayAlias;
+    }
+    if (Scale < 0) {
+        Scale = -Scale;
+        std::swap(A, B);
+    }
+
+    Threshold = std::max<std::size_t>(1, Threshold);
+    if (auto LB = lowerBoundDiff(A, B, LI)) {
+        long long MinDiff = ConstDiff + Scale * (*LB);
+        if (MinDiff >= static_cast<long long>(Threshold)) {
+            return AliasInfo::NoAlias;
+        }
+    }
+    if (auto LB = lowerBoundDiff(B, A, LI)) {
+        long long MaxDiff = ConstDiff - Scale * (*LB);
+        if (MaxDiff <= -static_cast<long long>(Threshold)) {
+            return AliasInfo::NoAlias;
+        }
+    }
+
+    return AliasInfo::MayAlias;
+}
+
+AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2,
+                                  const LoopInfo& LI, bool UseIndexRange) {
     auto E1 = fillLinearGEP(GEP1);
     auto E2 = fillLinearGEP(GEP2);
 
@@ -215,7 +452,14 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
 
     const long long ConstDiff = E1.ConstantOffset - E2.ConstantOffset;
 
+    std::size_t Access1 = getPointeeAccessSize(GEP1);
+    std::size_t Access2 = getPointeeAccessSize(GEP2);
+    std::size_t Threshold = std::max<std::size_t>(1, std::max(Access1, Access2));
+
     if (!DiffVars.empty()) {
+        if (UseIndexRange) {
+            return aliasGEPByIndexDistance(DiffVars, ConstDiff, Threshold, LI);
+        }
         return AliasInfo::MayAlias;
     }
 
@@ -223,21 +467,6 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
         return AliasInfo::MustAlias;
     }
 
-    std::size_t Access1 = 0;
-    if (GEP1 && GEP1->getIRType() && GEP1->getIRType()->getEnum() == IR_POINTER) {
-        auto PtrV1 = std::dynamic_pointer_cast<POINTERType>(GEP1->getIRType());
-        if (PtrV1 && PtrV1->getPointerType()) {
-            Access1 = PtrV1->getPointerType()->getSize();
-        }
-    }
-    std::size_t Access2 = 0;
-    if (GEP2 && GEP2->getIRType() && GEP2->getIRType()->getEnum() == IR_POINTER) {
-        auto PtrV2 = std::dynamic_pointer_cast<POINTERType>(GEP2->getIRType());
-        if (PtrV2 && PtrV2->getPointerType()) {
-            Access2 = PtrV2->getPointerType()->getSize();
-        }
-    }
-    std::size_t Threshold = std::max<std::size_t>(1, std::max(Access1, Access2));
     long long Distance = std::llabs(ConstDiff);
     if (Distance >= static_cast<long long>(Threshold)) {
         return AliasInfo::NoAlias;
@@ -245,7 +474,8 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
     return AliasInfo::MayAlias;
 }
 
-AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI) {
+AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI,
+                                  bool UseIndexRange) {
     if (!Phi) {
         return AliasInfo::MayAlias;
     }
@@ -261,9 +491,11 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
                 return AliasInfo::MayAlias;
             }
 
-            AliasInfo Acc = alias(Phi->getIncomingValue(0), OtherPhi->getIncomingValue(0), LI);
+            AliasInfo Acc = aliasImpl(Phi->getIncomingValue(0), OtherPhi->getIncomingValue(0),
+                                      LI, UseIndexRange);
             for (unsigned i = 1; i < N; ++i) {
-                AliasInfo Cur = alias(Phi->getIncomingValue(i), OtherPhi->getIncomingValue(i), LI);
+                AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i), OtherPhi->getIncomingValue(i),
+                                          LI, UseIndexRange);
                 Acc = mergePhiAlias(Acc, Cur);
                 if (Acc == AliasInfo::MayAlias) {
                     break;
@@ -273,9 +505,9 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
         }
     }
 
-    AliasInfo Acc = alias(Phi->getIncomingValue(0), Other, LI);
+    AliasInfo Acc = aliasImpl(Phi->getIncomingValue(0), Other, LI, UseIndexRange);
     for (unsigned i = 1; i < N; ++i) {
-        AliasInfo Cur = alias(Phi->getIncomingValue(i), Other, LI);
+        AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i), Other, LI, UseIndexRange);
         Acc = mergePhiAlias(Acc, Cur);
         if (Acc == AliasInfo::MayAlias) {
             break;
@@ -285,21 +517,19 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
 }
 
 AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
+    return aliasImpl(V1, V2, LI, false);
+}
+
+AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
+                                             const LoopInfo& LI) {
+    return aliasImpl(V1, V2, LI, true);
+}
+
+AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
+                                   bool UseIndexRange) {
     //1.如果任一者访问的内存大小为0,直接判定为NoAlias
-    std::size_t Access1 = 0;
-    if (V1->getIRType() && V1->getIRType()->getEnum() == IR_POINTER) {
-        auto PtrV1 = std::dynamic_pointer_cast<POINTERType>(V1->getIRType());
-        if (PtrV1 && PtrV1->getPointerType()) {
-            Access1 = PtrV1->getPointerType()->getSize();
-        }
-    }
-    std::size_t Access2 = 0;
-    if (V2->getIRType() && V2->getIRType()->getEnum() == IR_POINTER) {
-        auto PtrV2 = std::dynamic_pointer_cast<POINTERType>(V2->getIRType());
-        if (PtrV2 && PtrV2->getPointerType()) {
-            Access2 = PtrV2->getPointerType()->getSize();
-        }
-    }
+    std::size_t Access1 = getPointeeAccessSize(V1);
+    std::size_t Access2 = getPointeeAccessSize(V2);
 
     if (Access1 == 0 || Access2 == 0) {
         return AliasInfo::NoAlias;
@@ -344,7 +574,7 @@ AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
         if (IsAlloca1 && IsAlloca2) {
             return AliasInfo::NoAlias;
         }
-        if (IsGlobal1 && IsGlobal2) {
+        if ((IsGlobal1 || IsConst1) && (IsGlobal2 || IsConst2)) {
             return AliasInfo::NoAlias;
         }
         if ((IsParam1 && IsAlloca2) || (IsParam2 && IsAlloca1)) {
@@ -354,31 +584,39 @@ AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
             (IsAlloca2 && (IsGlobal1 || IsConst1))) {
             return AliasInfo::NoAlias;
         }
+        if (hasObjectNoAlias(O1, O2)) {
+            return AliasInfo::NoAlias;
+        }
 
         return AliasInfo::MayAlias;
     }
 
-    auto Key = makeCanonicalPair(V1, V2);
-    auto It = AliasCache.find(Key);
-    if (It != AliasCache.end()) {
-        return It->second;
+    std::pair<Value*, Value*> Key;
+    if (!UseIndexRange) {
+        Key = makeCanonicalPair(V1, V2);
+        auto It = AliasCache.find(Key);
+        if (It != AliasCache.end()) {
+            return It->second;
+        }
+        AliasCache[Key] = AliasInfo::MayAlias;
     }
-    AliasCache[Key] = AliasInfo::MayAlias;
 
     AliasInfo Result = AliasInfo::MayAlias;
     auto *G1 = dynamic_cast<GetElementPtrInst*>(V1);
     auto *G2 = dynamic_cast<GetElementPtrInst*>(V2);
     if (G1 && G2) {
-        Result = aliasGEP(G1, G2);
+        Result = aliasGEP(G1, G2, LI, UseIndexRange);
     } else if (auto *P1 = dynamic_cast<PhiInst*>(V1)) {
-        Result = aliasPHI(P1, V2, LI);
+        Result = aliasPHI(P1, V2, LI, UseIndexRange);
     } else if (auto *P2 = dynamic_cast<PhiInst*>(V2)) {
-        Result = aliasPHI(P2, V1, LI);
+        Result = aliasPHI(P2, V1, LI, UseIndexRange);
     } else if (V1 == V2) {
         Result = AliasInfo::MayAlias;
     }
 
-    AliasCache[Key] = Result;
+    if (!UseIndexRange) {
+        AliasCache[Key] = Result;
+    }
     return Result;
 }
 
@@ -386,6 +624,78 @@ PassID BasicAliasAnalysis::Key;
 
 BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
     BasicAAResult Result;
-    (void)FAM;
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+    auto &Params = F.getParams();
+    std::vector<unsigned> PointerParams;
+    PointerParams.reserve(Params.size());
+    for (unsigned I = 0; I < Params.size(); ++I) {
+        Value *Param = Params[I].get();
+        if (Param && Param->getIRType() && Param->getIRType()->isPointer()) {
+            PointerParams.push_back(I);
+        }
+    }
+    if (PointerParams.empty()) {
+        return Result;
+    }
+
+    std::vector<CallInst*> Calls;
+    bool AllDirectCalls = true;
+    for (auto It = F.getUseList().begin(); It != F.getUseList().end(); ++It) {
+        Use* U = *It;
+        auto *CI = U ? dynamic_cast<CallInst*>(U->getUser()) : nullptr;
+        if (!CI || CI->getUserIndex(U) != 0) {
+            AllDirectCalls = false;
+            break;
+        }
+        Calls.push_back(CI);
+    }
+    if (!AllDirectCalls || Calls.empty()) {
+        return Result;
+    }
+
+    BasicAAResult SeedAA;
+    for (unsigned I = 0; I < PointerParams.size(); ++I) {
+        for (unsigned J = I + 1; J < PointerParams.size(); ++J) {
+            unsigned PI = PointerParams[I];
+            unsigned PJ = PointerParams[J];
+            bool AllNoAlias = true;
+            for (CallInst* CI : Calls) {
+                Value* ArgI = CI->getArg(PI);
+                Value* ArgJ = CI->getArg(PJ);
+                if (!ArgI || !ArgJ || SeedAA.alias(ArgI, ArgJ, LI) != AliasInfo::NoAlias) {
+                    AllNoAlias = false;
+                    break;
+                }
+            }
+            if (AllNoAlias) {
+                Result.addObjectNoAliasFact(Params[PI].get(), Params[PJ].get());
+            }
+        }
+    }
+
+    Module* M = Module::getActiveModule();
+    if (!M) {
+        return Result;
+    }
+    for (auto &GV : M->getGlobalVar()) {
+        Value* Global = GV.get();
+        if (!(Global && Global->getIRType() && Global->getIRType()->isPointer())) {
+            continue;
+        }
+        for (unsigned PI : PointerParams) {
+            bool AllNoAlias = true;
+            for (CallInst* CI : Calls) {
+                Value* Arg = CI->getArg(PI);
+                if (!Arg || SeedAA.alias(Arg, Global, LI) != AliasInfo::NoAlias) {
+                    AllNoAlias = false;
+                    break;
+                }
+            }
+            if (AllNoAlias) {
+                Result.addObjectNoAliasFact(Params[PI].get(), Global);
+            }
+        }
+    }
     return Result;
 }

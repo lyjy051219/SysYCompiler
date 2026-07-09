@@ -3,8 +3,6 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
-#include <unordered_set>
-
 // 死函数消除（模块级 GlobalDCE 的函数子集）。
 // 只保留从 main / 外部 ABI 根可达的函数，以及在可达代码中被直接调用或地址逃逸的函数。
 // 未被标记的用户函数会在 sweep 阶段从 Module 函数表中删除。
@@ -18,7 +16,4 @@ private:
 	FunctionAnalysisPassManager &FAM;
 
 	static bool isExternalRoot(Function *F);
-	static Function *getParentFunction(Instruction *I);
-	static void collectReachableBlocks(Function *F, std::unordered_set<BasicBlock *> &Reachable);
-	static void dropAllReferences(Function *F);
 };

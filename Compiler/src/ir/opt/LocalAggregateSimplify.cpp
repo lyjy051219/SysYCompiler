@@ -7,14 +7,6 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-struct PointerPath {
-    AllocaInst *Root = nullptr;
-    std::vector<int> Indices;
-    bool IsConstant = true;
-};
-
 static bool isArrayAlloca(AllocaInst *AI) {
     if (!AI) return false;
     auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
@@ -103,15 +95,10 @@ static bool unflattenScalarPath(std::shared_ptr<IRType> Ty, int FlatIndex,
 }
 
 static bool getConstIndex(Value *V, int &Index) {
-    if (auto *CI = dynamic_cast<ConstInt *>(V)) {
-        Index = CI->getVal();
-        return true;
-    }
-    if (auto *CB = dynamic_cast<ConstBool *>(V)) {
-        Index = CB->getVal() ? 1 : 0;
-        return true;
-    }
-    return false;
+    int32_t Tmp = 0;
+    if (!V || !V->tryGetIntConst(Tmp)) return false;
+    Index = Tmp;
+    return true;
 }
 
 static Value *makeIndexConstant(Value *Index, int Val) {
@@ -128,19 +115,6 @@ static Value *makeIndexConstant(Value *Index, int Val) {
     return ConstInt::newConstInt(Val, Index->getIRType()->getSize());
 }
 
-static bool insertInstBefore(Instruction *Pos, Instruction *NewI) {
-    if (!Pos || !NewI) return false;
-    BasicBlock *BB = Pos->getParent();
-    if (!BB) return false;
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        if (*It == Pos) {
-            It.insertBefore(NewI);
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool appearsBefore(Instruction *A, Instruction *B) {
     if (!A || !B || A->getParent() != B->getParent()) return false;
     for (auto It = A->getParent()->begin(); It != A->getParent()->end();
@@ -154,9 +128,9 @@ static bool appearsBefore(Instruction *A, Instruction *B) {
 // Trace only the pointer forms emitted by the front end. Each aggregate GEP
 // starts with a zero pointer-dereference index; the remaining indices select
 // array elements and can therefore be concatenated across chained GEPs.
-static PointerPath tracePointer(Value *V,
+static LocalAggregatePointerPath tracePointer(Value *V,
                                 std::unordered_set<Value *> &Visiting) {
-    PointerPath Result;
+    LocalAggregatePointerPath Result;
     if (!V || !Visiting.insert(V).second) return Result;
 
     if (auto *AI = dynamic_cast<AllocaInst *>(V)) {
@@ -212,7 +186,7 @@ static PointerPath tracePointer(Value *V,
     return Result;
 }
 
-static PointerPath tracePointer(Value *V) {
+static LocalAggregatePointerPath tracePointer(Value *V) {
     std::unordered_set<Value *> Visiting;
     return tracePointer(V, Visiting);
 }
@@ -343,10 +317,8 @@ static bool getConstantOffsetScalarGEP(Value *Base, GetElementPtrInst *GEP,
 
 static bool isMemcpy(CallInst *CI) {
     if (!CI) return false;
-    auto &Ops = CI->getUserList();
-    if (Ops.empty() || !Ops[0]) return false;
 
-    Value *Callee = Ops[0]->getValue();
+    Value *Callee = CI->getCallee();
     std::string Name;
     if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee))
         Name = BIF->getIdent();
@@ -356,17 +328,14 @@ static bool isMemcpy(CallInst *CI) {
 }
 
 static bool isFalseConstant(Value *V) {
-    if (auto *CB = dynamic_cast<ConstBool *>(V)) return !CB->getVal();
-    if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == 0;
-    return false;
+    int32_t Out = 0;
+    return V && V->tryGetIntConst(Out) && Out == 0;
 }
 
 static bool isNonVolatileMemcpy(CallInst *CI) {
     if (!isMemcpy(CI)) return false;
-    auto &Ops = CI->getUserList();
     // callee, destination, source, byte count, volatile flag
-    return Ops.size() >= 5 && Ops[4] &&
-           isFalseConstant(Ops[4]->getValue());
+    return CI->getArgCount() >= 4 && isFalseConstant(CI->getArg(3));
 }
 
 static bool haveSameShape(const std::shared_ptr<IRType> &A,
@@ -410,8 +379,7 @@ static bool isWholeConstantCopy(CallInst *CI, AllocaInst *Destination,
         !isNonVolatileMemcpy(CI))
         return false;
 
-    auto &Ops = CI->getUserList();
-    auto *ByteCount = dynamic_cast<ConstInt *>(Ops[3]->getValue());
+    auto *ByteCount = dynamic_cast<ConstInt *>(CI->getArg(2));
     auto DestPtr =
         std::dynamic_pointer_cast<POINTERType>(Destination->getIRType());
     auto SourcePtr =
@@ -423,17 +391,6 @@ static bool isWholeConstantCopy(CallInst *CI, AllocaInst *Destination,
     return ByteCount->getVal() >= 0 &&
            static_cast<size_t>(ByteCount->getVal()) == DestTy->getSize() &&
            haveSameShape(DestTy, SourceTy);
-}
-
-static Value *makeZero(std::shared_ptr<IRType> Ty) {
-    if (!Ty) return nullptr;
-    if (Ty->getEnum() == IR_FLOAT) return ConstFloat::newConstFloat();
-    if (Ty->getEnum() != IR_INT) return nullptr;
-
-    if (auto IntTy = std::dynamic_pointer_cast<INTType>(Ty);
-        IntTy && IntTy->getIsBool())
-        return ConstBool::newConstBool();
-    return ConstInt::newConstInt(0, Ty->getSize());
 }
 
 static bool compatibleTypes(Value *A, Value *B) {
@@ -471,7 +428,7 @@ static Value *getConstantElement(Variable *Source,
     }
 
     if (Ty && Ty->getEnum() == IR_ARRAY) return nullptr;
-    if (!Node) return makeZero(Ty);
+    if (!Node) return Value::makeZeroForType(Ty);
     return dynamic_cast<ConstantSystem *>(Node) ? Node : nullptr;
 }
 
@@ -529,13 +486,12 @@ static bool forwardConstantLoads(AllocaInst *AI) {
 
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            auto &Ops = CI->getUserList();
-            if (!isMemcpy(CI) || Ops.size() < 3) continue;
+            if (!isMemcpy(CI) || CI->getArgCount() < 2) continue;
 
-            PointerPath Dest = tracePointer(Ops[1]->getValue());
+            LocalAggregatePointerPath Dest = tracePointer(CI->getArg(0));
             if (Dest.Root != AI) continue;
 
-            auto *Source = dynamic_cast<Variable *>(Ops[2]->getValue());
+            auto *Source = dynamic_cast<Variable *>(CI->getArg(1));
             if (!Dest.IsConstant || !Dest.Indices.empty() ||
                 !isWholeConstantCopy(CI, AI, Source)) {
                 StateValid = false;
@@ -550,9 +506,7 @@ static bool forwardConstantLoads(AllocaInst *AI) {
         }
 
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-            auto &Ops = SI->getUserList();
-            if (Ops.size() < 2) continue;
-            PointerPath Dest = tracePointer(Ops[1]->getValue());
+            LocalAggregatePointerPath Dest = tracePointer(SI->getPointerOperand());
             if (Dest.Root != AI) continue;
 
             if (!StateValid || !Dest.IsConstant || Dest.Indices.empty()) {
@@ -561,16 +515,14 @@ static bool forwardConstantLoads(AllocaInst *AI) {
                 Overwrites.clear();
                 continue;
             }
-            Overwrites[Dest.Indices] = Ops[0]->getValue();
+            Overwrites[Dest.Indices] = SI->getValueOperand();
             continue;
         }
 
         auto *LI = dynamic_cast<LoadInst *>(I);
         if (!LI) continue;
-        auto &Ops = LI->getUserList();
-        if (Ops.empty()) continue;
 
-        PointerPath SourcePath = tracePointer(Ops[0]->getValue());
+        LocalAggregatePointerPath SourcePath = tracePointer(LI->getPointerOperand());
         if (SourcePath.Root != AI || !StateValid ||
             !SourcePath.IsConstant || SourcePath.Indices.empty())
             continue;
@@ -609,15 +561,8 @@ static bool indexTypeCanSelectAll(Value *Index, int Count) {
     return !IntTy || !IntTy->getIsBool() || Count <= 2;
 }
 
-struct ReadOnlyConstantArrayPlan {
-    Variable *Source = nullptr;
-    CallInst *InitCopy = nullptr;
-    std::vector<GetElementPtrInst *> ElementPtrs;
-    std::vector<LoadInst *> Loads;
-};
-
 static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
-                                             ReadOnlyConstantArrayPlan &Plan,
+                                             LocalAggregateReadOnlyConstantArrayPlan &Plan,
                                              int Count) {
     if (!AI || Count <= 0) return false;
 
@@ -644,12 +589,11 @@ static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
 
         if (auto *CI = dynamic_cast<CallInst *>(I);
             CI && OperandIndex == 1 && isNonVolatileMemcpy(CI)) {
-            auto &Ops = CI->getUserList();
-            if (Ops.size() < 3 || Ops[1]->getValue() != AI ||
+            if (CI->getArgCount() < 2 || CI->getArg(0) != AI ||
                 Plan.InitCopy)
                 return false;
 
-            auto *Source = dynamic_cast<Variable *>(Ops[2]->getValue());
+            auto *Source = dynamic_cast<Variable *>(CI->getArg(1));
             if (!isWholeConstantCopy(CI, AI, Source)) return false;
             Plan.InitCopy = CI;
             Plan.Source = Source;
@@ -717,13 +661,13 @@ static Value *buildConstantArrayLookup(Variable *Source, int Count,
         Value *Needle = makeIndexConstant(Index, I);
         if (!Needle) return nullptr;
         auto *Cmp = new BinaryInst(Index, BinaryInst::E, Needle);
-        if (!insertInstBefore(InsertBefore, Cmp)) {
+        if (!InsertBefore->insertBefore(Cmp)) {
             delete Cmp;
             return nullptr;
         }
         auto *Sel = new SelectInst(Cmp, Elements[static_cast<size_t>(I)],
                                    Result);
-        if (!insertInstBefore(InsertBefore, Sel)) {
+        if (!InsertBefore->insertBefore(Sel)) {
             delete Sel;
             return nullptr;
         }
@@ -738,7 +682,7 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
     int Count = getOneDimScalarArrayCount(AI);
     if (Count <= 0) return false;
 
-    ReadOnlyConstantArrayPlan Plan;
+    LocalAggregateReadOnlyConstantArrayPlan Plan;
     if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
         return false;
 
@@ -748,9 +692,7 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
     bool HasDynamicIndex = false;
     for (LoadInst *LI : Plan.Loads) {
         if (!compatibleTypes(LI, FirstElement)) return false;
-        auto &Ops = LI->getUserList();
-        if (Ops.empty()) return false;
-        auto *GEP = dynamic_cast<GetElementPtrInst *>(Ops[0]->getValue());
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(LI->getPointerOperand());
         Value *Index = nullptr;
         if (!getDirectOneDimElementIndex(AI, GEP, Index) ||
             !indexTypeCanSelectAll(Index, Count))
@@ -769,8 +711,7 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
     Replacements.reserve(Plan.Loads.size());
     for (LoadInst *LI : Plan.Loads) {
-        auto *GEP =
-            dynamic_cast<GetElementPtrInst *>(LI->getUserList()[0]->getValue());
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(LI->getPointerOperand());
         Value *Index = nullptr;
         if (!getDirectOneDimElementIndex(AI, GEP, Index)) return false;
 
@@ -939,10 +880,9 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
         int OperandIndex = UserI->getUserIndex(U);
         if (auto *CI = dynamic_cast<CallInst *>(UserI);
             CI && OperandIndex == 1 && isNonVolatileMemcpy(CI)) {
-            auto &Ops = CI->getUserList();
-            if (Ops.size() < 3 || Ops[1]->getValue() != AI || InitCopy)
+            if (CI->getArgCount() < 2 || CI->getArg(0) != AI || InitCopy)
                 return Fail("bad memcpy operands");
-            auto *Source = dynamic_cast<Variable *>(Ops[2]->getValue());
+            auto *Source = dynamic_cast<Variable *>(CI->getArg(1));
             if (!isWholeConstantCopy(CI, AI, Source))
                 return Fail("not whole const copy");
             InitCopy = CI;
@@ -1014,7 +954,7 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
     for (auto &Entry : SlotTypes) {
         auto *Slot =
             new AllocaInst(POINTERType::NewPointer(Entry.second));
-        if (!insertInstBefore(AI, Slot)) {
+        if (!AI->insertBefore(Slot)) {
             delete Slot;
             return false;
         }
@@ -1027,7 +967,7 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
         for (auto &Entry : Slots) {
             Value *Init = InitialValues[Entry.first];
             auto *Store = new StoreInst(Init, Entry.second);
-            if (!insertInstBefore(InitInsertPoint, Store)) {
+            if (!InitInsertPoint->insertBefore(Store)) {
                 delete Store;
                 return false;
             }
@@ -1063,14 +1003,8 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
     return true;
 }
 
-struct DeadAggregateUses {
-    bool IsDead = true;
-    std::vector<Instruction *> Writes;
-    std::vector<Instruction *> DerivedPointers;
-};
-
-static DeadAggregateUses collectDeadAggregateUses(AllocaInst *AI) {
-    DeadAggregateUses Result;
+static LocalAggregateDeadUses collectDeadAggregateUses(AllocaInst *AI) {
+    LocalAggregateDeadUses Result;
     std::vector<Value *> Worklist{AI};
     std::unordered_set<Value *> SeenValues;
     std::unordered_set<Instruction *> SeenWrites;
@@ -1122,7 +1056,7 @@ static DeadAggregateUses collectDeadAggregateUses(AllocaInst *AI) {
 }
 
 static bool deleteDeadAggregate(AllocaInst *AI) {
-    DeadAggregateUses Uses = collectDeadAggregateUses(AI);
+    LocalAggregateDeadUses Uses = collectDeadAggregateUses(AI);
     if (!Uses.IsDead) return false;
 
     for (Instruction *I : Uses.Writes)
@@ -1153,8 +1087,6 @@ static std::vector<AllocaInst *> collectArrayAllocas(Function &F) {
     }
     return Aggregates;
 }
-
-} // namespace
 
 PreservationStatus
 LocalAggregateSimplifyPass::run(Function &F,

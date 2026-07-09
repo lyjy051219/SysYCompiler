@@ -9,13 +9,6 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-static bool hasUses(Value *V) {
-	if (!V) return false;
-	return !V->getUseList().is_empty();
-}
-
 static Value *safeReplacement(PhiInst *Phi, const DominatorTree &DT) {
 	if (!Phi) return nullptr;
 
@@ -76,7 +69,7 @@ static bool cleanupFunction(Function &F, DominatorTree &DT) {
 		for (PhiInst *Phi : Phis) {
 			if (!Phi || !Phi->getParent()) continue;
 
-			if (!hasUses(Phi)) {
+			if (!Phi->hasUses()) {
 				delete Phi;
 				Changed = true;
 				LocalChanged = true;
@@ -95,8 +88,6 @@ static bool cleanupFunction(Function &F, DominatorTree &DT) {
 
 	return Changed;
 }
-
-} // namespace
 
 PreservationStatus LatePhiCleanupPass::run(Function &F,
                                            FunctionAnalysisPassManager &FAM) {

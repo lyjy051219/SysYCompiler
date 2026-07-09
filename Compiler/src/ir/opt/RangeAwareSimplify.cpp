@@ -2,6 +2,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <vector>
 #include <cmath>
@@ -34,20 +35,6 @@
 //    如果被除数非负且除数为正，signed rem 等价于 unsigned rem
 //    当前 IR 无独立 UREM 指令，pass 保留接口等后端区分后再实装
 // =====================================================================
-
-namespace {
-
-// 判断一个 ConstInt 值是否是 2 的幂
-static bool isPowerOf2(int val) {
-    return val > 0 && (val & (val - 1)) == 0;
-}
-
-// 计算 log2(val)，val 必须是 2 的幂
-static int log2i(int val) {
-    int n = 0;
-    while ((1 << n) < val) n++;
-    return n;
-}
 
 static bool isPureIntExprOp(BinaryInst::Operation op) {
     switch (op) {
@@ -188,8 +175,8 @@ static bool strengthReduce(Function &F, RangeInfo &RI, DominatorTree &DT) {
 
         // 右操作数必须是 2 的幂常量
         auto *rhsConst = dynamic_cast<ConstInt *>(rhs);
-        if (!rhsConst || !isPowerOf2(rhsConst->getVal())) continue;
-        int shift = log2i(rhsConst->getVal());
+        if (!rhsConst || !IRMath::isPowerOf2(rhsConst->getVal())) continue;
+        int shift = IRMath::log2i(rhsConst->getVal());
 
         BasicBlock *BB = BI->ChainNode<BasicBlock, Instruction>::getParent();
         if (!BB) continue;
@@ -838,8 +825,6 @@ static bool convertSignedToUnsigned(Function &F, RangeInfo &RI, DominatorTree &D
 
     return changed;
 }
-
-} // namespace
 
 PreservationStatus RangeAwareSimplifyPass::run(Function &F,
                                                 FunctionAnalysisPassManager &FAM) {

@@ -2,6 +2,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <vector>
 #include <stack>
@@ -39,33 +40,7 @@
 //      （如 if (getch() < 100) 里，getch 范围 [0,127]，控制流再加 <100 的约束）
 // =====================================================================
 
-namespace {
-
-// 一条约束：val op bound
-struct Constraint {
-    Value *val;
-    BinaryInst::Operation op; // L, LE, G, GE, E, NE
-    Value *bound;
-    // 如果 bound 是 ConstInt，记住它的值方便蕴含检查
-    bool boundIsConst;
-    int64_t boundVal;
-    // 表示 val op (bound + boundOffset)。bound 是常量时等价于常量整体偏移；
-    // bound 是 SSA 值时只在两条约束引用同一个 bound 时做偏移比较。
-    int64_t boundOffset;
-};
-
-struct OffsetExpr {
-    Value *Base = nullptr;
-    int64_t Offset = 0;
-    bool Valid = false;
-};
-
-static bool addI32(int64_t A, int64_t B, int64_t &Out) {
-    Out = A + B;
-    return Out >= (int64_t)INT32_MIN && Out <= (int64_t)INT32_MAX;
-}
-
-static OffsetExpr decomposeOffset(Value *V, int depth = 2) {
+static ConstraintElimOffsetExpr decomposeOffset(Value *V, int depth = 2) {
     if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
         return {};
     if (depth <= 0)
@@ -75,32 +50,29 @@ static OffsetExpr decomposeOffset(Value *V, int depth = 2) {
     if (!BI)
         return {V, 0, true};
 
-    auto &UL = BI->getUserList();
-    if (UL.size() < 2)
-        return {V, 0, true};
-    Value *lhs = UL[0]->getValue();
-    Value *rhs = UL[1]->getValue();
-    if (!lhs || !rhs)
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!BI->getOperands(lhs, rhs))
         return {V, 0, true};
 
     if (BI->getOp() == BinaryInst::ADD) {
         if (auto *C = dynamic_cast<ConstInt *>(lhs)) {
-            OffsetExpr E = decomposeOffset(rhs, depth - 1);
+            ConstraintElimOffsetExpr E = decomposeOffset(rhs, depth - 1);
             int64_t NewOffset = 0;
-            if (E.Valid && addI32(E.Offset, C->getVal(), NewOffset))
+            if (E.Valid && IRMath::addI32(E.Offset, C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
         }
         if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
-            OffsetExpr E = decomposeOffset(lhs, depth - 1);
+            ConstraintElimOffsetExpr E = decomposeOffset(lhs, depth - 1);
             int64_t NewOffset = 0;
-            if (E.Valid && addI32(E.Offset, C->getVal(), NewOffset))
+            if (E.Valid && IRMath::addI32(E.Offset, C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
         }
     } else if (BI->getOp() == BinaryInst::SUB) {
         if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
-            OffsetExpr E = decomposeOffset(lhs, depth - 1);
+            ConstraintElimOffsetExpr E = decomposeOffset(lhs, depth - 1);
             int64_t NewOffset = 0;
-            if (E.Valid && addI32(E.Offset, -(int64_t)C->getVal(), NewOffset))
+            if (E.Valid && IRMath::addI32(E.Offset, -(int64_t)C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
         }
     }
@@ -110,9 +82,9 @@ static OffsetExpr decomposeOffset(Value *V, int depth = 2) {
 
 static bool rewriteOffsetConstraint(Value *lhs, Value *rhs,
                                     BinaryInst::Operation op,
-                                    Constraint &out) {
-    OffsetExpr L = decomposeOffset(lhs);
-    OffsetExpr R = decomposeOffset(rhs);
+                                    ConstraintElimConstraint &out) {
+    ConstraintElimOffsetExpr L = decomposeOffset(lhs);
+    ConstraintElimOffsetExpr R = decomposeOffset(rhs);
     if (!L.Valid || !R.Valid || !L.Base || !R.Base) return false;
 
     int64_t Delta = R.Offset - L.Offset;
@@ -158,41 +130,6 @@ static bool rewriteOffsetConstraint(Value *lhs, Value *rhs,
     return true;
 }
 
-// 从条件分支的 icmp 提取约束
-// 如果是 br(icmp op lhs rhs, trueBB, falseBB)，
-// true 分支上的约束是 (lhs op rhs)，false 分支上的约束是 (lhs !op rhs)
-static BinaryInst::Operation negateOp(BinaryInst::Operation op) {
-    switch (op) {
-        case BinaryInst::L:  return BinaryInst::GE;
-        case BinaryInst::LE: return BinaryInst::G;
-        case BinaryInst::G:  return BinaryInst::LE;
-        case BinaryInst::GE: return BinaryInst::L;
-        case BinaryInst::E:  return BinaryInst::NE;
-        case BinaryInst::NE: return BinaryInst::E;
-        default: return op;
-    }
-}
-
-static BinaryInst::Operation reverseOp(BinaryInst::Operation op) {
-    switch (op) {
-        case BinaryInst::L:  return BinaryInst::G;
-        case BinaryInst::LE: return BinaryInst::GE;
-        case BinaryInst::G:  return BinaryInst::L;
-        case BinaryInst::GE: return BinaryInst::LE;
-        case BinaryInst::E:
-        case BinaryInst::NE:
-            return op;
-        default:
-            return op;
-    }
-}
-
-static bool isCmpOp(BinaryInst::Operation op) {
-    return op == BinaryInst::L || op == BinaryInst::LE ||
-           op == BinaryInst::G || op == BinaryInst::GE ||
-           op == BinaryInst::E || op == BinaryInst::NE;
-}
-
 // 从 icmp 指令提取约束
 // 只处理整数比较：BinaryInst 的比较操作符在整数和浮点间复用，
 // 浮点比较的语义（NaN、inf）和整数不同，不能用整数约束推理。
@@ -203,19 +140,17 @@ static bool isCmpOp(BinaryInst::Operation op) {
 //   (c1 - x) op c2  →  x (反向 op) (c1 - c2)      —— x 搬到一侧要翻号
 //   x op (y + c)    →  (x - y) op c               —— 这步风险大先不做
 // 前三种只要 RHS 是常量就能做；溢出检查走 int64，溢出时退回原始形式。
-static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
-    if (!cmp || !isCmpOp(cmp->getOp())) return false;
-    auto &UL = cmp->getUserList();
-    if (UL.size() < 2) return false;
-
-    Value *lhs = UL[0]->getValue();
-    Value *rhs = UL[1]->getValue();
+static bool extractConstraint(BinaryInst *cmp, bool negate, ConstraintElimConstraint &out) {
+    if (!cmp || !BinaryInst::isCompareOp(cmp->getOp())) return false;
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!cmp->getOperands(lhs, rhs)) return false;
 
     // 仅整数比较
     if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return false;
     if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return false;
 
-    BinaryInst::Operation op = negate ? negateOp(cmp->getOp()) : cmp->getOp();
+    BinaryInst::Operation op = negate ? BinaryInst::negatePredicate(cmp->getOp()) : cmp->getOp();
     Value *val = lhs;
     Value *bound = rhs;
 
@@ -223,10 +158,9 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
     // 避免了把非常量搬到 bound 侧引入新值。溢出一律退回原式。
     if (auto *rConst = dynamic_cast<ConstInt *>(rhs)) {
         if (auto *lBI = dynamic_cast<BinaryInst *>(lhs)) {
-            auto &lUL = lBI->getUserList();
-            if (lUL.size() >= 2) {
-                Value *la = lUL[0]->getValue();
-                Value *lb = lUL[1]->getValue();
+            Value *la = nullptr;
+            Value *lb = nullptr;
+            if (lBI->getOperands(la, lb)) {
                 int64_t c2 = rConst->getVal();
 
                 auto inI32 = [](int64_t v) {
@@ -278,14 +212,7 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
                         int64_t newBound = (int64_t)laConst->getVal() - c2;
                         if (inI32(newBound)) {
                             // 翻号：L↔G, LE↔GE, E 不变, NE 不变
-                            BinaryInst::Operation flipped = op;
-                            switch (op) {
-                                case BinaryInst::L:  flipped = BinaryInst::G;  break;
-                                case BinaryInst::LE: flipped = BinaryInst::GE; break;
-                                case BinaryInst::G:  flipped = BinaryInst::L;  break;
-                                case BinaryInst::GE: flipped = BinaryInst::LE; break;
-                                default: break;
-                            }
+                            BinaryInst::Operation flipped = BinaryInst::reversePredicate(op);
                             out.val = lb;
                             out.op = flipped;
                             out.bound = ConstInt::newConstInt((int)newBound);
@@ -316,18 +243,11 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, Constraint &out) {
     return true;
 }
 
-static bool addNoOverflow(int64_t A, int64_t B, int64_t &Out) {
-    if ((B > 0 && A > INT64_MAX - B) || (B < 0 && A < INT64_MIN - B))
-        return false;
-    Out = A + B;
-    return true;
-}
-
-static bool comparableBoundValues(const Constraint &A, const Constraint &B,
+static bool comparableBoundValues(const ConstraintElimConstraint &A, const ConstraintElimConstraint &B,
                                   int64_t &AV, int64_t &BV) {
     if (A.boundIsConst && B.boundIsConst) {
-        return addNoOverflow(A.boundVal, A.boundOffset, AV) &&
-               addNoOverflow(B.boundVal, B.boundOffset, BV);
+        return IRMath::addNoOverflow(A.boundVal, A.boundOffset, AV) &&
+               IRMath::addNoOverflow(B.boundVal, B.boundOffset, BV);
     }
     if (!A.boundIsConst && !B.boundIsConst && A.bound == B.bound) {
         AV = A.boundOffset;
@@ -339,7 +259,7 @@ static bool comparableBoundValues(const Constraint &A, const Constraint &B,
 
 // 检查已知约束 known 是否蕴含目标约束 target
 // 两个约束必须是关于同一个 val 和同一个 bound（或 bound 是常量可比较）
-static bool implies(const Constraint &known, const Constraint &target) {
+static bool implies(const ConstraintElimConstraint &known, const ConstraintElimConstraint &target) {
     // 必须是同一个值
     if (known.val != target.val) return false;
 
@@ -425,14 +345,14 @@ static bool implies(const Constraint &known, const Constraint &target) {
 }
 
 // 检查约束栈是否蕴含目标约束（单跳）
-static bool isImplied(const std::vector<Constraint> &stack, const Constraint &target) {
+static bool isImplied(const std::vector<ConstraintElimConstraint> &stack, const ConstraintElimConstraint &target) {
     for (auto &known : stack) {
         if (implies(known, target)) return true;
         if (!known.boundIsConst && !target.boundIsConst &&
             known.boundOffset == 0 && target.boundOffset == 0) {
-            Constraint reversed;
+            ConstraintElimConstraint reversed;
             reversed.val = known.bound;
-            reversed.op = reverseOp(known.op);
+            reversed.op = BinaryInst::reversePredicate(known.op);
             reversed.bound = known.val;
             reversed.boundIsConst = false;
             reversed.boundVal = 0;
@@ -450,11 +370,11 @@ static bool isImplied(const std::vector<Constraint> &stack, const Constraint &ta
 //
 // 复杂度：对每个 target，最多扫 stack 两遍，总共 O(stack^2)，而栈大小
 // 受支配树深度限制，实际很小。
-static bool impliesTransitive(const std::vector<Constraint> &stack,
-                              const Constraint &target) {
+static bool impliesTransitive(const std::vector<ConstraintElimConstraint> &stack,
+                              const ConstraintElimConstraint &target) {
     int64_t checkedTargetConst = 0;
     if (!target.boundIsConst ||
-        !addNoOverflow(target.boundVal, target.boundOffset, checkedTargetConst))
+        !IRMath::addNoOverflow(target.boundVal, target.boundOffset, checkedTargetConst))
         return false;
     (void)checkedTargetConst;
 
@@ -492,12 +412,12 @@ static bool impliesTransitive(const std::vector<Constraint> &stack,
             };
             BinaryInst::Operation combined = compose(k1.op, k2.op);
             if (combined == BinaryInst::NE) continue; // 不兼容的组合
-            Constraint synthesized;
+            ConstraintElimConstraint synthesized;
             synthesized.val = target.val;
             synthesized.op = combined;
             synthesized.bound = k2.bound;
             synthesized.boundIsConst = true;
-            if (!addNoOverflow(k2.boundVal, k2.boundOffset, synthesized.boundVal))
+            if (!IRMath::addNoOverflow(k2.boundVal, k2.boundOffset, synthesized.boundVal))
                 continue;
             synthesized.boundOffset = 0;
             if (implies(synthesized, target)) return true;
@@ -507,18 +427,16 @@ static bool impliesTransitive(const std::vector<Constraint> &stack,
 }
 
 // 综合判定：先试单跳，不行再试两跳链
-static bool isImpliedChained(const std::vector<Constraint> &stack,
-                             const Constraint &target) {
+static bool isImpliedChained(const std::vector<ConstraintElimConstraint> &stack,
+                             const ConstraintElimConstraint &target) {
     return isImplied(stack, target) || impliesTransitive(stack, target);
 }
 
-static bool isContradicted(const std::vector<Constraint> &stack, const Constraint &target) {
-    Constraint negTarget = target;
-    negTarget.op = negateOp(target.op);
+static bool isContradicted(const std::vector<ConstraintElimConstraint> &stack, const ConstraintElimConstraint &target) {
+    ConstraintElimConstraint negTarget = target;
+    negTarget.op = BinaryInst::negatePredicate(target.op);
     return isImpliedChained(stack, negTarget);
 }
-
-} // namespace
 
 PreservationStatus ConstraintEliminationPass::run(Function &F,
                                                    FunctionAnalysisPassManager &FAM) {
@@ -526,24 +444,13 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     bool changed = false;
 
-    // DFS 遍历支配树，维护约束栈
-    struct StackFrame {
-        DominatorNode *node;
-        int constraintsBefore; // 进入时约束栈的大小，离开时 pop 回来
-    };
-
-    std::vector<Constraint> constraintStack;
-    std::stack<StackFrame> dfsStack;
+    std::vector<ConstraintElimConstraint> constraintStack;
+    std::stack<ConstraintElimStackFrame> dfsStack;
 
     if (!DT.Root) return PreservationStatus::all();
     dfsStack.push({DT.Root, 0});
 
-    // 收集要处理的比较指令（先收集后处理，避免迭代中删指令影响 DFS）
-    struct FoldCandidate {
-        BinaryInst *cmp;
-        bool result; // true or false
-    };
-    std::vector<FoldCandidate> toFold;
+    std::vector<ConstraintElimFoldCandidate> toFold;
 
     while (!dfsStack.empty()) {
         auto frame = dfsStack.top();
@@ -572,7 +479,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                     auto *falseBB = dynamic_cast<BasicBlock *>(brUL[2]->getValue());
 
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
-                        Constraint c;
+                        ConstraintElimConstraint c;
                         bool negate = (BB == falseBB);
                         if (extractConstraint(cmpInst, negate, c)) {
                             constraintStack.push_back(c);
@@ -592,7 +499,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                 if (brUL.size() == 3) {
                     Value *cond = brUL[0]->getValue();
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
-                        Constraint target;
+                        ConstraintElimConstraint target;
                         if (extractConstraint(cmpInst, false, target)) {
                             // 把 target.val 的 RangeAnalysis 结果当成一对临时
                             // 常量上下界约束 push 到栈尾；用完 pop 回去，
@@ -604,7 +511,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                                 if (!vr.isTop() && !vr.isBottom()) {
                                     // 用 interned ConstInt 当 bound，避免 bound=nullptr
                                     // 让 implies 的 sameBound 快速路径错判"不同数值但指针同"
-                                    Constraint lo, hi;
+                                    ConstraintElimConstraint lo, hi;
                                     lo.val = target.val;
                                     lo.op = BinaryInst::GE;
                                     lo.bound = ConstInt::newConstInt((int)vr.min);

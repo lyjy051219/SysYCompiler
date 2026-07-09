@@ -5,8 +5,6 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 
-#include <unordered_set>
-#include <deque>
 #include <vector>
 
 // =====================================================================
@@ -24,25 +22,14 @@
 // 后续 CFGSimplifyPass 负责清理不可达块和 stale PHI。
 // =====================================================================
 
-namespace {
-
-// ADCEContext
-struct ADCEContext {
-    std::unordered_set<Instruction*> LiveInsts;
-    std::unordered_set<BasicBlock*>  LiveBlocks;
-    std::deque<Instruction*>         Worklist;
-    std::unordered_set<BasicBlock*>  CDProcessed;   // 控制依赖去重
-};
-
 // callHasObservableSideEffect [F1 修正]
 // 只有明确标记 NoModRef 的 builtin 才可删。
 // 用户函数调用全部 root-live。
 // 理由: SideEffectAnalysis 对自递归调用跳过 (SideEffect.cpp:277),
 //       getFunctionModRefInfo 不证明可终止。
 static bool callHasObservableSideEffect(CallInst *CI, FunctionAnalysisPassManager &FAM) {
-    auto &UL = CI->getUserList();
-    if (UL.empty()) return true;
-    Value *Callee = UL[0]->getValue();
+    Value *Callee = CI ? CI->getCallee() : nullptr;
+    if (!Callee) return true;
 
     // Case 1: 内置函数
     if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
@@ -180,48 +167,6 @@ static BasicBlock *pickSurvivorSuccessor(BasicBlock *BB,
     return trueBB;
 }
 
-// removePhiIncoming
-static void removePhiIncoming(BasicBlock *predBB, BasicBlock *phiBB) {
-    std::vector<PhiInst *> phis;
-    for (auto inst : *phiBB) {
-        PhiInst *phi = dynamic_cast<PhiInst *>(inst);
-        if (!phi) break;
-        phis.push_back(phi);
-    }
-
-    for (PhiInst *phi : phis) {
-        bool needRebuild = false;
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-            if (phi->getIncomingBlock(i) == predBB) {
-                needRebuild = true;
-                break;
-            }
-        }
-        if (!needRebuild) continue;
-
-        PhiInst *newPhi = new PhiInst(phi->getIRType());
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-            if (phi->getIncomingBlock(i) != predBB) {
-                newPhi->addIncoming(phi->getIncomingValue(i),
-                                    phi->getIncomingBlock(i));
-            }
-        }
-
-        if (newPhi->getNumIncomingValues() == 0) {
-            phi->replaceAllUsesWith(
-                UndefValue::NewUndefValue(phi->getIRType()));
-            delete newPhi;
-        } else if (newPhi->getNumIncomingValues() == 1) {
-            phi->replaceAllUsesWith(newPhi->getIncomingValue(0));
-            delete newPhi;
-        } else {
-            phi->replaceAllUsesWith(newPhi);
-            phi->replaceWith(newPhi);
-        }
-        delete phi;
-    }
-}
-
 // sweep [F3/F4 重设计]
 static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &cfgChanged) {
     bool changed = false;
@@ -251,7 +196,7 @@ static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &c
 
         // 清理被丢弃边的 PHI incoming
         if (dropped != survivor) {
-            removePhiIncoming(BB, dropped);
+            BasicBlock::removeEdgeFromSuccPhis(dropped, BB, -1);
         }
 
         // 改写: 删条件分支，换无条件跳转
@@ -281,8 +226,6 @@ static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &c
 
     return changed;
 }
-
-} // namespace
 
 // ADCEPass::run
 PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {

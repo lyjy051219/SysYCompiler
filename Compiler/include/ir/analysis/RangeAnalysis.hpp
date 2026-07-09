@@ -351,6 +351,11 @@ struct LoopInductionInfo {
                           hasUpperBound(false), upperBound(0) {}
 };
 
+struct InterprocRangeCache {
+    std::unordered_map<Function*, IntRange> RetRanges;
+    std::unordered_map<Function*, FloatRange> FloatRetRanges;
+};
+
 // ---------------------------------------------------------------------
 // 范围分析结果
 // ---------------------------------------------------------------------

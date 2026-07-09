@@ -3,6 +3,27 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <vector>
+
+struct LocalAggregatePointerPath {
+    AllocaInst *Root = nullptr;
+    std::vector<int> Indices;
+    bool IsConstant = true;
+};
+
+struct LocalAggregateReadOnlyConstantArrayPlan {
+    Variable *Source = nullptr;
+    CallInst *InitCopy = nullptr;
+    std::vector<GetElementPtrInst *> ElementPtrs;
+    std::vector<LoadInst *> Loads;
+};
+
+struct LocalAggregateDeadUses {
+    bool IsDead = true;
+    std::vector<Instruction *> Writes;
+    std::vector<Instruction *> DerivedPointers;
+};
+
 // Simplify small, non-escaping local aggregates:
 //   1. forward constant elements copied from a constant global into same-block loads;
 //   2. expand read-only small constant arrays into select chains for dynamic loads;

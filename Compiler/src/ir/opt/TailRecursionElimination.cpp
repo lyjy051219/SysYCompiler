@@ -11,17 +11,15 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
 // 将目标 Ret 的返回值映射到 Pred 上可用的 SSA 值。
 // 允许处理位于 TargetBB 中的 PHI 与 BitCast 链，其他 TargetBB 本地指令一律判为不合法。
-Value *resolveRetValueForPred(Value *V,
-                              BasicBlock *Pred,
-                              BasicBlock *TargetBB,
-                              BasicBlock *InsertBB,
-                              Instruction *InsertBefore,
-                              std::vector<Instruction *> &ClonedInsts,
-                              std::unordered_set<Value *> &Visiting) {
+static Value *resolveRetValueForPred(Value *V,
+                                     BasicBlock *Pred,
+                                     BasicBlock *TargetBB,
+                                     BasicBlock *InsertBB,
+                                     Instruction *InsertBefore,
+                                     std::vector<Instruction *> &ClonedInsts,
+                                     std::unordered_set<Value *> &Visiting) {
     if (!V) return nullptr;
     if (Visiting.count(V)) return nullptr;
     Visiting.insert(V);
@@ -38,10 +36,10 @@ Value *resolveRetValueForPred(Value *V,
 
     if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
         if (BC->getParent() != TargetBB) return BC;
-        auto &BCUses = BC->getUserList();
-        if (BCUses.size() != 1 || !BCUses[0]) return nullptr;
+        Value *BCSrc = BC->getOperand(0);
+        if (!BCSrc) return nullptr;
 
-        Value *Src = resolveRetValueForPred(BCUses[0]->getValue(), Pred, TargetBB,
+        Value *Src = resolveRetValueForPred(BCSrc, Pred, TargetBB,
                                             InsertBB, InsertBefore, ClonedInsts, Visiting);
         if (!Src) return nullptr;
 
@@ -62,32 +60,27 @@ Value *resolveRetValueForPred(Value *V,
     return V;
 }
 
-bool rewriteClonedRetOperandForPred(RetInst *ClonedRet,
-                                    BasicBlock *Pred,
-                                    BasicBlock *TargetBB,
-                                    BasicBlock *InsertBB,
-                                    Instruction *InsertBefore,
-                                    std::vector<Instruction *> &ClonedInsts) {
-    auto &RetUses = ClonedRet->getUserList();
-    if (RetUses.empty() || !RetUses[0]) return true; // void ret
+static bool rewriteClonedRetOperandForPred(RetInst *ClonedRet,
+                                           BasicBlock *Pred,
+                                           BasicBlock *TargetBB,
+                                           BasicBlock *InsertBB,
+                                           Instruction *InsertBefore,
+                                           std::vector<Instruction *> &ClonedInsts) {
+    Value *RetVal = ClonedRet->getOperand(0);
+    if (!RetVal) return true; // void ret
 
     std::unordered_set<Value *> Visiting;
-    Value *Resolved = resolveRetValueForPred(RetUses[0]->getValue(), Pred, TargetBB,
+    Value *Resolved = resolveRetValueForPred(RetVal, Pred, TargetBB,
                                              InsertBB, InsertBefore, ClonedInsts, Visiting);
     if (!Resolved) return false;
-    RetUses[0]->replaceUseeWith(Resolved);
+    ClonedRet->replaceOperand(0, Resolved);
     return true;
 }
-
-} // namespace
 
 
 //  判断 CallInst 是否是对当前函数 F 的自递归调用
 bool TailRecursionEliminationPass::isSelfCall(CallInst *CI, Function &F) {
-    auto &uses = CI->getUserList();
-    if (uses.empty()) return false;
-    Value *calledVal = uses[0]->getValue();
-    return calledVal == &F;
+    return CI && CI->getCallee() == &F;
 }
 
 //  快速检查：函数是否包含自递归调用
@@ -114,9 +107,9 @@ static bool isReadonlyLikeCallInst(Instruction *I,
                                    FunctionAnalysisPassManager &FAM,
                                    Function &F) {
     if (I->instType != Instruction::CALL) return true;
-    auto &UL = I->getUserList();
-    if (UL.empty()) return false;
-    Value *Callee = UL[0]->getValue();
+    auto *CI = dynamic_cast<CallInst *>(I);
+    Value *Callee = CI ? CI->getCallee() : nullptr;
+    if (!Callee) return false;
     if (auto *CalleeFunc = dynamic_cast<Function *>(Callee)) {
         const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
         ModRefInfo FMRI = getFunctionModRefInfo(SEI);
@@ -141,54 +134,12 @@ static bool hasInterferingEarlierSelfCallInBlock(BasicBlock *BB,
         if (inst->instType != Instruction::CALL) continue;
         auto *CI = dynamic_cast<CallInst *>(inst);
         if (!CI) continue;
-        auto &uses = CI->getUserList();
-        if (uses.empty()) continue;
-        if (!(uses[0] && uses[0]->getValue() == &F)) continue;
+        if (CI->getCallee() != &F) continue;
 
         if (!isReadonlyLikeCallInst(CI, FAM, F)) return true;
         if (CI->getUseList().size != 0) return true;
     }
     return false;
-}
-
-static void removeEdgeFromSuccPhisSafe(BasicBlock *Succ, BasicBlock *Pred) {
-    if (!Succ || !Pred) return;
-
-    std::vector<PhiInst *> Phis;
-    for (auto inst : *Succ) {
-        auto *Phi = dynamic_cast<PhiInst *>(inst);
-        if (!Phi) break;
-        Phis.push_back(Phi);
-    }
-
-    for (auto *Phi : Phis) {
-        auto *NewPhi = new PhiInst(Phi->getIRType());
-        bool removed = false;
-        for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-            if (Phi->getIncomingBlock(i) == Pred) {
-                removed = true;
-                continue;
-            }
-            NewPhi->addIncoming(Phi->getIncomingValue(i), Phi->getIncomingBlock(i));
-        }
-
-        if (!removed) {
-            delete NewPhi;
-            continue;
-        }
-
-        if (NewPhi->getNumIncomingValues() == 0) {
-            Phi->replaceAllUsesWith(UndefValue::NewUndefValue(Phi->getIRType()));
-            delete NewPhi;
-        } else if (NewPhi->getNumIncomingValues() == 1) {
-            Phi->replaceAllUsesWith(NewPhi->getIncomingValue(0));
-            delete NewPhi;
-        } else {
-            Phi->replaceAllUsesWith(NewPhi);
-            Phi->replaceWith(NewPhi);
-        }
-        delete Phi;
-    }
 }
 
 static RetInst *getRetOnlyTerminatorBlockRet(BasicBlock *BB) {
@@ -228,10 +179,8 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
         if (isSelfCall(CI, F)) continue;
         //2.简单逃逸分析：没有任何Alloca被call指令当作参数传走
         bool hasEscapingLocalPtr = false;
-        auto &callUses = CI->getUserList();
-
-        for (size_t i = 1; i < callUses.size(); ++i) {
-            Value *argVal = callUses[i]->getValue();
+        for (unsigned i = 0; i < CI->getArgCount(); ++i) {
+            Value *argVal = CI->getArg(i);
             std::unordered_set<Value*> visited;
             std::vector<Value*> worklist;
             worklist.push_back(argVal);
@@ -268,8 +217,7 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
                 changed = true;
             }
         } else {
-            auto &retUses = RI->getUserList();
-            if (!retUses.empty() && retUses[0]->getValue() == CI) {
+            if (RI->getOperand(0) == CI) {
                 CI->setTailCall(true);
                 changed = true;
             }
@@ -316,10 +264,9 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
                 // 不支持多条累加指令
                 if (AccInst) return false;
 
-                auto &UL = BI->getUserList();
-                if (UL.size() != 2) return false;
-                Value *Op0 = UL[0]->getValue();
-                Value *Op1 = UL[1]->getValue();
+                Value *Op0 = nullptr;
+                Value *Op1 = nullptr;
+                if (!BI->getOperands(Op0, Op1)) return false;
 
                 // 恰好有一个操作数是 call 返回值
                 bool op0IsCall = (Op0 == static_cast<Value *>(CI));
@@ -349,9 +296,9 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
 
         // CALL: 被调函数必须只读
         if (I->instType == Instruction::CALL) {
-            auto &UL = I->getUserList();
-            if (UL.empty()) return false;
-            Value *Callee = UL[0]->getValue();
+            auto *Call = dynamic_cast<CallInst *>(I);
+            Value *Callee = Call ? Call->getCallee() : nullptr;
+            if (!Callee) return false;
             if (auto *CalleeFunc = dynamic_cast<Function *>(Callee)) {
                 const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
                 ModRefInfo FMRI = getFunctionModRefInfo(SEI);
@@ -370,9 +317,9 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
 
         // LOAD: call 不能 Mod 这块地址
         if (I->instType == Instruction::LOAD) {
-            auto &UL = I->getUserList();
-            if (!UL.empty() && UL[0]) {
-                Value *Ptr = UL[0]->getValue();
+            auto *LIInst = dynamic_cast<LoadInst *>(I);
+            if (LIInst) {
+                Value *Ptr = LIInst->getPointerOperand();
                 auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
                 auto &LI = FAM.getResult<LoopAnalysis>(F);
                 ModRefInfo MRI = getInstModRefInfo(Ptr, CI, AA, LI, FAM);
@@ -442,9 +389,8 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 
     // ===== 3.2 将尾递归实参添加到原入口块 PHI =====
     {
-        auto &callUses = CI->getUserList();
         for (size_t i = 0; i < ArgPhis.size(); ++i) {
-            Value *Arg = (i + 1 < callUses.size()) ? callUses[i + 1]->getValue() : nullptr;
+            Value *Arg = CI->getArg(static_cast<unsigned>(i));
             if (Arg)
                 ArgPhis[i]->addIncoming(Arg, BB);
         }
@@ -474,9 +420,9 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         }
 
         // 找累加器中非 call 的操作数
-        auto &accUses = AccInst->getUserList();
-        Value *Op0 = accUses[0]->getValue();
-        Value *Op1 = accUses[1]->getValue();
+        Value *Op0 = nullptr;
+        Value *Op1 = nullptr;
+        if (!AccInst->getOperands(Op0, Op1)) return false;
         Value *OtherOperand = (Op0 == static_cast<Value *>(CI)) ? Op1 : Op0;
 
         // 创建 AccPhi op OtherOperand, 插到 RI 之前
@@ -526,9 +472,8 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
     // 累加器模式下，旧 AccInst 仍引用 CI，若直接 delete CI 会触发 Value::~Value 级联删除用户。
     // 先断开 RI->AccInst，再将旧 AccInst 从块中移除并销毁，避免悬垂/级联破坏 CFG。
     if (AccInst && isInstructionStillInBlock(BB, AccInst)) {
-        auto &retUses = RI->getUserList();
-        if (!retUses.empty() && retUses[0] && retUses[0]->getValue() == AccInst) {
-            retUses[0]->replaceUseeWith(UndefValue::NewUndefValue(AccInst->getIRType()));
+        if (RI->getOperand(0) == AccInst) {
+            RI->replaceOperand(0, UndefValue::NewUndefValue(AccInst->getIRType()));
         }
         AccInst->EraseFromParent();
         delete AccInst;
@@ -614,9 +559,8 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 BrTerm = dynamic_cast<BrInst *>(term);
                 if (!BrTerm) continue;
 
-                auto &brUses = BrTerm->getUserList();
-                if (brUses.size() != 1) continue;
-                targetRetBB = dynamic_cast<BasicBlock *>(brUses[0]->getValue());
+                if (!BasicBlock::isUncondBr(BrTerm)) continue;
+                targetRetBB = dynamic_cast<BasicBlock *>(BrTerm->getOperand(0));
                 if (!targetRetBB) continue;
 
                 RetInst *TargetRet = getRetOnlyTerminatorBlockRet(targetRetBB);
@@ -659,10 +603,9 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 term = bb->back();
                 if (!term || term->instType != Instruction::BR)
                     continue;
-                auto &brUses2 = term->getUserList();
-                if (brUses2.size() != 1)
-                    continue;
-                BasicBlock *CurTarget = dynamic_cast<BasicBlock *>(brUses2[0]->getValue());
+                auto *CurBr = dynamic_cast<BrInst *>(term);
+                if (!BasicBlock::isUncondBr(CurBr)) continue;
+                BasicBlock *CurTarget = dynamic_cast<BasicBlock *>(CurBr->getOperand(0));
                 if (!CurTarget || CurTarget != targetRetBB)
                     continue;
 
@@ -711,7 +654,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
 
                 int edgeCount = bb->countEdgesToSucc(CurTarget);
                 if (edgeCount > 0) {
-                    removeEdgeFromSuccPhisSafe(CurTarget, bb);
+                    BasicBlock::removeEdgeFromSuccPhis(CurTarget, bb, -1);
                 }
 
                 delete term;

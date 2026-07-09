@@ -1,4 +1,5 @@
 #include "ir/analysis/SCEV.hpp"
+#include "lib/IRUtils.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -6,21 +7,6 @@
 #include <unordered_set>
 
 PassID SCEVAnalysis::Key;
-
-namespace {
-
-static Value *operand(User *U, unsigned Idx) {
-    if (!U) return nullptr;
-    auto &Ops = U->getUserList();
-    if (Idx >= Ops.size() || !Ops[Idx]) return nullptr;
-    return Ops[Idx]->getValue();
-}
-
-static bool isCmpOp(BinaryInst::Operation Op) {
-    return Op == BinaryInst::E || Op == BinaryInst::NE ||
-           Op == BinaryInst::GE || Op == BinaryInst::L ||
-           Op == BinaryInst::LE || Op == BinaryInst::G;
-}
 
 static std::string ptrKey(const void *P) {
     std::ostringstream OS;
@@ -83,14 +69,6 @@ static const char *predName(BinaryInst::Operation Op) {
     default: return "badpred";
     }
 }
-
-static int64_t ceilDivPositive(int64_t Num, int64_t Den) {
-    if (Num <= 0) return 0;
-    if (Den <= 0) return 0;
-    return (Num + Den - 1) / Den;
-}
-
-} // namespace
 
 SCEVResult::SCEVResult(Function *F, LoopInfo *LoopInfoPtr, DominatorTree *DTPtr)
     : Func(F), LI(LoopInfoPtr), DT(DTPtr) {}
@@ -399,12 +377,12 @@ const SCEVExpr *SCEVResult::create(Value *V) {
 }
 
 const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
-    Value *LHS = operand(BI, 0);
-    Value *RHS = operand(BI, 1);
+    Value *LHS = BI->getOperand(0);
+    Value *RHS = BI->getOperand(1);
     if (!LHS || !RHS) return makeUnknown(BI);
 
     BinaryInst::Operation Op = BI->getOp();
-    if (isCmpOp(Op)) return makeCompare(Op, getSCEV(LHS), getSCEV(RHS));
+    if (BinaryInst::isCompareOp(Op)) return makeCompare(Op, getSCEV(LHS), getSCEV(RHS));
 
     if (Op == BinaryInst::SHL) {
         if (auto *CI = dynamic_cast<ConstInt *>(RHS)) {
@@ -429,7 +407,7 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
 }
 
 const SCEVExpr *SCEVResult::createFromCast(Instruction *I, SCEVCastKind CK) {
-    Value *Op = operand(I, 0);
+    Value *Op = I->getOperand(0);
     if (!Op) return makeUnknown(I);
     return makeCast(CK, getSCEV(Op), I->getIRType());
 }
@@ -499,8 +477,8 @@ SCEVResult::findAdditiveDelta(PhiInst *Self, Value *V, const Loop *L) {
     auto *BI = dynamic_cast<BinaryInst *>(V);
     if (!BI) return std::nullopt;
 
-    Value *A = operand(BI, 0);
-    Value *B = operand(BI, 1);
+    Value *A = BI->getOperand(0);
+    Value *B = BI->getOperand(1);
     if (!A || !B) return std::nullopt;
 
     BinaryInst::Operation Op = BI->getOp();
@@ -541,8 +519,8 @@ const SCEVExpr *SCEVResult::trySimpleMulDivRec(PhiInst *Self, Value *Update,
                                                Value *Start, const Loop *L) {
     auto *BI = dynamic_cast<BinaryInst *>(Update);
     if (!BI) return nullptr;
-    Value *A = operand(BI, 0);
-    Value *B = operand(BI, 1);
+    Value *A = BI->getOperand(0);
+    Value *B = BI->getOperand(1);
     if (!A || !B) return nullptr;
 
     if (BI->getOp() == BinaryInst::MUL) {
@@ -591,9 +569,9 @@ bool SCEVResult::isDirectLoopBlock(const Loop *L, BasicBlock *BB) const {
 }
 
 const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
-    Value *Cond = operand(Sel, 0);
-    Value *TrueV = operand(Sel, 1);
-    Value *FalseV = operand(Sel, 2);
+    Value *Cond = Sel->getOperand(0);
+    Value *TrueV = Sel->getOperand(1);
+    Value *FalseV = Sel->getOperand(2);
     if (!Cond || !TrueV || !FalseV) return makeUnknown(Sel);
 
     if (auto *CB = dynamic_cast<ConstBool *>(Cond))
@@ -606,10 +584,10 @@ const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
     if (sameExpr(TE, FE)) return TE;
 
     auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
-    if (!Cmp || !isCmpOp(Cmp->getOp())) return makeUnknown(Sel);
+    if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp())) return makeUnknown(Sel);
 
-    Value *A = operand(Cmp, 0);
-    Value *B = operand(Cmp, 1);
+    Value *A = Cmp->getOperand(0);
+    Value *B = Cmp->getOperand(1);
     if (!A || !B) return makeUnknown(Sel);
 
     const bool TrueIsA = sameExpr(TE, getSCEV(A));
@@ -846,9 +824,9 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
     if (DT && !DT->dominates(Info.ExitingBlock, Latch)) return std::nullopt;
 
     auto *Br = Info.ExitingBlock->getBranchTerminator();
-    Value *Cond = operand(Br, 0);
+    Value *Cond = Br->getOperand(0);
     auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
-    if (!Cmp || !isCmpOp(Cmp->getOp())) return std::nullopt;
+    if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp())) return std::nullopt;
 
     Info.ExitCmp = Cmp;
     if (!fillTripCountFromComparison(Info)) return std::nullopt;
@@ -863,8 +841,8 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
 
     BinaryInst::Operation Pred = Info.ContinueOnTrue ? Cmp->getOp()
                                                      : invertPredicate(Cmp->getOp());
-    Value *LHSVal = operand(Cmp, 0);
-    Value *RHSVal = operand(Cmp, 1);
+    Value *LHSVal = Cmp->getOperand(0);
+    Value *RHSVal = Cmp->getOperand(1);
     if (!LHSVal || !RHSVal) return false;
 
     const SCEVExpr *LHS = getSCEV(LHSVal);
@@ -930,7 +908,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
             if (*D < 0 || (*D % AbsStep) != 0) return false;
             TC = makeConstant(*D / AbsStep, Distance->Ty);
         } else {
-            TC = makeConstant(ceilDivPositive(*D, AbsStep), Distance->Ty);
+            TC = makeConstant(IRMath::ceilDivPositive(*D, AbsStep), Distance->Ty);
         }
     } else {
         // For !=, a runtime distance is only safe if exact reachability can be

@@ -6,7 +6,10 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <limits>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 enum class UnrollKind {
@@ -33,8 +36,6 @@ struct UnrollConfig {
 
     bool UnrollRemainder = false;
 
-    // Tuned for the SysY test set and RISC-V BOOM: favor runtime speed, but
-    // cap code growth before register pressure and I-cache misses dominate.
     int FullThreshold = 192;
     int PartialThreshold = 160;
     int RuntimeThreshold = 96;
@@ -67,6 +68,59 @@ struct UnrollDecision {
     bool IsPeeling = false;
 
     std::string Reason;
+};
+
+struct PeelPredicate {
+    BinaryInst::Operation Op = BinaryInst::E;
+    int64_t Constant = 0;
+};
+
+struct LoopExecutionShape {
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Header = nullptr;
+    BasicBlock *Latch = nullptr;
+    BasicBlock *Exiting = nullptr;
+    BasicBlock *Exit = nullptr;
+};
+
+struct UnrolledBodyCore {
+    LoopExecutionShape Shape;
+    int Count = 0;
+    std::vector<std::vector<BasicBlock *>> IterBlocks;
+    std::vector<BasicBlock *> Headers;
+    std::vector<BasicBlock *> Latches;
+    std::vector<BasicBlock *> Exitings;
+    std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
+};
+
+struct PeeledBodyCore {
+    LoopExecutionShape Shape;
+    int PeelCount = 0;
+    std::vector<std::vector<BasicBlock *>> IterBlocks;
+    std::vector<BasicBlock *> Headers;
+    std::vector<BasicBlock *> Latches;
+    std::vector<BasicBlock *> Exitings;
+    std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
+};
+
+struct ExitRegionDataUse {
+    Use *OperandUse = nullptr;
+    Value *OriginalValue = nullptr;
+    Value *LookupValue = nullptr;
+    std::shared_ptr<IRType> ExpectedType = nullptr;
+};
+
+struct HeaderState {
+    PhiInst *OriginalPhi = nullptr;
+    PhiInst *CurrentPhi = nullptr;
+    Value *CurrentValue = nullptr;
+    Value *InitialValue = nullptr;
+    Value *BackedgeValue = nullptr;
+    Value *MainValue = nullptr;
+    Value *TailStateValue = nullptr;
+    int TailStartIter = std::numeric_limits<int>::max();
+    bool MainValueIsOriginalPhi = false;
+    bool BackedgeIsOriginalPhi = false;
 };
 
 class LoopUnrollPass : public PassDescriptor<LoopUnrollPass> {

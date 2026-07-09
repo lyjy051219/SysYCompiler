@@ -2,6 +2,22 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <cstdint>
+#include <unordered_set>
+#include <vector>
+
+struct StoreOnlyGlobalTraceResult {
+    Value *base = nullptr;
+    std::vector<int64_t> constPath;
+    bool hasVarIdx = false;
+    bool unresolved = false;
+};
+
+struct StoreOnlyGlobalReadInfo {
+    bool anyIndexRead = false;
+    std::unordered_set<int64_t> constIdx;
+};
+
 // 只写全局变量消除（索引精确版）：
 //   1) 对每个全局 G，跟踪是否被读，以及（对数组 G）被读的"常量索引集合"
 //   2) 复用 SideEffectAnalysis：Call 的实参只在 callee 实际 Ref 时才算读

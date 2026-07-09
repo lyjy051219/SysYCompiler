@@ -32,31 +32,6 @@
 // - onStack + memo 正确处理钻石图和循环
 // =====================================================================
 
-namespace {
-
-// =====================================================================
-// QueryResult
-// =====================================================================
-struct QueryResult {
-    enum Kind {
-        KNOWN,              // 所有路径值相同 = value
-        PHI_NEEDED,         // 各前驱已知但值不同，predMap 有效
-        CLOBBERED,          // 某路径上出现无法证明的事件
-        UNKNOWN,            // 预算耗尽 / 递归过深 / 环依赖
-        NEED_PREDECESSORS   // 块内没找到定义，要继续查前驱（仅内部使用）
-    };
-    Kind kind;
-    Value *value = nullptr;
-    std::vector<std::pair<BasicBlock*, Value*>> predMap;
-
-    static QueryResult known(Value *V)      { return {KNOWN, V, {}}; }
-    static QueryResult clobbered()          { return {CLOBBERED, nullptr, {}}; }
-    static QueryResult unknown()            { return {UNKNOWN, nullptr, {}}; }
-    static QueryResult needPredecessors()   { return {NEED_PREDECESSORS, nullptr, {}}; }
-    static QueryResult phiNeeded(std::vector<std::pair<BasicBlock*, Value*>> m)
-                                            { return {PHI_NEEDED, nullptr, std::move(m)}; }
-};
-
 // =====================================================================
 // 辅助函数
 // =====================================================================
@@ -69,32 +44,13 @@ static bool isTypeCompatible(Value *source, LoadInst *targetLoad) {
     return source->getIRType()->getEnum() == targetLoad->getIRType()->getEnum();
 }
 
-// callMayAliasPointer: 检查 CallInst 是否传递了任何可能 alias P 的指针参数。
-// 仅用作 getInstModRefInfo 的 fallback 安全网（SideEffectAnalysis 对自递归不完整）。
-// 不作为主判据。
-static bool callMayAliasPointer(
-    CallInst *CI, Value *P,
-    BasicAAResult &AA, const LoopInfo &LI)
-{
-    auto &UL = CI->getUserList();
-    for (size_t i = 1; i < UL.size(); ++i) {
-        Value *Arg = UL[i] ? UL[i]->getValue() : nullptr;
-        if (!Arg) continue;
-        if (!Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) continue;
-        if (AA.alias(P, Arg, LI) != AliasInfo::NoAlias) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // =====================================================================
 // scanBlockBackward: 从块内某位置向前扫描，寻找 P 的最近可用值。
 //
 // stopBefore: 扫描到此指令前停止。nullptr = 从块末尾开始扫全块。
 // targetLoad: 正在查询的 load 指令，用于类型检查和避免自引用。
 // =====================================================================
-static QueryResult scanBlockBackward(
+static LoadElimQueryResult scanBlockBackward(
     BasicBlock *BB, Value *P, Instruction *stopBefore, LoadInst *targetLoad,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
@@ -113,12 +69,12 @@ static QueryResult scanBlockBackward(
             if (SI->getUserList().size() >= 2) {
                 Value *StorePtr = SI->getUserList()[1]->getValue();
                 Value *StoredVal = SI->getUserList()[0]->getValue();
-                AliasInfo ai = AA.alias(P, StorePtr, LI);
+                AliasInfo ai = AA.aliasWithIndexRange(P, StorePtr, LI);
                 if (ai == AliasInfo::MustAlias && isTypeCompatible(StoredVal, targetLoad)) {
-                    return QueryResult::known(StoredVal);
+                    return LoadElimQueryResult::known(StoredVal);
                 }
                 if (ai != AliasInfo::NoAlias) {
-                    return QueryResult::clobbered();  // MayAlias store → 值可能被改
+                    return LoadElimQueryResult::clobbered();  // MayAlias store → 值可能被改
                 }
             }
         }
@@ -126,9 +82,9 @@ static QueryResult scanBlockBackward(
         else if (auto *LI2 = dynamic_cast<LoadInst *>(cur)) {
             if (LI2 != targetLoad && LI2->getUserList().size() >= 1) {
                 Value *LoadPtr = LI2->getUserList()[0]->getValue();
-                if (AA.alias(P, LoadPtr, LI) == AliasInfo::MustAlias
+                if (AA.aliasWithIndexRange(P, LoadPtr, LI) == AliasInfo::MustAlias
                     && isTypeCompatible(LI2, targetLoad)) {
-                    return QueryResult::known(LI2);
+                    return LoadElimQueryResult::known(LI2);
                 }
             }
         }
@@ -136,26 +92,26 @@ static QueryResult scanBlockBackward(
         else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
             ModRefInfo MR = getInstModRefInfo(P, cur, AA, LI, FAM);
             if (isModSet(MR)) {
-                return QueryResult::clobbered();
+                return LoadElimQueryResult::clobbered();
             }
             // 纯 Ref → 不阻断 load forwarding，继续
             // 安全网：ModRef 说 NoModRef 但传了 aliasing pointer → Clobbered
-            if (isNoModRef(MR) && callMayAliasPointer(CI, P, AA, LI)) {
-                return QueryResult::clobbered();
+            if (isNoModRef(MR) && AA.callMayAliasPointer(CI, P, LI)) {
+                return LoadElimQueryResult::clobbered();
             }
         }
         // 其他指令
         else {
             ModRefInfo MR = getInstModRefInfo(P, cur, AA, LI, FAM);
             if (isModSet(MR)) {
-                return QueryResult::clobbered();
+                return LoadElimQueryResult::clobbered();
             }
         }
 
         cur = cur->getPrev();
     }
 
-    return QueryResult::needPredecessors();
+    return LoadElimQueryResult::needPredecessors();
 }
 
 // =====================================================================
@@ -166,20 +122,20 @@ static QueryResult scanBlockBackward(
 // =====================================================================
 static const int MAX_DEPTH = 8;
 
-static QueryResult queryAvailableValue(
+static LoadElimQueryResult queryAvailableValue(
     Value *P, BasicBlock *BB, LoadInst *targetLoad, int depth,
     std::unordered_set<BasicBlock*> &onStack,
-    std::unordered_map<BasicBlock*, QueryResult> &memo,
+    std::unordered_map<BasicBlock*, LoadElimQueryResult> &memo,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
     if (depth > MAX_DEPTH) {
-        return QueryResult::unknown();
+        return LoadElimQueryResult::unknown();
     }
 
     // 环检测：当前递归栈上的块
     if (onStack.count(BB)) {
-        return QueryResult::unknown();
+        return LoadElimQueryResult::unknown();
     }
 
     // 缓存命中
@@ -191,9 +147,9 @@ static QueryResult queryAvailableValue(
     onStack.insert(BB);
 
     // 块内扫描（扫全块，从末尾开始）
-    QueryResult result = scanBlockBackward(BB, P, nullptr, targetLoad, AA, LI, FAM);
+    LoadElimQueryResult result = scanBlockBackward(BB, P, nullptr, targetLoad, AA, LI, FAM);
 
-    if (result.kind == QueryResult::KNOWN || result.kind == QueryResult::CLOBBERED) {
+    if (result.kind == LoadElimQueryResult::KNOWN || result.kind == LoadElimQueryResult::CLOBBERED) {
         onStack.erase(BB);
         memo[BB] = result;
         return result;
@@ -204,7 +160,7 @@ static QueryResult queryAvailableValue(
     if (preds.empty()) {
         // 函数入口，P 的初始值未知
         onStack.erase(BB);
-        memo[BB] = QueryResult::clobbered();
+        memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
 
@@ -213,42 +169,42 @@ static QueryResult queryAvailableValue(
     Value *firstVal = nullptr;
 
     for (BasicBlock *pred : preds) {
-        QueryResult predResult = queryAvailableValue(
+        LoadElimQueryResult predResult = queryAvailableValue(
             P, pred, targetLoad, depth + 1, onStack, memo, AA, LI, FAM);
 
-        if (predResult.kind == QueryResult::CLOBBERED ||
-            predResult.kind == QueryResult::UNKNOWN) {
+        if (predResult.kind == LoadElimQueryResult::CLOBBERED ||
+            predResult.kind == LoadElimQueryResult::UNKNOWN) {
             onStack.erase(BB);
-            memo[BB] = QueryResult::clobbered();
+            memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
 
-        if (predResult.kind == QueryResult::KNOWN) {
+        if (predResult.kind == LoadElimQueryResult::KNOWN) {
             predValues.push_back({pred, predResult.value});
             if (firstVal == nullptr) {
                 firstVal = predResult.value;
             } else if (predResult.value != firstVal) {
                 allSame = false;
             }
-        } else if (predResult.kind == QueryResult::PHI_NEEDED) {
+        } else if (predResult.kind == LoadElimQueryResult::PHI_NEEDED) {
             // 前驱本身需要 PHI → 第一版不处理嵌套 PHI
             onStack.erase(BB);
-            memo[BB] = QueryResult::clobbered();
+            memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
     }
 
     if ((int)predValues.size() != (int)preds.size()) {
         onStack.erase(BB);
-        memo[BB] = QueryResult::clobbered();
+        memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
 
-    QueryResult finalResult;
+    LoadElimQueryResult finalResult;
     if (allSame) {
-        finalResult = QueryResult::known(firstVal);
+        finalResult = LoadElimQueryResult::known(firstVal);
     } else {
-        finalResult = QueryResult::phiNeeded(std::move(predValues));
+        finalResult = LoadElimQueryResult::phiNeeded(std::move(predValues));
     }
 
     onStack.erase(BB);
@@ -268,15 +224,15 @@ static bool processLoad(
     Value *P = loadInst->getUserList()[0]->getValue();
 
     // Step 1: 块内扫描（从 load 位置向前）
-    QueryResult result = scanBlockBackward(BB, P, loadInst, loadInst, AA, LI, FAM);
+    LoadElimQueryResult result = scanBlockBackward(BB, P, loadInst, loadInst, AA, LI, FAM);
 
-    if (result.kind == QueryResult::KNOWN) {
+    if (result.kind == LoadElimQueryResult::KNOWN) {
         loadInst->replaceAllUsesWith(result.value);
         delete loadInst;
         return true;
     }
 
-    if (result.kind != QueryResult::NEED_PREDECESSORS) {
+    if (result.kind != LoadElimQueryResult::NEED_PREDECESSORS) {
         return false;   // CLOBBERED 或其他
     }
 
@@ -285,17 +241,17 @@ static bool processLoad(
     if (preds.empty()) return false;
 
     std::unordered_set<BasicBlock*> onStack;
-    std::unordered_map<BasicBlock*, QueryResult> memo;
+    std::unordered_map<BasicBlock*, LoadElimQueryResult> memo;
 
     std::vector<std::pair<BasicBlock*, Value*>> predValues;
     bool allSame = true;
     Value *firstVal = nullptr;
 
     for (BasicBlock *pred : preds) {
-        QueryResult predResult = queryAvailableValue(
+        LoadElimQueryResult predResult = queryAvailableValue(
             P, pred, loadInst, 1, onStack, memo, AA, LI, FAM);
 
-        if (predResult.kind != QueryResult::KNOWN) {
+        if (predResult.kind != LoadElimQueryResult::KNOWN) {
             return false;   // 任何非 KNOWN → 放弃
         }
 
@@ -374,8 +330,6 @@ static bool processFunction(
 
     return changed;
 }
-
-} // namespace
 
 // =====================================================================
 // LoadEliminationPass::run

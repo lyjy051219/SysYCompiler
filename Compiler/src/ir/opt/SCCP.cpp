@@ -12,45 +12,22 @@
 extern bool checkBinaryBoolean(BinaryInst::Operation op);
 
 static bool isConstantZeroValue(Value* V) {
-    if (!V) return false;
-    if (auto* ci = dynamic_cast<ConstInt*>(V)) return ci->getVal() == 0;
-    if (auto* cf = dynamic_cast<ConstFloat*>(V)) return cf->getVal() == 0.0f;
-    if (auto* cb = dynamic_cast<ConstBool*>(V)) return !cb->getVal();
-    return false;
+    return V && V->isConstZero();
 }
 
 static bool isConstantOneValue(Value* V) {
-    if (!V) return false;
-    if (auto* ci = dynamic_cast<ConstInt*>(V)) return ci->getVal() == 1;
-    if (auto* cf = dynamic_cast<ConstFloat*>(V)) return cf->getVal() == 1.0f;
-    if (auto* cb = dynamic_cast<ConstBool*>(V)) return cb->getVal();
-    return false;
+    return V && V->isConstOne();
 }
 
 static Value* makeZeroForType(std::shared_ptr<IRType> Ty) {
-    if (!Ty) return ConstInt::newConstInt(0);
-    switch (Ty->getEnum()) {
-    case IR_FLOAT:
-        return ConstFloat::newConstFloat(0.0f);
-    case IR_INT: {
-        auto* iTy = dynamic_cast<INTType*>(Ty.get());
-        if (iTy && iTy->getIsBool()) return ConstBool::newConstBool(false);
-        return ConstInt::newConstInt(0);
-    }
-    default:
-        return ConstInt::newConstInt(0);
-    }
+    return Value::makeZeroForType(Ty);
 }
 
 static unsigned getIntBitWidthFromType(std::shared_ptr<IRType> Ty) {
-    if (!Ty || Ty->getEnum() != IR_INT) return 32;
-    auto* iTy = dynamic_cast<INTType*>(Ty.get());
-    if (!iTy) return 32;
-    if (iTy->getIsBool()) return 1;
-    unsigned bits = static_cast<unsigned>(iTy->getSize() * 8);
-    if (bits == 0) return 32;
-    if (bits > 32) return 32;
-    return bits;
+    int Bits = Ty ? Ty->getIntegerBitWidth(32) : 32;
+    if (Bits < 1) return 32;
+    if (Bits > 32) return 32;
+    return static_cast<unsigned>(Bits);
 }
 
 static int32_t normalizeSignedToWidth(int64_t v, unsigned bits) {

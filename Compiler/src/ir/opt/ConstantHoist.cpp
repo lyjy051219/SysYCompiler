@@ -10,33 +10,13 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
 // RISC-V/ARM sign-ext imm12 范围：|v| < 2048 可以直接做立即数，不用物化
 static constexpr int64_t IMM_THRESHOLD = 2048;
 static constexpr int USE_THRESHOLD = 2;
 static constexpr int STRAIGHT_LINE_USE_THRESHOLD = 3;
 
-struct UseSite {
-    Use *u;
-    Instruction *inst;
-    BasicBlock *block;
-    unsigned loopDepth;
-};
-
-struct Candidate {
-    int32_t value;
-    std::vector<UseSite> uses;
-    unsigned maxDepth = 0;
-};
-
-struct Group {
-    std::vector<Candidate> members;
-    size_t baseIdx = 0;
-};
-
 static BasicBlock *foldCommonDominator(const DominatorTree &DT,
-                                        const std::vector<UseSite> &uses) {
+                                        const std::vector<ConstantHoistUseSite> &uses) {
     if (uses.empty()) return nullptr;
     BasicBlock *acc = uses[0].block;
     if (!acc) return nullptr;
@@ -60,32 +40,6 @@ static BasicBlock *foldCommonDominator(const DominatorTree &DT,
     return acc;
 }
 
-static void insertAfterPhis(BasicBlock *BB, Instruction *inst) {
-    auto it = BB->begin();
-    while (*it != nullptr && dynamic_cast<PhiInst *>(*it)) ++it;
-    if (*it == nullptr) BB->push_back(inst);
-    else it.insertBefore(inst);
-}
-
-static void insertBeforeInst(BasicBlock *BB, Instruction *before,
-                             Instruction *inst) {
-    auto it = BB->begin();
-    while (*it != nullptr && *it != before) ++it;
-    if (*it == before) {
-        it.insertBefore(inst);
-        return;
-    }
-    // before 不在 BB 里（集合不一致）。push_back 会越过 terminator 破坏 IR
-    // 合法性，退到 terminator 前
-    Instruction *term = BB->getBranchTerminator();
-    if (term) {
-        auto it2 = BB->begin();
-        while (*it2 != nullptr && *it2 != term) ++it2;
-        if (*it2 == term) { it2.insertBefore(inst); return; }
-    }
-    BB->push_back(inst);
-}
-
 static BasicBlock *pickInsertionBlock(BasicBlock *common,
                                        BasicBlock *entry,
                                        const LoopInfo &LI) {
@@ -99,13 +53,8 @@ static BasicBlock *pickInsertionBlock(BasicBlock *common,
     return entry;
 }
 
-struct CollectResult {
-    std::unordered_map<int32_t, Candidate> intBuckets;
-    std::unordered_map<uint32_t, Candidate> floatBuckets;  // key = float bit pattern
-};
-
-static CollectResult collectCandidates(Function &F, const LoopInfo &LI) {
-    CollectResult R;
+static ConstantHoistCollectResult collectCandidates(Function &F, const LoopInfo &LI) {
+    ConstantHoistCollectResult R;
     for (BasicBlock *BB : F) {
         unsigned depth = 0;
         if (Loop *L = LI.getLoopFor(BB)) depth = L->getDepth();
@@ -140,7 +89,7 @@ static CollectResult collectCandidates(Function &F, const LoopInfo &LI) {
     return R;
 }
 
-static void closeGroup(Group &cur, std::vector<Group> &groups) {
+static void closeGroup(ConstantHoistGroup &cur, std::vector<ConstantHoistGroup> &groups) {
     if (cur.members.empty()) return;
     size_t totalUses = 0, bestIdx = 0, bestUses = 0;
     for (size_t j = 0; j < cur.members.size(); ++j) {
@@ -157,11 +106,11 @@ static void closeGroup(Group &cur, std::vector<Group> &groups) {
 
 // 窗口条件 diff < IMM_THRESHOLD 保证组内 max-min <= 2047，无论 base 选
 // 谁，|v - base| <= max-min 都落在 imm12 内
-static std::vector<Group> groupByBaseOffset(std::vector<Candidate> &sorted) {
-    std::vector<Group> groups;
+static std::vector<ConstantHoistGroup> groupByBaseOffset(std::vector<ConstantHoistCandidate> &sorted) {
+    std::vector<ConstantHoistGroup> groups;
     if (sorted.empty()) return groups;
 
-    Group cur;
+    ConstantHoistGroup cur;
     cur.members.push_back(std::move(sorted[0]));
     int64_t windowMin = cur.members[0].value;
 
@@ -171,7 +120,7 @@ static std::vector<Group> groupByBaseOffset(std::vector<Candidate> &sorted) {
             cur.members.push_back(std::move(sorted[i]));
         } else {
             closeGroup(cur, groups);
-            cur = Group{};
+            cur = ConstantHoistGroup{};
             cur.members.push_back(std::move(sorted[i]));
             windowMin = cur.members[0].value;
         }
@@ -180,22 +129,22 @@ static std::vector<Group> groupByBaseOffset(std::vector<Candidate> &sorted) {
     return groups;
 }
 
-static bool materializeGroup(Group &G, BasicBlock *insertBB) {
+static bool materializeGroup(ConstantHoistGroup &G, BasicBlock *insertBB) {
     if (G.members.empty()) return false;
     int32_t baseValue = G.members[G.baseIdx].value;
 
     auto *baseSSA = new BinaryInst(
         ConstInt::newConstInt(0), BinaryInst::ADD,
         ConstInt::newConstInt(baseValue));
-    insertAfterPhis(insertBB, baseSSA);
+    insertBB->insertAfterPhiNodes(baseSSA);
 
     bool anyChange = false;
     for (size_t i = 0; i < G.members.size(); ++i) {
-        Candidate &m = G.members[i];
+        ConstantHoistCandidate &m = G.members[i];
         int64_t offset = (int64_t)m.value - (int64_t)baseValue;
 
         if (offset == 0) {
-            for (UseSite &us : m.uses) {
+            for (ConstantHoistUseSite &us : m.uses) {
                 us.u->replaceUseeWith(baseSSA);
                 anyChange = true;
             }
@@ -203,8 +152,8 @@ static bool materializeGroup(Group &G, BasicBlock *insertBB) {
         }
 
         // 同 block 内同值多 use 聚合为一条 rebase
-        std::unordered_map<BasicBlock*, std::vector<UseSite*>> byBlock;
-        for (UseSite &us : m.uses) byBlock[us.block].push_back(&us);
+        std::unordered_map<BasicBlock*, std::vector<ConstantHoistUseSite*>> byBlock;
+        for (ConstantHoistUseSite &us : m.uses) byBlock[us.block].push_back(&us);
 
         for (auto &kv : byBlock) {
             BasicBlock *B = kv.first;
@@ -212,7 +161,7 @@ static bool materializeGroup(Group &G, BasicBlock *insertBB) {
             if (useList.empty() || !B) continue;
 
             std::unordered_set<Instruction*> userSet;
-            for (UseSite *us : useList) userSet.insert(us->inst);
+            for (ConstantHoistUseSite *us : useList) userSet.insert(us->inst);
 
             Instruction *earliest = nullptr;
             for (Instruction *I : *B) {
@@ -223,15 +172,16 @@ static bool materializeGroup(Group &G, BasicBlock *insertBB) {
             auto *matInst = new BinaryInst(
                 baseSSA, BinaryInst::ADD,
                 ConstInt::newConstInt((int32_t)offset));
-            insertBeforeInst(B, earliest, matInst);
-            for (UseSite *us : useList) us->u->replaceUseeWith(matInst);
+            if (!earliest->insertBefore(matInst))
+                B->insertBeforeTerminator(matInst);
+            for (ConstantHoistUseSite *us : useList) us->u->replaceUseeWith(matInst);
             anyChange = true;
         }
     }
     return anyChange;
 }
 
-static bool materializeFloatCandidate(Candidate &C, BasicBlock *insertBB) {
+static bool materializeFloatCandidate(ConstantHoistCandidate &C, BasicBlock *insertBB) {
     uint32_t bits = (uint32_t)C.value;
     float fv;
     std::memcpy(&fv, &bits, sizeof(fv));
@@ -241,12 +191,10 @@ static bool materializeFloatCandidate(Candidate &C, BasicBlock *insertBB) {
     auto *baseSSA = new BinaryInst(
         ConstFloat::newConstFloat(-0.0f), BinaryInst::ADD,
         ConstFloat::newConstFloat(fv));
-    insertAfterPhis(insertBB, baseSSA);
-    for (UseSite &us : C.uses) us.u->replaceUseeWith(baseSSA);
+    insertBB->insertAfterPhiNodes(baseSSA);
+    for (ConstantHoistUseSite &us : C.uses) us.u->replaceUseeWith(baseSSA);
     return true;
 }
-
-} // namespace
 
 PreservationStatus ConstantHoistPass::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) {
@@ -257,19 +205,19 @@ PreservationStatus ConstantHoistPass::run(Function &F,
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-    CollectResult R = collectCandidates(F, LI);
+    ConstantHoistCollectResult R = collectCandidates(F, LI);
 
-    std::vector<Candidate> intSorted;
+    std::vector<ConstantHoistCandidate> intSorted;
     intSorted.reserve(R.intBuckets.size());
     for (auto &kv : R.intBuckets) intSorted.push_back(std::move(kv.second));
     std::sort(intSorted.begin(), intSorted.end(),
-              [](const Candidate &a, const Candidate &b) {
+              [](const ConstantHoistCandidate &a, const ConstantHoistCandidate &b) {
                   return a.value < b.value;
               });
-    std::vector<Group> intGroups = groupByBaseOffset(intSorted);
+    std::vector<ConstantHoistGroup> intGroups = groupByBaseOffset(intSorted);
 
     bool changed = false;
-    for (Group &G : intGroups) {
+    for (ConstantHoistGroup &G : intGroups) {
         unsigned maxDepth = 0;
         size_t totalUses = 0;
         for (auto &m : G.members) {
@@ -280,7 +228,7 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         if (maxDepth == 0 && (int)totalUses < STRAIGHT_LINE_USE_THRESHOLD)
             continue;
 
-        std::vector<UseSite> allUses;
+        std::vector<ConstantHoistUseSite> allUses;
         for (auto &m : G.members)
             for (auto &u : m.uses) allUses.push_back(u);
 
@@ -292,7 +240,7 @@ PreservationStatus ConstantHoistPass::run(Function &F,
     }
 
     for (auto &kv : R.floatBuckets) {
-        Candidate &C = kv.second;
+        ConstantHoistCandidate &C = kv.second;
         if ((int)C.uses.size() < USE_THRESHOLD) continue;
         if (C.maxDepth == 0 && (int)C.uses.size() < STRAIGHT_LINE_USE_THRESHOLD)
             continue;

@@ -9,8 +9,6 @@
 #include <unordered_set>
 #include <utility>
 
-namespace {
-
 bool functionHasBlockIdent(Function *F, const std::string &Name) {
     if (!F) return false;
 
@@ -125,13 +123,6 @@ bool isSupportedCloneInstruction(Instruction *I) {
     }
 }
 
-Value *getOperand(Instruction *I, unsigned Index) {
-    if (!I) return nullptr;
-    auto &Ops = I->getUserList();
-    if (Index >= Ops.size() || !Ops[Index]) return nullptr;
-    return Ops[Index]->getValue();
-}
-
 Value *stripSimpleCast(Value *V) {
     while (auto *I = dynamic_cast<Instruction *>(V)) {
         switch (I->instType) {
@@ -139,7 +130,7 @@ Value *stripSimpleCast(Value *V) {
         case Instruction::ZEXT:
         case Instruction::SEXT:
         case Instruction::BITCAST:
-            V = getOperand(I, 0);
+            V = I->getOperand(0);
             continue;
         default:
             return V;
@@ -149,37 +140,18 @@ Value *stripSimpleCast(Value *V) {
 }
 
 std::optional<int64_t> asConstInt(Value *V) {
-    if (auto *CI = dynamic_cast<ConstInt *>(V)) {
-        return CI->getVal();
-    }
-    if (auto *CB = dynamic_cast<ConstBool *>(V)) {
-        return CB->getVal() ? 1 : 0;
-    }
+    int32_t Out = 0;
+    if (V && V->tryGetIntConst(Out)) return Out;
     return std::nullopt;
 }
-
-BinaryInst::Operation swapPredicate(BinaryInst::Operation Op) {
-    switch (Op) {
-    case BinaryInst::GE: return BinaryInst::LE;
-    case BinaryInst::L:  return BinaryInst::G;
-    case BinaryInst::LE: return BinaryInst::GE;
-    case BinaryInst::G:  return BinaryInst::L;
-    default: return Op;
-    }
-}
-
-struct PeelPredicate {
-    BinaryInst::Operation Op = BinaryInst::E;
-    int64_t Constant = 0;
-};
 
 std::optional<PeelPredicate> matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
     if (!Cmp || !IV || Cmp->getUserList().size() < 2) {
         return std::nullopt;
     }
 
-    Value *LHS = stripSimpleCast(getOperand(Cmp, 0));
-    Value *RHS = stripSimpleCast(getOperand(Cmp, 1));
+    Value *LHS = stripSimpleCast(Cmp->getOperand(0));
+    Value *RHS = stripSimpleCast(Cmp->getOperand(1));
     IV = stripSimpleCast(IV);
 
     if (LHS == IV) {
@@ -190,7 +162,7 @@ std::optional<PeelPredicate> matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
 
     if (RHS == IV) {
         if (auto C = asConstInt(LHS)) {
-            return PeelPredicate{swapPredicate(Cmp->getOp()), *C};
+            return PeelPredicate{BinaryInst::reversePredicate(Cmp->getOp()), *C};
         }
     }
 
@@ -220,8 +192,8 @@ bool isInternalConditionalBranch(Loop *L, BrInst *Br) {
         return false;
     }
 
-    auto *TrueBB = dynamic_cast<BasicBlock *>(getOperand(Br, 1));
-    auto *FalseBB = dynamic_cast<BasicBlock *>(getOperand(Br, 2));
+    auto *TrueBB = dynamic_cast<BasicBlock *>(Br->getOperand(1));
+    auto *FalseBB = dynamic_cast<BasicBlock *>(Br->getOperand(2));
     return TrueBB && FalseBB && L->contains(TrueBB) && L->contains(FalseBB);
 }
 
@@ -282,34 +254,6 @@ int localSCEVNodeCost(const SCEVExpr *E) {
 
     return 1000000;
 }
-
-struct LoopExecutionShape {
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Header = nullptr;
-    BasicBlock *Latch = nullptr;
-    BasicBlock *Exiting = nullptr;
-    BasicBlock *Exit = nullptr;
-};
-
-struct UnrolledBodyCore {
-    LoopExecutionShape Shape;
-    int Count = 0;
-    std::vector<std::vector<BasicBlock *>> IterBlocks;
-    std::vector<BasicBlock *> Headers;
-    std::vector<BasicBlock *> Latches;
-    std::vector<BasicBlock *> Exitings;
-    std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
-};
-
-struct PeeledBodyCore {
-    LoopExecutionShape Shape;
-    int PeelCount = 0;
-    std::vector<std::vector<BasicBlock *>> IterBlocks;
-    std::vector<BasicBlock *> Headers;
-    std::vector<BasicBlock *> Latches;
-    std::vector<BasicBlock *> Exitings;
-    std::vector<std::unordered_map<Value *, Value *>> ValueMaps;
-};
 
 std::optional<LoopExecutionShape>
 getLoopExecutionShape(Loop *L, SCEVResult &SE) {
@@ -984,13 +928,6 @@ bool rewriteExitPhisForSingleExiting(UnrolledBodyCore &Core,
     return true;
 }
 
-struct ExitRegionDataUse {
-    Use *OperandUse = nullptr;
-    Value *OriginalValue = nullptr;
-    Value *LookupValue = nullptr;
-    std::shared_ptr<IRType> ExpectedType = nullptr;
-};
-
 std::vector<BasicBlock *> collectExitRegionBlocksFrom(
     BasicBlock *Exit,
     const std::unordered_set<BasicBlock *> &StopBlocks,
@@ -1337,19 +1274,6 @@ Value *getValueBeforeLoop(Value *V, const UnrolledBodyCore &Core,
     }
     return isDataValue(V) ? V : nullptr;
 }
-
-struct HeaderState {
-    PhiInst *OriginalPhi = nullptr;
-    PhiInst *CurrentPhi = nullptr;
-    Value *CurrentValue = nullptr;
-    Value *InitialValue = nullptr;
-    Value *BackedgeValue = nullptr;
-    Value *MainValue = nullptr;
-    Value *TailStateValue = nullptr;
-    int TailStartIter = std::numeric_limits<int>::max();
-    bool MainValueIsOriginalPhi = false;
-    bool BackedgeIsOriginalPhi = false;
-};
 
 BasicBlock *getNonExitSuccessor(BasicBlock *Exiting, BasicBlock *Exit) {
     if (!Exiting || !Exit) return nullptr;
@@ -1810,8 +1734,6 @@ LoopUnrollResult executeUnrollWithTail(
     return LoopUnrollResult::PartiallyUnrolled;
 }
 
-} // namespace
-
 LoopUnrollPass::LoopUnrollPass(UnrollConfig ConfigValue)
     : Config(std::move(ConfigValue)) {}
 
@@ -2120,7 +2042,7 @@ int LoopUnrollPass::detectPeelCount(Loop *L,
             continue;
         }
 
-        auto *Cmp = dynamic_cast<BinaryInst *>(getOperand(Br, 0));
+        auto *Cmp = dynamic_cast<BinaryInst *>(Br->getOperand(0));
         auto Match = matchCompareWithIV(Cmp, IV.Phi);
         if (!Match) {
             continue;

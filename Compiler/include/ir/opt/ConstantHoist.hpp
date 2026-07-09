@@ -2,6 +2,33 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+struct ConstantHoistUseSite {
+    Use *u = nullptr;
+    Instruction *inst = nullptr;
+    BasicBlock *block = nullptr;
+    unsigned loopDepth = 0;
+};
+
+struct ConstantHoistCandidate {
+    int32_t value = 0;
+    std::vector<ConstantHoistUseSite> uses;
+    unsigned maxDepth = 0;
+};
+
+struct ConstantHoistGroup {
+    std::vector<ConstantHoistCandidate> members;
+    size_t baseIdx = 0;
+};
+
+struct ConstantHoistCollectResult {
+    std::unordered_map<int32_t, ConstantHoistCandidate> intBuckets;
+    std::unordered_map<uint32_t, ConstantHoistCandidate> floatBuckets;
+};
+
 // 常量提升：共享的大整数做 value-key 分桶 + base/offset 重组（相近值用
 // `add base, offset` rebase）；共享的浮点用 `fadd -0.0, fv` wrapper 拎出
 // 一个 SSA 值，只共享不做 base/offset。

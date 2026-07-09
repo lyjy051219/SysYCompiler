@@ -54,25 +54,12 @@
 // 也处理两个索引都是 add(base, const) 形式、差值是常量的情况。
 // =====================================================================
 
-namespace {
-
 static bool isConstZero(Value *V) {
-    auto *CI = dynamic_cast<ConstInt *>(V);
-    return CI && CI->getVal() == 0;
+    return V && V->isConstIntZero();
 }
 
 static ConstInt *asConstInt(Value *V) {
     return dynamic_cast<ConstInt *>(V);
-}
-
-// 计算 UseList 中 user 数量（UseList 没有 size()）
-static int countUses(Value *V) {
-    int count = 0;
-    for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
-        count++;
-        if (count > 1) return count; // 快速退出，只需要知道 >1
-    }
-    return count;
 }
 
 // =====================================================================
@@ -105,7 +92,7 @@ static bool combineChainedGEPs(Function &F) {
         if (deleted.count(BaseGEP)) continue;
 
         // 单 use 检查：base GEP 必须只被当前 GEP 使用
-        if (countUses(BaseGEP) > 1) continue;
+        if (BaseGEP->countUses() > 1) continue;
 
         auto &BaseUL = BaseGEP->getUserList();
         if (BaseUL.size() < 2) continue;
@@ -211,7 +198,7 @@ static bool foldGEPOfPhi(Function &F) {
             if (!Phi->getIRType() || Phi->getIRType()->getEnum() != IR_POINTER) continue;
 
             // PHI 单 use 检查
-            if (countUses(Phi) > 1) continue;
+            if (Phi->countUses() > 1) continue;
 
             auto *FirstGEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0));
             if (!FirstGEP) continue;
@@ -438,8 +425,6 @@ static bool combineLoopGEPs(Function &F) {
 
     return changed;
 }
-
-} // namespace
 
 PreservationStatus GepCombinePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = false;

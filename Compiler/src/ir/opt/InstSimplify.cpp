@@ -5,6 +5,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -12,157 +13,78 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
 static bool isUndef(Value *V) {
 	return dynamic_cast<UndefValue *>(V) != nullptr;
 }
 
 static bool isBoolType(const std::shared_ptr<IRType> &Ty) {
-	if (!Ty || Ty->getEnum() != IR_INT) return false;
-	auto *IT = dynamic_cast<INTType *>(Ty.get());
-	return IT && IT->getIsBool();
+	return Ty && Ty->isBool();
 }
 
 static bool isIntType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->getEnum() == IR_INT;
+	return Ty && Ty->isInt();
 }
 
 static bool isFloatType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->getEnum() == IR_FLOAT;
+	return Ty && Ty->isFloat();
 }
 
 static bool isConstZero(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == 0;
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) return CF->getVal() == 0.0f;
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) return !CB->getVal();
-	return false;
+	return V && V->isConstZero();
 }
 
 static bool isConstOne(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == 1;
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) return CF->getVal() == 1.0f;
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) return CB->getVal();
-	return false;
+	return V && V->isConstOne();
 }
 
 static bool isConstMinusOne(Value *V) {
-	if (!V) return false;
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal() == -1;
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) return CF->getVal() == -1.0f;
-	return false;
+	return V && V->isConstMinusOne();
 }
 
 static bool tryGetBoolConst(Value *V, bool &Out) {
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) {
-		Out = CB->getVal();
-		return true;
-	}
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) {
-		Out = (CI->getVal() != 0);
-		return true;
-	}
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) {
-		Out = (CF->getVal() != 0.0f);
-		return true;
-	}
-	return false;
+	return V && V->tryGetBoolConst(Out);
 }
 
 static bool tryGetIntConst(Value *V, int32_t &Out) {
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) {
-		Out = CI->getVal();
-		return true;
-	}
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) {
-		Out = CB->getVal() ? 1 : 0;
-		return true;
-	}
-	return false;
+	return V && V->tryGetIntConst(Out);
 }
 
 static bool tryGetFloatConst(Value *V, float &Out) {
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) {
-		Out = CF->getVal();
-		return true;
-	}
-	return false;
+	return V && V->tryGetFloatConst(Out);
 }
 
 static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty) {
-	return UndefValue::NewUndefValue(Ty ? Ty : INTType::NewInt(4));
+	return Value::makeUndefForType(Ty);
 }
 
 static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty) {
-	if (!Ty) return ConstInt::newConstInt(0);
-	if (isFloatType(Ty)) return ConstFloat::newConstFloat(0.0f);
-	if (isBoolType(Ty)) return ConstBool::newConstBool(false);
-	if (isIntType(Ty)) {
-		auto *IT = dynamic_cast<INTType *>(Ty.get());
-		return ConstInt::newConstInt(0, IT ? IT->getSize() : 4);
-	}
-	return ConstInt::newConstInt(0);
+	return Value::makeZeroForType(Ty);
 }
 
 static Value *makeOneForType(const std::shared_ptr<IRType> &Ty) {
-	if (!Ty) return ConstInt::newConstInt(1);
-	if (isFloatType(Ty)) return ConstFloat::newConstFloat(1.0f);
-	if (isBoolType(Ty)) return ConstBool::newConstBool(true);
-	if (isIntType(Ty)) {
-		auto *IT = dynamic_cast<INTType *>(Ty.get());
-		return ConstInt::newConstInt(1, IT ? IT->getSize() : 4);
-	}
-	return ConstInt::newConstInt(1);
+	return Value::makeOneForType(Ty);
 }
 
 static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
-	if (!Ty) return ConstInt::newConstInt(-1);
-	if (isFloatType(Ty)) return ConstFloat::newConstFloat(-1.0f);
-	if (isBoolType(Ty)) return ConstBool::newConstBool(true);
-	if (isIntType(Ty)) {
-		auto *IT = dynamic_cast<INTType *>(Ty.get());
-		return ConstInt::newConstInt(-1, IT ? IT->getSize() : 4);
-	}
-	return ConstInt::newConstInt(-1);
+	return Value::makeMinusOneForType(Ty);
 }
 
 static bool isCompareOp(BinaryInst::Operation Op) {
-	switch (Op) {
-	case BinaryInst::E:
-	case BinaryInst::NE:
-	case BinaryInst::G:
-	case BinaryInst::GE:
-	case BinaryInst::L:
-	case BinaryInst::LE:
-		return true;
-	default:
-		return false;
-	}
+	return BinaryInst::isCompareOp(Op);
 }
 
 static bool isPowerOfTwoU32(uint32_t X) {
-	return X && ((X & (X - 1)) == 0);
+	return IRMath::isUnsignedPowerOf2(static_cast<int32_t>(X));
 }
 
 static int32_t ctzPowerOfTwoU32(uint32_t X) {
-	int32_t N = 0;
-	while ((X & 1u) == 0u) {
-		X >>= 1u;
-		++N;
-	}
-	return N;
+	return IRMath::log2u(X);
 }
 
 static bool getBinaryOperandsForOp(Value *V, BinaryInst::Operation Op, Value *&L, Value *&R) {
 	auto *BI = dynamic_cast<BinaryInst *>(V);
 	if (!BI || BI->getOp() != Op) return false;
-	auto &UL = BI->getUserList();
-	if (UL.size() < 2) return false;
-	L = UL[0]->getValue();
-	R = UL[1]->getValue();
-	return L && R;
+	return BI->getOperands(L, R);
 }
 
 static bool matchNeg(Value *V, Value *&Y) {
@@ -177,11 +99,7 @@ static bool matchNeg(Value *V, Value *&Y) {
 static bool isSubInst(Value *V, Value *&LHS, Value *&RHS) {
 	auto *BI = dynamic_cast<BinaryInst *>(V);
 	if (!BI || BI->getOp() != BinaryInst::SUB) return false;
-	auto &UL = BI->getUserList();
-	if (UL.size() < 2) return false;
-	LHS = UL[0]->getValue();
-	RHS = UL[1]->getValue();
-	return LHS && RHS;
+	return BI->getOperands(LHS, RHS);
 }
 
 static bool isNegationPair(Value *A, Value *B) {
@@ -398,23 +316,11 @@ private:
 	}
 
 	static bool getBinaryOperands(BinaryInst *BI, Value *&LHS, Value *&RHS) {
-		LHS = nullptr;
-		RHS = nullptr;
-		if (!BI) return false;
-		auto &UL = BI->getUserList();
-		if (UL.size() < 2) return false;
-		LHS = UL[0]->getValue();
-		RHS = UL[1]->getValue();
-		return LHS && RHS;
+		return BI && BI->getOperands(LHS, RHS);
 	}
 
 	static bool getUnaryOperand(Instruction *I, Value *&Op) {
-		Op = nullptr;
-		if (!I) return false;
-		auto &UL = I->getUserList();
-		if (UL.size() != 1 || !UL[0]) return false;
-		Op = UL[0]->getValue();
-		return Op != nullptr;
+		return I && I->getNumOperands() == 1 && I->getOperand(0, Op);
 	}
 
 	static Value *stripBoolExt(Value *V, BoolExtKind &Kind) {
@@ -1412,8 +1318,6 @@ private:
 		return Common;
 	}
 };
-
-} // namespace
 
 PreservationStatus InstSimplifyPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	DominatorTree *DT = nullptr;

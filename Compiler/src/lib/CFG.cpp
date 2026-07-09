@@ -4,24 +4,14 @@
 #include <cmath>
 #include <sstream>
 #include <map>
-#include <queue>
 #include <unordered_set>
 #include <variant>
+#include <limits>
 
 extern std::unique_ptr<Module> ModuleIR;
 
 bool checkBinaryBoolean(BinaryInst::Operation op) {
-  switch (op) {
-  case BinaryInst::E:
-  case BinaryInst::NE:
-  case BinaryInst::G:
-  case BinaryInst::GE:
-  case BinaryInst::L:
-  case BinaryInst::LE:
-    return true;
-  default:
-    return false;
-  }
+  return BinaryInst::isCompareOp(op);
 }
 
 static bool isIntOnlyBinaryOp(BinaryInst::Operation op) {
@@ -91,6 +81,189 @@ bool Value::isConstZero() {
     else
         return false;
 }
+
+bool Value::isConstIntZero() {
+    auto *CI = dynamic_cast<ConstInt *>(this);
+    return CI && CI->getVal() == 0;
+}
+
+bool Value::isConstOne() {
+    if (auto *CI = dynamic_cast<ConstInt *>(this)) return CI->getVal() == 1;
+    if (auto *CF = dynamic_cast<ConstFloat *>(this)) return CF->getVal() == 1.0f;
+    if (auto *CB = dynamic_cast<ConstBool *>(this)) return CB->getVal();
+    return false;
+}
+
+bool Value::isConstMinusOne() {
+    if (auto *CI = dynamic_cast<ConstInt *>(this)) return CI->getVal() == -1;
+    if (auto *CF = dynamic_cast<ConstFloat *>(this)) return CF->getVal() == -1.0f;
+    return false;
+}
+
+bool Value::tryGetBoolConst(bool &Out) {
+    if (auto *CB = dynamic_cast<ConstBool *>(this)) {
+        Out = CB->getVal();
+        return true;
+    }
+    if (auto *CI = dynamic_cast<ConstInt *>(this)) {
+        Out = CI->getVal() != 0;
+        return true;
+    }
+    if (auto *CF = dynamic_cast<ConstFloat *>(this)) {
+        Out = CF->getVal() != 0.0f;
+        return true;
+    }
+    return false;
+}
+
+bool Value::tryGetIntConst(int32_t &Out) {
+    if (auto *CI = dynamic_cast<ConstInt *>(this)) {
+        Out = CI->getVal();
+        return true;
+    }
+    if (auto *CB = dynamic_cast<ConstBool *>(this)) {
+        Out = CB->getVal() ? 1 : 0;
+        return true;
+    }
+    return false;
+}
+
+bool Value::tryGetFloatConst(float &Out) {
+    if (auto *CF = dynamic_cast<ConstFloat *>(this)) {
+        Out = CF->getVal();
+        return true;
+    }
+    return false;
+}
+
+int Value::integerBitWidth(int DefaultBits) {
+    if (!getIRType()) return DefaultBits;
+    return getIRType()->getIntegerBitWidth(DefaultBits);
+}
+
+int Value::countUses() {
+    int Count = 0;
+    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
+        Use *U = *It;
+        if (!U || U->getValue() != this) continue;
+        ++Count;
+    }
+    return Count;
+}
+
+int Value::countInstructionUses(Instruction **SingleUser) {
+    if (SingleUser) *SingleUser = nullptr;
+
+    int Count = 0;
+    Instruction *OnlyInstUser = nullptr;
+    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
+        Use *U = *It;
+        if (!U || U->getValue() != this) continue;
+        auto *InstUser = dynamic_cast<Instruction *>(U->getUser());
+        if (!InstUser) continue;
+        ++Count;
+        if (Count == 1) {
+            OnlyInstUser = InstUser;
+        } else {
+            OnlyInstUser = nullptr;
+        }
+    }
+
+    if (SingleUser && Count == 1) *SingleUser = OnlyInstUser;
+    return Count;
+}
+
+bool Value::hasUses() {
+    return countUses() > 0;
+}
+
+bool Value::hasExactlyOneUse() {
+    int Count = 0;
+    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
+        Use *U = *It;
+        if (!U || U->getValue() != this) continue;
+        ++Count;
+        if (Count > 1) return false;
+    }
+    return Count == 1;
+}
+
+bool Value::isPointerValue() {
+    return getIRType() && getIRType()->isPointer();
+}
+
+bool Value::isExternalVariable() {
+    auto *Var = dynamic_cast<Variable *>(this);
+    return Var && (Var->isGlobal() || Var->isParam());
+}
+
+Value *Value::stripPointerCastsAndGEP(Value *V) {
+    std::unordered_set<Value *> Visited;
+    while (V && Visited.insert(V).second) {
+        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {
+            V = GEP->getOperand(0);
+            continue;
+        }
+        if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
+            V = BC->getOperand(0);
+            continue;
+        }
+        break;
+    }
+    return V;
+}
+
+bool Value::isLocalStackPointer(Value *V) {
+    return dynamic_cast<AllocaInst *>(stripPointerCastsAndGEP(V)) != nullptr;
+}
+
+Value *Value::makeZeroForType(const std::shared_ptr<IRType> &Ty) {
+    if (!Ty) return ConstInt::newConstInt(0);
+    if (Ty->isFloat()) return ConstFloat::newConstFloat(0.0f);
+    if (Ty->isBool()) return ConstBool::newConstBool(false);
+    if (Ty->isInt()) return ConstInt::newConstInt(0, Ty->getSize());
+    return ConstInt::newConstInt(0);
+}
+
+Value *Value::makeOneForType(const std::shared_ptr<IRType> &Ty) {
+    if (!Ty) return ConstInt::newConstInt(1);
+    if (Ty->isFloat()) return ConstFloat::newConstFloat(1.0f);
+    if (Ty->isBool()) return ConstBool::newConstBool(true);
+    if (Ty->isInt()) return ConstInt::newConstInt(1, Ty->getSize());
+    return ConstInt::newConstInt(1);
+}
+
+Value *Value::makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
+    if (!Ty) return ConstInt::newConstInt(-1);
+    if (Ty->isFloat()) return ConstFloat::newConstFloat(-1.0f);
+    if (Ty->isBool()) return ConstBool::newConstBool(true);
+    if (Ty->isInt()) return ConstInt::newConstInt(-1, Ty->getSize());
+    return ConstInt::newConstInt(-1);
+}
+
+Value *Value::makeUndefForType(const std::shared_ptr<IRType> &Ty) {
+    return UndefValue::NewUndefValue(Ty ? Ty : INTType::NewInt(4));
+}
+
+size_t User::getNumOperands() const {
+    return userList.size();
+}
+
+Value *User::getOperand(size_t Index) const {
+    if (Index >= userList.size() || !userList[Index]) return nullptr;
+    return userList[Index]->getValue();
+}
+
+bool User::getOperand(size_t Index, Value *&Out) const {
+    Out = getOperand(Index);
+    return Out != nullptr;
+}
+
+bool User::replaceOperand(size_t Index, Value *V) {
+    if (Index >= userList.size() || !userList[Index] || !V) return false;
+    return userList[Index]->replaceUseeWith(V);
+}
+
 void Value::dumpIR() {
     if (isConst()) std::cout << getIdent();
     else if (isGlobal()) std::cout << "@" << getIdent();
@@ -202,29 +375,56 @@ std::vector<std::unique_ptr<Value>>& Function::getParams(){return params;}
 void Function::InsertAlloca(AllocaInst* ptr){front()->push_back(ptr);}
 
 bool Function::isReachable(BasicBlock* BB) {
-  if (!BB || this->Size() == 0) return false;
+  if (!BB) return false;
 
-  std::unordered_set<BasicBlock*> visited;
-  std::queue<BasicBlock*> worklist;
+  std::unordered_set<BasicBlock *> Reachable;
+  collectReachableBlocks(Reachable);
+  return Reachable.count(BB) != 0;
+}
 
-  BasicBlock* entry = front();
-  worklist.push(entry);
-  visited.insert(entry);
+void Function::collectReachableBlocks(
+    std::unordered_set<BasicBlock *> &Reachable) {
+  Reachable.clear();
+  if (this->Size() == 0 || !front()) return;
 
-  while (!worklist.empty()) {
-    BasicBlock* current = worklist.front();
-    worklist.pop();
+  std::vector<BasicBlock *> WorkList;
+  BasicBlock *Entry = front();
+  WorkList.push_back(Entry);
+  Reachable.insert(Entry);
 
-    if (current == BB) return true;
+  while (!WorkList.empty()) {
+    BasicBlock *Current = WorkList.back();
+    WorkList.pop_back();
+    if (!Current) continue;
 
-    for (BasicBlock* succ : current->getSuccessors()) {
-      if (succ && visited.insert(succ).second) {
-        worklist.push(succ);
+    for (BasicBlock *Succ : Current->getSuccessors()) {
+      if (Succ && Reachable.insert(Succ).second) {
+        WorkList.push_back(Succ);
       }
     }
   }
+}
 
-  return false;
+std::vector<BasicBlock *> Function::getReachableBlocks() {
+  std::unordered_set<BasicBlock *> ReachableSet;
+  collectReachableBlocks(ReachableSet);
+
+  std::vector<BasicBlock *> Blocks;
+  Blocks.reserve(ReachableSet.size());
+  for (BasicBlock *BB : *this) {
+    if (BB && ReachableSet.count(BB)) Blocks.push_back(BB);
+  }
+  return Blocks;
+}
+
+void Function::dropAllReferences() {
+  for (BasicBlock *BB : *this) {
+    if (!BB) continue;
+    for (Instruction *I : *BB) {
+      if (!I) continue;
+      I->getUserList().clear();
+    }
+  }
 }
 
 void Function::dumpIR(){
@@ -301,6 +501,19 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
     mp[ident] = new BuildInFunction(gt(), ident);
   }
   return mp[ident];
+}
+
+bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
+  static const std::unordered_set<std::string> SysyLibNames = {
+      "getint", "getch", "getfloat", "getarray", "getfarray",
+      "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
+      "starttime", "stoptime", "_sysy_starttime", "_sysy_stoptime"};
+
+  if (SysyLibNames.count(Name)) return true;
+  if (Name.find("_sysy_") != std::string::npos) return true;
+  if (Name.find("memcpy") != std::string::npos) return true;
+  if (Name.find("llvm.") == 0) return true;
+  return false;
 }
 
 
@@ -708,6 +921,33 @@ bool BasicBlock::hasTerminator(){
     return 0;
 }
 
+bool BasicBlock::insertBeforeTerminator(Instruction *I) {
+  if (!I) return false;
+  for (auto It = begin(); It != end(); ++It) {
+    Instruction *Current = *It;
+    if (!Current) break;
+    if (Current->instType == Instruction::BR ||
+        Current->instType == Instruction::RET) {
+      It.insertBefore(I);
+      return true;
+    }
+  }
+  push_back(I);
+  return true;
+}
+
+bool BasicBlock::insertAfterPhiNodes(Instruction *I) {
+  if (!I) return false;
+  for (auto It = begin(); It != end(); ++It) {
+    if (!dynamic_cast<PhiInst *>(*It)) {
+      It.insertBefore(I);
+      return true;
+    }
+  }
+  push_back(I);
+  return true;
+}
+
 void BasicBlock::clear(){
     for(auto inst : *this) assert(inst->getUseList().size == 0);
     ChainList<BasicBlock,Instruction>::clear();
@@ -719,9 +959,40 @@ Function* Instruction::getUserFunction(Use* U) {
   if (!U) return nullptr;
   auto* I = dynamic_cast<Instruction*>(U->getUser());
   if (!I) return nullptr;
-  BasicBlock* BB = I->getParent();
+  return I->getParentFunction();
+}
+
+Function *Instruction::getParentFunction() {
+  return getParentFunction(this);
+}
+
+Function *Instruction::getParentFunction(Instruction *I) {
+  if (!I) return nullptr;
+  BasicBlock *BB = I->getParent();
   if (!BB) return nullptr;
   return BB->getParent();
+}
+
+bool Instruction::insertBefore(Instruction *Pos, Instruction *NewI) {
+  if (!Pos || !NewI || !Pos->getParent()) return false;
+  BasicBlock::Iterator It(Pos);
+  It.insertBefore(NewI);
+  return true;
+}
+
+bool Instruction::insertAfter(Instruction *Pos, Instruction *NewI) {
+  if (!Pos || !NewI || !Pos->getParent()) return false;
+  BasicBlock::Iterator It(Pos);
+  It.insertAfter(NewI);
+  return true;
+}
+
+bool Instruction::insertBefore(Instruction *NewI) {
+  return insertBefore(this, NewI);
+}
+
+bool Instruction::insertAfter(Instruction *NewI) {
+  return insertAfter(this, NewI);
 }
 
 RetInst::RetInst(Value* retVal){
@@ -808,6 +1079,15 @@ StoreInst::StoreInst(Value* val,Value* ptr){
 }
 
 Value* getOprand(){return nullptr;}
+
+Value* StoreInst::getValueOperand() const {
+    return getOperand(0);
+}
+
+Value* StoreInst::getPointerOperand() const {
+    return getOperand(1);
+}
+
 void StoreInst::dumpIR(){
   std::cout << "store ";
   for (auto &i : userList) {
@@ -830,6 +1110,10 @@ LoadInst::LoadInst(Value* v) : Instruction(VOIDType::NewVoid()) { // 先传一�
 
     addUse(v);
     instType = InstType::LOAD;
+}
+
+Value* LoadInst::getPointerOperand() const {
+  return getOperand(0);
 }
 
 void LoadInst::dumpIR(){
@@ -923,11 +1207,112 @@ void GetElementPtrInst::updateType() {
     this->irtype = POINTERType::NewPointer(currentType);
 }
 
+std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
+    auto &Operands = getUserList();
+    if (Operands.size() < 2 || !Operands.front()) return std::nullopt;
+
+    Value *Base = Operands.front()->getValue();
+    if (!Base || !Base->getIRType()) return std::nullopt;
+
+    std::shared_ptr<IRType> CurrentTy = Base->getIRType();
+    int64_t LastStride = 0;
+    for (size_t I = 1; I < Operands.size(); ++I) {
+        std::shared_ptr<IRType> ElementTy;
+        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
+            ElementTy = PtrTy->getPointerType();
+        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurrentTy)) {
+            ElementTy = ArrTy->getElementType();
+        } else {
+            return std::nullopt;
+        }
+        if (!ElementTy ||
+            ElementTy->getSize() >
+                static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            return std::nullopt;
+        }
+        LastStride = static_cast<int64_t>(ElementTy->getSize());
+        CurrentTy = ElementTy;
+    }
+    return LastStride;
+}
+
+bool GetElementPtrInst::flattenZeroBasedChain(Value *&Base,
+                                              std::vector<Value *> &Indices) {
+    return flattenZeroBasedChain(this, Base, Indices);
+}
+
+bool GetElementPtrInst::flattenZeroBasedChain(Value *V, Value *&Base,
+                                              std::vector<Value *> &Indices) {
+    auto *GEP = dynamic_cast<GetElementPtrInst *>(V);
+    if (!GEP) {
+        Base = V;
+        return Base != nullptr;
+    }
+
+    auto &Operands = GEP->getUserList();
+    if (Operands.empty() || !Operands.front()) return false;
+
+    Value *LocalBase = Operands.front()->getValue();
+    auto *BaseGEP = dynamic_cast<GetElementPtrInst *>(LocalBase);
+    if (BaseGEP) {
+        Value *FirstIndex = nullptr;
+        if (Operands.size() < 2 || !Operands[1] ||
+            !(FirstIndex = Operands[1]->getValue()) ||
+            !FirstIndex->isConstIntZero()) {
+            return false;
+        }
+        if (!flattenZeroBasedChain(BaseGEP, Base, Indices))
+            return false;
+        for (size_t I = 2; I < Operands.size(); ++I) {
+            if (!Operands[I] || !Operands[I]->getValue()) return false;
+            Indices.push_back(Operands[I]->getValue());
+        }
+        return true;
+    }
+
+    Base = LocalBase;
+    for (size_t I = 1; I < Operands.size(); ++I) {
+        if (!Operands[I] || !Operands[I]->getValue()) return false;
+        Indices.push_back(Operands[I]->getValue());
+    }
+    return Base != nullptr;
+}
+
+bool GetElementPtrInst::getIndexStrides(Value *Base,
+                                        const std::vector<Value *> &Indices,
+                                        std::vector<int64_t> &Strides,
+                                        int64_t &FinalPointeeStride) {
+    Strides.clear();
+    FinalPointeeStride = 0;
+    if (!Base || !Base->getIRType()) return false;
+
+    std::shared_ptr<IRType> CurrentTy = Base->getIRType();
+    for (Value *Idx : Indices) {
+        (void)Idx;
+        std::shared_ptr<IRType> ElementTy;
+        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
+            ElementTy = PtrTy->getPointerType();
+        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurrentTy)) {
+            ElementTy = ArrTy->getElementType();
+        } else {
+            return false;
+        }
+        if (!ElementTy ||
+            ElementTy->getSize() >
+                static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            return false;
+        }
+        int64_t Stride = static_cast<int64_t>(ElementTy->getSize());
+        Strides.push_back(Stride);
+        FinalPointeeStride = Stride;
+        CurrentTy = ElementTy;
+    }
+    return FinalPointeeStride > 0 && Strides.size() == Indices.size();
+}
+
 BinaryInst::BinaryInst(std::shared_ptr<IRType> irtype):Instruction(irtype){
     instType = InstType::BinaryUnknown;
 }
-
-
 
 BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
     :Instruction(x->getIRType()),op(op){
@@ -937,6 +1322,76 @@ BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
     this->instType = mapBinaryOpToInstType(op, x->getIRType()->getEnum());
     this->addUse(x);
     this->addUse(y);
+}
+
+bool BinaryInst::getOperands(Value *&LHS, Value *&RHS) const {
+    LHS = nullptr;
+    RHS = nullptr;
+    if (getNumOperands() < 2) return false;
+    LHS = getOperand(0);
+    RHS = getOperand(1);
+    return LHS && RHS;
+}
+
+bool BinaryInst::setOperands(Value *LHS, Value *RHS) {
+    if (!LHS || !RHS || getNumOperands() < 2) return false;
+    bool Changed = false;
+    if (getOperand(0) != LHS) Changed |= replaceOperand(0, LHS);
+    if (getOperand(1) != RHS) Changed |= replaceOperand(1, RHS);
+    return Changed;
+}
+
+bool BinaryInst::isCompareOp(Operation Op) {
+  switch (Op) {
+  case E:
+  case NE:
+  case G:
+  case GE:
+  case L:
+  case LE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool BinaryInst::isAssociativeOp(Operation Op) {
+  return Op == ADD || Op == MUL || Op == AND || Op == OR || Op == XOR;
+}
+
+bool BinaryInst::isCommutativeOp(Operation Op) {
+  return isAssociativeOp(Op) || Op == E || Op == NE;
+}
+
+bool BinaryInst::isReassociateOp(Operation Op) {
+  return Op == ADD || Op == SUB || Op == MUL ||
+         Op == AND || Op == OR || Op == XOR;
+}
+
+BinaryInst::Operation BinaryInst::negatePredicate(Operation Op) {
+  switch (Op) {
+  case L:  return GE;
+  case LE: return G;
+  case G:  return LE;
+  case GE: return L;
+  case E:  return NE;
+  case NE: return E;
+  default: return Op;
+  }
+}
+
+BinaryInst::Operation BinaryInst::reversePredicate(Operation Op) {
+  switch (Op) {
+  case L:  return G;
+  case LE: return GE;
+  case G:  return L;
+  case GE: return LE;
+  case E:
+  case NE:
+    return Op;
+  default:
+    return Op;
+  }
 }
 
 void BinaryInst::dumpIR(){
@@ -1065,6 +1520,19 @@ void CallInst::dumpIR(){
       std::cout << ", ";
   }
   std::cout << ")\n";
+}
+
+Value *CallInst::getCallee() const {
+  return getOperand(0);
+}
+
+Value *CallInst::getArg(unsigned Index) const {
+  return getOperand(static_cast<size_t>(Index) + 1);
+}
+
+unsigned CallInst::getArgCount() const {
+  size_t NumOperands = getNumOperands();
+  return NumOperands == 0 ? 0 : static_cast<unsigned>(NumOperands - 1);
 }
 
 FPTOSIInst::FPTOSIInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::FPTOSI;}
@@ -1252,6 +1720,16 @@ bool Variable::isParam(){
     if(vartag == Param) return true;
     else return false;
 }
+
+bool Variable::isScalarGlobal() {
+  if (vartag != GlobalVariable) return false;
+  auto PtrTy = std::dynamic_pointer_cast<POINTERType>(getIRType());
+  if (!PtrTy) return false;
+  auto ElemTy = PtrTy->getPointerType();
+  if (!ElemTy) return false;
+  return ElemTy->isInt() || ElemTy->isFloat();
+}
+
 void Variable::dumpIR(){
     Value::dumpIR();
     if (vartag == GlobalVariable)

@@ -14,8 +14,6 @@
 #include <utility>
 #include <vector>
 
-namespace gvnpre_detail {
-
 struct InstRecord {
 	int Num = 0;
 	Instruction *Inst = nullptr;
@@ -150,8 +148,6 @@ private:
 	void domTreeDFS(BasicBlock *BB,
 	                std::function<void(BasicBlock *)> Visit);
 };
-
-} // namespace gvnpre_detail
 
 // GVN + PRE 组合优化
 // - GVN：同值冗余消除（包含局部 LOAD/CALL 前扫）

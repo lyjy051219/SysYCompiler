@@ -33,18 +33,9 @@
 //   另外用 SideEffectAnalysis 消除了"任何指针参数都当 ModRef"的过保守假设。
 // =====================================================================
 
-namespace {
-
 // 从 ptr 向上追 GEP/BitCast 链到基址，并沿途记录常量索引序列。
 // 返回 base（可能是全局 Variable / 其他）。如果 path 里遇到非常量索引，
 // 把 hasVarIdx 置 true。path 只记录 "全部都是常量" 时才有用。
-struct TraceResult {
-    Value *base = nullptr;
-    std::vector<int64_t> constPath;  // 从 base 出发的索引序列（仅所有都常量时有效）
-    bool hasVarIdx = false;           // GEP 某层索引非常量
-    bool unresolved = false;           // 遇到 PHI/Select/Load 等不可静态解析
-};
-
 static void collectReachableBases(Value *ptr,
                                   std::unordered_set<Value*> &bases,
                                   std::unordered_set<Value*> &visited,
@@ -59,14 +50,16 @@ static void collectReachableBases(Value *ptr,
         return;
     }
     if (auto *gep = dynamic_cast<GetElementPtrInst*>(ptr)) {
-        if (gep->getUserList().empty()) { escape = true; return; }
-        collectReachableBases(gep->getUserList()[0]->getValue(),
+        Value *Base = gep->getOperand(0);
+        if (!Base) { escape = true; return; }
+        collectReachableBases(Base,
                               bases, visited, escape, depth + 1);
         return;
     }
     if (auto *bc = dynamic_cast<BitCastInst*>(ptr)) {
-        if (bc->getUserList().empty()) { escape = true; return; }
-        collectReachableBases(bc->getUserList()[0]->getValue(),
+        Value *Base = bc->getOperand(0);
+        if (!Base) { escape = true; return; }
+        collectReachableBases(Base,
                               bases, visited, escape, depth + 1);
         return;
     }
@@ -79,9 +72,8 @@ static void collectReachableBases(Value *ptr,
         return;
     }
     if (auto *sel = dynamic_cast<SelectInst*>(ptr)) {
-        auto &UL = sel->getUserList();
-        for (size_t i = 1; i < UL.size(); i++) {
-            collectReachableBases(UL[i]->getValue(),
+        for (unsigned i = 1; i < sel->getNumOperands(); i++) {
+            collectReachableBases(sel->getOperand(i),
                                   bases, visited, escape, depth + 1);
             if (escape) return;
         }
@@ -94,8 +86,8 @@ static void collectReachableBases(Value *ptr,
 
 // 简化版：trace 单一 ptr，成功返回 base 和常量索引序列（若全常量）。
 // 失败（PHI / 多 base / 未知）返回 base=nullptr 或 hasVarIdx/unresolved=true。
-static TraceResult traceBaseAndIndex(Value *ptr) {
-    TraceResult R;
+static StoreOnlyGlobalTraceResult traceBaseAndIndex(Value *ptr) {
+    StoreOnlyGlobalTraceResult R;
     std::vector<int64_t> idx;
     Value *cur = ptr;
     int depth = 0;
@@ -108,24 +100,23 @@ static TraceResult traceBaseAndIndex(Value *ptr) {
             return R;
         }
         if (auto *gep = dynamic_cast<GetElementPtrInst*>(cur)) {
-            auto &UL = gep->getUserList();
-            if (UL.empty()) { R.unresolved = true; return R; }
+            if (gep->getNumOperands() == 0) { R.unresolved = true; return R; }
             // UL[1..] 是索引，累积（全常量才有意义）
-            for (size_t i = 1; i < UL.size(); i++) {
-                Value *vi = UL[i]->getValue();
+            for (unsigned i = 1; i < gep->getNumOperands(); i++) {
+                Value *vi = gep->getOperand(i);
                 if (auto *ci = dynamic_cast<ConstInt*>(vi)) {
                     idx.push_back((int64_t)ci->getVal());
                 } else {
                     R.hasVarIdx = true;
                 }
             }
-            cur = UL[0]->getValue();
+            cur = gep->getOperand(0);
             depth++;
             continue;
         }
         if (auto *bc = dynamic_cast<BitCastInst*>(cur)) {
-            if (bc->getUserList().empty()) { R.unresolved = true; return R; }
-            cur = bc->getUserList()[0]->getValue();
+            cur = bc->getOperand(0);
+            if (!cur) { R.unresolved = true; return R; }
             depth++;
             continue;
         }
@@ -138,14 +129,8 @@ static TraceResult traceBaseAndIndex(Value *ptr) {
 }
 
 // 每个 global 的读信息
-struct ReadInfo {
-    bool anyIndexRead = false;                    // 有变量索引读 OR 不能追踪到具体 idx
-    std::unordered_set<int64_t> constIdx;          // 被读到的常量索引（hash 单值就够）
-    // 对多维数组，粗粒度起见用 "首级非零常量索引" 作为 key，其它不精确追踪
-};
-
-static void markGlobalRead(Variable *G, const TraceResult *tr,
-                           std::unordered_map<Variable*, ReadInfo> &reads) {
+static void markGlobalRead(Variable *G, const StoreOnlyGlobalTraceResult *tr,
+                           std::unordered_map<Variable*, StoreOnlyGlobalReadInfo> &reads) {
     if (!G) return;
     auto &info = reads[G];
     if (info.anyIndexRead) return;
@@ -169,8 +154,6 @@ static void markGlobalRead(Variable *G, const TraceResult *tr,
     }
 }
 
-} // namespace
-
 PreservationStatus StoreOnlyGlobalEliminationPass::run(
     Module &M, ModuleAnalysisPassManager &MAM)
 {
@@ -182,7 +165,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
     if (candidates.empty()) return PreservationStatus::all();
 
     // 每 global 的读信息
-    std::unordered_map<Variable*, ReadInfo> reads;
+    std::unordered_map<Variable*, StoreOnlyGlobalReadInfo> reads;
 
     // ---------- Pass 1：扫全模块，收集读 ----------
     for (auto &funcPtr : M.getFunctions()) {
@@ -193,12 +176,11 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             for (Instruction *I : *BB) {
                 // LoadInst → 读
                 if (auto *LI = dynamic_cast<LoadInst*>(I)) {
-                    auto &UL = LI->getUserList();
-                    if (UL.empty()) continue;
-                    Value *ptr = UL[0]->getValue();
+                    Value *ptr = LI->getPointerOperand();
+                    if (!ptr) continue;
 
                     // 先尝试单 base 精确路径
-                    TraceResult tr = traceBaseAndIndex(ptr);
+                    StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
                     if (tr.base) {
                         if (auto *v = dynamic_cast<Variable*>(tr.base)) {
                             if (v->isGlobal()) markGlobalRead(v, &tr, reads);
@@ -224,9 +206,8 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
 
                 // CallInst → 仅当 callee 会读该 global 的时候才标
                 if (auto *CI = dynamic_cast<CallInst*>(I)) {
-                    auto &UL = CI->getUserList();
-                    if (UL.empty()) continue;
-                    Value *callee = UL[0]->getValue();
+                    Value *callee = CI->getCallee();
+                    if (!callee) continue;
 
                     // 内置函数：按 FuncAttr 判定
                     if (auto *BIF = dynamic_cast<BuildInFunction*>(callee)) {
@@ -238,8 +219,8 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                             attr == FuncAttr::Untracked;
                         if (maybeRead) {
                             // 实参里若有指针指向 global，保守标该 global anyIndexRead
-                            for (size_t k = 1; k < UL.size(); k++) {
-                                Value *arg = UL[k] ? UL[k]->getValue() : nullptr;
+                            for (unsigned k = 0; k < CI->getArgCount(); k++) {
+                                Value *arg = CI->getArg(k);
                                 if (!arg || !arg->getIRType()) continue;
                                 if (arg->getIRType()->getEnum() != IR_POINTER) continue;
                                 std::unordered_set<Value*> bases;
@@ -264,8 +245,8 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         auto &SEI = FAM.getResult<SideEffectAnalysis>(*calleeF);
                         // hasBuiltin：callee 内部调过 Untracked 的东西 → 保守全读
                         if (SEI.hasBuiltin) {
-                            for (size_t k = 1; k < UL.size(); k++) {
-                                Value *arg = UL[k] ? UL[k]->getValue() : nullptr;
+                            for (unsigned k = 0; k < CI->getArgCount(); k++) {
+                                Value *arg = CI->getArg(k);
                                 if (!arg || !arg->getIRType()) continue;
                                 if (arg->getIRType()->getEnum() != IR_POINTER) continue;
                                 std::unordered_set<Value*> bases;
@@ -290,11 +271,11 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         }
                         // 2) 通过 param 传入的指针实参：对应 param 在 RefSet 里 → 实参基址被读
                         auto &params = calleeF->getParams();
-                        for (unsigned i = 0; i < params.size() && i + 1 < UL.size(); i++) {
+                        for (unsigned i = 0; i < params.size() && i < CI->getArgCount(); i++) {
                             Value *p = params[i].get();
                             if (!p) continue;
                             if (!SEI.RefSet.count(p)) continue;  // callee 没读此 param
-                            Value *arg = UL[i + 1] ? UL[i + 1]->getValue() : nullptr;
+                            Value *arg = CI->getArg(i);
                             if (!arg) continue;
                             std::unordered_set<Value*> bases;
                             std::unordered_set<Value*> visited;
@@ -331,11 +312,10 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             for (Instruction *I : *BB) {
                 auto *SI = dynamic_cast<StoreInst*>(I);
                 if (!SI) continue;
-                auto &UL = SI->getUserList();
-                if (UL.size() < 2) continue;
-                Value *ptr = UL[1]->getValue();
+                Value *ptr = SI->getPointerOperand();
+                if (!ptr) continue;
 
-                TraceResult tr = traceBaseAndIndex(ptr);
+                StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
                 if (!tr.base) continue;
                 auto *G = dynamic_cast<Variable*>(tr.base);
                 if (!G || !G->isGlobal()) continue;
@@ -347,7 +327,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     toDelete.push_back(SI);
                     continue;
                 }
-                const ReadInfo &info = it->second;
+                const StoreOnlyGlobalReadInfo &info = it->second;
                 // 情形 B：G 被"任意索引"读过 → 保守不删
                 if (info.anyIndexRead) continue;
                 // 情形 C：G 只被常量索引读过，检查此 store 是否落在读集合之外
@@ -399,14 +379,14 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             for (BasicBlock *BB : *F) {
                 for (Instruction *I : *BB) {
                     if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
-                        auto &UL = SI2->getUserList();
-                        if (UL.size() < 2) continue;
-                        TraceResult tr = traceBaseAndIndex(UL[1]->getValue());
+                        Value *ptr = SI2->getPointerOperand();
+                        if (!ptr) continue;
+                        StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
                         if (tr.base == G) { anyWrite = true; }
                     } else if (auto *LI = dynamic_cast<LoadInst*>(I)) {
-                        auto &UL = LI->getUserList();
-                        if (UL.empty()) continue;
-                        TraceResult tr = traceBaseAndIndex(UL[0]->getValue());
+                        Value *ptr = LI->getPointerOperand();
+                        if (!ptr) continue;
+                        StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
                         if (tr.base == G) {
                             // 只处理标量 load：GEP 路径必须是 {0}（即直接取值）
                             if (!tr.hasVarIdx && !tr.unresolved &&
