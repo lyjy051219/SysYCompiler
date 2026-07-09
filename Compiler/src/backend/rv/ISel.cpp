@@ -199,6 +199,9 @@ void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
 
 MachineReg materializeInt(MachineFunction &mf, MachineBasicBlock &mbb,
                           int64_t value, RegClass rc) {
+  if (value == 0) {
+    return MachineReg::preg(PhysReg::X0, rc);
+  }
   MachineReg reg = mf.createVReg(rc);
   MachineInstr instr;
   instr.opcode = Opcode::LI;

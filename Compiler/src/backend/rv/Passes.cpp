@@ -122,6 +122,9 @@ MachineReg materializeConstant(MachineFunction &mf,
   }
 
   if (hasInt) {
+    if (intValue == 0) {
+      return MachineReg::preg(PhysReg::X0, regClassForValue(value));
+    }
     MachineReg reg = mf.createVReg(regClassForValue(value));
     MachineInstr li;
     li.opcode = Opcode::LI;
