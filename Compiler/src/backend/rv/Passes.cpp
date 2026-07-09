@@ -331,20 +331,6 @@ void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
 
 } // namespace
 
-void MachineFunctionPassManager::addPass(Pass pass) {
-  if (pass) {
-    passes_.push_back(pass);
-  }
-}
-
-bool MachineFunctionPassManager::run(MachineFunction &mf) const {
-  bool changed = false;
-  for (Pass pass : passes_) {
-    changed = pass(mf) || changed;
-  }
-  return changed;
-}
-
 void rebuildCFG(MachineFunction &mf) {
   for (MachineBasicBlock &block : mf.blocks) {
     block.preds.clear();
@@ -469,17 +455,6 @@ void lowerSelectPseudo(MachineFunction &mf) {
     mf.blocks.insert(insertPos, std::move(trueBlock));
   }
   rebuildCFG(mf);
-}
-
-void runPreRAOptimizations(MachineFunction &mf) {
-  MachineFunctionPassManager pipeline;
-  (void)pipeline.run(mf);
-}
-
-void runPostRAOptimizations(MachineFunction &mf) {
-  MachineFunctionPassManager pipeline;
-  pipeline.addPass(runPostRAPeephole);
-  (void)pipeline.run(mf);
 }
 
 } // namespace riscv
