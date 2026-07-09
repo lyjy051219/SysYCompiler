@@ -122,6 +122,9 @@ MachineReg materializeConstant(MachineFunction &mf,
   }
 
   if (hasInt) {
+    if (intValue == 0) {
+      return MachineReg::preg(PhysReg::X0, regClassForValue(value));
+    }
     MachineReg reg = mf.createVReg(regClassForValue(value));
     MachineInstr li;
     li.opcode = Opcode::LI;
@@ -452,34 +455,6 @@ void lowerSelectPseudo(MachineFunction &mf) {
     mf.blocks.insert(insertPos, std::move(trueBlock));
   }
   rebuildCFG(mf);
-}
-
-void runPreRAOptimizations(MachineFunction &mf) {
-  (void)mf;
-}
-
-void runPostRAOptimizations(MachineFunction &mf) {
-  for (MachineBasicBlock &block : mf.blocks) {
-    block.instrs.erase(
-        std::remove_if(block.instrs.begin(), block.instrs.end(),
-                       [](const MachineInstr &instr) {
-                         if (instr.opcode != Opcode::COPY &&
-                             instr.opcode != Opcode::F_COPY &&
-                             instr.opcode != Opcode::PARALLEL_COPY) {
-                           return false;
-                         }
-                         if (instr.defs.size() != 1 || instr.uses.size() != 1 ||
-                             instr.defs.front().kind != OperandKind::Reg ||
-                             instr.uses.front().kind != OperandKind::Reg) {
-                           return false;
-                         }
-                         const MachineReg def = instr.defs.front().regValue;
-                         const MachineReg use = instr.uses.front().regValue;
-                         return def.physical == use.physical &&
-                                def.id == use.id && def.phys == use.phys;
-                       }),
-        block.instrs.end());
-  }
 }
 
 } // namespace riscv

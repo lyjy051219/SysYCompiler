@@ -7,8 +7,15 @@
 
 namespace riscv {
 
+// 后端优化等级，O0 只跑必经的代码生成阶段
+enum class CodegenOptLevel {
+  O0 = 0,
+  O1 = 1,
+};
+
 struct BackendOptions {
   bool emitMetrics = false;
+  CodegenOptLevel optLevel = CodegenOptLevel::O1;
 };
 
 class BackendError {

@@ -199,6 +199,9 @@ void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
 
 MachineReg materializeInt(MachineFunction &mf, MachineBasicBlock &mbb,
                           int64_t value, RegClass rc) {
+  if (value == 0) {
+    return MachineReg::preg(PhysReg::X0, rc);
+  }
   MachineReg reg = mf.createVReg(rc);
   MachineInstr instr;
   instr.opcode = Opcode::LI;
@@ -220,11 +223,7 @@ MachineReg materializeFloat(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
-  // IR_POINTER 也是标量类型，PHI 节点可能产生指针类型结果
-  // 修复 fft/sl/2024-* 等用例的 "unsupported operand type=3 inst=PHI" 错误
-  return type && (type->getEnum() == IR_INT ||
-                  type->getEnum() == IR_FLOAT ||
-                  type->getEnum() == IR_POINTER);
+  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT);
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
