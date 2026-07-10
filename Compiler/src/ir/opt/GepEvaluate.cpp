@@ -24,11 +24,7 @@
 // 拆分不改变地址计算语义：两个 GEP 串联的偏移等价于原始单个 GEP。
 // =====================================================================
 
-static bool isConstZero(Value *V) {
-    return V && V->isConstIntZero();
-}
-
-static bool evaluateGEP(Function &F) {
+bool GepEvaluatePass::evaluateGEP(Function &F) {
     bool changed = false;
 
     std::vector<GetElementPtrInst *> geps;
@@ -40,10 +36,9 @@ static bool evaluateGEP(Function &F) {
     }
 
     for (GetElementPtrInst *GEP : geps) {
-        auto &UL = GEP->getUserList();
-        if (UL.empty()) continue;
-        Value *Base = UL[0]->getValue();
-        size_t numIndices = UL.size() - 1;
+        Value *Base = GEP->getBasePointer();
+        if (!Base) continue;
+        size_t numIndices = GEP->getNumIndices();
 
         // 无索引的退化 GEP：gep(p) 没有索引，结果就是 p，类型不变
         if (numIndices == 0) {
@@ -54,7 +49,7 @@ static bool evaluateGEP(Function &F) {
         }
 
         // undef 基址传播：gep(undef, ...) → undef
-        if (dynamic_cast<UndefValue *>(Base)) {
+        if (Base->isUndef()) {
             GEP->replaceAllUsesWith(UndefValue::NewUndefValue(GEP->getIRType()));
             delete GEP;
             changed = true;
@@ -66,24 +61,25 @@ static bool evaluateGEP(Function &F) {
         {
             int nonZeroCount = 0;
             size_t splitPoint = 0;
-            for (size_t i = 1; i < UL.size(); i++) {
-                if (i == 1 && isConstZero(UL[i]->getValue())) continue;
-                if (!isConstZero(UL[i]->getValue())) {
+            for (size_t i = 0; i < numIndices; i++) {
+                Value *Index = GEP->getIndex(i);
+                if (i == 0 && Index && Index->isConstIntZero()) continue;
+                if (!Index || !Index->isConstIntZero()) {
                     nonZeroCount++;
                     if (nonZeroCount == 2) {
-                        splitPoint = i;
+                        splitPoint = i + 1;
                         break;
                     }
                 }
             }
 
             if (splitPoint > 0) {
-                BasicBlock *BB = GEP->ChainNode<BasicBlock, Instruction>::getParent();
+                BasicBlock *BB = GEP->getParent();
                 if (!BB) continue;
 
                 std::vector<Value *> frontIndices;
-                for (size_t i = 1; i < splitPoint; i++)
-                    frontIndices.push_back(UL[i]->getValue());
+                for (size_t i = 0; i + 1 < splitPoint; i++)
+                    frontIndices.push_back(GEP->getIndex(i));
 
                 auto *frontGEP = new GetElementPtrInst(Base, frontIndices);
                 frontGEP->updateType();
@@ -92,13 +88,10 @@ static bool evaluateGEP(Function &F) {
 
                 std::vector<Value *> backIndices;
                 backIndices.push_back(ConstInt::newConstInt(0));
-                for (size_t i = splitPoint; i < UL.size(); i++)
-                    backIndices.push_back(UL[i]->getValue());
+                for (size_t i = splitPoint - 1; i < numIndices; i++)
+                    backIndices.push_back(GEP->getIndex(i));
 
-                while (UL.size() > 0) UL.pop_back();
-                GEP->addUse(frontGEP);
-                for (Value *idx : backIndices) GEP->addUse(idx);
-                GEP->updateType();
+                GEP->reset(frontGEP, backIndices);
 
                 changed = true;
             }

@@ -64,15 +64,13 @@ public:
         if (constVal == other.constVal) return false;
 
         // 两个不同的常量 → 值比较（ConstInt/ConstFloat/ConstBool 可能是不同指针但相同值）
-        if (areSameConstant(constVal, other.constVal)) return false;
+        if (Value::areEqualConstants(constVal, other.constVal)) return false;
 
         state = Bottom;
         constVal = nullptr;
         return true;
     }
 
-    // 比较两个常量 Value 的实际值是否相等
-    static bool areSameConstant(Value* a, Value* b);
 };
 
 // SCCP 求解器 (Solver)
@@ -137,18 +135,8 @@ private:
     void getFeasibleSuccessors(BrInst* Br,
                                std::vector<bool>& Succs);
 
-    // 尝试对二元运算进行常量折叠
-    Value* tryConstantFoldBinary(BinaryInst::Operation op,
-                                 Value* LHS, Value* RHS);
-    // 尝试对类型转换进行常量折叠
-    Value* tryConstantFoldCast(Instruction::InstType castTy, Value* Operand);
-     // 位移指令访问者
-    void visitShiftInst(Instruction* I);
     // Select 指令访问者
     void visitSelectInst(Instruction* I);
-
-    // 尝试对位移运算进行常量折叠
-    Value* tryConstantFoldShift(Instruction::InstType shiftTy, Value* LHS, Value* RHS);
 };
 
 // SCCP Pass

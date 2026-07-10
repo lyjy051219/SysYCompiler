@@ -52,6 +52,16 @@ public:
     bool contains(BasicBlock* BB) const;
     // 收集本循环（含子循环）通向循环外部的出口块
     std::vector<BasicBlock*> getExitBlocks() const;
+    // 收集本循环及其子循环中的全部块。
+    std::vector<BasicBlock*> getBlocksIncludingSubLoops() const;
+    // 按所属函数中的稳定顺序收集本循环及其子循环中的全部块。
+    std::vector<BasicBlock*> getBlocksInFunctionOrder() const;
+    // 当前循环直接拥有块的 CFG 逆后序，不进入子循环。
+    std::vector<BasicBlock*> getBlocksInRPO() const;
+    // 当前循环树的后序；可选择反转同级循环的访问顺序。
+    std::vector<Loop*> getLoopsInPostOrder(
+        bool ReverseSiblingOrder = false) const;
+    bool isExitingBlock(BasicBlock *BB) const;
     // 检查是否满足 LoopSimplify 的基础形状：唯一 PreHeader、唯一 Latch、Dedicated Exits
     bool getLoopSimplifyForm(BasicBlock* &PreHeader, BasicBlock* &Latch) const;
     // 是否是最内层循环（没有子循环）
@@ -89,6 +99,8 @@ public:
 
     // 获取顶层循环列表
     const std::vector<Loop*>& getTopLevelLoops() const { return TopLevelLoops; }
+    std::vector<Loop*> getLoopsInPostOrder(
+        bool ReverseSiblingOrder = false) const;
 
     bool invalidate(Function &F, const PreservationStatus &PA);
 };

@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
-static Value *safeReplacement(PhiInst *Phi, const DominatorTree &DT) {
+Value *LatePhiCleanupPass::safeReplacement(PhiInst *Phi, const DominatorTree &DT) {
 	if (!Phi) return nullptr;
 
 	const unsigned N = Phi->getNumIncomingValues();
@@ -26,7 +26,7 @@ static Value *safeReplacement(PhiInst *Phi, const DominatorTree &DT) {
 		Value *V = Phi->getIncomingValue(i);
 		if (Pred) Preds.insert(Pred);
 		if (!V || V == Phi) continue;
-		if (dynamic_cast<UndefValue *>(V)) {
+		if (V->isUndef()) {
 			SawUndef = true;
 			continue;
 		}
@@ -52,7 +52,7 @@ static Value *safeReplacement(PhiInst *Phi, const DominatorTree &DT) {
 	return Common;
 }
 
-static bool cleanupFunction(Function &F, DominatorTree &DT) {
+bool LatePhiCleanupPass::cleanupFunction(Function &F, DominatorTree &DT) {
 	bool Changed = false;
 	bool LocalChanged = true;
 

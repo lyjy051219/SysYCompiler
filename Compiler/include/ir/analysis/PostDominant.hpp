@@ -54,7 +54,6 @@ private:
     void runDFS(BasicBlock* startBlock, unsigned parentDFSNum);
     void buildPostDominatorTree(PostDominatorTree& PDT);
 
-    std::unordered_set<BasicBlock*> collectForwardReachable(Function* func);
     std::vector<BasicBlock*> findExitBlocks(
         Function* func, const std::unordered_set<BasicBlock*>& reachable);
 

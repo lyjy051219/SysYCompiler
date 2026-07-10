@@ -12,9 +12,9 @@
 #include <unordered_set>
 #include <vector>
 
-static bool insertSignedDivPow2Sequence(BinaryInst *BI, Value *LHS,
-                                        int32_t Divisor,
-                                        Instruction *&Quotient) {
+bool LateStrengthReducePass::insertSignedDivPow2Sequence(
+    BinaryInst *BI, Value *LHS, int32_t Divisor,
+    Instruction *&Quotient) {
     Quotient = nullptr;
     if (!BI || !LHS || !IRMath::isPowerOf2(Divisor)) return false;
 
@@ -43,8 +43,8 @@ static bool insertSignedDivPow2Sequence(BinaryInst *BI, Value *LHS,
     return true;
 }
 
-static bool isGuaranteedNonNegativeImpl(Value *V, int Depth,
-                                        std::unordered_set<Value *> &Visiting) {
+bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
+    Value *V, int Depth, std::unordered_set<Value *> &Visiting) {
     if (!V || !V->getIRType() || !V->getIRType()->isInt()) return false;
 
     int32_t C = 0;
@@ -60,10 +60,9 @@ static bool isGuaranteedNonNegativeImpl(Value *V, int Depth,
 
     if (auto *SI = dynamic_cast<SelectInst *>(V)) {
         bool Result = false;
-        auto &UL = SI->getUserList();
-        if (UL.size() == 3) {
-            Value *TV = UL[1]->getValue();
-            Value *FV = UL[2]->getValue();
+        if (SI->getNumOperands() == 3) {
+            Value *TV = SI->getTrueValue();
+            Value *FV = SI->getFalseValue();
             Result = isGuaranteedNonNegativeImpl(TV, Depth - 1, Visiting) &&
                      isGuaranteedNonNegativeImpl(FV, Depth - 1, Visiting);
         }
@@ -121,12 +120,12 @@ static bool isGuaranteedNonNegativeImpl(Value *V, int Depth,
     return false;
 }
 
-static bool isGuaranteedNonNegative(Value *V) {
+bool LateStrengthReducePass::isGuaranteedNonNegative(Value *V) {
     std::unordered_set<Value *> Visiting;
     return isGuaranteedNonNegativeImpl(V, 4, Visiting);
 }
 
-static bool reduceFunction(Function &F) {
+bool LateStrengthReducePass::reduceFunction(Function &F) {
     bool Changed = false;
     std::vector<BinaryInst *> Candidates;
 

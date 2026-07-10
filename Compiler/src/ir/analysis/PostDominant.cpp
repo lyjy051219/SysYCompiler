@@ -98,29 +98,6 @@ void PostSemiNCAInfo::runSemiNCA() {
     }
 }
 
-// PostSemiNCAInfo: PostDom 特有函数
-// 从 entry 沿 getSuccessors() 做 DFS，返回所有 entry 可达块
-std::unordered_set<BasicBlock*> PostSemiNCAInfo::collectForwardReachable(Function* func) {
-    std::unordered_set<BasicBlock*> reachable;
-    if (func->Size() == 0) return reachable;
-
-    std::stack<BasicBlock*> worklist;
-    BasicBlock* entry = func->front();
-    worklist.push(entry);
-    reachable.insert(entry);
-
-    while (!worklist.empty()) {
-        BasicBlock* BB = worklist.top();
-        worklist.pop();
-        for (BasicBlock* succ : BB->getSuccessors()) {
-            if (succ && reachable.insert(succ).second) {
-                worklist.push(succ);
-            }
-        }
-    }
-    return reachable;
-}
-
 // 在 reachable 集合中，找出所有 getSuccessors() 为空的块 (即以 RetInst 结尾)
 std::vector<BasicBlock*> PostSemiNCAInfo::findExitBlocks(
     Function* func, const std::unordered_set<BasicBlock*>& reachable)
@@ -279,7 +256,8 @@ PostDominatorTree PostSemiNCAInfo::calculate(Function* func) {
     if (func->Size() == 0) return PDT;
 
     // 1. 收集 entry 可达块
-    auto reachable = collectForwardReachable(func);
+    std::unordered_set<BasicBlock*> reachable;
+    func->collectReachableBlocks(reachable);
     if (reachable.empty()) return PDT;
 
     // 2. 找出口块 (getSuccessors() 为空的 reachable 块)

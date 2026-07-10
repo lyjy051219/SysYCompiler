@@ -15,8 +15,10 @@ unsigned BlockInfo::getInstIndex(const Instruction* I){
     unsigned bbnum = 0;
     const BasicBlock* bb = I->getParent();
     for(auto inst : *const_cast<BasicBlock*>(bb)){
-        if( (dynamic_cast<LoadInst*>(inst) && dynamic_cast<AllocaInst *>(inst->getUserList()[0]->getValue())) ||
-            (dynamic_cast<StoreInst *>(inst) && dynamic_cast<AllocaInst *>(inst->getUserList()[1]->getValue())) ){
+        auto *LI = dynamic_cast<LoadInst *>(inst);
+        auto *SI = dynamic_cast<StoreInst *>(inst);
+        if ((LI && dynamic_cast<AllocaInst *>(LI->getPointerOperand())) ||
+            (SI && dynamic_cast<AllocaInst *>(SI->getPointerOperand()))) {
             InstNum[inst] = bbnum++;
         }
     }
@@ -48,7 +50,7 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
             continue;
         }
         else if (auto storeInst = dynamic_cast<StoreInst*>(user)) {
-            Value* storedVal = storeInst->getUserList()[0]->getValue();
+            Value* storedVal = storeInst->getValueOperand();
             int index = storeInst->getUserIndex(use);
             if (index == 0) {
                 return false;
@@ -99,8 +101,7 @@ void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
 
 bool PromotePass::rewriteSingleStoreAlloca(AllocaInfo &info,AllocaInst* AI,DominatorTree& DT,BlockInfo &blockInfo){
     StoreInst* onlyStore = info.OnlyStore;
-    auto &storeUser = onlyStore->getUserList();
-    Value* val =  storeUser[0]->getValue();
+    Value* val = onlyStore->getValueOperand();
     BasicBlock* BB = onlyStore->getParent();
     unsigned index = -1;
     info.LoadBlocks.clear();
@@ -188,7 +189,7 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
             if(stores.empty()) retVal = UndefValue::NewUndefValue(LI->getIRType());
             else return false;
         }else{
-            retVal = std::prev(it)->second->getUserList()[0]->getValue();
+            retVal = std::prev(it)->second->getValueOperand();
         }
 
         replacements.push_back({LI, retVal});
@@ -423,14 +424,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         IncomingVals[i].push(UndefValue::NewUndefValue(ptrType->getPointerType()));
     }
 
-    struct RenameFrame {
-        DominatorNode* Node;
-        DominatorNode* ChildIter;
-        std::vector<unsigned> PushCounts;
-        bool Processed;
-    };
-
-    std::stack<RenameFrame> renameStack;
+    std::stack<Mem2RegRenameFrame> renameStack;
     DominatorNode* rootNode = DT.getNode(F.front());
     if(!rootNode) return changed;
 
@@ -459,7 +453,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                 if(dynamic_cast<PhiInst*>(inst)) continue;
 
                 if(LoadInst* LI = dynamic_cast<LoadInst*>(inst)){
-                    Value* ptr = LI->getUserList()[0]->getValue();
+                    Value* ptr = LI->getPointerOperand();
                     AllocaInst* AI = dynamic_cast<AllocaInst*>(ptr);
                     if(AI){
                         auto idxIt = AllocaIndex.find(AI);
@@ -472,13 +466,13 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                     }
                 }
                 else if(StoreInst* SI = dynamic_cast<StoreInst*>(inst)){
-                    Value* ptr = SI->getUserList()[1]->getValue();
+                    Value* ptr = SI->getPointerOperand();
                     AllocaInst* AI = dynamic_cast<AllocaInst*>(ptr);
                     if(AI){
                         auto idxIt = AllocaIndex.find(AI);
                         if(idxIt != AllocaIndex.end()){
                             unsigned allocIdx = idxIt->second;
-                            Value* storedVal = SI->getUserList()[0]->getValue();
+                            Value* storedVal = SI->getValueOperand();
                             IncomingVals[allocIdx].push(storedVal);
                             frame.PushCounts[allocIdx]++;
                             instsToDelete.push_back(SI);
@@ -595,13 +589,13 @@ void PromotePass::computeLiveInBlocks(
         bool foundLoadBeforeStore = false;
         for (auto inst : *BB) {
             if (auto* SI = dynamic_cast<StoreInst*>(inst)) {
-                if (dynamic_cast<AllocaInst*>(SI->getUserList()[1]->getValue()) == AI) {
+                if (dynamic_cast<AllocaInst*>(SI->getPointerOperand()) == AI) {
                     foundStoreFirst = true;
                     break;
                 }
             }
             if (auto* loadI = dynamic_cast<LoadInst*>(inst)) {
-                if (dynamic_cast<AllocaInst*>(loadI->getUserList()[0]->getValue()) == AI) {
+                if (dynamic_cast<AllocaInst*>(loadI->getPointerOperand()) == AI) {
                     foundLoadBeforeStore = true;
                     break;
                 }

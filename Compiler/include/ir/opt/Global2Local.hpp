@@ -5,8 +5,6 @@
 
 #include <cstddef>
 #include <memory>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 struct Global2LocalCandidateInfo {
@@ -27,10 +25,5 @@ private:
 	static constexpr size_t RISCVThreshold = 32;
 	bool RelaxScalarUses = false;
 
-	static bool isMemcpyLikeCall(CallInst *CI);
-	static bool isMemcpyArgUse(Use *U);
-	static std::unordered_map<Function *, std::vector<Function *>> buildCallGraph(Module &M);
-	static std::unordered_set<Function *> computeReachableFrom(
-		Function *Entry,
-		const std::unordered_map<Function *, std::vector<Function *>> &CallGraph);
+	static bool isSafeScalarUseInMain(Use *U, Variable *GV);
 };

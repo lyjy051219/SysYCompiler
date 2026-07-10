@@ -17,23 +17,8 @@
 
 using RankMap = std::unordered_map<Value *, uint32_t>;
 
-static bool isConstLike(Value *V) {
-	return dynamic_cast<ConstantSystem *>(V) != nullptr;
-}
-
-static bool isIntegerValue(Value *V) {
-	return V && V->getIRType() && V->getIRType()->isInt();
-}
-
-static Value *makeIntConst(int Val) {
-	return ConstInt::newConstInt(Val);
-}
-
-static Value *makeIntConst(int Val, const std::shared_ptr<IRType> &Ty) {
-	return ConstInt::newConstInt(Val, Ty ? Ty->getSize() : 4);
-}
-
-static bool isDeadInstForReassociate(Instruction *I, FunctionAnalysisPassManager &FAM) {
+bool ReassociatePass::isDeadInstruction(
+	Instruction *I, FunctionAnalysisPassManager &FAM) {
 	if (!I) return false;
 	if (I->countInstructionUses() > 0) return false;
 
@@ -49,25 +34,9 @@ static bool isDeadInstForReassociate(Instruction *I, FunctionAnalysisPassManager
 	return true;
 }
 
-static bool evalConst(BinaryInst::Operation Op, Value *L, Value *R, Value *&Out) {
-	Out = nullptr;
-	if (!L || !R) return false;
-
-	int LI = 0;
-	int RI = 0;
-	if (!L->tryGetIntConst(LI) || !R->tryGetIntConst(RI)) return false;
-
-	switch (Op) {
-	case BinaryInst::ADD: Out = ConstInt::newConstInt(LI + RI); return true;
-	case BinaryInst::MUL: Out = ConstInt::newConstInt(LI * RI); return true;
-	case BinaryInst::AND: Out = ConstInt::newConstInt(LI & RI); return true;
-	case BinaryInst::OR: Out = ConstInt::newConstInt(LI | RI); return true;
-	case BinaryInst::XOR: Out = ConstInt::newConstInt(LI ^ RI); return true;
-	default: return false;
-	}
-}
-
-static bool isAlreadyBuilt(Instruction *I, BinaryInst::Operation Op, const std::vector<Value *> &Ops) {
+bool ReassociatePass::isAlreadyBuilt(
+	Instruction *I, BinaryInst::Operation Op,
+	const std::vector<Value *> &Ops) {
 	if (!I) return false;
 	if (Ops.size() < 2) return false;
 
@@ -112,7 +81,7 @@ public:
 				for (auto *I : *BB) Insts.push_back(I);
 				for (Instruction *I : Insts) {
 					if (!I || !I->getParent()) continue;
-					if (isDeadInstForReassociate(I, FAM)) {
+					if (ReassociatePass::isDeadInstruction(I, FAM)) {
 						continue;
 					}
 					LocalChanged |= optimizeInst(I);
@@ -176,7 +145,7 @@ private:
 
 	uint32_t getRank(Value *V) const {
 		if (!V) return 0;
-		if (isConstLike(V)) return 1;
+		if (V && V->isConst()) return 1;
 		auto It = Ranks.find(V);
 		if (It != Ranks.end()) return It->second;
 		return 2;
@@ -218,7 +187,7 @@ private:
 			Todo.pop_back();
 			InTodo.erase(I);
 			if (!I || !I->getParent()) continue;
-			if (isDeadInstForReassociate(I, FAM)) continue;
+			if (ReassociatePass::isDeadInstruction(I, FAM)) continue;
 			Changed |= optimizeInst(I);
 		}
 		return Changed;
@@ -326,7 +295,7 @@ private:
 			OuterProduct.push_back(SquareRoot);
 		}
 
-		if (OuterProduct.empty()) return makeIntConst(1);
+		if (OuterProduct.empty()) return ConstInt::newConstInt(1);
 
 		Value *Out = nullptr;
 		if (!buildBalancedProduct(Root, OuterProduct, Out)) return nullptr;
@@ -381,7 +350,7 @@ private:
 		NonConst.reserve(Ops.size());
 		Consts.reserve(Ops.size());
 		for (Value *V : Ops) {
-			if (isConstLike(V)) Consts.push_back(V);
+			if (V && V->isConst()) Consts.push_back(V);
 			else NonConst.push_back(V);
 		}
 
@@ -392,8 +361,8 @@ private:
 				TotalConst = C;
 				continue;
 			}
-			Value *Folded = nullptr;
-			if (evalConst(Op, TotalConst, C, Folded) && Folded) {
+			Value *Folded = BinaryInst::foldConstants(Op, TotalConst, C);
+			if (Folded) {
 				TotalConst = Folded;
 				Changed = true;
 			}
@@ -430,7 +399,8 @@ private:
 						continue;
 					}
 
-					Instruction *MulI = createBinaryBefore(Root, BinaryInst::MUL, makeIntConst(K), V);
+					Instruction *MulI = createBinaryBefore(
+						Root, BinaryInst::MUL, ConstInt::newConstInt(K), V);
 					if (!MulI) {
 						NewOps.push_back(V);
 						continue;
@@ -523,7 +493,7 @@ private:
 						}
 						Factors.erase(Fit);
 						if (Factors.empty()) {
-							RemainingTerms.push_back(makeIntConst(1));
+							RemainingTerms.push_back(ConstInt::newConstInt(1));
 						} else if (Factors.size() == 1) {
 							RemainingTerms.push_back(Factors[0]);
 						} else {
@@ -597,12 +567,15 @@ private:
 		Value *LHS = nullptr;
 		Value *RHS = nullptr;
 		if (!BI->getOperands(LHS, RHS)) return false;
-		if (!isIntegerValue(LHS) || !isIntegerValue(RHS)) {
+		if (!IRType::isInt(LHS ? LHS->getIRType() : nullptr) ||
+			!IRType::isInt(RHS ? RHS->getIRType() : nullptr)) {
 			return false;
 		}
         //2.如果本条指令是SUB A-B指令，直接优化成A + B×（-1），将新生成的指令加入TodoList，然后直接返回执行下一条指令
 		if (Op == BinaryInst::SUB) {
-			Instruction *Neg = createBinaryBefore(I, BinaryInst::MUL, RHS, makeIntConst(-1, RHS->getIRType()));
+			Instruction *Neg = createBinaryBefore(
+				I, BinaryInst::MUL, RHS,
+				Value::makeIntegerForType(-1, RHS->getIRType()));
 			if (!Neg) return false;
 			Instruction *Add = createBinaryBefore(I, BinaryInst::ADD, LHS, Neg);
 			if (!Add) return false;
@@ -692,7 +665,7 @@ private:
 		if (Ops.size() < 2) return Changed;
 
 		// Avoid rebuilding when the tree is already in canonical shape.
-		if (isAlreadyBuilt(I, Op, Ops)) return Changed;
+		if (ReassociatePass::isAlreadyBuilt(I, Op, Ops)) return Changed;
 
 		Value *R = Ops.back(); Ops.pop_back();
 		Value *L = Ops.back(); Ops.pop_back();

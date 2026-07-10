@@ -26,19 +26,10 @@
 // =====================================================================
 
 // =====================================================================
-// 块染色结果
-// =====================================================================
-enum class BlockColor {
-    KILL,        // 块内存在 MustAlias 完整覆盖 store
-    CLOBBER,     // 块内存在无法继续证明的事件 (READ 或 BARRIER)
-    TRANSPARENT  // 块内无 P 相关事件
-};
-
-// =====================================================================
 // Phase 1: 块内 DSE（保留现有逻辑）
 // =====================================================================
 
-bool eliminateInBlock(BasicBlock *BB) {
+bool DSEPass::eliminateInBlock(BasicBlock *BB) {
     if (BB == nullptr) {
         return false;
     }
@@ -55,8 +46,7 @@ bool eliminateInBlock(BasicBlock *BB) {
         Instruction *I = *it;
 
         if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-            if (LI->getUserList().size() >= 1) {
-                Value *ptr = LI->getUserList()[0]->getValue();
+            if (Value *ptr = LI->getPointerOperand()) {
                 pendingStores.erase(ptr);
             } else {
                 pendingStores.clear();
@@ -65,12 +55,11 @@ bool eliminateInBlock(BasicBlock *BB) {
         }
 
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-            if (SI->getUserList().size() < 2) {
+            Value *ptr = SI->getPointerOperand();
+            if (!ptr) {
                 pendingStores.clear();
                 continue;
             }
-
-            Value *ptr = SI->getUserList()[1]->getValue();
             auto pendingIt = pendingStores.find(ptr);
             if (pendingIt != pendingStores.end()) {
                 delete SI;
@@ -94,24 +83,23 @@ bool eliminateInBlock(BasicBlock *BB) {
 // Phase 2: 全局 DSE — Forward Kill Coverage
 // =====================================================================
 
-// classifyBlock: 扫描整个块，确定该块对指针 P 的第一个相关事件。
+// 从 First 开始扫描，确定对指针 P 的第一个相关事件。
 //
 // 【假设】当前 IR 中 MustAlias 隐含完整覆盖（同类型同宽度）。
 // 若后续 IR 引入不同宽度/切片的 store 到同基地址，
 // 此处 KILL 判定需要额外加大小比较。
-static BlockColor classifyBlock(
-    BasicBlock *BB, Value *P,
+DSEBlockColor DSEPass::classifyFrom(
+    Instruction *First, Value *P,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    for (Instruction *I : *BB) {
+    for (Instruction *I = First; I; I = I->getNext()) {
         // 先检查 KILL：MustAlias store
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-            if (SI->getUserList().size() >= 2) {
-                Value *StorePtr = SI->getUserList()[1]->getValue();
-                if (AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias) {
-                    return BlockColor::KILL;
-                }
+            Value *StorePtr = SI->getPointerOperand();
+            if (StorePtr &&
+                AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias) {
+                return DSEBlockColor::Kill;
             }
         }
 
@@ -121,7 +109,7 @@ static BlockColor classifyBlock(
         // 对自递归调用可能返回不完整的 ModRef 信息。
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
             if (AA.callMayAliasPointer(CI, P, LI)) {
-                return BlockColor::CLOBBER;
+                return DSEBlockColor::Clobber;
             }
         }
 
@@ -132,82 +120,30 @@ static BlockColor classifyBlock(
         // 后续若需区分，在此拆分。
         ModRefInfo MR = getInstModRefInfo(P, I, AA, LI, FAM);
 
-        if (isRefSet(MR)) {
-            return BlockColor::CLOBBER;
-        }
-
-        if (isModSet(MR)) {
-            // I 可能写 P，但不是 MustAlias store
-            // 可能是 MayAlias store 或 call with Mod
-            // 无法证明完整覆盖 → BARRIER
-            return BlockColor::CLOBBER;
-        }
+        if (isRefSet(MR) || isModSet(MR)) return DSEBlockColor::Clobber;
     }
 
-    return BlockColor::TRANSPARENT;
-}
-
-// classifyBlockPartial: 同 classifyBlock，但只扫描 startAfter 之后的指令。
-// 用于 S1 所在块的尾部扫描。
-static BlockColor classifyBlockPartial(
-    BasicBlock *BB, Value *P, Instruction *startAfter,
-    BasicAAResult &AA, const LoopInfo &LI,
-    FunctionAnalysisPassManager &FAM)
-{
-    // 从 startAfter 的下一条指令开始
-    Instruction *I = startAfter->getNext();
-    while (I) {
-        // 先检查 KILL
-        if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-            if (SI->getUserList().size() >= 2) {
-                Value *StorePtr = SI->getUserList()[1]->getValue();
-                if (AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias) {
-                    return BlockColor::KILL;
-                }
-            }
-        }
-
-        // CallInst 安全网（同 classifyBlock 中的逻辑）
-        if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (AA.callMayAliasPointer(CI, P, LI)) {
-                return BlockColor::CLOBBER;
-            }
-        }
-
-        ModRefInfo MR = getInstModRefInfo(P, I, AA, LI, FAM);
-
-        if (isRefSet(MR)) {
-            return BlockColor::CLOBBER;
-        }
-
-        if (isModSet(MR)) {
-            return BlockColor::CLOBBER;
-        }
-
-        I = I->getNext();
-    }
-
-    return BlockColor::TRANSPARENT;
+    return DSEBlockColor::Transparent;
 }
 
 // isStoreDead: 判断一个 store 是否为 dead store。
 // 不使用全局早退 isReachableToExit —— 同块覆盖在任何块中都可以检测到。
 // 只在 BFS 走到 exit 块时，根据指针是否 local 决定是否放行。
-static bool isStoreDead(
+bool DSEPass::isStoreDead(
     StoreInst *S1,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    if (S1->getUserList().size() < 2) return false;
-    Value *P = S1->getUserList()[1]->getValue();
-    BasicBlock *B1 = dynamic_cast<BasicBlock *>(
-        static_cast<Instruction *>(S1)->ChainNode<BasicBlock, Instruction>::getParent());
+    if (!S1) return false;
+    Value *P = S1->getPointerOperand();
+    BasicBlock *B1 = S1->getParent();
+    if (!P) return false;
     if (!B1) return false;
 
     // Phase A: 检查 S1 所在块的剩余指令
-    BlockColor tailColor = classifyBlockPartial(B1, P, S1, AA, LI, FAM);
-    if (tailColor == BlockColor::KILL)    return true;   // 同块覆盖
-    if (tailColor == BlockColor::CLOBBER) return false;  // 同块就被读了
+    DSEBlockColor tailColor = classifyFrom(S1->getNext(), P, AA, LI, FAM);
+    if (tailColor == DSEBlockColor::Kill) return true;   // 同块覆盖
+    if (tailColor == DSEBlockColor::Clobber) return false;  // 同块就被读了
 
     // Phase A.5: B1 本身是 exit 块的情况
     // Phase A 返回 TRANSPARENT 说明 S1 之后到块末尾无 P 相关事件。
@@ -256,13 +192,13 @@ static bool isStoreDead(
             return false;  // 超出预算，保守放弃
         }
 
-        BlockColor color = classifyBlock(BB, P, AA, LI, FAM);
+        DSEBlockColor color = classifyFrom(BB->front(), P, AA, LI, FAM);
 
-        if (color == BlockColor::KILL) {
+        if (color == DSEBlockColor::Kill) {
             continue;  // 这条路径被覆盖 store 挡住，不再探索后继
         }
 
-        if (color == BlockColor::CLOBBER) {
+        if (color == DSEBlockColor::Clobber) {
             return false;  // 存在一条路径上 P 被读或被不可证明地修改 → S1 alive
         }
 

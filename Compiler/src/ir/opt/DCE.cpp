@@ -12,17 +12,13 @@
 
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	if (!CI) return true;
-	auto& UL = CI->getUserList();
-	if (UL.empty() || !UL[0]) return true;
-
-	Value* Callee = UL[0]->getValue();
+	Value* Callee = CI->getCallee();
 	if (!Callee) return true;
 
 	if (auto* BIF = dynamic_cast<BuildInFunction*>(Callee)) {
 		const std::string& N = BIF->getIdent();
 		// I/O builtins have observable side effects even if they are memory-readonly.
-		if (N == "putint" || N == "putch" || N == "putfloat" ||
-			N == "putarray" || N == "putfarray" || N == "putf") {
+		if (BuildInFunction::isOutputName(N)) {
 			return true;
 		}
 
@@ -40,15 +36,12 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	return true;
 }
 
-static bool isDeletableInst(Instruction* I, FunctionAnalysisPassManager& FAM) {
+bool DCEPass::isDeletableInstruction(
+	Instruction* I, FunctionAnalysisPassManager& FAM) {
 	if (!I) return false;
 
 	// 1) 仍被其他指令使用：不能删
-	for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
-		Use* U = *It;
-		if (!U || U->getValue() != I) continue;
-		if (dynamic_cast<Instruction*>(U->getUser())) return false;
-	}
+	if (I->countInstructionUses() > 0) return false;
 
 	// 2) 终结指令：不能删
 	if (I->instType == Instruction::RET || I->instType == Instruction::BR) return false;
@@ -81,12 +74,12 @@ PreservationStatus DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	auto tryErase = [&](Instruction* I) -> bool {
 		if (!I) return false;
 		if (Erased.count(I)) return false;
-		if (!isDeletableInst(I, FAM)) return false;
+		if (!isDeletableInstruction(I, FAM)) return false;
 
 		// 遍历并断开 I 的所有操作数，再尝试把可能新变死的定义指令加入队列
-		auto& Operands = I->getUserList();
-		for (auto& UsePtr : Operands) {
-			Use* U = UsePtr.get();
+		for (size_t OperandIndex = 0;
+			 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+			Use* U = I->getOperandUse(OperandIndex);
 			if (!U) continue;
 
 			Value* Op = U->getValue();
@@ -104,17 +97,9 @@ PreservationStatus DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 			if (Erased.count(DefI)) continue;
 
 			// 该操作数若已无指令使用，并且本身可删，则入队
-			bool DefIHasInstUser = false;
-			for (auto It = DefI->getUseList().begin(); It != DefI->getUseList().end(); ++It) {
-				Use* DU = *It;
-				if (!DU || DU->getValue() != DefI) continue;
-				if (dynamic_cast<Instruction*>(DU->getUser())) {
-					DefIHasInstUser = true;
-					break;
-				}
-			}
+			bool DefIHasInstUser = DefI->countInstructionUses() > 0;
 
-			if (!DefIHasInstUser && isDeletableInst(DefI, FAM)) {
+			if (!DefIHasInstUser && isDeletableInstruction(DefI, FAM)) {
 				enqueue(DefI);
 			}
 		}

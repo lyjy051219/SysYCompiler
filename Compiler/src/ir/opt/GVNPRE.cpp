@@ -1,14 +1,11 @@
 #include "ir/opt/GVNPRE.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <functional>
 #include <queue>
 #include <utility>
-
-static bool isInstInBlock(Instruction *I, BasicBlock *BB) {
-    return I && BB && I->getParent() == BB;
-}
 
 bool ExprKey::operator==(const ExprKey &RHS) const {
     return Opcode == RHS.Opcode && Args == RHS.Args;
@@ -118,55 +115,6 @@ bool GVNPRESolver::hasResultValue(Instruction *I) {
     return I && I->getIRType() && I->getIRType()->getEnum() != IR_VOID;
 }
 
-bool GVNPRESolver::isCommutativeInst(Instruction *I) {
-    if (!I) return false;
-    switch (I->instType) {
-    case Instruction::ADD:
-    case Instruction::FADD:
-    case Instruction::MUL:
-    case Instruction::FMUL:
-    case Instruction::AND:
-    case Instruction::OR:
-    case Instruction::XOR:
-        return true;
-    default:
-        break;
-    }
-    return false;
-}
-
-bool GVNPRESolver::isCompareInst(Instruction *I) {
-    if (!I) return false;
-    return I->instType == Instruction::ICMP || I->instType == Instruction::FCMP;
-}
-
-BinaryInst::Operation GVNPRESolver::invertPredicate(BinaryInst::Operation Op) {
-    switch (Op) {
-    case BinaryInst::G:
-        return BinaryInst::L;
-    case BinaryInst::GE:
-        return BinaryInst::LE;
-    case BinaryInst::L:
-        return BinaryInst::G;
-    case BinaryInst::LE:
-        return BinaryInst::GE;
-    default:
-        return Op;
-    }
-}
-
-bool GVNPRESolver::isConstTrue(Value *V) {
-    if (auto *B = dynamic_cast<ConstBool *>(V)) return B->getVal();
-    if (auto *I = dynamic_cast<ConstInt *>(V)) return I->getVal() != 0;
-    if (auto *F = dynamic_cast<ConstFloat *>(V)) return F->getVal() != 0.0f;
-    return false;
-}
-
-bool GVNPRESolver::isConstCond(Value *V) {
-    return dynamic_cast<ConstBool *>(V) || dynamic_cast<ConstInt *>(V) ||
-           dynamic_cast<ConstFloat *>(V);
-}
-
 void GVNPRESolver::rebuildRPOAndReachability() {
     ReachableBlocks.clear();
     RPO.clear();
@@ -174,35 +122,9 @@ void GVNPRESolver::rebuildRPOAndReachability() {
     BasicBlock *Entry = F.front();
     if (!Entry) return;
 
-    std::unordered_set<BasicBlock *> Visited;
-    std::vector<BasicBlock *> Post;
-
-    // 迭代式后序 DFS
-    std::vector<std::pair<BasicBlock *, bool>> Stack;
-    Stack.push_back({Entry, false});
-
-    while (!Stack.empty()) {
-        auto &[BB, Processed] = Stack.back();
-        if (Processed) {
-            Post.push_back(BB);
-            Stack.pop_back();
-            continue;
-        }
-        Processed = true;
-        if (!Visited.insert(BB).second) {
-            Stack.pop_back();
-            continue;
-        }
-        ReachableBlocks.insert(BB);
-        auto Succs = BB->getSuccessors();
-        for (auto It = Succs.rbegin(); It != Succs.rend(); ++It) {
-            if (*It && !Visited.count(*It))
-                Stack.push_back({*It, false});
-        }
-    }
-
-    std::reverse(Post.begin(), Post.end());
-    RPO = std::move(Post);
+    F.collectReachableBlocks(ReachableBlocks);
+    std::vector<BasicBlock *> Roots{Entry};
+    RPO = TraverseTools::buildRPOFromRoots<BasicBlock>(Roots);
 }
 
 void GVNPRESolver::buildTablesForPRE() {
@@ -234,21 +156,15 @@ void GVNPRESolver::buildAvailOut() {
     // Use iterative DFS on domtree
     std::vector<BasicBlock *> DomOrder;
     {
-        struct StackItem { BasicBlock *BB; };
-        std::vector<StackItem> Stack;
-        Stack.push_back({Entry});
+        std::vector<BasicBlock *> Stack{Entry};
         while (!Stack.empty()) {
-            auto [BB] = Stack.back();
+            BasicBlock *BB = Stack.back();
             Stack.pop_back();
             if (!BB || isDeadBlock(BB)) continue;
             DomOrder.push_back(BB);
 
-            // Push domtree children (children = blocks whose idom is BB)
-            for (BasicBlock *Cand : RPO) {
-                if (!Cand || isDeadBlock(Cand)) continue;
-                if (DT.getIDom(Cand) == BB) {
-                    Stack.push_back({Cand});
-                }
+            for (BasicBlock *Child : DT.getChildren(BB)) {
+                if (Child && !isDeadBlock(Child)) Stack.push_back(Child);
             }
         }
     }
@@ -348,7 +264,7 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
     Instruction *Best = nullptr;
     for (const InstRecord &R : It->second) {
         if (!R.Inst || !R.BB || isDeadBlock(R.BB)) continue;
-        if (!isInstInBlock(R.Inst, R.BB)) continue;
+        if (!R.Inst || !R.Inst->isInBlock(R.BB)) continue;
         if (!DT.dominates(R.BB, UseBB)) continue;
 
         if (UseI && R.BB == UseBB && !isBeforeInSameBlock(R.Inst, UseI)) {
@@ -369,7 +285,7 @@ Instruction *GVNPRESolver::findAvailLeader(int Num, BasicBlock *PredBB) const {
     auto EntIt = AOIt->second.find(Num);
     if (EntIt == AOIt->second.end()) return nullptr;
     Instruction *Inst = EntIt->second.Inst;
-    if (!Inst || !isInstInBlock(Inst, Inst->getParent())) return nullptr;
+    if (!Inst || !Inst->isInBlock(Inst->getParent())) return nullptr;
     return Inst;
 }
 
@@ -440,10 +356,11 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
     if (!I) return false;
 
     auto appendOperands = [&](Instruction *Inst, std::vector<int> &Args) {
-        for (auto &U : Inst->getUserList()) {
-            if (!U) continue;
+        for (size_t OperandIndex = 0;
+             OperandIndex < Inst->getNumOperands(); ++OperandIndex) {
             bool Fresh = false;
-            Args.push_back(getOrAssignValueNum(U->getValue(), Fresh));
+            Args.push_back(getOrAssignValueNum(
+                Inst->getOperand(OperandIndex), Fresh));
         }
     };
 
@@ -451,23 +368,24 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
     K.Opcode = (static_cast<unsigned>(I->instType) << 8);
 
     if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
-        auto &UL = BI->getUserList();
-        if (UL.size() != 2 || !UL[0] || !UL[1]) return false;
+        Value *LHS = nullptr;
+        Value *RHS = nullptr;
+        if (!BI->getOperands(LHS, RHS)) return false;
 
         bool F0 = false;
         bool F1 = false;
-        int A0 = getOrAssignValueNum(UL[0]->getValue(), F0);
-        int A1 = getOrAssignValueNum(UL[1]->getValue(), F1);
+        int A0 = getOrAssignValueNum(LHS, F0);
+        int A1 = getOrAssignValueNum(RHS, F1);
 
-        if (isCommutativeInst(I) && A0 > A1) {
+        if (BI->isCommutativeOp(BI->getOp()) && A0 > A1) {
             std::swap(A0, A1);
         }
 
-        if (isCompareInst(I)) {
+        if (BinaryInst::isCompareOp(BI->getOp())) {
             auto Pred = BI->getOp();
             if (A0 > A1) {
                 std::swap(A0, A1);
-                Pred = invertPredicate(Pred);
+                Pred = BinaryInst::reversePredicate(Pred);
             }
             K.Opcode = (static_cast<unsigned>(I->instType) << 8) |
                        static_cast<unsigned>(Pred);
@@ -507,11 +425,7 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
     if (!CI) return ModRefInfo::ModRef;
 
-    auto &UL = CI->getUserList();
-    if (UL.empty() || !UL[0]) return ModRefInfo::ModRef;
-    Value *Callee = UL[0]->getValue();
-
-    if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
+    if (auto *BIF = CI->getBuiltinCallee()) {
         FuncAttr Attr = classifyBuiltin(BIF);
         if (Attr == FuncAttr::Untracked)    return ModRefInfo::ModRef;
         if (Attr == FuncAttr::NoModRef)     return ModRefInfo::NoModRef;
@@ -520,7 +434,7 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
         return ModRefInfo::ModRef;
     }
 
-    if (auto *CalleeF = dynamic_cast<Function *>(Callee)) {
+    if (auto *CalleeF = CI->getDirectCallee()) {
         const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeF);
         for (const auto &KV : SEI.ptrMap) {
             if (KV.second.untracked) return ModRefInfo::ModRef;
@@ -529,44 +443,6 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
     }
 
     return ModRefInfo::ModRef;
-}
-
-Value *GVNPRESolver::getLoadPtr(Instruction *I) {
-    auto *LI = dynamic_cast<LoadInst *>(I);
-    if (!LI) return nullptr;
-    auto &UL = LI->getUserList();
-    if (UL.empty() || !UL[0]) return nullptr;
-    return UL[0]->getValue();
-}
-
-Value *GVNPRESolver::getStorePtr(Instruction *I) {
-    auto *SI = dynamic_cast<StoreInst *>(I);
-    if (!SI) return nullptr;
-    auto &UL = SI->getUserList();
-    if (UL.size() < 2 || !UL[1]) return nullptr;
-    return UL[1]->getValue();
-}
-
-Value *GVNPRESolver::getStoreValue(Instruction *I) {
-    auto *SI = dynamic_cast<StoreInst *>(I);
-    if (!SI) return nullptr;
-    auto &UL = SI->getUserList();
-    if (UL.size() < 2 || !UL[0]) return nullptr;
-    return UL[0]->getValue();
-}
-
-std::vector<Value *> GVNPRESolver::collectCallPtrArgs(CallInst *CI) {
-    std::vector<Value *> Ptrs;
-    if (!CI) return Ptrs;
-    auto &UL = CI->getUserList();
-    for (size_t i = 1; i < UL.size(); ++i) {
-        if (!UL[i]) continue;
-        Value *Arg = UL[i]->getValue();
-        if (Arg && Arg->getIRType() && Arg->getIRType()->getEnum() == IR_POINTER) {
-            Ptrs.push_back(Arg);
-        }
-    }
-    return Ptrs;
 }
 
 std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
@@ -581,20 +457,11 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
         ReadPtrs.push_back(V);
     };
 
-    auto &UL = CI->getUserList();
-    if (UL.empty() || !UL[0]) return ReadPtrs;
+    std::vector<Value *> Args = CI->getArgs();
 
-    Value *Callee = UL[0]->getValue();
-    std::vector<Value *> Args;
-    Args.reserve(UL.size() > 0 ? UL.size() - 1 : 0);
-    for (size_t i = 1; i < UL.size(); ++i) {
-        Args.push_back(UL[i] ? UL[i]->getValue() : nullptr);
-    }
-
-    if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
+    if (auto *BIF = CI->getBuiltinCallee()) {
         if (getIntrinsicID(BIF) == IntrinsicID::Memcpy) {
-            if (Args.size() >= 2 && Args[1] && Args[1]->getIRType() &&
-                Args[1]->getIRType()->getEnum() == IR_POINTER) {
+            if (Args.size() >= 2 && Args[1] && Args[1]->isPointerValue()) {
                 pushUnique(Args[1]);
             }
             return ReadPtrs;
@@ -605,15 +472,14 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
         if (!DoRef) return ReadPtrs;
 
         for (Value *Arg : Args) {
-            if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) continue;
+            if (!Arg || !Arg->isPointerValue()) continue;
             pushUnique(Arg);
         }
         return ReadPtrs;
     }
 
-    if (auto *CalleeFunc = dynamic_cast<Function *>(Callee)) {
+    if (auto *CalleeFunc = CI->getDirectCallee()) {
         const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
-        auto &Params = CalleeFunc->getParams();
 
         for (Value *RV : SEI.RefSet) {
             auto *Var = dynamic_cast<Variable *>(RV);
@@ -625,13 +491,11 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
             }
 
             if (!Var->isParam()) continue;
-            for (size_t i = 0; i < Params.size(); ++i) {
-                if (Params[i].get() != RV) continue;
-                if (i < Args.size() && Args[i] && Args[i]->getIRType() &&
-                    Args[i]->getIRType()->getEnum() == IR_POINTER) {
-                    pushUnique(Args[i]);
-                }
-                break;
+            int Index = CalleeFunc->getParamIndex(RV);
+            if (Index >= 0 && static_cast<size_t>(Index) < Args.size() &&
+                Args[static_cast<size_t>(Index)] &&
+                Args[static_cast<size_t>(Index)]->isPointerValue()) {
+                pushUnique(Args[static_cast<size_t>(Index)]);
             }
         }
     }
@@ -641,12 +505,10 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
 
 bool GVNPRESolver::identicalCall(CallInst *A, CallInst *B) {
     if (!A || !B) return false;
-    auto &UA = A->getUserList();
-    auto &UB = B->getUserList();
-    if (UA.size() != UB.size()) return false;
-    for (size_t i = 0; i < UA.size(); ++i) {
-        if (!UA[i] || !UB[i]) return false;
-        if (UA[i]->getValue() != UB[i]->getValue()) return false;
+    if (A->getNumOperands() != B->getNumOperands()) return false;
+    for (size_t i = 0; i < A->getNumOperands(); ++i) {
+        if (!A->getOperand(i) || !B->getOperand(i)) return false;
+        if (A->getOperand(i) != B->getOperand(i)) return false;
     }
     return true;
 }
@@ -701,21 +563,20 @@ void GVNPRESolver::markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc) 
 
 void GVNPRESolver::processBranchForDeadBlocks(Instruction *I) {
     auto *Br = dynamic_cast<BrInst *>(I);
-    if (!Br) return;
-    auto &UL = Br->getUserList();
-    if (UL.size() != 3 || !UL[0] || !UL[1] || !UL[2]) return;
-    Value *Cond = UL[0]->getValue();
-    if (!isConstCond(Cond)) return;
-    BasicBlock *TrueBB  = dynamic_cast<BasicBlock *>(UL[1]->getValue());
-    BasicBlock *FalseBB = dynamic_cast<BasicBlock *>(UL[2]->getValue());
-    BasicBlock *DeadSucc = isConstTrue(Cond) ? FalseBB : TrueBB;
+    if (!Br || !Br->isConditional()) return;
+    Value *Cond = Br->getCondition();
+    bool CondValue = false;
+    if (!Cond || !Cond->tryGetBoolConst(CondValue)) return;
+    BasicBlock *TrueBB = Br->getTrueSuccessor();
+    BasicBlock *FalseBB = Br->getFalseSuccessor();
+    BasicBlock *DeadSucc = CondValue ? FalseBB : TrueBB;
     markDeadBranchBlocks(Br->getParent(), DeadSucc);
 }
 
 bool GVNPRESolver::processLoad(Instruction *I) {
     auto *LIst = dynamic_cast<LoadInst *>(I);
     if (!LIst) return false;
-    Value *Ptr = getLoadPtr(LIst);
+    Value *Ptr = LIst->getPointerOperand();
     if (!Ptr) return false;
 
     BasicBlock *BB = I->getParent();
@@ -732,11 +593,11 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             if (++ScanCount > kBackwardScanLimit) return false;
 
             if (auto *SI = dynamic_cast<StoreInst *>(Cur)) {
-                Value *SPtr = getStorePtr(SI);
+                Value *SPtr = SI->getPointerOperand();
                 if (!SPtr) continue;
                 AliasInfo AI = AA.alias(Ptr, SPtr, LI);
                 if (AI == AliasInfo::MustAlias) {
-                    Value *Stored = getStoreValue(SI);
+                    Value *Stored = SI->getValueOperand();
                     if (!Stored) return false;
                     I->replaceAllUsesWith(Stored);
                     forgetInstruction(I);
@@ -748,7 +609,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             }
 
             if (auto *LI2 = dynamic_cast<LoadInst *>(Cur)) {
-                Value *PrevPtr = getLoadPtr(LI2);
+                Value *PrevPtr = LI2->getPointerOperand();
                 if (!PrevPtr) continue;
                 AliasInfo AI = AA.alias(Ptr, PrevPtr, LI);
                 if (AI == AliasInfo::MustAlias) {
@@ -794,11 +655,11 @@ bool GVNPRESolver::processCall(Instruction *I) {
         for (; Cur != nullptr; Cur = Cur->getPrev()) {
             if (++ScanCount > kBackwardScanLimit) return false;
 
-            if (dynamic_cast<StoreInst *>(Cur)) {
-                Value *SPtr = getStorePtr(Cur);
+            if (auto *SI = dynamic_cast<StoreInst *>(Cur)) {
+                Value *SPtr = SI->getPointerOperand();
                 if (!SPtr) continue;
                 for (Value *RP : ReadPtrs) {
-                    if (!RP || !RP->getIRType() || RP->getIRType()->getEnum() != IR_POINTER)
+                    if (!RP || !RP->isPointerValue())
                         continue;
                     if (AA.alias(RP, SPtr, LI) != AliasInfo::NoAlias) return false;
                 }
@@ -813,7 +674,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
                     return true;
                 }
                 for (Value *RP : ReadPtrs) {
-                    if (!RP || !RP->getIRType() || RP->getIRType()->getEnum() != IR_POINTER)
+                    if (!RP || !RP->isPointerValue())
                         continue;
                     ModRefInfo MRI = getInstModRefInfo(RP, PrevCall, AA, LI, FAM);
                     if (isModSet(MRI)) return false;
@@ -910,7 +771,9 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         return true;
     }
 
-    if (isCompareInst(I)) return true;
+    if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
+        if (BinaryInst::isCompareOp(BI->getOp())) return true;
+    }
 
     if (I->instType == Instruction::SDIV || I->instType == Instruction::UDIV ||
         I->instType == Instruction::FDIV || I->instType == Instruction::SREM ||
@@ -1032,38 +895,6 @@ Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicB
     return OrigV;
 }
 
-void GVNPRESolver::insertBeforeTerminator(BasicBlock *BB, Instruction *NewI) {
-    if (!BB || !NewI) return;
-    if (BB->Size() == 0) {
-        BB->push_back(NewI);
-        return;
-    }
-    Instruction *Term = BB->back();
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        if (*It == Term) {
-            It.insertBefore(NewI);
-            return;
-        }
-    }
-    BB->push_back(NewI);
-}
-
-void GVNPRESolver::insertPhiAfterExistingPhis(BasicBlock *BB, PhiInst *Phi) {
-    if (!BB || !Phi) return;
-    if (BB->Size() == 0) {
-        BB->push_back(Phi);
-        return;
-    }
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        Instruction *Cur = *It;
-        if (!dynamic_cast<PhiInst *>(Cur)) {
-            It.insertBefore(Phi);
-            return;
-        }
-    }
-    BB->push_back(Phi);
-}
-
 void GVNPRESolver::seedDeadBlocksToLeaderTable() {
     for (BasicBlock *BB : DeadBlocks) {
         if (!BB) continue;
@@ -1174,21 +1005,14 @@ bool GVNPRESolver::runPRE() {
             if (!Cloned) continue;
 
             bool OperandOK = true;
-            auto &OrigUL  = I->getUserList();
-            auto &CloneUL = Cloned->getUserList();
-
-            if (OrigUL.size() != CloneUL.size()) {
+            if (I->getNumOperands() != Cloned->getNumOperands()) {
                 delete Cloned;
                 continue;
             }
 
-            for (size_t Idx = 0; OperandOK && Idx < OrigUL.size(); ++Idx) {
-                if (!OrigUL[Idx] || !CloneUL[Idx]) {
-                    OperandOK = false;
-                    break;
-                }
-
-                Value *OrigV = OrigUL[Idx]->getValue();
+            for (size_t Idx = 0;
+                 OperandOK && Idx < I->getNumOperands(); ++Idx) {
+                Value *OrigV = I->getOperand(Idx);
                 if (!OrigV) {
                     OperandOK = false;
                     break;
@@ -1201,9 +1025,8 @@ bool GVNPRESolver::runPRE() {
                     break;
                 }
 
-                if (CloneUL[Idx]->getValue() != Resolved) {
-                    CloneUL[Idx]->replaceUseeWith(Resolved);
-                }
+                if (Cloned->getOperand(Idx) != Resolved)
+                    Cloned->replaceOperand(Idx, Resolved);
             }
 
             if (!OperandOK) {
@@ -1212,7 +1035,7 @@ bool GVNPRESolver::runPRE() {
             }
 
             // Insert cloned instruction into PREPred before its terminator
-            insertBeforeTerminator(PREPred, Cloned);
+            PREPred->insertBeforeTerminator(Cloned);
             ValueNum[Cloned] = Num;
             NumToValue[Num]  = Cloned;
             addRecord(Num, Cloned, PREPred);
@@ -1222,7 +1045,7 @@ bool GVNPRESolver::runPRE() {
 
             // Create PHI at BB to merge
             auto *NewPhi = new PhiInst(I->getIRType());
-            insertPhiAfterExistingPhis(BB, NewPhi);
+            BB->insertAfterPhiNodes(NewPhi);
 
             for (BasicBlock *Pred : ConsideredPreds) {
                 auto It = PredMap.find(Pred);
@@ -1277,11 +1100,8 @@ void GVNPRESolver::domTreeDFS(BasicBlock *BB,
                               std::function<void(BasicBlock *)> Visit) {
     if (!BB) return;
     Visit(BB);
-    for (BasicBlock *Cand : RPO) {
-        if (!Cand || Cand == BB) continue;
-        if (DT.getIDom(Cand) == BB) {
-            domTreeDFS(Cand, Visit);
-        }
+    for (BasicBlock *Child : DT.getChildren(BB)) {
+        if (Child) domTreeDFS(Child, Visit);
     }
 }
 

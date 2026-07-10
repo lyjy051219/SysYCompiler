@@ -10,27 +10,17 @@
 #include <unordered_set>
 #include <vector>
 
-static bool getDirectStoreToGlobal(Use *U, Variable *G, StoreInst *&SI) {
-    SI = nullptr;
-    if (!U || !G || U->getValue() != G) return false;
-    auto *Store = dynamic_cast<StoreInst *>(U->getUser());
-    if (!Store) return false;
-
-    if (Store->getPointerOperand() != G) return false;
-
-    SI = Store;
-    return true;
-}
-
-static bool collectDeadStoresForGlobal(Variable *G,
-                                       std::vector<StoreInst *> &Stores) {
+bool LateDeadGlobalCleanupPass::collectDeadStoresForGlobal(
+    Variable *G, std::vector<StoreInst *> &Stores) {
     if (!G || !G->isScalarGlobal()) return false;
-    if (G->getUseList().is_empty()) return false;
+    if (!G->hasUses()) return false;
 
     std::vector<StoreInst *> LocalStores;
     for (auto It = G->getUseList().begin(); It != G->getUseList().end(); ++It) {
-        StoreInst *SI = nullptr;
-        if (!getDirectStoreToGlobal(*It, G, SI)) return false;
+        Use *U = *It;
+        if (!U || U->getValue() != G) return false;
+        auto *SI = dynamic_cast<StoreInst *>(U->getUser());
+        if (!SI || SI->getPointerOperand() != G) return false;
         LocalStores.push_back(SI);
     }
 

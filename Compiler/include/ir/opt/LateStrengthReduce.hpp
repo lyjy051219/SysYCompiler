@@ -2,6 +2,9 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <cstdint>
+#include <unordered_set>
+
 // Late, control-flow-neutral strength reduction.
 //
 // This pass intentionally avoids the full RangeAwareSimplify comparison and
@@ -12,4 +15,13 @@
 class LateStrengthReducePass : public PassDescriptor<LateStrengthReducePass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+    static bool insertSignedDivPow2Sequence(
+        BinaryInst *BI, Value *LHS, int32_t Divisor,
+        Instruction *&Quotient);
+    static bool isGuaranteedNonNegativeImpl(
+        Value *V, int Depth, std::unordered_set<Value *> &Visiting);
+    static bool isGuaranteedNonNegative(Value *V);
+    static bool reduceFunction(Function &F);
 };

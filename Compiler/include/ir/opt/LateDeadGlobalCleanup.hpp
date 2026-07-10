@@ -11,4 +11,8 @@ class LateDeadGlobalCleanupPass
     : public PassDescriptor<LateDeadGlobalCleanupPass> {
 public:
     PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
+
+private:
+    static bool collectDeadStoresForGlobal(
+        Variable *G, std::vector<StoreInst *> &Stores);
 };

@@ -14,6 +14,13 @@
 class BlockInfo;
 class AllocaInfo;
 
+struct Mem2RegRenameFrame {
+    DominatorNode *Node = nullptr;
+    DominatorNode *ChildIter = nullptr;
+    std::vector<unsigned> PushCounts;
+    bool Processed = false;
+};
+
 class PromotePass : public PassDescriptor<PromotePass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

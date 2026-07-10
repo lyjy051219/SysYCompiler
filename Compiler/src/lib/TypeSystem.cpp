@@ -4,16 +4,149 @@
 int IRType::getScope(){ return 0; }
 bool IRType::isInt() const { return getEnum() == IR_INT; }
 bool IRType::isFloat() const { return getEnum() == IR_FLOAT; }
+bool IRType::isVoid() const { return getEnum() == IR_VOID; }
 bool IRType::isPointer() const { return getEnum() == IR_POINTER; }
 bool IRType::isArray() const { return getEnum() == IR_ARRAY; }
 bool IRType::isBool() const {
     auto *IT = dynamic_cast<const INTType *>(this);
     return IT && IT->getIsBool();
 }
+bool IRType::isScalar() const { return isInt() || isFloat(); }
+bool IRType::hasSameScalarType(const IRType &Other) const {
+    return isScalar() && Other.isScalar() && getEnum() == Other.getEnum() &&
+           getSize() == Other.getSize();
+}
+bool IRType::hasSameStorageType(const IRType &Other) const {
+    return getEnum() == Other.getEnum() && getSize() == Other.getSize();
+}
+bool IRType::hasSameShape(const IRType &Other) const {
+    if (getEnum() != Other.getEnum() || getSize() != Other.getSize())
+        return false;
+    if (!isArray()) return true;
+
+    auto *ThisArray = dynamic_cast<const ARRAYType *>(this);
+    auto *OtherArray = dynamic_cast<const ARRAYType *>(&Other);
+    return ThisArray && OtherArray &&
+           ThisArray->getElementCount() == OtherArray->getElementCount() &&
+           ThisArray->getElementType() && OtherArray->getElementType() &&
+           ThisArray->getElementType()->hasSameShape(
+               *OtherArray->getElementType());
+}
+std::shared_ptr<IRType> IRType::getPointeeType() const {
+    auto *PtrTy = dynamic_cast<const POINTERType *>(this);
+    return PtrTy ? PtrTy->getPointerType() : nullptr;
+}
+int IRType::countScalarElements(int Limit) const {
+    if (Limit < 1) return -1;
+    if (isScalar()) return 1;
+    auto *ArrayTy = dynamic_cast<const ARRAYType *>(this);
+    if (!ArrayTy || ArrayTy->getElementCount() < 0 ||
+        !ArrayTy->getElementType())
+        return -1;
+    int SubCount = ArrayTy->getElementType()->countScalarElements(Limit);
+    if (SubCount < 0 || ArrayTy->getElementCount() > Limit / SubCount)
+        return -1;
+    return SubCount * ArrayTy->getElementCount();
+}
+bool IRType::flattenScalarPath(const std::vector<int> &Path,
+                               int &FlatIndex) const {
+    FlatIndex = 0;
+    const IRType *Current = this;
+    for (int Index : Path) {
+        auto *ArrayTy = dynamic_cast<const ARRAYType *>(Current);
+        if (!ArrayTy || Index < 0 || Index >= ArrayTy->getElementCount() ||
+            !ArrayTy->getElementType())
+            return false;
+        int SubCount = ArrayTy->getElementType()->countScalarElements(1 << 20);
+        if (SubCount < 0) return false;
+        FlatIndex += Index * SubCount;
+        Current = ArrayTy->getElementType().get();
+    }
+    return Current && Current->isScalar();
+}
+bool IRType::unflattenScalarPath(
+    int FlatIndex, std::vector<int> &Path,
+    std::shared_ptr<IRType> &ElementTy) const {
+    Path.clear();
+    ElementTy = nullptr;
+    if (FlatIndex < 0) return false;
+
+    const IRType *Current = this;
+    while (auto *ArrayTy = dynamic_cast<const ARRAYType *>(Current)) {
+        std::shared_ptr<IRType> ChildTy = ArrayTy->getElementType();
+        if (!ChildTy) return false;
+        int SubCount = ChildTy->countScalarElements(1 << 20);
+        if (SubCount <= 0) return false;
+        int Index = FlatIndex / SubCount;
+        if (Index < 0 || Index >= ArrayTy->getElementCount()) return false;
+        Path.push_back(Index);
+        FlatIndex %= SubCount;
+        ElementTy = ChildTy;
+        Current = ChildTy.get();
+    }
+
+    if (FlatIndex != 0 || !Current || !Current->isScalar()) return false;
+    if (!ElementTy) {
+        if (Current->isBool()) ElementTy = INTType::NewBool();
+        else if (Current->isInt()) ElementTy = INTType::NewInt(Current->getSize());
+        else if (Current->isFloat()) ElementTy = FLOATType::NewFloat();
+    }
+    return ElementTy != nullptr;
+}
 int IRType::getIntegerBitWidth(int DefaultBits) const {
     if (!isInt()) return DefaultBits;
     int Bits = static_cast<int>(getSize() * 8);
     return Bits > 0 ? Bits : DefaultBits;
+}
+bool IRType::isInt(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isInt();
+}
+bool IRType::isFloat(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isFloat();
+}
+bool IRType::isBool(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isBool();
+}
+bool IRType::isPointer(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isPointer();
+}
+bool IRType::isArray(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isArray();
+}
+bool IRType::isScalar(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isScalar();
+}
+bool IRType::hasSameScalarType(const std::shared_ptr<IRType> &A,
+                               const std::shared_ptr<IRType> &B) {
+    return A && B && A->hasSameScalarType(*B);
+}
+bool IRType::hasSameShape(const std::shared_ptr<IRType> &A,
+                          const std::shared_ptr<IRType> &B) {
+    return A && B && A->hasSameShape(*B);
+}
+int IRType::countScalarElements(const std::shared_ptr<IRType> &Ty,
+                                int Limit) {
+    return Ty ? Ty->countScalarElements(Limit) : -1;
+}
+bool IRType::flattenScalarPath(const std::shared_ptr<IRType> &Ty,
+                               const std::vector<int> &Path,
+                               int &FlatIndex) {
+    if (!Ty) {
+        FlatIndex = 0;
+        return false;
+    }
+    return Ty->flattenScalarPath(Path, FlatIndex);
+}
+bool IRType::unflattenScalarPath(const std::shared_ptr<IRType> &Ty,
+                                 int FlatIndex,
+                                 std::vector<int> &Path,
+                                 std::shared_ptr<IRType> &ElementTy) {
+    if (!Ty) {
+        Path.clear();
+        ElementTy = nullptr;
+        return false;
+    }
+    return Ty->unflattenScalarPath(FlatIndex, Path, ElementTy);
 }
 
 std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){

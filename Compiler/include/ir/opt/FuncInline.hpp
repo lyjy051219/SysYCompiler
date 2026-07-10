@@ -22,5 +22,12 @@ public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+	static CalleeInlineProfile analyzeCallee(
+		Function *Callee, FunctionAnalysisPassManager &FAM);
+	static bool isInlineSite(
+		Function &Caller, CallInst *CI, Function *Callee,
+		const std::unordered_map<Function *, int> &CalleeFrequency,
+		bool EnableRecursiveInline, FunctionAnalysisPassManager &FAM,
+		CalleeInlineProfile &OutProfile);
 	bool EnableRecursiveInline = true;
 };

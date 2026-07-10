@@ -43,30 +43,22 @@ bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
 }
 
 std::size_t BasicAAResult::getPointeeAccessSize(Value* V) const {
-    if (!(V && V->getIRType() && V->getIRType()->isPointer())) {
-        return 0;
-    }
-    auto Ptr = std::dynamic_pointer_cast<POINTERType>(V->getIRType());
-    if (!Ptr || !Ptr->getPointerType()) {
-        return 0;
-    }
-    return Ptr->getPointerType()->getSize();
+    std::shared_ptr<IRType> Pointee =
+        V && V->getIRType() ? V->getIRType()->getPointeeType() : nullptr;
+    return Pointee ? Pointee->getSize() : 0;
 }
 
 Value* BasicAAResult::stripBaseInst(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
-        if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_POINTER) {
+        if (!V->isPointerValue()) {
             return V;
         }
 
         if (auto *GEP = dynamic_cast<GetElementPtrInst*>(V)) {
             bool AllZero = true;
-            for (unsigned i = 1; i < GEP->getUserList().size(); ++i) {
-                auto &Ops = GEP->getUserList();
-                Value* Idx = (i < Ops.size() && Ops[i]) ? Ops[i]->getValue() : nullptr;
-                auto *CI = dynamic_cast<ConstInt*>(Idx);
-                if (!CI || CI->getVal() != 0) {
+            for (Value *Idx : GEP->getIndices()) {
+                if (!Idx || !Idx->isConstIntZero()) {
                     AllZero = false;
                     break;
                 }
@@ -74,14 +66,12 @@ Value* BasicAAResult::stripBaseInst(Value* V) const {
             if (!AllZero) {
                 return V;
             }
-            auto &Ops = GEP->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = GEP->getBasePointer();
             continue;
         }
 
         if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
-            auto &Ops = BC->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = BC->getUnaryOperand();
             continue;
         }
 
@@ -101,14 +91,12 @@ Value* BasicAAResult::getBaseAddress(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
         if (auto *GEP = dynamic_cast<GetElementPtrInst*>(V)) {
-            auto &Ops = GEP->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = GEP->getBasePointer();
             continue;
         }
 
         if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
-            auto &Ops = BC->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = BC->getUnaryOperand();
             continue;
         }
 
@@ -157,14 +145,13 @@ std::pair<Value*, Value*> BasicAAResult::makeCanonicalPair(Value* A, Value* B) c
 }
 
 bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr) const {
-    auto &Ops = GEP->getUserList();
-    Value* BasePtr = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+    Value* BasePtr = GEP ? GEP->getBasePointer() : nullptr;
     if (!BasePtr || !BasePtr->getIRType()) {
         return false;
     }
 
     std::shared_ptr<IRType> CurType = BasePtr->getIRType();
-    for (unsigned i = 1; i < Ops.size(); ++i) {
+    for (size_t i = 0; i < GEP->getNumIndices(); ++i) {
         std::size_t Stride = 0;
         if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurType)) {
             CurType = PtrTy->getPointerType();
@@ -182,7 +169,7 @@ bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr
             return false;
         }
 
-        Value* Idx = Ops[i] ? Ops[i]->getValue() : nullptr;
+        Value* Idx = GEP->getIndex(i);
         if (auto *CI = dynamic_cast<ConstInt*>(Idx)) {
             Expr.ConstantOffset += static_cast<long long>(CI->getVal()) * static_cast<long long>(Stride);
         } else if (Idx) {
@@ -203,14 +190,12 @@ BasicAAResult::LinearGEP BasicAAResult::fillLinearGEP(Value* V) const {
                 Expr.Valid = false;
                 return Expr;
             }
-            auto &Ops = GEP->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = GEP->getBasePointer();
             continue;
         }
 
         if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
-            auto &Ops = BC->getUserList();
-            V = (!Ops.empty() && Ops[0]) ? Ops[0]->getValue() : nullptr;
+            V = BC->getUnaryOperand();
             continue;
         }
 
@@ -539,14 +524,12 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     V1 = stripBaseInst(V1);
     V2 = stripBaseInst(V2);
 
-    if (!V1 || !V2 || !V1->getIRType() || !V2->getIRType() ||
-        V1->getIRType()->getEnum() != IR_POINTER ||
-        V2->getIRType()->getEnum() != IR_POINTER) {
+    if (!V1 || !V2 || !V1->isPointerValue() || !V2->isPointerValue()) {
         return AliasInfo::NoAlias;
     }
 
     //3.如果有UndefValue参与，直接判定为NoAlias
-    if (dynamic_cast<UndefValue*>(V1) || dynamic_cast<UndefValue*>(V2)) {
+    if (V1->isUndef() || V2->isUndef()) {
         return AliasInfo::NoAlias;
     }
     //4.判断相等性及拦截跨迭代相等性的情况
@@ -626,12 +609,11 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
     BasicAAResult Result;
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-    auto &Params = F.getParams();
     std::vector<unsigned> PointerParams;
-    PointerParams.reserve(Params.size());
-    for (unsigned I = 0; I < Params.size(); ++I) {
-        Value *Param = Params[I].get();
-        if (Param && Param->getIRType() && Param->getIRType()->isPointer()) {
+    PointerParams.reserve(F.getParamCount());
+    for (unsigned I = 0; I < F.getParamCount(); ++I) {
+        Value *Param = F.getParam(I);
+        if (Param && Param->isPointerValue()) {
             PointerParams.push_back(I);
         }
     }
@@ -639,18 +621,8 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
         return Result;
     }
 
-    std::vector<CallInst*> Calls;
-    bool AllDirectCalls = true;
-    for (auto It = F.getUseList().begin(); It != F.getUseList().end(); ++It) {
-        Use* U = *It;
-        auto *CI = U ? dynamic_cast<CallInst*>(U->getUser()) : nullptr;
-        if (!CI || CI->getUserIndex(U) != 0) {
-            AllDirectCalls = false;
-            break;
-        }
-        Calls.push_back(CI);
-    }
-    if (!AllDirectCalls || Calls.empty()) {
+    std::vector<CallInst*> Calls = F.getDirectCallSites();
+    if (!F.hasOnlyDirectCallUses() || Calls.empty()) {
         return Result;
     }
 
@@ -669,7 +641,7 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
                 }
             }
             if (AllNoAlias) {
-                Result.addObjectNoAliasFact(Params[PI].get(), Params[PJ].get());
+                Result.addObjectNoAliasFact(F.getParam(PI), F.getParam(PJ));
             }
         }
     }
@@ -693,7 +665,7 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
                 }
             }
             if (AllNoAlias) {
-                Result.addObjectNoAliasFact(Params[PI].get(), Global);
+                Result.addObjectNoAliasFact(F.getParam(PI), Global);
             }
         }
     }

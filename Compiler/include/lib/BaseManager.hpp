@@ -5,11 +5,11 @@
 #include <unordered_map>
 #include <iostream>
 #include <cstdint>
+#include <optional>
 #include "TypeSystem.hpp"
 
 
 //Value,User,Use
-class IRType;
 class IRType;
 class VOIDType;
 class ConstInt;
@@ -68,8 +68,8 @@ public:
     //通过Value访问UseList利用其addUseNode函数进行插入该结点
     Use(User* er ,Value* ee);
     ~Use();
-    User* getUser(){return user;}
-    Value* getValue(){return usee;}
+    User* getUser() const {return user;}
+    Value* getValue() const {return usee;}
     //替换当前 Use 关系中的目标 Value (被使用者)
     bool replaceUseeWith(Value* V);
     //一定是User调用这个函数
@@ -92,7 +92,8 @@ class UseList final{
 
    Use* getBack();
    Use*& getHead(){return head;}
-   bool is_empty(){return head == nullptr;}
+   Use* getHead() const {return head;}
+   bool is_empty() const {return head == nullptr;}
 
    //实现迭代器--只能正向进行遍历
     class iterator{
@@ -111,6 +112,8 @@ class UseList final{
     };
     iterator begin(){return iterator(this->head);}
     iterator end(){return iterator(nullptr);}
+    iterator begin() const {return iterator(this->head);}
+    iterator end() const {return iterator(nullptr);}
     /*使用示例：
     for(UserList::iterator it = list.begin(); it != list.end(); ++it) {
     Use* currentUse = *it;
@@ -126,6 +129,13 @@ class Value{
    std::string ident;   //名称
    int num;
    public:
+   enum class BooleanExtensionKind {
+       None,
+       PlainBool,
+       ZeroExt,
+       SignExt,
+   };
+
    //调用Use的析构函数进行彻底删除
    virtual ~Value();
    Value() = delete;
@@ -135,30 +145,56 @@ class Value{
    virtual bool isConst(){ return false; }
    virtual bool isGlobal(){ return false; }
    std::shared_ptr<IRType> getIRType(){return irtype;}
+   std::shared_ptr<IRType> getIRType() const {return irtype;}
    void setIRType(std::shared_ptr<IRType> it){this->irtype = it;}
    void setIdent(std::string id){this->ident = id;}
-   std::string getIdent(){ return ident;}
+   std::string getIdent() const { return ident;}
    UseList& getUseList(){return useList;}
-   bool isConstZero();
-   bool isConstIntZero();
-   bool isConstOne();
-   bool isConstMinusOne();
-   bool tryGetBoolConst(bool &Out);
-   bool tryGetIntConst(int32_t &Out);
-   bool tryGetFloatConst(float &Out);
-   int integerBitWidth(int DefaultBits = 32);
-   int countUses();
-   int countInstructionUses(Instruction **SingleUser = nullptr);
-   bool hasUses();
-   bool hasExactlyOneUse();
-   bool isPointerValue();
-   bool isExternalVariable();
+   const UseList& getUseList() const {return useList;}
+   bool isConstZero() const;
+   bool isConstIntZero() const;
+   bool isConstOne() const;
+   bool isConstMinusOne() const;
+   bool isUndef() const;
+   bool tryGetBoolConst(bool &Out) const;
+   bool tryGetIntConst(int32_t &Out) const;
+   bool tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const;
+   bool tryGetFloatConst(float &Out) const;
+   bool tryGetNumericFloatConst(float &Out) const;
+   std::optional<int64_t> getIntConstant() const;
+   int integerBitWidth(int DefaultBits = 32) const;
+   int countUses() const;
+   int countInstructionUses(Instruction **SingleUser = nullptr) const;
+   std::vector<Instruction *> getInstructionUsers() const;
+   bool hasUses() const;
+   bool hasExactlyOneUse() const;
+   bool isPointerValue() const;
+   std::shared_ptr<IRType> getPointeeType() const;
+   bool hasSameStorageType(const Value *Other) const;
+   static std::shared_ptr<IRType> getPointeeType(const Value *V);
+   static bool hasSameStorageType(const Value *A, const Value *B);
+   bool isExternalVariable() const;
+   static bool isConstZero(const Value *V);
+   static bool isConstIntZero(const Value *V);
+   static bool isConstOne(const Value *V);
+   static bool isConstMinusOne(const Value *V);
+   static bool isUndef(const Value *V);
+   static bool tryGetBoolConst(const Value *V, bool &Out);
+   static bool tryGetIntConst(const Value *V, int32_t &Out);
+   static bool tryGetFloatConst(const Value *V, float &Out);
+   static bool areEqualConstants(const Value *A, const Value *B);
+   static bool tryGetIntIndex(const Value *V, int &Out);
+   static Value *stripBooleanExtension(Value *V,
+                                       BooleanExtensionKind &Kind);
    static Value *stripPointerCastsAndGEP(Value *V);
    static bool isLocalStackPointer(Value *V);
    static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty);
+   static Value *makeIntegerForType(int32_t Val,
+                                    const std::shared_ptr<IRType> &Ty);
+   static Value *makeIntegerLike(const Value *Model, int32_t Val);
    void replaceAllUsesWith(Value* val){
         this->useList.size = 0;
         Use* head = this->useList.getHead();
@@ -181,6 +217,8 @@ class Value{
    template<typename T>
 
     T* as(){return dynamic_cast<T*>(this);}
+   template<typename T>
+    const T* as() const {return dynamic_cast<const T*>(this);}
 };
 
 
@@ -197,12 +235,16 @@ class User : public Value{
    User(std::shared_ptr<IRType> irtype);
 
     std::vector<std::unique_ptr<Use>>& getUserList(){return this->userList;}
+    const std::vector<std::unique_ptr<Use>>& getUserList() const {return this->userList;}
     size_t getNumOperands() const;
     Value *getOperand(size_t Index) const;
+    Use *getOperandUse(size_t Index) const;
     bool getOperand(size_t Index, Value *&Out) const;
     bool replaceOperand(size_t Index, Value *V);
+    bool eraseOperand(size_t Index);
+    void clearOperands();
     //获得在UserList中的索引
-    int getUserIndex(Use* u);
+    int getUserIndex(const Use* u) const;
 
 
    //这个是往UserList里面加结点的函数,同时调用了Use的构造函数，在UseList里面也创建了相应的结点
@@ -272,7 +314,7 @@ inline User::User():Value(VOIDType::NewVoid()){} // 需要传入有效的IRType
 
 inline User::User(std::shared_ptr<IRType> irtype) : Value(irtype) {}
 
-inline int User::getUserIndex(Use* u) {
+inline int User::getUserIndex(const Use* u) const {
     for (size_t i = 0; i < userList.size(); i++) {
         if (userList[i].get() == u)
             return i;

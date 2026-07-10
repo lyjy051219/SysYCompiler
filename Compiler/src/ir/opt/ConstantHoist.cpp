@@ -10,13 +10,9 @@
 #include <unordered_set>
 #include <vector>
 
-// RISC-V/ARM sign-ext imm12 范围：|v| < 2048 可以直接做立即数，不用物化
-static constexpr int64_t IMM_THRESHOLD = 2048;
-static constexpr int USE_THRESHOLD = 2;
-static constexpr int STRAIGHT_LINE_USE_THRESHOLD = 3;
-
-static BasicBlock *foldCommonDominator(const DominatorTree &DT,
-                                        const std::vector<ConstantHoistUseSite> &uses) {
+BasicBlock *ConstantHoistPass::foldCommonDominator(
+    const DominatorTree &DT,
+    const std::vector<ConstantHoistUseSite> &uses) {
     if (uses.empty()) return nullptr;
     BasicBlock *acc = uses[0].block;
     if (!acc) return nullptr;
@@ -40,9 +36,8 @@ static BasicBlock *foldCommonDominator(const DominatorTree &DT,
     return acc;
 }
 
-static BasicBlock *pickInsertionBlock(BasicBlock *common,
-                                       BasicBlock *entry,
-                                       const LoopInfo &LI) {
+BasicBlock *ConstantHoistPass::pickInsertionBlock(
+    BasicBlock *common, BasicBlock *entry, const LoopInfo &LI) {
     if (!common) return entry;
     Loop *L = LI.getLoopFor(common);
     if (!L) return common;
@@ -53,7 +48,8 @@ static BasicBlock *pickInsertionBlock(BasicBlock *common,
     return entry;
 }
 
-static ConstantHoistCollectResult collectCandidates(Function &F, const LoopInfo &LI) {
+ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
+    Function &F, const LoopInfo &LI) {
     ConstantHoistCollectResult R;
     for (BasicBlock *BB : F) {
         unsigned depth = 0;
@@ -62,14 +58,14 @@ static ConstantHoistCollectResult collectCandidates(Function &F, const LoopInfo 
             // PHI 的 incoming 定义点必须在 incoming block 末尾，我们的物化
             // 指令插在非-PHI 位置无法满足这个规约
             if (dynamic_cast<PhiInst *>(I)) continue;
-            auto &UL = I->getUserList();
-            for (auto &upUse : UL) {
-                Use *u = upUse.get();
+            for (size_t OperandIndex = 0;
+                 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+                Use *u = I->getOperandUse(OperandIndex);
                 if (!u) continue;
                 Value *v = u->getValue();
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
                     int32_t val = (int32_t)ci->getVal();
-                    if ((int64_t)std::abs(val) < IMM_THRESHOLD) continue;
+                    if ((int64_t)std::abs(val) < ImmediateThreshold) continue;
                     auto &C = R.intBuckets[val];
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
@@ -89,7 +85,8 @@ static ConstantHoistCollectResult collectCandidates(Function &F, const LoopInfo 
     return R;
 }
 
-static void closeGroup(ConstantHoistGroup &cur, std::vector<ConstantHoistGroup> &groups) {
+void ConstantHoistPass::closeGroup(
+    ConstantHoistGroup &cur, std::vector<ConstantHoistGroup> &groups) {
     if (cur.members.empty()) return;
     size_t totalUses = 0, bestIdx = 0, bestUses = 0;
     for (size_t j = 0; j < cur.members.size(); ++j) {
@@ -100,13 +97,14 @@ static void closeGroup(ConstantHoistGroup &cur, std::vector<ConstantHoistGroup> 
         }
     }
     cur.baseIdx = bestIdx;
-    if ((int)totalUses >= USE_THRESHOLD)
+    if ((int)totalUses >= UseThreshold)
         groups.push_back(std::move(cur));
 }
 
 // 窗口条件 diff < IMM_THRESHOLD 保证组内 max-min <= 2047，无论 base 选
 // 谁，|v - base| <= max-min 都落在 imm12 内
-static std::vector<ConstantHoistGroup> groupByBaseOffset(std::vector<ConstantHoistCandidate> &sorted) {
+std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
+    std::vector<ConstantHoistCandidate> &sorted) {
     std::vector<ConstantHoistGroup> groups;
     if (sorted.empty()) return groups;
 
@@ -116,7 +114,7 @@ static std::vector<ConstantHoistGroup> groupByBaseOffset(std::vector<ConstantHoi
 
     for (size_t i = 1; i < sorted.size(); ++i) {
         int64_t diff = (int64_t)sorted[i].value - windowMin;
-        if (diff < IMM_THRESHOLD) {
+        if (diff < ImmediateThreshold) {
             cur.members.push_back(std::move(sorted[i]));
         } else {
             closeGroup(cur, groups);
@@ -129,7 +127,8 @@ static std::vector<ConstantHoistGroup> groupByBaseOffset(std::vector<ConstantHoi
     return groups;
 }
 
-static bool materializeGroup(ConstantHoistGroup &G, BasicBlock *insertBB) {
+bool ConstantHoistPass::materializeGroup(
+    ConstantHoistGroup &G, BasicBlock *insertBB) {
     if (G.members.empty()) return false;
     int32_t baseValue = G.members[G.baseIdx].value;
 
@@ -181,7 +180,8 @@ static bool materializeGroup(ConstantHoistGroup &G, BasicBlock *insertBB) {
     return anyChange;
 }
 
-static bool materializeFloatCandidate(ConstantHoistCandidate &C, BasicBlock *insertBB) {
+bool ConstantHoistPass::materializeFloatCandidate(
+    ConstantHoistCandidate &C, BasicBlock *insertBB) {
     uint32_t bits = (uint32_t)C.value;
     float fv;
     std::memcpy(&fv, &bits, sizeof(fv));
@@ -225,7 +225,8 @@ PreservationStatus ConstantHoistPass::run(Function &F,
             totalUses += m.uses.size();
         }
         // 冷代码下 hoist 净增一条 base add，不划算
-        if (maxDepth == 0 && (int)totalUses < STRAIGHT_LINE_USE_THRESHOLD)
+        if (maxDepth == 0 &&
+            (int)totalUses < StraightLineUseThreshold)
             continue;
 
         std::vector<ConstantHoistUseSite> allUses;
@@ -241,8 +242,9 @@ PreservationStatus ConstantHoistPass::run(Function &F,
 
     for (auto &kv : R.floatBuckets) {
         ConstantHoistCandidate &C = kv.second;
-        if ((int)C.uses.size() < USE_THRESHOLD) continue;
-        if (C.maxDepth == 0 && (int)C.uses.size() < STRAIGHT_LINE_USE_THRESHOLD)
+        if ((int)C.uses.size() < UseThreshold) continue;
+        if (C.maxDepth == 0 &&
+            (int)C.uses.size() < StraightLineUseThreshold)
             continue;
         BasicBlock *common = foldCommonDominator(DT, C.uses);
         BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);

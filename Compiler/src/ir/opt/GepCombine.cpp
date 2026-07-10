@@ -54,18 +54,10 @@
 // 也处理两个索引都是 add(base, const) 形式、差值是常量的情况。
 // =====================================================================
 
-static bool isConstZero(Value *V) {
-    return V && V->isConstIntZero();
-}
-
-static ConstInt *asConstInt(Value *V) {
-    return dynamic_cast<ConstInt *>(V);
-}
-
 // =====================================================================
 // Part 1: 链式 GEP 合并
 // =====================================================================
-static bool combineChainedGEPs(Function &F) {
+bool GepCombinePass::combineChainedGEPs(Function &F) {
     bool changed = false;
 
     std::vector<GetElementPtrInst *> geps;
@@ -83,10 +75,9 @@ static bool combineChainedGEPs(Function &F) {
         // 跳过已删除的 GEP
         if (deleted.count(GEP)) continue;
 
-        auto &UL = GEP->getUserList();
-        if (UL.size() < 2) continue;
+        if (GEP->getNumIndices() < 1) continue;
 
-        Value *Base = UL[0]->getValue();
+        Value *Base = GEP->getBasePointer();
         auto *BaseGEP = dynamic_cast<GetElementPtrInst *>(Base);
         if (!BaseGEP) continue;
         if (deleted.count(BaseGEP)) continue;
@@ -94,73 +85,58 @@ static bool combineChainedGEPs(Function &F) {
         // 单 use 检查：base GEP 必须只被当前 GEP 使用
         if (BaseGEP->countUses() > 1) continue;
 
-        auto &BaseUL = BaseGEP->getUserList();
-        if (BaseUL.size() < 2) continue;
+        if (BaseGEP->getNumIndices() < 1) continue;
 
-        Value *firstIdx = UL[1]->getValue();
-        Value *baseLastIdx = BaseUL.back()->getValue();
+        Value *firstIdx = GEP->getIndex(0);
+        Value *baseLastIdx = BaseGEP->getIndex(BaseGEP->getNumIndices() - 1);
 
         bool merged = false;
 
         // 首索引为 0 → 把 base 的全部索引前置
-        if (isConstZero(firstIdx)) {
-            std::vector<Value *> newIndices;
-            for (size_t i = 1; i < BaseUL.size(); i++)
-                newIndices.push_back(BaseUL[i]->getValue());
-            for (size_t i = 2; i < UL.size(); i++)
-                newIndices.push_back(UL[i]->getValue());
+        if (firstIdx && firstIdx->isConstIntZero()) {
+            std::vector<Value *> newIndices = BaseGEP->getIndices();
+            for (size_t i = 1; i < GEP->getNumIndices(); i++)
+                newIndices.push_back(GEP->getIndex(i));
 
-            Value *origBase = BaseUL[0]->getValue();
-            while (UL.size() > 0) UL.pop_back();
-            GEP->addUse(origBase);
-            for (Value *idx : newIndices) GEP->addUse(idx);
-            GEP->updateType();
+            GEP->reset(BaseGEP->getBasePointer(), newIndices);
             deleted.insert(BaseGEP);
             toDelete.push_back(BaseGEP);
             merged = true;
         }
         // base 末索引为 0 → 合并（去掉 base 末索引）
-        else if (isConstZero(baseLastIdx)) {
-            std::vector<Value *> newIndices;
-            for (size_t i = 1; i + 1 < BaseUL.size(); i++)
-                newIndices.push_back(BaseUL[i]->getValue());
-            for (size_t i = 1; i < UL.size(); i++)
-                newIndices.push_back(UL[i]->getValue());
+        else if (baseLastIdx && baseLastIdx->isConstIntZero()) {
+            std::vector<Value *> newIndices = BaseGEP->getIndices();
+            newIndices.pop_back();
+            auto CurrentIndices = GEP->getIndices();
+            newIndices.insert(newIndices.end(), CurrentIndices.begin(),
+                              CurrentIndices.end());
 
-            Value *origBase = BaseUL[0]->getValue();
-            while (UL.size() > 0) UL.pop_back();
-            GEP->addUse(origBase);
-            for (Value *idx : newIndices) GEP->addUse(idx);
-            GEP->updateType();
+            GEP->reset(BaseGEP->getBasePointer(), newIndices);
             deleted.insert(BaseGEP);
             toDelete.push_back(BaseGEP);
             merged = true;
         }
         // 交界处两个常量索引相加
         else {
-            auto *CI1 = asConstInt(firstIdx);
-            auto *CI2 = asConstInt(baseLastIdx);
+            auto *CI1 = firstIdx ? firstIdx->as<ConstInt>() : nullptr;
+            auto *CI2 = baseLastIdx ? baseLastIdx->as<ConstInt>() : nullptr;
             if (CI1 && CI2) {
                 int sumVal = CI1->getVal() + CI2->getVal();
                 std::vector<Value *> newIndices;
-                for (size_t i = 1; i + 1 < BaseUL.size(); i++)
-                    newIndices.push_back(BaseUL[i]->getValue());
+                for (size_t i = 0; i + 1 < BaseGEP->getNumIndices(); i++)
+                    newIndices.push_back(BaseGEP->getIndex(i));
                 newIndices.push_back(ConstInt::newConstInt(sumVal));
-                for (size_t i = 2; i < UL.size(); i++)
-                    newIndices.push_back(UL[i]->getValue());
+                for (size_t i = 1; i < GEP->getNumIndices(); i++)
+                    newIndices.push_back(GEP->getIndex(i));
 
                 // 合并后非零索引数检查：超过 1 个非零索引就不合并
                 int nonZeroCount = 0;
                 for (size_t i = 0; i < newIndices.size(); i++) {
-                    if (i == 0 && isConstZero(newIndices[i])) continue;
-                    if (!isConstZero(newIndices[i])) nonZeroCount++;
+                    if (i == 0 && newIndices[i]->isConstIntZero()) continue;
+                    if (!newIndices[i]->isConstIntZero()) nonZeroCount++;
                 }
                 if (nonZeroCount <= 1) {
-                    Value *origBase = BaseUL[0]->getValue();
-                    while (UL.size() > 0) UL.pop_back();
-                    GEP->addUse(origBase);
-                    for (Value *idx : newIndices) GEP->addUse(idx);
-                    GEP->updateType();
+                    GEP->reset(BaseGEP->getBasePointer(), newIndices);
                     deleted.insert(BaseGEP);
                     toDelete.push_back(BaseGEP);
                     merged = true;
@@ -182,7 +158,7 @@ static bool combineChainedGEPs(Function &F) {
 // =====================================================================
 // Part 2: PHI 中 GEP 提取
 // =====================================================================
-static bool foldGEPOfPhi(Function &F) {
+bool GepCombinePass::foldGEPOfPhi(Function &F) {
     bool changed = false;
 
     for (BasicBlock *BB : F) {
@@ -195,7 +171,7 @@ static bool foldGEPOfPhi(Function &F) {
 
         for (PhiInst *Phi : phis) {
             if (Phi->getNumIncomingValues() < 2) continue;
-            if (!Phi->getIRType() || Phi->getIRType()->getEnum() != IR_POINTER) continue;
+            if (!Phi->getIRType() || !Phi->getIRType()->isPointer()) continue;
 
             // PHI 单 use 检查
             if (Phi->countUses() > 1) continue;
@@ -210,8 +186,7 @@ static bool foldGEPOfPhi(Function &F) {
             }
             if (selfRef) continue;
 
-            auto &FirstUL = FirstGEP->getUserList();
-            if (FirstUL.size() < 2) continue;
+            if (FirstGEP->getNumIndices() < 1) continue;
 
             bool valid = true;
             int diffIdx = -1;
@@ -220,15 +195,17 @@ static bool foldGEPOfPhi(Function &F) {
                 auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
                 if (!OtherGEP) { valid = false; break; }
 
-                auto &OtherUL = OtherGEP->getUserList();
-                if (OtherUL.size() != FirstUL.size()) { valid = false; break; }
+                if (OtherGEP->getNumIndices() != FirstGEP->getNumIndices()) {
+                    valid = false;
+                    break;
+                }
 
-                if (OtherUL[0]->getValue() != FirstUL[0]->getValue()) {
+                if (OtherGEP->getBasePointer() != FirstGEP->getBasePointer()) {
                     valid = false; break;
                 }
 
-                for (size_t j = 1; j < FirstUL.size(); j++) {
-                    if (OtherUL[j]->getValue() != FirstUL[j]->getValue()) {
+                for (size_t j = 0; j < FirstGEP->getNumIndices(); j++) {
+                    if (OtherGEP->getIndex(j) != FirstGEP->getIndex(j)) {
                         if (diffIdx == -1) {
                             diffIdx = (int)j;
                         } else if (diffIdx != (int)j) {
@@ -246,56 +223,40 @@ static bool foldGEPOfPhi(Function &F) {
                 // 所有 incoming GEP 完全相同。
                 // 不能直接用 FirstGEP 替换，因为它在前驱块，不支配当前块的 uses。
                 // 正确做法：clone 一份到当前块。
-                std::vector<Value *> cloneIndices;
-                for (size_t j = 1; j < FirstUL.size(); j++)
-                    cloneIndices.push_back(FirstUL[j]->getValue());
-                Value *base = FirstUL[0]->getValue();
+                std::vector<Value *> cloneIndices = FirstGEP->getIndices();
+                Value *base = FirstGEP->getBasePointer();
                 auto *clonedGEP = new GetElementPtrInst(base, cloneIndices);
                 clonedGEP->updateType();
-                for (Instruction *I : *BB) {
-                    if (!dynamic_cast<PhiInst *>(I)) {
-                        auto it = BB->begin();
-                        while (*it != I) ++it;
-                        it.insertBefore(clonedGEP);
-                        break;
-                    }
-                }
+                BB->insertAfterPhiNodes(clonedGEP);
                 Phi->replaceAllUsesWith(clonedGEP);
                 delete Phi;
                 changed = true;
             } else {
                 // 在不同的索引位置创建新 PHI
-                Value *diffVal = FirstUL[diffIdx]->getValue();
+                Value *diffVal = FirstGEP->getIndex(static_cast<size_t>(diffIdx));
                 if (!diffVal->getIRType()) continue;
 
                 PhiInst *newPhi = new PhiInst(diffVal->getIRType());
                 for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
                     auto *G = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
-                    newPhi->addIncoming(G->getUserList()[diffIdx]->getValue(),
+                    newPhi->addIncoming(G->getIndex(static_cast<size_t>(diffIdx)),
                                         Phi->getIncomingBlock(i));
                 }
                 BB->push_front(newPhi);
 
                 std::vector<Value *> newIndices;
-                for (size_t j = 1; j < FirstUL.size(); j++) {
-                    if ((int)j == diffIdx)
+                for (size_t j = 0; j < FirstGEP->getNumIndices(); j++) {
+                    if (static_cast<int>(j) == diffIdx)
                         newIndices.push_back(newPhi);
                     else
-                        newIndices.push_back(FirstUL[j]->getValue());
+                        newIndices.push_back(FirstGEP->getIndex(j));
                 }
 
-                Value *base = FirstUL[0]->getValue();
+                Value *base = FirstGEP->getBasePointer();
                 auto *newGEP = new GetElementPtrInst(base, newIndices);
                 newGEP->updateType();
 
-                for (Instruction *I : *BB) {
-                    if (!dynamic_cast<PhiInst *>(I)) {
-                        auto it = BB->begin();
-                        while (*it != I) ++it;
-                        it.insertBefore(newGEP);
-                        break;
-                    }
-                }
+                BB->insertAfterPhiNodes(newGEP);
 
                 Phi->replaceAllUsesWith(newGEP);
                 delete Phi;
@@ -310,42 +271,37 @@ static bool foldGEPOfPhi(Function &F) {
 // =====================================================================
 // Part 3: 循环内相邻 GEP 合并
 // =====================================================================
-static bool combineLoopGEPs(Function &F) {
+bool GepCombinePass::combineLoopGEPs(Function &F) {
     bool changed = false;
 
     for (BasicBlock *BB : F) {
-        struct GEPGroup {
-            std::vector<GetElementPtrInst *> geps;
-        };
-        std::vector<GEPGroup> groups;
+        std::vector<GepCombineGroup> groups;
         std::unordered_map<size_t, std::vector<size_t>> hashToGroups;
 
         for (Instruction *I : *BB) {
             auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
             if (!GEP) continue;
-            auto &UL = GEP->getUserList();
-            if (UL.size() < 3) continue;
+            if (GEP->getNumIndices() < 2) continue;
 
             size_t hash = 0;
-            for (size_t i = 0; i + 1 < UL.size(); i++)
-                hash = hash * 131 + std::hash<Value *>{}(UL[i]->getValue());
-            hash = hash * 131 + UL.size();
+            for (size_t i = 0; i + 1 < GEP->getNumOperands(); i++)
+                hash = hash * 131 + std::hash<Value *>{}(GEP->getOperand(i));
+            hash = hash * 131 + GEP->getNumOperands();
 
             bool inserted = false;
             if (hashToGroups.count(hash)) {
                 for (size_t gIdx : hashToGroups[hash]) {
                     auto &grp = groups[gIdx];
-                    auto *first = grp.geps[0];
-                    auto &firstUL = first->getUserList();
-                    if (firstUL.size() != UL.size()) continue;
+                    auto *first = grp.Geps[0];
+                    if (first->getNumOperands() != GEP->getNumOperands()) continue;
                     bool match = true;
-                    for (size_t i = 0; i + 1 < UL.size(); i++) {
-                        if (UL[i]->getValue() != firstUL[i]->getValue()) {
+                    for (size_t i = 0; i + 1 < GEP->getNumOperands(); i++) {
+                        if (GEP->getOperand(i) != first->getOperand(i)) {
                             match = false; break;
                         }
                     }
                     if (match) {
-                        grp.geps.push_back(GEP);
+                        grp.Geps.push_back(GEP);
                         inserted = true;
                         break;
                     }
@@ -359,33 +315,29 @@ static bool combineLoopGEPs(Function &F) {
         }
 
         for (auto &grp : groups) {
-            if (grp.geps.size() < 2) continue;
+            if (grp.Geps.size() < 2) continue;
 
-            for (size_t i = 1; i < grp.geps.size(); i++) {
-                auto *prevGEP = grp.geps[i - 1];
-                auto *curGEP = grp.geps[i];
-                auto &prevUL = prevGEP->getUserList();
-                auto &curUL = curGEP->getUserList();
+            for (size_t i = 1; i < grp.Geps.size(); i++) {
+                auto *prevGEP = grp.Geps[i - 1];
+                auto *curGEP = grp.Geps[i];
 
-                Value *prevLast = prevUL.back()->getValue();
-                Value *curLast = curUL.back()->getValue();
+                Value *prevLast = prevGEP->getIndex(prevGEP->getNumIndices() - 1);
+                Value *curLast = curGEP->getIndex(curGEP->getNumIndices() - 1);
 
                 // 检查 curLast = prevLast + C（直接 add 常量偏移）
                 if (auto *Bin = dynamic_cast<BinaryInst *>(curLast)) {
-                    if (Bin->getOp() == BinaryInst::ADD && Bin->getUserList().size() == 2) {
-                        Value *lhs = Bin->getUserList()[0]->getValue();
-                        Value *rhs = Bin->getUserList()[1]->getValue();
+                    Value *lhs = nullptr;
+                    Value *rhs = nullptr;
+                    if (Bin->getOp() == BinaryInst::ADD &&
+                        Bin->getOperands(lhs, rhs)) {
                         ConstInt *offset = nullptr;
-                        if (lhs == prevLast) offset = asConstInt(rhs);
-                        else if (rhs == prevLast) offset = asConstInt(lhs);
+                        if (lhs == prevLast) offset = rhs ? rhs->as<ConstInt>() : nullptr;
+                        else if (rhs == prevLast) offset = lhs ? lhs->as<ConstInt>() : nullptr;
 
                         if (offset) {
                             std::vector<Value *> newIndices;
                             newIndices.push_back(ConstInt::newConstInt(offset->getVal()));
-                            while (curUL.size() > 0) curUL.pop_back();
-                            curGEP->addUse(prevGEP);
-                            for (Value *idx : newIndices) curGEP->addUse(idx);
-                            curGEP->updateType();
+                            curGEP->reset(prevGEP, newIndices);
                             changed = true;
                             continue;
                         }
@@ -396,23 +348,22 @@ static bool combineLoopGEPs(Function &F) {
                 if (auto *PrevBin = dynamic_cast<BinaryInst *>(prevLast)) {
                     if (auto *CurBin = dynamic_cast<BinaryInst *>(curLast)) {
                         if (PrevBin->getOp() == BinaryInst::ADD &&
-                            CurBin->getOp() == BinaryInst::ADD &&
-                            PrevBin->getUserList().size() == 2 &&
-                            CurBin->getUserList().size() == 2) {
-
-                            Value *prevBase = PrevBin->getUserList()[0]->getValue();
-                            Value *curBase = CurBin->getUserList()[0]->getValue();
-                            auto *prevOff = asConstInt(PrevBin->getUserList()[1]->getValue());
-                            auto *curOff = asConstInt(CurBin->getUserList()[1]->getValue());
+                            CurBin->getOp() == BinaryInst::ADD) {
+                            Value *prevBase = nullptr;
+                            Value *prevOffset = nullptr;
+                            Value *curBase = nullptr;
+                            Value *curOffset = nullptr;
+                            if (!PrevBin->getOperands(prevBase, prevOffset) ||
+                                !CurBin->getOperands(curBase, curOffset))
+                                continue;
+                            auto *prevOff = prevOffset ? prevOffset->as<ConstInt>() : nullptr;
+                            auto *curOff = curOffset ? curOffset->as<ConstInt>() : nullptr;
 
                             if (prevBase == curBase && prevOff && curOff) {
                                 int diff = curOff->getVal() - prevOff->getVal();
                                 std::vector<Value *> newIndices;
                                 newIndices.push_back(ConstInt::newConstInt(diff));
-                                while (curUL.size() > 0) curUL.pop_back();
-                                curGEP->addUse(prevGEP);
-                                for (Value *idx : newIndices) curGEP->addUse(idx);
-                                curGEP->updateType();
+                                curGEP->reset(prevGEP, newIndices);
                                 changed = true;
                                 continue;
                             }

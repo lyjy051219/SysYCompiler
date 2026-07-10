@@ -148,6 +148,7 @@ struct IntRange {
     IntRange band(const IntRange &rhs) const;
     IntRange bor(const IntRange &rhs) const;
 
+    static int64_t clampI32(int64_t Value);
     static IntRange bottom() { return IntRange(1, 0); }
     static IntRange nonNegative() { return IntRange(0, I32_MAX); }
 };
@@ -333,6 +334,7 @@ struct FloatRange {
     FloatRange mul(const FloatRange &rhs) const;
     FloatRange fdiv(const FloatRange &rhs) const;
 
+    static FloatRange sanitize(double Lo, double Hi);
     static FloatRange bottom() { return FloatRange(1.0, 0.0); }
 };
 
@@ -354,6 +356,8 @@ struct LoopInductionInfo {
 struct InterprocRangeCache {
     std::unordered_map<Function*, IntRange> RetRanges;
     std::unordered_map<Function*, FloatRange> FloatRetRanges;
+
+    static InterprocRangeCache &get();
 };
 
 // ---------------------------------------------------------------------

@@ -9,6 +9,71 @@ BasicBlock* DominatorTree::getIDom(BasicBlock* BB) const {
     return node->IDom ? node->IDom->Block : nullptr;
 }
 
+std::vector<DominatorNode *> DominatorTree::getNodesInPostOrder() const {
+    std::vector<DominatorNode *> Order;
+    if (!Root) return Order;
+
+    std::vector<std::pair<DominatorNode *, bool>> Stack;
+    Stack.push_back({Root, false});
+    while (!Stack.empty()) {
+        auto [Node, Expanded] = Stack.back();
+        Stack.pop_back();
+        if (!Node) continue;
+        if (Expanded) {
+            Order.push_back(Node);
+            continue;
+        }
+        Stack.push_back({Node, true});
+        std::vector<DominatorNode *> Children;
+        for (DominatorNode *Child = Node->FirstChild; Child;
+             Child = Child->NextSibling)
+            Children.push_back(Child);
+        for (auto It = Children.rbegin(); It != Children.rend(); ++It)
+            Stack.push_back({*It, false});
+    }
+    return Order;
+}
+
+std::vector<DominatorNode *> DominatorTree::getChildNodes(
+    DominatorNode *Node) const {
+    std::vector<DominatorNode *> Children;
+    if (!Node) return Children;
+    for (DominatorNode *Child = Node->FirstChild; Child;
+         Child = Child->NextSibling)
+        Children.push_back(Child);
+    return Children;
+}
+
+std::vector<BasicBlock *> DominatorTree::getBlocksInPreOrder() const {
+    std::vector<BasicBlock *> Order;
+    if (!Root) return Order;
+    std::vector<DominatorNode *> Stack{Root};
+    while (!Stack.empty()) {
+        DominatorNode *Node = Stack.back();
+        Stack.pop_back();
+        if (!Node) continue;
+        if (Node->Block) Order.push_back(Node->Block);
+        std::vector<DominatorNode *> Children;
+        for (DominatorNode *Child = Node->FirstChild; Child;
+             Child = Child->NextSibling)
+            Children.push_back(Child);
+        for (auto It = Children.rbegin(); It != Children.rend(); ++It)
+            Stack.push_back(*It);
+    }
+    return Order;
+}
+
+std::vector<BasicBlock *> DominatorTree::getChildren(BasicBlock *BB) const {
+    std::vector<BasicBlock *> Children;
+    DominatorNode *Node = getNode(BB);
+    if (!Node) return Children;
+    for (DominatorNode *Child = Node->FirstChild; Child;
+         Child = Child->NextSibling) {
+        if (Child->Block) Children.push_back(Child->Block);
+    }
+    return Children;
+}
+
 DominatorNode* DominatorTree::getNode(BasicBlock* BB) const {
     auto it = BlockToNode.find(BB);
     if (it == BlockToNode.end()) return nullptr;

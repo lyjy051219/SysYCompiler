@@ -36,9 +36,40 @@ class IRType{
     bool isInt() const;
     bool isFloat() const;
     bool isBool() const;
+    bool isVoid() const;
     bool isPointer() const;
     bool isArray() const;
+    bool isScalar() const;
+    bool hasSameScalarType(const IRType &Other) const;
+    bool hasSameStorageType(const IRType &Other) const;
+    bool hasSameShape(const IRType &Other) const;
+    std::shared_ptr<IRType> getPointeeType() const;
+    int countScalarElements(int Limit) const;
+    bool flattenScalarPath(const std::vector<int> &Path,
+                           int &FlatIndex) const;
+    bool unflattenScalarPath(int FlatIndex,
+                             std::vector<int> &Path,
+                             std::shared_ptr<IRType> &ElementTy) const;
     int getIntegerBitWidth(int DefaultBits = 32) const;
+    static bool isInt(const std::shared_ptr<IRType> &Ty);
+    static bool isFloat(const std::shared_ptr<IRType> &Ty);
+    static bool isBool(const std::shared_ptr<IRType> &Ty);
+    static bool isPointer(const std::shared_ptr<IRType> &Ty);
+    static bool isArray(const std::shared_ptr<IRType> &Ty);
+    static bool isScalar(const std::shared_ptr<IRType> &Ty);
+    static bool hasSameScalarType(const std::shared_ptr<IRType> &A,
+                                  const std::shared_ptr<IRType> &B);
+    static bool hasSameShape(const std::shared_ptr<IRType> &A,
+                             const std::shared_ptr<IRType> &B);
+    static int countScalarElements(const std::shared_ptr<IRType> &Ty,
+                                   int Limit);
+    static bool flattenScalarPath(const std::shared_ptr<IRType> &Ty,
+                                  const std::vector<int> &Path,
+                                  int &FlatIndex);
+    static bool unflattenScalarPath(const std::shared_ptr<IRType> &Ty,
+                                    int FlatIndex,
+                                    std::vector<int> &Path,
+                                    std::shared_ptr<IRType> &ElementTy);
     //这个版本的不包括Function，Pointer，Array
     static std::shared_ptr<IRType> NewTypeByTypeSystem(TypeSystem type);
 

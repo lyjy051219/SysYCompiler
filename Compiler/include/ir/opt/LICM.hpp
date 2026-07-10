@@ -26,4 +26,18 @@ struct ExitValueKeyHash {
 class LICMPass : public PassDescriptor<LICMPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+    static bool areAllUsersOutsideLoop(Instruction *I, const Loop &L);
+    static bool isInvariant(
+        Instruction *I, const Loop &L, const DominatorTree &DT,
+        const std::unordered_set<Instruction *> &InvariantSet);
+    static bool isSafeToMove(
+        Instruction *I, const Loop &L, const DominatorTree &DT,
+        const std::vector<BasicBlock *> &ExitBlocks,
+        const std::vector<BasicBlock *> &Latches,
+        const std::vector<Instruction *> &LoopInstructions,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM, bool ForSink,
+        bool AggressiveHoist);
 };

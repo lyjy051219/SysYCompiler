@@ -8,27 +8,22 @@
 
 PassID SCEVAnalysis::Key;
 
-static std::string ptrKey(const void *P) {
-    std::ostringstream OS;
-    OS << P;
-    return OS.str();
-}
-
-static bool isRecKind(SCEVExprKind K) {
+bool SCEVExpr::isRecurrence() const {
+    SCEVExprKind K = Kind;
     return K == SCEVExprKind::AddRec ||
            K == SCEVExprKind::MulRec ||
            K == SCEVExprKind::DivRec;
 }
 
-static bool mentionsLoop(const SCEVExpr *E, const Loop *L) {
-    if (!E || !L) return false;
-    if (isRecKind(E->Kind) && E->RecLoop == L) return true;
-    for (const SCEVExpr *Op : E->Operands)
-        if (mentionsLoop(Op, L)) return true;
+bool SCEVExpr::mentionsLoop(const Loop *L) const {
+    if (!L) return false;
+    if (isRecurrence() && RecLoop == L) return true;
+    for (const SCEVExpr *Op : Operands)
+        if (Op && Op->mentionsLoop(L)) return true;
     return false;
 }
 
-static const char *kindName(SCEVExprKind K) {
+const char *SCEVExpr::kindName(SCEVExprKind K) {
     switch (K) {
     case SCEVExprKind::Constant: return "const";
     case SCEVExprKind::Unknown: return "unknown";
@@ -48,7 +43,7 @@ static const char *kindName(SCEVExprKind K) {
     return "bad";
 }
 
-static const char *castName(SCEVCastKind K) {
+const char *SCEVExpr::castName(SCEVCastKind K) {
     switch (K) {
     case SCEVCastKind::Trunc: return "trunc";
     case SCEVCastKind::ZExt: return "zext";
@@ -58,7 +53,7 @@ static const char *castName(SCEVCastKind K) {
     return "badcast";
 }
 
-static const char *predName(BinaryInst::Operation Op) {
+const char *SCEVExpr::predicateName(BinaryInst::Operation Op) {
     switch (Op) {
     case BinaryInst::E: return "eq";
     case BinaryInst::NE: return "ne";
@@ -87,11 +82,7 @@ const SCEVExpr *SCEVResult::intern(std::unique_ptr<SCEVExpr> E) {
 }
 
 std::string SCEVResult::typeKey(std::shared_ptr<IRType> Ty) const {
-    if (!Ty) return "noty";
-    std::ostringstream OS;
-    OS << "ty" << static_cast<int>(Ty->getEnum()) << ":" << Ty->getSize()
-       << ":" << Ty.get();
-    return OS.str();
+    return "ty" + IRKey::type(Ty);
 }
 
 const SCEVExpr *SCEVResult::makeConstant(int64_t V, std::shared_ptr<IRType> Ty) {
@@ -109,7 +100,7 @@ const SCEVExpr *SCEVResult::makeUnknown(Value *V) {
     E->Kind = SCEVExprKind::Unknown;
     E->RawValue = V;
     E->Ty = V ? V->getIRType() : nullptr;
-    E->Key = std::string("u:") + ptrKey(V);
+    E->Key = std::string("u:") + IRKey::pointer(V);
     return intern(std::move(E));
 }
 
@@ -137,7 +128,7 @@ const SCEVExpr *SCEVResult::makeBinary(SCEVExprKind K, const SCEVExpr *L,
     E->Kind = K;
     E->Ty = Ty ? Ty : (L->Ty ? L->Ty : R->Ty);
     E->Operands = {L, R};
-    E->Key = std::string(kindName(K)) + ":" + typeKey(E->Ty) + "(" +
+    E->Key = std::string(SCEVExpr::kindName(K)) + ":" + typeKey(E->Ty) + "(" +
              L->Key + "," + R->Key + ")";
     return intern(std::move(E));
 }
@@ -173,7 +164,7 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
     E->CastKind = K;
     E->Ty = Ty;
     E->Operands = {Op};
-    E->Key = std::string("cast:") + castName(K) + ":" + typeKey(Ty) +
+    E->Key = std::string("cast:") + SCEVExpr::castName(K) + ":" + typeKey(Ty) +
              "(" + Op->Key + ")";
     return intern(std::move(E));
 }
@@ -202,7 +193,7 @@ const SCEVExpr *SCEVResult::makeCompare(BinaryInst::Operation Pred,
     E->Predicate = Pred;
     E->Ty = INTType::NewBool();
     E->Operands = {L, R};
-    E->Key = std::string("cmp:") + predName(Pred) + "(" + L->Key + "," +
+    E->Key = std::string("cmp:") + SCEVExpr::predicateName(Pred) + "(" + L->Key + "," +
              R->Key + ")";
     return intern(std::move(E));
 }
@@ -222,7 +213,7 @@ const SCEVExpr *SCEVResult::makeRec(SCEVExprKind K, const Loop *L,
     E->RecLoop = L;
     E->Ty = Ty ? Ty : Base->Ty;
     E->Operands = {Base, Step};
-    E->Key = std::string(kindName(K)) + "@" + ptrKey(L) + ":" +
+    E->Key = std::string(SCEVExpr::kindName(K)) + "@" + IRKey::pointer(L) + ":" +
              typeKey(E->Ty) + "(" + Base->Key + "," + Step->Key + ")";
     return intern(std::move(E));
 }
@@ -257,11 +248,11 @@ const SCEVExpr *SCEVResult::add(const SCEVExpr *L, const SCEVExpr *R) {
                        add(L->Operands[0], R->Operands[0]),
                        add(L->Operands[1], R->Operands[1]), L->Ty);
     }
-    if (L->Kind == SCEVExprKind::AddRec && !isRecKind(R->Kind)) {
+    if (L->Kind == SCEVExprKind::AddRec && !R->isRecurrence()) {
         return makeRec(SCEVExprKind::AddRec, L->RecLoop,
                        add(L->Operands[0], R), L->Operands[1], L->Ty);
     }
-    if (R->Kind == SCEVExprKind::AddRec && !isRecKind(L->Kind)) {
+    if (R->Kind == SCEVExprKind::AddRec && !L->isRecurrence()) {
         return makeRec(SCEVExprKind::AddRec, R->RecLoop,
                        add(R->Operands[0], L), R->Operands[1], R->Ty);
     }
@@ -279,7 +270,7 @@ const SCEVExpr *SCEVResult::sub(const SCEVExpr *L, const SCEVExpr *R) {
     }
     if (R->Kind == SCEVExprKind::AddRec)
         return add(L, neg(R));
-    if (L->Kind == SCEVExprKind::AddRec && !isRecKind(R->Kind)) {
+    if (L->Kind == SCEVExprKind::AddRec && !R->isRecurrence()) {
         return makeRec(SCEVExprKind::AddRec, L->RecLoop,
                        sub(L->Operands[0], R), L->Operands[1], L->Ty);
     }
@@ -553,7 +544,7 @@ bool SCEVResult::isLoopInvariant(Value *V, const Loop *L) const {
 bool SCEVResult::isLoopInvariantExpr(const SCEVExpr *E,
                                      const Loop *L) const {
     if (!E || !L) return true;
-    if (isRecKind(E->Kind) && E->RecLoop == L) return false;
+    if (E->isRecurrence() && E->RecLoop == L) return false;
     if (E->Kind == SCEVExprKind::Unknown)
         return isLoopInvariant(E->RawValue, L);
     for (const SCEVExpr *Op : E->Operands)
@@ -569,15 +560,14 @@ bool SCEVResult::isDirectLoopBlock(const Loop *L, BasicBlock *BB) const {
 }
 
 const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
-    Value *Cond = Sel->getOperand(0);
-    Value *TrueV = Sel->getOperand(1);
-    Value *FalseV = Sel->getOperand(2);
+    Value *Cond = Sel->getCondition();
+    Value *TrueV = Sel->getTrueValue();
+    Value *FalseV = Sel->getFalseValue();
     if (!Cond || !TrueV || !FalseV) return makeUnknown(Sel);
 
-    if (auto *CB = dynamic_cast<ConstBool *>(Cond))
-        return getSCEV(CB->getVal() ? TrueV : FalseV);
-    if (auto *CI = dynamic_cast<ConstInt *>(Cond))
-        return getSCEV(CI->getVal() != 0 ? TrueV : FalseV);
+    bool CondValue = false;
+    if (Cond->tryGetBoolConst(CondValue))
+        return getSCEV(CondValue ? TrueV : FalseV);
 
     const SCEVExpr *TE = getSCEV(TrueV);
     const SCEVExpr *FE = getSCEV(FalseV);
@@ -586,9 +576,9 @@ const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
     auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
     if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp())) return makeUnknown(Sel);
 
-    Value *A = Cmp->getOperand(0);
-    Value *B = Cmp->getOperand(1);
-    if (!A || !B) return makeUnknown(Sel);
+    Value *A = nullptr;
+    Value *B = nullptr;
+    if (!Cmp->getOperands(A, B)) return makeUnknown(Sel);
 
     const bool TrueIsA = sameExpr(TE, getSCEV(A));
     const bool TrueIsB = sameExpr(TE, getSCEV(B));
@@ -617,17 +607,14 @@ const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
 }
 
 const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
-    auto &Ops = GEP->getUserList();
-    if (Ops.empty() || !Ops[0]) return makeUnknown(GEP);
-
-    Value *Base = Ops[0]->getValue();
+    Value *Base = GEP ? GEP->getBasePointer() : nullptr;
     if (!Base || !Base->getIRType()) return makeUnknown(GEP);
 
     const SCEVExpr *Result = getSCEV(Base);
     std::shared_ptr<IRType> CurType = Base->getIRType();
     int64_t ConstantOffset = 0;
 
-    for (unsigned I = 1; I < Ops.size(); ++I) {
+    for (size_t I = 0; I < GEP->getNumIndices(); ++I) {
         std::size_t Stride = 0;
         if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurType)) {
             CurType = PtrTy->getPointerType();
@@ -641,7 +628,7 @@ const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
             return makeUnknown(GEP);
         }
 
-        Value *Idx = Ops[I] ? Ops[I]->getValue() : nullptr;
+        Value *Idx = GEP->getIndex(I);
         if (!Idx) return makeUnknown(GEP);
         if (auto *CI = dynamic_cast<ConstInt *>(Idx)) {
             ConstantOffset += static_cast<int64_t>(CI->getVal()) *
@@ -675,24 +662,6 @@ std::optional<SCEVAffineInfo> SCEVResult::getAffine(const SCEVExpr *E) const {
     return Info;
 }
 
-std::vector<BasicBlock *> SCEVResult::collectLoopBlocks(const Loop *L) const {
-    std::vector<BasicBlock *> Blocks;
-    std::vector<const Loop *> Stack;
-    std::unordered_set<BasicBlock *> Seen;
-    if (L) Stack.push_back(L);
-    while (!Stack.empty()) {
-        const Loop *Cur = Stack.back();
-        Stack.pop_back();
-        for (BasicBlock *BB : Cur->getBlocks()) {
-            if (BB && Seen.insert(BB).second) Blocks.push_back(BB);
-        }
-        for (Loop *Sub : Cur->getSubLoops()) {
-            if (Sub) Stack.push_back(Sub);
-        }
-    }
-    return Blocks;
-}
-
 std::vector<BasicBlock *>
 SCEVResult::collectDirectLoopBlocks(const Loop *L) const {
     std::vector<BasicBlock *> Blocks;
@@ -705,28 +674,6 @@ SCEVResult::collectDirectLoopBlocks(const Loop *L) const {
     }
 
     return Blocks;
-}
-
-BinaryInst::Operation SCEVResult::invertPredicate(BinaryInst::Operation Op) const {
-    switch (Op) {
-    case BinaryInst::E: return BinaryInst::NE;
-    case BinaryInst::NE: return BinaryInst::E;
-    case BinaryInst::GE: return BinaryInst::L;
-    case BinaryInst::L: return BinaryInst::GE;
-    case BinaryInst::LE: return BinaryInst::G;
-    case BinaryInst::G: return BinaryInst::LE;
-    default: return Op;
-    }
-}
-
-BinaryInst::Operation SCEVResult::swapPredicate(BinaryInst::Operation Op) const {
-    switch (Op) {
-    case BinaryInst::GE: return BinaryInst::LE;
-    case BinaryInst::L: return BinaryInst::G;
-    case BinaryInst::LE: return BinaryInst::GE;
-    case BinaryInst::G: return BinaryInst::L;
-    default: return Op;
-    }
 }
 
 const SCEVExpr *SCEVResult::getTripCount(const Loop *L) {
@@ -801,11 +748,8 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
 
         auto *Br = BB->getBranchTerminator();
         if (!BasicBlock::isCondBr(Br)) return std::nullopt;
-        auto &Ops = Br->getUserList();
-        if (Ops.size() < 3 || !Ops[1] || !Ops[2]) return std::nullopt;
-
-        BasicBlock *TrueBB = dynamic_cast<BasicBlock *>(Ops[1]->getValue());
-        BasicBlock *FalseBB = dynamic_cast<BasicBlock *>(Ops[2]->getValue());
+        BasicBlock *TrueBB = Br->getTrueSuccessor();
+        BasicBlock *FalseBB = Br->getFalseSuccessor();
         bool TrueIn = TrueBB && L->contains(TrueBB);
         bool FalseIn = FalseBB && L->contains(FalseBB);
         if (TrueIn == FalseIn) return std::nullopt;
@@ -839,8 +783,9 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     BinaryInst *Cmp = Info.ExitCmp;
     if (!L || !Cmp) return false;
 
-    BinaryInst::Operation Pred = Info.ContinueOnTrue ? Cmp->getOp()
-                                                     : invertPredicate(Cmp->getOp());
+    BinaryInst::Operation Pred = Info.ContinueOnTrue
+                                     ? Cmp->getOp()
+                                     : BinaryInst::negatePredicate(Cmp->getOp());
     Value *LHSVal = Cmp->getOperand(0);
     Value *RHSVal = Cmp->getOperand(1);
     if (!LHSVal || !RHSVal) return false;
@@ -855,7 +800,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         if (RHSAffine && RHSAffine->RecLoop == L) {
             std::swap(LHS, RHS);
             std::swap(LHSVal, RHSVal);
-            Pred = swapPredicate(Pred);
+            Pred = BinaryInst::reversePredicate(Pred);
             Affine = RHSAffine;
         } else {
             return false;
@@ -1249,9 +1194,11 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
     case SCEVExprKind::Max:
         return "max(" + format(E->Operands[0]) + ", " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Cast:
-        return std::string(castName(E->CastKind)) + "(" + format(E->Operands[0]) + ")";
+        return std::string(SCEVExpr::castName(E->CastKind)) + "(" +
+               format(E->Operands[0]) + ")";
     case SCEVExprKind::Compare:
-        return "(" + format(E->Operands[0]) + " " + predName(E->Predicate) +
+        return "(" + format(E->Operands[0]) + " " +
+               SCEVExpr::predicateName(E->Predicate) +
                " " + format(E->Operands[1]) + ")";
     case SCEVExprKind::AddRec:
         return "{" + format(E->Operands[0]) + ",+, " + format(E->Operands[1]) +

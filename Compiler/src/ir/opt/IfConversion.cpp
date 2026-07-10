@@ -7,12 +7,7 @@
 
 #include <vector>
 
-static bool isConstCond(Value *V) {
-	bool Out = false;
-	return V && V->tryGetBoolConst(Out);
-}
-
-static bool isForbiddenInst(const Instruction *I) {
+bool IfConversionPass::isForbiddenInst(const Instruction *I) {
 	if (!I) return false;
 	switch (I->instType) {
 		case Instruction::STORE:
@@ -29,7 +24,7 @@ static bool isForbiddenInst(const Instruction *I) {
 	}
 }
 
-static int countCandidateInsts(BasicBlock *BB) {
+int IfConversionPass::countCandidateInsts(BasicBlock *BB) {
 	if (!BB) return 0;
 	int Cnt = 0;
 	for (Instruction *I : *BB) {
@@ -40,7 +35,7 @@ static int countCandidateInsts(BasicBlock *BB) {
 	return Cnt;
 }
 
-static bool checkBlockConvertible(BasicBlock *BB) {
+bool IfConversionPass::checkBlockConvertible(BasicBlock *BB) {
 	if (!BB) return false;
 	for (Instruction *I : *BB) {
 		if (!I) continue;
@@ -52,7 +47,7 @@ static bool checkBlockConvertible(BasicBlock *BB) {
 
 // 仅允许候选块中的指令被本块内部或 Succ 的 PHI 使用，
 // 防止将分支内部计算无约束上提，造成性能/语义风险。
-static bool usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
+bool IfConversionPass::usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
 	if (!BB || !Succ) return false;
 	for (Instruction *I : *BB) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
@@ -69,7 +64,7 @@ static bool usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
 	return true;
 }
 
-static bool hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *B) {
+bool IfConversionPass::hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *B) {
 	if (!BB || !A || !B) return false;
 	auto Preds = BB->getPredecessors();
 	if (Preds.size() != 2) return false;
@@ -83,7 +78,7 @@ static bool hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *B) {
 	return SeenA && SeenB;
 }
 
-static bool matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
+bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	if (!TrueBB) return false;
 
 	auto Preds = TrueBB->getPredecessors();
@@ -97,12 +92,11 @@ static bool matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	BrInst *PredBr = Pred->getBranchTerminator();
 	if (!PredBr || !BasicBlock::isCondBr(PredBr)) return false;
 
-	auto &UL = PredBr->getUserList();
-	if (UL.size() != 3) return false;
-	Value *Cond = UL[0]->getValue();
-	auto *Dest0 = dynamic_cast<BasicBlock *>(UL[1]->getValue());
-	auto *Dest1 = dynamic_cast<BasicBlock *>(UL[2]->getValue());
-	if (!Cond || !Dest0 || !Dest1 || isConstCond(Cond)) return false;
+	Value *Cond = PredBr->getCondition();
+	auto *Dest0 = PredBr->getTrueSuccessor();
+	auto *Dest1 = PredBr->getFalseSuccessor();
+	bool ConstCond = false;
+	if (!Cond || !Dest0 || !Dest1 || Cond->tryGetBoolConst(ConstCond)) return false;
 
 	BasicBlock *ElseBB = nullptr;
 	bool HasElse = false;
@@ -135,12 +129,12 @@ static bool matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 
 	BrInst *TrueBr = TrueBB->getBranchTerminator();
 	if (!TrueBr || !BasicBlock::isUncondBr(TrueBr)) return false;
-	if (TrueBr->getUserList().size() != 1 || TrueBr->getUserList()[0]->getValue() != Succ) return false;
+	if (TrueBr->getSuccessor(0) != Succ) return false;
 
 	if (HasElse) {
 		BrInst *ElseBr = ElseBB->getBranchTerminator();
 		if (!ElseBr || !BasicBlock::isUncondBr(ElseBr)) return false;
-		if (ElseBr->getUserList().size() != 1 || ElseBr->getUserList()[0]->getValue() != Succ) return false;
+		if (ElseBr->getSuccessor(0) != Succ) return false;
 	}
 
 	// 仅处理标准三角/菱形：Succ 不能有额外前驱（例如循环回边）。

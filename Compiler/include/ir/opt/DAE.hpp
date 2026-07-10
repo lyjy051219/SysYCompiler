@@ -23,10 +23,11 @@ private:
 
 	using ParamMaskMap = std::unordered_map<Function *, std::vector<bool>>;
 
-	static bool isExternelFunc(Function *F);
-	static bool isDirectCallOperand(CallInst *CI, const Use *U);
-	static Function *getDirectCallee(CallInst *CI);
-	static const std::vector<bool> *getLiveMask(const ParamMaskMap &Masks, Function *F);
+    static const std::vector<bool> *getLiveMask(const ParamMaskMap &Masks, Function *F);
+	static bool tryConstantSpecialization(
+		Function *F, const std::vector<CallInst *> &CallSites);
+	static bool tryRedundantArgMerge(
+		Function *F, const std::vector<CallInst *> &CallSites);
 
 	bool isParamLive(
 		Function *Owner,

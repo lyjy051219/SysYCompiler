@@ -51,6 +51,103 @@ std::vector<BasicBlock*> Loop::getExitBlocks() const {
     return exitBlocks;
 }
 
+std::vector<BasicBlock*> Loop::getBlocksIncludingSubLoops() const {
+    std::vector<BasicBlock*> Result;
+    std::unordered_set<BasicBlock*> Seen;
+    std::vector<const Loop*> Stack{this};
+    while (!Stack.empty()) {
+        const Loop *Current = Stack.back();
+        Stack.pop_back();
+        if (!Current) continue;
+        for (BasicBlock *BB : Current->getBlocks()) {
+            if (BB && Seen.insert(BB).second) Result.push_back(BB);
+        }
+        for (Loop *Sub : Current->getSubLoops()) {
+            if (Sub) Stack.push_back(Sub);
+        }
+    }
+    return Result;
+}
+
+std::vector<BasicBlock*> Loop::getBlocksInFunctionOrder() const {
+    std::vector<BasicBlock*> Result;
+    Function *F = Header ? Header->getParent() : nullptr;
+    if (!F) return Result;
+    for (BasicBlock *BB : *F) {
+        if (BB && contains(BB)) Result.push_back(BB);
+    }
+    return Result;
+}
+
+std::vector<BasicBlock*> Loop::getBlocksInRPO() const {
+    std::vector<BasicBlock*> PostOrder;
+    std::unordered_set<BasicBlock*> InLoop;
+    std::unordered_set<BasicBlock*> Visited;
+    for (BasicBlock *BB : Blocks) {
+        if (BB) InLoop.insert(BB);
+    }
+
+    auto AppendPostOrder = [&](BasicBlock *Start) {
+        if (!Start || !InLoop.count(Start) || !Visited.insert(Start).second)
+            return;
+        std::vector<std::pair<BasicBlock *, bool>> Stack{{Start, false}};
+        while (!Stack.empty()) {
+            auto [BB, Expanded] = Stack.back();
+            Stack.pop_back();
+            if (Expanded) {
+                PostOrder.push_back(BB);
+                continue;
+            }
+            Stack.push_back({BB, true});
+            auto Succs = BB->getSuccessors();
+            for (auto It = Succs.rbegin(); It != Succs.rend(); ++It) {
+                BasicBlock *Succ = *It;
+                if (Succ && InLoop.count(Succ) && Visited.insert(Succ).second)
+                    Stack.push_back({Succ, false});
+            }
+        }
+    };
+
+    AppendPostOrder(Header);
+    for (BasicBlock *BB : Blocks) AppendPostOrder(BB);
+    std::reverse(PostOrder.begin(), PostOrder.end());
+    return PostOrder;
+}
+
+std::vector<Loop*> Loop::getLoopsInPostOrder(
+    bool ReverseSiblingOrder) const {
+    std::vector<Loop*> Result;
+    std::vector<std::pair<Loop *, bool>> Stack{
+        {const_cast<Loop *>(this), false}};
+    while (!Stack.empty()) {
+        auto [Current, Expanded] = Stack.back();
+        Stack.pop_back();
+        if (!Current) continue;
+        if (Expanded) {
+            Result.push_back(Current);
+            continue;
+        }
+        Stack.push_back({Current, true});
+        const auto &Subs = Current->getSubLoops();
+        if (ReverseSiblingOrder) {
+            for (Loop *Sub : Subs)
+                if (Sub) Stack.push_back({Sub, false});
+        } else {
+            for (auto It = Subs.rbegin(); It != Subs.rend(); ++It)
+                if (*It) Stack.push_back({*It, false});
+        }
+    }
+    return Result;
+}
+
+bool Loop::isExitingBlock(BasicBlock *BB) const {
+    if (!BB || !contains(BB)) return false;
+    for (BasicBlock *Succ : BB->getSuccessors()) {
+        if (Succ && !contains(Succ)) return true;
+    }
+    return false;
+}
+
 bool Loop::getLoopSimplifyForm(BasicBlock* &PreHeader, BasicBlock* &Latch) const {
     PreHeader = nullptr;
     Latch = nullptr;
@@ -92,31 +189,23 @@ bool LoopInfo::invalidate(Function &F, const PreservationStatus &PA) {
     return true;
 }
 
-// LoopInfoBuilder 辅助：后序遍历支配树
-static void postorderDT(DominatorNode* node, std::vector<DominatorNode*>& order) {
-    if (!node) return;
-
-    std::vector<std::pair<DominatorNode*, bool>> st;
-    st.push_back({node, false});
-
-    while (!st.empty()) {
-        auto [curr, visited] = st.back();
-        st.pop_back();
-
-        if (visited) {
-            order.push_back(curr);
-            continue;
+std::vector<Loop*> LoopInfo::getLoopsInPostOrder(
+    bool ReverseSiblingOrder) const {
+    std::vector<Loop*> Result;
+    if (ReverseSiblingOrder) {
+        for (auto It = TopLevelLoops.rbegin(); It != TopLevelLoops.rend(); ++It) {
+            if (!*It) continue;
+            auto Nested = (*It)->getLoopsInPostOrder(true);
+            Result.insert(Result.end(), Nested.begin(), Nested.end());
         }
-
-        st.push_back({curr, true});
-
-        std::vector<DominatorNode*> children;
-        for (DominatorNode* child = curr->FirstChild; child != nullptr; child = child->NextSibling)
-            children.push_back(child);
-
-        for (int j = (int)children.size() - 1; j >= 0; --j)
-            st.push_back({children[j], false});
+    } else {
+        for (Loop *Top : TopLevelLoops) {
+            if (!Top) continue;
+            auto Nested = Top->getLoopsInPostOrder(false);
+            Result.insert(Result.end(), Nested.begin(), Nested.end());
+        }
     }
+    return Result;
 }
 
 // 步骤1：后序遍历支配树，识别回边 & 创建 Loop 对象
@@ -125,8 +214,7 @@ void LoopInfoBuilder::discoverLoopHeaders(Function &F, const DominatorTree &DT,
                                           LoopInfo &LI,
                                           std::vector<Loop*>& RPOLoops) {
     // 1a. 后序遍历支配树，得到后序序列
-    std::vector<DominatorNode*> postorder;
-    postorderDT(DT.Root, postorder);
+    std::vector<DominatorNode*> postorder = DT.getNodesInPostOrder();
 
     // 1b. 对后序序列中的每个节点，检查是否有回边指向它（即是否是循环头）
     for (DominatorNode* dtNode : postorder) {

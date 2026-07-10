@@ -1,7 +1,9 @@
 #include "IRUtils.hpp"
+#include "TypeSystem.hpp"
 
 #include <cstdint>
 #include <limits>
+#include <sstream>
 
 bool IRMath::isPowerOf2(int64_t Val) {
     if (Val <= 0) return false;
@@ -44,4 +46,27 @@ bool IRMath::addNoOverflow(int64_t A, int64_t B, int64_t &Out) {
 int64_t IRMath::ceilDivPositive(int64_t Num, int64_t Den) {
     if (Num <= 0 || Den <= 0) return 0;
     return (Num + Den - 1) / Den;
+}
+
+int32_t IRMath::normalizeSignedToWidth(int64_t Val, unsigned Bits) {
+    if (Bits == 0 || Bits >= 32) return static_cast<int32_t>(Val);
+    const uint32_t Mask = (uint32_t{1} << Bits) - 1;
+    uint32_t Truncated = static_cast<uint32_t>(Val) & Mask;
+    const uint32_t Sign = uint32_t{1} << (Bits - 1);
+    if (Truncated & Sign) Truncated |= ~Mask;
+    return static_cast<int32_t>(Truncated);
+}
+
+std::string IRKey::pointer(const void *Ptr) {
+    std::ostringstream OS;
+    OS << Ptr;
+    return OS.str();
+}
+
+std::string IRKey::type(const std::shared_ptr<IRType> &Ty) {
+    if (!Ty) return "noty";
+    std::ostringstream OS;
+    OS << static_cast<int>(Ty->getEnum()) << ':' << Ty->getSize() << ':'
+       << Ty.get();
+    return OS.str();
 }

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 class Value;
 class Function;
@@ -16,6 +17,9 @@ class AllocaInst;
 class BinaryInst;
 class PhiInst;
 class BrInst;
+
+using FunctionCallGraph =
+    std::unordered_map<Function *, std::vector<Function *>>;
 
 class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     public:
@@ -45,6 +49,12 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     static bool insertAfter(Instruction *Pos, Instruction *NewI);
     bool insertBefore(Instruction *NewI);
     bool insertAfter(Instruction *NewI);
+    bool isInBlock(const BasicBlock *BB) const;
+    bool comesBefore(const Instruction *Other) const;
+    static bool comesBefore(const Instruction *A, const Instruction *B);
+    Value *getUnaryOperand() const;
+    static Value *getUnaryOperand(const Instruction *I);
+    static Value *foldConstantCast(InstType CastType, Value *Operand);
 
     virtual Instruction* clone(const std::unordered_map<Value*, Value*>&) { return nullptr; }
 
@@ -77,6 +87,7 @@ class BinaryInst : public Instruction{
     BinaryInst(Value* x,Operation op,Value* y);
     Operation getOp() const { return op; }
     bool getOperands(Value *&LHS, Value *&RHS) const;
+    static bool getOperands(const BinaryInst *BI, Value *&LHS, Value *&RHS);
     bool setOperands(Value *LHS, Value *RHS);
     static bool isCompareOp(Operation Op);
     static bool isAssociativeOp(Operation Op);
@@ -84,6 +95,9 @@ class BinaryInst : public Instruction{
     static bool isReassociateOp(Operation Op);
     static Operation negatePredicate(Operation Op);
     static Operation reversePredicate(Operation Op);
+    static BinaryInst *createBooleanNot(Value *Operand);
+    static Value *foldConstants(Operation Op, Value *LHS, Value *RHS,
+                                bool NormalizeIntegerWidth = false);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
@@ -111,6 +125,9 @@ class Module final{
     void deleteFunction(Function*ptr);
     Function* getMainFunction(); //寻找main函数并返回
     static Module* getActiveModule();
+    FunctionCallGraph buildDirectCallGraph() const;
+    static std::unordered_set<Function *> collectReachableFunctions(
+        Function *Entry, const FunctionCallGraph &CallGraph);
     //全局变量管理
     void pushGlobalVar(Variable* ptr); //只是将一个全局变量加入到Function
     std::vector<std::unique_ptr<Variable>>& getGlobalVar();
@@ -149,6 +166,9 @@ class Variable : public User{
     //是不是函数形参
     virtual bool isParam() final;
     bool isScalarGlobal();
+    Value *getConstantElement(const std::vector<int> &Path);
+    static Value *getConstantElement(Variable *Source,
+                                     const std::vector<int> &Path);
 
     Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident);
     void dumpIR();
@@ -175,6 +195,16 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     void pushParam(std::string ident,Variable* v);
     void pushParam(Variable* v);
     std::vector<std::unique_ptr<Value>>& getParams();
+    const std::vector<std::unique_ptr<Value>>& getParams() const;
+    size_t getParamCount() const;
+    Value *getParam(size_t Index) const;
+    int getParamIndex(const Value *Param) const;
+    bool eraseParam(size_t Index);
+    std::vector<CallInst *> getDirectCallSites() const;
+    bool hasOnlyDirectCallUses() const;
+    bool hasReservedSignature() const;
+    bool hasBlockIdent(const std::string &Name) const;
+    std::string makeUniqueBlockIdent(const std::string &Base) const;
     //virtual Function* clone(std::unordered_map<Value*,Value*>&)override{return this;}
     //Inst插入
     void InsertAlloca(AllocaInst* ptr);
@@ -184,7 +214,7 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     void dropAllReferences();
     //调试信息打印
     void dumpIR();
-    std::string getIdent(){ return ident;}
+    std::string getIdent() const { return ident;}
 };
 
 //内置函数系统 -- 用来包含LLVM内置的函数
@@ -194,8 +224,17 @@ class BuildInFunction : public Value{
     public:
     //virtual BuildInFunction* clone(std::unordered_map<Value*,Value*>&)override{return this;}
     static BuildInFunction* genBuildInFunction(std::string);
+    static bool isSupportedName(const std::string &Name);
     static bool isKnownRuntimeName(const std::string &Name);
-    std::string getIdent(){ return ident;}
+    static bool isMemcpyName(const std::string &Name);
+    static bool isTimingName(const std::string &Name);
+    static bool isScalarIOName(const std::string &Name);
+    static bool isScalarOutputName(const std::string &Name);
+    static bool isArrayInputName(const std::string &Name);
+    static bool isArrayOutputName(const std::string &Name);
+    static bool isOutputName(const std::string &Name);
+    static const char *getDefaultMemcpyName();
+    std::string getIdent() const { return ident;}
 };
 
 class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, public ChainNode<Function,BasicBlock>{
@@ -209,12 +248,18 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     void dumpIR();
     std::vector<BasicBlock*> getSuccessors();
     std::vector<BasicBlock*> getPredecessors();
+    Instruction *getTerminator();
     BrInst* getBranchTerminator();
     static bool isCondBr(BrInst *Br);
     static bool isUncondBr(BrInst *Br);
     int countEdgesToSucc(BasicBlock *To);
+    bool hasMultipleDistinctSuccessors();
+    bool isCriticalEdgeTo(BasicBlock *To);
     static bool redirectBranchTarget(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc);
     static bool replaceCondBrWithUncond(BasicBlock *BB, BasicBlock *Dst);
+    bool replaceTerminator(Instruction *NewTerminator);
+    static bool replaceTerminator(BasicBlock *BB,
+                                  Instruction *NewTerminator);
     bool onlyPhiAndTerminator();
     static bool hasOnlyBlockLocalInstructionUsers(Instruction *I, BasicBlock *BB);
     void eraseBlockSafely();
@@ -275,6 +320,8 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     bool hasTerminator();
     bool insertBeforeTerminator(Instruction *I);
     bool insertAfterPhiNodes(Instruction *I);
+    static bool insertBeforeTerminator(BasicBlock *BB, Instruction *I);
+    static bool insertAfterPhiNodes(BasicBlock *BB, Instruction *I);
     void clear();
 
     /*目前用不到
@@ -301,6 +348,7 @@ class RetInst : public Instruction{
     RetInst(Value* retVal);
     //RetInst* clone(std::unordered_map<Value*, Value*>&)override;
     Value* getOprand()final;
+    Value *getReturnValue() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
@@ -317,6 +365,11 @@ class BrInst : public Instruction{
     Value* getOprand()final;
     void dumpIR() override;
     bool isConditional() const { return isCond; }
+    Value *getCondition() const;
+    unsigned getSuccessorCount() const;
+    BasicBlock *getSuccessor(unsigned Index) const;
+    BasicBlock *getTrueSuccessor() const;
+    BasicBlock *getFalseSuccessor() const;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
@@ -327,6 +380,10 @@ class AllocaInst : public Instruction{
     AllocaInst(std::shared_ptr<IRType> irtype);
     AllocaInst(std::string ident,std::shared_ptr<IRType> irtype);
     void dumpIR() override;
+    std::shared_ptr<IRType> getAllocatedType() const;
+    bool isArrayAllocation() const;
+    static std::shared_ptr<IRType> getAllocatedType(const AllocaInst *AI);
+    static bool isArrayAllocation(const AllocaInst *AI);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 
 };
@@ -363,6 +420,15 @@ class GetElementPtrInst : public Instruction{
     GetElementPtrInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     void updateType();
+    Value *getBasePointer() const;
+    size_t getNumIndices() const;
+    Value *getIndex(size_t Index) const;
+    std::vector<Value *> getIndices() const;
+    bool hasOnlyConstantIndices() const;
+    bool getBaseAndIndices(Value *&Base, std::vector<Value *> &Indices) const;
+    static bool getBaseAndIndices(const GetElementPtrInst *GEP, Value *&Base,
+                                  std::vector<Value *> &Indices);
+    bool reset(Value *Base, const std::vector<Value *> &Indices);
     std::optional<int64_t> getLastIndexStride();
     bool flattenZeroBasedChain(Value *&Base, std::vector<Value *> &Indices);
     static bool flattenZeroBasedChain(Value *V, Value *&Base,
@@ -388,8 +454,19 @@ class CallInst : public Instruction{
     bool isTailCall() const { return tailCall; }
     void setTailCall(bool v) { tailCall = v; }
     Value *getCallee() const;
+    Function *getDirectCallee() const;
+    BuildInFunction *getBuiltinCallee() const;
+    std::string getCalleeName() const;
     Value *getArg(unsigned Index) const;
+    std::vector<Value *> getArgs() const;
     unsigned getArgCount() const;
+    int getArgIndex(const Use *U) const;
+    bool isCalleeUse(const Use *U) const;
+    bool eraseArg(unsigned Index);
+    bool isMemcpyLike() const;
+    bool isNonVolatileMemcpy() const;
+    static bool isMemcpyLike(const CallInst *CI);
+    static bool isNonVolatileMemcpy(const CallInst *CI);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
@@ -448,6 +525,9 @@ class SelectInst : public Instruction{
     public:
     SelectInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::SELECT;}
     SelectInst(Value* cond,Value* isTrue,Value* isFalse);
+    Value *getCondition() const;
+    Value *getTrueValue() const;
+    Value *getFalseValue() const;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
     void dumpIR() override;
 };
@@ -472,6 +552,7 @@ class PhiInst : public Instruction{
     BasicBlock* getIncomingBlock(unsigned i) { return dynamic_cast<BasicBlock*>(userList[i * 2 + 1]->getValue()); }
     // 设置第 i 个 incoming 的 Value (用于重命名时更新)
     void setIncomingValue(unsigned i, Value* val);
+    bool setIncomingBlock(unsigned i, BasicBlock *BB);
     std::vector<IncomingEdge> collectIncomingEdges();
     static bool rebuildFromIncoming(PhiInst *Phi, const std::vector<IncomingEdge> &Incoming);
     static bool removeIncomingByPred(PhiInst *Phi, BasicBlock *Pred, int RemoveCount);
@@ -507,7 +588,7 @@ class ConstBool : public ConstantSystem{
     bool val;
     ConstBool(bool val);
     public:
-    bool getVal();
+    bool getVal() const;
     static ConstBool* newConstBool(bool = false);
 
 };
@@ -519,7 +600,7 @@ class ConstBool : public ConstantSystem{
     ConstInt(int val);
     ConstInt(int val, size_t size);
     public:
-    int getVal();
+    int getVal() const;
     //静态工厂方法
      static ConstInt* newConstInt(int val = 0, size_t size = 4);
  };
@@ -529,7 +610,7 @@ class ConstBool : public ConstantSystem{
     float val;
     ConstFloat(float val);
     public:
-    float getVal();
+    float getVal() const;
     static ConstFloat* newConstFloat(float = 0);
 };
 

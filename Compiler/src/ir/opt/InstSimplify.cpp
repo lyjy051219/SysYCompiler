@@ -13,211 +13,55 @@
 #include <unordered_set>
 #include <vector>
 
-static bool isUndef(Value *V) {
-	return dynamic_cast<UndefValue *>(V) != nullptr;
-}
-
-static bool isBoolType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->isBool();
-}
-
-static bool isIntType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->isInt();
-}
-
-static bool isFloatType(const std::shared_ptr<IRType> &Ty) {
-	return Ty && Ty->isFloat();
-}
-
-static bool isConstZero(Value *V) {
-	return V && V->isConstZero();
-}
-
-static bool isConstOne(Value *V) {
-	return V && V->isConstOne();
-}
-
-static bool isConstMinusOne(Value *V) {
-	return V && V->isConstMinusOne();
-}
-
-static bool tryGetBoolConst(Value *V, bool &Out) {
-	return V && V->tryGetBoolConst(Out);
-}
-
-static bool tryGetIntConst(Value *V, int32_t &Out) {
-	return V && V->tryGetIntConst(Out);
-}
-
-static bool tryGetFloatConst(Value *V, float &Out) {
-	return V && V->tryGetFloatConst(Out);
-}
-
-static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty) {
-	return Value::makeUndefForType(Ty);
-}
-
-static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty) {
-	return Value::makeZeroForType(Ty);
-}
-
-static Value *makeOneForType(const std::shared_ptr<IRType> &Ty) {
-	return Value::makeOneForType(Ty);
-}
-
-static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
-	return Value::makeMinusOneForType(Ty);
-}
-
-static bool isCompareOp(BinaryInst::Operation Op) {
-	return BinaryInst::isCompareOp(Op);
-}
-
-static bool isPowerOfTwoU32(uint32_t X) {
-	return IRMath::isUnsignedPowerOf2(static_cast<int32_t>(X));
-}
-
-static int32_t ctzPowerOfTwoU32(uint32_t X) {
-	return IRMath::log2u(X);
-}
-
-static bool getBinaryOperandsForOp(Value *V, BinaryInst::Operation Op, Value *&L, Value *&R) {
+bool InstSimplifyPass::getBinaryOperandsForOp(
+	Value *V, BinaryInst::Operation Op, Value *&L, Value *&R) {
 	auto *BI = dynamic_cast<BinaryInst *>(V);
 	if (!BI || BI->getOp() != Op) return false;
 	return BI->getOperands(L, R);
 }
 
-static bool matchNeg(Value *V, Value *&Y) {
+bool InstSimplifyPass::matchNegation(Value *V, Value *&Y) {
 	Value *L = nullptr;
 	Value *R = nullptr;
-	if (!getBinaryOperandsForOp(V, BinaryInst::SUB, L, R)) return false;
-	if (!isConstZero(L)) return false;
+	if (!InstSimplifyPass::getBinaryOperandsForOp(V, BinaryInst::SUB, L, R)) return false;
+	if (!Value::isConstZero(L)) return false;
 	Y = R;
 	return Y != nullptr;
 }
 
-static bool isSubInst(Value *V, Value *&LHS, Value *&RHS) {
+bool InstSimplifyPass::matchSub(Value *V, Value *&LHS, Value *&RHS) {
 	auto *BI = dynamic_cast<BinaryInst *>(V);
 	if (!BI || BI->getOp() != BinaryInst::SUB) return false;
 	return BI->getOperands(LHS, RHS);
 }
 
-static bool isNegationPair(Value *A, Value *B) {
+bool InstSimplifyPass::isNegationPair(Value *A, Value *B) {
 	if (!A || !B) return false;
 
 	int32_t AI = 0, BI = 0;
-	if (tryGetIntConst(A, AI) && tryGetIntConst(B, BI)) {
+	if (Value::tryGetIntConst(A, AI) && Value::tryGetIntConst(B, BI)) {
 		return AI == -BI;
 	}
 
 	float AF = 0.0f, BF = 0.0f;
-	if (tryGetFloatConst(A, AF) && tryGetFloatConst(B, BF)) {
+	if (Value::tryGetFloatConst(A, AF) && Value::tryGetFloatConst(B, BF)) {
 		return AF == -BF;
 	}
 
 	Value *SL = nullptr, *SR = nullptr;
-	if (isSubInst(B, SL, SR) && isConstZero(SL) && SR == A) return true;
-	if (isSubInst(A, SL, SR) && isConstZero(SL) && SR == B) return true;
+	if (InstSimplifyPass::matchSub(B, SL, SR) && Value::isConstZero(SL) && SR == A) return true;
+	if (InstSimplifyPass::matchSub(A, SL, SR) && Value::isConstZero(SL) && SR == B) return true;
 
 	return false;
 }
 
-static bool matchYMinusX(Value *MaybeSub, Value *X, Value *&Y) {
+bool InstSimplifyPass::matchYMinusX(Value *MaybeSub, Value *X, Value *&Y) {
 	Value *SubL = nullptr;
 	Value *SubR = nullptr;
-	if (!isSubInst(MaybeSub, SubL, SubR)) return false;
+	if (!InstSimplifyPass::matchSub(MaybeSub, SubL, SubR)) return false;
 	if (SubR != X) return false;
 	Y = SubL;
 	return Y != nullptr;
-}
-
-static Value *foldBinaryConstants(BinaryInst::Operation Op, Value *LHS, Value *RHS) {
-	if (!LHS || !RHS) return nullptr;
-
-	const auto Ty = LHS->getIRType();
-
-	if (isCompareOp(Op)) {
-		if (isFloatType(Ty)) {
-			float LF = 0.0f, RF = 0.0f;
-			if (!tryGetFloatConst(LHS, LF) || !tryGetFloatConst(RHS, RF)) return nullptr;
-			bool C = false;
-			switch (Op) {
-			case BinaryInst::E: C = (LF == RF); break;
-			case BinaryInst::NE: C = (LF != RF); break;
-			case BinaryInst::G: C = (LF > RF); break;
-			case BinaryInst::GE: C = (LF >= RF); break;
-			case BinaryInst::L: C = (LF < RF); break;
-			case BinaryInst::LE: C = (LF <= RF); break;
-			default: return nullptr;
-			}
-			return ConstBool::newConstBool(C);
-		}
-
-		int32_t LI = 0, RI = 0;
-		if (!tryGetIntConst(LHS, LI) || !tryGetIntConst(RHS, RI)) return nullptr;
-		bool C = false;
-		switch (Op) {
-		case BinaryInst::E: C = (LI == RI); break;
-		case BinaryInst::NE: C = (LI != RI); break;
-		case BinaryInst::G: C = (LI > RI); break;
-		case BinaryInst::GE: C = (LI >= RI); break;
-		case BinaryInst::L: C = (LI < RI); break;
-		case BinaryInst::LE: C = (LI <= RI); break;
-		default: return nullptr;
-		}
-		return ConstBool::newConstBool(C);
-	}
-
-	if (isFloatType(Ty)) {
-		float LF = 0.0f, RF = 0.0f;
-		if (!tryGetFloatConst(LHS, LF) || !tryGetFloatConst(RHS, RF)) return nullptr;
-
-		switch (Op) {
-		case BinaryInst::ADD: return ConstFloat::newConstFloat(LF + RF);
-		case BinaryInst::SUB: return ConstFloat::newConstFloat(LF - RF);
-		case BinaryInst::MUL: return ConstFloat::newConstFloat(LF * RF);
-		case BinaryInst::DIV:
-			if (RF == 0.0f) return makeUndefForType(Ty);
-			return ConstFloat::newConstFloat(LF / RF);
-		case BinaryInst::MOD:
-			if (RF == 0.0f) return makeUndefForType(Ty);
-			return ConstFloat::newConstFloat(std::fmod(LF, RF));
-		default:
-			return nullptr;
-		}
-	}
-
-	int32_t LI = 0, RI = 0;
-	if (!tryGetIntConst(LHS, LI) || !tryGetIntConst(RHS, RI)) return nullptr;
-
-	switch (Op) {
-	case BinaryInst::ADD: return ConstInt::newConstInt(LI + RI);
-	case BinaryInst::SUB: return ConstInt::newConstInt(LI - RI);
-	case BinaryInst::MUL: return ConstInt::newConstInt(LI * RI);
-	case BinaryInst::DIV:
-		if (RI == 0) return makeUndefForType(Ty);
-		return ConstInt::newConstInt(LI / RI);
-	case BinaryInst::UDIV: {
-		if (RI == 0) return makeUndefForType(Ty);
-		const uint32_t L = static_cast<uint32_t>(LI);
-		const uint32_t R = static_cast<uint32_t>(RI);
-		return ConstInt::newConstInt(static_cast<int32_t>(L / R));
-	}
-	case BinaryInst::MOD:
-		if (RI == 0) return makeUndefForType(Ty);
-		return ConstInt::newConstInt(LI % RI);
-	case BinaryInst::UREM: {
-		if (RI == 0) return makeUndefForType(Ty);
-		const uint32_t L = static_cast<uint32_t>(LI);
-		const uint32_t R = static_cast<uint32_t>(RI);
-		return ConstInt::newConstInt(static_cast<int32_t>(L % R));
-	}
-	case BinaryInst::AND: return ConstInt::newConstInt(LI & RI);
-	case BinaryInst::OR: return ConstInt::newConstInt(LI | RI);
-	case BinaryInst::XOR: return ConstInt::newConstInt(LI ^ RI);
-	default:
-		return nullptr;
-	}
 }
 
 class InstSimplifier {
@@ -256,7 +100,7 @@ public:
 			Value *V = simplifyInstruction(I, Changed);
 			if (!V || V == I) continue;
 
-			std::vector<Instruction *> Users = collectInstructionUsers(I);
+			std::vector<Instruction *> Users = I->getInstructionUsers();
 
 			if (auto *NewI = dynamic_cast<Instruction *>(V)) {
 				if (NewI->getParent() == nullptr) {
@@ -283,152 +127,11 @@ private:
 	BasicAAResult *AA = nullptr;
 	LoopInfo *LI = nullptr;
 
-	enum class BoolExtKind {
-		None,
-		PlainBool,
-		ZeroExt,
-		SignExt,
-	};
-
-	static std::vector<Instruction *> collectInstructionUsers(Value *V) {
-		std::vector<Instruction *> Out;
-		if (!V) return Out;
-		for (auto It = V->getUseList().begin(); It != V->getUseList().end(); ++It) {
-			Use *U = *It;
-			if (!U || U->getValue() != V) continue;
-			if (auto *UI = dynamic_cast<Instruction *>(U->getUser())) {
-				Out.push_back(UI);
-			}
-		}
-		return Out;
-	}
-
-	static bool hasExactlyOneUse(Value *V) {
-		if (!V) return false;
-		int Cnt = 0;
-		for (auto It = V->getUseList().begin(); It != V->getUseList().end(); ++It) {
-			Use *U = *It;
-			if (!U || U->getValue() != V) continue;
-			++Cnt;
-			if (Cnt > 1) return false;
-		}
-		return Cnt == 1;
-	}
-
-	static bool getBinaryOperands(BinaryInst *BI, Value *&LHS, Value *&RHS) {
-		return BI && BI->getOperands(LHS, RHS);
-	}
-
-	static bool getUnaryOperand(Instruction *I, Value *&Op) {
-		return I && I->getNumOperands() == 1 && I->getOperand(0, Op);
-	}
-
-	static Value *stripBoolExt(Value *V, BoolExtKind &Kind) {
-		Kind = BoolExtKind::None;
-		if (!V) return nullptr;
-		if (isBoolType(V->getIRType())) {
-			Kind = BoolExtKind::PlainBool;
-			return V;
-		}
-
-		if (auto *ZI = dynamic_cast<ZextInst *>(V)) {
-			Value *Op = nullptr;
-			if (getUnaryOperand(ZI, Op) && isBoolType(Op->getIRType())) {
-				Kind = BoolExtKind::ZeroExt;
-				return Op;
-			}
-		}
-		if (auto *SI = dynamic_cast<SextInst *>(V)) {
-			Value *Op = nullptr;
-			if (getUnaryOperand(SI, Op) && isBoolType(Op->getIRType())) {
-				Kind = BoolExtKind::SignExt;
-				return Op;
-			}
-		}
-		return nullptr;
-	}
-
-	static Value *invertBool(Value *V) {
-		if (!V) return nullptr;
-		return new BinaryInst(V, BinaryInst::XOR, ConstBool::newConstBool(true));
-	}
-
-	static bool insertInstBefore(Instruction *Pos, Instruction *NewI) {
-		if (!Pos || !NewI) return false;
-		BasicBlock *BB = Pos->getParent();
-		if (!BB) return false;
-		for (auto It = BB->begin(); It != BB->end(); ++It) {
-			if (*It == Pos) {
-				It.insertBefore(NewI);
-				return true;
-			}
-		}
-		return false;
-	}
-
-	static bool insertInstAfterPhiNodes(BasicBlock *BB, Instruction *NewI) {
-		if (!BB || !NewI) return false;
-		for (auto It = BB->begin(); It != BB->end(); ++It) {
-			auto *Cur = *It;
-			if (!dynamic_cast<PhiInst *>(Cur)) {
-				It.insertBefore(NewI);
-				return true;
-			}
-		}
-		BB->push_back(NewI);
-		return true;
-	}
-
-	static bool getLoadPtr(LoadInst *LI, Value *&Ptr) {
-		Ptr = nullptr;
-		if (!LI) return false;
-		auto &UL = LI->getUserList();
-		if (UL.size() != 1) return false;
-		Ptr = UL[0]->getValue();
-		return Ptr != nullptr;
-	}
-
-	static bool getStorePtr(StoreInst *SI, Value *&Ptr) {
-		Ptr = nullptr;
-		if (!SI) return false;
-		auto &UL = SI->getUserList();
-		if (UL.size() < 2) return false;
-		Ptr = UL[1]->getValue();
-		return Ptr != nullptr;
-	}
-
-	static bool getGEPOperands(GetElementPtrInst *GEP, Value *&Ptr, std::vector<Value *> &Idxs) {
-		Ptr = nullptr;
-		Idxs.clear();
-		if (!GEP) return false;
-		auto &UL = GEP->getUserList();
-		if (UL.empty()) return false;
-		Ptr = UL[0]->getValue();
-		if (!Ptr) return false;
-		for (size_t i = 1; i < UL.size(); ++i) {
-			Value *V = UL[i]->getValue();
-			if (!V) return false;
-			Idxs.push_back(V);
-		}
-		return true;
-	}
-
-	static bool isConstantOffsetGEP(GetElementPtrInst *GEP) {
-		Value *Ptr = nullptr;
-		std::vector<Value *> Idxs;
-		if (!getGEPOperands(GEP, Ptr, Idxs)) return false;
-		if (Idxs.empty()) return true;
-		for (Value *Idx : Idxs) {
-			if (!Idx || !Idx->isConst()) return false;
-		}
-		return true;
-	}
-
 	bool isLoadSuitableForSinking(LoadInst *L) const {
 		if (!L || !FAM || !AA || !LI) return false;
 
-		Value *Ptr = nullptr;
-		if (!getLoadPtr(L, Ptr)) return false;
+		Value *Ptr = L->getPointerOperand();
+		if (!Ptr) return false;
 		BasicBlock *BB = L->getParent();
 		if (!BB) return false;
 
@@ -454,8 +157,7 @@ private:
 				}
 				if (dynamic_cast<LoadInst *>(UserI)) continue;
 				if (auto *S = dynamic_cast<StoreInst *>(UserI)) {
-					Value *StorePtr = nullptr;
-					if (getStorePtr(S, StorePtr) && StorePtr == Alloca) continue;
+					if (S->getPointerOperand() == Alloca) continue;
 				}
 				AddressTaken = true;
 				break;
@@ -464,7 +166,7 @@ private:
 		}
 
 		if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Ptr)) {
-			if (isConstantOffsetGEP(GEP)) return false;
+			if (GEP->hasOnlyConstantIndices()) return false;
 		}
 
 		return true;
@@ -480,7 +182,7 @@ private:
 
 		Value *FL = nullptr;
 		Value *FR = nullptr;
-		if (!getBinaryOperands(First, FL, FR)) return nullptr;
+		if (!BinaryInst::getOperands(First, FL, FR)) return nullptr;
 		BinaryInst::Operation Op = First->getOp();
 
 		Value *CommonL = FL;
@@ -490,7 +192,7 @@ private:
 			if (!Bin || Bin->getOp() != Op) return nullptr;
 			Value *L = nullptr;
 			Value *R = nullptr;
-			if (!getBinaryOperands(Bin, L, R)) return nullptr;
+			if (!BinaryInst::getOperands(Bin, L, R)) return nullptr;
 			if (CommonL && CommonL != L) CommonL = nullptr;
 			if (CommonR && CommonR != R) CommonR = nullptr;
 			if (!CommonL && !CommonR) return nullptr;
@@ -502,12 +204,12 @@ private:
 		if (CommonL) {
 			Value *TmpL = nullptr;
 			Value *TmpR = nullptr;
-			if (!getBinaryOperands(First, TmpL, TmpR)) return nullptr;
+			if (!BinaryInst::getOperands(First, TmpL, TmpR)) return nullptr;
 			SampleUncommon = TmpR;
 		} else {
 			Value *TmpL = nullptr;
 			Value *TmpR = nullptr;
-			if (!getBinaryOperands(First, TmpL, TmpR)) return nullptr;
+			if (!BinaryInst::getOperands(First, TmpL, TmpR)) return nullptr;
 			SampleUncommon = TmpL;
 		}
 		if (!SampleUncommon) return nullptr;
@@ -517,7 +219,7 @@ private:
 			auto *Bin = dynamic_cast<BinaryInst *>(Phi->getIncomingValue(i));
 			Value *L = nullptr;
 			Value *R = nullptr;
-			if (!Bin || !getBinaryOperands(Bin, L, R)) {
+			if (!Bin || !BinaryInst::getOperands(Bin, L, R)) {
 				delete UncommonPhi;
 				return nullptr;
 			}
@@ -525,14 +227,14 @@ private:
 			UncommonPhi->addIncoming(U, Phi->getIncomingBlock(i));
 		}
 
-		if (!insertInstBefore(Phi, UncommonPhi)) {
+		if (!Instruction::insertBefore(Phi, UncommonPhi)) {
 			delete UncommonPhi;
 			return nullptr;
 		}
 
 		auto *NewBin = CommonL ? new BinaryInst(CommonL, Op, UncommonPhi)
 							  : new BinaryInst(UncommonPhi, Op, CommonR);
-		if (!insertInstAfterPhiNodes(Phi->getParent(), NewBin)) {
+		if (!BasicBlock::insertAfterPhiNodes(Phi->getParent(), NewBin)) {
 			delete NewBin;
 			return nullptr;
 		}
@@ -546,11 +248,11 @@ private:
 		if (N < 2) return nullptr;
 
 		auto *First = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0));
-		if (!First || isConstantOffsetGEP(First)) return nullptr;
+		if (!First || First->hasOnlyConstantIndices()) return nullptr;
 
 		Value *FirstPtr = nullptr;
 		std::vector<Value *> FirstIdxs;
-		if (!getGEPOperands(First, FirstPtr, FirstIdxs)) return nullptr;
+		if (!GetElementPtrInst::getBaseAndIndices(First, FirstPtr, FirstIdxs)) return nullptr;
 		if (dynamic_cast<AllocaInst *>(FirstPtr)) return nullptr;
 
 		std::vector<Value *> Commons = FirstIdxs;
@@ -559,11 +261,11 @@ private:
 		size_t UncommonCnt = 0;
 		for (unsigned i = 0; i < N; ++i) {
 			auto *GEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
-			if (!GEP || isConstantOffsetGEP(GEP)) return nullptr;
+			if (!GEP || GEP->hasOnlyConstantIndices()) return nullptr;
 
 			Value *Ptr = nullptr;
 			std::vector<Value *> Idxs;
-			if (!getGEPOperands(GEP, Ptr, Idxs)) return nullptr;
+			if (!GetElementPtrInst::getBaseAndIndices(GEP, Ptr, Idxs)) return nullptr;
 			if (Idxs.size() != Commons.size() - 1) return nullptr;
 			if (dynamic_cast<AllocaInst *>(Ptr)) return nullptr;
 
@@ -592,12 +294,12 @@ private:
 		if (UncommonIndex == Commons.size() - 1) {
 			Value *Ptr = nullptr;
 			std::vector<Value *> Idxs;
-			if (!getGEPOperands(dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0)), Ptr, Idxs)) return nullptr;
+			if (!GetElementPtrInst::getBaseAndIndices(dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0)), Ptr, Idxs)) return nullptr;
 			Sample = Ptr;
 		} else {
 			Value *Ptr = nullptr;
 			std::vector<Value *> Idxs;
-			if (!getGEPOperands(dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0)), Ptr, Idxs)) return nullptr;
+			if (!GetElementPtrInst::getBaseAndIndices(dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0)), Ptr, Idxs)) return nullptr;
 			Sample = Idxs[UncommonIndex];
 		}
 		if (!Sample) return nullptr;
@@ -607,7 +309,7 @@ private:
 			auto *GEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
 			Value *Ptr = nullptr;
 			std::vector<Value *> Idxs;
-			if (!GEP || !getGEPOperands(GEP, Ptr, Idxs)) {
+			if (!GEP || !GetElementPtrInst::getBaseAndIndices(GEP, Ptr, Idxs)) {
 				delete UncommonPhi;
 				return nullptr;
 			}
@@ -618,7 +320,7 @@ private:
 			}
 		}
 
-		if (!insertInstBefore(Phi, UncommonPhi)) {
+		if (!Instruction::insertBefore(Phi, UncommonPhi)) {
 			delete UncommonPhi;
 			return nullptr;
 		}
@@ -638,7 +340,7 @@ private:
 			dynamic_cast<GetElementPtrInst *>(NewGEP)->updateType();
 		}
 
-		if (!insertInstAfterPhiNodes(Phi->getParent(), NewGEP)) {
+		if (!BasicBlock::insertAfterPhiNodes(Phi->getParent(), NewGEP)) {
 			delete NewGEP;
 			return nullptr;
 		}
@@ -652,13 +354,13 @@ private:
 
 		auto *First = dynamic_cast<LoadInst *>(Phi->getIncomingValue(0));
 		if (!First) return nullptr;
-		Value *FirstPtr = nullptr;
-		if (!getLoadPtr(First, FirstPtr) || !FirstPtr) return nullptr;
+		Value *FirstPtr = First->getPointerOperand();
+		if (!FirstPtr) return nullptr;
 
 		for (unsigned i = 0; i < N; ++i) {
 			auto *L = dynamic_cast<LoadInst *>(Phi->getIncomingValue(i));
 			if (!L) return nullptr;
-			if (!hasExactlyOneUse(L)) return nullptr;
+			if (!L->hasExactlyOneUse()) return nullptr;
 			if (L->getParent() != Phi->getIncomingBlock(i)) return nullptr;
 			if (!isLoadSuitableForSinking(L)) return nullptr;
 		}
@@ -666,21 +368,21 @@ private:
 		auto *MergedPtr = new PhiInst(FirstPtr->getIRType());
 		for (unsigned i = 0; i < N; ++i) {
 			auto *L = dynamic_cast<LoadInst *>(Phi->getIncomingValue(i));
-			Value *Ptr = nullptr;
-			if (!L || !getLoadPtr(L, Ptr)) {
+			Value *Ptr = L ? L->getPointerOperand() : nullptr;
+			if (!L || !Ptr) {
 				delete MergedPtr;
 				return nullptr;
 			}
 			MergedPtr->addIncoming(Ptr, Phi->getIncomingBlock(i));
 		}
 
-		if (!insertInstBefore(Phi, MergedPtr)) {
+		if (!Instruction::insertBefore(Phi, MergedPtr)) {
 			delete MergedPtr;
 			return nullptr;
 		}
 
 		auto *MergedLoad = new LoadInst(MergedPtr);
-		if (!insertInstAfterPhiNodes(Phi->getParent(), MergedLoad)) {
+		if (!BasicBlock::insertAfterPhiNodes(Phi->getParent(), MergedLoad)) {
 			delete MergedLoad;
 			return nullptr;
 		}
@@ -712,9 +414,7 @@ private:
 		case BinaryInst::AND:
 		case BinaryInst::OR:
 		case BinaryInst::XOR: {
-			auto &UL = BI->getUserList();
-			UL[0]->replaceUseeWith(RHS);
-			UL[1]->replaceUseeWith(LHS);
+			BI->setOperands(RHS, LHS);
 			std::swap(LHS, RHS);
 			Changed = true;
 			return true;
@@ -725,32 +425,32 @@ private:
 	}
 
 	Value *simplifyAdd(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
-		const bool IsIntArith = isIntType(BI->getIRType()) && !isBoolType(BI->getIRType());
+		const bool IsIntArith = IRType::isInt(BI->getIRType()) && !IRType::isBool(BI->getIRType());
 
 		if ((LHS->isConst() && RHS->isConst())) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeUndefForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (isConstZero(RHS)) {
+		if (Value::isConstZero(RHS)) {
 			return LHS;
 		}
 
-		if (IsIntArith && isNegationPair(LHS, RHS)) {
-			return makeZeroForType(BI->getIRType());
+		if (IsIntArith && InstSimplifyPass::isNegationPair(LHS, RHS)) {
+			return Value::makeZeroForType(BI->getIRType());
 		}
 
 		// x + c1 + c2 -> x + (c1 + c2)
 		if (IsIntArith && RHS->isConst()) {
 			Value *AL = nullptr;
 			Value *AR = nullptr;
-			if (getBinaryOperandsForOp(LHS, BinaryInst::ADD, AL, AR) && AR && AR->isConst()) {
-				Value *SumC = foldBinaryConstants(BinaryInst::ADD, AR, RHS);
+			if (InstSimplifyPass::getBinaryOperandsForOp(LHS, BinaryInst::ADD, AL, AR) && AR && AR->isConst()) {
+				Value *SumC = BinaryInst::foldConstants(BinaryInst::ADD, AR, RHS);
 				if (SumC) {
 					return new BinaryInst(AL, BinaryInst::ADD, SumC);
 				}
@@ -758,45 +458,45 @@ private:
 		}
 
 		Value *Y = nullptr;
-		if (IsIntArith && matchYMinusX(RHS, LHS, Y)) return Y;
-		if (IsIntArith && matchYMinusX(LHS, RHS, Y)) return Y;
+		if (IsIntArith && InstSimplifyPass::matchYMinusX(RHS, LHS, Y)) return Y;
+		if (IsIntArith && InstSimplifyPass::matchYMinusX(LHS, RHS, Y)) return Y;
 
 		return nullptr;
 	}
 
 	Value *simplifySub(BinaryInst *BI, Value *LHS, Value *RHS) {
-		const bool IsIntArith = isIntType(BI->getIRType()) && !isBoolType(BI->getIRType());
+		const bool IsIntArith = IRType::isInt(BI->getIRType()) && !IRType::isBool(BI->getIRType());
 
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeUndefForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (isConstZero(RHS)) {
+		if (Value::isConstZero(RHS)) {
 			return LHS;
 		}
 
 		if (LHS == RHS) {
-			return makeZeroForType(BI->getIRType());
+			return Value::makeZeroForType(BI->getIRType());
 		}
 
 		// x - (x + y) -> -y
 		if (IsIntArith) {
 			Value *AL = nullptr;
 			Value *AR = nullptr;
-			if (getBinaryOperandsForOp(RHS, BinaryInst::ADD, AL, AR)) {
-				if (AL == LHS) return new BinaryInst(makeZeroForType(BI->getIRType()), BinaryInst::SUB, AR);
-				if (AR == LHS) return new BinaryInst(makeZeroForType(BI->getIRType()), BinaryInst::SUB, AL);
+			if (InstSimplifyPass::getBinaryOperandsForOp(RHS, BinaryInst::ADD, AL, AR)) {
+				if (AL == LHS) return new BinaryInst(Value::makeZeroForType(BI->getIRType()), BinaryInst::SUB, AR);
+				if (AR == LHS) return new BinaryInst(Value::makeZeroForType(BI->getIRType()), BinaryInst::SUB, AL);
 			}
 		}
 
 		// x - (-y) -> x + y
 		if (IsIntArith) {
 			Value *Y = nullptr;
-			if (matchNeg(RHS, Y)) {
+			if (InstSimplifyPass::matchNegation(RHS, Y)) {
 				return new BinaryInst(LHS, BinaryInst::ADD, Y);
 			}
 		}
@@ -807,8 +507,8 @@ private:
 			Value *L1 = nullptr;
 			Value *R0 = nullptr;
 			Value *R1 = nullptr;
-			if (getBinaryOperandsForOp(LHS, BinaryInst::MUL, L0, L1) &&
-				getBinaryOperandsForOp(RHS, BinaryInst::MUL, R0, R1)) {
+			if (InstSimplifyPass::getBinaryOperandsForOp(LHS, BinaryInst::MUL, L0, L1) &&
+				InstSimplifyPass::getBinaryOperandsForOp(RHS, BinaryInst::MUL, R0, R1)) {
 				Value *Common = nullptr;
 				Value *Y = nullptr;
 				Value *Z = nullptr;
@@ -819,7 +519,7 @@ private:
 
 				if (Common && Y && Z) {
 					auto *YZ = new BinaryInst(Y, BinaryInst::SUB, Z);
-					if (insertInstBefore(BI, YZ)) {
+					if (Instruction::insertBefore(BI, YZ)) {
 						return new BinaryInst(Common, BinaryInst::MUL, YZ);
 					}
 					delete YZ;
@@ -833,12 +533,12 @@ private:
 			Value *L1 = nullptr;
 			Value *R0 = nullptr;
 			Value *R1 = nullptr;
-			if (getBinaryOperandsForOp(LHS, BinaryInst::MUL, L0, L1) &&
-				getBinaryOperandsForOp(RHS, BinaryInst::MUL, R0, R1) &&
+			if (InstSimplifyPass::getBinaryOperandsForOp(LHS, BinaryInst::MUL, L0, L1) &&
+				InstSimplifyPass::getBinaryOperandsForOp(RHS, BinaryInst::MUL, R0, R1) &&
 				L0 == L1 && R0 == R1) {
 				auto *Plus = new BinaryInst(L0, BinaryInst::ADD, R0);
 				auto *Minus = new BinaryInst(L0, BinaryInst::SUB, R0);
-				if (insertInstBefore(BI, Plus) && insertInstBefore(BI, Minus)) {
+				if (Instruction::insertBefore(BI, Plus) && Instruction::insertBefore(BI, Minus)) {
 					return new BinaryInst(Plus, BinaryInst::MUL, Minus);
 				}
 				delete Plus;
@@ -851,36 +551,36 @@ private:
 
 	Value *simplifyMul(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeZeroForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeZeroForType(BI->getIRType());
 		}
 
-		if (isConstZero(RHS)) {
-			return makeZeroForType(BI->getIRType());
+		if (Value::isConstZero(RHS)) {
+			return Value::makeZeroForType(BI->getIRType());
 		}
 
-		if (isConstOne(RHS)) {
+		if (Value::isConstOne(RHS)) {
 			return LHS;
 		}
 
-		if (isIntType(BI->getIRType()) && !isBoolType(BI->getIRType()) &&
-			isConstMinusOne(RHS)) {
-			return new BinaryInst(makeZeroForType(BI->getIRType()), BinaryInst::SUB, LHS);
+		if (IRType::isInt(BI->getIRType()) && !IRType::isBool(BI->getIRType()) &&
+			Value::isConstMinusOne(RHS)) {
+			return new BinaryInst(Value::makeZeroForType(BI->getIRType()), BinaryInst::SUB, LHS);
 		}
 
 		// x * 2^n -> x << n (integer domain)
-		if (isIntType(BI->getIRType())) {
+		if (IRType::isInt(BI->getIRType())) {
 			int32_t C = 0;
-			if (tryGetIntConst(RHS, C) && C > 0) {
+			if (Value::tryGetIntConst(RHS, C) && C > 0) {
 				uint32_t U = static_cast<uint32_t>(C);
-				if (isPowerOfTwoU32(U)) {
+				if (IRMath::isUnsignedPowerOf2(U)) {
 					return new BinaryInst(LHS, BinaryInst::SHL,
-						ConstInt::newConstInt(ctzPowerOfTwoU32(U)));
+						ConstInt::newConstInt(IRMath::log2u(U)));
 				}
 			}
 		}
@@ -892,43 +592,43 @@ private:
 		const auto Op = BI->getOp();
 		const auto Ty = BI->getIRType();
 
-		if (Op == BinaryInst::DIV && isIntType(Ty) && isNegationPair(LHS, RHS)) {
-			return makeMinusOneForType(Ty);
+		if (Op == BinaryInst::DIV && IRType::isInt(Ty) && InstSimplifyPass::isNegationPair(LHS, RHS)) {
+			return Value::makeMinusOneForType(Ty);
 		}
 
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(Op, LHS, RHS);
+			return BinaryInst::foldConstants(Op, LHS, RHS);
 		}
 
-		if (isUndef(RHS)) {
-			return makeUndefForType(Ty);
+		if (Value::isUndef(RHS)) {
+			return Value::makeUndefForType(Ty);
 		}
 
-		if (isUndef(LHS)) {
-			if (isConstZero(RHS) || isUndef(RHS)) {
-				return makeUndefForType(Ty);
+		if (Value::isUndef(LHS)) {
+			if (Value::isConstZero(RHS) || Value::isUndef(RHS)) {
+				return Value::makeUndefForType(Ty);
 			}
-			return makeZeroForType(Ty);
+			return Value::makeZeroForType(Ty);
 		}
 
-		if (isConstZero(RHS)) {
-			return makeUndefForType(Ty);
+		if (Value::isConstZero(RHS)) {
+			return Value::makeUndefForType(Ty);
 		}
 
-		if (isConstZero(LHS)) {
-			return makeZeroForType(Ty);
+		if (Value::isConstZero(LHS)) {
+			return Value::makeZeroForType(Ty);
 		}
 
 		if (LHS == RHS) {
-			return makeOneForType(Ty);
+			return Value::makeOneForType(Ty);
 		}
 
-		if (isConstOne(RHS)) {
+		if (Value::isConstOne(RHS)) {
 			return LHS;
 		}
 
-		if (Op == BinaryInst::DIV && isConstMinusOne(RHS)) {
-			return new BinaryInst(makeZeroForType(Ty), BinaryInst::SUB, LHS);
+		if (Op == BinaryInst::DIV && Value::isConstMinusOne(RHS)) {
+			return new BinaryInst(Value::makeZeroForType(Ty), BinaryInst::SUB, LHS);
 		}
 
 		return nullptr;
@@ -937,83 +637,83 @@ private:
 	Value *simplifyRem(BinaryInst *BI, Value *LHS, Value *RHS) {
 		const auto Ty = BI->getIRType();
 
-		if (isNegationPair(LHS, RHS)) {
-			return makeZeroForType(Ty);
+		if (InstSimplifyPass::isNegationPair(LHS, RHS)) {
+			return Value::makeZeroForType(Ty);
 		}
 
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
-		if (isUndef(RHS)) return makeUndefForType(Ty);
-		if (isUndef(LHS)) return makeZeroForType(Ty);
+		if (Value::isUndef(RHS)) return Value::makeUndefForType(Ty);
+		if (Value::isUndef(LHS)) return Value::makeZeroForType(Ty);
 
-		if (isConstZero(LHS)) return makeZeroForType(Ty);
-		if (isConstZero(RHS)) return makeUndefForType(Ty);
-		if (isConstOne(RHS)) return makeZeroForType(Ty);
-		if (BI->getOp() == BinaryInst::MOD && isConstMinusOne(RHS)) return makeZeroForType(Ty);
-		if (LHS == RHS) return makeZeroForType(Ty);
+		if (Value::isConstZero(LHS)) return Value::makeZeroForType(Ty);
+		if (Value::isConstZero(RHS)) return Value::makeUndefForType(Ty);
+		if (Value::isConstOne(RHS)) return Value::makeZeroForType(Ty);
+		if (BI->getOp() == BinaryInst::MOD && Value::isConstMinusOne(RHS)) return Value::makeZeroForType(Ty);
+		if (LHS == RHS) return Value::makeZeroForType(Ty);
 
 		return nullptr;
 	}
 
 	Value *simplifyAnd(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeZeroForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeZeroForType(BI->getIRType());
 		}
 
 		if (LHS == RHS) return LHS;
-		if (isConstZero(RHS)) return makeZeroForType(BI->getIRType());
-		if (isConstMinusOne(RHS)) return LHS;
+		if (Value::isConstZero(RHS)) return Value::makeZeroForType(BI->getIRType());
+		if (Value::isConstMinusOne(RHS)) return LHS;
 
 		return nullptr;
 	}
 
 	Value *simplifyOr(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeMinusOneForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeMinusOneForType(BI->getIRType());
 		}
 
-		if (isConstMinusOne(RHS)) return makeMinusOneForType(BI->getIRType());
+		if (Value::isConstMinusOne(RHS)) return Value::makeMinusOneForType(BI->getIRType());
 		if (LHS == RHS) return LHS;
-		if (isConstZero(RHS)) return LHS;
+		if (Value::isConstZero(RHS)) return LHS;
 
 		// (x > a) || (x < b) -> true, when a < b
-		if (isBoolType(BI->getIRType())) {
+		if (IRType::isBool(BI->getIRType())) {
 			Value *GL = nullptr;
 			Value *GR = nullptr;
 			Value *LL = nullptr;
 			Value *LR = nullptr;
-			if (getBinaryOperandsForOp(LHS, BinaryInst::G, GL, GR) &&
-				getBinaryOperandsForOp(RHS, BinaryInst::L, LL, LR) &&
+			if (InstSimplifyPass::getBinaryOperandsForOp(LHS, BinaryInst::G, GL, GR) &&
+				InstSimplifyPass::getBinaryOperandsForOp(RHS, BinaryInst::L, LL, LR) &&
 				GL == LL && GR && LR && GR->isConst() && LR->isConst() &&
-				isIntType(GL->getIRType()) && !isFloatType(GL->getIRType())) {
-				Value *Cmp = foldBinaryConstants(BinaryInst::L, GR, LR);
+				IRType::isInt(GL->getIRType()) && !IRType::isFloat(GL->getIRType())) {
+				Value *Cmp = BinaryInst::foldConstants(BinaryInst::L, GR, LR);
 				bool TrueCond = false;
-				if (Cmp && tryGetBoolConst(Cmp, TrueCond) && TrueCond) {
+				if (Cmp && Value::tryGetBoolConst(Cmp, TrueCond) && TrueCond) {
 					return ConstBool::newConstBool(true);
 				}
 			}
 
-			if (getBinaryOperandsForOp(LHS, BinaryInst::L, GL, GR) &&
-				getBinaryOperandsForOp(RHS, BinaryInst::G, LL, LR) &&
+			if (InstSimplifyPass::getBinaryOperandsForOp(LHS, BinaryInst::L, GL, GR) &&
+				InstSimplifyPass::getBinaryOperandsForOp(RHS, BinaryInst::G, LL, LR) &&
 				GL == LL && GR && LR && GR->isConst() && LR->isConst() &&
-				isIntType(GL->getIRType()) && !isFloatType(GL->getIRType())) {
-				Value *Cmp = foldBinaryConstants(BinaryInst::L, LR, GR);
+				IRType::isInt(GL->getIRType()) && !IRType::isFloat(GL->getIRType())) {
+				Value *Cmp = BinaryInst::foldConstants(BinaryInst::L, LR, GR);
 				bool TrueCond = false;
-				if (Cmp && tryGetBoolConst(Cmp, TrueCond) && TrueCond) {
+				if (Cmp && Value::tryGetBoolConst(Cmp, TrueCond) && TrueCond) {
 					return ConstBool::newConstBool(true);
 				}
 			}
@@ -1024,30 +724,31 @@ private:
 
 	Value *simplifyXor(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
-		if (isUndef(LHS) || isUndef(RHS)) {
-			return makeUndefForType(BI->getIRType());
+		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
+			return Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (isConstZero(RHS)) return LHS;
-		if (LHS == RHS) return makeZeroForType(BI->getIRType());
+		if (Value::isConstZero(RHS)) return LHS;
+		if (LHS == RHS) return Value::makeZeroForType(BI->getIRType());
 
 		return nullptr;
 	}
 
 	Value *simplifyCmp(BinaryInst *BI, Value *LHS, Value *RHS) {
 		if (LHS->isConst() && RHS->isConst()) {
-			return foldBinaryConstants(BI->getOp(), LHS, RHS);
+			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		if (BI->getOp() == BinaryInst::E || BI->getOp() == BinaryInst::NE) {
 			auto tryBoolCmpConst = [&](Value *A, Value *B) -> Value * {
-				BoolExtKind Kind = BoolExtKind::None;
-				Value *Cond = stripBoolExt(A, Kind);
+				Value::BooleanExtensionKind Kind =
+					Value::BooleanExtensionKind::None;
+				Value *Cond = Value::stripBooleanExtension(A, Kind);
 				if (!Cond || !B) return nullptr;
 
 				int32_t Raw = 0;
@@ -1059,12 +760,15 @@ private:
 					return nullptr;
 				}
 
-				int32_t TrueValue = (Kind == BoolExtKind::SignExt) ? -1 : 1;
+				int32_t TrueValue =
+					(Kind == Value::BooleanExtensionKind::SignExt) ? -1 : 1;
 				if (Raw == TrueValue) {
-					return BI->getOp() == BinaryInst::E ? Cond : invertBool(Cond);
+					return BI->getOp() == BinaryInst::E
+						? Cond : BinaryInst::createBooleanNot(Cond);
 				}
 				if (Raw == 0) {
-					return BI->getOp() == BinaryInst::E ? invertBool(Cond) : Cond;
+					return BI->getOp() == BinaryInst::E
+						? BinaryInst::createBooleanNot(Cond) : Cond;
 				}
 				return ConstBool::newConstBool(BI->getOp() == BinaryInst::NE);
 			};
@@ -1085,16 +789,16 @@ private:
 				auto *MB = dynamic_cast<BinaryInst *>(A);
 				if (!MB) return nullptr;
 				if (MB->getOp() != BinaryInst::MOD && MB->getOp() != BinaryInst::UREM) return nullptr;
-				if (!getBinaryOperandsForOp(MB, MB->getOp(), X, D)) return nullptr;
+				if (!InstSimplifyPass::getBinaryOperandsForOp(MB, MB->getOp(), X, D)) return nullptr;
 				if (!B || !B->isConst()) return nullptr;
 
 				int32_t Div = 0;
 				int32_t T = 0;
-				if (!tryGetIntConst(D, Div) || !tryGetIntConst(B, T)) return nullptr;
+				if (!Value::tryGetIntConst(D, Div) || !Value::tryGetIntConst(B, T)) return nullptr;
 				if (Div <= 0) return nullptr;
 
 				const uint32_t UDiv = static_cast<uint32_t>(Div);
-				if (!isPowerOfTwoU32(UDiv)) return nullptr;
+				if (!IRMath::isUnsignedPowerOf2(UDiv)) return nullptr;
 
 				const int32_t Mask = static_cast<int32_t>(UDiv - 1u);
 				bool Safe = false;
@@ -1106,7 +810,7 @@ private:
 				if (!Safe) return nullptr;
 
 				auto *And = new BinaryInst(X, BinaryInst::AND, ConstInt::newConstInt(Mask));
-				if (!insertInstBefore(BI, And)) {
+				if (!Instruction::insertBefore(BI, And)) {
 					delete And;
 					return nullptr;
 				}
@@ -1138,7 +842,7 @@ private:
 	Value *simplifyBinary(BinaryInst *BI, bool &Changed) {
 		Value *LHS = nullptr;
 		Value *RHS = nullptr;
-		if (!getBinaryOperands(BI, LHS, RHS)) return nullptr;
+		if (!BinaryInst::getOperands(BI, LHS, RHS)) return nullptr;
 
 		switch (BI->getOp()) {
 		case BinaryInst::ADD:
@@ -1172,27 +876,24 @@ private:
 	}
 
 	Value *simplifySelect(SelectInst *SI) {
-		auto &UL = SI->getUserList();
-		if (UL.size() < 3) return nullptr;
-
-		Value *Cond = UL[0]->getValue();
-		Value *TV = UL[1]->getValue();
-		Value *FV = UL[2]->getValue();
+		Value *Cond = SI->getCondition();
+		Value *TV = SI->getTrueValue();
+		Value *FV = SI->getFalseValue();
 		if (!Cond || !TV || !FV) return nullptr;
 
 		if (TV == FV) return TV;
 
-		if (isUndef(TV)) return FV;
-		if (isUndef(FV)) return TV;
+		if (Value::isUndef(TV)) return FV;
+		if (Value::isUndef(FV)) return TV;
 
-		if (isUndef(Cond)) {
+		if (Value::isUndef(Cond)) {
 			if (TV->isConst() && !FV->isConst()) return TV;
 			if (FV->isConst() && !TV->isConst()) return FV;
 			return TV;
 		}
 
 		bool CV = false;
-		if (tryGetBoolConst(Cond, CV)) {
+		if (Value::tryGetBoolConst(Cond, CV)) {
 			return CV ? TV : FV;
 		}
 
@@ -1200,40 +901,40 @@ private:
 			// 三个操作数均为常量时，按条件常量进行折叠；
 			// 若条件常量形态不可判真值，则保守不折叠。
 			bool ConstCond = false;
-			if (tryGetBoolConst(Cond, ConstCond)) {
+			if (Value::tryGetBoolConst(Cond, ConstCond)) {
 				return ConstCond ? TV : FV;
 			}
 			return nullptr;
 		}
 
 		const auto ResTy = SI->getIRType();
-		if (isBoolType(ResTy)) {
-			if (isConstZero(FV)) {
+		if (IRType::isBool(ResTy)) {
+			if (Value::isConstZero(FV)) {
 				return new BinaryInst(Cond, BinaryInst::AND, TV);
 			}
-			if (isConstOne(TV)) {
+			if (Value::isConstOne(TV)) {
 				return new BinaryInst(Cond, BinaryInst::OR, FV);
 			}
 
-			if (isBoolType(Cond->getIRType()) && isConstOne(FV)) {
-				auto *NotX = new BinaryInst(Cond, BinaryInst::XOR, ConstBool::newConstBool(true));
-				if (insertInstBefore(SI, NotX)) {
+			if (IRType::isBool(Cond->getIRType()) && Value::isConstOne(FV)) {
+				auto *NotX = BinaryInst::createBooleanNot(Cond);
+				if (Instruction::insertBefore(SI, NotX)) {
 					return new BinaryInst(NotX, BinaryInst::OR, TV);
 				}
 				delete NotX;
 			}
 
-			if (isBoolType(Cond->getIRType()) && isConstZero(TV)) {
-				auto *NotX = new BinaryInst(Cond, BinaryInst::XOR, ConstBool::newConstBool(true));
-				if (insertInstBefore(SI, NotX)) {
+			if (IRType::isBool(Cond->getIRType()) && Value::isConstZero(TV)) {
+				auto *NotX = BinaryInst::createBooleanNot(Cond);
+				if (Instruction::insertBefore(SI, NotX)) {
 					return new BinaryInst(NotX, BinaryInst::AND, FV);
 				}
 				delete NotX;
 			}
 		}
 
-		if (isBoolType(Cond->getIRType()) && isIntType(ResTy) && !isBoolType(ResTy) &&
-			isConstOne(TV) && isConstZero(FV)) {
+		if (IRType::isBool(Cond->getIRType()) && IRType::isInt(ResTy) && !IRType::isBool(ResTy) &&
+			Value::isConstOne(TV) && Value::isConstZero(FV)) {
 			auto *ZI = new ZextInst(ResTy);
 			ZI->addUse(Cond);
 			return ZI;
@@ -1242,7 +943,7 @@ private:
 		if (auto *Cmp = dynamic_cast<BinaryInst *>(Cond)) {
 			Value *CmpL = nullptr;
 			Value *CmpR = nullptr;
-			if (getBinaryOperands(Cmp, CmpL, CmpR) && CmpL && CmpR) {
+			if (BinaryInst::getOperands(Cmp, CmpL, CmpR) && CmpL && CmpR) {
 				if (Cmp->getOp() == BinaryInst::E &&
 					((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
 					return TV;
@@ -1253,24 +954,24 @@ private:
 					return TV;
 				}
 
-				if (Cmp->getOp() == BinaryInst::E && isConstZero(CmpR)) {
+				if (Cmp->getOp() == BinaryInst::E && Value::isConstZero(CmpR)) {
 					if (auto *OrI = dynamic_cast<BinaryInst *>(CmpL)) {
 						Value *OrL = nullptr;
 						Value *OrR = nullptr;
-						if (OrI->getOp() == BinaryInst::OR && getBinaryOperands(OrI, OrL, OrR) &&
-							(TV == OrL || TV == OrR) && isConstZero(FV)) {
-							return makeZeroForType(TV->getIRType());
+						if (OrI->getOp() == BinaryInst::OR && BinaryInst::getOperands(OrI, OrL, OrR) &&
+							(TV == OrL || TV == OrR) && Value::isConstZero(FV)) {
+							return Value::makeZeroForType(TV->getIRType());
 						}
 					}
 				}
 
-				if (Cmp->getOp() == BinaryInst::E && isConstMinusOne(CmpR)) {
+				if (Cmp->getOp() == BinaryInst::E && Value::isConstMinusOne(CmpR)) {
 					if (auto *AndI = dynamic_cast<BinaryInst *>(CmpL)) {
 						Value *AndL = nullptr;
 						Value *AndR = nullptr;
-						if (AndI->getOp() == BinaryInst::AND && getBinaryOperands(AndI, AndL, AndR) &&
-							(TV == AndL || TV == AndR) && isConstMinusOne(FV)) {
-							return makeMinusOneForType(TV->getIRType());
+						if (AndI->getOp() == BinaryInst::AND && BinaryInst::getOperands(AndI, AndL, AndR) &&
+							(TV == AndL || TV == AndR) && Value::isConstMinusOne(FV)) {
+							return Value::makeMinusOneForType(TV->getIRType());
 						}
 					}
 				}
@@ -1294,7 +995,7 @@ private:
 		for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
 			Value *InV = Phi->getIncomingValue(i);
 			if (!InV || InV == Phi) continue;
-			if (isUndef(InV)) {
+			if (Value::isUndef(InV)) {
 				HasUndef = true;
 				continue;
 			}

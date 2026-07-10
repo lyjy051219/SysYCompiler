@@ -27,7 +27,7 @@
 // 用户函数调用全部 root-live。
 // 理由: SideEffectAnalysis 对自递归调用跳过 (SideEffect.cpp:277),
 //       getFunctionModRefInfo 不证明可终止。
-static bool callHasObservableSideEffect(CallInst *CI, FunctionAnalysisPassManager &FAM) {
+bool ADCEPass::callHasObservableSideEffect(CallInst *CI) {
     Value *Callee = CI ? CI->getCallee() : nullptr;
     if (!Callee) return true;
 
@@ -51,9 +51,8 @@ static bool callHasObservableSideEffect(CallInst *CI, FunctionAnalysisPassManage
 }
 
 // isRootLive [F5 + OQ 修正]
-static bool isRootLive(Instruction *I, Function &F,
-                       PostDominatorTree &PDT,
-                       FunctionAnalysisPassManager &FAM) {
+bool ADCEPass::isRootLive(
+    Instruction *I, PostDominatorTree &PDT) {
     // 1. StoreInst → always root live
     if (dynamic_cast<StoreInst *>(I)) return true;
 
@@ -62,19 +61,17 @@ static bool isRootLive(Instruction *I, Function &F,
 
     // 3. CallInst → 看副作用
     if (auto *CI = dynamic_cast<CallInst *>(I))
-        return callHasObservableSideEffect(CI, FAM);
+        return callHasObservableSideEffect(CI);
 
     // 4. BrInst
     if (auto *BI = dynamic_cast<BrInst *>(I)) {
-        auto &uses = BI->getUserList();
         // 4a. 无条件分支 → always root live
-        if (uses.size() == 1) return true;
+        if (!BI->isConditional()) return true;
 
         // 4b. [OQ 修正] reverse-unreachable 块的 terminator → root live
         //     这些块 entry 可达但到不了 exit，ipostdom 关系不可靠
         //     保守保留其 CFG 结构
-        BasicBlock *BB = static_cast<Instruction *>(BI)->
-            ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = BI->getParent();
         if (BB && !PDT.isReachableToExit(BB)) return true;
 
         // 4c. [F5 修正] 不再特判 entry block
@@ -89,11 +86,11 @@ static bool isRootLive(Instruction *I, Function &F,
 }
 
 // markLive
-static void markLive(Instruction *I, ADCEContext &ctx) {
+void ADCEPass::markLive(Instruction *I, ADCEContext &ctx) {
     if (!ctx.LiveInsts.insert(I).second)
         return;
     ctx.Worklist.push_back(I);
-    BasicBlock *BB = I->ChainNode<BasicBlock, Instruction>::getParent();
+    BasicBlock *BB = I->getParent();
     if (BB) ctx.LiveBlocks.insert(BB);
 }
 
@@ -102,9 +99,8 @@ static void markLive(Instruction *I, ADCEContext &ctx) {
 // 控制依赖(B) ≈ postdom frontier(B) 的反向定义。
 // 从 B 的每个前驱 P 开始，沿 ipostdom 链走到 ipostdom(B)，
 // 路径上每个条件分支都控制 B 的执行 → 保活。
-static void markControlDependences(BasicBlock *B,
-                                   PostDominatorTree &PDT,
-                                   ADCEContext &ctx) {
+void ADCEPass::markControlDependences(
+    BasicBlock *B, PostDominatorTree &PDT, ADCEContext &ctx) {
     if (!B) return;
     if (!ctx.CDProcessed.insert(B).second) return;
 
@@ -126,8 +122,7 @@ static void markControlDependences(BasicBlock *B,
             Instruction *term = runner->back();
             if (term) {
                 auto *br = dynamic_cast<BrInst *>(term);
-                // 只保活条件分支 (userList.size() == 3)
-                if (br && br->getUserList().size() == 3) {
+                if (br && br->isConditional()) {
                     markLive(term, ctx);
                 }
             }
@@ -140,15 +135,14 @@ static void markControlDependences(BasicBlock *B,
 //
 // 始终从原始两个后继中选一个。
 // 不跳到任意 postdom → 不需要 PHI repair。
-static BasicBlock *pickSurvivorSuccessor(BasicBlock *BB,
-                                         PostDominatorTree &PDT) {
+BasicBlock *ADCEPass::pickSurvivorSuccessor(
+    BasicBlock *BB, PostDominatorTree &PDT) {
     BrInst *br = dynamic_cast<BrInst *>(BB->back());
     if (!br) return nullptr;
-    auto &uses = br->getUserList();
-    if (uses.size() != 3) return nullptr;
+    if (!br->isConditional()) return nullptr;
 
-    BasicBlock *trueBB  = dynamic_cast<BasicBlock *>(uses[1]->getValue());
-    BasicBlock *falseBB = dynamic_cast<BasicBlock *>(uses[2]->getValue());
+    BasicBlock *trueBB = br->getTrueSuccessor();
+    BasicBlock *falseBB = br->getFalseSuccessor();
     if (!trueBB || !falseBB) return trueBB ? trueBB : falseBB;
 
     // 两个目标相同 → 选它
@@ -168,7 +162,9 @@ static BasicBlock *pickSurvivorSuccessor(BasicBlock *BB,
 }
 
 // sweep [F3/F4 重设计]
-static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &cfgChanged) {
+bool ADCEPass::sweep(
+    Function &F, PostDominatorTree &PDT, ADCEContext &ctx,
+    bool &cfgChanged) {
     bool changed = false;
     cfgChanged = false;
 
@@ -179,16 +175,15 @@ static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &c
         if (!term) continue;
         if (ctx.LiveInsts.count(term)) continue;  // 活的不动
         auto *br = dynamic_cast<BrInst *>(term);
-        if (br && br->getUserList().size() == 3) {
+        if (br && br->isConditional()) {
             blocksToRewrite.push_back(bb);
         }
     }
 
     for (BasicBlock *BB : blocksToRewrite) {
         BrInst *br = dynamic_cast<BrInst *>(BB->back());
-        auto &uses = br->getUserList();
-        BasicBlock *trueBB  = dynamic_cast<BasicBlock *>(uses[1]->getValue());
-        BasicBlock *falseBB = dynamic_cast<BasicBlock *>(uses[2]->getValue());
+        BasicBlock *trueBB = br->getTrueSuccessor();
+        BasicBlock *falseBB = br->getFalseSuccessor();
 
         // 选择保留哪条边
         BasicBlock *survivor = pickSurvivorSuccessor(BB, PDT);
@@ -200,8 +195,7 @@ static bool sweep(Function &F, PostDominatorTree &PDT, ADCEContext &ctx, bool &c
         }
 
         // 改写: 删条件分支，换无条件跳转
-        delete br;
-        BB->genUnCondInst(survivor);
+        BasicBlock::replaceCondBrWithUncond(BB, survivor);
         changed = true;
         cfgChanged = true;
     }
@@ -238,7 +232,7 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
     // 2. Initialize: 收集 root-live
     for (auto bb : F) {
         for (auto inst : *bb) {
-            if (isRootLive(inst, F, PDT, FAM)) {
+            if (isRootLive(inst, PDT)) {
                 markLive(inst, ctx);
             }
         }
@@ -250,15 +244,16 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
         ctx.Worklist.pop_front();
 
         // 3a. 数据依赖: 保活所有 Instruction 型操作数
-        for (auto &use : I->getUserList()) {
-            Value *V = use->getValue();
+        for (size_t OperandIndex = 0;
+             OperandIndex < I->getNumOperands(); ++OperandIndex) {
+            Value *V = I->getOperand(OperandIndex);
             if (auto *OpI = dynamic_cast<Instruction *>(V)) {
                 markLive(OpI, ctx);
             }
         }
 
         // 3b. 控制依赖: I 所在块
-        BasicBlock *BB = I->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = I->getParent();
         markControlDependences(BB, PDT, ctx);
 
         // 3c. 控制依赖: PhiInst 的每个 incoming block

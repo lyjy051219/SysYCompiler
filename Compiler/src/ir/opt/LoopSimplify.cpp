@@ -9,32 +9,6 @@
 #include <set>
 #include <string>
 
-//将Pred中指向Header的边重定向到PreHeader
-bool LoopSimplifyPass::replaceWith(BasicBlock *Pred, BasicBlock *Header, BasicBlock *PreHeader) {
-    if (!Pred || !Header || !PreHeader || Header == PreHeader) return false;
-    //获取前驱块最后一条指令
-    auto *br = dynamic_cast<BrInst *>(Pred->back());
-    if (!br) return false;
-
-    bool changed = false;
-    //遍历这条Br的usee
-    //如果发现Br的某个操作数是Header，就把这个操作数替换成PreHeader
-    for (auto &useUPtr : br->getUserList()) {
-        Use *U = useUPtr.get();
-        if (U && U->getValue() == Header) {
-            //将Use从Header中删除
-            U->removeFromUseList(U->getUser());
-            //改变操作数为PreHeader
-            U->usee = PreHeader;
-            //将Use挂载到PreHeader上
-            PreHeader->getUseList().addUseNode(U); // 将该 Use 注册到新的目标 (PreHeader) 的使用链表中
-
-            changed = true;
-        }
-    }
-    return changed;
-}
-
 //Preds->MergeBlock->Target
 //修改Target中的Phi节点--将来自Preds的边提升到MergeBlock的新Phi，并将MergeBlock这个新Phi作为Target
 bool LoopSimplifyPass::rewritePhisForMergedPreds(
@@ -133,7 +107,7 @@ bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
     F.pushBlock(preheader);
     //第四步：建立前驱块和PreHeader之间的联系，取消前驱块和Header之间的联系--其实就是改动Br
     for (BasicBlock *pred : outPreds) {
-        replaceWith(pred, header, preheader);
+        BasicBlock::redirectBranchTarget(pred, header, preheader);
     }
     //第五步：修改Header中的Phi节点
     std::unordered_set<BasicBlock *> outSet(outPreds.begin(), outPreds.end());
@@ -178,7 +152,7 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
         //依旧还是那三步
         std::unordered_set<BasicBlock *> insidePreds(insidePredSet.begin(), insidePredSet.end());
         for (BasicBlock *pred : insidePredSet) {
-            replaceWith(pred, exitBB, dedExit);
+            BasicBlock::redirectBranchTarget(pred, exitBB, dedExit);
         }
 
         rewritePhisForMergedPreds(exitBB, insidePreds, dedExit);
@@ -208,7 +182,7 @@ bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
     //依旧是那三步
     std::unordered_set<BasicBlock *> backedgeSet(backedgePreds.begin(), backedgePreds.end());
     for (BasicBlock *pred : backedgePreds) {
-        replaceWith(pred, header, latch);
+        BasicBlock::redirectBranchTarget(pred, header, latch);
     }
 
     rewritePhisForMergedPreds(header, backedgeSet, latch);

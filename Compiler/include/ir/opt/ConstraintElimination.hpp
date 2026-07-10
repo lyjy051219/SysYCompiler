@@ -3,6 +3,7 @@
 #include "lib/CFG.hpp"
 
 #include <cstdint>
+#include <vector>
 
 class DominatorNode;
 
@@ -35,4 +36,30 @@ struct ConstraintElimFoldCandidate {
 class ConstraintEliminationPass : public PassDescriptor<ConstraintEliminationPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+    static ConstraintElimOffsetExpr decomposeOffset(Value *V, int Depth = 2);
+    static bool rewriteOffsetConstraint(
+        Value *LHS, Value *RHS, BinaryInst::Operation Op,
+        ConstraintElimConstraint &Out);
+    static bool extractConstraint(
+        BinaryInst *Cmp, bool Negate, ConstraintElimConstraint &Out);
+    static bool comparableBoundValues(
+        const ConstraintElimConstraint &A,
+        const ConstraintElimConstraint &B, int64_t &AV, int64_t &BV);
+    static bool implies(
+        const ConstraintElimConstraint &Known,
+        const ConstraintElimConstraint &Target);
+    static bool isImplied(
+        const std::vector<ConstraintElimConstraint> &Stack,
+        const ConstraintElimConstraint &Target);
+    static bool impliesTransitive(
+        const std::vector<ConstraintElimConstraint> &Stack,
+        const ConstraintElimConstraint &Target);
+    static bool isImpliedChained(
+        const std::vector<ConstraintElimConstraint> &Stack,
+        const ConstraintElimConstraint &Target);
+    static bool isContradicted(
+        const std::vector<ConstraintElimConstraint> &Stack,
+        const ConstraintElimConstraint &Target);
 };

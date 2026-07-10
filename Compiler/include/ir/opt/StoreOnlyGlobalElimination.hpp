@@ -3,6 +3,7 @@
 #include "lib/CFG.hpp"
 
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -29,5 +30,13 @@ public:
     explicit StoreOnlyGlobalEliminationPass(FunctionAnalysisPassManager &FAM) : FAM(FAM) {}
     PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
 private:
+    static void collectReachableBases(
+        Value *Pointer, std::unordered_set<Value *> &Bases,
+        std::unordered_set<Value *> &Visited, bool &Escapes,
+        int Depth = 0);
+    static StoreOnlyGlobalTraceResult traceBaseAndIndex(Value *Pointer);
+    static void markGlobalRead(
+        Variable *Global, const StoreOnlyGlobalTraceResult *Trace,
+        std::unordered_map<Variable *, StoreOnlyGlobalReadInfo> &ReadInfo);
     FunctionAnalysisPassManager &FAM;
 };

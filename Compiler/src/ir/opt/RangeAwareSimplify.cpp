@@ -36,7 +36,7 @@
 //    当前 IR 无独立 UREM 指令，pass 保留接口等后端区分后再实装
 // =====================================================================
 
-static bool isPureIntExprOp(BinaryInst::Operation op) {
+bool RangeAwareSimplifyPass::isPureIntExprOp(BinaryInst::Operation op) {
     switch (op) {
         case BinaryInst::ADD:
         case BinaryInst::SUB:
@@ -54,9 +54,9 @@ static bool isPureIntExprOp(BinaryInst::Operation op) {
     }
 }
 
-static IntRange queryIntExprImpl(Value *V, BasicBlock *BB, RangeInfo &RI,
-                                 DominatorTree &DT, int depth,
-                                 std::unordered_set<Value *> &visiting) {
+IntRange RangeAwareSimplifyPass::queryIntExprImpl(
+    Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT,
+    int depth, std::unordered_set<Value *> &visiting) {
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return IntRange(CI->getVal());
     if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
@@ -70,14 +70,13 @@ static IntRange queryIntExprImpl(Value *V, BasicBlock *BB, RangeInfo &RI,
     if (!BI || !isPureIntExprOp(BI->getOp()))
         return base;
 
-    BasicBlock *DefBB = BI->ChainNode<BasicBlock, Instruction>::getParent();
+    BasicBlock *DefBB = BI->getParent();
     if (DefBB != BB)
         return base;
 
-    auto &UL = BI->getUserList();
-    if (UL.size() < 2) return base;
-    Value *lhs = UL[0]->getValue();
-    Value *rhs = UL[1]->getValue();
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!BI->getOperands(lhs, rhs)) return base;
     if (!lhs || !rhs) return base;
     if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return base;
     if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return base;
@@ -105,14 +104,14 @@ static IntRange queryIntExprImpl(Value *V, BasicBlock *BB, RangeInfo &RI,
     return base.intersectWith(expr);
 }
 
-static IntRange queryIntExpr(Value *V, BasicBlock *BB, RangeInfo &RI,
-                             DominatorTree &DT) {
+IntRange RangeAwareSimplifyPass::queryIntExpr(
+    Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT) {
     std::unordered_set<Value *> visiting;
     return queryIntExprImpl(V, BB, RI, DT, 3, visiting);
 }
 
-static bool isKnownNonNegative(Value *V, BasicBlock *BB, RangeInfo &RI,
-                               DominatorTree &DT) {
+bool RangeAwareSimplifyPass::isKnownNonNegative(
+    Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT) {
     if (!V || !BB) return false;
 
     IntRange R = queryIntExpr(V, BB, RI, DT);
@@ -125,11 +124,11 @@ static bool isKnownNonNegative(Value *V, BasicBlock *BB, RangeInfo &RI,
     return !FromBits.isBottom() && FromBits.isNonNegative();
 }
 
-static int evalTruth(Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT) {
-    if (auto *CB = dynamic_cast<ConstBool *>(V))
-        return CB->getVal() ? 1 : 0;
-    if (auto *CI = dynamic_cast<ConstInt *>(V))
-        return CI->getVal() != 0 ? 1 : 0;
+int RangeAwareSimplifyPass::evalTruth(
+    Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT) {
+    bool ConstantTruth = false;
+    if (V && V->tryGetBoolConst(ConstantTruth))
+        return ConstantTruth ? 1 : 0;
     if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
         return -1;
 
@@ -148,7 +147,8 @@ static int evalTruth(Value *V, BasicBlock *BB, RangeInfo &RI, DominatorTree &DT)
 // =====================================================================
 // Step 1: 强度削减 — 除法/取模 → 移位/位与
 // =====================================================================
-static bool strengthReduce(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::strengthReduce(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<BinaryInst *> candidates;
@@ -163,10 +163,9 @@ static bool strengthReduce(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (BinaryInst *BI : candidates) {
-        auto &UL = BI->getUserList();
-        if (UL.size() < 2) continue;
-        Value *lhs = UL[0]->getValue();
-        Value *rhs = UL[1]->getValue();
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (!BI->getOperands(lhs, rhs)) continue;
 
         // 只处理整数除法/取模（BinaryInst::DIV/MOD 也用于 fdiv/frem，
         // 对浮点做移位/位与是致命的语义错误）
@@ -178,7 +177,7 @@ static bool strengthReduce(Function &F, RangeInfo &RI, DominatorTree &DT) {
         if (!rhsConst || !IRMath::isPowerOf2(rhsConst->getVal())) continue;
         int shift = IRMath::log2i(rhsConst->getVal());
 
-        BasicBlock *BB = BI->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = BI->getParent();
         if (!BB) continue;
 
         // 左操作数必须非负。优先使用局部表达式范围，再结合 KnownBits
@@ -217,7 +216,8 @@ static bool strengthReduce(Function &F, RangeInfo &RI, DominatorTree &DT) {
 // =====================================================================
 // Step 2: 常量折叠 — 范围是单值时替换为 ConstInt / ConstFloat
 // =====================================================================
-static bool foldConstants(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldConstants(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     // 整数 fold 候选 + 浮点 fold 候选分别收集
@@ -236,7 +236,7 @@ static bool foldConstants(Function &F, RangeInfo &RI, DominatorTree &DT) {
             if (dynamic_cast<LoadInst *>(I)) continue;
             if (dynamic_cast<StoreInst *>(I)) continue;
 
-            BasicBlock *block = I->ChainNode<BasicBlock, Instruction>::getParent();
+            BasicBlock *block = I->getParent();
             if (!block) continue;
 
             auto ty = I->getIRType()->getEnum();
@@ -268,7 +268,7 @@ static bool foldConstants(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (Instruction *I : intToFold) {
-        BasicBlock *block = I->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *block = I->getParent();
         if (!block) continue;
         IntRange range = RI.query(I, block, DT);
         int cval;
@@ -285,7 +285,7 @@ static bool foldConstants(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (Instruction *I : floatToFold) {
-        BasicBlock *block = I->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *block = I->getParent();
         if (!block) continue;
         FloatRange range = RI.queryFloat(I, block, DT);
         if (!range.isSingleValue()) continue;
@@ -302,7 +302,8 @@ static bool foldConstants(Function &F, RangeInfo &RI, DominatorTree &DT) {
 // =====================================================================
 // Step 3: 比较折叠 — icmp 的两操作数范围不重叠时折叠为 true/false
 // =====================================================================
-static bool foldComparisons(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldComparisons(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<BinaryInst *> cmps;
@@ -319,13 +320,12 @@ static bool foldComparisons(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (BinaryInst *cmp : cmps) {
-        auto &UL = cmp->getUserList();
-        if (UL.size() < 2) continue;
-        Value *lhs = UL[0]->getValue();
-        Value *rhs = UL[1]->getValue();
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (!cmp->getOperands(lhs, rhs)) continue;
         if (!lhs->getIRType() || !rhs->getIRType()) continue;
 
-        BasicBlock *BB = cmp->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = cmp->getParent();
         if (!BB) continue;
 
         auto opTy = lhs->getIRType()->getEnum();
@@ -454,7 +454,8 @@ static bool foldComparisons(Function &F, RangeInfo &RI, DominatorTree &DT) {
 // 抽自 foldComparisons 的核心表，供 select 相关 pattern 复用。
 // 要求 lhs / rhs 都是 IR_INT 且不是 Bottom / Top（Top 返回 -1）。
 // =====================================================================
-static int evalIntCmp(BinaryInst::Operation op, const IntRange &l, const IntRange &r) {
+int RangeAwareSimplifyPass::evalIntCmp(
+    BinaryInst::Operation op, const IntRange &l, const IntRange &r) {
     if (l.isTop() || r.isTop() || l.isBottom() || r.isBottom()) return -1;
     switch (op) {
         case BinaryInst::L:
@@ -487,7 +488,7 @@ static int evalIntCmp(BinaryInst::Operation op, const IntRange &l, const IntRang
 }
 
 // 整数 cmp op 的意义（返回 true 表示这是我们处理的 6 种之一）
-static bool isIntCmpOp(BinaryInst::Operation op) {
+bool RangeAwareSimplifyPass::isIntCmpOp(BinaryInst::Operation op) {
     return op == BinaryInst::L || op == BinaryInst::LE ||
            op == BinaryInst::G || op == BinaryInst::GE ||
            op == BinaryInst::E || op == BinaryInst::NE;
@@ -506,7 +507,8 @@ static bool isIntCmpOp(BinaryInst::Operation op) {
 //                    "true 在 true 支"时 cmp ≡ cond，"true 在 false 支"时
 //                    cmp ≡ !cond —— 后者我们不新造 xor 1，直接跳过保守
 // =====================================================================
-static bool foldIcmpOfSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldIcmpOfSelect(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<BinaryInst *> cmps;
@@ -518,24 +520,21 @@ static bool foldIcmpOfSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (BinaryInst *cmp : cmps) {
-        auto &UL = cmp->getUserList();
-        if (UL.size() < 2) continue;
-        Value *lhs = UL[0]->getValue();
-        Value *rhs = UL[1]->getValue();
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (!cmp->getOperands(lhs, rhs)) continue;
         if (!lhs->getIRType() || !rhs->getIRType()) continue;
         if (lhs->getIRType()->getEnum() != IR_INT) continue;
         if (rhs->getIRType()->getEnum() != IR_INT) continue;
 
-        BasicBlock *BB = cmp->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = cmp->getParent();
         if (!BB) continue;
 
         // 只支持 lhs 是 select 的场景；rhs-是-select 可对称实现但概率低，先省
         auto *sel = dynamic_cast<SelectInst *>(lhs);
         if (!sel) continue;
-        auto &selUL = sel->getUserList();
-        if (selUL.size() < 3) continue;
-        Value *tv = selUL[1]->getValue();
-        Value *fv = selUL[2]->getValue();
+        Value *tv = sel->getTrueValue();
+        Value *fv = sel->getFalseValue();
         if (!tv->getIRType() || tv->getIRType()->getEnum() != IR_INT) continue;
         if (!fv->getIRType() || fv->getIRType()->getEnum() != IR_INT) continue;
 
@@ -557,7 +556,7 @@ static bool foldIcmpOfSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
             changed = true;
         } else if (resT == 1 && resF == 0) {
             // true 支 true、false 支 false → cmp ≡ select 的 cond
-            Value *cond = selUL[0]->getValue();
+            Value *cond = sel->getCondition();
             cmp->replaceAllUsesWith(cond);
             delete cmp;
             changed = true;
@@ -574,7 +573,8 @@ static bool foldIcmpOfSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
 // 比较条件通常会被 foldComparisons 先折掉；这里补的是非直接比较条件，
 // 例如经过 zext/trunc/xor/phi 之后 RangeAnalysis 仍能证明 cond != 0。
 // =====================================================================
-static bool foldSelectByConditionRange(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldSelectByConditionRange(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<SelectInst *> candidates;
@@ -586,14 +586,12 @@ static bool foldSelectByConditionRange(Function &F, RangeInfo &RI, DominatorTree
     }
 
     for (SelectInst *SI : candidates) {
-        auto &UL = SI->getUserList();
-        if (UL.size() < 3) continue;
-        Value *cond = UL[0]->getValue();
-        Value *tv = UL[1]->getValue();
-        Value *fv = UL[2]->getValue();
+        Value *cond = SI->getCondition();
+        Value *tv = SI->getTrueValue();
+        Value *fv = SI->getFalseValue();
         if (!cond || !tv || !fv) continue;
 
-        BasicBlock *BB = SI->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = SI->getParent();
         if (!BB) continue;
         int truth = evalTruth(cond, BB, RI, DT);
         if (truth < 0) continue;
@@ -618,7 +616,8 @@ static bool foldSelectByConditionRange(Function &F, RangeInfo &RI, DominatorTree
 //   非负 → abs(x) = x
 //   非正 → abs(x) = 已有的 sub(0, x)
 // =====================================================================
-static bool foldAbsViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldAbsViaSelect(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<SelectInst *> candidates;
@@ -634,27 +633,25 @@ static bool foldAbsViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
     auto matchNeg = [](Value *v) -> Value * {
         auto *BI = dynamic_cast<BinaryInst *>(v);
         if (!BI || BI->getOp() != BinaryInst::SUB) return nullptr;
-        auto &UL = BI->getUserList();
-        if (UL.size() < 2) return nullptr;
-        auto *c = dynamic_cast<ConstInt *>(UL[0]->getValue());
+        Value *LHS = nullptr;
+        Value *RHS = nullptr;
+        if (!BI->getOperands(LHS, RHS)) return nullptr;
+        auto *c = dynamic_cast<ConstInt *>(LHS);
         if (!c || c->getVal() != 0) return nullptr;
-        return UL[1]->getValue();
+        return RHS;
     };
 
     for (SelectInst *SI : candidates) {
-        auto &selUL = SI->getUserList();
-        if (selUL.size() < 3) continue;
-        auto *cmp = dynamic_cast<BinaryInst *>(selUL[0]->getValue());
+        auto *cmp = dynamic_cast<BinaryInst *>(SI->getCondition());
         if (!cmp || !isIntCmpOp(cmp->getOp())) continue;
-        auto &cmpUL = cmp->getUserList();
-        if (cmpUL.size() < 2) continue;
-
-        Value *cmpLhs = cmpUL[0]->getValue();
-        auto *cmpRhs = dynamic_cast<ConstInt *>(cmpUL[1]->getValue());
+        Value *cmpLhs = nullptr;
+        Value *cmpRhsValue = nullptr;
+        if (!cmp->getOperands(cmpLhs, cmpRhsValue)) continue;
+        auto *cmpRhs = dynamic_cast<ConstInt *>(cmpRhsValue);
         if (!cmpRhs || cmpRhs->getVal() != 0) continue;
 
-        Value *tv = selUL[1]->getValue();
-        Value *fv = selUL[2]->getValue();
+        Value *tv = SI->getTrueValue();
+        Value *fv = SI->getFalseValue();
 
         // 判断是哪种 abs 写法
         Value *x = nullptr;
@@ -676,7 +673,7 @@ static bool foldAbsViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
 
         if (!isAbs) continue;
 
-        BasicBlock *BB = SI->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = SI->getParent();
         if (!BB) continue;
         IntRange xr = queryIntExpr(x, BB, RI, DT);
         Value *chosen = nullptr;
@@ -705,7 +702,8 @@ static bool foldAbsViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
 //   a.min >= b.max → a >= b 恒成立 → smax→a, smin→b
 //   b.min >= a.max → b >= a 恒成立 → smax→b, smin→a
 // =====================================================================
-static bool foldMinMaxViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<SelectInst *> candidates;
@@ -719,17 +717,13 @@ static bool foldMinMaxViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
     }
 
     for (SelectInst *SI : candidates) {
-        auto &selUL = SI->getUserList();
-        if (selUL.size() < 3) continue;
-        auto *cmp = dynamic_cast<BinaryInst *>(selUL[0]->getValue());
+        auto *cmp = dynamic_cast<BinaryInst *>(SI->getCondition());
         if (!cmp || !isIntCmpOp(cmp->getOp())) continue;
-        auto &cmpUL = cmp->getUserList();
-        if (cmpUL.size() < 2) continue;
-
-        Value *a = cmpUL[0]->getValue();
-        Value *b = cmpUL[1]->getValue();
-        Value *tv = selUL[1]->getValue();
-        Value *fv = selUL[2]->getValue();
+        Value *a = nullptr;
+        Value *b = nullptr;
+        if (!cmp->getOperands(a, b)) continue;
+        Value *tv = SI->getTrueValue();
+        Value *fv = SI->getFalseValue();
 
         // 必须 tv/fv 来自 {a, b} 的排列，否则不是 min/max pattern
         bool straight = (tv == a && fv == b);  // select(cmp, a, b)
@@ -740,7 +734,7 @@ static bool foldMinMaxViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
         if (op != BinaryInst::L && op != BinaryInst::LE &&
             op != BinaryInst::G && op != BinaryInst::GE) continue;
 
-        BasicBlock *BB = SI->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = SI->getParent();
         if (!BB) continue;
         IntRange ra = dynamic_cast<ConstInt *>(a) ?
             IntRange(dynamic_cast<ConstInt *>(a)->getVal()) : queryIntExpr(a, BB, RI, DT);
@@ -789,7 +783,8 @@ static bool foldMinMaxViaSelect(Function &F, RangeInfo &RI, DominatorTree &DT) {
 // =====================================================================
 // Step 4: srem → urem 转换
 // =====================================================================
-static bool convertSignedToUnsigned(Function &F, RangeInfo &RI, DominatorTree &DT) {
+bool RangeAwareSimplifyPass::convertSignedToUnsigned(
+    Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
     std::vector<BinaryInst *> srems;
@@ -802,12 +797,11 @@ static bool convertSignedToUnsigned(Function &F, RangeInfo &RI, DominatorTree &D
     }
 
     for (BinaryInst *srem : srems) {
-        auto &UL = srem->getUserList();
-        if (UL.size() < 2) continue;
-        Value *lhs = UL[0]->getValue();
-        Value *rhs = UL[1]->getValue();
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (!srem->getOperands(lhs, rhs)) continue;
 
-        BasicBlock *BB = srem->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = srem->getParent();
         if (!BB) continue;
 
         IntRange lRange = RI.query(lhs, BB, DT);

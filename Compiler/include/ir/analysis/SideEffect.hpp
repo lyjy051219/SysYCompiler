@@ -48,6 +48,7 @@ struct BaseAddressInfo {
 
     bool merge(const BaseAddressInfo& Other);
     bool isEmpty() const { return bases.empty() && !untracked; }
+    void collectExternalBases(std::unordered_set<Value*> &Dest) const;
 };
 
 using BaseAddressInfoMap = std::unordered_map<Value*, BaseAddressInfo>;
@@ -72,12 +73,16 @@ public:
 private:
     friend AnalysisDescriptor<SideEffectAnalysis>;
     static PassID Key;
+    static void ensureInitialized(Value *V, BaseAddressInfoMap &Map);
+    static BaseAddressInfoMap buildBaseAddressInfoMap(Function &F);
+    static void processBuiltinCall(
+        BuildInFunction *BIF, const std::vector<Value*> &Args,
+        const BaseAddressInfoMap &CallerPtrMap, SideEffectInfo &Info);
 };
 
 
 FuncAttr    classifyBuiltin(BuildInFunction* BIF);
 IntrinsicID getIntrinsicID(BuildInFunction* BIF);
-BaseAddressInfoMap buildBaseAddressInfoMap(Function& F);
 
 // 指令级副作用查询接口
 // 查询 Instruction I 对内存地址 V 的读写行为

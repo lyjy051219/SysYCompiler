@@ -92,6 +92,10 @@ public:
     BasicBlock* getIDom(BasicBlock* BB) const;
     DominatorNode* getNode(BasicBlock* BB) const;
     bool dominates(BasicBlock* A, BasicBlock* B) const; // A 是否支配 B
+    std::vector<DominatorNode *> getNodesInPostOrder() const;
+    std::vector<DominatorNode *> getChildNodes(DominatorNode *Node) const;
+    std::vector<BasicBlock *> getBlocksInPreOrder() const;
+    std::vector<BasicBlock *> getChildren(BasicBlock *BB) const;
     // Value级别的支配关系：判断DefVal是否支配UseVal
     bool dominatesValue(Value* DefVal, Value* UseVal) const;
 

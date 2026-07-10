@@ -7,129 +7,11 @@
 #include <utility>
 #include <vector>
 
-static bool isArrayAlloca(AllocaInst *AI) {
-    if (!AI) return false;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
-    return PtrTy && PtrTy->getPointerType() &&
-           PtrTy->getPointerType()->getEnum() == IR_ARRAY;
-}
-
-static std::shared_ptr<IRType> getAllocatedType(AllocaInst *AI) {
-    if (!AI) return nullptr;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
-    return PtrTy ? PtrTy->getPointerType() : nullptr;
-}
-
-static std::shared_ptr<IRType> getPointeeType(Value *V) {
-    if (!V) return nullptr;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(V->getIRType());
-    return PtrTy ? PtrTy->getPointerType() : nullptr;
-}
-
-static bool isScalarType(const std::shared_ptr<IRType> &Ty) {
-    if (!Ty) return false;
-    return Ty->getEnum() == IR_INT || Ty->getEnum() == IR_FLOAT;
-}
-
-static bool haveSameScalarType(const std::shared_ptr<IRType> &A,
-                               const std::shared_ptr<IRType> &B) {
-    return isScalarType(A) && isScalarType(B) &&
-           A->getEnum() == B->getEnum() &&
-           A->getSize() == B->getSize();
-}
-
-static int countScalarElements(const std::shared_ptr<IRType> &Ty,
-                               int Limit) {
-    if (!Ty) return -1;
-    if (isScalarType(Ty)) return 1;
-    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-    if (!ArrTy || ArrTy->getElementCount() < 0) return -1;
-    int Sub = countScalarElements(ArrTy->getElementType(), Limit);
-    if (Sub < 0) return -1;
-    long long Total = 1LL * Sub * ArrTy->getElementCount();
-    if (Total > Limit) return -1;
-    return static_cast<int>(Total);
-}
-
-static bool flattenScalarPath(std::shared_ptr<IRType> Ty,
-                              const std::vector<int> &Path,
-                              int &FlatIndex) {
-    FlatIndex = 0;
-    for (int Index : Path) {
-        auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-        if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
-            return false;
-        int Sub = countScalarElements(ArrTy->getElementType(),
-                                      1 << 20);
-        if (Sub < 0) return false;
-        FlatIndex += Index * Sub;
-        Ty = ArrTy->getElementType();
-    }
-    return isScalarType(Ty);
-}
-
-static bool unflattenScalarPath(std::shared_ptr<IRType> Ty, int FlatIndex,
-                                std::vector<int> &Path,
-                                std::shared_ptr<IRType> &ElementTy) {
-    Path.clear();
-    ElementTy = nullptr;
-    if (!Ty || FlatIndex < 0) return false;
-
-    while (Ty && Ty->getEnum() == IR_ARRAY) {
-        auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-        if (!ArrTy) return false;
-        int Sub = countScalarElements(ArrTy->getElementType(),
-                                      1 << 20);
-        if (Sub <= 0) return false;
-        int Index = FlatIndex / Sub;
-        if (Index < 0 || Index >= ArrTy->getElementCount())
-            return false;
-        Path.push_back(Index);
-        FlatIndex %= Sub;
-        Ty = ArrTy->getElementType();
-    }
-
-    if (FlatIndex != 0 || !isScalarType(Ty)) return false;
-    ElementTy = Ty;
-    return true;
-}
-
-static bool getConstIndex(Value *V, int &Index) {
-    int32_t Tmp = 0;
-    if (!V || !V->tryGetIntConst(Tmp)) return false;
-    Index = Tmp;
-    return true;
-}
-
-static Value *makeIndexConstant(Value *Index, int Val) {
-    if (!Index || !Index->getIRType() ||
-        Index->getIRType()->getEnum() != IR_INT)
-        return nullptr;
-
-    auto IntTy = std::dynamic_pointer_cast<INTType>(Index->getIRType());
-    if (IntTy && IntTy->getIsBool()) {
-        if (Val != 0 && Val != 1) return nullptr;
-        return ConstBool::newConstBool(Val != 0);
-    }
-
-    return ConstInt::newConstInt(Val, Index->getIRType()->getSize());
-}
-
-static bool appearsBefore(Instruction *A, Instruction *B) {
-    if (!A || !B || A->getParent() != B->getParent()) return false;
-    for (auto It = A->getParent()->begin(); It != A->getParent()->end();
-         ++It) {
-        if (*It == A) return true;
-        if (*It == B) return false;
-    }
-    return false;
-}
-
 // Trace only the pointer forms emitted by the front end. Each aggregate GEP
 // starts with a zero pointer-dereference index; the remaining indices select
 // array elements and can therefore be concatenated across chained GEPs.
-static LocalAggregatePointerPath tracePointer(Value *V,
-                                std::unordered_set<Value *> &Visiting) {
+LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
+    Value *V, std::unordered_set<Value *> &Visiting) {
     LocalAggregatePointerPath Result;
     if (!V || !Visiting.insert(V).second) return Result;
 
@@ -140,9 +22,8 @@ static LocalAggregatePointerPath tracePointer(Value *V,
     }
 
     if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
-        auto &Ops = BC->getUserList();
-        if (Ops.size() == 1 && Ops[0])
-            Result = tracePointer(Ops[0]->getValue(), Visiting);
+        if (Value *Operand = BC->getUnaryOperand())
+            Result = tracePointer(Operand, Visiting);
         Visiting.erase(V);
         return Result;
     }
@@ -153,29 +34,28 @@ static LocalAggregatePointerPath tracePointer(Value *V,
         return Result;
     }
 
-    auto &Ops = GEP->getUserList();
-    if (Ops.size() < 2 || !Ops[0]) {
+    if (GEP->getNumIndices() < 1 || !GEP->getBasePointer()) {
         Visiting.erase(V);
         return Result;
     }
 
-    Result = tracePointer(Ops[0]->getValue(), Visiting);
+    Result = tracePointer(GEP->getBasePointer(), Visiting);
     if (!Result.Root) {
         Visiting.erase(V);
         return Result;
     }
 
     int FirstIndex = 0;
-    if (!Ops[1] || !getConstIndex(Ops[1]->getValue(), FirstIndex) ||
+    if (!Value::tryGetIntIndex(GEP->getIndex(0), FirstIndex) ||
         FirstIndex != 0) {
         Result.IsConstant = false;
         Visiting.erase(V);
         return Result;
     }
 
-    for (size_t I = 2; I < Ops.size(); ++I) {
+    for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
         int Index = 0;
-        if (!Ops[I] || !getConstIndex(Ops[I]->getValue(), Index)) {
+        if (!Value::tryGetIntIndex(GEP->getIndex(I), Index)) {
             Result.IsConstant = false;
             break;
         }
@@ -186,31 +66,30 @@ static LocalAggregatePointerPath tracePointer(Value *V,
     return Result;
 }
 
-static LocalAggregatePointerPath tracePointer(Value *V) {
+LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(Value *V) {
     std::unordered_set<Value *> Visiting;
     return tracePointer(V, Visiting);
 }
 
-static bool getDirectConstantPath(
+bool LocalAggregateSimplifyPass::getDirectConstantPath(
     AllocaInst *AI, GetElementPtrInst *GEP, std::vector<int> &Path,
     std::shared_ptr<IRType> &PointeeTy) {
     Path.clear();
     PointeeTy = nullptr;
     if (!AI || !GEP) return false;
 
-    auto &Ops = GEP->getUserList();
-    if (Ops.size() < 2 || !Ops[0] || Ops[0]->getValue() != AI)
+    if (GEP->getNumIndices() < 1 || GEP->getBasePointer() != AI)
         return false;
 
     int FirstIndex = 0;
-    if (!Ops[1] || !getConstIndex(Ops[1]->getValue(), FirstIndex) ||
+    if (!Value::tryGetIntIndex(GEP->getIndex(0), FirstIndex) ||
         FirstIndex != 0)
         return false;
 
-    std::shared_ptr<IRType> Ty = getAllocatedType(AI);
-    for (size_t I = 2; I < Ops.size(); ++I) {
+    std::shared_ptr<IRType> Ty = AllocaInst::getAllocatedType(AI);
+    for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
         int Index = 0;
-        if (!Ops[I] || !getConstIndex(Ops[I]->getValue(), Index))
+        if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
             return false;
         auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
         if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
@@ -224,38 +103,37 @@ static bool getDirectConstantPath(
     return PointeeTy != nullptr;
 }
 
-static bool getDirectConstantScalarPath(
+bool LocalAggregateSimplifyPass::getDirectConstantScalarPath(
     AllocaInst *AI, GetElementPtrInst *GEP, std::vector<int> &Path,
     std::shared_ptr<IRType> &ElementTy) {
     if (!getDirectConstantPath(AI, GEP, Path, ElementTy))
         return false;
-    if (!isScalarType(ElementTy)) return false;
+    if (!IRType::isScalar(ElementTy)) return false;
     return true;
 }
 
-static bool appendConstantAggregateGEPPath(
+bool LocalAggregateSimplifyPass::appendConstantAggregateGEPPath(
     Value *Base, GetElementPtrInst *GEP, const std::vector<int> &BasePath,
     std::vector<int> &NewPath, std::shared_ptr<IRType> &PointeeTy) {
     NewPath.clear();
     PointeeTy = nullptr;
     if (!Base || !GEP) return false;
 
-    auto &Ops = GEP->getUserList();
-    if (Ops.size() < 3 || !Ops[0] || Ops[0]->getValue() != Base)
+    if (GEP->getNumIndices() < 2 || GEP->getBasePointer() != Base)
         return false;
 
     int FirstIndex = 0;
-    if (!Ops[1] || !getConstIndex(Ops[1]->getValue(), FirstIndex) ||
+    if (!Value::tryGetIntIndex(GEP->getIndex(0), FirstIndex) ||
         FirstIndex != 0)
         return false;
 
-    std::shared_ptr<IRType> Ty = getPointeeType(Base);
+    std::shared_ptr<IRType> Ty = Value::getPointeeType(Base);
     if (!Ty || Ty->getEnum() != IR_ARRAY) return false;
 
     NewPath = BasePath;
-    for (size_t I = 2; I < Ops.size(); ++I) {
+    for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
         int Index = 0;
-        if (!Ops[I] || !getConstIndex(Ops[I]->getValue(), Index))
+        if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
             return false;
         auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
         if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
@@ -268,90 +146,47 @@ static bool appendConstantAggregateGEPPath(
     return PointeeTy != nullptr;
 }
 
-static bool getDirectOneDimElementIndex(AllocaInst *AI,
-                                        GetElementPtrInst *GEP,
-                                        Value *&Index) {
+bool LocalAggregateSimplifyPass::getDirectOneDimElementIndex(
+    AllocaInst *AI, GetElementPtrInst *GEP, Value *&Index) {
     Index = nullptr;
     if (!AI || !GEP) return false;
-    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(getAllocatedType(AI));
-    if (!ArrTy || !isScalarType(ArrTy->getElementType())) return false;
+    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(AllocaInst::getAllocatedType(AI));
+    if (!ArrTy || !IRType::isScalar(ArrTy->getElementType())) return false;
 
-    auto &Ops = GEP->getUserList();
-    if (Ops.size() != 3 || !Ops[0] || Ops[0]->getValue() != AI ||
-        !Ops[1] || !Ops[2])
+    if (GEP->getNumIndices() != 2 || GEP->getBasePointer() != AI)
         return false;
 
     int FirstIndex = 0;
-    if (!getConstIndex(Ops[1]->getValue(), FirstIndex) ||
+    if (!Value::tryGetIntIndex(GEP->getIndex(0), FirstIndex) ||
         FirstIndex != 0)
         return false;
 
-    Index = Ops[2]->getValue();
+    Index = GEP->getIndex(1);
     return Index && Index->getIRType() &&
            Index->getIRType()->getEnum() == IR_INT;
 }
 
-static bool getConstantOffsetScalarGEP(Value *Base, GetElementPtrInst *GEP,
-                                       int &Offset) {
+bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
+    Value *Base, GetElementPtrInst *GEP, int &Offset) {
     Offset = 0;
     if (!Base || !GEP) return false;
-    auto &Ops = GEP->getUserList();
-    if (Ops.size() != 2 || !Ops[0] || Ops[0]->getValue() != Base ||
-        !Ops[1])
+    if (GEP->getNumIndices() != 1 || GEP->getBasePointer() != Base)
         return false;
 
-    if (!getConstIndex(Ops[1]->getValue(), Offset))
+    if (!Value::tryGetIntIndex(GEP->getIndex(0), Offset))
         return false;
 
     auto BasePtr = std::dynamic_pointer_cast<POINTERType>(Base->getIRType());
     auto GEPPtr = std::dynamic_pointer_cast<POINTERType>(GEP->getIRType());
     return BasePtr && GEPPtr && BasePtr->getPointerType() &&
            GEPPtr->getPointerType() &&
-           isScalarType(BasePtr->getPointerType()) &&
-           isScalarType(GEPPtr->getPointerType()) &&
-           BasePtr->getPointerType()->getEnum() ==
-               GEPPtr->getPointerType()->getEnum() &&
-           BasePtr->getPointerType()->getSize() ==
-               GEPPtr->getPointerType()->getSize();
+           IRType::isScalar(BasePtr->getPointerType()) &&
+           IRType::isScalar(GEPPtr->getPointerType()) &&
+           BasePtr->getPointerType()->hasSameScalarType(
+               *GEPPtr->getPointerType());
 }
 
-static bool isMemcpy(CallInst *CI) {
-    if (!CI) return false;
-
-    Value *Callee = CI->getCallee();
-    std::string Name;
-    if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee))
-        Name = BIF->getIdent();
-    else if (auto *F = dynamic_cast<Function *>(Callee))
-        Name = F->getIdent();
-    return Name.find("memcpy") != std::string::npos;
-}
-
-static bool isFalseConstant(Value *V) {
-    int32_t Out = 0;
-    return V && V->tryGetIntConst(Out) && Out == 0;
-}
-
-static bool isNonVolatileMemcpy(CallInst *CI) {
-    if (!isMemcpy(CI)) return false;
-    // callee, destination, source, byte count, volatile flag
-    return CI->getArgCount() >= 4 && isFalseConstant(CI->getArg(3));
-}
-
-static bool haveSameShape(const std::shared_ptr<IRType> &A,
-                          const std::shared_ptr<IRType> &B) {
-    if (!A || !B || A->getEnum() != B->getEnum() ||
-        A->getSize() != B->getSize())
-        return false;
-
-    if (A->getEnum() != IR_ARRAY) return true;
-    auto AA = std::dynamic_pointer_cast<ARRAYType>(A);
-    auto BA = std::dynamic_pointer_cast<ARRAYType>(B);
-    return AA && BA && AA->getElementCount() == BA->getElementCount() &&
-           haveSameShape(AA->getElementType(), BA->getElementType());
-}
-
-static bool isProvablyReadOnlySource(Variable *Source) {
+bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
     if (!Source) return false;
     if (Source->vartag == Variable::Constant) return true;
     if (Source->vartag != Variable::GlobalVariable) return false;
@@ -365,18 +200,17 @@ static bool isProvablyReadOnlySource(Variable *Source) {
         Use *U = *It;
         if (!U || U->getValue() != Source) continue;
         auto *CI = dynamic_cast<CallInst *>(U->getUser());
-        if (!CI || !isNonVolatileMemcpy(CI) ||
-            CI->getUserIndex(U) != 2)
+        if (!CI || !CI->isNonVolatileMemcpy() || CI->getArgIndex(U) != 1)
             return false;
     }
     return true;
 }
 
-static bool isWholeConstantCopy(CallInst *CI, AllocaInst *Destination,
-                                Variable *Source) {
+bool LocalAggregateSimplifyPass::isWholeConstantCopy(
+    CallInst *CI, AllocaInst *Destination, Variable *Source) {
     if (!CI || !Destination || !Source ||
         !isProvablyReadOnlySource(Source) ||
-        !isNonVolatileMemcpy(CI))
+        !CI->isNonVolatileMemcpy())
         return false;
 
     auto *ByteCount = dynamic_cast<ConstInt *>(CI->getArg(2));
@@ -390,51 +224,13 @@ static bool isWholeConstantCopy(CallInst *CI, AllocaInst *Destination,
     auto SourceTy = SourcePtr->getPointerType();
     return ByteCount->getVal() >= 0 &&
            static_cast<size_t>(ByteCount->getVal()) == DestTy->getSize() &&
-           haveSameShape(DestTy, SourceTy);
-}
-
-static bool compatibleTypes(Value *A, Value *B) {
-    if (!A || !B || !A->getIRType() || !B->getIRType()) return false;
-    auto ATy = A->getIRType();
-    auto BTy = B->getIRType();
-    return ATy->getEnum() == BTy->getEnum() &&
-           ATy->getSize() == BTy->getSize();
-}
-
-// Return a scalar element from a constant aggregate. Missing initializer
-// entries and a null initializer both have zeroinitializer semantics.
-static Value *getConstantElement(Variable *Source,
-                                 const std::vector<int> &Path) {
-    if (!Source) return nullptr;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(Source->getIRType());
-    if (!PtrTy) return nullptr;
-
-    std::shared_ptr<IRType> Ty = PtrTy->getPointerType();
-    Value *Node = Source->getUsee();
-
-    for (int Index : Path) {
-        auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-        if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
-            return nullptr;
-
-        if (Node) {
-            auto *Init = dynamic_cast<Initializer *>(Node);
-            if (!Init) return nullptr;
-            Node = static_cast<size_t>(Index) < Init->size()
-                       ? (*Init)[static_cast<size_t>(Index)]
-                       : nullptr;
-        }
-        Ty = ArrTy->getElementType();
-    }
-
-    if (Ty && Ty->getEnum() == IR_ARRAY) return nullptr;
-    if (!Node) return Value::makeZeroForType(Ty);
-    return dynamic_cast<ConstantSystem *>(Node) ? Node : nullptr;
+           IRType::hasSameShape(DestTy, SourceTy);
 }
 
 // Constant forwarding is intentionally restricted to one block. Validate the
 // whole pointer-use graph first so an unmodelled use cannot silently alias it.
-static bool hasSupportedSameBlockUses(AllocaInst *AI, BasicBlock *BB) {
+bool LocalAggregateSimplifyPass::hasSupportedSameBlockUses(
+    AllocaInst *AI, BasicBlock *BB) {
     std::vector<Value *> Worklist{AI};
     std::unordered_set<Value *> Seen;
 
@@ -462,7 +258,7 @@ static bool hasSupportedSameBlockUses(AllocaInst *AI, BasicBlock *BB) {
             if (dynamic_cast<StoreInst *>(I) && OperandIndex == 1)
                 continue;
             if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && isNonVolatileMemcpy(CI) && OperandIndex == 1)
+                CI && CallInst::isNonVolatileMemcpy(CI) && OperandIndex == 1)
                 continue;
             return false;
         }
@@ -470,7 +266,7 @@ static bool hasSupportedSameBlockUses(AllocaInst *AI, BasicBlock *BB) {
     return true;
 }
 
-static bool forwardConstantLoads(AllocaInst *AI) {
+bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     BasicBlock *BB = AI ? AI->getParent() : nullptr;
     if (!BB || !hasSupportedSameBlockUses(AI, BB)) return false;
 
@@ -486,7 +282,7 @@ static bool forwardConstantLoads(AllocaInst *AI) {
 
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (!isMemcpy(CI) || CI->getArgCount() < 2) continue;
+            if (!CallInst::isMemcpyLike(CI) || CI->getArgCount() < 2) continue;
 
             LocalAggregatePointerPath Dest = tracePointer(CI->getArg(0));
             if (Dest.Root != AI) continue;
@@ -532,10 +328,10 @@ static bool forwardConstantLoads(AllocaInst *AI) {
         if (OverwriteIt != Overwrites.end())
             Replacement = OverwriteIt->second;
         else
-            Replacement = getConstantElement(InitialValue,
+            Replacement = Variable::getConstantElement(InitialValue,
                                              SourcePath.Indices);
 
-        if (!compatibleTypes(LI, Replacement)) continue;
+        if (!Value::hasSameStorageType(LI, Replacement)) continue;
         LI->replaceAllUsesWith(Replacement);
         DeadLoads.push_back(LI);
         Changed = true;
@@ -546,14 +342,15 @@ static bool forwardConstantLoads(AllocaInst *AI) {
     return Changed;
 }
 
-static int getOneDimScalarArrayCount(AllocaInst *AI) {
-    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(getAllocatedType(AI));
-    if (!ArrTy || !isScalarType(ArrTy->getElementType()))
+int LocalAggregateSimplifyPass::getOneDimScalarArrayCount(AllocaInst *AI) {
+    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(AllocaInst::getAllocatedType(AI));
+    if (!ArrTy || !IRType::isScalar(ArrTy->getElementType()))
         return -1;
     return ArrTy->getElementCount();
 }
 
-static bool indexTypeCanSelectAll(Value *Index, int Count) {
+bool LocalAggregateSimplifyPass::indexTypeCanSelectAll(
+    Value *Index, int Count) {
     if (!Index || !Index->getIRType() ||
         Index->getIRType()->getEnum() != IR_INT)
         return false;
@@ -561,9 +358,9 @@ static bool indexTypeCanSelectAll(Value *Index, int Count) {
     return !IntTy || !IntTy->getIsBool() || Count <= 2;
 }
 
-static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
-                                             LocalAggregateReadOnlyConstantArrayPlan &Plan,
-                                             int Count) {
+bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
+    Function &F, AllocaInst *AI,
+    LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count) {
     if (!AI || Count <= 0) return false;
 
     std::set<GetElementPtrInst *> SeenGEPs;
@@ -588,7 +385,7 @@ static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
         }
 
         if (auto *CI = dynamic_cast<CallInst *>(I);
-            CI && OperandIndex == 1 && isNonVolatileMemcpy(CI)) {
+            CI && OperandIndex == 1 && CallInst::isNonVolatileMemcpy(CI)) {
             if (CI->getArgCount() < 2 || CI->getArg(0) != AI ||
                 Plan.InitCopy)
                 return false;
@@ -630,7 +427,7 @@ static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
     BasicBlock *Entry = F.front();
     for (LoadInst *LI : Plan.Loads) {
         if (LI->getParent() == InitBB) {
-            if (!appearsBefore(Plan.InitCopy, LI)) return false;
+            if (!Instruction::comesBefore(Plan.InitCopy, LI)) return false;
         } else if (InitBB != Entry) {
             return false;
         }
@@ -639,26 +436,25 @@ static bool collectReadOnlyConstantArrayUses(Function &F, AllocaInst *AI,
     return true;
 }
 
-static Value *buildConstantArrayLookup(Variable *Source, int Count,
-                                       Value *Index,
-                                       Instruction *InsertBefore) {
+Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
+    Variable *Source, int Count, Value *Index, Instruction *InsertBefore) {
     int ConstIndex = 0;
-    if (getConstIndex(Index, ConstIndex)) {
+    if (Value::tryGetIntIndex(Index, ConstIndex)) {
         if (ConstIndex < 0 || ConstIndex >= Count) return nullptr;
-        return getConstantElement(Source, {ConstIndex});
+        return Variable::getConstantElement(Source, {ConstIndex});
     }
 
     std::vector<Value *> Elements;
     Elements.reserve(static_cast<size_t>(Count));
     for (int I = 0; I < Count; ++I) {
-        Value *Elem = getConstantElement(Source, {I});
+        Value *Elem = Variable::getConstantElement(Source, {I});
         if (!Elem) return nullptr;
         Elements.push_back(Elem);
     }
 
     Value *Result = Elements[0];
     for (int I = 1; I < Count; ++I) {
-        Value *Needle = makeIndexConstant(Index, I);
+        Value *Needle = Value::makeIntegerLike(Index, I);
         if (!Needle) return nullptr;
         auto *Cmp = new BinaryInst(Index, BinaryInst::E, Needle);
         if (!InsertBefore->insertBefore(Cmp)) {
@@ -676,7 +472,8 @@ static Value *buildConstantArrayLookup(Variable *Source, int Count,
     return Result;
 }
 
-static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
+bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
+    Function &F, AllocaInst *AI) {
     constexpr int kMaxDynamicSelectArrayElements = 2;
 
     int Count = getOneDimScalarArrayCount(AI);
@@ -686,12 +483,12 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
     if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
         return false;
 
-    Value *FirstElement = getConstantElement(Plan.Source, {0});
+    Value *FirstElement = Variable::getConstantElement(Plan.Source, {0});
     if (!FirstElement) return false;
 
     bool HasDynamicIndex = false;
     for (LoadInst *LI : Plan.Loads) {
-        if (!compatibleTypes(LI, FirstElement)) return false;
+        if (!Value::hasSameStorageType(LI, FirstElement)) return false;
         auto *GEP = dynamic_cast<GetElementPtrInst *>(LI->getPointerOperand());
         Value *Index = nullptr;
         if (!getDirectOneDimElementIndex(AI, GEP, Index) ||
@@ -699,7 +496,7 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
             return false;
 
         int ConstIndex = 0;
-        if (getConstIndex(Index, ConstIndex)) {
+        if (Value::tryGetIntIndex(Index, ConstIndex)) {
             if (ConstIndex < 0 || ConstIndex >= Count) return false;
         } else {
             HasDynamicIndex = true;
@@ -717,7 +514,7 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
 
         Value *Replacement =
             buildConstantArrayLookup(Plan.Source, Count, Index, LI);
-        if (!compatibleTypes(LI, Replacement)) return false;
+        if (!Value::hasSameStorageType(LI, Replacement)) return false;
         Replacements.push_back({LI, Replacement});
     }
 
@@ -737,20 +534,20 @@ static bool expandReadOnlyConstantArrayLoads(Function &F, AllocaInst *AI) {
     return true;
 }
 
-static bool addScalarSlot(
+bool LocalAggregateSimplifyPass::addScalarSlot(
     std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,
     const std::vector<int> &Path,
     const std::shared_ptr<IRType> &ElementTy,
     int MaxScalarizedElements) {
     auto SlotIt = SlotTypes.find(Path);
     if (SlotIt != SlotTypes.end())
-        return haveSameScalarType(SlotIt->second, ElementTy);
+        return IRType::hasSameScalarType(SlotIt->second, ElementTy);
 
     SlotTypes.emplace(Path, ElementTy);
     return static_cast<int>(SlotTypes.size()) <= MaxScalarizedElements;
 }
 
-static bool collectScalarizedPointerUses(
+bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
     AllocaInst *AI, Value *Ptr, const std::vector<int> &PtrPath,
     std::vector<GetElementPtrInst *> &TransparentPtrs,
     std::map<GetElementPtrInst *, std::vector<int>> &TransparentPath,
@@ -758,8 +555,8 @@ static bool collectScalarizedPointerUses(
     std::vector<Instruction *> &MemoryAccesses,
     std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,
     int MaxScalarizedElements) {
-    auto PtrPointeeTy = getPointeeType(Ptr);
-    bool PtrIsScalar = isScalarType(PtrPointeeTy);
+    auto PtrPointeeTy = Value::getPointeeType(Ptr);
+    bool PtrIsScalar = IRType::isScalar(PtrPointeeTy);
 
     for (auto It = Ptr->getUseList().begin(); It != Ptr->getUseList().end();
          ++It) {
@@ -785,13 +582,13 @@ static bool collectScalarizedPointerUses(
             GEP && OperandIndex == 0 &&
             getConstantOffsetScalarGEP(Ptr, GEP, Offset)) {
             int FlatIndex = 0;
-            if (!flattenScalarPath(getAllocatedType(AI), PtrPath,
+            if (!IRType::flattenScalarPath(AllocaInst::getAllocatedType(AI), PtrPath,
                                    FlatIndex))
                 return false;
 
             std::vector<int> NewPath;
             std::shared_ptr<IRType> NewElementTy;
-            if (!unflattenScalarPath(getAllocatedType(AI),
+            if (!IRType::unflattenScalarPath(AllocaInst::getAllocatedType(AI),
                                      FlatIndex + Offset, NewPath,
                                      NewElementTy))
                 return false;
@@ -822,11 +619,11 @@ static bool collectScalarizedPointerUses(
             GEP && OperandIndex == 0 &&
             appendConstantAggregateGEPPath(Ptr, GEP, PtrPath, NewPath,
                                            NewPointeeTy)) {
-            if (isScalarType(NewPointeeTy) &&
+            if (IRType::isScalar(NewPointeeTy) &&
                 !addScalarSlot(SlotTypes, NewPath, NewPointeeTy,
                                MaxScalarizedElements))
                 return false;
-            if (!isScalarType(NewPointeeTy) &&
+            if (!IRType::isScalar(NewPointeeTy) &&
                 NewPointeeTy->getEnum() != IR_ARRAY)
                 return false;
 
@@ -852,9 +649,10 @@ static bool collectScalarizedPointerUses(
     return true;
 }
 
-static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
+bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
+    AllocaInst *AI) {
     constexpr int kMaxScalarizedElements = 32;
-    if (!AI || !isArrayAlloca(AI)) return false;
+    if (!AI || !AllocaInst::isArrayAllocation(AI)) return false;
     auto Fail = [](const char *) {
         return false;
     };
@@ -879,7 +677,7 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
 
         int OperandIndex = UserI->getUserIndex(U);
         if (auto *CI = dynamic_cast<CallInst *>(UserI);
-            CI && OperandIndex == 1 && isNonVolatileMemcpy(CI)) {
+            CI && OperandIndex == 1 && CallInst::isNonVolatileMemcpy(CI)) {
             if (CI->getArgCount() < 2 || CI->getArg(0) != AI || InitCopy)
                 return Fail("bad memcpy operands");
             auto *Source = dynamic_cast<Variable *>(CI->getArg(1));
@@ -898,9 +696,9 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
         if (!getDirectConstantPath(AI, GEP, Path, PointeeTy))
             return false;
 
-        if (!isScalarType(PointeeTy) && PointeeTy->getEnum() != IR_ARRAY)
+        if (!IRType::isScalar(PointeeTy) && PointeeTy->getEnum() != IR_ARRAY)
             return Fail("bad pointee ty");
-        if (isScalarType(PointeeTy) &&
+        if (IRType::isScalar(PointeeTy) &&
             !addScalarSlot(SlotTypes, Path, PointeeTy,
                            kMaxScalarizedElements))
             return Fail("add root slot");
@@ -929,7 +727,7 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
         for (Instruction *Access : MemoryAccesses) {
             if (!Access) return Fail("bad memory access");
             if (Access->getParent() == InitCopy->getParent()) {
-                if (!appearsBefore(InitCopy, Access))
+                if (!Instruction::comesBefore(InitCopy, Access))
                     return Fail("access before init");
                 continue;
             }
@@ -941,7 +739,7 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
     std::map<std::vector<int>, Value *> InitialValues;
     if (InitSource) {
         for (auto &Entry : SlotTypes) {
-            Value *Init = getConstantElement(InitSource, Entry.first);
+            Value *Init = Variable::getConstantElement(InitSource, Entry.first);
             if (!Init || !Init->getIRType() || !Entry.second ||
                 Init->getIRType()->getEnum() != Entry.second->getEnum() ||
                 Init->getIRType()->getSize() != Entry.second->getSize())
@@ -1003,7 +801,8 @@ static bool scalarizeConstantIndexedAggregate(AllocaInst *AI) {
     return true;
 }
 
-static LocalAggregateDeadUses collectDeadAggregateUses(AllocaInst *AI) {
+LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
+    AllocaInst *AI) {
     LocalAggregateDeadUses Result;
     std::vector<Value *> Worklist{AI};
     std::unordered_set<Value *> SeenValues;
@@ -1041,7 +840,7 @@ static LocalAggregateDeadUses collectDeadAggregateUses(AllocaInst *AI) {
             }
 
             if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && isNonVolatileMemcpy(CI) && OperandIndex == 1) {
+                CI && CallInst::isNonVolatileMemcpy(CI) && OperandIndex == 1) {
                 if (SeenWrites.insert(I).second) Result.Writes.push_back(I);
                 continue;
             }
@@ -1055,7 +854,7 @@ static LocalAggregateDeadUses collectDeadAggregateUses(AllocaInst *AI) {
     return Result;
 }
 
-static bool deleteDeadAggregate(AllocaInst *AI) {
+bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     LocalAggregateDeadUses Uses = collectDeadAggregateUses(AI);
     if (!Uses.IsDead) return false;
 
@@ -1075,13 +874,14 @@ static bool deleteDeadAggregate(AllocaInst *AI) {
     return true;
 }
 
-static std::vector<AllocaInst *> collectArrayAllocas(Function &F) {
+std::vector<AllocaInst *>
+LocalAggregateSimplifyPass::collectArrayAllocas(Function &F) {
     std::vector<AllocaInst *> Aggregates;
     for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt) {
         BasicBlock *BB = *BBIt;
         for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
             if (auto *AI = dynamic_cast<AllocaInst *>(*IIt);
-                isArrayAlloca(AI))
+                AllocaInst::isArrayAllocation(AI))
                 Aggregates.push_back(AI);
         }
     }

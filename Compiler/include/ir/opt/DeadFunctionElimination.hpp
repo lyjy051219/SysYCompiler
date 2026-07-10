@@ -14,6 +14,4 @@ public:
 
 private:
 	FunctionAnalysisPassManager &FAM;
-
-	static bool isExternalRoot(Function *F);
 };

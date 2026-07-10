@@ -8,22 +8,6 @@
 #include <unordered_set>
 #include <vector>
 
-static bool isKnownBoolConst(Value *V, bool &Out) {
-	if (auto *CB = dynamic_cast<ConstBool *>(V)) {
-		Out = CB->getVal();
-		return true;
-	}
-	if (auto *CI = dynamic_cast<ConstInt *>(V)) {
-		Out = (CI->getVal() != 0);
-		return true;
-	}
-	if (auto *CF = dynamic_cast<ConstFloat *>(V)) {
-		Out = (CF->getVal() != 0.0f);
-		return true;
-	}
-	return false;
-}
-
 //消除死块
 bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 	bool Changed = false;
@@ -64,10 +48,9 @@ bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 		BrInst *Br = BB->getBranchTerminator();
 		if (!BasicBlock::isCondBr(Br)) continue;
 
-		auto &UL = Br->getUserList();
-		Value *Cond = UL[0]->getValue();
-		auto *TrueBB = dynamic_cast<BasicBlock *>(UL[1]->getValue());
-		auto *FalseBB = dynamic_cast<BasicBlock *>(UL[2]->getValue());
+		Value *Cond = Br->getCondition();
+		auto *TrueBB = Br->getTrueSuccessor();
+		auto *FalseBB = Br->getFalseSuccessor();
 		if (!TrueBB || !FalseBB) continue;
 
 		if (TrueBB == FalseBB) {
@@ -79,7 +62,7 @@ bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 		}
 
 		bool CondVal = false;
-		if (!isKnownBoolConst(Cond, CondVal)) continue;
+		if (!Cond || !Cond->tryGetBoolConst(CondVal)) continue;
 
 		BasicBlock *Taken = CondVal ? TrueBB : FalseBB;
 		BasicBlock *Untaken = CondVal ? FalseBB : TrueBB;
@@ -211,7 +194,7 @@ bool CFGSimplifyPass::simplifyUncondBranch(Function &F, BasicBlock *BB) {
 	if (!BasicBlock::isUncondBr(Br)) return false;
 	if (!BB->onlyPhiAndTerminator()) return false;
 
-	auto *Succ = dynamic_cast<BasicBlock *>(Br->getUserList()[0]->getValue());
+	auto *Succ = Br->getSuccessor(0);
 	if (!Succ || Succ == BB) return false;
 
 	auto Preds = BB->getPredecessors();

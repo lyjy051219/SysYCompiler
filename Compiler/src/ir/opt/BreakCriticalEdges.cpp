@@ -9,21 +9,6 @@
 #include <vector>
 
 
-static bool hasMultipleDistinctSuccs(BasicBlock *BB) {
-	if (!BB) return false;
-	auto Succs = BB->getSuccessors();
-	if (Succs.size() < 2) return false;
-	return Succs[0] != Succs[1];
-}
-
-static bool isCriticalEdge(BasicBlock *From, BasicBlock *To) {
-	if (!From || !To) return false;
-	if (!hasMultipleDistinctSuccs(From)) return false;
-	auto Preds = To->getPredecessors();
-	return Preds.size() > 1;
-}
-
-
 PreservationStatus BreakCriticalEdgesPass::run(Function &F, FunctionAnalysisPassManager &) {
 	std::vector<std::pair<BasicBlock *, BasicBlock *>> CriticalEdges;
 
@@ -34,7 +19,7 @@ PreservationStatus BreakCriticalEdgesPass::run(Function &F, FunctionAnalysisPass
 		if (Succs[0] == Succs[1]) continue;
 
 		for (BasicBlock *To : Succs) {
-			if (isCriticalEdge(From, To)) {
+			if (From->isCriticalEdgeTo(To)) {
 				CriticalEdges.emplace_back(From, To);
 			}
 		}
@@ -52,7 +37,7 @@ PreservationStatus BreakCriticalEdgesPass::run(Function &F, FunctionAnalysisPass
 		if (!From || !To) continue;
 
 		// 保护性重检：前面拆边可能改变 CFG 形态。
-		if (!isCriticalEdge(From, To)) continue;
+		if (!From->isCriticalEdgeTo(To)) continue;
 
 		auto *SplitBB = new BasicBlock();
 		F.pushBlock(SplitBB);

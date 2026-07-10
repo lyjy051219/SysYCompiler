@@ -20,5 +20,11 @@ public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+	static bool isForbiddenInst(const Instruction *I);
+	static int countCandidateInsts(BasicBlock *BB);
+	static bool checkBlockConvertible(BasicBlock *BB);
+	static bool usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ);
+	static bool hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *B);
+	static bool matchPattern(BasicBlock *TrueBB, IfConvMatch &M);
 	bool tryConvertOne(Function &F, BasicBlock *TrueBB);
 };

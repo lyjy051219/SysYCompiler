@@ -1,18 +1,16 @@
 #include "../../include/lib/CFG.hpp"
 #include "../../include/lib/BaseManager.hpp"
 #include "CFG.hpp"
+#include "IRUtils.hpp"
 #include <cmath>
 #include <sstream>
 #include <map>
 #include <unordered_set>
 #include <variant>
 #include <limits>
+#include <queue>
 
 extern std::unique_ptr<Module> ModuleIR;
-
-bool checkBinaryBoolean(BinaryInst::Operation op) {
-  return BinaryInst::isCompareOp(op);
-}
 
 static bool isIntOnlyBinaryOp(BinaryInst::Operation op) {
   switch (op) {
@@ -71,77 +69,128 @@ static Instruction::InstType mapBinaryOpToInstType(BinaryInst::Operation op,
   }
 }
 
-bool Value::isConstZero() {
-    if (auto num_val = dynamic_cast<ConstInt*>(this))
+bool Value::isConstZero() const {
+    if (auto num_val = dynamic_cast<const ConstInt*>(this))
         return num_val->getVal() == 0;
-    else if (auto num_val = dynamic_cast<ConstFloat*>(this))
+    else if (auto num_val = dynamic_cast<const ConstFloat*>(this))
         return num_val->getVal() == 0.0f;
-    else if (auto num_val = dynamic_cast<ConstBool*>(this))
+    else if (auto num_val = dynamic_cast<const ConstBool*>(this))
         return num_val->getVal() == false;
     else
         return false;
 }
 
-bool Value::isConstIntZero() {
-    auto *CI = dynamic_cast<ConstInt *>(this);
+bool Value::isConstIntZero() const {
+    auto *CI = dynamic_cast<const ConstInt *>(this);
     return CI && CI->getVal() == 0;
 }
 
-bool Value::isConstOne() {
-    if (auto *CI = dynamic_cast<ConstInt *>(this)) return CI->getVal() == 1;
-    if (auto *CF = dynamic_cast<ConstFloat *>(this)) return CF->getVal() == 1.0f;
-    if (auto *CB = dynamic_cast<ConstBool *>(this)) return CB->getVal();
+bool Value::isConstOne() const {
+    if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == 1;
+    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == 1.0f;
+    if (auto *CB = dynamic_cast<const ConstBool *>(this)) return CB->getVal();
     return false;
 }
 
-bool Value::isConstMinusOne() {
-    if (auto *CI = dynamic_cast<ConstInt *>(this)) return CI->getVal() == -1;
-    if (auto *CF = dynamic_cast<ConstFloat *>(this)) return CF->getVal() == -1.0f;
+bool Value::isConstMinusOne() const {
+    if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == -1;
+    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == -1.0f;
     return false;
 }
 
-bool Value::tryGetBoolConst(bool &Out) {
-    if (auto *CB = dynamic_cast<ConstBool *>(this)) {
+bool Value::isUndef() const {
+    return dynamic_cast<const UndefValue *>(this) != nullptr;
+}
+
+bool Value::tryGetBoolConst(bool &Out) const {
+    if (auto *CB = dynamic_cast<const ConstBool *>(this)) {
         Out = CB->getVal();
         return true;
     }
-    if (auto *CI = dynamic_cast<ConstInt *>(this)) {
+    if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
         Out = CI->getVal() != 0;
         return true;
     }
-    if (auto *CF = dynamic_cast<ConstFloat *>(this)) {
+    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) {
         Out = CF->getVal() != 0.0f;
         return true;
     }
     return false;
 }
 
-bool Value::tryGetIntConst(int32_t &Out) {
-    if (auto *CI = dynamic_cast<ConstInt *>(this)) {
+bool Value::tryGetIntConst(int32_t &Out) const {
+    if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
         Out = CI->getVal();
         return true;
     }
-    if (auto *CB = dynamic_cast<ConstBool *>(this)) {
+    if (auto *CB = dynamic_cast<const ConstBool *>(this)) {
         Out = CB->getVal() ? 1 : 0;
         return true;
     }
     return false;
 }
 
-bool Value::tryGetFloatConst(float &Out) {
-    if (auto *CF = dynamic_cast<ConstFloat *>(this)) {
+bool Value::tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const {
+    int32_t Raw = 0;
+    if (!tryGetIntConst(Raw)) return false;
+    Out = IRMath::normalizeSignedToWidth(Raw, Bits);
+    return true;
+}
+
+bool Value::tryGetFloatConst(float &Out) const {
+    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) {
         Out = CF->getVal();
         return true;
     }
     return false;
 }
 
-int Value::integerBitWidth(int DefaultBits) {
+bool Value::tryGetNumericFloatConst(float &Out) const {
+    if (tryGetFloatConst(Out)) return true;
+    int32_t IntValue = 0;
+    if (!tryGetIntConst(IntValue)) return false;
+    Out = static_cast<float>(IntValue);
+    return true;
+}
+
+Value *Value::stripBooleanExtension(Value *V,
+                                    BooleanExtensionKind &Kind) {
+    Kind = BooleanExtensionKind::None;
+    if (!V) return nullptr;
+    if (IRType::isBool(V->getIRType())) {
+        Kind = BooleanExtensionKind::PlainBool;
+        return V;
+    }
+
+    if (auto *ZI = dynamic_cast<ZextInst *>(V)) {
+        Value *Operand = ZI->getUnaryOperand();
+        if (Operand && IRType::isBool(Operand->getIRType())) {
+            Kind = BooleanExtensionKind::ZeroExt;
+            return Operand;
+        }
+    }
+    if (auto *SI = dynamic_cast<SextInst *>(V)) {
+        Value *Operand = SI->getUnaryOperand();
+        if (Operand && IRType::isBool(Operand->getIRType())) {
+            Kind = BooleanExtensionKind::SignExt;
+            return Operand;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<int64_t> Value::getIntConstant() const {
+    int32_t Result = 0;
+    if (!tryGetIntConst(Result)) return std::nullopt;
+    return static_cast<int64_t>(Result);
+}
+
+int Value::integerBitWidth(int DefaultBits) const {
     if (!getIRType()) return DefaultBits;
     return getIRType()->getIntegerBitWidth(DefaultBits);
 }
 
-int Value::countUses() {
+int Value::countUses() const {
     int Count = 0;
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
         Use *U = *It;
@@ -151,7 +200,7 @@ int Value::countUses() {
     return Count;
 }
 
-int Value::countInstructionUses(Instruction **SingleUser) {
+int Value::countInstructionUses(Instruction **SingleUser) const {
     if (SingleUser) *SingleUser = nullptr;
 
     int Count = 0;
@@ -173,11 +222,22 @@ int Value::countInstructionUses(Instruction **SingleUser) {
     return Count;
 }
 
-bool Value::hasUses() {
+std::vector<Instruction *> Value::getInstructionUsers() const {
+    std::vector<Instruction *> Users;
+    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
+        Use *U = *It;
+        if (!U || U->getValue() != this) continue;
+        if (auto *InstUser = dynamic_cast<Instruction *>(U->getUser()))
+            Users.push_back(InstUser);
+    }
+    return Users;
+}
+
+bool Value::hasUses() const {
     return countUses() > 0;
 }
 
-bool Value::hasExactlyOneUse() {
+bool Value::hasExactlyOneUse() const {
     int Count = 0;
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
         Use *U = *It;
@@ -188,13 +248,88 @@ bool Value::hasExactlyOneUse() {
     return Count == 1;
 }
 
-bool Value::isPointerValue() {
+bool Value::isPointerValue() const {
     return getIRType() && getIRType()->isPointer();
 }
 
-bool Value::isExternalVariable() {
-    auto *Var = dynamic_cast<Variable *>(this);
-    return Var && (Var->isGlobal() || Var->isParam());
+std::shared_ptr<IRType> Value::getPointeeType() const {
+    return getIRType() ? getIRType()->getPointeeType() : nullptr;
+}
+
+bool Value::hasSameStorageType(const Value *Other) const {
+    return Other && getIRType() && Other->getIRType() &&
+           getIRType()->hasSameStorageType(*Other->getIRType());
+}
+
+std::shared_ptr<IRType> Value::getPointeeType(const Value *V) {
+    return V ? V->getPointeeType() : nullptr;
+}
+
+bool Value::hasSameStorageType(const Value *A, const Value *B) {
+    return A && A->hasSameStorageType(B);
+}
+
+bool Value::isExternalVariable() const {
+    auto *Var = dynamic_cast<const Variable *>(this);
+    return Var && (Var->vartag == Variable::GlobalVariable ||
+                   Var->vartag == Variable::Param);
+}
+
+bool Value::isConstZero(const Value *V) {
+    return V && V->isConstZero();
+}
+
+bool Value::isConstIntZero(const Value *V) {
+    return V && V->isConstIntZero();
+}
+
+bool Value::isConstOne(const Value *V) {
+    return V && V->isConstOne();
+}
+
+bool Value::isConstMinusOne(const Value *V) {
+    return V && V->isConstMinusOne();
+}
+
+bool Value::isUndef(const Value *V) {
+    return V && V->isUndef();
+}
+
+bool Value::tryGetBoolConst(const Value *V, bool &Out) {
+    return V && V->tryGetBoolConst(Out);
+}
+
+bool Value::tryGetIntConst(const Value *V, int32_t &Out) {
+    return V && V->tryGetIntConst(Out);
+}
+
+bool Value::tryGetFloatConst(const Value *V, float &Out) {
+    return V && V->tryGetFloatConst(Out);
+}
+
+bool Value::areEqualConstants(const Value *A, const Value *B) {
+    if (A == B) return true;
+    if (!A || !B) return false;
+    if (auto *AI = dynamic_cast<const ConstInt *>(A)) {
+        auto *BI = dynamic_cast<const ConstInt *>(B);
+        return BI && AI->getVal() == BI->getVal();
+    }
+    if (auto *AF = dynamic_cast<const ConstFloat *>(A)) {
+        auto *BF = dynamic_cast<const ConstFloat *>(B);
+        return BF && AF->getVal() == BF->getVal();
+    }
+    if (auto *AB = dynamic_cast<const ConstBool *>(A)) {
+        auto *BB = dynamic_cast<const ConstBool *>(B);
+        return BB && AB->getVal() == BB->getVal();
+    }
+    return false;
+}
+
+bool Value::tryGetIntIndex(const Value *V, int &Out) {
+    int32_t Raw = 0;
+    if (!tryGetIntConst(V, Raw)) return false;
+    Out = static_cast<int>(Raw);
+    return true;
 }
 
 Value *Value::stripPointerCastsAndGEP(Value *V) {
@@ -245,6 +380,20 @@ Value *Value::makeUndefForType(const std::shared_ptr<IRType> &Ty) {
     return UndefValue::NewUndefValue(Ty ? Ty : INTType::NewInt(4));
 }
 
+Value *Value::makeIntegerForType(int32_t Val,
+                                 const std::shared_ptr<IRType> &Ty) {
+    if (!Ty || !Ty->isInt()) return nullptr;
+    if (Ty->isBool()) {
+        if (Val != 0 && Val != 1) return nullptr;
+        return ConstBool::newConstBool(Val != 0);
+    }
+    return ConstInt::newConstInt(Val, Ty->getSize());
+}
+
+Value *Value::makeIntegerLike(const Value *Model, int32_t Val) {
+    return Model ? makeIntegerForType(Val, Model->getIRType()) : nullptr;
+}
+
 size_t User::getNumOperands() const {
     return userList.size();
 }
@@ -252,6 +401,11 @@ size_t User::getNumOperands() const {
 Value *User::getOperand(size_t Index) const {
     if (Index >= userList.size() || !userList[Index]) return nullptr;
     return userList[Index]->getValue();
+}
+
+Use *User::getOperandUse(size_t Index) const {
+    if (Index >= userList.size() || !userList[Index]) return nullptr;
+    return userList[Index].get();
 }
 
 bool User::getOperand(size_t Index, Value *&Out) const {
@@ -262,6 +416,16 @@ bool User::getOperand(size_t Index, Value *&Out) const {
 bool User::replaceOperand(size_t Index, Value *V) {
     if (Index >= userList.size() || !userList[Index] || !V) return false;
     return userList[Index]->replaceUseeWith(V);
+}
+
+bool User::eraseOperand(size_t Index) {
+    if (Index >= userList.size()) return false;
+    userList.erase(userList.begin() + static_cast<std::ptrdiff_t>(Index));
+    return true;
+}
+
+void User::clearOperands() {
+    userList.clear();
 }
 
 void Value::dumpIR() {
@@ -310,6 +474,45 @@ Function* Module::getMainFunction(){
 
 Module* Module::getActiveModule() {
   return ModuleIR.get();
+}
+
+FunctionCallGraph Module::buildDirectCallGraph() const {
+  FunctionCallGraph Graph;
+  for (const auto &FunctionPtr : functions) {
+    Function *F = FunctionPtr.get();
+    if (!F) continue;
+    auto &Callees = Graph[F];
+    for (BasicBlock *BB : *F) {
+      if (!BB) continue;
+      for (Instruction *I : *BB) {
+        auto *CI = dynamic_cast<CallInst *>(I);
+        Function *Callee = CI ? CI->getDirectCallee() : nullptr;
+        if (Callee) Callees.push_back(Callee);
+      }
+    }
+  }
+  return Graph;
+}
+
+std::unordered_set<Function *> Module::collectReachableFunctions(
+    Function *Entry, const FunctionCallGraph &CallGraph) {
+  std::unordered_set<Function *> Reachable;
+  if (!Entry) return Reachable;
+
+  std::queue<Function *> WorkList;
+  Reachable.insert(Entry);
+  WorkList.push(Entry);
+  while (!WorkList.empty()) {
+    Function *Current = WorkList.front();
+    WorkList.pop();
+    auto It = CallGraph.find(Current);
+    if (It == CallGraph.end()) continue;
+    for (Function *Callee : It->second) {
+      if (Callee && Reachable.insert(Callee).second)
+        WorkList.push(Callee);
+    }
+  }
+  return Reachable;
 }
 
 void Module::pushGlobalVar(Variable* ptr){
@@ -371,6 +574,64 @@ void Function::pushParam(std::string ident,Variable* v){
 }
 
 std::vector<std::unique_ptr<Value>>& Function::getParams(){return params;}
+const std::vector<std::unique_ptr<Value>>& Function::getParams() const {
+  return params;
+}
+
+size_t Function::getParamCount() const { return params.size(); }
+
+Value *Function::getParam(size_t Index) const {
+  return Index < params.size() ? params[Index].get() : nullptr;
+}
+
+int Function::getParamIndex(const Value *Param) const {
+  if (!Param) return -1;
+  for (size_t I = 0; I < params.size(); ++I) {
+    if (params[I].get() == Param) return static_cast<int>(I);
+  }
+  return -1;
+}
+
+bool Function::eraseParam(size_t Index) {
+  if (Index >= params.size()) return false;
+  params.erase(params.begin() + static_cast<std::ptrdiff_t>(Index));
+  return true;
+}
+
+std::vector<CallInst *> Function::getDirectCallSites() const {
+  std::vector<CallInst *> Calls;
+  for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
+    Use *U = *It;
+    if (!U || U->getValue() != this) continue;
+    auto *CI = dynamic_cast<CallInst *>(U->getUser());
+    if (CI && CI->isCalleeUse(U)) Calls.push_back(CI);
+  }
+  return Calls;
+}
+
+bool Function::hasOnlyDirectCallUses() const {
+  return static_cast<int>(getDirectCallSites().size()) == countUses();
+}
+
+bool Function::hasReservedSignature() const {
+  return ident == "main" || BuildInFunction::isKnownRuntimeName(ident) ||
+         const_cast<Function *>(this)->front() == nullptr;
+}
+
+bool Function::hasBlockIdent(const std::string &Name) const {
+  for (const BasicBlock *BB : *this) {
+    if (BB && BB->getIdent() == Name) return true;
+  }
+  return false;
+}
+
+std::string Function::makeUniqueBlockIdent(const std::string &Base) const {
+  if (!hasBlockIdent(Base)) return Base;
+  for (int Suffix = 1;; ++Suffix) {
+    std::string Candidate = Base + "." + std::to_string(Suffix);
+    if (!hasBlockIdent(Candidate)) return Candidate;
+  }
+}
 
 void Function::InsertAlloca(AllocaInst* ptr){front()->push_back(ptr);}
 
@@ -503,15 +764,61 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
   return mp[ident];
 }
 
+bool BuildInFunction::isSupportedName(const std::string &Name) {
+  static const std::unordered_set<std::string> SupportedNames = {
+      "getint", "getch", "getfloat", "getarray", "getfarray",
+      "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
+      "starttime", "stoptime", "llvm.memcpy.p0i8.p0i8.i32",
+      "llvm.memcpy.p0.p0.i32"};
+  return SupportedNames.count(Name) != 0;
+}
+
+bool BuildInFunction::isMemcpyName(const std::string &Name) {
+  return Name.find("memcpy") != std::string::npos;
+}
+
+bool BuildInFunction::isTimingName(const std::string &Name) {
+  return Name == "starttime" || Name == "stoptime" ||
+         Name == "_sysy_starttime" || Name == "_sysy_stoptime";
+}
+
+bool BuildInFunction::isScalarIOName(const std::string &Name) {
+  static const std::unordered_set<std::string> Names = {
+      "getint", "getch", "getfloat", "putint", "putch", "putfloat"};
+  return Names.count(Name) != 0;
+}
+
+bool BuildInFunction::isScalarOutputName(const std::string &Name) {
+  static const std::unordered_set<std::string> Names = {
+      "putint", "putch", "putfloat", "putf"};
+  return Names.count(Name) != 0;
+}
+
+bool BuildInFunction::isArrayInputName(const std::string &Name) {
+  return Name == "getarray" || Name == "getfarray";
+}
+
+bool BuildInFunction::isArrayOutputName(const std::string &Name) {
+  return Name == "putarray" || Name == "putfarray" || Name == "putf";
+}
+
+bool BuildInFunction::isOutputName(const std::string &Name) {
+  return isScalarOutputName(Name) || isArrayOutputName(Name);
+}
+
+const char *BuildInFunction::getDefaultMemcpyName() {
+  return "llvm.memcpy.p0.p0.i32";
+}
+
 bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
   static const std::unordered_set<std::string> SysyLibNames = {
       "getint", "getch", "getfloat", "getarray", "getfarray",
       "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
       "starttime", "stoptime", "_sysy_starttime", "_sysy_stoptime"};
 
-  if (SysyLibNames.count(Name)) return true;
+  if (SysyLibNames.count(Name) || isSupportedName(Name)) return true;
   if (Name.find("_sysy_") != std::string::npos) return true;
-  if (Name.find("memcpy") != std::string::npos) return true;
+  if (isMemcpyName(Name)) return true;
   if (Name.find("llvm.") == 0) return true;
   return false;
 }
@@ -537,40 +844,11 @@ void BasicBlock::dumpIR(){
 
 std::vector<BasicBlock*> BasicBlock::getSuccessors() {
     std::vector<BasicBlock*> succs;
-    // 1. 如果块为空，没有后继
     if (this->Size() == 0) return succs;
-    // 2. 获取最后一条指令（List 提供的 back() 接口）
-    Instruction* term = this->back();
-
-    // 3. 只有 BR 指令才有 CFG 图意义上的后继
-    // (RetInst 表示函数结束，没有后继块)
-    if (term->instType == Instruction::BR) {
-        // 获取操作数列表 (Instruction 继承自 User)
-        auto& uses = term->getUserList();
-        // 4. 根据 userList 的大小判断是条件跳转还是无条件跳转
-        if (uses.size() == 1) {
-            // === 无条件跳转: br label %dest ===
-            // 构造时：addUse(bb) -> index 0
-            // 获取 Value* 并转为 BasicBlock*
-            Value* op = uses[0]->getValue();
-            if (BasicBlock* bb = dynamic_cast<BasicBlock*>(op)) {
-                succs.push_back(bb);
-            }
-        }
-        else if (uses.size() == 3) {
-            // === 条件跳转: br i1 %cond, label %true, label %false ===
-            // 构造时：addUse(cond)[0], addUse(true)[1], addUse(false)[2]
-            // 获取 True 分支
-            Value* trueOp = uses[1]->getValue();
-            if (BasicBlock* trueBB = dynamic_cast<BasicBlock*>(trueOp)) {
-                succs.push_back(trueBB);
-            }
-            // 获取 False 分支
-            Value* falseOp = uses[2]->getValue();
-            if (BasicBlock* falseBB = dynamic_cast<BasicBlock*>(falseOp)) {
-                succs.push_back(falseBB);
-            }
-        }
+    auto *Br = dynamic_cast<BrInst *>(back());
+    if (!Br) return succs;
+    for (unsigned I = 0; I < Br->getSuccessorCount(); ++I) {
+        if (BasicBlock *Succ = Br->getSuccessor(I)) succs.push_back(Succ);
     }
     return succs;
 }
@@ -590,6 +868,29 @@ std::vector<BasicBlock*> BasicBlock::getPredecessors() {
         }
     }
     return preds;
+}
+
+Instruction *BasicBlock::getTerminator() {
+    if (Size() == 0) return nullptr;
+    Instruction *Term = back();
+    return dynamic_cast<BrInst *>(Term) || dynamic_cast<RetInst *>(Term)
+               ? Term
+               : nullptr;
+}
+
+bool BasicBlock::hasMultipleDistinctSuccessors() {
+    auto Successors = getSuccessors();
+    if (Successors.size() < 2) return false;
+    for (size_t I = 1; I < Successors.size(); ++I) {
+        if (Successors[I] != Successors[0]) return true;
+    }
+    return false;
+}
+
+bool BasicBlock::isCriticalEdgeTo(BasicBlock *To) {
+    if (!To || !hasMultipleDistinctSuccessors()) return false;
+    auto Preds = To->getPredecessors();
+    return Preds.size() > 1;
 }
 
 void BasicBlock::genRetInst(Value* retVal){
@@ -784,7 +1085,7 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation
         assert(0);
     } else
       assert(0);
-    if (checkBinaryBoolean(op))
+    if (BinaryInst::isCompareOp(op))
       return ConstBool::newConstBool(std::get<int>(fuc));
     else if (std::holds_alternative<int>(fuc))
       return ConstInt::newConstInt(std::get<int>(fuc));
@@ -841,26 +1142,7 @@ BasicBlock* BasicBlock::genBlock(std::string ident){
 
 // 在 BasicBlock::genCallInst 函数中修改类型检查逻辑
 Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
-  auto check_builtin = [](std::string _id) {
-    if (_id == "getint") return true;
-    if (_id == "getfloat") return true;
-    if (_id == "getch") return true;
-    if (_id == "getarray") return true;
-    if (_id == "getfarray") return true;
-    if (_id == "putint") return true;
-    if (_id == "putch") return true;
-    if (_id == "putarray") return true;
-    if (_id == "putfloat") return true;
-    if (_id == "putfarray") return true;
-    if (_id == "starttime") return true;
-    if (_id == "stoptime") return true;
-    if (_id == "putf") return true;
-    if (_id == "llvm.memcpy.p0i8.p0i8.i32") return true;
-    if (_id == "llvm.memcpy.p0.p0.i32") return true;
-    return false;
-  };
-
-  if (check_builtin(ident)) {
+  if (BuildInFunction::isSupportedName(ident)) {
     ModuleIR->registerBuiltin(ident);
     if (ident == "putint" || ident == "putch" || ident == "putarray" ||
         ident == "putfarray") {
@@ -948,6 +1230,14 @@ bool BasicBlock::insertAfterPhiNodes(Instruction *I) {
   return true;
 }
 
+bool BasicBlock::insertBeforeTerminator(BasicBlock *BB, Instruction *I) {
+  return BB && BB->insertBeforeTerminator(I);
+}
+
+bool BasicBlock::insertAfterPhiNodes(BasicBlock *BB, Instruction *I) {
+  return BB && BB->insertAfterPhiNodes(I);
+}
+
 void BasicBlock::clear(){
     for(auto inst : *this) assert(inst->getUseList().size == 0);
     ChainList<BasicBlock,Instruction>::clear();
@@ -995,6 +1285,69 @@ bool Instruction::insertAfter(Instruction *NewI) {
   return insertAfter(this, NewI);
 }
 
+bool Instruction::isInBlock(const BasicBlock *BB) const {
+  return BB && const_cast<Instruction *>(this)->getParent() == BB;
+}
+
+bool Instruction::comesBefore(const Instruction *Other) const {
+  if (!Other || this == Other) return false;
+  BasicBlock *BB = const_cast<Instruction *>(this)->getParent();
+  if (!BB || const_cast<Instruction *>(Other)->getParent() != BB) return false;
+  for (Instruction *I : *BB) {
+    if (I == this) return true;
+    if (I == Other) return false;
+  }
+  return false;
+}
+
+bool Instruction::comesBefore(const Instruction *A, const Instruction *B) {
+  return A && A->comesBefore(B);
+}
+
+Value *Instruction::getUnaryOperand() const {
+  return getNumOperands() == 1 ? getOperand(0) : nullptr;
+}
+
+Value *Instruction::getUnaryOperand(const Instruction *I) {
+  return I ? I->getUnaryOperand() : nullptr;
+}
+
+Value *Instruction::foldConstantCast(InstType CastType, Value *Operand) {
+  if (!Operand) return nullptr;
+
+  int32_t IntValue = 0;
+  float FloatValue = 0.0f;
+  switch (CastType) {
+  case SITOFP:
+    return Operand->tryGetIntConst(IntValue)
+               ? static_cast<Value *>(
+                     ConstFloat::newConstFloat(static_cast<float>(IntValue)))
+               : nullptr;
+  case FPTOSI:
+    return Operand->tryGetFloatConst(FloatValue)
+               ? static_cast<Value *>(
+                     ConstInt::newConstInt(static_cast<int>(FloatValue)))
+               : nullptr;
+  case ZEXT:
+    return Operand->tryGetIntConst(IntValue)
+               ? static_cast<Value *>(ConstInt::newConstInt(IntValue))
+               : nullptr;
+  case SEXT:
+    if (auto *CB = dynamic_cast<ConstBool *>(Operand))
+      return ConstInt::newConstInt(CB->getVal() ? -1 : 0);
+    return Operand->tryGetIntConst(IntValue)
+               ? static_cast<Value *>(ConstInt::newConstInt(IntValue))
+               : nullptr;
+  case TRUNC:
+    return Operand->tryGetIntConst(IntValue)
+               ? static_cast<Value *>(
+                     ConstBool::newConstBool((IntValue & 1) != 0))
+               : nullptr;
+  default:
+    return nullptr;
+  }
+}
+
 RetInst::RetInst(Value* retVal){
     addUse(retVal);
     instType = InstType::RET;
@@ -1002,6 +1355,9 @@ RetInst::RetInst(Value* retVal){
 RetInst::RetInst(){instType = InstType::RET;}
 RetInst::RetInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::RET;}
 Value* RetInst::getOprand(){return nullptr;}
+Value *RetInst::getReturnValue() const {
+  return getNumOperands() == 1 ? getOperand(0) : nullptr;
+}
 void RetInst::dumpIR(){
     std::cout << "ret ";
   for (auto &i : userList) {
@@ -1031,6 +1387,30 @@ BrInst::BrInst(std::shared_ptr<IRType> irtype,bool is_Cond):Instruction(irtype){
 
 Value* BrInst::getOprand(){
     return nullptr;
+}
+
+Value *BrInst::getCondition() const {
+  return isConditional() && getNumOperands() == 3 ? getOperand(0) : nullptr;
+}
+
+unsigned BrInst::getSuccessorCount() const {
+  if (isConditional() && getNumOperands() == 3) return 2;
+  if (!isConditional() && getNumOperands() == 1) return 1;
+  return 0;
+}
+
+BasicBlock *BrInst::getSuccessor(unsigned Index) const {
+  if (Index >= getSuccessorCount()) return nullptr;
+  size_t OperandIndex = isConditional() ? Index + 1 : Index;
+  return dynamic_cast<BasicBlock *>(getOperand(OperandIndex));
+}
+
+BasicBlock *BrInst::getTrueSuccessor() const {
+  return getSuccessor(0);
+}
+
+BasicBlock *BrInst::getFalseSuccessor() const {
+  return isConditional() ? getSuccessor(1) : nullptr;
 }
 
 void BrInst::dumpIR(){
@@ -1068,6 +1448,22 @@ void AllocaInst::dumpIR(){
     std::cout << " = alloca ";
     std::dynamic_pointer_cast<POINTERType>(irtype)->getPointerType()->to_string();
     std::cout << "\n";
+}
+
+std::shared_ptr<IRType> AllocaInst::getAllocatedType() const {
+  return getIRType() ? getIRType()->getPointeeType() : nullptr;
+}
+
+bool AllocaInst::isArrayAllocation() const {
+  return IRType::isArray(getAllocatedType());
+}
+
+std::shared_ptr<IRType> AllocaInst::getAllocatedType(const AllocaInst *AI) {
+  return AI ? AI->getAllocatedType() : nullptr;
+}
+
+bool AllocaInst::isArrayAllocation(const AllocaInst *AI) {
+  return AI && AI->isArrayAllocation();
 }
 
 StoreInst::StoreInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::STORE;}
@@ -1207,6 +1603,68 @@ void GetElementPtrInst::updateType() {
     this->irtype = POINTERType::NewPointer(currentType);
 }
 
+Value *GetElementPtrInst::getBasePointer() const {
+    return getOperand(0);
+}
+
+size_t GetElementPtrInst::getNumIndices() const {
+    size_t NumOperands = getNumOperands();
+    return NumOperands == 0 ? 0 : NumOperands - 1;
+}
+
+Value *GetElementPtrInst::getIndex(size_t Index) const {
+    return Index < getNumIndices() ? getOperand(Index + 1) : nullptr;
+}
+
+std::vector<Value *> GetElementPtrInst::getIndices() const {
+    std::vector<Value *> Indices;
+    Indices.reserve(getNumIndices());
+    for (size_t I = 0; I < getNumIndices(); ++I)
+        Indices.push_back(getIndex(I));
+    return Indices;
+}
+
+bool GetElementPtrInst::hasOnlyConstantIndices() const {
+    if (!getBasePointer()) return false;
+    for (size_t I = 0; I < getNumIndices(); ++I) {
+        Value *Index = getIndex(I);
+        if (!Index || !Index->isConst()) return false;
+    }
+    return true;
+}
+
+bool GetElementPtrInst::getBaseAndIndices(
+    Value *&Base, std::vector<Value *> &Indices) const {
+    Base = getBasePointer();
+    Indices = getIndices();
+    if (!Base) return false;
+    for (Value *Index : Indices) {
+        if (!Index) return false;
+    }
+    return true;
+}
+
+bool GetElementPtrInst::getBaseAndIndices(
+    const GetElementPtrInst *GEP, Value *&Base,
+    std::vector<Value *> &Indices) {
+    Base = nullptr;
+    Indices.clear();
+    return GEP && GEP->getBaseAndIndices(Base, Indices);
+}
+
+bool GetElementPtrInst::reset(Value *Base,
+                              const std::vector<Value *> &Indices) {
+    if (!Base) return false;
+    for (Value *Index : Indices) {
+        if (!Index) return false;
+    }
+    clearOperands();
+    addUse(Base);
+    for (Value *Index : Indices) addUse(Index);
+    updateType();
+    return true;
+}
+
 std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
     auto &Operands = getUserList();
     if (Operands.size() < 2 || !Operands.front()) return std::nullopt;
@@ -1316,7 +1774,7 @@ BinaryInst::BinaryInst(std::shared_ptr<IRType> irtype):Instruction(irtype){
 
 BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
     :Instruction(x->getIRType()),op(op){
-    if (checkBinaryBoolean(op)) {
+    if (BinaryInst::isCompareOp(op)) {
       this->irtype = INTType::NewBool();
     }
     this->instType = mapBinaryOpToInstType(op, x->getIRType()->getEnum());
@@ -1331,6 +1789,12 @@ bool BinaryInst::getOperands(Value *&LHS, Value *&RHS) const {
     LHS = getOperand(0);
     RHS = getOperand(1);
     return LHS && RHS;
+}
+
+bool BinaryInst::getOperands(const BinaryInst *BI, Value *&LHS, Value *&RHS) {
+    LHS = nullptr;
+    RHS = nullptr;
+    return BI && BI->getOperands(LHS, RHS);
 }
 
 bool BinaryInst::setOperands(Value *LHS, Value *RHS) {
@@ -1391,6 +1855,220 @@ BinaryInst::Operation BinaryInst::reversePredicate(Operation Op) {
     return Op;
   default:
     return Op;
+  }
+}
+
+BinaryInst *BinaryInst::createBooleanNot(Value *Operand) {
+  return Operand
+      ? new BinaryInst(Operand, XOR, ConstBool::newConstBool(true))
+      : nullptr;
+}
+
+Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
+                                 bool NormalizeIntegerWidth) {
+  if (!LHS || !RHS) return nullptr;
+  const auto Ty = LHS->getIRType();
+
+  if (NormalizeIntegerWidth) {
+    auto *IntTy = dynamic_cast<INTType *>(Ty.get());
+
+    // Preserve SCCP's established undef result types for zero divisors.
+    if ((Op == DIV || Op == UDIV) && RHS->isConstZero()) {
+      return IntTy ? Value::makeUndefForType(INTType::NewInt(4))
+                   : Value::makeUndefForType(FLOATType::NewFloat());
+    }
+    if ((Op == MOD || Op == UREM) && RHS->isConstZero())
+      return Value::makeUndefForType(INTType::NewInt(4));
+
+    if (isCompareOp(Op)) {
+      if (IntTy) {
+        const unsigned Bits = IntTy->getIsBool()
+                                  ? 1u
+                                  : static_cast<unsigned>(IntTy->getSize() * 8);
+        int32_t LV = 0;
+        int32_t RV = 0;
+        if (!LHS->tryGetIntConstAtWidth(Bits, LV) ||
+            !RHS->tryGetIntConstAtWidth(Bits, RV))
+          return nullptr;
+        switch (Op) {
+        case E:  return ConstBool::newConstBool(LV == RV);
+        case NE: return ConstBool::newConstBool(LV != RV);
+        case G:  return ConstBool::newConstBool(LV > RV);
+        case GE: return ConstBool::newConstBool(LV >= RV);
+        case L:  return ConstBool::newConstBool(LV < RV);
+        case LE: return ConstBool::newConstBool(LV <= RV);
+        default: return nullptr;
+        }
+      }
+
+      float LV = 0.0f;
+      float RV = 0.0f;
+      if (!LHS->tryGetNumericFloatConst(LV) ||
+          !RHS->tryGetNumericFloatConst(RV))
+        return nullptr;
+      switch (Op) {
+      case E:  return ConstBool::newConstBool(LV == RV);
+      case NE: return ConstBool::newConstBool(LV != RV);
+      case G:  return ConstBool::newConstBool(LV > RV);
+      case GE: return ConstBool::newConstBool(LV >= RV);
+      case L:  return ConstBool::newConstBool(LV < RV);
+      case LE: return ConstBool::newConstBool(LV <= RV);
+      default: return nullptr;
+      }
+    }
+
+    if (IntTy) {
+      const unsigned Bits = IntTy->getIsBool()
+                                ? 1u
+                                : static_cast<unsigned>(IntTy->getSize() * 8);
+      int32_t LV = 0;
+      int32_t RV = 0;
+      if (!LHS->tryGetIntConstAtWidth(Bits, LV) ||
+          !RHS->tryGetIntConstAtWidth(Bits, RV))
+        return nullptr;
+
+      int64_t Raw = 0;
+      switch (Op) {
+      case ADD: Raw = static_cast<int64_t>(LV) + RV; break;
+      case SUB: Raw = static_cast<int64_t>(LV) - RV; break;
+      case MUL: Raw = static_cast<int64_t>(LV) * RV; break;
+      case DIV: Raw = LV / RV; break;
+      case UDIV:
+        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) /
+                                   static_cast<uint32_t>(RV));
+        break;
+      case MOD: Raw = LV % RV; break;
+      case UREM:
+        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) %
+                                   static_cast<uint32_t>(RV));
+        break;
+      case AND: Raw = LV & RV; break;
+      case OR:  Raw = LV | RV; break;
+      case XOR: Raw = LV ^ RV; break;
+      case SHL:
+        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
+          return Value::makeUndefForType(Ty);
+        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) << RV);
+        break;
+      case LSHR:
+        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
+          return Value::makeUndefForType(Ty);
+        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) >> RV);
+        break;
+      case ASHR:
+        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
+          return Value::makeUndefForType(Ty);
+        Raw = LV >> RV;
+        break;
+      default: return nullptr;
+      }
+
+      const int32_t Normalized =
+          IRMath::normalizeSignedToWidth(Raw, Bits);
+      if (IntTy->getIsBool())
+        return ConstBool::newConstBool((Normalized & 1) != 0);
+      return ConstInt::newConstInt(Normalized, IntTy->getSize());
+    }
+
+    float LV = 0.0f;
+    float RV = 0.0f;
+    if (!LHS->tryGetNumericFloatConst(LV) ||
+        !RHS->tryGetNumericFloatConst(RV))
+      return nullptr;
+    switch (Op) {
+    case ADD: return ConstFloat::newConstFloat(LV + RV);
+    case SUB: return ConstFloat::newConstFloat(LV - RV);
+    case MUL: return ConstFloat::newConstFloat(LV * RV);
+    case DIV: return ConstFloat::newConstFloat(LV / RV);
+    default: return nullptr;
+    }
+  }
+
+  if (isCompareOp(Op)) {
+    if (IRType::isFloat(Ty)) {
+      float LV = 0.0f;
+      float RV = 0.0f;
+      if (!Value::tryGetFloatConst(LHS, LV) ||
+          !Value::tryGetFloatConst(RHS, RV))
+        return nullptr;
+      switch (Op) {
+      case E:  return ConstBool::newConstBool(LV == RV);
+      case NE: return ConstBool::newConstBool(LV != RV);
+      case G:  return ConstBool::newConstBool(LV > RV);
+      case GE: return ConstBool::newConstBool(LV >= RV);
+      case L:  return ConstBool::newConstBool(LV < RV);
+      case LE: return ConstBool::newConstBool(LV <= RV);
+      default: return nullptr;
+      }
+    }
+
+    int32_t LV = 0;
+    int32_t RV = 0;
+    if (!Value::tryGetIntConst(LHS, LV) ||
+        !Value::tryGetIntConst(RHS, RV))
+      return nullptr;
+    switch (Op) {
+    case E:  return ConstBool::newConstBool(LV == RV);
+    case NE: return ConstBool::newConstBool(LV != RV);
+    case G:  return ConstBool::newConstBool(LV > RV);
+    case GE: return ConstBool::newConstBool(LV >= RV);
+    case L:  return ConstBool::newConstBool(LV < RV);
+    case LE: return ConstBool::newConstBool(LV <= RV);
+    default: return nullptr;
+    }
+  }
+
+  if (IRType::isFloat(Ty)) {
+    float LV = 0.0f;
+    float RV = 0.0f;
+    if (!Value::tryGetFloatConst(LHS, LV) ||
+        !Value::tryGetFloatConst(RHS, RV))
+      return nullptr;
+    switch (Op) {
+    case ADD: return ConstFloat::newConstFloat(LV + RV);
+    case SUB: return ConstFloat::newConstFloat(LV - RV);
+    case MUL: return ConstFloat::newConstFloat(LV * RV);
+    case DIV:
+      return RV == 0.0f ? Value::makeUndefForType(Ty)
+                        : static_cast<Value *>(ConstFloat::newConstFloat(LV / RV));
+    case MOD:
+      return RV == 0.0f ? Value::makeUndefForType(Ty)
+                        : static_cast<Value *>(ConstFloat::newConstFloat(std::fmod(LV, RV)));
+    default: return nullptr;
+    }
+  }
+
+  int32_t LV = 0;
+  int32_t RV = 0;
+  if (!Value::tryGetIntConst(LHS, LV) ||
+      !Value::tryGetIntConst(RHS, RV))
+    return nullptr;
+  switch (Op) {
+  case ADD: return ConstInt::newConstInt(LV + RV);
+  case SUB: return ConstInt::newConstInt(LV - RV);
+  case MUL: return ConstInt::newConstInt(LV * RV);
+  case DIV:
+    return RV == 0 ? Value::makeUndefForType(Ty)
+                   : static_cast<Value *>(ConstInt::newConstInt(LV / RV));
+  case UDIV:
+    return RV == 0
+               ? Value::makeUndefForType(Ty)
+               : static_cast<Value *>(ConstInt::newConstInt(
+                     static_cast<int32_t>(static_cast<uint32_t>(LV) /
+                                          static_cast<uint32_t>(RV))));
+  case MOD:
+    return RV == 0 ? Value::makeUndefForType(Ty)
+                   : static_cast<Value *>(ConstInt::newConstInt(LV % RV));
+  case UREM:
+    return RV == 0
+               ? Value::makeUndefForType(Ty)
+               : static_cast<Value *>(ConstInt::newConstInt(
+                     static_cast<int32_t>(static_cast<uint32_t>(LV) %
+                                          static_cast<uint32_t>(RV))));
+  case AND: return ConstInt::newConstInt(LV & RV);
+  case OR:  return ConstInt::newConstInt(LV | RV);
+  case XOR: return ConstInt::newConstInt(LV ^ RV);
+  default: return nullptr;
   }
 }
 
@@ -1526,13 +2204,65 @@ Value *CallInst::getCallee() const {
   return getOperand(0);
 }
 
+Function *CallInst::getDirectCallee() const {
+  return dynamic_cast<Function *>(getCallee());
+}
+
+BuildInFunction *CallInst::getBuiltinCallee() const {
+  return dynamic_cast<BuildInFunction *>(getCallee());
+}
+
+std::string CallInst::getCalleeName() const {
+  if (auto *F = getDirectCallee()) return F->getIdent();
+  if (auto *BIF = getBuiltinCallee()) return BIF->getIdent();
+  return {};
+}
+
 Value *CallInst::getArg(unsigned Index) const {
   return getOperand(static_cast<size_t>(Index) + 1);
+}
+
+std::vector<Value *> CallInst::getArgs() const {
+  std::vector<Value *> Args;
+  Args.reserve(getArgCount());
+  for (unsigned I = 0; I < getArgCount(); ++I) Args.push_back(getArg(I));
+  return Args;
 }
 
 unsigned CallInst::getArgCount() const {
   size_t NumOperands = getNumOperands();
   return NumOperands == 0 ? 0 : static_cast<unsigned>(NumOperands - 1);
+}
+
+int CallInst::getArgIndex(const Use *U) const {
+  int OperandIndex = getUserIndex(U);
+  return OperandIndex > 0 ? OperandIndex - 1 : -1;
+}
+
+bool CallInst::isCalleeUse(const Use *U) const {
+  return U && getUserIndex(U) == 0;
+}
+
+bool CallInst::eraseArg(unsigned Index) {
+  return Index < getArgCount() && eraseOperand(static_cast<size_t>(Index) + 1);
+}
+
+bool CallInst::isMemcpyLike() const {
+  return BuildInFunction::isMemcpyName(getCalleeName());
+}
+
+bool CallInst::isNonVolatileMemcpy() const {
+  int32_t IsVolatile = 0;
+  return isMemcpyLike() && getArgCount() >= 4 && getArg(3) &&
+         getArg(3)->tryGetIntConst(IsVolatile) && IsVolatile == 0;
+}
+
+bool CallInst::isMemcpyLike(const CallInst *CI) {
+  return CI && CI->isMemcpyLike();
+}
+
+bool CallInst::isNonVolatileMemcpy(const CallInst *CI) {
+  return CI && CI->isNonVolatileMemcpy();
 }
 
 FPTOSIInst::FPTOSIInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::FPTOSI;}
@@ -1633,6 +2363,10 @@ SelectInst::SelectInst(Value* cond,Value* isTrue,Value* isFalse)
   addUse(isTrue);
   addUse(isFalse);
 }
+
+Value *SelectInst::getCondition() const { return getOperand(0); }
+Value *SelectInst::getTrueValue() const { return getOperand(1); }
+Value *SelectInst::getFalseValue() const { return getOperand(2); }
 
 void SelectInst::dumpIR() {
   Value::dumpIR();
@@ -1754,6 +2488,37 @@ void Variable::dumpIR(){
     return userList[0]->usee;
  }
 
+Value *Variable::getConstantElement(const std::vector<int> &Path) {
+  std::shared_ptr<IRType> Ty =
+      getIRType() ? getIRType()->getPointeeType() : nullptr;
+  if (!Ty) return nullptr;
+
+  Value *Node = getUsee();
+  for (int Index : Path) {
+    auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
+    if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
+      return nullptr;
+
+    if (Node) {
+      auto *Init = dynamic_cast<Initializer *>(Node);
+      if (!Init) return nullptr;
+      Node = static_cast<size_t>(Index) < Init->size()
+                 ? (*Init)[static_cast<size_t>(Index)]
+                 : nullptr;
+    }
+    Ty = ArrTy->getElementType();
+  }
+
+  if (!Ty || Ty->isArray()) return nullptr;
+  if (!Node) return Value::makeZeroForType(Ty);
+  return dynamic_cast<ConstantSystem *>(Node) ? Node : nullptr;
+}
+
+Value *Variable::getConstantElement(Variable *Source,
+                                    const std::vector<int> &Path) {
+  return Source ? Source->getConstantElement(Path) : nullptr;
+}
+
 Initializer::Initializer(std::shared_ptr<IRType> irtype):Value(irtype){}
 
 void Initializer::Var2Store(BasicBlock *bb, const std::string &name, std::vector<int> &gep_data) {
@@ -1857,7 +2622,7 @@ ConstBool::ConstBool(bool val):ConstantSystem(INTType::NewBool()),val(val){
     ident = "false";
 }
 
-bool ConstBool::getVal(){return val;}
+bool ConstBool::getVal() const {return val;}
 
 ConstBool* ConstBool::newConstBool(bool val){
   static ConstBool true_const(true);
@@ -1875,7 +2640,7 @@ ConstInt::ConstInt(int val, size_t size):ConstantSystem(INTType::NewInt(size)),v
     ident = std::to_string(val);
 }
 
-int ConstInt::getVal(){return val;}
+int ConstInt::getVal() const {return val;}
 
 ConstInt* ConstInt::newConstInt(int val, size_t size){
   static std::map<std::pair<int, size_t>, ConstInt*> int_const_map;
@@ -1899,7 +2664,7 @@ ConstFloat* ConstFloat::newConstFloat(float val){
 }
 
 
-float ConstFloat::getVal(){return val;}
+float ConstFloat::getVal() const {return val;}
 
  ConstPtr::ConstPtr(std::shared_ptr<IRType> irtype):ConstantSystem(irtype){}
 
@@ -1966,6 +2731,11 @@ void PhiInst::setIncomingValue(unsigned i, Value* val) {
     use->usee = val;
     // 加入新 Value 的 UseList
     val->getUseList().addUseNode(use);
+}
+
+bool PhiInst::setIncomingBlock(unsigned i, BasicBlock *BB) {
+    if (!BB || i >= getNumIncomingValues()) return false;
+    return replaceOperand(i * 2 + 1, BB);
 }
 
 void PhiInst::dumpIR() {
@@ -2278,6 +3048,25 @@ bool BasicBlock::replaceCondBrWithUncond(BasicBlock *BB, BasicBlock *Dst) {
   OldBr->replaceWith(NewBr);
   delete OldBr;
   return true;
+}
+
+bool BasicBlock::replaceTerminator(Instruction *NewTerminator) {
+  if (!NewTerminator) return false;
+  Instruction *OldTerminator = getTerminator();
+  if (!OldTerminator) {
+    delete NewTerminator;
+    return false;
+  }
+  OldTerminator->replaceWith(NewTerminator);
+  delete OldTerminator;
+  return true;
+}
+
+bool BasicBlock::replaceTerminator(BasicBlock *BB,
+                                   Instruction *NewTerminator) {
+  if (BB) return BB->replaceTerminator(NewTerminator);
+  delete NewTerminator;
+  return false;
 }
 
 bool BasicBlock::onlyPhiAndTerminator() {

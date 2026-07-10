@@ -17,8 +17,6 @@ public:
 private:
 	bool runLoopRotate(Function &F, Loop &L, const DominatorTree &DT, const LoopInfo &LI);
 
-	static bool replaceTerminatorTarget(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc);
-
 	static bool isLCSSAPhi(PhiInst *Phi);
 	static Instruction *cloneInstructionWithMap(
 		Instruction *I,

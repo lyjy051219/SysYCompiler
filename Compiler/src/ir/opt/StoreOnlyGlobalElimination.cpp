@@ -36,11 +36,11 @@
 // 从 ptr 向上追 GEP/BitCast 链到基址，并沿途记录常量索引序列。
 // 返回 base（可能是全局 Variable / 其他）。如果 path 里遇到非常量索引，
 // 把 hasVarIdx 置 true。path 只记录 "全部都是常量" 时才有用。
-static void collectReachableBases(Value *ptr,
+void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
                                   std::unordered_set<Value*> &bases,
                                   std::unordered_set<Value*> &visited,
                                   bool &escape,
-                                  int depth = 0) {
+                                  int depth) {
     if (escape || !ptr) return;
     if (!visited.insert(ptr).second) return;
     if (depth > 32) { escape = true; return; }
@@ -86,7 +86,8 @@ static void collectReachableBases(Value *ptr,
 
 // 简化版：trace 单一 ptr，成功返回 base 和常量索引序列（若全常量）。
 // 失败（PHI / 多 base / 未知）返回 base=nullptr 或 hasVarIdx/unresolved=true。
-static StoreOnlyGlobalTraceResult traceBaseAndIndex(Value *ptr) {
+StoreOnlyGlobalTraceResult
+StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
     StoreOnlyGlobalTraceResult R;
     std::vector<int64_t> idx;
     Value *cur = ptr;
@@ -129,7 +130,8 @@ static StoreOnlyGlobalTraceResult traceBaseAndIndex(Value *ptr) {
 }
 
 // 每个 global 的读信息
-static void markGlobalRead(Variable *G, const StoreOnlyGlobalTraceResult *tr,
+void StoreOnlyGlobalEliminationPass::markGlobalRead(
+                           Variable *G, const StoreOnlyGlobalTraceResult *tr,
                            std::unordered_map<Variable*, StoreOnlyGlobalReadInfo> &reads) {
     if (!G) return;
     auto &info = reads[G];
@@ -402,7 +404,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         }
         if (anyWrite || loads.empty()) continue;
 
-        // 取初值：userList[0] 若存在就是显式初值，否则 zero-initializer
+        // 取显式初值；没有初始化 operand 时使用 zero-initializer。
         Value *initVal = G->getUsee();
         Value *constRepl = nullptr;
         if (initVal) {

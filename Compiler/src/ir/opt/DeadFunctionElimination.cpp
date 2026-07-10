@@ -3,20 +3,6 @@
 #include <unordered_set>
 #include <vector>
 
-bool DeadFunctionEliminationPass::isExternalRoot(Function *F) {
-	if (!F) return true;
-
-	const std::string Name = F->getIdent();
-	if (Name == "main") return true;
-	if (BuildInFunction::isKnownRuntimeName(Name)) return true;
-
-	// 目前 Function 构造时通常自带入口块；这里仍保留 declaration 判断，
-	// 以后若支持仅声明函数，不能把 ABI 可见声明删掉。
-	if (F->front() == nullptr) return true;
-
-	return false;
-}
-
 PreservationStatus DeadFunctionEliminationPass::run(
 	Module &M,
 	ModuleAnalysisPassManager &MAM)
@@ -49,7 +35,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 	for (auto &FPtr : Functions) {
 		Function *F = FPtr.get();
 		if (!F) continue;
-		if (isExternalRoot(F)) {
+			if (F->hasReservedSignature()) {
 			markLive(F);
 		}
 	}
@@ -91,10 +77,10 @@ PreservationStatus DeadFunctionEliminationPass::run(
 			for (Instruction *I : *BB) {
 				if (!I) continue;
 
-				auto &Operands = I->getUserList();
-				for (auto &UsePtr : Operands) {
-					if (!UsePtr) continue;
-					auto *Target = dynamic_cast<Function *>(UsePtr->getValue());
+				for (size_t OperandIndex = 0;
+					 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+					auto *Target = dynamic_cast<Function *>(
+						I->getOperand(OperandIndex));
 					if (!Target || !InModule.count(Target)) continue;
 
 					// 直接调用会让 callee 可达；函数值作为普通操作数出现时，

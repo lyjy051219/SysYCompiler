@@ -8,7 +8,8 @@
 #include <vector>
 
 
-static CalleeInlineProfile analyzeCallee(Function* Callee, FunctionAnalysisPassManager& FAM) {
+CalleeInlineProfile FuncInlinePass::analyzeCallee(
+	Function* Callee, FunctionAnalysisPassManager& FAM) {
 	CalleeInlineProfile P;
 	if (!Callee) return P;
 
@@ -21,15 +22,9 @@ static CalleeInlineProfile analyzeCallee(Function* Callee, FunctionAnalysisPassM
 			if (!I) continue;
 			++P.TotalInstCount;
 
-			if (I->instType != Instruction::CALL) continue;
-			auto& UL = I->getUserList();
-			if (UL.empty() || !UL[0]) {
-				P.HasOtherCalls = true;
-				continue;
-			}
-
-			Value* CV = UL[0]->getValue();
-			auto* CF = dynamic_cast<Function*>(CV);
+			auto *CI = dynamic_cast<CallInst *>(I);
+			if (!CI) continue;
+			Function *CF = CI->getDirectCallee();
 			if (!CF) {
 				P.HasOtherCalls = true;
 				continue;
@@ -56,7 +51,7 @@ static CalleeInlineProfile analyzeCallee(Function* Callee, FunctionAnalysisPassM
 }
 
 // 外层内联条件判定：仅保留在辅助函数中，内联主流程尽量集中在 run 里。
-static bool isInlineSite(
+bool FuncInlinePass::isInlineSite(
 	Function& Caller,
 	CallInst* CI,
 	Function* Callee,
@@ -109,9 +104,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			auto* CI = dynamic_cast<CallInst*>(I);
 			if (!CI) continue;
 
-			auto& UL = CI->getUserList();
-			if (UL.empty() || !UL[0]) continue;
-			auto* Callee = dynamic_cast<Function*>(UL[0]->getValue());
+			auto* Callee = CI->getDirectCallee();
 			if (!Callee) continue;
 
 			FreqCallee[Callee]++;
@@ -124,9 +117,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		BasicBlock* CallBB = CI->getParent();
 		if (!CallBB) continue;
 
-		auto& CallUL = CI->getUserList();
-		if (CallUL.empty() || !CallUL[0]) continue;
-		auto* Callee = dynamic_cast<Function*>(CallUL[0]->getValue());
+		auto* Callee = CI->getDirectCallee();
 		if (!Callee) continue;
 
 		CalleeInlineProfile Profile;
@@ -144,12 +135,9 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			if (OldBB) CalleeOrigBlocks.push_back(OldBB);
 		}
 
-		auto& Params = Callee->getParams();
-		for (size_t i = 0; i < Params.size(); ++i) {
-			Value* Param = Params[i].get();
-			Value* Arg = (i + 1 < CallUL.size() && CallUL[i + 1])
-				? CallUL[i + 1]->getValue()
-				: nullptr;
+		for (unsigned i = 0; i < Callee->getParamCount(); ++i) {
+			Value* Param = Callee->getParam(i);
+			Value* Arg = CI->getArg(i);
 			VMap[Param] = Arg;
 		}
 
@@ -198,15 +186,12 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			auto* NewI = Pair.second;
 			if (!OldI || !NewI) continue;
 
-			auto& OUL = OldI->getUserList();
-			auto& NUL = NewI->getUserList();
-			size_t N = std::min(OUL.size(), NUL.size());
+			size_t N = std::min(OldI->getNumOperands(), NewI->getNumOperands());
 			for (size_t i = 0; i < N; ++i) {
-				if (!OUL[i] || !NUL[i]) continue;
-				Value* OldOp = OUL[i]->getValue();
+				Value* OldOp = OldI->getOperand(i);
 				auto It = VMap.find(OldOp);
 				if (It != VMap.end() && It->second) {
-					NUL[i]->replaceUseeWith(It->second);
+					NewI->replaceOperand(i, It->second);
 				}
 			}
 		}
@@ -228,7 +213,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 
 				auto Bit = BBMap.find(OldInB);
 				if (Bit != BBMap.end()) {
-					NewPhi->getUserList()[i * 2 + 1]->replaceUseeWith(Bit->second);
+					NewPhi->setIncomingBlock(i, Bit->second);
 				}
 			}
 		}
@@ -243,22 +228,11 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			auto* BI = dynamic_cast<BrInst*>(TI);
 			if (!BI) continue;
 
-			auto& BUL = BI->getUserList();
-			if (BUL.size() == 1 && BUL[0]) {
-				auto* Dst = dynamic_cast<BasicBlock*>(BUL[0]->getValue());
-				auto it = BBMap.find(Dst);
-				if (it != BBMap.end() && it->second != Dst) {
-					BUL[0]->replaceUseeWith(it->second);
-				}
-			} else if (BUL.size() == 3) {
-				for (int idx : {1, 2}) {
-					if (!BUL[idx]) continue;
-					auto* Dst = dynamic_cast<BasicBlock*>(BUL[idx]->getValue());
-					auto it = BBMap.find(Dst);
-					if (it != BBMap.end() && it->second != Dst) {
-						BUL[idx]->replaceUseeWith(it->second);
-					}
-				}
+			for (unsigned i = 0; i < BI->getSuccessorCount(); ++i) {
+				BasicBlock *Dst = BI->getSuccessor(i);
+				auto It = BBMap.find(Dst);
+				if (It != BBMap.end() && It->second != Dst)
+					BasicBlock::redirectBranchTarget(NewBB, Dst, It->second);
 			}
 		}
 
@@ -301,37 +275,17 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		}
 
 		// 原块 successor 的 PHI incoming 现在应从 A2 进入（原 terminator 已搬到 A2）。
-		for (BasicBlock* Succ : A2->getSuccessors()) {
-			if (!Succ) continue;
-			for (auto* Inst : *Succ) {
-				auto* Phi = dynamic_cast<PhiInst*>(Inst);
-				if (!Phi) break;
-				for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-					if (Phi->getIncomingBlock(i) == CallBB) {
-						Phi->getUserList()[i * 2 + 1]->replaceUseeWith(A2);
-					}
-				}
-			}
-		}
+		for (BasicBlock* Succ : A2->getSuccessors())
+			BasicBlock::replaceIncomingPredInSuccPhis(Succ, CallBB, A2);
 
-		bool CallHasInstUsers = false;
-		for (auto It = CI->getUseList().begin(); It != CI->getUseList().end(); ++It) {
-			Use* U = *It;
-			if (!U || U->getValue() != CI) continue;
-			if (dynamic_cast<Instruction*>(U->getUser())) {
-				CallHasInstUsers = true;
-				break;
-			}
-		}
+		bool CallHasInstUsers = CI->countInstructionUses() > 0;
 
 		std::vector<std::pair<BasicBlock*, Value*>> RetEdges;
 		RetEdges.reserve(ClonedRets.size());
 		for (RetInst* RI : ClonedRets) {
 			if (!RI) continue;
 			auto* RB = RI->getParent();
-			Value* RV = nullptr;
-			auto& RUL = RI->getUserList();
-			if (!RUL.empty() && RUL[0]) RV = RUL[0]->getValue();
+			Value* RV = RI->getReturnValue();
 			RetEdges.push_back({RB, RV});
 		}
 

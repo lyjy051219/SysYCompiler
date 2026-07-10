@@ -38,7 +38,8 @@
 
 // 【假设】当前 IR 中同一 MustAlias 地址上的 load/store 类型一定一致。
 // 若后续 IR 出现 bitcast / 不同宽度访问同址，此处需增加宽度检查。
-static bool isTypeCompatible(Value *source, LoadInst *targetLoad) {
+bool LoadEliminationPass::isTypeCompatible(
+    Value *source, LoadInst *targetLoad) {
     if (!source || !targetLoad) return false;
     if (!source->getIRType() || !targetLoad->getIRType()) return false;
     return source->getIRType()->getEnum() == targetLoad->getIRType()->getEnum();
@@ -50,7 +51,7 @@ static bool isTypeCompatible(Value *source, LoadInst *targetLoad) {
 // stopBefore: 扫描到此指令前停止。nullptr = 从块末尾开始扫全块。
 // targetLoad: 正在查询的 load 指令，用于类型检查和避免自引用。
 // =====================================================================
-static LoadElimQueryResult scanBlockBackward(
+LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     BasicBlock *BB, Value *P, Instruction *stopBefore, LoadInst *targetLoad,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
@@ -66,9 +67,9 @@ static LoadElimQueryResult scanBlockBackward(
     while (cur) {
         // store → load forwarding
         if (auto *SI = dynamic_cast<StoreInst *>(cur)) {
-            if (SI->getUserList().size() >= 2) {
-                Value *StorePtr = SI->getUserList()[1]->getValue();
-                Value *StoredVal = SI->getUserList()[0]->getValue();
+            Value *StorePtr = SI->getPointerOperand();
+            Value *StoredVal = SI->getValueOperand();
+            if (StorePtr && StoredVal) {
                 AliasInfo ai = AA.aliasWithIndexRange(P, StorePtr, LI);
                 if (ai == AliasInfo::MustAlias && isTypeCompatible(StoredVal, targetLoad)) {
                     return LoadElimQueryResult::known(StoredVal);
@@ -80,8 +81,8 @@ static LoadElimQueryResult scanBlockBackward(
         }
         // load → load 复用
         else if (auto *LI2 = dynamic_cast<LoadInst *>(cur)) {
-            if (LI2 != targetLoad && LI2->getUserList().size() >= 1) {
-                Value *LoadPtr = LI2->getUserList()[0]->getValue();
+            if (LI2 != targetLoad) {
+                Value *LoadPtr = LI2->getPointerOperand();
                 if (AA.aliasWithIndexRange(P, LoadPtr, LI) == AliasInfo::MustAlias
                     && isTypeCompatible(LI2, targetLoad)) {
                     return LoadElimQueryResult::known(LI2);
@@ -120,16 +121,14 @@ static LoadElimQueryResult scanBlockBackward(
 // onStack: 当前递归栈上的块（检测真实 CFG 环）
 // memo:    缓存块末尾查询结果（钻石图共享祖先只算一次）
 // =====================================================================
-static const int MAX_DEPTH = 8;
-
-static LoadElimQueryResult queryAvailableValue(
+LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     Value *P, BasicBlock *BB, LoadInst *targetLoad, int depth,
     std::unordered_set<BasicBlock*> &onStack,
     std::unordered_map<BasicBlock*, LoadElimQueryResult> &memo,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    if (depth > MAX_DEPTH) {
+    if (depth > MaxQueryDepth) {
         return LoadElimQueryResult::unknown();
     }
 
@@ -215,13 +214,13 @@ static LoadElimQueryResult queryAvailableValue(
 // =====================================================================
 // processLoad: 尝试消除一个 load 指令。
 // =====================================================================
-static bool processLoad(
+bool LoadEliminationPass::processLoad(
     LoadInst *loadInst, BasicBlock *BB,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    if (loadInst->getUserList().size() < 1) return false;
-    Value *P = loadInst->getUserList()[0]->getValue();
+    Value *P = loadInst ? loadInst->getPointerOperand() : nullptr;
+    if (!P) return false;
 
     // Step 1: 块内扫描（从 load 位置向前）
     LoadElimQueryResult result = scanBlockBackward(BB, P, loadInst, loadInst, AA, LI, FAM);
@@ -287,7 +286,7 @@ static bool processLoad(
 // =====================================================================
 // processFunction: 支配树前序遍历处理所有 load。
 // =====================================================================
-static bool processFunction(
+bool LoadEliminationPass::processFunction(
     Function &F, DominatorTree &DT,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
@@ -314,15 +313,12 @@ static bool processFunction(
 
         for (LoadInst *LI2 : loads) {
             // 检查 load 是否还活着（可能被前一轮 processLoad 间接影响）
-            if (LI2->ChainNode<BasicBlock, Instruction>::getParent() != BB) continue;
+            if (LI2->getParent() != BB) continue;
             changed |= processLoad(LI2, BB, AA, LI, FAM);
         }
 
         // 推入子节点（逆序推入保持前序遍历顺序）
-        std::vector<DominatorNode*> children;
-        for (DominatorNode *child = node->FirstChild; child; child = child->NextSibling) {
-            children.push_back(child);
-        }
+        std::vector<DominatorNode*> children = DT.getChildNodes(node);
         for (auto it = children.rbegin(); it != children.rend(); ++it) {
             dtStack.push(*it);
         }

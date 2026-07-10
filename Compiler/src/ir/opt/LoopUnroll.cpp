@@ -9,39 +9,12 @@
 #include <unordered_set>
 #include <utility>
 
-bool functionHasBlockIdent(Function *F, const std::string &Name) {
-    if (!F) return false;
-
-    for (BasicBlock *BB : *F) {
-        if (BB && BB->getIdent() == Name) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-std::string makeUniqueBlockIdent(Function *F, const std::string &Base) {
-    if (!F) return Base;
-
-    if (!functionHasBlockIdent(F, Base)) {
-        return Base;
-    }
-
-    for (int Suffix = 1;; ++Suffix) {
-        std::string Candidate = Base + "." + std::to_string(Suffix);
-        if (!functionHasBlockIdent(F, Candidate)) {
-            return Candidate;
-        }
-    }
-}
-
-int nextUnrollSerial() {
+int LoopUnrollPass::nextUnrollSerial() {
     static int Serial = 0;
     return ++Serial;
 }
 
-std::string makeUnrollBlockIdent(Function *F,
+std::string LoopUnrollPass::makeUnrollBlockIdent(Function *F,
                                  BasicBlock *BB,
                                  int Iter,
                                  int UnrollSerial) {
@@ -52,10 +25,10 @@ std::string makeUnrollBlockIdent(Function *F,
     Base += ".";
     Base += std::to_string(Iter);
 
-    return makeUniqueBlockIdent(F, Base);
+    return F ? F->makeUniqueBlockIdent(Base) : Base;
 }
 
-std::string makePeelBlockIdent(Function *F,
+std::string LoopUnrollPass::makePeelBlockIdent(Function *F,
                                BasicBlock *BB,
                                int Iter,
                                int PeelSerial) {
@@ -66,51 +39,10 @@ std::string makePeelBlockIdent(Function *F,
     Base += ".";
     Base += std::to_string(Iter);
 
-    return makeUniqueBlockIdent(F, Base);
+    return F ? F->makeUniqueBlockIdent(Base) : Base;
 }
 
-std::vector<BasicBlock *> collectAllLoopBlocks(Loop *L) {
-    std::vector<BasicBlock *> Blocks;
-    if (!L) return Blocks;
-
-    std::vector<Loop *> Stack;
-    Stack.push_back(L);
-    std::unordered_set<BasicBlock *> Seen;
-
-    while (!Stack.empty()) {
-        Loop *Cur = Stack.back();
-        Stack.pop_back();
-        if (!Cur) continue;
-
-        for (BasicBlock *BB : Cur->getBlocks()) {
-            if (BB && Seen.insert(BB).second) {
-                Blocks.push_back(BB);
-            }
-        }
-
-        for (Loop *Sub : Cur->getSubLoops()) {
-            if (Sub) Stack.push_back(Sub);
-        }
-    }
-
-    return Blocks;
-}
-
-bool hasSubLoops(Loop *L) {
-    return L && !L->getSubLoops().empty();
-}
-
-bool isLoopExitingBlock(Loop *L, BasicBlock *BB) {
-    if (!L || !BB) return false;
-    for (BasicBlock *Succ : BB->getSuccessors()) {
-        if (Succ && !L->contains(Succ)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool isSupportedCloneInstruction(Instruction *I) {
+bool LoopUnrollPass::isSupportedCloneInstruction(Instruction *I) {
     if (!I) return false;
 
     switch (I->instType) {
@@ -123,14 +55,14 @@ bool isSupportedCloneInstruction(Instruction *I) {
     }
 }
 
-Value *stripSimpleCast(Value *V) {
+Value *LoopUnrollPass::stripSimpleCast(Value *V) {
     while (auto *I = dynamic_cast<Instruction *>(V)) {
         switch (I->instType) {
         case Instruction::TRUNC:
         case Instruction::ZEXT:
         case Instruction::SEXT:
         case Instruction::BITCAST:
-            V = I->getOperand(0);
+            V = I->getUnaryOperand();
             continue;
         default:
             return V;
@@ -139,29 +71,24 @@ Value *stripSimpleCast(Value *V) {
     return V;
 }
 
-std::optional<int64_t> asConstInt(Value *V) {
-    int32_t Out = 0;
-    if (V && V->tryGetIntConst(Out)) return Out;
-    return std::nullopt;
-}
-
-std::optional<PeelPredicate> matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
-    if (!Cmp || !IV || Cmp->getUserList().size() < 2) {
+std::optional<PeelPredicate> LoopUnrollPass::matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
+    Value *RawLHS = nullptr;
+    Value *RawRHS = nullptr;
+    if (!Cmp || !IV || !Cmp->getOperands(RawLHS, RawRHS))
         return std::nullopt;
-    }
 
-    Value *LHS = stripSimpleCast(Cmp->getOperand(0));
-    Value *RHS = stripSimpleCast(Cmp->getOperand(1));
+    Value *LHS = stripSimpleCast(RawLHS);
+    Value *RHS = stripSimpleCast(RawRHS);
     IV = stripSimpleCast(IV);
 
     if (LHS == IV) {
-        if (auto C = asConstInt(RHS)) {
+        if (auto C = RHS ? RHS->getIntConstant() : std::nullopt) {
             return PeelPredicate{Cmp->getOp(), *C};
         }
     }
 
     if (RHS == IV) {
-        if (auto C = asConstInt(LHS)) {
+        if (auto C = LHS ? LHS->getIntConstant() : std::nullopt) {
             return PeelPredicate{BinaryInst::reversePredicate(Cmp->getOp()), *C};
         }
     }
@@ -169,7 +96,7 @@ std::optional<PeelPredicate> matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
     return std::nullopt;
 }
 
-int peelCountForPredicate(const PeelPredicate &P) {
+int LoopUnrollPass::peelCountForPredicate(const PeelPredicate &P) {
     switch (P.Op) {
     case BinaryInst::E:
         if (P.Constant == 0) return 1;
@@ -187,17 +114,17 @@ int peelCountForPredicate(const PeelPredicate &P) {
     }
 }
 
-bool isInternalConditionalBranch(Loop *L, BrInst *Br) {
-    if (!L || !Br || !Br->isConditional() || Br->getUserList().size() != 3) {
+bool LoopUnrollPass::isInternalConditionalBranch(Loop *L, BrInst *Br) {
+    if (!L || !Br || !Br->isConditional()) {
         return false;
     }
 
-    auto *TrueBB = dynamic_cast<BasicBlock *>(Br->getOperand(1));
-    auto *FalseBB = dynamic_cast<BasicBlock *>(Br->getOperand(2));
+    auto *TrueBB = Br->getTrueSuccessor();
+    auto *FalseBB = Br->getFalseSuccessor();
     return TrueBB && FalseBB && L->contains(TrueBB) && L->contains(FalseBB);
 }
 
-UnrollDecision makeNoUnrollDecision(std::string Reason) {
+UnrollDecision LoopUnrollPass::makeNoUnrollDecision(std::string Reason) {
     UnrollDecision Decision;
     Decision.Kind = UnrollKind::None;
     Decision.Count = 0;
@@ -209,11 +136,11 @@ UnrollDecision makeNoUnrollDecision(std::string Reason) {
     return Decision;
 }
 
-bool withinThreshold(int64_t Cost, int Threshold) {
+bool LoopUnrollPass::withinThreshold(int64_t Cost, int Threshold) {
     return Threshold >= 0 && Cost <= static_cast<int64_t>(Threshold);
 }
 
-static int chooseFactorBySize(int BodyCost, int SizeLimit, int MaxCount) {
+int LoopUnrollPass::chooseFactorBySize(int BodyCost, int SizeLimit, int MaxCount) {
     if (BodyCost <= 0 || SizeLimit <= 0 || MaxCount < 2)
         return 0;
 
@@ -227,7 +154,7 @@ static int chooseFactorBySize(int BodyCost, int SizeLimit, int MaxCount) {
     return 0;
 }
 
-int localSCEVNodeCost(const SCEVExpr *E) {
+int LoopUnrollPass::localSCEVNodeCost(const SCEVExpr *E) {
     if (!E) return 1000000;
 
     switch (E->Kind) {
@@ -256,7 +183,7 @@ int localSCEVNodeCost(const SCEVExpr *E) {
 }
 
 std::optional<LoopExecutionShape>
-getLoopExecutionShape(Loop *L, SCEVResult &SE) {
+LoopUnrollPass::getLoopExecutionShape(Loop *L, SCEVResult &SE) {
     if (!L) return std::nullopt;
 
     BasicBlock *PreHeader = nullptr;
@@ -278,22 +205,7 @@ getLoopExecutionShape(Loop *L, SCEVResult &SE) {
     return Shape;
 }
 
-std::vector<BasicBlock *> collectLoopBlocksInFunctionOrder(Loop *L) {
-    std::vector<BasicBlock *> Blocks;
-    if (!L || !L->getHeader() || !L->getHeader()->getParent()) {
-        return Blocks;
-    }
-
-    Function *F = L->getHeader()->getParent();
-    for (BasicBlock *BB : *F) {
-        if (BB && L->contains(BB)) {
-            Blocks.push_back(BB);
-        }
-    }
-    return Blocks;
-}
-
-bool canCloneAllInstructions(const std::vector<BasicBlock *> &Blocks) {
+bool LoopUnrollPass::canCloneAllInstructions(const std::vector<BasicBlock *> &Blocks) {
     std::unordered_map<Value *, Value *> VMap;
     for (BasicBlock *BB : Blocks) {
         if (BB) VMap[BB] = BB;
@@ -312,7 +224,7 @@ bool canCloneAllInstructions(const std::vector<BasicBlock *> &Blocks) {
     return true;
 }
 
-Value *mapValueAtIteration(Value *V,
+Value *LoopUnrollPass::mapValueAtIteration(Value *V,
                            int Iter,
                            const UnrolledBodyCore &Core) {
     if (!V || Iter <= 0) return V;
@@ -322,16 +234,16 @@ Value *mapValueAtIteration(Value *V,
     return It == Core.ValueMaps[Iter].end() ? V : It->second;
 }
 
-bool isBlockValue(Value *V) {
+bool LoopUnrollPass::isBlockValue(Value *V) {
     return dynamic_cast<BasicBlock *>(V) != nullptr;
 }
 
-bool isDataValue(Value *V) {
+bool LoopUnrollPass::isDataValue(Value *V) {
     return V && !isBlockValue(V) && V->getIRType() &&
            V->getIRType()->getEnum() != IR_LABEL;
 }
 
-bool isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
+bool LoopUnrollPass::isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
     if (!Phi || !isDataValue(V)) return false;
     auto Ty = Phi->getIRType();
     auto VTy = V->getIRType();
@@ -340,7 +252,7 @@ bool isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
            Ty->getSize() == VTy->getSize();
 }
 
-bool isValueCompatibleWithType(Value *V, std::shared_ptr<IRType> Ty) {
+bool LoopUnrollPass::isValueCompatibleWithType(Value *V, std::shared_ptr<IRType> Ty) {
     if (!isDataValue(V) || !Ty) return false;
     auto VTy = V->getIRType();
     if (!VTy) return false;
@@ -348,7 +260,7 @@ bool isValueCompatibleWithType(Value *V, std::shared_ptr<IRType> Ty) {
            Ty->getSize() == VTy->getSize();
 }
 
-Value *mapDataValueAtIteration(Value *V,
+Value *LoopUnrollPass::mapDataValueAtIteration(Value *V,
                                int Iter,
                                const UnrolledBodyCore &Core) {
     if (!V) return nullptr;
@@ -361,7 +273,7 @@ Value *mapDataValueAtIteration(Value *V,
     return isDataValue(V) ? V : nullptr;
 }
 
-Value *mapDataValueAtPeelIteration(Value *V,
+Value *LoopUnrollPass::mapDataValueAtPeelIteration(Value *V,
                                    int Iter,
                                    const PeeledBodyCore &Core) {
     if (!V) return nullptr;
@@ -374,7 +286,7 @@ Value *mapDataValueAtPeelIteration(Value *V,
     return isDataValue(V) ? V : nullptr;
 }
 
-Value *getCapturedDataValueMappedAtIteration(Value *V,
+Value *LoopUnrollPass::getCapturedDataValueMappedAtIteration(Value *V,
                                              int Iter,
                                              const UnrolledBodyCore &Core) {
     if (!V || Iter <= 0 ||
@@ -387,7 +299,7 @@ Value *getCapturedDataValueMappedAtIteration(Value *V,
     return isDataValue(It->second) ? It->second : nullptr;
 }
 
-bool addIncomingChecked(PhiInst *Phi, Value *V, BasicBlock *Pred) {
+bool LoopUnrollPass::addIncomingChecked(PhiInst *Phi, Value *V, BasicBlock *Pred) {
     if (!Phi || !Pred || !isValueCompatibleWithPhi(V, Phi)) {
         return false;
     }
@@ -395,10 +307,10 @@ bool addIncomingChecked(PhiInst *Phi, Value *V, BasicBlock *Pred) {
     return true;
 }
 
-bool rebuildPhiFromIncomingChecked(
+bool LoopUnrollPass::rebuildPhiFromIncomingChecked(
     PhiInst *Phi,
     const std::vector<PhiInst::IncomingEdge> &Incoming,
-    Value **Replacement = nullptr) {
+    Value **Replacement) {
     if (!Phi) return false;
     for (const auto &Edge : Incoming) {
         if (!Edge.Pred || !isValueCompatibleWithPhi(Edge.V, Phi)) {
@@ -430,13 +342,14 @@ bool rebuildPhiFromIncomingChecked(
     return true;
 }
 
-bool replaceOperandsUsingMap(Instruction *I,
+bool LoopUnrollPass::replaceOperandsUsingMap(Instruction *I,
                              const std::unordered_map<Value *, Value *> &VMap) {
     if (!I) return false;
 
     bool Changed = false;
-    for (auto &UsePtr : I->getUserList()) {
-        Use *U = UsePtr.get();
+    for (size_t OperandIndex = 0;
+         OperandIndex < I->getNumOperands(); ++OperandIndex) {
+        Use *U = I->getOperandUse(OperandIndex);
         if (!U) continue;
         auto It = VMap.find(U->getValue());
         if (It == VMap.end()) continue;
@@ -445,13 +358,14 @@ bool replaceOperandsUsingMap(Instruction *I,
     return Changed;
 }
 
-bool replaceDataOperandsUsingMap(
+bool LoopUnrollPass::replaceDataOperandsUsingMap(
     Instruction *I,
     const std::unordered_map<Value *, Value *> &VMap) {
     if (!I) return false;
 
-    for (auto &UsePtr : I->getUserList()) {
-        Use *U = UsePtr.get();
+    for (size_t OperandIndex = 0;
+         OperandIndex < I->getNumOperands(); ++OperandIndex) {
+        Use *U = I->getOperandUse(OperandIndex);
         if (!U) continue;
         Value *Old = U->getValue();
         if (isBlockValue(Old)) continue;
@@ -463,7 +377,7 @@ bool replaceDataOperandsUsingMap(
     return true;
 }
 
-bool removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
+bool LoopUnrollPass::removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
     if (Iter <= 0 || Iter >= Core.Count) return false;
 
     BasicBlock *OrigHeader = Core.Headers.front();
@@ -495,7 +409,7 @@ bool removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
     return true;
 }
 
-bool removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
+bool LoopUnrollPass::removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
     if (Iter < 0 || Iter >= Core.PeelCount) return false;
 
     BasicBlock *OrigHeader = Core.Shape.Header;
@@ -538,15 +452,15 @@ bool removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
 }
 
 std::optional<UnrolledBodyCore>
-cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
-    if (!L || Count < 2 || hasSubLoops(L)) return std::nullopt;
+LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
+    if (!L || Count < 2 || !L->isInnermost()) return std::nullopt;
 
     auto Shape = getLoopExecutionShape(L, SE);
     if (!Shape || !Shape->Header || !Shape->Header->getParent()) {
         return std::nullopt;
     }
 
-    std::vector<BasicBlock *> LoopBlocks = collectLoopBlocksInFunctionOrder(L);
+    std::vector<BasicBlock *> LoopBlocks = L->getBlocksInFunctionOrder();
     if (LoopBlocks.empty() || !canCloneAllInstructions(LoopBlocks)) {
         return std::nullopt;
     }
@@ -615,8 +529,8 @@ cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
 }
 
 std::optional<PeeledBodyCore>
-clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
-    if (!L || PeelCount <= 0 || hasSubLoops(L)) return std::nullopt;
+LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
+    if (!L || PeelCount <= 0 || !L->isInnermost()) return std::nullopt;
 
     auto Shape = getLoopExecutionShape(L, SE);
     if (!Shape || !Shape->Header || !Shape->PreHeader || !Shape->Latch ||
@@ -624,7 +538,7 @@ clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
         return std::nullopt;
     }
 
-    std::vector<BasicBlock *> LoopBlocks = collectLoopBlocksInFunctionOrder(L);
+    std::vector<BasicBlock *> LoopBlocks = L->getBlocksInFunctionOrder();
     if (LoopBlocks.empty() || !canCloneAllInstructions(LoopBlocks)) {
         return std::nullopt;
     }
@@ -689,10 +603,10 @@ clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
     return Core;
 }
 
-bool rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
+bool LoopUnrollPass::rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
                                          int LastIter,
                                          std::unordered_map<PhiInst *, Value *>
-                                             *Replacements = nullptr) {
+                                             *Replacements) {
     BasicBlock *Header = Core.Headers.front();
     BasicBlock *OrigLatch = Core.Latches.front();
     BasicBlock *LastLatch =
@@ -701,12 +615,6 @@ bool rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
     if (!Header || !OrigLatch || !LastLatch || LastIter <= 0) return false;
 
     auto HeaderPhis = Header->collectPhiNodes();
-    struct PhiRewritePlan {
-        PhiInst *OldPhi = nullptr;
-        std::vector<PhiInst::IncomingEdge> Incoming;
-        Value *Replacement = nullptr;
-        PhiInst *NewPhi = nullptr;
-    };
     std::vector<PhiRewritePlan> Plans;
     Plans.reserve(HeaderPhis.size());
 
@@ -779,7 +687,7 @@ bool rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
     return true;
 }
 
-bool rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core) {
+bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core) {
     BasicBlock *Header = Core.Shape.Header;
     BasicBlock *PreHeader = Core.Shape.PreHeader;
     BasicBlock *OrigLatch = Core.Shape.Latch;
@@ -832,7 +740,7 @@ bool rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core) {
     return true;
 }
 
-bool removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &Core) {
+bool LoopUnrollPass::removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &Core) {
     BasicBlock *Exit = Core.Shape.Exit;
     if (!Exit) return false;
 
@@ -859,38 +767,13 @@ bool removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &Core) {
     return true;
 }
 
-bool replaceBranch(BasicBlock *BB, BrInst *NewBranch) {
-    if (!BB || !NewBranch) return false;
-    BrInst *OldBranch = BB->getBranchTerminator();
-    if (!OldBranch) {
-        delete NewBranch;
-        return false;
-    }
-    OldBranch->replaceWith(NewBranch);
-    delete OldBranch;
-    return true;
-}
-
-void insertBeforeTerminator(BasicBlock *BB, Instruction *I) {
-    if (!BB || !I) return;
-    for (auto It = BB->begin(); It != BB->end(); ++It) {
-        Instruction *Current = *It;
-        if (Current && (Current->instType == Instruction::BR ||
-                        Current->instType == Instruction::RET)) {
-            It.insertBefore(I);
-            return;
-        }
-    }
-    BB->push_back(I);
-}
-
-bool hasLatchExitShape(const UnrolledBodyCore &Core) {
+bool LoopUnrollPass::hasLatchExitShape(const UnrolledBodyCore &Core) {
     return Core.Shape.Exiting && Core.Shape.Latch &&
            Core.Shape.Exiting == Core.Shape.Latch;
 }
 
 std::unordered_set<BasicBlock *>
-collectCoreExitings(const UnrolledBodyCore &Core) {
+LoopUnrollPass::collectCoreExitings(const UnrolledBodyCore &Core) {
     std::unordered_set<BasicBlock *> Result;
     for (BasicBlock *BB : Core.Exitings) {
         if (BB) Result.insert(BB);
@@ -898,7 +781,7 @@ collectCoreExitings(const UnrolledBodyCore &Core) {
     return Result;
 }
 
-bool rewriteExitPhisForSingleExiting(UnrolledBodyCore &Core,
+bool LoopUnrollPass::rewriteExitPhisForSingleExiting(UnrolledBodyCore &Core,
                                      int ActiveIter) {
     if (ActiveIter < 0 || ActiveIter >= Core.Count) return false;
 
@@ -928,10 +811,10 @@ bool rewriteExitPhisForSingleExiting(UnrolledBodyCore &Core,
     return true;
 }
 
-std::vector<BasicBlock *> collectExitRegionBlocksFrom(
+std::vector<BasicBlock *> LoopUnrollPass::collectExitRegionBlocksFrom(
     BasicBlock *Exit,
     const std::unordered_set<BasicBlock *> &StopBlocks,
-    bool StopAtConditionalBranch = true) {
+    bool StopAtConditionalBranch) {
     std::vector<BasicBlock *> Region;
     if (!Exit) return Region;
 
@@ -963,11 +846,11 @@ std::vector<BasicBlock *> collectExitRegionBlocksFrom(
     return Region;
 }
 
-std::vector<ExitRegionDataUse> collectExitRegionDataUsesFrom(
+std::vector<ExitRegionDataUse> LoopUnrollPass::collectExitRegionDataUsesFrom(
     BasicBlock *Exit,
     const std::unordered_set<BasicBlock *> &StopBlocks,
-    BasicBlock *Exiting = nullptr,
-    bool StopAtConditionalBranch = true) {
+    BasicBlock *Exiting,
+    bool StopAtConditionalBranch) {
     std::vector<ExitRegionDataUse> Uses;
 
     for (BasicBlock *BB : collectExitRegionBlocksFrom(
@@ -975,8 +858,9 @@ std::vector<ExitRegionDataUse> collectExitRegionDataUsesFrom(
         if (!BB) continue;
         for (Instruction *I : *BB) {
             if (!I || dynamic_cast<PhiInst *>(I)) continue;
-            for (auto &UsePtr : I->getUserList()) {
-                Use *U = UsePtr.get();
+            for (size_t OperandIndex = 0;
+                 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+                Use *U = I->getOperandUse(OperandIndex);
                 if (!U) continue;
                 Value *Old = U->getValue();
                 if (!isDataValue(Old)) continue;
@@ -996,11 +880,11 @@ std::vector<ExitRegionDataUse> collectExitRegionDataUsesFrom(
     return Uses;
 }
 
-bool rewriteExitRegionDataOperandsForIteration(
+bool LoopUnrollPass::rewriteExitRegionDataOperandsForIteration(
     UnrolledBodyCore &Core,
     int ActiveIter,
     const std::vector<ExitRegionDataUse> &CapturedUses,
-    const std::unordered_map<Value *, Value *> *HeaderExitValues = nullptr) {
+    const std::unordered_map<Value *, Value *> *HeaderExitValues) {
     if (ActiveIter <= 0 ||
         ActiveIter >= static_cast<int>(Core.ValueMaps.size())) {
         return false;
@@ -1030,7 +914,7 @@ bool rewriteExitRegionDataOperandsForIteration(
     return true;
 }
 
-bool replaceDataOperandsInReachableRegionFrom(
+bool LoopUnrollPass::replaceDataOperandsInReachableRegionFrom(
     BasicBlock *Start,
     const std::unordered_set<BasicBlock *> &StopBlocks,
     const std::unordered_map<Value *, Value *> &Replacements) {
@@ -1047,7 +931,7 @@ bool replaceDataOperandsInReachableRegionFrom(
     return true;
 }
 
-void refreshCapturedExitRegionUses(
+void LoopUnrollPass::refreshCapturedExitRegionUses(
     std::vector<ExitRegionDataUse> &Uses,
     const std::unordered_map<Value *, Value *> &Replacements) {
     for (ExitRegionDataUse &Entry : Uses) {
@@ -1063,7 +947,7 @@ void refreshCapturedExitRegionUses(
     }
 }
 
-bool removeOriginalHeaderPhisForFull(UnrolledBodyCore &Core) {
+bool LoopUnrollPass::removeOriginalHeaderPhisForFull(UnrolledBodyCore &Core) {
     BasicBlock *Header = Core.Headers.front();
     BasicBlock *PreHeader = Core.Shape.PreHeader;
     if (!Header || !PreHeader) return false;
@@ -1080,7 +964,7 @@ bool removeOriginalHeaderPhisForFull(UnrolledBodyCore &Core) {
     return true;
 }
 
-bool makeStraightLineMain(UnrolledBodyCore &Core, int MainCount,
+bool LoopUnrollPass::makeStraightLineMain(UnrolledBodyCore &Core, int MainCount,
                           BasicBlock *FinalTarget, Value *ContinueCondition) {
     if (MainCount < 2 || MainCount > Core.Count || !FinalTarget) return false;
     if (!hasLatchExitShape(Core)) return false;
@@ -1098,12 +982,12 @@ bool makeStraightLineMain(UnrolledBodyCore &Core, int MainCount,
         return BasicBlock::replaceCondBrWithUncond(LastExiting, FinalTarget);
     }
 
-    return replaceBranch(
+    return BasicBlock::replaceTerminator(
         LastExiting,
         new BrInst(ContinueCondition, Core.Headers.front(), FinalTarget));
 }
 
-Value *makeTypedIntConstant(int64_t V, std::shared_ptr<IRType> Ty) {
+Value *LoopUnrollPass::makeTypedIntConstant(int64_t V, std::shared_ptr<IRType> Ty) {
     if (V < std::numeric_limits<int>::min() ||
         V > std::numeric_limits<int>::max()) {
         return nullptr;
@@ -1113,7 +997,7 @@ Value *makeTypedIntConstant(int64_t V, std::shared_ptr<IRType> Ty) {
     return ConstInt::newConstInt(static_cast<int>(V), Size);
 }
 
-bool isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *PreHeader,
+bool LoopUnrollPass::isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *PreHeader,
                                  const DominatorTree &DT) {
     if (!V || !L || !PreHeader) return false;
     if (V->isConst()) return true;
@@ -1126,7 +1010,7 @@ bool isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *PreHeader,
            DT.dominates(I->getParent(), PreHeader);
 }
 
-bool canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+bool LoopUnrollPass::canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
                         const DominatorTree &DT) {
     if (!E) return false;
     switch (E->Kind) {
@@ -1157,7 +1041,7 @@ bool canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
     return false;
 }
 
-Value *materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+Value *LoopUnrollPass::materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
                        const DominatorTree &DT,
                        std::unordered_map<const SCEVExpr *, Value *> &Cache) {
     if (!canMaterializeSCEV(E, L, PreHeader, DT)) return nullptr;
@@ -1193,7 +1077,7 @@ Value *materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
             break;
         }
         if (!Cast) return nullptr;
-        insertBeforeTerminator(PreHeader, Cast);
+        BasicBlock::insertBeforeTerminator(PreHeader, Cast);
         Result = Cast;
     } else {
         Value *LHS =
@@ -1208,9 +1092,9 @@ Value *materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
                 E->Kind == SCEVExprKind::Min ? BinaryInst::L
                                              : BinaryInst::G;
             auto *Cmp = new BinaryInst(LHS, Pred, RHS);
-            insertBeforeTerminator(PreHeader, Cmp);
+            BasicBlock::insertBeforeTerminator(PreHeader, Cmp);
             auto *Select = new SelectInst(Cmp, LHS, RHS);
-            insertBeforeTerminator(PreHeader, Select);
+            BasicBlock::insertBeforeTerminator(PreHeader, Select);
             Result = Select;
         } else {
             BinaryInst::Operation Op = BinaryInst::ADD;
@@ -1224,7 +1108,7 @@ Value *materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
             default: return nullptr;
             }
             auto *I = new BinaryInst(LHS, Op, RHS);
-            insertBeforeTerminator(PreHeader, I);
+            BasicBlock::insertBeforeTerminator(PreHeader, I);
             Result = I;
         }
     }
@@ -1233,7 +1117,7 @@ Value *materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
     return Result;
 }
 
-bool replaceValuesInIterationBlocks(
+bool LoopUnrollPass::replaceValuesInIterationBlocks(
     UnrolledBodyCore &Core, int FirstIter,
     const std::unordered_map<Value *, Value *> &Replacements) {
     for (int Iter = FirstIter; Iter < Core.Count; ++Iter) {
@@ -1252,7 +1136,7 @@ bool replaceValuesInIterationBlocks(
     return true;
 }
 
-Value *getValueBeforeLoop(Value *V, const UnrolledBodyCore &Core,
+Value *LoopUnrollPass::getValueBeforeLoop(Value *V, const UnrolledBodyCore &Core,
                           std::shared_ptr<IRType> FallbackTy) {
     if (!V) return UndefValue::NewUndefValue(std::move(FallbackTy));
     if (!isDataValue(V)) return nullptr;
@@ -1275,7 +1159,7 @@ Value *getValueBeforeLoop(Value *V, const UnrolledBodyCore &Core,
     return isDataValue(V) ? V : nullptr;
 }
 
-BasicBlock *getNonExitSuccessor(BasicBlock *Exiting, BasicBlock *Exit) {
+BasicBlock *LoopUnrollPass::getNonExitSuccessor(BasicBlock *Exiting, BasicBlock *Exit) {
     if (!Exiting || !Exit) return nullptr;
     for (BasicBlock *Succ : Exiting->getSuccessors()) {
         if (Succ && Succ != Exit) return Succ;
@@ -1283,7 +1167,7 @@ BasicBlock *getNonExitSuccessor(BasicBlock *Exiting, BasicBlock *Exit) {
     return nullptr;
 }
 
-Value *mapValueAfterIteration(Value *V, int Iter,
+Value *LoopUnrollPass::mapValueAfterIteration(Value *V, int Iter,
                               const std::vector<HeaderState> &States,
                               const UnrolledBodyCore &Core) {
     if (!isDataValue(V)) return nullptr;
@@ -1303,7 +1187,7 @@ Value *mapValueAfterIteration(Value *V, int Iter,
     return mapDataValueAtIteration(V, Iter, Core);
 }
 
-bool buildHeaderExitValueMap(
+bool LoopUnrollPass::buildHeaderExitValueMap(
     const std::vector<HeaderState> &HeaderStates,
     int ExitIter,
     const UnrolledBodyCore &Core,
@@ -1333,7 +1217,7 @@ bool buildHeaderExitValueMap(
     return true;
 }
 
-bool buildHeaderTailInputValueMap(
+bool LoopUnrollPass::buildHeaderTailInputValueMap(
     const std::vector<HeaderState> &HeaderStates,
     BasicBlock *PreHeader,
     std::unordered_map<Value *, Value *> &TailInputValues) {
@@ -1359,7 +1243,7 @@ bool buildHeaderTailInputValueMap(
     return true;
 }
 
-LoopUnrollResult executeUnrollWithTail(
+LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     Loop *L, int MainCount, int TailCopies, Value *NumGroups,
     Value *RemainderValue, bool IsRuntime, SCEVResult &SE) {
     if (!L || MainCount < 2 || TailCopies < 1 || !NumGroups) {
@@ -1371,7 +1255,7 @@ LoopUnrollResult executeUnrollWithTail(
         return LoopUnrollResult::Unmodified;
     }
     std::unordered_set<BasicBlock *> PreCloneLoopBlocks;
-    for (BasicBlock *BB : collectLoopBlocksInFunctionOrder(L)) {
+    for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
         if (BB) PreCloneLoopBlocks.insert(BB);
     }
     bool PreCloneHeaderExiting =
@@ -1453,7 +1337,7 @@ LoopUnrollResult executeUnrollWithTail(
     std::string TailBase =
         Header->getIdent() +
         (IsRuntime ? ".unr.runtime.tail" : ".unr.constant.tail");
-    TailEntry->setIdent(makeUniqueBlockIdent(F, TailBase));
+    TailEntry->setIdent(F->makeUniqueBlockIdent(TailBase));
     F->pushBlock(TailEntry);
 
     if (IsRuntime || HeaderExiting) {
@@ -1508,13 +1392,13 @@ LoopUnrollResult executeUnrollWithTail(
     Header->push_front(GroupPhi);
 
     auto *NextGroup = new BinaryInst(GroupPhi, BinaryInst::ADD, One);
-    insertBeforeTerminator(MainLast, NextGroup);
+    BasicBlock::insertBeforeTerminator(MainLast, NextGroup);
     GroupPhi->addIncoming(NextGroup, MainLast);
 
     if (LatchExiting) {
         auto *MoreGroups =
             new BinaryInst(NextGroup, BinaryInst::L, NumGroups);
-        insertBeforeTerminator(MainLast, MoreGroups);
+        BasicBlock::insertBeforeTerminator(MainLast, MoreGroups);
         if (!makeStraightLineMain(*Core, MainCount, TailEntry,
                                   MoreGroups)) {
             return LoopUnrollResult::Unmodified;
@@ -1527,8 +1411,8 @@ LoopUnrollResult executeUnrollWithTail(
 
         auto *HasGroup =
             new BinaryInst(GroupPhi, BinaryInst::L, NumGroups);
-        insertBeforeTerminator(Header, HasGroup);
-        if (!replaceBranch(
+        BasicBlock::insertBeforeTerminator(Header, HasGroup);
+        if (!BasicBlock::replaceTerminator(
                 Header, new BrInst(HasGroup, FirstBody, TailEntry))) {
             return LoopUnrollResult::Unmodified;
         }
@@ -1597,8 +1481,8 @@ LoopUnrollResult executeUnrollWithTail(
         }
         auto *HasMore =
             new BinaryInst(RemainderValue, BinaryInst::G, Threshold);
-        insertBeforeTerminator(TailExiting, HasMore);
-        if (!replaceBranch(TailExiting,
+        BasicBlock::insertBeforeTerminator(TailExiting, HasMore);
+        if (!BasicBlock::replaceTerminator(TailExiting,
                            new BrInst(HasMore, Core->Headers[Iter + 1],
                                       Exit))) {
             return LoopUnrollResult::Unmodified;
@@ -1707,8 +1591,8 @@ LoopUnrollResult executeUnrollWithTail(
         }
         auto *HasMain =
             new BinaryInst(NumGroups, BinaryInst::G, ZeroGroups);
-        insertBeforeTerminator(PreHeader, HasMain);
-        if (!replaceBranch(
+        BasicBlock::insertBeforeTerminator(PreHeader, HasMain);
+        if (!BasicBlock::replaceTerminator(
                 PreHeader,
                 new BrInst(HasMain, Core->Headers.front(), TailEntry))) {
             return LoopUnrollResult::Unmodified;
@@ -1747,11 +1631,7 @@ PreservationStatus LoopUnrollPass::run(Function &F,
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
-    std::vector<Loop *> Worklist = collectLoopsInPostOrder(LI);
-    while (!Worklist.empty()) {
-        Loop *L = Worklist.back();
-        Worklist.pop_back();
-
+    for (Loop *L : LI.getLoopsInPostOrder(true)) {
         LoopUnrollResult Result = tryToUnrollLoop(F, L, LI, DT, SE);
         if (Result != LoopUnrollResult::Unmodified) {
             SE.clear();
@@ -1760,40 +1640,6 @@ PreservationStatus LoopUnrollPass::run(Function &F,
     }
 
     return PreservationStatus::all();
-}
-
-std::vector<Loop *> LoopUnrollPass::collectLoopsInPostOrder(
-    const LoopInfo &LI) const {
-    std::vector<Loop *> Worklist;
-    std::vector<std::pair<Loop *, bool>> Stack;
-
-    for (Loop *Top : LI.getTopLevelLoops()) {
-        if (Top) Stack.push_back({Top, false});
-    }
-
-    while (!Stack.empty()) {
-        auto Item = Stack.back();
-        Stack.pop_back();
-
-        Loop *Cur = Item.first;
-        bool Expanded = Item.second;
-        if (!Cur) continue;
-
-        if (Expanded) {
-            Worklist.push_back(Cur);
-            continue;
-        }
-
-        Stack.push_back({Cur, true});
-        for (Loop *Sub : Cur->getSubLoops()) {
-            if (Sub) Stack.push_back({Sub, false});
-        }
-    }
-
-    // The pass pops from the back, so reverse postorder here to process
-    // innermost loops before their parents.
-    std::reverse(Worklist.begin(), Worklist.end());
-    return Worklist;
 }
 
 LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
@@ -1868,8 +1714,8 @@ bool LoopUnrollPass::isCanonicalLoop(Loop *L) const {
     }
 
     std::unordered_set<BasicBlock *> ExitingBlocks;
-    for (BasicBlock *BB : collectAllLoopBlocks(L)) {
-        if (isLoopExitingBlock(L, BB)) {
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (L->isExitingBlock(BB)) {
             ExitingBlocks.insert(BB);
         }
     }
@@ -1881,7 +1727,7 @@ bool LoopUnrollPass::canCloneLoopBody(Loop *L, LoopInfo &LI) const {
     (void)LI;
     if (!L) return false;
 
-    for (BasicBlock *BB : collectAllLoopBlocks(L)) {
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
         for (auto It = BB->begin(); It != BB->end(); ++It) {
             if (!isSupportedCloneInstruction(*It)) {
@@ -1968,7 +1814,7 @@ bool LoopUnrollPass::containsCall(Loop *L, LoopInfo &LI) const {
     (void)LI;
     if (!L) return false;
 
-    for (BasicBlock *BB : collectAllLoopBlocks(L)) {
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) continue;
         for (auto It = BB->begin(); It != BB->end(); ++It) {
             Instruction *I = *It;
@@ -2069,7 +1915,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     }
 
     bool HasCall = containsCall(L, LI);
-    bool Nested = hasSubLoops(L);
+    bool Nested = !L->isInnermost();
 
     if (Config.AllowFull && TCI.ConstantTripCount) {
         int64_t TripCount = *TCI.ConstantTripCount;
@@ -2402,13 +2248,13 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
 
     auto *Remainder =
         new BinaryInst(TripCount, BinaryInst::MOD, Factor);
-    insertBeforeTerminator(TCI->PreHeader, Remainder);
+    BasicBlock::insertBeforeTerminator(TCI->PreHeader, Remainder);
     auto *MainTripCount =
         new BinaryInst(TripCount, BinaryInst::SUB, Remainder);
-    insertBeforeTerminator(TCI->PreHeader, MainTripCount);
+    BasicBlock::insertBeforeTerminator(TCI->PreHeader, MainTripCount);
     auto *NumGroups =
         new BinaryInst(MainTripCount, BinaryInst::DIV, Factor);
-    insertBeforeTerminator(TCI->PreHeader, NumGroups);
+    BasicBlock::insertBeforeTerminator(TCI->PreHeader, NumGroups);
 
     return executeUnrollWithTail(L, Decision.Count, Decision.Count - 1,
                                  NumGroups, Remainder, true, SE);
@@ -2428,7 +2274,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     }
 
     int PeelCount = Decision.Count;
-    if (hasSubLoops(L)) {
+    if (!L->isInnermost()) {
         return LoopUnrollResult::Unmodified;
     }
 
@@ -2438,8 +2284,8 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     }
 
     std::unordered_set<BasicBlock *> ExitingBlocks;
-    for (BasicBlock *BB : collectAllLoopBlocks(L)) {
-        if (isLoopExitingBlock(L, BB)) {
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (L->isExitingBlock(BB)) {
             ExitingBlocks.insert(BB);
         }
     }
@@ -2465,7 +2311,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
-    std::vector<BasicBlock *> LoopBlocks = collectLoopBlocksInFunctionOrder(L);
+    std::vector<BasicBlock *> LoopBlocks = L->getBlocksInFunctionOrder();
     if (LoopBlocks.empty() || !canCloneAllInstructions(LoopBlocks)) {
         return LoopUnrollResult::Unmodified;
     }

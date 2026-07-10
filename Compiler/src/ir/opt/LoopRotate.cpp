@@ -4,21 +4,6 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/LoopSimplify.hpp"
 #include <algorithm>
-#include <functional>
-
-bool LoopRotatePass::replaceTerminatorTarget(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc) {
-    if (!Pred || !OldSucc || !NewSucc) return false;
-    auto *Term = Pred->back();
-    if (!Term) return false;
-    bool Changed = false;
-    for (auto &UseUPtr : Term->getUserList()) {
-        Use *U = UseUPtr.get();
-        if (U && U->getValue() == OldSucc) {
-            Changed |= U->replaceUseeWith(NewSucc);
-        }
-    }
-    return Changed;
-}
 
 bool LoopRotatePass::isLCSSAPhi(PhiInst *Phi) {
     if (!Phi) return false;
@@ -71,10 +56,10 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     auto *HeaderTerm = dynamic_cast<BrInst *>(Header->back());
     if (!HeaderTerm) return false;
-    if (HeaderTerm->getUserList().size() != 3) return false;
-    Value *HeaderCond = HeaderTerm->getUserList()[0]->getValue();
-    BasicBlock *SuccA = dynamic_cast<BasicBlock *>(HeaderTerm->getUserList()[1]->getValue());
-    BasicBlock *SuccB = dynamic_cast<BasicBlock *>(HeaderTerm->getUserList()[2]->getValue());
+    if (!HeaderTerm->isConditional()) return false;
+    Value *HeaderCond = HeaderTerm->getCondition();
+    BasicBlock *SuccA = HeaderTerm->getTrueSuccessor();
+    BasicBlock *SuccB = HeaderTerm->getFalseSuccessor();
     if (!SuccA || !SuccB) return false;
 
     BasicBlock *Body = nullptr;
@@ -109,8 +94,8 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     if (BodyPreds.size() != 1 || BodyPreds.front() != Header) return false;
 
     auto *LatchTermCheck = dynamic_cast<BrInst *>(Latch->back());
-    if (!LatchTermCheck || LatchTermCheck->getUserList().size() != 1) return false;
-    BasicBlock *LatchDstCheck = dynamic_cast<BasicBlock *>(LatchTermCheck->getUserList()[0]->getValue());
+    if (!LatchTermCheck || LatchTermCheck->isConditional()) return false;
+    BasicBlock *LatchDstCheck = LatchTermCheck->getTrueSuccessor();
     if (LatchDstCheck != Header) return false;
 
     // 步骤5：Body PHI 折叠（保留 .lcssa）
@@ -144,7 +129,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     // 步骤6：核心 Rotate1 - Header 指令 clone 到 PreHeader，并为 Body 建立对应 PHI
     auto *PreHeaderTerm = dynamic_cast<BrInst *>(PreHeader->back());
-    if (!PreHeaderTerm || PreHeaderTerm->getUserList().size() != 1) return false;
+    if (!PreHeaderTerm || PreHeaderTerm->isConditional()) return false;
     delete PreHeaderTerm;
 
     std::unordered_map<Value *, Value *> HeaderToPreValue;
@@ -229,8 +214,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
                     if (OpIdx >= 0 && (OpIdx % 2) == 0) {
                         unsigned InIdx = static_cast<unsigned>(OpIdx / 2);
                         if (UserPhi->getIncomingBlock(InIdx) == Header) {
-                            Use *BlkUse = UserPhi->getUserList()[InIdx * 2 + 1].get();
-                            BlkUse->replaceUseeWith(Body);
+                            UserPhi->setIncomingBlock(InIdx, Body);
                         }
                     }
                 }
@@ -318,7 +302,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     // 步骤9：常量折叠与 LoopSimplify 形态修复
     auto *PHBr = dynamic_cast<BrInst *>(PreHeader->back());
-    if (!PHBr || PHBr->getUserList().size() != 3) {
+    if (!PHBr || !PHBr->isConditional()) {
         if (auto *OldTerm = PreHeader->back()) {
             delete OldTerm;
         }
@@ -328,17 +312,11 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     bool FoldToBody = false;
     if (PHBr) {
-        Value *PHCond = PHBr->getUserList()[0]->getValue();
-        BasicBlock *PHT = dynamic_cast<BasicBlock *>(PHBr->getUserList()[1]->getValue());
-        BasicBlock *PHF = dynamic_cast<BasicBlock *>(PHBr->getUserList()[2]->getValue());
-        if (auto *CB = dynamic_cast<ConstBool *>(PHCond)) {
-            FoldToBody = CB->getVal() ? (PHT == Body) : (PHF == Body);
-            if (FoldToBody) {
-                delete PHBr;
-                PreHeader->genUnCondInst(Body);
-            }
-        } else if (auto *CI = dynamic_cast<ConstInt *>(PHCond)) {
-            bool CV = CI->getVal() != 0;
+        Value *PHCond = PHBr->getCondition();
+        BasicBlock *PHT = PHBr->getTrueSuccessor();
+        BasicBlock *PHF = PHBr->getFalseSuccessor();
+        bool CV = false;
+        if (PHCond && PHCond->tryGetBoolConst(CV)) {
             FoldToBody = CV ? (PHT == Body) : (PHF == Body);
             if (FoldToBody) {
                 delete PHBr;
@@ -352,12 +330,11 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         auto *NewPreHeader = new BasicBlock();
         F.pushBlock(NewPreHeader);
         NewPreHeader->genUnCondInst(Body);
-        replaceTerminatorTarget(PreHeader, Body, NewPreHeader);
+        BasicBlock::redirectBranchTarget(PreHeader, Body, NewPreHeader);
         for (PhiInst *Phi : Body->collectPhiNodes()) {
             for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
                 if (Phi->getIncomingBlock(i) == OldPreHeader) {
-                    Use *BlkUse = Phi->getUserList()[i * 2 + 1].get();
-                    BlkUse->replaceUseeWith(NewPreHeader);
+                    Phi->setIncomingBlock(i, NewPreHeader);
                 }
             }
         }
@@ -379,7 +356,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         auto *DedicatedExit = new BasicBlock();
         F.pushBlock(DedicatedExit);
         for (BasicBlock *Pred : MergePreds) {
-            replaceTerminatorTarget(Pred, Exit, DedicatedExit);
+            BasicBlock::redirectBranchTarget(Pred, Exit, DedicatedExit);
         }
         // 更换为 LoopSimplifyPass 的接口
         LoopSimplifyPass::rewritePhisForMergedPreds(Exit, MergePreds, DedicatedExit);
@@ -388,7 +365,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     // 步骤10：合并 Header 到 Latch
     auto *LatchTerm = dynamic_cast<BrInst *>(Latch->back());
-    if (!LatchTerm || LatchTerm->getUserList().size() != 1) return false;
+    if (!LatchTerm || LatchTerm->isConditional()) return false;
 
     // 当这一步执行完成，Header 里的条件分支（连同指向 Exit 的边）就正式转移到了 Latch 中。
     delete LatchTerm;
@@ -404,8 +381,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         for (PhiInst *Phi : SuccPhis) {
             for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
                 if (Phi->getIncomingBlock(i) == Header) {
-                    Use *BlkUse = Phi->getUserList()[i * 2 + 1].get();
-                    BlkUse->replaceUseeWith(Latch);
+                    Phi->setIncomingBlock(i, Latch);
                 }
             }
         }
@@ -429,13 +405,7 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
         for (Loop *Top : LI.getTopLevelLoops()) {
             if (!Top || !Top->getHeader()) continue;
 
-            std::vector<Loop *> Loops;
-            std::function<void(Loop *)> PostOrder = [&](Loop *Cur) {
-                if (!Cur) return;
-                for (Loop *Sub : Cur->getSubLoops()) PostOrder(Sub);
-                Loops.push_back(Cur);
-            };
-            PostOrder(Top);
+            std::vector<Loop *> Loops = Top->getLoopsInPostOrder();
 
             // 逆后序遍历，从最外层循环开始尝试旋转
             for (auto It = Loops.rbegin(); It != Loops.rend(); ++It) {

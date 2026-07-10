@@ -19,26 +19,7 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 
 	bool Changed = false;
 
-	std::vector<Loop*> PostOrderLoops;
-	std::vector<std::pair<Loop*, bool>> LoopStack;
-	for (Loop* Top : LI.getTopLevelLoops()) {
-		if (Top) LoopStack.push_back({Top, false});
-	}
-	while (!LoopStack.empty()) {
-		auto Item = LoopStack.back();
-		LoopStack.pop_back();
-		Loop* Cur = Item.first;
-		bool Expanded = Item.second;
-		if (!Cur) continue;
-		if (Expanded) {
-			PostOrderLoops.push_back(Cur);
-			continue;
-		}
-		LoopStack.push_back({Cur, true});
-		for (Loop* Sub : Cur->getSubLoops()) {
-			if (Sub) LoopStack.push_back({Sub, false});
-		}
-	}
+	std::vector<Loop*> PostOrderLoops = LI.getLoopsInPostOrder(true);
     //TopLevel+后序遍历所有循环
 	for (Loop* L : PostOrderLoops) {
 		if (!L || !L->getHeader()) continue;
@@ -70,37 +51,27 @@ PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManage
 					CanEnter = true;
 					break;
 				}
-				Instruction* Term = Pred->back();
-				if (!Term || Term->instType != Instruction::BR) {
+				auto *Br = dynamic_cast<BrInst *>(Pred->back());
+				if (!Br) {
 					CanEnter = true;
 					break;
 				}
 
-				auto& UL = Term->getUserList();
-				if (UL.size() != 3 || !UL[0] || !UL[1] || !UL[2]) {
+				if (!Br->isConditional()) {
 					CanEnter = true;
 					break;
 				}
 
-				Value* Cond = UL[0]->getValue();
-				auto* TrueBB = dynamic_cast<BasicBlock*>(UL[1]->getValue());
-				auto* FalseBB = dynamic_cast<BasicBlock*>(UL[2]->getValue());
+				Value* Cond = Br->getCondition();
+				auto* TrueBB = Br->getTrueSuccessor();
+				auto* FalseBB = Br->getFalseSuccessor();
 				if (!TrueBB || !FalseBB) {
 					CanEnter = true;
 					break;
 				}
 
-				bool KnownCond = false;
 				bool CondVal = false;
-				if (auto* CB = dynamic_cast<ConstBool*>(Cond)) {
-					KnownCond = true;
-					CondVal = CB->getVal();
-				} else if (auto* CI = dynamic_cast<ConstInt*>(Cond)) {
-					KnownCond = true;
-					CondVal = (CI->getVal() != 0);
-				}
-
-				if (!KnownCond) {
+				if (!Cond || !Cond->tryGetBoolConst(CondVal)) {
 					CanEnter = true;
 					break;
 				}

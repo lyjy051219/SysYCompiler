@@ -8,7 +8,8 @@ class DCEPass : public PassDescriptor<DCEPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
-
+	static bool isDeletableInstruction(
+		Instruction *I, FunctionAnalysisPassManager &FAM);
 };
 
 // Reusable helper: classify whether a call has observable side effects.

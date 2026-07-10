@@ -40,7 +40,8 @@
 //      （如 if (getch() < 100) 里，getch 范围 [0,127]，控制流再加 <100 的约束）
 // =====================================================================
 
-static ConstraintElimOffsetExpr decomposeOffset(Value *V, int depth = 2) {
+ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
+    Value *V, int depth) {
     if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
         return {};
     if (depth <= 0)
@@ -80,9 +81,9 @@ static ConstraintElimOffsetExpr decomposeOffset(Value *V, int depth = 2) {
     return {V, 0, true};
 }
 
-static bool rewriteOffsetConstraint(Value *lhs, Value *rhs,
-                                    BinaryInst::Operation op,
-                                    ConstraintElimConstraint &out) {
+bool ConstraintEliminationPass::rewriteOffsetConstraint(
+    Value *lhs, Value *rhs, BinaryInst::Operation op,
+    ConstraintElimConstraint &out) {
     ConstraintElimOffsetExpr L = decomposeOffset(lhs);
     ConstraintElimOffsetExpr R = decomposeOffset(rhs);
     if (!L.Valid || !R.Valid || !L.Base || !R.Base) return false;
@@ -140,7 +141,8 @@ static bool rewriteOffsetConstraint(Value *lhs, Value *rhs,
 //   (c1 - x) op c2  →  x (反向 op) (c1 - c2)      —— x 搬到一侧要翻号
 //   x op (y + c)    →  (x - y) op c               —— 这步风险大先不做
 // 前三种只要 RHS 是常量就能做；溢出检查走 int64，溢出时退回原始形式。
-static bool extractConstraint(BinaryInst *cmp, bool negate, ConstraintElimConstraint &out) {
+bool ConstraintEliminationPass::extractConstraint(
+    BinaryInst *cmp, bool negate, ConstraintElimConstraint &out) {
     if (!cmp || !BinaryInst::isCompareOp(cmp->getOp())) return false;
     Value *lhs = nullptr;
     Value *rhs = nullptr;
@@ -243,8 +245,9 @@ static bool extractConstraint(BinaryInst *cmp, bool negate, ConstraintElimConstr
     return true;
 }
 
-static bool comparableBoundValues(const ConstraintElimConstraint &A, const ConstraintElimConstraint &B,
-                                  int64_t &AV, int64_t &BV) {
+bool ConstraintEliminationPass::comparableBoundValues(
+    const ConstraintElimConstraint &A, const ConstraintElimConstraint &B,
+    int64_t &AV, int64_t &BV) {
     if (A.boundIsConst && B.boundIsConst) {
         return IRMath::addNoOverflow(A.boundVal, A.boundOffset, AV) &&
                IRMath::addNoOverflow(B.boundVal, B.boundOffset, BV);
@@ -259,7 +262,9 @@ static bool comparableBoundValues(const ConstraintElimConstraint &A, const Const
 
 // 检查已知约束 known 是否蕴含目标约束 target
 // 两个约束必须是关于同一个 val 和同一个 bound（或 bound 是常量可比较）
-static bool implies(const ConstraintElimConstraint &known, const ConstraintElimConstraint &target) {
+bool ConstraintEliminationPass::implies(
+    const ConstraintElimConstraint &known,
+    const ConstraintElimConstraint &target) {
     // 必须是同一个值
     if (known.val != target.val) return false;
 
@@ -345,7 +350,9 @@ static bool implies(const ConstraintElimConstraint &known, const ConstraintElimC
 }
 
 // 检查约束栈是否蕴含目标约束（单跳）
-static bool isImplied(const std::vector<ConstraintElimConstraint> &stack, const ConstraintElimConstraint &target) {
+bool ConstraintEliminationPass::isImplied(
+    const std::vector<ConstraintElimConstraint> &stack,
+    const ConstraintElimConstraint &target) {
     for (auto &known : stack) {
         if (implies(known, target)) return true;
         if (!known.boundIsConst && !target.boundIsConst &&
@@ -370,8 +377,9 @@ static bool isImplied(const std::vector<ConstraintElimConstraint> &stack, const 
 //
 // 复杂度：对每个 target，最多扫 stack 两遍，总共 O(stack^2)，而栈大小
 // 受支配树深度限制，实际很小。
-static bool impliesTransitive(const std::vector<ConstraintElimConstraint> &stack,
-                              const ConstraintElimConstraint &target) {
+bool ConstraintEliminationPass::impliesTransitive(
+    const std::vector<ConstraintElimConstraint> &stack,
+    const ConstraintElimConstraint &target) {
     int64_t checkedTargetConst = 0;
     if (!target.boundIsConst ||
         !IRMath::addNoOverflow(target.boundVal, target.boundOffset, checkedTargetConst))
@@ -427,12 +435,15 @@ static bool impliesTransitive(const std::vector<ConstraintElimConstraint> &stack
 }
 
 // 综合判定：先试单跳，不行再试两跳链
-static bool isImpliedChained(const std::vector<ConstraintElimConstraint> &stack,
-                             const ConstraintElimConstraint &target) {
+bool ConstraintEliminationPass::isImpliedChained(
+    const std::vector<ConstraintElimConstraint> &stack,
+    const ConstraintElimConstraint &target) {
     return isImplied(stack, target) || impliesTransitive(stack, target);
 }
 
-static bool isContradicted(const std::vector<ConstraintElimConstraint> &stack, const ConstraintElimConstraint &target) {
+bool ConstraintEliminationPass::isContradicted(
+    const std::vector<ConstraintElimConstraint> &stack,
+    const ConstraintElimConstraint &target) {
     ConstraintElimConstraint negTarget = target;
     negTarget.op = BinaryInst::negatePredicate(target.op);
     return isImpliedChained(stack, negTarget);
@@ -471,12 +482,10 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             BasicBlock *pred = preds[0];
             Instruction *term = pred->back();
             if (auto *br = dynamic_cast<BrInst *>(term)) {
-                auto &brUL = br->getUserList();
-                if (brUL.size() == 3) {
+                if (br->isConditional()) {
                     // 条件分支
-                    Value *cond = brUL[0]->getValue();
-                    auto *trueBB = dynamic_cast<BasicBlock *>(brUL[1]->getValue());
-                    auto *falseBB = dynamic_cast<BasicBlock *>(brUL[2]->getValue());
+                    Value *cond = br->getCondition();
+                    auto *falseBB = br->getFalseSuccessor();
 
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
                         ConstraintElimConstraint c;
@@ -495,9 +504,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
         if (!constraintStack.empty()) {
             Instruction *term = BB->back();
             if (auto *br = dynamic_cast<BrInst *>(term)) {
-                auto &brUL = br->getUserList();
-                if (brUL.size() == 3) {
-                    Value *cond = brUL[0]->getValue();
+                if (br->isConditional()) {
+                    Value *cond = br->getCondition();
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
                         ConstraintElimConstraint target;
                         if (extractConstraint(cmpInst, false, target)) {

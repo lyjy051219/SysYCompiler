@@ -13,7 +13,7 @@
 
 // 将目标 Ret 的返回值映射到 Pred 上可用的 SSA 值。
 // 允许处理位于 TargetBB 中的 PHI 与 BitCast 链，其他 TargetBB 本地指令一律判为不合法。
-static Value *resolveRetValueForPred(Value *V,
+Value *TailRecursionEliminationPass::resolveRetValueForPred(Value *V,
                                      BasicBlock *Pred,
                                      BasicBlock *TargetBB,
                                      BasicBlock *InsertBB,
@@ -36,7 +36,7 @@ static Value *resolveRetValueForPred(Value *V,
 
     if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
         if (BC->getParent() != TargetBB) return BC;
-        Value *BCSrc = BC->getOperand(0);
+        Value *BCSrc = BC->getUnaryOperand();
         if (!BCSrc) return nullptr;
 
         Value *Src = resolveRetValueForPred(BCSrc, Pred, TargetBB,
@@ -44,9 +44,11 @@ static Value *resolveRetValueForPred(Value *V,
         if (!Src) return nullptr;
 
         auto *NewBC = new BitCastInst(Src, BC->getIRType());
-        auto It = InsertBB->begin();
-        while (*It != InsertBefore) ++It;
-        It.insertBefore(NewBC);
+        if (!InsertBefore->isInBlock(InsertBB) ||
+            !InsertBefore->insertBefore(NewBC)) {
+            delete NewBC;
+            return nullptr;
+        }
         ClonedInsts.push_back(NewBC);
         return NewBC;
     }
@@ -60,13 +62,13 @@ static Value *resolveRetValueForPred(Value *V,
     return V;
 }
 
-static bool rewriteClonedRetOperandForPred(RetInst *ClonedRet,
+bool TailRecursionEliminationPass::rewriteClonedRetOperandForPred(RetInst *ClonedRet,
                                            BasicBlock *Pred,
                                            BasicBlock *TargetBB,
                                            BasicBlock *InsertBB,
                                            Instruction *InsertBefore,
                                            std::vector<Instruction *> &ClonedInsts) {
-    Value *RetVal = ClonedRet->getOperand(0);
+    Value *RetVal = ClonedRet->getReturnValue();
     if (!RetVal) return true; // void ret
 
     std::unordered_set<Value *> Visiting;
@@ -95,27 +97,18 @@ bool TailRecursionEliminationPass::hasSelfRecursion(Function &F) {
     return false;
 }
 
-static bool isInstructionStillInBlock(BasicBlock *BB, Instruction *I) {
-    if (!BB || !I) return false;
-    for (auto inst : *BB) {
-        if (inst == I) return true;
-    }
-    return false;
-}
-
-static bool isReadonlyLikeCallInst(Instruction *I,
+bool TailRecursionEliminationPass::isReadonlyLikeCallInst(Instruction *I,
                                    FunctionAnalysisPassManager &FAM,
                                    Function &F) {
     if (I->instType != Instruction::CALL) return true;
     auto *CI = dynamic_cast<CallInst *>(I);
-    Value *Callee = CI ? CI->getCallee() : nullptr;
-    if (!Callee) return false;
-    if (auto *CalleeFunc = dynamic_cast<Function *>(Callee)) {
+    if (!CI || !CI->getCallee()) return false;
+    if (auto *CalleeFunc = CI->getDirectCallee()) {
         const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
         ModRefInfo FMRI = getFunctionModRefInfo(SEI);
         return FMRI == ModRefInfo::NoModRef || FMRI == ModRefInfo::Ref;
     }
-    if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
+    if (auto *BIF = CI->getBuiltinCallee()) {
         FuncAttr Attr = classifyBuiltin(BIF);
         return Attr == FuncAttr::NoModRef || Attr == FuncAttr::MemReadOnly;
     }
@@ -124,7 +117,7 @@ static bool isReadonlyLikeCallInst(Instruction *I,
 
 // 更精细的“前置 self-call 干扰”判定：
 // 仅当该前置 self-call 可能读写状态，或其返回值被使用时，才阻止当前候选。
-static bool hasInterferingEarlierSelfCallInBlock(BasicBlock *BB,
+bool TailRecursionEliminationPass::hasInterferingEarlierSelfCallInBlock(BasicBlock *BB,
                                                  CallInst *StopCI,
                                                  Function &F,
                                                  FunctionAnalysisPassManager &FAM) {
@@ -137,12 +130,12 @@ static bool hasInterferingEarlierSelfCallInBlock(BasicBlock *BB,
         if (CI->getCallee() != &F) continue;
 
         if (!isReadonlyLikeCallInst(CI, FAM, F)) return true;
-        if (CI->getUseList().size != 0) return true;
+        if (CI->hasUses()) return true;
     }
     return false;
 }
 
-static RetInst *getRetOnlyTerminatorBlockRet(BasicBlock *BB) {
+RetInst *TailRecursionEliminationPass::getRetOnlyTerminatorBlockRet(BasicBlock *BB) {
     if (!BB) return nullptr;
     RetInst *FoundRet = nullptr;
     bool seenNonPhi = false;
@@ -197,11 +190,10 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
                 }
 
                 if (auto *inst = dynamic_cast<Instruction*>(curr)) {
-                    auto &opUses = inst->getUserList();
-                    for (auto &u : opUses) {
-                        if (u->getValue())
-                            worklist.push_back(u->getValue());
-                    }
+                    for (size_t OperandIndex = 0;
+                         OperandIndex < inst->getNumOperands(); ++OperandIndex)
+                        if (Value *Operand = inst->getOperand(OperandIndex))
+                            worklist.push_back(Operand);
                 }
             }
             if (hasEscapingLocalPtr) break;
@@ -280,7 +272,7 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
                 }
 
                 // 只能被使用一次且 User 是 Ret
-                if (BI->getUseList().size != 1) return false;
+                if (!BI->hasExactlyOneUse()) return false;
                 Use *singleUse = BI->getUseList().getHead();
                 if (!singleUse || singleUse->getUser() != RI) return false;
 
@@ -328,9 +320,9 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         }
 
         // 操作数不能依赖 call 的返回值
-        auto &UL = I->getUserList();
-        for (auto &U : UL) {
-            if (U->getValue() == static_cast<Value *>(CI))
+        for (size_t OperandIndex = 0;
+             OperandIndex < I->getNumOperands(); ++OperandIndex) {
+            if (I->getOperand(OperandIndex) == static_cast<Value *>(CI))
                 return false;
         }
     }
@@ -471,7 +463,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 
     // 累加器模式下，旧 AccInst 仍引用 CI，若直接 delete CI 会触发 Value::~Value 级联删除用户。
     // 先断开 RI->AccInst，再将旧 AccInst 从块中移除并销毁，避免悬垂/级联破坏 CFG。
-    if (AccInst && isInstructionStillInBlock(BB, AccInst)) {
+    if (AccInst && AccInst->isInBlock(BB)) {
         if (RI->getOperand(0) == AccInst) {
             RI->replaceOperand(0, UndefValue::NewUndefValue(AccInst->getIRType()));
         }
@@ -525,11 +517,11 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
         auto rollbackClonedArtifacts = [&](BasicBlock *BB,
                                           RetInst *ClonedRI,
                                           std::vector<Instruction *> &SupportInsts) {
-            if (ClonedRI && isInstructionStillInBlock(BB, ClonedRI)) {
+            if (ClonedRI && ClonedRI->isInBlock(BB)) {
                 ClonedRI->EraseFromParent();
             }
             for (auto *I : SupportInsts) {
-                if (I && isInstructionStillInBlock(BB, I)) {
+                if (I && I->isInBlock(BB)) {
                     I->EraseFromParent();
                 }
             }
@@ -661,7 +653,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 WorkRI = ClonedRI;
             }
 
-            if (!isInstructionStillInBlock(bb, CI) || !isInstructionStillInBlock(bb, WorkRI))
+            if (!CI->isInBlock(bb) || !WorkRI->isInBlock(bb))
                 continue;
 
             if (eliminateTailRecursion(bb, CI, WorkRI, AccInst, F, FAM,
@@ -682,10 +674,8 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             auto *RI = dynamic_cast<RetInst *>(term);
             if (!RI) continue;
 
-            auto &retUses = RI->getUserList();
-            if (retUses.empty()) continue; // void 返回
-
-            Value *OrigRetVal = retUses[0]->getValue();
+            Value *OrigRetVal = RI->getReturnValue();
+            if (!OrigRetVal) continue; // void 返回
             if (OrigRetVal == AccPhi) continue;
 
             // Ret 之前插入 AccPhi op OrigRetVal
@@ -695,7 +685,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 while (*it != RI) ++it;
                 it.insertBefore(FinalAcc);
             }
-            retUses[0]->replaceUseeWith(FinalAcc);
+            RI->replaceOperand(0, FinalAcc);
         }
     }
 

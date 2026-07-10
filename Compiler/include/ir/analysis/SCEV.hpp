@@ -57,6 +57,11 @@ struct SCEVExpr {
     bool isConstant(int64_t V) const {
         return Kind == SCEVExprKind::Constant && ConstValue == V;
     }
+    bool isRecurrence() const;
+    bool mentionsLoop(const Loop *L) const;
+    static const char *kindName(SCEVExprKind K);
+    static const char *castName(SCEVCastKind K);
+    static const char *predicateName(BinaryInst::Operation Op);
 };
 
 struct SCEVAffineInfo {
@@ -227,7 +232,6 @@ private:
     std::optional<int64_t> asConstant(const SCEVExpr *E) const;
     std::string typeKey(std::shared_ptr<IRType> Ty) const;
 
-    std::vector<BasicBlock *> collectLoopBlocks(const Loop *L) const;
     std::vector<BasicBlock *> collectDirectLoopBlocks(const Loop *L) const;
     const SCEVExpr *computeTripCount(const Loop *L);
     const SCEVExpr *tripFromComparison(const Loop *L, BinaryInst *Cmp,
@@ -235,8 +239,6 @@ private:
     bool fillTripCountFromComparison(LoopTripCountInfo &Info);
     PhiInst *findPhiForAddRec(const Loop *L, const SCEVExpr *AddRec);
     PhiInst *findPhiForAffineRec(const Loop *L, const SCEVAffineInfo &Affine);
-    BinaryInst::Operation invertPredicate(BinaryInst::Operation Op) const;
-    BinaryInst::Operation swapPredicate(BinaryInst::Operation Op) const;
 };
 
 class SCEVAnalysis : public AnalysisDescriptor<SCEVAnalysis> {

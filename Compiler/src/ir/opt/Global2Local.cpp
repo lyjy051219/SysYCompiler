@@ -7,33 +7,17 @@
 #include "lib/TypeSystem.hpp"
 
 #include <algorithm>
-#include <queue>
 #include <utility>
-
-static Instruction *insertAllocaAfterEntryPhis(Function *F, AllocaInst *AI) {
-	if (!F || !AI) return nullptr;
-	BasicBlock *Entry = F->front();
-	if (!Entry) return nullptr;
-
-	return Entry->insertAfterPhiNodes(AI) ? AI : nullptr;
-}
-
-static Instruction *insertAllocaAfter(Function *F, AllocaInst *AI, Instruction *AfterI) {
-	if (!F || !AI || !AfterI) return nullptr;
-	BasicBlock *Entry = F->front();
-	if (!Entry) return nullptr;
-	return AfterI->getParent() == Entry && AfterI->insertAfter(AI) ? AI : nullptr;
-}
 
 // For scalar globals, only allow very simple load/store users in main.
 // Complex pointer/address-taken patterns are deferred to avoid downstream IR issues.
-static bool isSafeScalarUseInMain(Use *U, Variable *GV) {
+bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	if (!U || !GV) return false;
 	auto *UserI = dynamic_cast<Instruction *>(U->getUser());
 	if (!UserI) return false;
 
 	if (auto *LI = dynamic_cast<LoadInst *>(UserI)) {
-		return LI->getUserIndex(U) == 0;
+		return LI->getPointerOperand() == GV;
 	}
 
 	if (auto *SI = dynamic_cast<StoreInst *>(UserI)) {
@@ -44,86 +28,6 @@ static bool isSafeScalarUseInMain(Use *U, Variable *GV) {
 	return false;
 }
 
-bool Global2LocalPass::isMemcpyLikeCall(CallInst *CI) {
-	if (!CI) return false;
-
-	Value *Callee = CI->getCallee();
-	if (!Callee) return false;
-
-	if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
-		const std::string Name = BIF->getIdent();
-		return Name.find("memcpy") != std::string::npos;
-	}
-
-	if (auto *F = dynamic_cast<Function *>(Callee)) {
-		const std::string Name = F->getIdent();
-		return Name.find("memcpy") != std::string::npos;
-	}
-
-	return false;
-}
-
-bool Global2LocalPass::isMemcpyArgUse(Use *U) {
-	if (!U) return false;
-	auto *CI = dynamic_cast<CallInst *>(U->getUser());
-	if (!CI || !isMemcpyLikeCall(CI)) return false;
-	int OpIdx = CI->getUserIndex(U);
-	return OpIdx >= 1;
-}
-
-std::unordered_map<Function *, std::vector<Function *>>
-Global2LocalPass::buildCallGraph(Module &M) {
-	std::unordered_map<Function *, std::vector<Function *>> G;
-
-	for (auto &FuncPtr : M.getFunctions()) {
-		Function *F = FuncPtr.get();
-		if (!F) continue;
-
-		auto &Adj = G[F];
-		for (BasicBlock *BB : *F) {
-			if (!BB) continue;
-			for (Instruction *I : *BB) {
-				auto *CI = dynamic_cast<CallInst *>(I);
-				if (!CI) continue;
-
-				auto *Callee = dynamic_cast<Function *>(CI->getCallee());
-				if (!Callee) continue;
-				Adj.push_back(Callee);
-			}
-		}
-	}
-
-	return G;
-}
-
-std::unordered_set<Function *> Global2LocalPass::computeReachableFrom(
-	Function *Entry,
-	const std::unordered_map<Function *, std::vector<Function *>> &CallGraph) {
-	std::unordered_set<Function *> Reachable;
-	if (!Entry) return Reachable;
-
-	std::queue<Function *> Q;
-	Reachable.insert(Entry);
-	Q.push(Entry);
-
-	while (!Q.empty()) {
-		Function *Cur = Q.front();
-		Q.pop();
-
-		auto It = CallGraph.find(Cur);
-		if (It == CallGraph.end()) continue;
-
-		for (Function *Nxt : It->second) {
-			if (!Nxt) continue;
-			if (Reachable.insert(Nxt).second) {
-				Q.push(Nxt);
-			}
-		}
-	}
-
-	return Reachable;
-}
-
 PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	Module *M = Module::getActiveModule();
 	if (!M) return PreservationStatus::all();
@@ -132,8 +36,9 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-	auto CallGraph = buildCallGraph(*M);
-	auto ReachableFromMain = computeReachableFrom(Main, CallGraph);
+	auto CallGraph = M->buildDirectCallGraph();
+	auto ReachableFromMain =
+		Module::collectReachableFunctions(Main, CallGraph);
 
 	std::vector<Global2LocalCandidateInfo> WorkList;
 
@@ -177,7 +82,9 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 				continue;
 			}
 
-			if (isMemcpyArgUse(U)) {
+			auto *MemcpyCall = dynamic_cast<CallInst *>(U ? U->getUser() : nullptr);
+			if (MemcpyCall && MemcpyCall->isMemcpyLike() &&
+				MemcpyCall->getArgIndex(U) >= 0) {
 				CanPromote = false;
 				break;
 			}
@@ -266,11 +173,13 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		Alloca->setIdent(C.GV->getIdent() + ".l2g");
 
 		Instruction *InsertPos = nullptr;
-		if (AllocaInsertTail) {
-			InsertPos = insertAllocaAfter(Main, Alloca, AllocaInsertTail);
+		BasicBlock *Entry = Main->front();
+		if (AllocaInsertTail && Entry && AllocaInsertTail->getParent() == Entry &&
+			AllocaInsertTail->insertAfter(Alloca)) {
+			InsertPos = Alloca;
 		}
-		if (!InsertPos) {
-			InsertPos = insertAllocaAfterEntryPhis(Main, Alloca);
+		if (!InsertPos && Entry && Entry->insertAfterPhiNodes(Alloca)) {
+			InsertPos = Alloca;
 		}
 		if (!InsertPos) {
 			delete Alloca;
@@ -290,8 +199,10 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			Args.push_back(ConstInt::newConstInt(ByteSize));
 			Args.push_back(ConstBool::newConstBool(false));
 
-			auto *MemcpyCall =
-				new CallInst(BuildInFunction::genBuildInFunction("llvm.memcpy.p0.p0.i32"), Args);
+			auto *MemcpyCall = new CallInst(
+				BuildInFunction::genBuildInFunction(
+					BuildInFunction::getDefaultMemcpyName()),
+				Args);
 			LastInitInst->insertAfter(MemcpyCall);
 			LastInitInst = MemcpyCall;
 		} else {

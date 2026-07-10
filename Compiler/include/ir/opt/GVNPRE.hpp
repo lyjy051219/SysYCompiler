@@ -98,11 +98,6 @@ private:
 	void buildAvailOut();
 
 	static bool hasResultValue(Instruction *I);
-	static bool isCommutativeInst(Instruction *I);
-	static bool isCompareInst(Instruction *I);
-	static BinaryInst::Operation invertPredicate(BinaryInst::Operation Op);
-	static bool isConstTrue(Value *V);
-	static bool isConstCond(Value *V);
 	bool isDeadBlock(BasicBlock *BB) const;
 
 	void addRecord(int Num, Instruction *I, BasicBlock *BB);
@@ -117,10 +112,6 @@ private:
 	bool buildExpressionKey(Instruction *I, ExprKey &K);
 
 	ModRefInfo getCallModRef(CallInst *CI);
-	static Value *getLoadPtr(Instruction *I);
-	static Value *getStorePtr(Instruction *I);
-	static Value *getStoreValue(Instruction *I);
-	static std::vector<Value *> collectCallPtrArgs(CallInst *CI);
 	std::vector<Value *> collectCallReadPtrs(CallInst *CI);
 	static bool identicalCall(CallInst *A, CallInst *B);
 
@@ -139,8 +130,6 @@ private:
 	Value *resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB,
 	                           BasicBlock *PredBB);
 
-	static void insertBeforeTerminator(BasicBlock *BB, Instruction *NewI);
-	static void insertPhiAfterExistingPhis(BasicBlock *BB, PhiInst *Phi);
 	void seedDeadBlocksToLeaderTable();
 	bool runPRE();
 

@@ -32,8 +32,6 @@ private:
 	using ExitPhiMap = std::unordered_map<BasicBlock *, PhiInst *>;
 
 	static bool replaceUseWithValue(Use *U, Value *V);
-	static std::unordered_set<BasicBlock *> computeReachableBlocks(Function &F);
-
     Value *getValueForBlock(BasicBlock *BB,
 							Instruction *InstDef,
                             const Loop &L,

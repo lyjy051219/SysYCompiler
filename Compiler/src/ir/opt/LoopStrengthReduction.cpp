@@ -20,81 +20,25 @@
 #include <unordered_set>
 #include <vector>
 
-constexpr int kUnsupportedMaterializeCost = 1000000;
-constexpr int64_t kMaxOffsetRange = 16;
-constexpr int kMaxPointerIVsPerInnerLoop = 8;
-constexpr int kMaxPointerIVsPerOuterLoop = 4;
-
-static bool isSCEVConstZero(const SCEVExpr *E) {
-    return E && E->Kind == SCEVExprKind::Constant && E->ConstValue == 0;
-}
-
-static bool hasCostlyElementStride(int64_t Stride) {
+bool LoopStrengthReductionPass::hasCostlyElementStride(int64_t Stride) {
     return Stride > 0 && !IRMath::isPowerOf2(Stride);
 }
 
-static bool isRecKind(SCEVExprKind K) {
-    return K == SCEVExprKind::AddRec || K == SCEVExprKind::MulRec ||
-           K == SCEVExprKind::DivRec;
-}
-
-static bool mentionsLoop(const SCEVExpr *E, const Loop *L) {
-    if (!E || !L) return false;
-    if (isRecKind(E->Kind) && E->RecLoop == L) return true;
-    for (const SCEVExpr *Op : E->Operands) {
-        if (mentionsLoop(Op, L)) return true;
-    }
-    return false;
-}
-
-static std::string pointerKey(const void *P) {
-    std::ostringstream OS;
-    OS << P;
-    return OS.str();
-}
-
-static std::string scevKey(const SCEVExpr *E) {
+std::string LoopStrengthReductionPass::scevKey(const SCEVExpr *E) {
     if (!E) return "<null>";
     if (!E->Key.empty()) return E->Key;
-    return "scev@" + pointerKey(E);
+    return "scev@" + IRKey::pointer(E);
 }
 
-static std::string typeKey(const std::shared_ptr<IRType> &Ty) {
-    if (!Ty) return "noty";
-    std::ostringstream OS;
-    OS << static_cast<int>(Ty->getEnum()) << ":" << Ty->getSize() << ":"
-       << Ty.get();
-    return OS.str();
-}
-
-static bool hasNonTrivialPrefix(const std::vector<IndexComponent> &Prefix) {
+bool LoopStrengthReductionPass::hasNonTrivialPrefix(const std::vector<IndexComponent> &Prefix) {
     if (Prefix.empty()) return false;
-    if (Prefix.size() == 1 && isSCEVConstZero(Prefix.front().Expr))
+    if (Prefix.size() == 1 && Prefix.front().Expr &&
+        Prefix.front().Expr->isConstant(0))
         return false;
     return true;
 }
 
-static std::vector<BasicBlock *> collectLoopBlocks(Loop *L) {
-    std::vector<BasicBlock *> Blocks;
-    std::vector<Loop *> Stack;
-    std::unordered_set<BasicBlock *> Seen;
-
-    if (L) Stack.push_back(L);
-    while (!Stack.empty()) {
-        Loop *Current = Stack.back();
-        Stack.pop_back();
-
-        for (BasicBlock *BB : Current->getBlocks()) {
-            if (BB && Seen.insert(BB).second) Blocks.push_back(BB);
-        }
-        for (Loop *SubLoop : Current->getSubLoops()) {
-            if (SubLoop) Stack.push_back(SubLoop);
-        }
-    }
-    return Blocks;
-}
-
-static bool canUseInPreheader(Value *V, BasicBlock *PreHeader,
+bool LoopStrengthReductionPass::canUseInPreheader(Value *V, BasicBlock *PreHeader,
                               const DominatorTree &DT) {
     if (!V || !PreHeader) return false;
     if (V->isConst()) return true;
@@ -108,10 +52,10 @@ static bool canUseInPreheader(Value *V, BasicBlock *PreHeader,
     return DT.dominates(Inst->getParent(), PreHeader);
 }
 
-static bool canMaterializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
+bool LoopStrengthReductionPass::canMaterializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
                                           BasicBlock *PreHeader,
                                           const DominatorTree &DT) {
-    if (!E || mentionsLoop(E, L)) return false;
+    if (!E || E->mentionsLoop(L)) return false;
 
     switch (E->Kind) {
     case SCEVExprKind::Constant:
@@ -144,11 +88,11 @@ static bool canMaterializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
     }
 }
 
-static int estimateMaterializeCost(const SCEVExpr *E, const Loop *L,
+int LoopStrengthReductionPass::estimateMaterializeCost(const SCEVExpr *E, const Loop *L,
                                    BasicBlock *PreHeader,
                                    const DominatorTree &DT) {
     if (!canMaterializeSCEVAtPreheader(E, L, PreHeader, DT))
-        return kUnsupportedMaterializeCost;
+        return UnsupportedMaterializeCost;
 
     switch (E->Kind) {
     case SCEVExprKind::Constant:
@@ -162,11 +106,11 @@ static int estimateMaterializeCost(const SCEVExpr *E, const Loop *L,
     case SCEVExprKind::Cast:
         return 1 + estimateMaterializeCost(E->Operands[0], L, PreHeader, DT);
     default:
-        return kUnsupportedMaterializeCost;
+        return UnsupportedMaterializeCost;
     }
 }
 
-static Value *makeSCEVConstant(int64_t V, const SCEVExpr *E) {
+Value *LoopStrengthReductionPass::makeSCEVConstant(int64_t V, const SCEVExpr *E) {
     if (V < std::numeric_limits<int>::min() ||
         V > std::numeric_limits<int>::max()) {
         return nullptr;
@@ -183,7 +127,7 @@ static Value *makeSCEVConstant(int64_t V, const SCEVExpr *E) {
     return ConstInt::newConstInt(IntValue, Size);
 }
 
-static Value *materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
+Value *LoopStrengthReductionPass::materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
                                          BasicBlock *PreHeader,
                                          const DominatorTree &DT) {
     if (!canMaterializeSCEVAtPreheader(E, L, PreHeader, DT)) return nullptr;
@@ -234,7 +178,7 @@ static Value *materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
     return NewI;
 }
 
-static int estimatePrefixMaterializeCost(
+int LoopStrengthReductionPass::estimatePrefixMaterializeCost(
     const std::vector<IndexComponent> &Prefix, const Loop *L,
     BasicBlock *PreHeader, const DominatorTree &DT) {
     int Cost = 0;
@@ -245,14 +189,14 @@ static int estimatePrefixMaterializeCost(
         }
         int ComponentCost =
             estimateMaterializeCost(Component.Expr, L, PreHeader, DT);
-        if (ComponentCost >= kUnsupportedMaterializeCost)
-            return kUnsupportedMaterializeCost;
+        if (ComponentCost >= UnsupportedMaterializeCost)
+            return UnsupportedMaterializeCost;
         Cost += ComponentCost;
     }
     return Cost;
 }
 
-static bool materializePrefix(const std::vector<IndexComponent> &Prefix,
+bool LoopStrengthReductionPass::materializePrefix(const std::vector<IndexComponent> &Prefix,
                               const Loop *L, BasicBlock *PreHeader,
                               const DominatorTree &DT,
                               std::vector<Value *> &Indices) {
@@ -270,7 +214,7 @@ static bool materializePrefix(const std::vector<IndexComponent> &Prefix,
     return true;
 }
 
-static bool isLoadStoreAddressUse(Instruction *UserI, Use *U) {
+bool LoopStrengthReductionPass::isLoadStoreAddressUse(Instruction *UserI, Use *U) {
     if (!UserI || !U) return false;
     int OpIdx = UserI->getUserIndex(U);
     if (dynamic_cast<LoadInst *>(UserI)) return OpIdx == 0;
@@ -278,7 +222,7 @@ static bool isLoadStoreAddressUse(Instruction *UserI, Use *U) {
     return false;
 }
 
-static int countAddressUses(GetElementPtrInst *GEP) {
+int LoopStrengthReductionPass::countAddressUses(GetElementPtrInst *GEP) {
     if (!GEP) return 0;
     int Count = 0;
     for (auto It = GEP->getUseList().begin(); It != GEP->getUseList().end();
@@ -291,9 +235,9 @@ static int countAddressUses(GetElementPtrInst *GEP) {
     return Count;
 }
 
-static int countLoopMemoryAddressUses(Loop *L) {
+int LoopStrengthReductionPass::countLoopMemoryAddressUses(Loop *L) {
     int Count = 0;
-    for (BasicBlock *BB : collectLoopBlocks(L)) {
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) continue;
         for (Instruction *I : *BB) {
             if (dynamic_cast<LoadInst *>(I) ||
@@ -305,7 +249,7 @@ static int countLoopMemoryAddressUses(Loop *L) {
     return Count;
 }
 
-static bool getConstantOffsetGEP(GetElementPtrInst *Parent,
+bool LoopStrengthReductionPass::getConstantOffsetGEP(GetElementPtrInst *Parent,
                                  Instruction *UserI, Use *U,
                                  GetElementPtrInst *&Child,
                                  int64_t &Offset) {
@@ -313,16 +257,15 @@ static bool getConstantOffsetGEP(GetElementPtrInst *Parent,
     if (!Parent || !Child || !U || Child->getUserIndex(U) != 0)
         return false;
 
-    auto &Operands = Child->getUserList();
-    if (Operands.size() != 2 || Operands.front()->getValue() != Parent)
+    if (Child->getNumIndices() != 1 || Child->getBasePointer() != Parent)
         return false;
-    auto *CI = dynamic_cast<ConstInt *>(Operands.back()->getValue());
+    auto *CI = dynamic_cast<ConstInt *>(Child->getIndex(0));
     if (!CI) return false;
     Offset = CI->getVal();
     return true;
 }
 
-static bool collectAddressGEPFamily(
+bool LoopStrengthReductionPass::collectAddressGEPFamily(
     GetElementPtrInst *GEP, Loop *L, int64_t CurrentOffset,
     std::vector<AddressGEPNode> &Nodes,
     std::unordered_set<GetElementPtrInst *> &Visited) {
@@ -368,14 +311,14 @@ static bool collectAddressGEPFamily(
     return HasSupportedUse;
 }
 
-static bool isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
+bool LoopStrengthReductionPass::isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
     if (NumIndices != 1 || !Base) return false;
     auto PtrTy = std::dynamic_pointer_cast<POINTERType>(Base->getIRType());
     return PtrTy && PtrTy->getPointerType() &&
            PtrTy->getPointerType()->getEnum() == IR_ARRAY;
 }
 
-static bool matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
+bool LoopStrengthReductionPass::matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
                      Value *&Base, Value *&Index,
                      std::vector<IndexComponent> &Prefix,
                      std::vector<IndexComponent> &Suffix,
@@ -411,7 +354,7 @@ static bool matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
         if (!Raw) return false;
         const SCEVExpr *Expr = SE.getSCEV(Raw);
         if (!Expr) return false;
-        bool Varies = mentionsLoop(Expr, L);
+        bool Varies = Expr && Expr->mentionsLoop(L);
         if (Varies) {
             if (ActivePos != -1) return false;
             ActivePos = static_cast<int>(I);
@@ -429,7 +372,8 @@ static bool matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
         Prefix.push_back(Components[I]);
     for (size_t I = static_cast<size_t>(ActivePos + 1);
          I < Components.size(); ++I) {
-        if (mentionsLoop(Components[I].Expr, L)) return false;
+        if (Components[I].Expr && Components[I].Expr->mentionsLoop(L))
+            return false;
         Suffix.push_back(Components[I]);
     }
 
@@ -442,8 +386,8 @@ static bool matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,
     return true;
 }
 
-static std::vector<LSRCandidate>
-collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
+std::vector<LSRCandidate>
+LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
                   const DominatorTree &DT) {
     std::unordered_map<BasicBlock *, size_t> BlockOrder;
     size_t NextBlockOrder = 0;
@@ -475,7 +419,7 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
         BasicBlock *Header = L->getHeader();
         if (!PreHeader || !Header || !Latch) continue;
 
-        std::vector<BasicBlock *> LoopBlocks = collectLoopBlocks(L);
+        std::vector<BasicBlock *> LoopBlocks = L->getBlocksIncludingSubLoops();
         std::sort(LoopBlocks.begin(), LoopBlocks.end(),
                   [&](BasicBlock *A, BasicBlock *B) {
                       size_t AO = BlockOrder.count(A)
@@ -536,10 +480,10 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
 
                 int PrefixCost =
                     estimatePrefixMaterializeCost(Prefix, L, PreHeader, DT);
-                if (PrefixCost >= kUnsupportedMaterializeCost) continue;
+                if (PrefixCost >= UnsupportedMaterializeCost) continue;
                 int SuffixCost =
                     estimatePrefixMaterializeCost(Suffix, L, PreHeader, DT);
-                if (SuffixCost >= kUnsupportedMaterializeCost) continue;
+                if (SuffixCost >= UnsupportedMaterializeCost) continue;
 
                 std::optional<int64_t> StartConst = Affine->ConstantStart;
                 if (StartConst &&
@@ -596,14 +540,14 @@ collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
     return Candidates;
 }
 
-static std::string candidateShapeKey(const LSRCandidate &C,
+std::string LoopStrengthReductionPass::candidateShapeKey(const LSRCandidate &C,
                                      bool IncludeStart) {
     std::ostringstream Key;
-    Key << "L=" << pointerKey(C.L) << ";B=" << pointerKey(C.Base)
+    Key << "L=" << IRKey::pointer(C.L) << ";B=" << IRKey::pointer(C.Base)
         << ";Step=" << C.Step
         << ";Stride=" << C.LastIndexStride
         << ";Lead0=" << (C.HasLeadingZero ? 1 : 0)
-        << ";Ty=" << typeKey(C.OldGEP ? C.OldGEP->getIRType() : nullptr)
+        << ";Ty=" << IRKey::type(C.OldGEP ? C.OldGEP->getIRType() : nullptr)
         << ";PrefixN=" << C.Prefix.size();
     for (const IndexComponent &Component : C.Prefix)
         Key << ";P=" << scevKey(Component.Expr);
@@ -619,8 +563,8 @@ static std::string candidateShapeKey(const LSRCandidate &C,
     return Key.str();
 }
 
-static std::vector<OffsetReuseGroup>
-buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
+std::vector<OffsetReuseGroup>
+LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
     std::vector<OffsetReuseGroup> Groups;
     std::unordered_map<std::string, size_t> GroupIndex;
 
@@ -663,7 +607,7 @@ buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
                                Starts.insert(*C->StartConst);
                            return Starts.size() < 2 ||
                                   Group.MaxStart - Group.AnchorStart >
-                                      kMaxOffsetRange;
+                                      MaxOffsetRange;
                        }),
         Groups.end());
 
@@ -682,8 +626,8 @@ buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
     return Groups;
 }
 
-static std::vector<LSRGroup>
-buildExactGroups(std::vector<LSRCandidate> &Candidates) {
+std::vector<LSRGroup>
+LoopStrengthReductionPass::buildExactGroups(std::vector<LSRCandidate> &Candidates) {
     std::vector<LSRGroup> Groups;
     std::unordered_map<std::string, size_t> GroupIndex;
 
@@ -726,7 +670,7 @@ buildExactGroups(std::vector<LSRCandidate> &Candidates) {
     return Groups;
 }
 
-static bool isRemovableIndexInst(Instruction *I) {
+bool LoopStrengthReductionPass::isRemovableIndexInst(Instruction *I) {
     if (!I || !I->getParent()) return false;
     return dynamic_cast<BinaryInst *>(I) ||
            dynamic_cast<GetElementPtrInst *>(I) ||
@@ -735,17 +679,7 @@ static bool isRemovableIndexInst(Instruction *I) {
            dynamic_cast<BitCastInst *>(I);
 }
 
-static bool hasNoUses(Instruction *I) {
-    if (!I) return false;
-    for (auto It = I->getUseList().begin(); It != I->getUseList().end();
-         ++It) {
-        Use *U = *It;
-        if (U && U->getValue() == I) return false;
-    }
-    return true;
-}
-
-static bool collectRemovableIndexChain(
+bool LoopStrengthReductionPass::collectRemovableIndexChain(
     Instruction *I, std::unordered_set<User *> &AllowedUsers,
     std::unordered_set<Instruction *> &Out) {
     if (!I || Out.count(I)) return true;
@@ -760,17 +694,17 @@ static bool collectRemovableIndexChain(
 
     Out.insert(I);
     AllowedUsers.insert(I);
-    for (auto &OperandUse : I->getUserList()) {
-        if (!OperandUse) continue;
-        auto *OperandI =
-            dynamic_cast<Instruction *>(OperandUse->getValue());
+    for (size_t OperandIndex = 0;
+         OperandIndex < I->getNumOperands(); ++OperandIndex) {
+        auto *OperandI = dynamic_cast<Instruction *>(
+            I->getOperand(OperandIndex));
         if (OperandI && OperandI != I)
             collectRemovableIndexChain(OperandI, AllowedUsers, Out);
     }
     return true;
 }
 
-static int countRemovableIndexInsts(
+int LoopStrengthReductionPass::countRemovableIndexInsts(
     const std::vector<LSRCandidate *> &Items) {
     std::unordered_set<User *> AllowedUsers;
     for (LSRCandidate *C : Items) {
@@ -786,7 +720,7 @@ static int countRemovableIndexInsts(
     return static_cast<int>(Removable.size());
 }
 
-static int countCoveredAddressUses(
+int LoopStrengthReductionPass::countCoveredAddressUses(
     const std::vector<LSRCandidate *> &Items) {
     int Count = 0;
     for (const LSRCandidate *C : Items) {
@@ -795,7 +729,7 @@ static int countCoveredAddressUses(
     return Count;
 }
 
-static bool coversDenseInnermostAddresses(
+bool LoopStrengthReductionPass::coversDenseInnermostAddresses(
     Loop *L, const std::vector<LSRCandidate *> &Items) {
     if (!L || !L->isInnermost()) return false;
     int CoveredAddressUses = countCoveredAddressUses(Items);
@@ -804,7 +738,7 @@ static bool coversDenseInnermostAddresses(
            CoveredAddressUses * 2 >= LoopAddressUses;
 }
 
-static void cleanupDeadIndexChains(
+void LoopStrengthReductionPass::cleanupDeadIndexChains(
     const std::vector<Instruction *> &Seeds) {
     std::vector<Instruction *> WorkList;
     std::unordered_set<Instruction *> Queued;
@@ -816,28 +750,28 @@ static void cleanupDeadIndexChains(
         Instruction *Current = WorkList.back();
         WorkList.pop_back();
         Queued.erase(Current);
-        if (!isRemovableIndexInst(Current) || !hasNoUses(Current)) continue;
+        if (!isRemovableIndexInst(Current) || Current->hasUses()) continue;
 
         std::vector<Instruction *> Operands;
-        for (auto &OperandUse : Current->getUserList()) {
-            if (!OperandUse) continue;
-            auto *OperandI =
-                dynamic_cast<Instruction *>(OperandUse->getValue());
+        for (size_t OperandIndex = 0;
+             OperandIndex < Current->getNumOperands(); ++OperandIndex) {
+            auto *OperandI = dynamic_cast<Instruction *>(
+                Current->getOperand(OperandIndex));
             if (OperandI && OperandI != Current) Operands.push_back(OperandI);
         }
 
         delete Current;
         for (Instruction *OperandI : Operands) {
             if (OperandI && isRemovableIndexInst(OperandI) &&
-                hasNoUses(OperandI) && Queued.insert(OperandI).second) {
+                !OperandI->hasUses() && Queued.insert(OperandI).second) {
                 WorkList.push_back(OperandI);
             }
         }
     }
 }
 
-static bool isSimpleSingleGEP(const LSRCandidate &C) {
-    if (C.Step != 1 || !C.Start || !isSCEVConstZero(C.Start) ||
+bool LoopStrengthReductionPass::isSimpleSingleGEP(const LSRCandidate &C) {
+    if (C.Step != 1 || !C.Start || !C.Start->isConstant(0) ||
         hasNonTrivialPrefix(C.Prefix)) {
         return false;
     }
@@ -845,7 +779,7 @@ static bool isSimpleSingleGEP(const LSRCandidate &C) {
     return Phi && Phi->getParent() == C.Header;
 }
 
-static bool shouldRewriteExactGroup(const LSRGroup &Group,
+bool LoopStrengthReductionPass::shouldRewriteExactGroup(const LSRGroup &Group,
                                     const DominatorTree &DT) {
     if (Group.Items.empty()) return false;
     bool CostlyStride = hasCostlyElementStride(Group.LastIndexStride);
@@ -881,11 +815,11 @@ static bool shouldRewriteExactGroup(const LSRGroup &Group,
            hasNonTrivialPrefix(Group.Prefix);
 }
 
-static bool shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
+bool LoopStrengthReductionPass::shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
                                      const DominatorTree &DT) {
     if (Group.Items.size() < 2) return false;
     int64_t Range = Group.MaxStart - Group.AnchorStart;
-    if (Range <= 0 || Range > kMaxOffsetRange) return false;
+    if (Range <= 0 || Range > MaxOffsetRange) return false;
 
     bool CostlyStride = hasCostlyElementStride(Group.LastIndexStride);
     int MaxPrefixCost = CostlyStride ? 2 : 1;
@@ -918,7 +852,7 @@ static bool shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
     return coversDenseInnermostAddresses(Group.L, Group.Items);
 }
 
-static PointerIV createPointerIV(Value *Base,
+PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
                                  const std::vector<Value *> &StartIndices,
                                  int64_t Step,
                                  const std::shared_ptr<IRType> &ResultTy,
@@ -946,7 +880,7 @@ static PointerIV createPointerIV(Value *Base,
     return Result;
 }
 
-static bool rewriteExactGroup(LSRGroup &Group, const DominatorTree &DT,
+bool LoopStrengthReductionPass::rewriteExactGroup(LSRGroup &Group, const DominatorTree &DT,
                               std::vector<Instruction *> &DeadSeeds) {
     std::vector<Value *> StartIndices;
     if (!materializePrefix(Group.Prefix, Group.L, Group.PreHeader, DT,
@@ -982,7 +916,7 @@ static bool rewriteExactGroup(LSRGroup &Group, const DominatorTree &DT,
     return true;
 }
 
-static bool rewriteOffsetGroup(OffsetReuseGroup &Group,
+bool LoopStrengthReductionPass::rewriteOffsetGroup(OffsetReuseGroup &Group,
                                const DominatorTree &DT,
                                std::vector<Instruction *> &DeadSeeds) {
     std::vector<Value *> StartIndices;
@@ -1059,12 +993,12 @@ static bool rewriteOffsetGroup(OffsetReuseGroup &Group,
     return true;
 }
 
-static int pointerIVLimit(const Loop *L) {
-    return L && L->isInnermost() ? kMaxPointerIVsPerInnerLoop
-                                 : kMaxPointerIVsPerOuterLoop;
+int LoopStrengthReductionPass::pointerIVLimit(const Loop *L) {
+    return L && L->isInnermost() ? MaxPointerIVsPerInnerLoop
+                                 : MaxPointerIVsPerOuterLoop;
 }
 
-static bool AddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
+bool LoopStrengthReductionPass::runAddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
                        DominatorTree &DT) {
     std::vector<LSRCandidate> Candidates =
         collectCandidates(F, LI, SE, DT);
@@ -1103,7 +1037,7 @@ PreservationStatus LoopStrengthReductionPass::run(
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
-    bool Changed = AddressLSR(F, LI, SE, DT);
+    bool Changed = runAddressLSR(F, LI, SE, DT);
     if (!Changed) return PreservationStatus::all();
 
     PreservationStatus PA;

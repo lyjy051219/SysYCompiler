@@ -14,6 +14,22 @@ public:
 
 private:
 
+    static Value *resolveRetValueForPred(
+        Value *V, BasicBlock *Pred, BasicBlock *TargetBB,
+        BasicBlock *InsertBB, Instruction *InsertBefore,
+        std::vector<Instruction *> &ClonedInsts,
+        std::unordered_set<Value *> &Visiting);
+    static bool rewriteClonedRetOperandForPred(
+        RetInst *ClonedRet, BasicBlock *Pred, BasicBlock *TargetBB,
+        BasicBlock *InsertBB, Instruction *InsertBefore,
+        std::vector<Instruction *> &ClonedInsts);
+    static bool isReadonlyLikeCallInst(
+        Instruction *I, FunctionAnalysisPassManager &FAM, Function &F);
+    static bool hasInterferingEarlierSelfCallInBlock(
+        BasicBlock *BB, CallInst *StopCI, Function &F,
+        FunctionAnalysisPassManager &FAM);
+    static RetInst *getRetOnlyTerminatorBlockRet(BasicBlock *BB);
+
     // 判断函数是否包含自递归调用
     bool hasSelfRecursion(Function &F);
 

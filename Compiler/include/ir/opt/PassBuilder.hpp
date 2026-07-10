@@ -18,4 +18,13 @@ class PassBuilder{
     void registerFunctionAnalyses(FunctionAnalysisPassManager &FAM);
     //Pipeline Building
     ModulePassManager buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM);
+
+    private:
+    static FunctionPassManager buildLightCleanupPipeline();
+    static FunctionPassManager buildHeavyMemoryPipeline();
+    static FunctionPassManager buildPostUnrollCleanupPipeline();
+    static FunctionPassManager buildLoopPipeline();
+    static FunctionPassManager buildPostLoopCleanupPipeline();
+    static FunctionPassManager buildLateControlFlowPipeline();
+    static FunctionPassManager buildLatePipeline();
 };

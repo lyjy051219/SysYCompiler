@@ -41,11 +41,7 @@ PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassMana
 		RetInst *RI = site.second;
 
 		if (!isVoidRet) {
-			Value *retVal = nullptr;
-			auto &UL = RI->getUserList();
-			if (!UL.empty() && UL[0]) {
-				retVal = UL[0]->getValue();
-			}
+			Value *retVal = RI->getReturnValue();
 			if (!retVal) {
 				retVal = UndefValue::NewUndefValue(F.getIRType());
 			}

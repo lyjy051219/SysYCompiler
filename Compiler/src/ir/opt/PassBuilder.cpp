@@ -45,7 +45,7 @@
 
 // Pipeline 阶段构建器 (Phase Builders)
 // 1. 轻量级清理 Pipeline
-static FunctionPassManager buildLightCleanupPipeline() {
+FunctionPassManager PassBuilder::buildLightCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(PromotePass()); // Mem2Reg (将局部变量提升为寄存器)
@@ -67,7 +67,7 @@ static FunctionPassManager buildLightCleanupPipeline() {
 }
 
 // 2. 重量级内存与冗余优化 Pipeline
-static FunctionPassManager buildHeavyMemoryPipeline() {
+FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(BreakCriticalEdgesPass());
 
@@ -95,7 +95,7 @@ static FunctionPassManager buildHeavyMemoryPipeline() {
 // LoopUnroll 会复制控制流、扩大基本块并暴露退化 PHI / 常量分支 / 死副本。
 // 这里使用偏局部、确定性的清理组合，收敛展开带来的直接噪声，再把循环形态
 // 修回 LoopSimplify + LCSSA，供后续 LICM / LSR 继续消费。
-static FunctionPassManager buildPostUnrollCleanupPipeline() {
+FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
@@ -113,7 +113,7 @@ static FunctionPassManager buildPostUnrollCleanupPipeline() {
 
 // 3. 循环优化 Pipeline
 // 针对循环结构的深度优化，限制迭代次数，防止编译挂起
-static FunctionPassManager buildLoopPipeline() {
+FunctionPassManager PassBuilder::buildLoopPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(BreakCriticalEdgesPass());
     FPM.addPass(LoopSimplifyPass());
@@ -140,7 +140,7 @@ static FunctionPassManager buildLoopPipeline() {
 // LoopRotate/LICM/LoopDeletion 会暴露新的局部代数机会和 LCSSA/exit PHI。
 // 这里刻意不用完整 RangeAware/Constraint/GVN/内存清理，避免 late CFG 上的
 // 路径范围误判；只做控制流中性、可局部证明正确的收敛。
-static FunctionPassManager buildPostLoopCleanupPipeline() {
+FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
@@ -163,7 +163,7 @@ static FunctionPassManager buildPostLoopCleanupPipeline() {
 // 4.1 晚期控制流收敛 Pipeline
 // LoopRotate/LICM/IfConversion 之后经常暴露新的常量分支、空块和可合并块。
 // 这段只做控制流/指令局部收敛，避免把 ConstantHoist/UnifyFuncExits 放进不动点。
-static FunctionPassManager buildLateControlFlowPipeline() {
+FunctionPassManager PassBuilder::buildLateControlFlowPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
@@ -177,7 +177,7 @@ static FunctionPassManager buildLateControlFlowPipeline() {
 }
 
 // 将 IR 规范化为后端代码生成器(CodeGen)最喜欢的形态
-static FunctionPassManager buildLatePipeline() {
+FunctionPassManager PassBuilder::buildLatePipeline() {
     FunctionPassManager LateFPM;
     LateFPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildLateControlFlowPipeline(), 3));

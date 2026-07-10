@@ -123,6 +123,13 @@ struct HeaderState {
     bool BackedgeIsOriginalPhi = false;
 };
 
+struct PhiRewritePlan {
+    PhiInst *OldPhi = nullptr;
+    std::vector<PhiInst::IncomingEdge> Incoming;
+    Value *Replacement = nullptr;
+    PhiInst *NewPhi = nullptr;
+};
+
 class LoopUnrollPass : public PassDescriptor<LoopUnrollPass> {
 public:
     explicit LoopUnrollPass(UnrollConfig Config = UnrollConfig());
@@ -130,8 +137,6 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
     const UnrollConfig &getConfig() const { return Config; }
-
-    std::vector<Loop *> collectLoopsInPostOrder(const LoopInfo &LI) const;
 
     LoopUnrollResult tryToUnrollLoop(Function &F,
                                      Loop *L,
@@ -191,4 +196,125 @@ public:
 
 private:
     UnrollConfig Config;
+
+    static int nextUnrollSerial();
+    static std::string makeUnrollBlockIdent(
+        Function *F, BasicBlock *BB, int Iter, int UnrollSerial);
+    static std::string makePeelBlockIdent(
+        Function *F, BasicBlock *BB, int Iter, int PeelSerial);
+    static bool isSupportedCloneInstruction(Instruction *I);
+    static Value *stripSimpleCast(Value *V);
+    static std::optional<PeelPredicate> matchCompareWithIV(
+        BinaryInst *Cmp, Value *IV);
+    static int peelCountForPredicate(const PeelPredicate &P);
+    static bool isInternalConditionalBranch(Loop *L, BrInst *Br);
+    static UnrollDecision makeNoUnrollDecision(std::string Reason);
+    static bool withinThreshold(int64_t Cost, int Threshold);
+    static int chooseFactorBySize(
+        int BodyCost, int SizeLimit, int MaxCount);
+    static int localSCEVNodeCost(const SCEVExpr *E);
+    static std::optional<LoopExecutionShape> getLoopExecutionShape(
+        Loop *L, SCEVResult &SE);
+    static bool canCloneAllInstructions(
+        const std::vector<BasicBlock *> &Blocks);
+    static Value *mapValueAtIteration(
+        Value *V, int Iter, const UnrolledBodyCore &Core);
+    static bool isBlockValue(Value *V);
+    static bool isDataValue(Value *V);
+    static bool isValueCompatibleWithPhi(Value *V, PhiInst *Phi);
+    static bool isValueCompatibleWithType(
+        Value *V, std::shared_ptr<IRType> Ty);
+    static Value *mapDataValueAtIteration(
+        Value *V, int Iter, const UnrolledBodyCore &Core);
+    static Value *mapDataValueAtPeelIteration(
+        Value *V, int Iter, const PeeledBodyCore &Core);
+    static Value *getCapturedDataValueMappedAtIteration(
+        Value *V, int Iter, const UnrolledBodyCore &Core);
+    static bool addIncomingChecked(
+        PhiInst *Phi, Value *V, BasicBlock *Pred);
+    static bool rebuildPhiFromIncomingChecked(
+        PhiInst *Phi, const std::vector<PhiInst::IncomingEdge> &Incoming,
+        Value **Replacement = nullptr);
+    static bool replaceOperandsUsingMap(
+        Instruction *I,
+        const std::unordered_map<Value *, Value *> &ValueMap);
+    static bool replaceDataOperandsUsingMap(
+        Instruction *I,
+        const std::unordered_map<Value *, Value *> &ValueMap);
+    static bool removeClonedHeaderPhis(
+        UnrolledBodyCore &Core, int Iter);
+    static bool removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter);
+    static std::optional<UnrolledBodyCore> cloneUnrolledBodyCore(
+        Loop *L, int Count, SCEVResult &SE);
+    static std::optional<PeeledBodyCore> clonePeeledIterations(
+        Loop *L, int PeelCount, SCEVResult &SE);
+    static bool rewriteOriginalHeaderPhisForPartial(
+        UnrolledBodyCore &Core, int LastIter,
+        std::unordered_map<PhiInst *, Value *> *Replacements = nullptr);
+    static bool rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core);
+    static bool removeIncomingFromExitPhisForPeeledBlocks(
+        PeeledBodyCore &Core);
+    static bool hasLatchExitShape(const UnrolledBodyCore &Core);
+    static std::unordered_set<BasicBlock *> collectCoreExitings(
+        const UnrolledBodyCore &Core);
+    static bool rewriteExitPhisForSingleExiting(
+        UnrolledBodyCore &Core, int ActiveIter);
+    static std::vector<BasicBlock *> collectExitRegionBlocksFrom(
+        BasicBlock *Exit,
+        const std::unordered_set<BasicBlock *> &StopBlocks,
+        bool StopAtConditionalBranch = true);
+    static std::vector<ExitRegionDataUse> collectExitRegionDataUsesFrom(
+        BasicBlock *Exit,
+        const std::unordered_set<BasicBlock *> &StopBlocks,
+        BasicBlock *Exiting = nullptr,
+        bool StopAtConditionalBranch = true);
+    static bool rewriteExitRegionDataOperandsForIteration(
+        UnrolledBodyCore &Core, int ActiveIter,
+        const std::vector<ExitRegionDataUse> &CapturedUses,
+        const std::unordered_map<Value *, Value *> *HeaderExitValues = nullptr);
+    static bool replaceDataOperandsInReachableRegionFrom(
+        BasicBlock *Start,
+        const std::unordered_set<BasicBlock *> &StopBlocks,
+        const std::unordered_map<Value *, Value *> &Replacements);
+    static void refreshCapturedExitRegionUses(
+        std::vector<ExitRegionDataUse> &Uses,
+        const std::unordered_map<Value *, Value *> &Replacements);
+    static bool removeOriginalHeaderPhisForFull(UnrolledBodyCore &Core);
+    static bool makeStraightLineMain(
+        UnrolledBodyCore &Core, int MainCount, BasicBlock *FinalTarget,
+        Value *ContinueCondition);
+    static Value *makeTypedIntConstant(
+        int64_t V, std::shared_ptr<IRType> Ty);
+    static bool isValueAvailableAtPreheader(
+        Value *V, Loop *L, BasicBlock *PreHeader,
+        const DominatorTree &DT);
+    static bool canMaterializeSCEV(
+        const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+        const DominatorTree &DT);
+    static Value *materializeSCEV(
+        const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+        const DominatorTree &DT,
+        std::unordered_map<const SCEVExpr *, Value *> &Cache);
+    static bool replaceValuesInIterationBlocks(
+        UnrolledBodyCore &Core, int FirstIter,
+        const std::unordered_map<Value *, Value *> &Replacements);
+    static Value *getValueBeforeLoop(
+        Value *V, const UnrolledBodyCore &Core,
+        std::shared_ptr<IRType> FallbackTy);
+    static BasicBlock *getNonExitSuccessor(
+        BasicBlock *Exiting, BasicBlock *Exit);
+    static Value *mapValueAfterIteration(
+        Value *V, int Iter, const std::vector<HeaderState> &States,
+        const UnrolledBodyCore &Core);
+    static bool buildHeaderExitValueMap(
+        const std::vector<HeaderState> &HeaderStates, int ExitIter,
+        const UnrolledBodyCore &Core, BasicBlock *PreHeader,
+        std::unordered_map<Value *, Value *> &HeaderExitValues);
+    static bool buildHeaderTailInputValueMap(
+        const std::vector<HeaderState> &HeaderStates,
+        BasicBlock *PreHeader,
+        std::unordered_map<Value *, Value *> &TailInputValues);
+    static LoopUnrollResult executeUnrollWithTail(
+        Loop *L, int MainCount, int TailCopies, Value *NumGroups,
+        Value *RemainderValue, bool IsRuntime, SCEVResult &SE);
 };

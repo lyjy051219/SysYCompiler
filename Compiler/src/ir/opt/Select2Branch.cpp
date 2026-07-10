@@ -28,12 +28,9 @@ PreservationStatus Select2BranchPass::run(Function &F, FunctionAnalysisPassManag
 		BasicBlock *CurBB = SI->getParent();
 		if (!CurBB) continue;
 
-		auto &UL = SI->getUserList();
-		if (UL.size() < 3 || !UL[0] || !UL[1] || !UL[2]) continue;
-
-		Value *Cond = UL[0]->getValue();
-		Value *TrueVal = UL[1]->getValue();
-		Value *FalseVal = UL[2]->getValue();
+		Value *Cond = SI->getCondition();
+		Value *TrueVal = SI->getTrueValue();
+		Value *FalseVal = SI->getFalseValue();
 		if (!Cond || !TrueVal || !FalseVal) continue;
 
 		auto *MergeBB = new BasicBlock();

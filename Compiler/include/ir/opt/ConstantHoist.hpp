@@ -6,6 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
+class DominatorTree;
+class LoopInfo;
+
 struct ConstantHoistUseSite {
     Use *u = nullptr;
     Instruction *inst = nullptr;
@@ -41,4 +44,25 @@ struct ConstantHoistCollectResult {
 class ConstantHoistPass : public PassDescriptor<ConstantHoistPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+    static constexpr int64_t ImmediateThreshold = 2048;
+    static constexpr int UseThreshold = 2;
+    static constexpr int StraightLineUseThreshold = 3;
+    static BasicBlock *foldCommonDominator(
+        const DominatorTree &DT,
+        const std::vector<ConstantHoistUseSite> &Uses);
+    static BasicBlock *pickInsertionBlock(
+        BasicBlock *Common, BasicBlock *Entry, const LoopInfo &LI);
+    static ConstantHoistCollectResult collectCandidates(
+        Function &F, const LoopInfo &LI);
+    static void closeGroup(
+        ConstantHoistGroup &Current,
+        std::vector<ConstantHoistGroup> &Groups);
+    static std::vector<ConstantHoistGroup> groupByBaseOffset(
+        std::vector<ConstantHoistCandidate> &Sorted);
+    static bool materializeGroup(
+        ConstantHoistGroup &Group, BasicBlock *InsertBB);
+    static bool materializeFloatCandidate(
+        ConstantHoistCandidate &Candidate, BasicBlock *InsertBB);
 };

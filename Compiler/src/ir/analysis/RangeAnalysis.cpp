@@ -13,7 +13,7 @@
 // 对 Top（全范围）操作数做保守处理。
 // =====================================================================
 
-static int64_t clampI32(int64_t v) {
+int64_t IntRange::clampI32(int64_t v) {
     if (v < IntRange::I32_MIN) return IntRange::I32_MIN;
     if (v > IntRange::I32_MAX) return IntRange::I32_MAX;
     return v;
@@ -230,25 +230,21 @@ IntRange IntRange::bor(const IntRange &rhs) const {
 // 无穷大参与运算按 IEEE 754 规则传播（inf + 正数 = inf, inf - inf = NaN→Top）。
 // =====================================================================
 
-static bool isBadFloat(double v) {
-    return std::isnan(v);
-}
-
 // 规范化：如果计算结果含 NaN，返回 Top
-static FloatRange sanitizeFloat(double lo, double hi) {
-    if (isBadFloat(lo) || isBadFloat(hi)) return FloatRange();
+FloatRange FloatRange::sanitize(double lo, double hi) {
+    if (std::isnan(lo) || std::isnan(hi)) return FloatRange();
     if (lo > hi) return FloatRange::bottom();
     return FloatRange(lo, hi);
 }
 
 FloatRange FloatRange::add(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    return sanitizeFloat(min + rhs.min, max + rhs.max);
+    return sanitize(min + rhs.min, max + rhs.max);
 }
 
 FloatRange FloatRange::sub(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    return sanitizeFloat(min - rhs.max, max - rhs.min);
+    return sanitize(min - rhs.max, max - rhs.min);
 }
 
 FloatRange FloatRange::mul(const FloatRange &rhs) const {
@@ -257,11 +253,11 @@ FloatRange FloatRange::mul(const FloatRange &rhs) const {
     double v2 = min * rhs.max;
     double v3 = max * rhs.min;
     double v4 = max * rhs.max;
-    if (isBadFloat(v1) || isBadFloat(v2) || isBadFloat(v3) || isBadFloat(v4))
+    if (std::isnan(v1) || std::isnan(v2) || std::isnan(v3) || std::isnan(v4))
         return FloatRange();
     double lo = std::min({v1, v2, v3, v4});
     double hi = std::max({v1, v2, v3, v4});
-    return sanitizeFloat(lo, hi);
+    return sanitize(lo, hi);
 }
 
 FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
@@ -272,11 +268,11 @@ FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
     double v2 = min / rhs.max;
     double v3 = max / rhs.min;
     double v4 = max / rhs.max;
-    if (isBadFloat(v1) || isBadFloat(v2) || isBadFloat(v3) || isBadFloat(v4))
+    if (std::isnan(v1) || std::isnan(v2) || std::isnan(v3) || std::isnan(v4))
         return FloatRange();
     double lo = std::min({v1, v2, v3, v4});
     double hi = std::max({v1, v2, v3, v4});
-    return sanitizeFloat(lo, hi);
+    return sanitize(lo, hi);
 }
 
 // =====================================================================
@@ -463,7 +459,7 @@ bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
 // 需要 pipeline 级多轮不动点迭代，复杂度不值得现在上。
 // =====================================================================
 
-static InterprocRangeCache& getInterprocCache() {
+InterprocRangeCache& InterprocRangeCache::get() {
     static InterprocRangeCache cache;
     return cache;
 }
@@ -787,36 +783,6 @@ public:
         return IntRange(info.initial);
     }
 
-    std::vector<BasicBlock *> collectLoopBlocksForHint(const Loop *L) const {
-        std::vector<BasicBlock *> blocks;
-        std::vector<const Loop *> stack;
-        std::unordered_set<BasicBlock *> seen;
-        if (L) stack.push_back(L);
-
-        while (!stack.empty()) {
-            const Loop *cur = stack.back();
-            stack.pop_back();
-            if (!cur) continue;
-            for (BasicBlock *BB : cur->getBlocks()) {
-                if (BB && seen.insert(BB).second)
-                    blocks.push_back(BB);
-            }
-            for (Loop *sub : cur->getSubLoops()) {
-                if (sub) stack.push_back(sub);
-            }
-        }
-        return blocks;
-    }
-
-    bool isLoopExitingBlockForHint(const Loop *L, BasicBlock *BB) const {
-        if (!L || !BB || !L->contains(BB)) return false;
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (Succ && !L->contains(Succ))
-                return true;
-        }
-        return false;
-    }
-
     void applySCEVContextHints(SCEVResult *SCEV) {
         if (!SCEV) return;
 
@@ -836,12 +802,12 @@ public:
                 continue;
 
             BasicBlock *header = info.RecLoop->getHeader();
-            for (BasicBlock *BB : collectLoopBlocksForHint(info.RecLoop)) {
+            for (BasicBlock *BB : info.RecLoop->getBlocksIncludingSubLoops()) {
                 // Header PHI can also take the first value that leaves the loop
                 // through the header condition, so the active-iteration range is
                 // intentionally limited to safe, non-exiting body blocks.
                 if (!BB || BB == header) continue;
-                if (isLoopExitingBlockForHint(info.RecLoop, BB)) continue;
+                if (info.RecLoop->isExitingBlock(BB)) continue;
 
                 IntRange cur = IntRange();
                 auto it = BlockLocalRanges.find(V);
@@ -864,7 +830,7 @@ public:
             FloatRange fresult = FloatRange::bottom();
             for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
                 BasicBlock *pred = Phi->getIncomingBlock(i);
-                BasicBlock *phiBB = Phi->ChainNode<BasicBlock, Instruction>::getParent();
+                BasicBlock *phiBB = Phi->getParent();
                 if (!FeasibleEdges.count({pred, phiBB})) continue;
 
                 Value *inVal = Phi->getIncomingValue(i);
@@ -899,7 +865,7 @@ public:
         bool firstKB = true;
         for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
             BasicBlock *pred = Phi->getIncomingBlock(i);
-            BasicBlock *phiBB = Phi->ChainNode<BasicBlock, Instruction>::getParent();
+            BasicBlock *phiBB = Phi->getParent();
             if (!FeasibleEdges.count({pred, phiBB})) continue;
 
             Value *inVal = Phi->getIncomingValue(i);
@@ -923,10 +889,9 @@ public:
     }
 
     void visitBinary(BinaryInst *BI) {
-        auto &UL = BI->getUserList();
-        if (UL.size() < 2) return;
-        Value *lhs = UL[0]->getValue();
-        Value *rhs = UL[1]->getValue();
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (!BI->getOperands(lhs, rhs)) return;
 
         // 浮点二元运算
         auto resultTy = BI->getIRType();
@@ -1131,22 +1096,19 @@ public:
     }
 
     void visitBranch(BrInst *Br) {
-        auto &UL = Br->getUserList();
-
         // 无条件分支
-        if (UL.size() == 1) {
-            auto *dest = dynamic_cast<BasicBlock *>(UL[0]->getValue());
-            BasicBlock *fromBB = Br->ChainNode<BasicBlock, Instruction>::getParent();
+        if (!Br->isConditional()) {
+            auto *dest = Br->getTrueSuccessor();
+            BasicBlock *fromBB = Br->getParent();
             if (dest) markEdgeFeasible(fromBB, dest);
             return;
         }
 
         // 条件分支
-        if (UL.size() != 3) return;
-        Value *cond = UL[0]->getValue();
-        auto *trueBB = dynamic_cast<BasicBlock *>(UL[1]->getValue());
-        auto *falseBB = dynamic_cast<BasicBlock *>(UL[2]->getValue());
-        BasicBlock *fromBB = Br->ChainNode<BasicBlock, Instruction>::getParent();
+        Value *cond = Br->getCondition();
+        auto *trueBB = Br->getTrueSuccessor();
+        auto *falseBB = Br->getFalseSuccessor();
+        BasicBlock *fromBB = Br->getParent();
 
         if (!trueBB || !falseBB) return;
 
@@ -1160,10 +1122,9 @@ public:
         if ((trueSinglePred || falseSinglePred) &&
             (dynamic_cast<BinaryInst *>(cond) != nullptr)) {
             auto *cmpInst = dynamic_cast<BinaryInst *>(cond);
-            auto &cmpUL = cmpInst->getUserList();
-            if (cmpUL.size() >= 2) {
-                Value *lhs = cmpUL[0]->getValue();
-                Value *rhs = cmpUL[1]->getValue();
+            Value *lhs = nullptr;
+            Value *rhs = nullptr;
+            if (cmpInst->getOperands(lhs, rhs)) {
                 auto op = cmpInst->getOp();
 
                 // 浮点分支收窄：操作数类型 IR_FLOAT 时走浮点路径
@@ -1366,9 +1327,8 @@ public:
     }
 
     void visitCall(CallInst *CI) {
-        auto &UL = CI->getUserList();
-        if (UL.empty()) return;
-        Value *callee = UL[0]->getValue();
+        Value *callee = CI->getCallee();
+        if (!callee) return;
 
         // 内置函数范围推断
         if (auto *BIF = dynamic_cast<BuildInFunction *>(callee)) {
@@ -1393,7 +1353,7 @@ public:
         // 后，函数会被用偏紧的参数分析，返回值可能被低估；修这个需要 pipeline
         // 级不动点迭代，超出单次 analysis 的范围）
         if (auto *F = dynamic_cast<Function *>(callee)) {
-            InterprocRangeCache &cache = getInterprocCache();
+            InterprocRangeCache &cache = InterprocRangeCache::get();
             auto callTy = CI->getIRType();
             if (callTy && callTy->getEnum() == IR_INT) {
                 auto it = cache.RetRanges.find(F);
@@ -1421,21 +1381,20 @@ public:
     }
 
     void visitGEP(GetElementPtrInst *GEP) {
-        auto &UL = GEP->getUserList();
-        if (UL.size() < 2) return;
-        Value *basePtr = UL[0]->getValue();
+        if (!GEP || GEP->getNumIndices() == 0) return;
+        Value *basePtr = GEP->getBasePointer();
         if (!basePtr || !basePtr->getIRType()) return;
-        BasicBlock *BB = GEP->ChainNode<BasicBlock, Instruction>::getParent();
+        BasicBlock *BB = GEP->getParent();
         if (!BB) return;
 
         auto currentType = basePtr->getIRType();
 
         // 按 updateType 的逻辑走类型链；对每个 ARRAYType 位置的索引加约束
-        for (size_t i = 1; i < UL.size(); i++) {
+        for (size_t i = 0; i < GEP->getNumIndices(); i++) {
             if (auto arr = std::dynamic_pointer_cast<ARRAYType>(currentType)) {
                 int count = arr->getElementCount();
                 if (count > 0) {
-                    Value *idx = UL[i]->getValue();
+                    Value *idx = GEP->getIndex(i);
                     if (idx && idx->getIRType() &&
                         idx->getIRType()->getEnum() == IR_INT &&
                         !dynamic_cast<ConstInt *>(idx)) {
@@ -1465,10 +1424,9 @@ public:
     // 已经在 visitBranch 做过；select 不在 CFG 上，做不到支配推理）。
     // =====================================================================
     void visitSelect(SelectInst *SI) {
-        auto &UL = SI->getUserList();
-        if (UL.size() < 3) return;
-        Value *tv = UL[1]->getValue();
-        Value *fv = UL[2]->getValue();
+        Value *tv = SI->getTrueValue();
+        Value *fv = SI->getFalseValue();
+        if (!tv || !fv) return;
         auto ty = SI->getIRType();
         if (!ty) return;
 
@@ -1499,9 +1457,7 @@ public:
     // fptosi f32 → i32：浮点区间转 i32，±inf 或超范围 → Top
     // =====================================================================
     void visitCast(Instruction *I) {
-        auto &UL = I->getUserList();
-        if (UL.empty()) return;
-        Value *src = UL[0]->getValue();
+        Value *src = I->getUnaryOperand();
         if (!src || !src->getIRType() || !I->getIRType()) return;
         auto srcTy = src->getIRType()->getEnum();
         auto dstTy = I->getIRType()->getEnum();
@@ -1601,7 +1557,7 @@ public:
     // 扫描本函数所有 RetInst，把返回值 range 的 union 写入跨函数 cache
     // 下次分析其他调用本函数的函数时能直接查到
     void publishReturnRange(Function &F) {
-        InterprocRangeCache &cache = getInterprocCache();
+        InterprocRangeCache &cache = InterprocRangeCache::get();
         IntRange retR = IntRange::bottom();
         FloatRange fretR = FloatRange::bottom();
         bool hasInt = false, hasFloat = false;
@@ -1611,9 +1567,8 @@ public:
             for (Instruction *I : *BB) {
                 auto *Ret = dynamic_cast<RetInst *>(I);
                 if (!Ret) continue;
-                auto &UL = Ret->getUserList();
-                if (UL.empty()) continue;   // ret void
-                Value *rv = UL[0]->getValue();
+                Value *rv = Ret->getReturnValue();
+                if (!rv) continue;   // ret void
                 if (!rv || !rv->getIRType()) continue;
                 auto ty = rv->getIRType();
 
@@ -1667,7 +1622,7 @@ public:
                 Instruction *I = InstWorkList.back();
                 InstWorkList.pop_back();
                 if (!ExecutableBlocks.count(
-                        I->ChainNode<BasicBlock, Instruction>::getParent()))
+                        I->getParent()))
                     continue;
                 visitInstruction(I);
             }
@@ -1716,7 +1671,7 @@ public:
             Instruction *I = InstWorkList.back();
             InstWorkList.pop_back();
             if (!ExecutableBlocks.count(
-                    I->ChainNode<BasicBlock, Instruction>::getParent()))
+                    I->getParent()))
                 continue;
             visitInstruction(I);
             budget--;

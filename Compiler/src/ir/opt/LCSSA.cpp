@@ -58,30 +58,6 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
     return true;
 }
 
-//BFS遍历计算可达块
-std::unordered_set<BasicBlock *> LCSSAPass::computeReachableBlocks(Function &F) {
-    std::unordered_set<BasicBlock *> Reachable;
-    BasicBlock *Entry = F.front();
-    if (!Entry) return Reachable;
-
-    std::queue<BasicBlock *> Q;
-    Reachable.insert(Entry);
-    Q.push(Entry);
-
-    while (!Q.empty()) {
-        BasicBlock *BB = Q.front();
-        Q.pop();
-
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (Succ && Reachable.insert(Succ).second) {
-                Q.push(Succ);
-            }
-        }
-    }
-
-    return Reachable;
-}
-
 Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
                                    Instruction *InstDef,
                                    const Loop &L,
@@ -286,25 +262,15 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     // 计算可达块
-    auto Reachable = computeReachableBlocks(F);
+    std::unordered_set<BasicBlock *> Reachable;
+    F.collectReachableBlocks(Reachable);
 
     std::queue<Instruction *> WorkList;
     std::unordered_set<Instruction *> InWorkList;
     bool Changed = false;
 
     //1：获取所有的循环，并按照后序遍历 (Post-Order) 的顺序排列
-    std::vector<Loop*> PostOrderLoops;
-    std::function<void(Loop*)> buildPostOrder = [&](Loop *L) {
-        for (Loop *Sub : L->getSubLoops()) {
-            buildPostOrder(Sub);
-        }
-        PostOrderLoops.push_back(L);
-    };
-
-    //根据顶层循环
-    for (Loop *TopL : LI.getTopLevelLoops()) {
-        buildPostOrder(TopL);
-    }
+    std::vector<Loop*> PostOrderLoops = LI.getLoopsInPostOrder();
 
     //2：按后序遍历的顺序，逐个处理循环
     for (Loop *L : PostOrderLoops) {

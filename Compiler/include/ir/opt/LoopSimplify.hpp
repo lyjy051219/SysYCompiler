@@ -27,6 +27,4 @@ private:
 	bool simplifyHeaderPhis(Loop &L);
 	bool runOnLoop(Function &F, Loop &L, bool &cfgChanged);
 
-	static bool replaceWith(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc);
-
 };

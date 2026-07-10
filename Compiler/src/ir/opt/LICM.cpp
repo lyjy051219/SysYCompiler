@@ -13,7 +13,7 @@
 
 
 // 1) 检查所有 user 是否都在循环外
-static bool isAllUsersOutLoop(Instruction *I, const Loop &L) {
+bool LICMPass::areAllUsersOutsideLoop(Instruction *I, const Loop &L) {
 	for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
 		Use *U = *It;
 		if (!U || U->getValue() != I) continue;
@@ -26,15 +26,15 @@ static bool isAllUsersOutLoop(Instruction *I, const Loop &L) {
 }
 
 // 2)循环不变量
-static bool isInvariant(
+bool LICMPass::isInvariant(
 	Instruction *I,
 	const Loop &L,
 	const DominatorTree &DT,
 	const std::unordered_set<Instruction *> &InvariantSet) {
 	if (!I || !I->getParent()) return false;
-	for (auto &U : I->getUserList()) {
-		if (!U) continue;
-		Value *V = U->getValue();
+	for (size_t OperandIndex = 0;
+		 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+		Value *V = I->getOperand(OperandIndex);
 		if (!V) return false;
 
 		if (dynamic_cast<ConstantSystem *>(V) ||
@@ -55,36 +55,8 @@ static bool isInvariant(
 	return true;
 }
 
-// 2.1) 构建当前循环（不含子循环）的 RPO 基本块序列
-static std::vector<BasicBlock *> getLoopBlocksInRPO(const Loop &L) {
-	std::vector<BasicBlock *> PostOrder;
-	std::unordered_set<BasicBlock *> Visited;
-	std::unordered_set<BasicBlock *> InLoop;
-
-	for (BasicBlock *BB : L.getBlocks()) {
-		if (BB) InLoop.insert(BB);
-	}
-
-	std::function<void(BasicBlock *)> Dfs = [&](BasicBlock *BB) {
-		if (!BB) return;
-		if (InLoop.count(BB) == 0) return;
-		if (!Visited.insert(BB).second) return;
-
-		for (BasicBlock *Succ : BB->getSuccessors()) {
-			if (InLoop.count(Succ)) Dfs(Succ);
-		}
-		PostOrder.push_back(BB);
-	};
-
-	Dfs(L.getHeader());
-	for (BasicBlock *BB : L.getBlocks()) Dfs(BB);
-
-	std::reverse(PostOrder.begin(), PostOrder.end());
-	return PostOrder;
-}
-
 // 3) 指令能否安全移动（基于别名/副作用 + 指令类别规则）
-static bool isSideEffect(
+bool LICMPass::isSafeToMove(
 	Instruction *I,
 	const Loop &L,
 	const DominatorTree &DT,
@@ -110,9 +82,10 @@ static bool isSideEffect(
 		case Instruction::FDIV:
 		case Instruction::SREM:
 		case Instruction::FREM: {
-			auto &UL = I->getUserList();
-			if (UL.size() < 2 || !UL[1]) return false;
-			Value *Divisor = UL[1]->getValue();
+			auto *BI = dynamic_cast<BinaryInst *>(I);
+			Value *Dividend = nullptr;
+			Value *Divisor = nullptr;
+			if (!BI || !BI->getOperands(Dividend, Divisor)) return false;
 			if (!Divisor) return false;
 			if (!dynamic_cast<ConstantSystem *>(Divisor)) return false;
 			if (Divisor->isConstZero()) return false;
@@ -127,18 +100,16 @@ static bool isSideEffect(
 
 	// LOAD：循环内任一指令若可能 Mod 该地址，则不可移动
 	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
-		auto &UL = LIst->getUserList();
-		if (UL.empty() || !UL[0]) return false;
-		Value *Ptr = UL[0]->getValue();
+		Value *Ptr = LIst->getPointerOperand();
+		if (!Ptr) return false;
 		bool UseIndexRange = LIst->getIRType() &&
 			LIst->getIRType()->getEnum() != IR_FLOAT;
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == I) continue;
 			if (UseIndexRange) {
 				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
-					auto &SUL = SI->getUserList();
-					if (SUL.size() < 2 || !SUL[1]) return false;
-					Value *StorePtr = SUL[1]->getValue();
+					Value *StorePtr = SI->getPointerOperand();
+					if (!StorePtr) return false;
 					if (AA.aliasWithIndexRange(Ptr, StorePtr, LI) == AliasInfo::NoAlias)
 						continue;
 					return false;
@@ -153,9 +124,8 @@ static bool isSideEffect(
     // STORE：Hoist 直接禁止；Sink 需证明“最后一次写”
 	if (auto *SI = dynamic_cast<StoreInst *>(I)) {
 		if (!ForSink && AggressiveHoist) return false;
-		auto &UL = SI->getUserList();
-		if (UL.size() < 2 || !UL[1]) return false;
-		Value *Ptr = UL[1]->getValue();
+		Value *Ptr = SI->getPointerOperand();
+		if (!Ptr) return false;
 
 		BasicBlock *SBB = SI->getParent();
 		if (!SBB) return false;
@@ -195,10 +165,7 @@ static bool isSideEffect(
 
 	// CALL：副作用分析 + ModRef + untracked + RefSet 逐点核对
 	if (auto *CI = dynamic_cast<CallInst *>(I)) {
-		auto &UL = CI->getUserList();
-		if (UL.empty() || !UL[0]) return false;
-		Value *Callee = UL[0]->getValue();
-		auto *CalleeFunc = dynamic_cast<Function *>(Callee);
+		auto *CalleeFunc = CI->getDirectCallee();
 		if (!CalleeFunc) return false;
 
 		const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
@@ -211,7 +178,6 @@ static bool isSideEffect(
 		if (!SEI.ModSet.empty()) return false;
 
 		if (!SEI.RefSet.empty()) {
-			auto &Params = CalleeFunc->getParams();
 			std::vector<Value *> ReadPtrs;
 
 			for (Value *RV : SEI.RefSet) {
@@ -223,14 +189,11 @@ static bool isSideEffect(
 				}
 				if (!Var->isParam()) continue;
 
-				for (size_t i = 0; i < Params.size(); ++i) {
-					if (Params[i].get() != RV) continue;
-					if (i + 1 >= UL.size() || !UL[i + 1]) break;
-					Value *Arg = UL[i + 1]->getValue();
-					if (!Arg || !Arg->getIRType() || Arg->getIRType()->getEnum() != IR_POINTER) break;
-					ReadPtrs.push_back(Arg);
-					break;
-				}
+				int ParamIndex = CalleeFunc->getParamIndex(RV);
+				if (ParamIndex < 0) continue;
+				Value *Arg = CI->getArg(static_cast<unsigned>(ParamIndex));
+				if (!Arg || !Arg->isPointerValue()) continue;
+				ReadPtrs.push_back(Arg);
 			}
 
 			for (Value *Ptr : ReadPtrs) {
@@ -277,21 +240,16 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 		auto collectLiveLoopInsts = [&]() {
 			std::vector<Instruction *> Insts;
-			std::function<void(Loop *)> collectFromLoop = [&](Loop *Cur) {
-				if (!Cur) return;
-				for (BasicBlock *BB : Cur->getBlocks()) {
-					if (!BB) continue;
-					for (auto *II : *BB) Insts.push_back(II);
-				}
-				for (Loop *Sub : Cur->getSubLoops()) collectFromLoop(Sub);
-			};
-			collectFromLoop(L);
+			for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+				if (!BB) continue;
+				for (auto *II : *BB) Insts.push_back(II);
+			}
 			return Insts;
 		};
 
 		// Sink：后序块 + 逆序指令
 		std::unordered_set<Instruction *> SinkInvariant;
-		auto SinkBlocksRPO = getLoopBlocksInRPO(*L);
+		auto SinkBlocksRPO = L->getBlocksInRPO();
 		for (auto BIt = SinkBlocksRPO.rbegin(); BIt != SinkBlocksRPO.rend(); ++BIt) {
 			BasicBlock *BB = *BIt;
 			if (!BB) continue;
@@ -304,7 +262,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				if (!I || I->getParent() != BB) continue;
 				auto LoopInsts = collectLiveLoopInsts();
 
-				if (!isSideEffect(
+				if (!isSafeToMove(
 						I,
 						*L,
 						DT,
@@ -319,7 +277,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					continue;
 				}
 
-				if (!isAllUsersOutLoop(I, *L)) {
+				if (!areAllUsersOutsideLoop(I, *L)) {
 					if (isInvariant(I, *L, DT, SinkInvariant)) SinkInvariant.insert(I);
 					continue;
 				}
@@ -336,9 +294,10 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						continue;
 					}
 
-					for (auto &U : Cloned->getUserList()) {
-						if (!U) continue;
-						Value *OldOp = U->getValue();
+					for (size_t OperandIndex = 0;
+						 OperandIndex < Cloned->getNumOperands(); ++OperandIndex) {
+						Use *U = Cloned->getOperandUse(OperandIndex);
+						Value *OldOp = Cloned->getOperand(OperandIndex);
 						if (!OldOp) continue;
 
 						auto *DefOpI = dynamic_cast<Instruction *>(OldOp);
@@ -417,7 +376,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 		// Hoist：RPO 块 + 正序指令
 		std::unordered_set<Instruction *> HoistInvariant;
-		auto HoistBlocksRPO = getLoopBlocksInRPO(*L);
+		auto HoistBlocksRPO = L->getBlocksInRPO();
 		for (BasicBlock *BB : HoistBlocksRPO) {
 			if (!BB) continue;
 			std::vector<Instruction *> Insts;
@@ -433,7 +392,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				for (BasicBlock *LatchBB : Latches)
 					if (!DT.dominates(BB, LatchBB)) Aggressive = false;
 
-				if (!isSideEffect(
+				if (!isSafeToMove(
 						I,
 						*L,
 						DT,
