@@ -24,7 +24,7 @@ void emitAssembly(Module &module, std::ostream &out,
 
   // 构建并运行代码生成流水线
   MachineModulePassManager MPM =
-      MPB.buildModulePipeline(options.optLevel, MFAM);
+      MPB.buildModulePipeline(options, MFAM);
   MPM.run(machine, MMAM);
 
   // 汇编打印

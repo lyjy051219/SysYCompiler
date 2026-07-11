@@ -16,7 +16,7 @@ struct RebuildCFGPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
-// 机器层控制流清理，当前为空位，留给之后的块合并和死块删除
+// 机器层控制流清理：删除不可达块、空跳板块、线性合并和冗余跳转
 struct CleanupCFGPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);

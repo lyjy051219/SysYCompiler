@@ -10,7 +10,7 @@ namespace riscv {
 // 这些函数由 CodegenPasses.hpp 中对应的 pass 包装后进入流水线
 
 void rebuildCFG(MachineFunction &mf);
-void cleanupMachineCFG(MachineFunction &mf);
+bool cleanupMachineCFG(MachineFunction &mf);
 void eliminatePhiNodes(MachineFunction &mf);
 void lowerSelectPseudo(MachineFunction &mf);
 bool runPostRAPeephole(MachineFunction &mf);

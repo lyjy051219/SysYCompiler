@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""RISC-V 后端性能评分脚本。
+"""
+后端用性能评分脚本。
+
+使用决赛评分标准。
+把当前前中端+clang o3 当作第一名。计算前中端加后端的分数。同时对比总运行时间。
+后端部分pass可在脚本中开关
 
 常用命令：
 
@@ -22,10 +27,11 @@
 
 评分规则：
 
-  1. 我方和 gcc 基线在所有预热、计时轮次都 AC，case 才计分。
-  2. 基线默认是 riscv64 gcc -O3 -ffp-contract=off，避免 FMA 改变严格浮点输出。
+  1. 我方和 baseline 在所有预热、计时轮次都 AC，case 才计分。
+  2. baseline 默认是我方前中端 IR 交给 clang-18 -O3 -ffp-contract=off
+     生成的 RISC-V 程序，避免 FMA 改变严格浮点输出。
   3. 默认每个可执行文件预热 5 轮，再计时 5 轮。
-  4. 单项分 = gcc_O3_平均时间 / 我方平均时间 * 100，默认不封顶。
+  4. 单项分 = baseline_平均时间 / 我方平均时间 * 100，默认不封顶。
   5. 总分 = 所有单项分的几何平均。
 
 总运行时间只统计计时轮次，不包含预热、编译、汇编、链接。
@@ -71,6 +77,8 @@ WORKSPACE = PROJECT.parent
 TESTS_ROOT = WORKSPACE.parent / "tests"
 BUILD_DIR = PROJECT / "build-riscv"
 COMPILER = BUILD_DIR / "compiler"
+MIDDLE_BUILD_DIR = PROJECT / "build-middle"
+MIDDLE_COMPILER = MIDDLE_BUILD_DIR / "compiler_middle_end"
 RUNTIME_C = PROJECT / "runtime" / "sylib.c"
 
 
@@ -92,35 +100,35 @@ class RunResult:
 @dataclass
 class CaseResult:
     case: Path
-    gcc_avg: float
+    baseline_avg: float
     ours_avg: float
     raw_score: float
     score: float
-    gcc_runs: list
+    baseline_runs: list
     ours_runs: list
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="按 gcc -O3 基线给 RISC-V 后端性能评分。",
+        description="Score RISC-V backend performance against a clang-optimized IR baseline.",
         add_help=False,
     )
-    parser._optionals.title = "选项"
-    parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
+    parser._optionals.title = "options"
+    parser.add_argument("-h", "--help", action="help", help="show this help message and exit")
     parser.add_argument(
         "--suite",
         choices=["26", "non26", "all"],
         default="all",
-        help="26 只跑 26 年性能用例；non26 只跑非 26 年性能用例；all 合并两者。",
+        help="26: testcases26 only; non26: performance cases outside testcases26; all: both.",
     )
-    parser.add_argument("--warmups", type=int, default=5, help="每个 case 的预热轮数")
-    parser.add_argument("--runs", type=int, default=5, help="每个 case 的计时轮数")
+    parser.add_argument("--warmups", type=int, default=5, help="warmup runs per case")
+    parser.add_argument("--runs", type=int, default=5, help="timed runs per case")
     parser.add_argument("--allow-under-standard", action="store_true",
-                        help="允许低于正式轮数，用于冒烟测试")
-    parser.add_argument("--skip-build", action="store_true", help="评分前不重新构建编译器")
-    parser.add_argument("--max-cases", type=int, help="排序后只取前 N 个 case")
+                        help="allow fewer warmup/timed runs for smoke tests")
+    parser.add_argument("--skip-build", action="store_true", help="do not rebuild the compiler")
+    parser.add_argument("--max-cases", type=int, help="use only the first N sorted cases")
     parser.add_argument("--single-case", action="append", default=[],
-                        help="只跑指定 case；可重复，也可逗号分隔")
+                        help="run only the given case; repeat or use comma-separated values")
     parser.add_argument("--work-root", type=Path, default=PROJECT / "perf_score_work")
     parser.add_argument("--compile-timeout", type=int, default=600)
     parser.add_argument("--assemble-timeout", type=int, default=60)
@@ -128,23 +136,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-timeout", type=int, default=300)
     parser.add_argument("--build-timeout", type=int, default=900)
     parser.add_argument("--cxx", default=os.environ.get("CXX", "clang++-18"))
+    parser.add_argument("--baseline", choices=["clang-ir", "gcc-o3"], default="clang-ir",
+                        help="baseline executable source; default: clang-ir")
+    parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-18"),
+                        help="clang used for the clang-ir baseline")
+    parser.add_argument("--clang-opt-level", choices=["O0", "O1", "O2", "O3"],
+                        default="O3", help="clang optimization level for clang-ir baseline")
+    parser.add_argument("--clang-extra", action="append", default=[],
+                        help="extra argument passed to clang baseline; repeatable")
+    parser.add_argument("--clang-fp-contract", default="off",
+                        choices=["off", "on", "fast"],
+                        help="clang baseline -ffp-contract mode; default: off")
     parser.add_argument("--gcc-extra", action="append", default=[],
-                        help="额外传给 gcc 基线的参数；可重复")
+                        help="extra argument passed to the gcc baseline; repeatable")
     parser.add_argument("--gcc-fp-contract", default="off",
                         choices=["off", "on", "fast"],
-                        help="gcc 基线的 -ffp-contract 模式；默认 off")
+                        help="gcc baseline -ffp-contract mode; default: off")
     parser.add_argument("--disable-backend-pass", action="append", default=[],
-                        help="关闭我方后端可选 pass；可重复，也可逗号分隔")
+                        help="disable optional backend pass for our compiler; repeat or comma-separate")
+    parser.add_argument("--time-stat", choices=["mean", "median", "trimmed-mean"],
+                        default="mean",
+                        help="per-case runtime statistic; official default: mean")
+    parser.add_argument("--clock-jump-retries", type=int, default=5,
+                        help="rerun an attempt when SysY wall-clock TOTAL is impossible")
+    parser.add_argument("--no-clock-jump-filter", action="store_true",
+                        help="use SysY TOTAL exactly as printed, without local clock-jump protection")
     parser.add_argument("--cap-score", action="store_true",
-                        help="把每个 case 的分数封顶为 100")
+                        help="cap each case score at 100")
     parser.add_argument("--no-score-cap", action="store_true",
-                        help="兼容旧参数；现在默认不封顶")
-    parser.add_argument("--keep-work", action="store_true", help="保留旧工作目录内容")
+                        help="compatibility option; scores are uncapped by default")
+    parser.add_argument("--keep-work", action="store_true", help="keep the previous work directory")
     return parser.parse_args()
 
 
 def fail(message: str) -> None:
-    print(f"{Color.RED}错误:{Color.RESET} {message}", file=sys.stderr)
+    print(f"{Color.RED}error:{Color.RESET} {message}", file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -199,7 +225,7 @@ def detect_riscv_prefix() -> str:
     for prefix in candidates:
         if shutil.which(prefix + "gcc"):
             return prefix
-    fail("找不到 RISC-V 工具链；请安装 riscv64-linux-gnu-gcc 或设置 RISCV_PREFIX")
+    fail("RISC-V toolchain not found; install riscv64-linux-gnu-gcc or set RISCV_PREFIX")
 
 
 RISCV_PREFIX = detect_riscv_prefix()
@@ -207,36 +233,60 @@ RISCV_GCC = RISCV_PREFIX + "gcc"
 RISCV_AS = RISCV_PREFIX + "as"
 QEMU = shutil.which("qemu-riscv64")
 if not QEMU:
-    fail("找不到 qemu-riscv64")
+    fail("qemu-riscv64 not found")
 
 
-def build_compiler(args: argparse.Namespace) -> None:
-    print(f"{Color.YELLOW}[SETUP]{Color.RESET} 构建编译器 ...")
+def build_cmake_target(build_dir: Path, target: str, configure_options: list,
+                       args: argparse.Namespace, label: str) -> None:
+    print(f"{Color.YELLOW}[SETUP]{Color.RESET} building {label} ...")
     configure_cmd = [
         "cmake",
         "-B",
-        str(BUILD_DIR),
+        str(build_dir),
         "-S",
         str(PROJECT),
         "-DCMAKE_BUILD_TYPE=Debug",
-        "-DBUILD_FRONTEND_ONLY=OFF",
-        "-DBUILD_MIDDLE_END=OFF",
-        "-DBUILD_FRONTEND_RELEASE=OFF",
         f"-DCMAKE_CXX_COMPILER={args.cxx}",
-    ]
+    ] + configure_options
     build_cmd = [
         "cmake",
         "--build",
-        str(BUILD_DIR),
+        str(build_dir),
         "--config",
         "Debug",
         "--target",
-        "compiler",
+        target,
         "-j",
         "4",
     ]
-    run_setup_command(configure_cmd, "configure", args.build_timeout)
-    run_setup_command(build_cmd, "build", args.build_timeout)
+    run_setup_command(configure_cmd, f"configure {label}", args.build_timeout)
+    run_setup_command(build_cmd, f"build {label}", args.build_timeout)
+
+
+def build_compiler(args: argparse.Namespace) -> None:
+    build_cmake_target(
+        BUILD_DIR,
+        "compiler",
+        [
+            "-DBUILD_FRONTEND_ONLY=OFF",
+            "-DBUILD_MIDDLE_END=OFF",
+            "-DBUILD_FRONTEND_RELEASE=OFF",
+        ],
+        args,
+        "riscv backend compiler",
+    )
+    if args.baseline == "clang-ir":
+        build_cmake_target(
+            MIDDLE_BUILD_DIR,
+            "compiler_middle_end",
+            [
+                "-DBUILD_FRONTEND_ONLY=OFF",
+                "-DBUILD_MIDDLE_END=ON",
+                "-DBUILD_FRONTEND_RELEASE=OFF",
+            ],
+            args,
+            "middle-end IR compiler",
+        )
 
 
 def is_bad_case(path: Path) -> bool:
@@ -423,16 +473,16 @@ def compile_ours(case: Path, case_dir: Path, runtime_obj: Path, args: argparse.N
     ret = run_command([str(COMPILER), "-S", "-o", str(asm_file), str(case)],
                       timeout=args.compile_timeout, env=compile_env)
     if ret.returncode != 0:
-        raise RuntimeError("编译器错误\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
+        raise RuntimeError("compiler error\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
 
     ret = run_command([RISCV_AS, str(asm_file), "-o", str(obj_file)], timeout=args.assemble_timeout)
     if ret.returncode != 0:
-        raise RuntimeError("汇编错误\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
+        raise RuntimeError("assembler error\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
 
     ret = run_command([RISCV_GCC, "-static", str(obj_file), str(runtime_obj), "-o", str(exe_file)],
                       timeout=args.link_timeout)
     if ret.returncode != 0:
-        raise RuntimeError("链接错误\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
+        raise RuntimeError("linker error\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
     return exe_file
 
 
@@ -457,33 +507,128 @@ def compile_gcc_o3(case: Path, case_dir: Path, header: Path, args: argparse.Name
     cmd[1:1] = baseline_extra
     ret = run_command(cmd, timeout=args.compile_timeout)
     if ret.returncode != 0:
-        raise RuntimeError("gcc -O3 编译/链接错误\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
+        raise RuntimeError("gcc -O3 compile/link error\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
     return exe_file
 
 
-def parse_runtime_seconds(stderr_bytes: bytes, fallback: float) -> float:
+def sanitize_ir_for_clang_riscv(input_file: Path, output_file: Path) -> None:
+    text = input_file.read_text(encoding="utf-8")
+    # runtime/runtime.ll is produced on the host and may carry x86 function
+    # target attributes. Keep the IR body intact, but let clang's RISC-V target
+    # options select the CPU/features for the baseline code generation.
+    text = re.sub(r'\s+"target-(?:cpu|features)"="[^"]*"', "", text)
+    output_file.write_text(text, encoding="utf-8")
+
+
+def compile_clang_ir_baseline(case: Path, case_dir: Path,
+                              args: argparse.Namespace) -> Path:
+    ir_file = case_dir / "baseline.ll"
+    clang_ir_file = case_dir / "baseline_sanitized.ll"
+    asm_file = case_dir / "baseline_clang.s"
+    obj_file = case_dir / "baseline_clang.o"
+    exe_file = case_dir / "baseline_clang.exe"
+
+    ret = run_command([str(MIDDLE_COMPILER), "-S", "-o", str(ir_file), str(case)],
+                      timeout=args.compile_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "middle-end IR compile error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+
+    sanitize_ir_for_clang_riscv(ir_file, clang_ir_file)
+
+    opt_flag = "-" + args.clang_opt_level
+    clang_cmd = [
+        args.clang,
+        "--target=riscv64-linux-gnu",
+        "-march=rv64gc",
+        "-mabi=lp64d",
+        opt_flag,
+        "-fno-addrsig",
+        f"-ffp-contract={args.clang_fp_contract}",
+        "-S",
+        str(clang_ir_file),
+        "-o",
+        str(asm_file),
+    ] + args.clang_extra
+    ret = run_command(clang_cmd, timeout=args.compile_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "clang IR baseline compile error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+
+    ret = run_command([RISCV_AS, str(asm_file), "-o", str(obj_file)],
+                      timeout=args.assemble_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "clang IR baseline assembler error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+
+    ret = run_command([RISCV_GCC, "-static", str(obj_file), "-o", str(exe_file)],
+                      timeout=args.link_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "clang IR baseline linker error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+    return exe_file
+
+
+def compile_baseline(case: Path, case_dir: Path, header: Path | None,
+                     args: argparse.Namespace) -> Path:
+    if args.baseline == "gcc-o3":
+        if header is None:
+            raise RuntimeError("gcc baseline header was not prepared")
+        return compile_gcc_o3(case, case_dir, header, args)
+    return compile_clang_ir_baseline(case, case_dir, args)
+
+
+def parse_sysy_total_seconds(stderr_bytes: bytes) -> float | None:
     text = stderr_bytes.decode("utf-8", errors="replace")
-    match = re.search(r"TOTAL:\s*(\d+)H-(\d+)M-(\d+)S-(\d+)us", text)
+    match = re.search(r"TOTAL:\s*(-?\d+)H-(-?\d+)M-(-?\d+)S-(-?\d+)us", text)
     if not match:
-        return fallback
+        return None
     hours, minutes, seconds, microseconds = map(int, match.groups())
     return hours * 3600 + minutes * 60 + seconds + microseconds / 1_000_000
 
 
+def clock_jump_detected(sysy_runtime: float, elapsed: float) -> bool:
+    if sysy_runtime < 0:
+        return True
+    # SysY TOTAL measures a section inside the process, so it cannot exceed
+    # the monotonic whole-process elapsed time by a large margin.
+    tolerance = max(1.0, elapsed * 0.20)
+    return sysy_runtime > elapsed + tolerance
+
+
 def expected_output(expected_file: Path) -> str:
     if not expected_file.exists():
-        raise RuntimeError(f"找不到期望输出: {expected_file}")
+        raise RuntimeError(f"expected output not found: {expected_file}")
     return expected_file.read_text(encoding="utf-8")
 
 
 def run_and_compare(exe: Path, input_file: Path, expected_text: str,
-                    timeout: int, label: str, case: Path) -> RunResult:
+                    args: argparse.Namespace, label: str, case: Path) -> RunResult:
     try:
-        ret = run_command([QEMU, str(exe)], timeout=timeout, stdin_path=input_file)
+        ret = run_command([QEMU, str(exe)], timeout=args.run_timeout, stdin_path=input_file)
     except subprocess.TimeoutExpired:
-        return RunResult("TLE", float(timeout), f"{label} qemu 超时 {timeout}s")
+        return RunResult("TLE", float(args.run_timeout), f"{label} qemu timeout after {args.run_timeout}s")
 
-    runtime = parse_runtime_seconds(ret.stderr, ret.elapsed)
+    sysy_runtime = parse_sysy_total_seconds(ret.stderr)
+    if sysy_runtime is None:
+        runtime = ret.elapsed
+    elif not args.no_clock_jump_filter and clock_jump_detected(sysy_runtime, ret.elapsed):
+        detail = (
+            f"{label} clock jump: SysY TOTAL={sysy_runtime:.6f}s, "
+            f"monotonic elapsed={ret.elapsed:.6f}s"
+        )
+        return RunResult("CLOCK_JUMP", sysy_runtime, detail)
+    else:
+        runtime = sysy_runtime if sysy_runtime >= 0 else ret.elapsed
+
     actual = ret.stdout.decode("utf-8", errors="replace")
     if actual and not actual.endswith("\n"):
         actual += "\n"
@@ -493,36 +638,72 @@ def run_and_compare(exe: Path, input_file: Path, expected_text: str,
                              fromfile=f"{label}-actual", tofile="expected", lineterm=""))
     if diff:
         detail = "\n".join(diff[:120])
-        return RunResult("WA", runtime, f"{label} 输出错误: {case}\n{detail}")
+        return RunResult("WA", runtime, f"{label} wrong answer: {case}\n{detail}")
     return RunResult("AC", max(runtime, 1e-9))
 
 
-def measure_pair(ours_exe: Path, gcc_exe: Path, case: Path, args: argparse.Namespace) -> tuple:
+def run_and_compare_stable(exe: Path, input_file: Path, expected_text: str,
+                           args: argparse.Namespace, label: str, case: Path) -> RunResult:
+    max_attempts = 1 if args.no_clock_jump_filter else args.clock_jump_retries + 1
+    for attempt in range(1, max_attempts + 1):
+        result = run_and_compare(exe, input_file, expected_text, args, label, case)
+        if result.status != "CLOCK_JUMP":
+            return result
+        if attempt < max_attempts:
+            print(
+                f"{Color.YELLOW}[CLOCK]{Color.RESET} {format_case(case)} "
+                f"{result.detail}; retry {attempt}/{max_attempts - 1}"
+            )
+    return result
+
+
+def baseline_label(args: argparse.Namespace) -> str:
+    return "gcc-o3" if args.baseline == "gcc-o3" else "clang-ir"
+
+
+def measure_pair(ours_exe: Path, baseline_exe: Path, case: Path,
+                 args: argparse.Namespace) -> tuple:
     input_file = case.with_suffix(".in")
     expected_text = expected_output(case.with_suffix(".out"))
+    label_base = baseline_label(args)
 
     for i in range(args.warmups):
-        for label, exe in [("gcc-o3", gcc_exe), ("ours", ours_exe)]:
-            result = run_and_compare(exe, input_file, expected_text, args.run_timeout, label, case)
+        for label, exe in [(label_base, baseline_exe), ("ours", ours_exe)]:
+            result = run_and_compare_stable(exe, input_file, expected_text, args, label, case)
             if result.status != "AC":
-                raise RuntimeError(f"{label} 预热第 {i + 1} 轮失败: {result.detail}")
+                raise RuntimeError(f"{label} warmup run {i + 1} failed: {result.detail}")
 
     ours_runs = []
-    gcc_runs = []
+    baseline_runs = []
     for i in range(args.runs):
-        order = [("gcc-o3", gcc_exe), ("ours", ours_exe)]
+        order = [(label_base, baseline_exe), ("ours", ours_exe)]
         if i % 2 == 1:
             order.reverse()
         for label, exe in order:
-            result = run_and_compare(exe, input_file, expected_text, args.run_timeout, label, case)
+            result = run_and_compare_stable(exe, input_file, expected_text, args, label, case)
             if result.status != "AC":
-                raise RuntimeError(f"{label} 计时第 {i + 1} 轮失败: {result.detail}")
-            if label == "gcc-o3":
-                gcc_runs.append(result.runtime)
+                raise RuntimeError(f"{label} timed run {i + 1} failed: {result.detail}")
+            if label == label_base:
+                baseline_runs.append(result.runtime)
             else:
                 ours_runs.append(result.runtime)
 
-    return gcc_runs, ours_runs
+    return baseline_runs, ours_runs
+
+
+def runtime_statistic(values: list, mode: str) -> float:
+    # 正式评分默认使用算术平均；median/trimmed-mean 只用于本机稳定性诊断。
+    if mode == "mean" or len(values) <= 2:
+        return sum(values) / len(values)
+    ordered = sorted(values)
+    if mode == "median":
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+    if len(ordered) >= 5:
+        ordered = ordered[1:-1]
+    return sum(ordered) / len(ordered)
 
 
 def geometric_mean(values: list) -> float:
@@ -548,11 +729,14 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
         writer = csv.writer(f)
         writer.writerow([
             "case",
-            "gcc_o3_avg",
-            "ours_avg",
+            "time_stat",
+            "baseline_time",
+            "ours_time",
+            "baseline_mean",
+            "ours_mean",
             "raw_score",
             "score",
-            "gcc_o3_runs",
+            "baseline_runs",
             "ours_runs",
         ])
         for result in results:
@@ -560,33 +744,44 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
                 case_name = str(result.case.relative_to(TESTS_ROOT))
             except ValueError:
                 case_name = str(result.case)
+            baseline_mean = sum(result.baseline_runs) / len(result.baseline_runs)
+            ours_mean = sum(result.ours_runs) / len(result.ours_runs)
             writer.writerow([
                 case_name,
-                f"{result.gcc_avg:.9f}",
+                args.time_stat,
+                f"{result.baseline_avg:.9f}",
                 f"{result.ours_avg:.9f}",
+                f"{baseline_mean:.9f}",
+                f"{ours_mean:.9f}",
                 f"{result.raw_score:.6f}",
                 f"{result.score:.6f}",
-                " ".join(f"{x:.9f}" for x in result.gcc_runs),
+                " ".join(f"{x:.9f}" for x in result.baseline_runs),
                 " ".join(f"{x:.9f}" for x in result.ours_runs),
             ])
 
-    gcc_total_runtime = sum(sum(result.gcc_runs) for result in results)
+    baseline_total_runtime = sum(sum(result.baseline_runs) for result in results)
     ours_total_runtime = sum(sum(result.ours_runs) for result in results)
     timed_run_count = sum(len(result.ours_runs) for result in results)
     summary = {
         "suite": args.suite,
+        "baseline": args.baseline,
         "warmups": args.warmups,
         "runs": args.runs,
+        "time_stat": args.time_stat,
         "case_count": len(results),
         "failure_count": len(failures),
         "score": geometric_mean([result.score for result in results]) if not failures else None,
         "raw_score": geometric_mean([result.raw_score for result in results]) if not failures else None,
         "score_cap": args.cap_score,
+        "clang": args.clang if args.baseline == "clang-ir" else None,
+        "clang_opt_level": args.clang_opt_level if args.baseline == "clang-ir" else None,
+        "clang_fp_contract": args.clang_fp_contract if args.baseline == "clang-ir" else None,
+        "clang_extra": args.clang_extra if args.baseline == "clang-ir" else None,
         "gcc_fp_contract": args.gcc_fp_contract,
         "gcc_extra": args.gcc_extra,
-        "gcc_total_timed_runtime": gcc_total_runtime,
+        "baseline_total_timed_runtime": baseline_total_runtime,
         "ours_total_timed_runtime": ours_total_runtime,
-        "gcc_average_timed_runtime": gcc_total_runtime / timed_run_count if timed_run_count else None,
+        "baseline_average_timed_runtime": baseline_total_runtime / timed_run_count if timed_run_count else None,
         "ours_average_timed_runtime": ours_total_runtime / timed_run_count if timed_run_count else None,
         "timed_run_count": timed_run_count,
         "csv": str(csv_path),
@@ -603,34 +798,52 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
 def main() -> int:
     args = parse_args()
     if not args.allow_under_standard and (args.warmups < 5 or args.runs < 2):
-        fail("正式评分要求 --warmups >= 5 且 --runs >= 2；冒烟测试请加 --allow-under-standard")
+        fail("official scoring requires --warmups >= 5 and --runs >= 2; add --allow-under-standard for smoke tests")
     if args.warmups < 0 or args.runs <= 0:
-        fail("warmups 必须 >= 0，runs 必须 > 0")
+        fail("warmups must be >= 0 and runs must be > 0")
     if not TESTS_ROOT.exists():
-        fail(f"找不到 tests 目录: {TESTS_ROOT}")
+        fail(f"tests directory not found: {TESTS_ROOT}")
     if not RUNTIME_C.exists():
-        fail(f"找不到运行库: {RUNTIME_C}")
+        fail(f"runtime library not found: {RUNTIME_C}")
+    if args.baseline == "clang-ir" and shutil.which(args.clang) is None:
+        fail(f"clang executable not found: {args.clang}")
 
     if not args.skip_build:
         build_compiler(args)
     if not COMPILER.exists():
-        fail(f"找不到编译器: {COMPILER}")
+        fail(f"compiler not found: {COMPILER}")
+    if args.baseline == "clang-ir" and not MIDDLE_COMPILER.exists():
+        fail(f"middle-end compiler not found: {MIDDLE_COMPILER}")
 
     cases = collect_cases(args)
     if not cases:
-        fail("没有选中性能用例")
+        fail("no performance cases selected")
 
     work_root = prepare_work(args)
-    gcc_header = write_gcc_header(work_root)
+    gcc_header = write_gcc_header(work_root) if args.baseline == "gcc-o3" else None
     runtime_obj = compile_runtime_obj(work_root, args)
 
-    print(f"{Color.YELLOW}[SETUP]{Color.RESET} 方案={args.suite}, 用例={len(cases)}, 预热={args.warmups}, 计时={args.runs}")
-    baseline_flags = [f"-ffp-contract={args.gcc_fp_contract}"] + args.gcc_extra
-    print(f"{Color.YELLOW}[SETUP]{Color.RESET} gcc 基线: {RISCV_GCC} -O3 {' '.join(baseline_flags)}")
+    print(
+        f"{Color.YELLOW}[SETUP]{Color.RESET} "
+        f"suite={args.suite}, cases={len(cases)}, warmups={args.warmups}, "
+        f"timed-runs={args.runs}, time-stat={args.time_stat}"
+    )
+    if args.baseline == "gcc-o3":
+        baseline_flags = [f"-ffp-contract={args.gcc_fp_contract}"] + args.gcc_extra
+        print(f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: {RISCV_GCC} -O3 {' '.join(baseline_flags)}")
+    else:
+        clang_flags = [
+            "-" + args.clang_opt_level,
+            f"-ffp-contract={args.clang_fp_contract}",
+        ] + args.clang_extra
+        print(
+            f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: "
+            f"{MIDDLE_COMPILER} IR -> {args.clang} {' '.join(clang_flags)}"
+        )
     disabled_passes = disabled_backend_passes(args)
     if disabled_passes:
-        print(f"{Color.YELLOW}[SETUP]{Color.RESET} 已关闭后端 pass: {','.join(disabled_passes)}")
-    print(f"{Color.YELLOW}[SETUP]{Color.RESET} 工作目录: {work_root}")
+        print(f"{Color.YELLOW}[SETUP]{Color.RESET} disabled backend passes: {','.join(disabled_passes)}")
+    print(f"{Color.YELLOW}[SETUP]{Color.RESET} work root: {work_root}")
 
     results = []
     failures = []
@@ -639,17 +852,19 @@ def main() -> int:
         case_dir.mkdir(parents=True, exist_ok=True)
         try:
             ours_exe = compile_ours(case, case_dir, runtime_obj, args)
-            gcc_exe = compile_gcc_o3(case, case_dir, gcc_header, args)
-            gcc_runs, ours_runs = measure_pair(ours_exe, gcc_exe, case, args)
-            gcc_avg = sum(gcc_runs) / len(gcc_runs)
-            ours_avg = sum(ours_runs) / len(ours_runs)
-            raw_score = (gcc_avg / max(ours_avg, 1e-9)) * 100.0
+            base_exe = compile_baseline(case, case_dir, gcc_header, args)
+            baseline_runs, ours_runs = measure_pair(ours_exe, base_exe, case, args)
+            baseline_avg = runtime_statistic(baseline_runs, args.time_stat)
+            ours_avg = runtime_statistic(ours_runs, args.time_stat)
+            raw_score = (baseline_avg / max(ours_avg, 1e-9)) * 100.0
             score = min(100.0, raw_score) if args.cap_score else raw_score
-            result = CaseResult(case, gcc_avg, ours_avg, raw_score, score, gcc_runs, ours_runs)
+            result = CaseResult(case, baseline_avg, ours_avg, raw_score, score,
+                                baseline_runs, ours_runs)
             results.append(result)
             print(
                 f"{Color.GREEN}[AC]{Color.RESET} {format_case(case)} "
-                f"gcc={gcc_avg:.6f}s ours={ours_avg:.6f}s score={score:8.4f} "
+                f"{baseline_label(args)}={baseline_avg:.6f}s "
+                f"ours={ours_avg:.6f}s score={score:8.4f} "
                 f"[{index}/{len(cases)}]"
             )
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
@@ -666,31 +881,31 @@ def main() -> int:
 
     print()
     print("=" * 72)
-    print(f"选中用例数: {len(cases)}")
-    print(f"AC 用例数:   {len(results)}")
-    print(f"失败数:      {len(failures)}")
+    print(f"Selected cases: {len(cases)}")
+    print(f"Accepted cases: {len(results)}")
+    print(f"Failures:       {len(failures)}")
     if failures:
-        print(f"{Color.RED}存在非 AC 用例，不输出最终分数。{Color.RESET}")
-        print(f"失败报告: {work_root / 'reports' / 'failure_report.txt'}")
+        print(f"{Color.RED}Non-AC cases exist; final score is not reported.{Color.RESET}")
+        print(f"Failure report: {work_root / 'reports' / 'failure_report.txt'}")
         return 1
 
     raw_final = geometric_mean([result.raw_score for result in results])
     final = geometric_mean([result.score for result in results])
-    gcc_total_runtime = sum(sum(result.gcc_runs) for result in results)
+    baseline_total_runtime = sum(sum(result.baseline_runs) for result in results)
     ours_total_runtime = sum(sum(result.ours_runs) for result in results)
     timed_run_count = sum(len(result.ours_runs) for result in results)
-    print(f"原始几何平均分: {raw_final:.6f}")
+    print(f"Raw geometric mean score: {raw_final:.6f}")
     if args.cap_score:
-        print(f"最终性能分:     {final:.6f} (单项封顶 100)")
+        print(f"Final performance score:  {final:.6f} (case scores capped at 100)")
     else:
-        print(f"最终性能分:     {final:.6f}")
-    print(f"gcc 计时总运行时间:  {gcc_total_runtime:.6f}s")
-    print(f"我方计时总运行时间: {ours_total_runtime:.6f}s")
+        print(f"Final performance score:  {final:.6f}")
+    print(f"{baseline_label(args)} timed total runtime: {baseline_total_runtime:.6f}s")
+    print(f"ours timed total runtime:      {ours_total_runtime:.6f}s")
     if timed_run_count:
-        print(f"gcc 单次计时平均:    {gcc_total_runtime / timed_run_count:.6f}s")
-        print(f"我方单次计时平均:   {ours_total_runtime / timed_run_count:.6f}s")
-    print(f"用例 CSV: {work_root / 'reports' / 'score_cases.csv'}")
-    print(f"汇总 JSON: {work_root / 'reports' / 'score_summary.json'}")
+        print(f"{baseline_label(args)} average timed run:   {baseline_total_runtime / timed_run_count:.6f}s")
+        print(f"ours average timed run:        {ours_total_runtime / timed_run_count:.6f}s")
+    print(f"Case CSV: {work_root / 'reports' / 'score_cases.csv'}")
+    print(f"Summary JSON: {work_root / 'reports' / 'score_summary.json'}")
     print("=" * 72)
     return 0
 

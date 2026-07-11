@@ -3,7 +3,10 @@
 #include "MIR.hpp"
 #include "MachinePassManager.hpp"
 
+#include <cstdint>
 #include <cstddef>
+#include <set>
+#include <vector>
 
 // 后端分析 pass 集合
 // 每个分析继承 MachineAnalysisDescriptor，声明 Result 类型和静态 Key，
@@ -42,6 +45,25 @@ public:
     // 下标与 MachineFunction::blocks 对应
     std::vector<std::vector<int>> preds;
     std::vector<std::vector<int>> succs;
+  };
+
+  Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;
+};
+
+// 函数级虚拟寄存器活跃性分析：按基本块给出 use/def/live-in/live-out
+// 结果只保存块下标和虚拟寄存器编号，不持有 MachineBasicBlock 指针或引用。
+class MachineLivenessAnalysis
+    : public MachineAnalysisDescriptor<MachineLivenessAnalysis> {
+public:
+  static MachinePassID Key;
+
+  using RegSet = std::set<uint32_t>;
+
+  struct Result {
+    std::vector<RegSet> uses;
+    std::vector<RegSet> defs;
+    std::vector<RegSet> liveIn;
+    std::vector<RegSet> liveOut;
   };
 
   Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;

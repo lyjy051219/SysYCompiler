@@ -23,9 +23,9 @@ RebuildCFGPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
 MachinePreservationStatus
 CleanupCFGPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
   (void)am;
-  cleanupMachineCFG(mf);
-  // 当前实现是空操作，等实际做清理时改为按需失效
-  return MachinePreservationStatus::all();
+  const bool changed = cleanupMachineCFG(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
 }
 
 MachinePreservationStatus
@@ -45,8 +45,7 @@ EliminatePhiPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
 MachinePreservationStatus
 RegisterAllocationPass::run(MachineFunction &mf,
                             MachineFunctionAnalysisManager &am) {
-  (void)am;
-  allocateRegisters(mf);
+  allocateRegisters(mf, am);
   return MachinePreservationStatus::none();
 }
 

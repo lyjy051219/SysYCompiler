@@ -1,5 +1,6 @@
 #include "../../../include/riscv/RegAlloc.hpp"
 
+#include "../../../include/riscv/MachineAnalysis.hpp"
 #include "../../../include/riscv/Registers.hpp"
 #include "../../../include/riscv/Target.hpp"
 
@@ -18,7 +19,6 @@
 namespace riscv {
 namespace {
 
-using VRegSet = std::set<uint32_t>;
 using Node = uint32_t;
 
 constexpr Node kPhysicalNodeBase = 0x80000000U;
@@ -102,64 +102,23 @@ std::vector<uint32_t> virtualDefs(const MachineInstr &instr) {
   return result;
 }
 
-struct Liveness {
-  std::vector<VRegSet> uses;
-  std::vector<VRegSet> defs;
-  std::vector<VRegSet> liveIn;
-  std::vector<VRegSet> liveOut;
-};
-
-Liveness computeLiveness(const MachineFunction &mf) {
-  Liveness live;
-  const std::size_t blockCount = mf.blocks.size();
-  live.uses.resize(blockCount);
-  live.defs.resize(blockCount);
-  live.liveIn.resize(blockCount);
-  live.liveOut.resize(blockCount);
-
-  for (std::size_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
-    for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
-      for (uint32_t use : virtualUses(instr)) {
-        if (live.defs[blockIndex].count(use) == 0) {
-          live.uses[blockIndex].insert(use);
-        }
-      }
-      for (uint32_t def : virtualDefs(instr)) {
-        live.defs[blockIndex].insert(def);
-      }
-    }
+MachineLivenessAnalysis::Result
+getLiveness(MachineFunction &mf, MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    return am->getResult<MachineLivenessAnalysis>(mf);
   }
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (std::size_t reverse = 0; reverse < blockCount; ++reverse) {
-      const std::size_t blockIndex = blockCount - reverse - 1;
-      VRegSet newOut;
-      for (int succ : mf.blocks[blockIndex].succs) {
-        if (succ < 0 || succ >= static_cast<int>(blockCount)) {
-          throw BackendError(
-              "invalid CFG successor during register allocation");
-        }
-        const VRegSet &succIn = live.liveIn[static_cast<std::size_t>(succ)];
-        newOut.insert(succIn.begin(), succIn.end());
-      }
+  MachineFunctionAnalysisManager localAM;
+  localAM.registerPass([] { return MachineCFGAnalysis(); });
+  localAM.registerPass([] { return MachineLivenessAnalysis(); });
+  return localAM.getResult<MachineLivenessAnalysis>(mf);
+}
 
-      VRegSet newIn = live.uses[blockIndex];
-      for (uint32_t value : newOut) {
-        if (live.defs[blockIndex].count(value) == 0) {
-          newIn.insert(value);
-        }
-      }
-      if (newIn != live.liveIn[blockIndex] ||
-          newOut != live.liveOut[blockIndex]) {
-        live.liveIn[blockIndex] = std::move(newIn);
-        live.liveOut[blockIndex] = std::move(newOut);
-        changed = true;
-      }
-    }
+void invalidateAnalysesAfterRewrite(MachineFunction &mf,
+                                    MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    am->invalidate(mf, MachinePreservationStatus::none());
   }
-  return live;
 }
 
 std::vector<int> computeLoopDepth(const MachineFunction &mf) {
@@ -394,7 +353,8 @@ bool isCopyForBank(const MachineInstr &instr, bool floatBank) {
 
 AllocationGraph buildAllocationGraph(const MachineFunction &mf,
                                      const ProgramInfo &info,
-                                     const Liveness &live, bool floatBank) {
+                                     const MachineLivenessAnalysis::Result &live,
+                                     bool floatBank) {
   AllocationGraph graph;
   graph.floatBank = floatBank;
   const RegClass bankClass = floatBank ? RegClass::FPR32 : RegClass::GPR64;
@@ -1209,7 +1169,8 @@ std::string allocationSignature(const MachineFunction &mf,
   return signature;
 }
 
-void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
+void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
+                           MachineFunctionAnalysisManager *am) {
   std::set<uint32_t> generatedBySpill;
   std::string previousSignature;
   int repeatedSignature = 0;
@@ -1222,7 +1183,7 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     if (info.classes.empty()) {
       return;
     }
-    const Liveness live = computeLiveness(mf);
+    const MachineLivenessAnalysis::Result live = getLiveness(mf, am);
 
     ColoringResult gpr =
         IRCAllocator(buildAllocationGraph(mf, info, live, false), info).run();
@@ -1280,6 +1241,7 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     previousSignature = signature;
 
     SpillRewriteResult rewrite = rewriteSpills(mf, info, spills, conflicts);
+    invalidateAnalysesAfterRewrite(mf, am);
     generatedBySpill.insert(rewrite.generated.begin(), rewrite.generated.end());
     if (stats != nullptr) {
       stats->spilledVRegs += spills.size();
@@ -1296,11 +1258,15 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
 } // anonymous namespace
 
 void allocateRegisters(MachineFunction &mf) {
-  allocateRegistersImpl(mf, nullptr);
+  allocateRegistersImpl(mf, nullptr, nullptr);
+}
+
+void allocateRegisters(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  allocateRegistersImpl(mf, nullptr, &am);
 }
 
 void allocateRegisters(MachineFunction &mf, RegAllocStats *stats) {
-  allocateRegistersImpl(mf, stats);
+  allocateRegistersImpl(mf, stats, nullptr);
 }
 
 } // namespace riscv
