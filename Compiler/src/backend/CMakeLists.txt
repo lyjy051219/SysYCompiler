@@ -1,6 +1,7 @@
 file(GLOB BACKEND_SRC CONFIGURE_DEPENDS
     "*.cpp"
     "rv/*.cpp"
+    "rv/opt/*.cpp"
 )
 
 add_library(Backend ${BACKEND_SRC})

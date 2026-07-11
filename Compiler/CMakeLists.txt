@@ -95,6 +95,7 @@ elseif(BUILD_MIDDLE_END)
 
 else()
     message(STATUS "=== 构建完整编译器 ===")
+    set(CMAKE_CXX_CLANG_TIDY "") # 与其他分支一致，关闭代码检查以简化构建
 
     # 完整编译器构建
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/lib)

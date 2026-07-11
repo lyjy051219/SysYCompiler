@@ -1,6 +1,6 @@
 #pragma once
 
-#include "MachinePassManager.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 // 代码生成必经阶段的 pass 封装
 // 把 Passes.hpp RegAlloc.hpp Frame.hpp 里的既有阶段包装成统一的 pass 形态，
@@ -22,8 +22,13 @@ struct CleanupCFGPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
-// 把 SELECT 伪指令下降为分支和拷贝
+// 把 SELECT 伪指令下降为无分支整数序列或分支和拷贝。
 struct LowerSelectPass {
+  bool branchlessOnly = false;
+
+  explicit LowerSelectPass(bool branchlessOnly = false)
+      : branchlessOnly(branchlessOnly) {}
+
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };
@@ -46,8 +51,38 @@ struct FrameLoweringPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前折叠 compare + branch 指令链
+struct BranchCompareFoldingPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配前复用函数内重复出现的全局地址
+struct PreRAGlobalAddressReusePass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配前保守拷贝传播
+struct PreRACopyPropagationPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配前基本块内局部公共子表达式删除
+struct PreRALocalCSEPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配后窥孔优化
 struct PostRAPeepholePass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配后消除相邻块中的条件跳转加无条件跳转双跳。
+struct BlockPlacementPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };

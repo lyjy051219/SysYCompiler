@@ -6,10 +6,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <iterator>
-#include <set>
+#include <initializer_list>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -17,10 +15,6 @@ namespace riscv {
 namespace {
 
 void appendJump(MachineBasicBlock &block, const std::string &label);
-void retargetBranchTargets(MachineFunction &mf, const std::string &oldLabel,
-                           const std::string &newLabel);
-void removePhiIncomingPreds(MachineFunction &mf,
-                            const std::set<std::string> &removedLabels);
 void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
                               const std::string &newLabel);
 int findBlockIndex(const MachineFunction &mf, const std::string &label);
@@ -30,6 +24,8 @@ bool isTerminator(Opcode opcode) {
   case Opcode::RET:
   case Opcode::BEQZ:
   case Opcode::BNEZ:
+  case Opcode::BEQ:
+  case Opcode::BNE:
   case Opcode::BLT:
   case Opcode::BGE:
   case Opcode::J:
@@ -54,406 +50,6 @@ bool blockCanFallThrough(const MachineBasicBlock &block) {
     }
   }
   return true;
-}
-
-bool isJumpTo(const MachineInstr &instr, const std::string &label) {
-  return instr.opcode == Opcode::J && !instr.uses.empty() &&
-         instr.uses.front().kind == OperandKind::Block &&
-         instr.uses.front().blockLabel == label;
-}
-
-bool blockEndsWithJumpTo(const MachineBasicBlock &block,
-                         const std::string &label) {
-  return !block.instrs.empty() && isJumpTo(block.instrs.back(), label);
-}
-
-bool sameReg(const MachineReg &lhs, const MachineReg &rhs) {
-  return lhs.physical == rhs.physical && lhs.id == rhs.id && lhs.rc == rhs.rc &&
-         lhs.phys == rhs.phys;
-}
-
-bool sameOperand(const MachineOperand &lhs, const MachineOperand &rhs) {
-  if (lhs.kind != rhs.kind) {
-    return false;
-  }
-  switch (lhs.kind) {
-  case OperandKind::Reg:
-    return sameReg(lhs.regValue, rhs.regValue);
-  case OperandKind::Imm:
-    return lhs.immValue == rhs.immValue;
-  case OperandKind::FrameIndex:
-    return lhs.frameIndexValue == rhs.frameIndexValue;
-  case OperandKind::Global:
-    return lhs.symbol == rhs.symbol;
-  case OperandKind::Block:
-    return lhs.blockLabel == rhs.blockLabel;
-  case OperandKind::ValueRef:
-    return lhs.valueRef == rhs.valueRef;
-  }
-  return false;
-}
-
-bool blockHasPhi(const MachineBasicBlock &block) {
-  return std::any_of(block.instrs.begin(), block.instrs.end(),
-                     [](const MachineInstr &instr) {
-                       return instr.opcode == Opcode::PHI;
-                     });
-}
-
-bool isEmptyOrTrampolineBlock(const MachineBasicBlock &block) {
-  if (blockHasPhi(block)) {
-    return false;
-  }
-  return std::all_of(block.instrs.begin(), block.instrs.end(),
-                     [](const MachineInstr &instr) {
-                       return instr.opcode == Opcode::NOP ||
-                              instr.opcode == Opcode::J;
-                     });
-}
-
-bool isRemovableEmptyBlock(const MachineBasicBlock &block) {
-  if (!isEmptyOrTrampolineBlock(block)) {
-    return false;
-  }
-  return std::none_of(block.instrs.begin(), block.instrs.end(),
-                      [](const MachineInstr &instr) {
-                        return instr.opcode != Opcode::NOP &&
-                               instr.opcode != Opcode::J;
-                      });
-}
-
-std::string emptyBlockTarget(const MachineFunction &mf,
-                             std::size_t blockIndex) {
-  const MachineBasicBlock &block = mf.blocks[blockIndex];
-  std::string target;
-  for (const MachineInstr &instr : block.instrs) {
-    if (instr.opcode != Opcode::J) {
-      continue;
-    }
-    if (!target.empty()) {
-      return {};
-    }
-    if (instr.uses.empty() || instr.uses.front().kind != OperandKind::Block) {
-      throw BackendError("malformed machine jump in CFG cleanup");
-    }
-    target = instr.uses.front().blockLabel;
-  }
-  if (!target.empty()) {
-    return target;
-  }
-  if (blockCanFallThrough(block) && blockIndex + 1 < mf.blocks.size()) {
-    return mf.blocks[blockIndex + 1].label;
-  }
-  return {};
-}
-
-std::vector<std::string> predecessorLabels(const MachineFunction &mf,
-                                           std::size_t blockIndex) {
-  std::vector<std::string> labels;
-  for (int pred : mf.blocks[blockIndex].preds) {
-    if (pred < 0 || pred >= static_cast<int>(mf.blocks.size())) {
-      throw BackendError("invalid CFG predecessor during cleanup");
-    }
-    if (pred == static_cast<int>(blockIndex)) {
-      continue;
-    }
-    const std::string &label = mf.blocks[static_cast<std::size_t>(pred)].label;
-    if (std::find(labels.begin(), labels.end(), label) == labels.end()) {
-      labels.push_back(label);
-    }
-  }
-  return labels;
-}
-
-bool blockFallsThroughTo(const MachineFunction &mf, std::size_t predIndex,
-                         std::size_t succIndex) {
-  return predIndex + 1 == succIndex && predIndex < mf.blocks.size() &&
-         blockCanFallThrough(mf.blocks[predIndex]);
-}
-
-void eraseBlockAt(MachineFunction &mf, std::size_t blockIndex) {
-  mf.blocks.erase(mf.blocks.begin() + static_cast<long>(blockIndex));
-}
-
-void removeTerminatorsTargeting(MachineBasicBlock &block,
-                                const std::string &label) {
-  block.instrs.erase(
-      std::remove_if(block.instrs.begin(), block.instrs.end(),
-                     [&](const MachineInstr &instr) {
-                       if (!isTerminatorInstr(instr)) {
-                         return false;
-                       }
-                       return std::any_of(
-                           instr.uses.begin(), instr.uses.end(),
-                           [&](const MachineOperand &use) {
-                             return use.kind == OperandKind::Block &&
-                                    use.blockLabel == label;
-                           });
-                     }),
-      block.instrs.end());
-}
-
-bool labelInList(const std::vector<std::string> &labels,
-                 const std::string &label) {
-  return std::find(labels.begin(), labels.end(), label) != labels.end();
-}
-
-bool phiReplacementValue(const MachineInstr &phi, const std::string &oldLabel,
-                         MachineOperand &value) {
-  bool found = false;
-  for (std::size_t i = 0; i < phi.uses.size(); i += 2) {
-    if (i + 1 >= phi.uses.size()) {
-      throw BackendError("malformed PHI incoming list");
-    }
-    const MachineOperand &pred = phi.uses[i + 1];
-    if (pred.kind != OperandKind::Block || pred.blockLabel != oldLabel) {
-      continue;
-    }
-    if (!found) {
-      value = phi.uses[i];
-      found = true;
-      continue;
-    }
-    if (!sameOperand(value, phi.uses[i])) {
-      return false;
-    }
-  }
-  return found;
-}
-
-bool canRewritePhiIncomingPreds(const MachineInstr &phi,
-                                const std::string &oldLabel,
-                                const std::vector<std::string> &newLabels) {
-  MachineOperand replacement;
-  if (!phiReplacementValue(phi, oldLabel, replacement)) {
-    return false;
-  }
-  for (std::size_t i = 0; i < phi.uses.size(); i += 2) {
-    const MachineOperand &value = phi.uses[i];
-    const MachineOperand &pred = phi.uses[i + 1];
-    if (pred.kind != OperandKind::Block ||
-        !labelInList(newLabels, pred.blockLabel)) {
-      continue;
-    }
-    if (!sameOperand(value, replacement)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool canRewritePhiTargetAfterEmptyBlockRemoval(
-    const MachineBasicBlock &target, const std::string &oldLabel,
-    const std::vector<std::string> &newLabels) {
-  for (const MachineInstr &instr : target.instrs) {
-    if (instr.opcode == Opcode::PHI &&
-        !canRewritePhiIncomingPreds(instr, oldLabel, newLabels)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool rewrittenPhiHasPred(const std::vector<MachineOperand> &rewritten,
-                         const std::string &label) {
-  for (std::size_t i = 1; i < rewritten.size(); i += 2) {
-    if (rewritten[i].kind == OperandKind::Block &&
-        rewritten[i].blockLabel == label) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void rewritePhiIncomingPredsInTarget(MachineBasicBlock &target,
-                                     const std::string &oldLabel,
-                                     const std::vector<std::string> &newLabels) {
-  for (MachineInstr &instr : target.instrs) {
-    if (instr.opcode != Opcode::PHI) {
-      continue;
-    }
-
-    MachineOperand replacement;
-    if (!phiReplacementValue(instr, oldLabel, replacement)) {
-      throw BackendError("failed to rewrite PHI incoming predecessor");
-    }
-
-    std::vector<MachineOperand> rewritten;
-    for (std::size_t i = 0; i < instr.uses.size(); i += 2) {
-      if (i + 1 >= instr.uses.size()) {
-        throw BackendError("malformed PHI incoming list");
-      }
-      const MachineOperand &value = instr.uses[i];
-      const MachineOperand &pred = instr.uses[i + 1];
-      if (pred.kind == OperandKind::Block && pred.blockLabel == oldLabel) {
-        continue;
-      }
-      if (pred.kind == OperandKind::Block &&
-          labelInList(newLabels, pred.blockLabel) &&
-          sameOperand(value, replacement)) {
-        if (rewrittenPhiHasPred(rewritten, pred.blockLabel)) {
-          continue;
-        }
-      }
-      rewritten.push_back(value);
-      rewritten.push_back(pred);
-    }
-
-    for (const std::string &newLabel : newLabels) {
-      if (!rewrittenPhiHasPred(rewritten, newLabel)) {
-        rewritten.push_back(replacement);
-        rewritten.push_back(MachineOperand::block(newLabel));
-      }
-    }
-    instr.uses = std::move(rewritten);
-  }
-}
-
-bool removeUnreachableBlocks(MachineFunction &mf) {
-  if (mf.blocks.empty()) {
-    return false;
-  }
-
-  std::vector<bool> reachable(mf.blocks.size(), false);
-  std::vector<int> work{0};
-  reachable[0] = true;
-  while (!work.empty()) {
-    const int block = work.back();
-    work.pop_back();
-    for (int succ : mf.blocks[static_cast<std::size_t>(block)].succs) {
-      if (succ < 0 || succ >= static_cast<int>(mf.blocks.size())) {
-        throw BackendError("invalid CFG successor during cleanup");
-      }
-      if (!reachable[static_cast<std::size_t>(succ)]) {
-        reachable[static_cast<std::size_t>(succ)] = true;
-        work.push_back(succ);
-      }
-    }
-  }
-
-  std::set<std::string> removedLabels;
-  for (std::size_t i = 1; i < mf.blocks.size(); ++i) {
-    if (!reachable[i]) {
-      removedLabels.insert(mf.blocks[i].label);
-    }
-  }
-  if (removedLabels.empty()) {
-    return false;
-  }
-
-  removePhiIncomingPreds(mf, removedLabels);
-  std::vector<MachineBasicBlock> kept;
-  kept.reserve(mf.blocks.size() - removedLabels.size());
-  for (std::size_t i = 0; i < mf.blocks.size(); ++i) {
-    if (i == 0 || reachable[i]) {
-      kept.push_back(std::move(mf.blocks[i]));
-    }
-  }
-  mf.blocks = std::move(kept);
-  return true;
-}
-
-bool removeEmptyBlock(MachineFunction &mf) {
-  for (std::size_t i = 1; i < mf.blocks.size(); ++i) {
-    if (!isRemovableEmptyBlock(mf.blocks[i])) {
-      continue;
-    }
-
-    const std::string oldLabel = mf.blocks[i].label;
-    const std::string targetLabel = emptyBlockTarget(mf, i);
-    if (targetLabel.empty() || targetLabel == oldLabel) {
-      continue;
-    }
-    const int targetIndex = findBlockIndex(mf, targetLabel);
-    if (targetIndex < 0) {
-      throw BackendError("machine branch targets unknown block " + targetLabel);
-    }
-
-    const std::vector<std::string> predLabels = predecessorLabels(mf, i);
-    const std::size_t targetBlockIndex = static_cast<std::size_t>(targetIndex);
-    const bool targetHasPhi = blockHasPhi(mf.blocks[targetBlockIndex]);
-    if (targetHasPhi &&
-        !canRewritePhiTargetAfterEmptyBlockRemoval(
-            mf.blocks[targetBlockIndex], oldLabel, predLabels)) {
-      continue;
-    }
-
-    for (int pred : mf.blocks[i].preds) {
-      if (pred < 0 || pred >= static_cast<int>(mf.blocks.size()) ||
-          pred == static_cast<int>(i)) {
-        continue;
-      }
-      if (blockFallsThroughTo(mf, static_cast<std::size_t>(pred), i)) {
-        appendJump(mf.blocks[static_cast<std::size_t>(pred)], targetLabel);
-      }
-    }
-
-    retargetBranchTargets(mf, oldLabel, targetLabel);
-    if (targetHasPhi) {
-      rewritePhiIncomingPredsInTarget(mf.blocks[targetBlockIndex], oldLabel,
-                                      predLabels);
-    } else if (predLabels.empty()) {
-      removePhiIncomingPreds(mf, {oldLabel});
-    }
-    eraseBlockAt(mf, i);
-    return true;
-  }
-  return false;
-}
-
-bool mergeLinearBlocks(MachineFunction &mf) {
-  for (std::size_t predIndex = 0; predIndex < mf.blocks.size(); ++predIndex) {
-    if (mf.blocks[predIndex].succs.size() != 1) {
-      continue;
-    }
-    const int succ = mf.blocks[predIndex].succs.front();
-    if (succ < 0 || succ >= static_cast<int>(mf.blocks.size()) ||
-        succ == static_cast<int>(predIndex) || succ == 0) {
-      continue;
-    }
-    const std::size_t succIndex = static_cast<std::size_t>(succ);
-    if (succIndex <= predIndex) {
-      continue;
-    }
-    if (mf.blocks[succIndex].preds.size() != 1 ||
-        blockHasPhi(mf.blocks[succIndex])) {
-      continue;
-    }
-
-    const std::string succLabel = mf.blocks[succIndex].label;
-    const bool movedBlockFallsThrough = blockCanFallThrough(mf.blocks[succIndex]);
-    const bool movedFallthroughChanges =
-        movedBlockFallsThrough && succIndex + 1 < mf.blocks.size() &&
-        succIndex != predIndex + 1;
-    const std::string movedFallthroughLabel =
-        movedFallthroughChanges ? mf.blocks[succIndex + 1].label : std::string();
-    removeTerminatorsTargeting(mf.blocks[predIndex], succLabel);
-
-    std::vector<MachineInstr> moved = std::move(mf.blocks[succIndex].instrs);
-    mf.blocks[predIndex].instrs.insert(mf.blocks[predIndex].instrs.end(),
-                                       std::make_move_iterator(moved.begin()),
-                                       std::make_move_iterator(moved.end()));
-    if (!movedFallthroughLabel.empty()) {
-      appendJump(mf.blocks[predIndex], movedFallthroughLabel);
-    }
-    retargetPhiIncomingPreds(mf, succLabel, mf.blocks[predIndex].label);
-    eraseBlockAt(mf, succIndex);
-    return true;
-  }
-  return false;
-}
-
-bool removeRedundantNextJumps(MachineFunction &mf) {
-  for (std::size_t i = 0; i + 1 < mf.blocks.size(); ++i) {
-    MachineBasicBlock &block = mf.blocks[i];
-    const MachineBasicBlock &next = mf.blocks[i + 1];
-    if (!blockEndsWithJumpTo(block, next.label)) {
-      continue;
-    }
-    block.instrs.pop_back();
-    return true;
-  }
-  return false;
 }
 
 bool isFloatType(const std::shared_ptr<IRType> &type) {
@@ -501,47 +97,6 @@ void addCFGEdge(MachineFunction &mf, int from, const std::string &toLabel) {
   auto &preds = mf.blocks[to].preds;
   if (std::find(preds.begin(), preds.end(), from) == preds.end()) {
     preds.push_back(from);
-  }
-}
-
-void retargetBranchTargets(MachineFunction &mf, const std::string &oldLabel,
-                           const std::string &newLabel) {
-  for (MachineBasicBlock &block : mf.blocks) {
-    for (MachineInstr &instr : block.instrs) {
-      if (!isTerminatorInstr(instr)) {
-        continue;
-      }
-      for (MachineOperand &use : instr.uses) {
-        if (use.kind == OperandKind::Block && use.blockLabel == oldLabel) {
-          use.blockLabel = newLabel;
-        }
-      }
-    }
-  }
-}
-
-void removePhiIncomingPreds(MachineFunction &mf,
-                            const std::set<std::string> &removedLabels) {
-  for (MachineBasicBlock &block : mf.blocks) {
-    for (MachineInstr &instr : block.instrs) {
-      if (instr.opcode != Opcode::PHI) {
-        continue;
-      }
-      std::vector<MachineOperand> rewritten;
-      for (std::size_t i = 0; i < instr.uses.size(); i += 2) {
-        if (i + 1 >= instr.uses.size()) {
-          throw BackendError("malformed PHI incoming list");
-        }
-        const MachineOperand &pred = instr.uses[i + 1];
-        if (pred.kind == OperandKind::Block &&
-            removedLabels.count(pred.blockLabel) != 0) {
-          continue;
-        }
-        rewritten.push_back(instr.uses[i]);
-        rewritten.push_back(pred);
-      }
-      instr.uses = std::move(rewritten);
-    }
   }
 }
 
@@ -700,6 +255,205 @@ MachineReg valueRegInBlock(MachineFunction &mf, MachineBasicBlock &block,
   return materializeConstant(mf, instrs, value);
 }
 
+bool sameMachineReg(const MachineReg &lhs, const MachineReg &rhs) {
+  return lhs.physical == rhs.physical && lhs.id == rhs.id &&
+         lhs.rc == rhs.rc && lhs.phys == rhs.phys;
+}
+
+bool isGPR(MachineReg reg) {
+  return reg.rc == RegClass::GPR32 || reg.rc == RegClass::GPR64;
+}
+
+bool isKnownBoolean(const std::vector<MachineReg> &known,
+                    const MachineReg &reg) {
+  if (reg.physical && reg.phys == PhysReg::X0) {
+    return true;
+  }
+  return std::find_if(known.begin(), known.end(), [&](const MachineReg &item) {
+           return sameMachineReg(item, reg);
+         }) != known.end();
+}
+
+void forgetKnownBoolean(std::vector<MachineReg> &known, const MachineReg &reg) {
+  known.erase(std::remove_if(known.begin(), known.end(),
+                             [&](const MachineReg &item) {
+                               return sameMachineReg(item, reg);
+                             }),
+              known.end());
+}
+
+void forgetDefinedRegisters(std::vector<MachineReg> &known,
+                            const MachineInstr &instr) {
+  for (const MachineOperand &def : instr.defs) {
+    if (def.kind == OperandKind::Reg) {
+      forgetKnownBoolean(known, def.regValue);
+    }
+  }
+  for (PhysReg def : instr.implicitDefs) {
+    MachineReg physical = MachineReg::preg(def, RegClass::GPR64);
+    forgetKnownBoolean(known, physical);
+    physical.rc = RegClass::GPR32;
+    forgetKnownBoolean(known, physical);
+    physical.rc = RegClass::FPR32;
+    forgetKnownBoolean(known, physical);
+  }
+}
+
+bool isRegUse(const MachineInstr &instr, std::size_t index) {
+  return index < instr.uses.size() &&
+         instr.uses[index].kind == OperandKind::Reg;
+}
+
+bool producesKnownBoolean(const MachineInstr &instr,
+                          const std::vector<MachineReg> &known) {
+  if (instr.defs.size() != 1 || instr.defs.front().kind != OperandKind::Reg ||
+      !isGPR(instr.defs.front().regValue) || instr.sideEffects ||
+      instr.terminator) {
+    return false;
+  }
+
+  switch (instr.opcode) {
+  case Opcode::SEQZ:
+  case Opcode::SNEZ:
+  case Opcode::SLT:
+  case Opcode::SLTU:
+  case Opcode::FEQ_S:
+  case Opcode::FLT_S:
+  case Opcode::FLE_S:
+    return true;
+  case Opcode::LI:
+    return instr.uses.size() == 1 && instr.uses.front().kind == OperandKind::Imm &&
+           (instr.uses.front().immValue == 0 ||
+            instr.uses.front().immValue == 1);
+  case Opcode::COPY:
+    return isRegUse(instr, 0) && isKnownBoolean(known, instr.uses[0].regValue);
+  case Opcode::ANDI:
+    return instr.uses.size() == 2 && isRegUse(instr, 0) &&
+           instr.uses[1].kind == OperandKind::Imm &&
+           (instr.uses[1].immValue == 0 || instr.uses[1].immValue == 1);
+  case Opcode::ORI:
+  case Opcode::XORI:
+    return instr.uses.size() == 2 && isRegUse(instr, 0) &&
+           instr.uses[1].kind == OperandKind::Imm &&
+           (instr.uses[1].immValue == 0 || instr.uses[1].immValue == 1) &&
+           isKnownBoolean(known, instr.uses[0].regValue);
+  case Opcode::AND:
+  case Opcode::OR:
+  case Opcode::XOR:
+    return isRegUse(instr, 0) && isRegUse(instr, 1) &&
+           isKnownBoolean(known, instr.uses[0].regValue) &&
+           isKnownBoolean(known, instr.uses[1].regValue);
+  default:
+    return false;
+  }
+}
+
+MachineInstr makeRegInstr(Opcode opcode, MachineReg dst,
+                          std::initializer_list<MachineReg> operands) {
+  MachineInstr instr;
+  instr.opcode = opcode;
+  instr.defs.push_back(MachineOperand::reg(dst));
+  for (MachineReg operand : operands) {
+    instr.uses.push_back(MachineOperand::reg(operand));
+  }
+  return instr;
+}
+
+bool findAddWithFalseValue(const std::vector<MachineInstr> &lowered,
+                           const MachineReg &trueValue,
+                           const MachineReg &falseValue,
+                           MachineReg &increment, Opcode &addOpcode) {
+  for (auto it = lowered.rbegin(); it != lowered.rend(); ++it) {
+    const MachineInstr &candidate = *it;
+    if (candidate.defs.size() != 1 || candidate.defs.front().kind != OperandKind::Reg ||
+        !sameMachineReg(candidate.defs.front().regValue, trueValue)) {
+      continue;
+    }
+    if ((candidate.opcode != Opcode::ADD && candidate.opcode != Opcode::ADDW) ||
+        candidate.uses.size() != 2 || !isRegUse(candidate, 0) ||
+        !isRegUse(candidate, 1)) {
+      return false;
+    }
+    if (sameMachineReg(candidate.uses[0].regValue, falseValue)) {
+      increment = candidate.uses[1].regValue;
+    } else if (sameMachineReg(candidate.uses[1].regValue, falseValue)) {
+      increment = candidate.uses[0].regValue;
+    } else {
+      return false;
+    }
+    addOpcode = candidate.opcode;
+    return increment.rc == falseValue.rc;
+  }
+  return false;
+}
+
+bool lowerBranchlessSelects(MachineFunction &mf) {
+  bool changed = false;
+  for (MachineBasicBlock &block : mf.blocks) {
+    std::vector<MachineReg> knownBooleans;
+    std::vector<MachineInstr> lowered;
+    lowered.reserve(block.instrs.size());
+
+    for (const MachineInstr &instr : block.instrs) {
+      if (instr.opcode == Opcode::SELECT && instr.defs.size() == 1 &&
+          instr.defs.front().kind == OperandKind::Reg &&
+          instr.uses.size() == 3 && isRegUse(instr, 0) &&
+          isRegUse(instr, 1) && isRegUse(instr, 2)) {
+        const MachineReg dst = instr.defs.front().regValue;
+        const MachineReg cond = instr.uses[0].regValue;
+        const MachineReg trueValue = instr.uses[1].regValue;
+        const MachineReg falseValue = instr.uses[2].regValue;
+        if (isGPR(dst) && dst.rc != RegClass::FPR32 &&
+            isKnownBoolean(knownBooleans, cond) &&
+            trueValue.rc == dst.rc && falseValue.rc == dst.rc) {
+          const MachineReg zero = MachineReg::preg(PhysReg::X0, dst.rc);
+          const MachineReg mask = mf.createVReg(dst.rc);
+          MachineReg increment;
+          Opcode addOpcode = Opcode::ADDW;
+          if (findAddWithFalseValue(lowered, trueValue, falseValue, increment,
+                                     addOpcode)) {
+            const MachineReg selected = mf.createVReg(dst.rc);
+            lowered.push_back(makeRegInstr(
+                dst.rc == RegClass::GPR32 ? Opcode::SUBW : Opcode::SUB, mask,
+                {zero, cond}));
+            lowered.push_back(
+                makeRegInstr(Opcode::AND, selected, {increment, mask}));
+            lowered.push_back(
+                makeRegInstr(addOpcode, dst, {falseValue, selected}));
+          } else {
+            const MachineReg difference = mf.createVReg(dst.rc);
+            const MachineReg selected = mf.createVReg(dst.rc);
+            lowered.push_back(makeRegInstr(
+                dst.rc == RegClass::GPR32 ? Opcode::SUBW : Opcode::SUB, mask,
+                {zero, cond}));
+            lowered.push_back(makeRegInstr(Opcode::XOR, difference,
+                                            {trueValue, falseValue}));
+            lowered.push_back(makeRegInstr(Opcode::AND, selected,
+                                            {difference, mask}));
+            lowered.push_back(
+                makeRegInstr(Opcode::XOR, dst, {selected, falseValue}));
+          }
+          forgetKnownBoolean(knownBooleans, dst);
+          changed = true;
+          continue;
+        }
+        forgetKnownBoolean(knownBooleans, dst);
+        lowered.push_back(instr);
+        continue;
+      }
+
+      forgetDefinedRegisters(knownBooleans, instr);
+      lowered.push_back(instr);
+      if (producesKnownBoolean(instr, knownBooleans) &&
+          instr.defs.front().kind == OperandKind::Reg) {
+        knownBooleans.push_back(instr.defs.front().regValue);
+      }
+    }
+    block.instrs = std::move(lowered);
+  }
+  return changed;
+}
+
 MachineInstr makeParallelCopy(MachineReg dst, MachineReg src) {
   MachineInstr copy;
   copy.opcode = Opcode::PARALLEL_COPY;
@@ -826,31 +580,6 @@ void rebuildCFG(MachineFunction &mf) {
   }
 }
 
-bool cleanupMachineCFG(MachineFunction &mf) {
-  bool changed = false;
-  bool localChanged = true;
-  rebuildCFG(mf);
-
-  while (localChanged) {
-    localChanged = false;
-    if (removeUnreachableBlocks(mf)) {
-      localChanged = true;
-    } else if (removeEmptyBlock(mf)) {
-      localChanged = true;
-    } else if (mergeLinearBlocks(mf)) {
-      localChanged = true;
-    } else if (removeRedundantNextJumps(mf)) {
-      localChanged = true;
-    }
-
-    if (localChanged) {
-      changed = true;
-      rebuildCFG(mf);
-    }
-  }
-  return changed;
-}
-
 void eliminatePhiNodes(MachineFunction &mf) {
   rebuildCFG(mf);
 
@@ -898,8 +627,13 @@ void eliminatePhiNodes(MachineFunction &mf) {
   }
 }
 
-void lowerSelectPseudo(MachineFunction &mf) {
+bool lowerSelectPseudo(MachineFunction &mf, bool branchlessOnly) {
+  if (branchlessOnly) {
+    return lowerBranchlessSelects(mf);
+  }
+
   int selectId = 0;
+  bool changed = false;
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size(); ++blockIndex) {
     MachineBasicBlock &block = mf.blocks[blockIndex];
     auto selectIt = std::find_if(block.instrs.begin(), block.instrs.end(),
@@ -914,6 +648,7 @@ void lowerSelectPseudo(MachineFunction &mf) {
     }
 
     MachineInstr select = *selectIt;
+    changed = true;
     std::vector<MachineInstr> tail(selectIt + 1, block.instrs.end());
     block.instrs.erase(selectIt, block.instrs.end());
 
@@ -951,6 +686,7 @@ void lowerSelectPseudo(MachineFunction &mf) {
     mf.blocks.insert(insertPos, std::move(trueBlock));
   }
   rebuildCFG(mf);
+  return changed;
 }
 
 } // namespace riscv

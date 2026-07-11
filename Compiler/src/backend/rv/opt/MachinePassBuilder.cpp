@@ -1,7 +1,7 @@
-#include "../../../include/riscv/MachinePassBuilder.hpp"
+#include "riscv/opt/MachinePassBuilder.hpp"
 
-#include "../../../include/riscv/CodegenPasses.hpp"
-#include "../../../include/riscv/MachineAnalysis.hpp"
+#include "riscv/opt/CodegenPasses.hpp"
+#include "riscv/opt/MachineAnalysis.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -114,6 +114,13 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   }
   // 分配前优化挂在这里，此时仍是带虚拟寄存器的 MIR
   // 例如拷贝合并，机器层公共子表达式删除，块布局调整
+  addOptionalPass(MPM, Options, "branch-compare-folding",
+                  BranchCompareFoldingPass());
+  addOptionalPass(MPM, Options, "pre-ra-global-address-reuse",
+                  PreRAGlobalAddressReusePass());
+  addOptionalPass(MPM, Options, "pre-ra-copy-prop",
+                  PreRACopyPropagationPass());
+  addOptionalPass(MPM, Options, "pre-ra-local-cse", PreRALocalCSEPass());
   return MPM;
 }
 
@@ -125,6 +132,11 @@ MachinePassBuilder::buildPostRAOptPipeline(const BackendOptions &Options) {
   }
   // 分配后优化挂在这里，此时寄存器和栈帧都已确定
   addOptionalPass(MPM, Options, "post-ra-peephole", PostRAPeepholePass());
+  // 寄存器合并可能把分配前保留的 phi 跳板变成空块；分配后重新建图，
+  // 再用独立开关清理这些只剩跳转的块和冗余顺序跳转。
+  MPM.addPass(RebuildCFGPass());
+  addOptionalPass(MPM, Options, "post-ra-cleanup-cfg", CleanupCFGPass());
+  addOptionalPass(MPM, Options, "block-placement", BlockPlacementPass());
   return MPM;
 }
 
@@ -137,8 +149,11 @@ MachinePassBuilder::buildCodegenPipeline(const BackendOptions &Options) {
   addOptionalPass(MPM, Options, "cleanup-cfg", CleanupCFGPass());
   addDebugPasses(MPM, "after isel");
 
-  // 伪指令下降：SELECT 展开成分支，PHI 改写成前驱末尾拷贝
-  MPM.addPass(LowerSelectPass());
+  // 伪指令下降：先尝试保守的无分支整数 SELECT，再把剩余 SELECT 展开成
+  // 分支；branchless-select 可单独关闭以便 A/B。
+  addOptionalPass(MPM, Options, "branchless-select",
+                  LowerSelectPass(/*branchlessOnly=*/true));
+  MPM.addPass(LowerSelectPass(/*branchlessOnly=*/false));
   MPM.addPass(EliminatePhiPass());
   addOptionalPass(MPM, Options, "cleanup-cfg", CleanupCFGPass());
   addDebugPasses(MPM, "after pseudo lowering");

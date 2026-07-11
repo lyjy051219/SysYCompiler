@@ -1,9 +1,10 @@
-#include "../../../include/riscv/CodegenPasses.hpp"
+#include "riscv/opt/CodegenPasses.hpp"
 
-#include "../../../include/riscv/Frame.hpp"
-#include "../../../include/riscv/MachineAnalysis.hpp"
-#include "../../../include/riscv/Passes.hpp"
-#include "../../../include/riscv/RegAlloc.hpp"
+#include "riscv/Frame.hpp"
+#include "riscv/Passes.hpp"
+#include "riscv/RegAlloc.hpp"
+#include "riscv/opt/MachineAnalysis.hpp"
+#include "riscv/opt/MachineOptPasses.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -31,8 +32,9 @@ CleanupCFGPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
 MachinePreservationStatus
 LowerSelectPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
   (void)am;
-  lowerSelectPseudo(mf);
-  return MachinePreservationStatus::none();
+  const bool changed = lowerSelectPseudo(mf, branchlessOnly);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
 }
 
 MachinePreservationStatus
@@ -60,10 +62,55 @@ FrameLoweringPass::run(MachineFunction &mf,
 }
 
 MachinePreservationStatus
+BranchCompareFoldingPass::run(MachineFunction &mf,
+                              MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runBranchCompareFolding(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+PreRAGlobalAddressReusePass::run(MachineFunction &mf,
+                                 MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runPreRAGlobalAddressReuse(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+PreRACopyPropagationPass::run(MachineFunction &mf,
+                              MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runPreRACopyPropagation(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+PreRALocalCSEPass::run(MachineFunction &mf,
+                       MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runPreRALocalCSE(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
 PostRAPeepholePass::run(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am) {
   (void)am;
   const bool changed = runPostRAPeephole(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+BlockPlacementPass::run(MachineFunction &mf,
+                         MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runBlockPlacement(mf);
   return changed ? MachinePreservationStatus::none()
                  : MachinePreservationStatus::all();
 }

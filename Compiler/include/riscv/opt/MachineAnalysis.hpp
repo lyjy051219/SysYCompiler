@@ -1,7 +1,7 @@
 #pragma once
 
-#include "MIR.hpp"
-#include "MachinePassManager.hpp"
+#include "riscv/MIR.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 #include <cstdint>
 #include <cstddef>

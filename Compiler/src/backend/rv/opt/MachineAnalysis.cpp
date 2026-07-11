@@ -1,6 +1,6 @@
-#include "../../../include/riscv/MachineAnalysis.hpp"
+#include "riscv/opt/MachineAnalysis.hpp"
 
-#include "../../../include/riscv/Target.hpp"
+#include "riscv/Target.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,6 +17,8 @@ bool isTerminatorOpcode(Opcode opcode) {
   case Opcode::RET:
   case Opcode::BEQZ:
   case Opcode::BNEZ:
+  case Opcode::BEQ:
+  case Opcode::BNE:
   case Opcode::BLT:
   case Opcode::BGE:
   case Opcode::J:

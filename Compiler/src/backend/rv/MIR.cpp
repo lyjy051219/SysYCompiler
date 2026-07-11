@@ -57,12 +57,30 @@ const char *opcodeName(Opcode opcode) {
     return "OR";
   case Opcode::XOR:
     return "XOR";
+  case Opcode::ANDI:
+    return "ANDI";
+  case Opcode::ORI:
+    return "ORI";
+  case Opcode::XORI:
+    return "XORI";
+  case Opcode::SLL:
+    return "SLL";
   case Opcode::SLLW:
     return "SLLW";
   case Opcode::SRAW:
     return "SRAW";
   case Opcode::SRLW:
     return "SRLW";
+  case Opcode::SLLI:
+    return "SLLI";
+  case Opcode::SLLIW:
+    return "SLLIW";
+  case Opcode::SRAI:
+    return "SRAI";
+  case Opcode::SRAIW:
+    return "SRAIW";
+  case Opcode::SRLIW:
+    return "SRLIW";
   case Opcode::SLT:
     return "SLT";
   case Opcode::SLTU:
@@ -117,6 +135,10 @@ const char *opcodeName(Opcode opcode) {
     return "BEQZ";
   case Opcode::BNEZ:
     return "BNEZ";
+  case Opcode::BEQ:
+    return "BEQ";
+  case Opcode::BNE:
+    return "BNE";
   case Opcode::BLT:
     return "BLT";
   case Opcode::BGE:

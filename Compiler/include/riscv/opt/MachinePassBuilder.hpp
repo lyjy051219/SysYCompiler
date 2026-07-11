@@ -1,7 +1,7 @@
 #pragma once
 
-#include "MachinePassManager.hpp"
-#include "Target.hpp"
+#include "riscv/Target.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 // 后端 MachinePassBuilder
 // 仿照中端 PassBuilder 的职责划分：集中注册分析 pass，按优化等级组装流水线。

@@ -2,8 +2,8 @@
 
 #include "../../../include/riscv/AsmPrinter.hpp"
 #include "../../../include/riscv/ISel.hpp"
-#include "../../../include/riscv/MachinePassBuilder.hpp"
-#include "../../../include/riscv/MachinePassManager.hpp"
+#include "riscv/opt/MachinePassBuilder.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 #include <ostream>
 
