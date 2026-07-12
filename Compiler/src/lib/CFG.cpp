@@ -3,6 +3,8 @@
 #include "CFG.hpp"
 #include "IRUtils.hpp"
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <sstream>
 #include <map>
 #include <unordered_set>
@@ -316,7 +318,14 @@ bool Value::areEqualConstants(const Value *A, const Value *B) {
     }
     if (auto *AF = dynamic_cast<const ConstFloat *>(A)) {
         auto *BF = dynamic_cast<const ConstFloat *>(B);
-        return BF && AF->getVal() == BF->getVal();
+        if (!BF) return false;
+        std::uint32_t ABits = 0;
+        std::uint32_t BBits = 0;
+        float AV = AF->getVal();
+        float BV = BF->getVal();
+        std::memcpy(&ABits, &AV, sizeof(ABits));
+        std::memcpy(&BBits, &BV, sizeof(BBits));
+        return ABits == BBits;
     }
     if (auto *AB = dynamic_cast<const ConstBool *>(A)) {
         auto *BB = dynamic_cast<const ConstBool *>(B);
@@ -1872,12 +1881,11 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
   if (NormalizeIntegerWidth) {
     auto *IntTy = dynamic_cast<INTType *>(Ty.get());
 
-    // Preserve SCCP's established undef result types for zero divisors.
-    if ((Op == DIV || Op == UDIV) && RHS->isConstZero()) {
-      return IntTy ? Value::makeUndefForType(INTType::NewInt(4))
-                   : Value::makeUndefForType(FLOATType::NewFloat());
-    }
-    if ((Op == MOD || Op == UREM) && RHS->isConstZero())
+    // Integer division/remainder by zero is undefined.  IEEE fdiv/frem by
+    // zero instead produces Inf/NaN and must reach the floating fold below.
+    if (IntTy && (Op == DIV || Op == UDIV) && RHS->isConstZero())
+      return Value::makeUndefForType(INTType::NewInt(4));
+    if (IntTy && (Op == MOD || Op == UREM) && RHS->isConstZero())
       return Value::makeUndefForType(INTType::NewInt(4));
 
     if (isCompareOp(Op)) {
@@ -1906,6 +1914,8 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
       if (!LHS->tryGetNumericFloatConst(LV) ||
           !RHS->tryGetNumericFloatConst(RV))
         return nullptr;
+      if (std::isnan(LV) || std::isnan(RV))
+        return ConstBool::newConstBool(true);
       switch (Op) {
       case E:  return ConstBool::newConstBool(LV == RV);
       case NE: return ConstBool::newConstBool(LV != RV);
@@ -1928,16 +1938,25 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
         return nullptr;
 
       int64_t Raw = 0;
+      const int64_t SignedMin = -(int64_t{1} << (Bits - 1));
       switch (Op) {
       case ADD: Raw = static_cast<int64_t>(LV) + RV; break;
       case SUB: Raw = static_cast<int64_t>(LV) - RV; break;
       case MUL: Raw = static_cast<int64_t>(LV) * RV; break;
-      case DIV: Raw = LV / RV; break;
+      case DIV:
+        if (RV == 0 || (LV == SignedMin && RV == -1))
+          return Value::makeUndefForType(Ty);
+        Raw = LV / RV;
+        break;
       case UDIV:
         Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) /
                                    static_cast<uint32_t>(RV));
         break;
-      case MOD: Raw = LV % RV; break;
+      case MOD:
+        if (RV == 0 || (LV == SignedMin && RV == -1))
+          return Value::makeUndefForType(Ty);
+        Raw = LV % RV;
+        break;
       case UREM:
         Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) %
                                    static_cast<uint32_t>(RV));
@@ -1991,6 +2010,8 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
       if (!Value::tryGetFloatConst(LHS, LV) ||
           !Value::tryGetFloatConst(RHS, RV))
         return nullptr;
+      if (std::isnan(LV) || std::isnan(RV))
+        return ConstBool::newConstBool(true);
       switch (Op) {
       case E:  return ConstBool::newConstBool(LV == RV);
       case NE: return ConstBool::newConstBool(LV != RV);
@@ -2029,11 +2050,9 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
     case SUB: return ConstFloat::newConstFloat(LV - RV);
     case MUL: return ConstFloat::newConstFloat(LV * RV);
     case DIV:
-      return RV == 0.0f ? Value::makeUndefForType(Ty)
-                        : static_cast<Value *>(ConstFloat::newConstFloat(LV / RV));
+      return ConstFloat::newConstFloat(LV / RV);
     case MOD:
-      return RV == 0.0f ? Value::makeUndefForType(Ty)
-                        : static_cast<Value *>(ConstFloat::newConstFloat(std::fmod(LV, RV)));
+      return ConstFloat::newConstFloat(std::fmod(LV, RV));
     default: return nullptr;
     }
   }
@@ -2043,13 +2062,22 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
   if (!Value::tryGetIntConst(LHS, LV) ||
       !Value::tryGetIntConst(RHS, RV))
     return nullptr;
+  const unsigned Bits = Ty ? static_cast<unsigned>(Ty->getIntegerBitWidth(32)) : 32u;
+  const int64_t SignedMin = -(int64_t{1} << (Bits - 1));
   switch (Op) {
-  case ADD: return ConstInt::newConstInt(LV + RV);
-  case SUB: return ConstInt::newConstInt(LV - RV);
-  case MUL: return ConstInt::newConstInt(LV * RV);
+  case ADD:
+    return ConstInt::newConstInt(
+        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) + RV, Bits));
+  case SUB:
+    return ConstInt::newConstInt(
+        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) - RV, Bits));
+  case MUL:
+    return ConstInt::newConstInt(
+        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) * RV, Bits));
   case DIV:
-    return RV == 0 ? Value::makeUndefForType(Ty)
-                   : static_cast<Value *>(ConstInt::newConstInt(LV / RV));
+    return (RV == 0 || (LV == SignedMin && RV == -1))
+               ? Value::makeUndefForType(Ty)
+               : static_cast<Value *>(ConstInt::newConstInt(LV / RV));
   case UDIV:
     return RV == 0
                ? Value::makeUndefForType(Ty)
@@ -2057,8 +2085,9 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
                      static_cast<int32_t>(static_cast<uint32_t>(LV) /
                                           static_cast<uint32_t>(RV))));
   case MOD:
-    return RV == 0 ? Value::makeUndefForType(Ty)
-                   : static_cast<Value *>(ConstInt::newConstInt(LV % RV));
+    return (RV == 0 || (LV == SignedMin && RV == -1))
+               ? Value::makeUndefForType(Ty)
+               : static_cast<Value *>(ConstInt::newConstInt(LV % RV));
   case UREM:
     return RV == 0
                ? Value::makeUndefForType(Ty)
@@ -2652,15 +2681,26 @@ ConstInt* ConstInt::newConstInt(int val, size_t size){
 
 ConstFloat::ConstFloat(float val):ConstantSystem(FLOATType::NewFloat()),val(val){
   double tmp = val;
+  std::uint64_t Bits = 0;
+  static_assert(sizeof(Bits) == sizeof(tmp), "unexpected double width");
+  std::memcpy(&Bits, &tmp, sizeof(Bits));
   std::stringstream ss;
-  ss << "0x" << std::hex << *(reinterpret_cast<long long *>(&tmp));
+  ss << "0x" << std::hex << Bits;
   ident = ss.str();
 }
 ConstFloat* ConstFloat::newConstFloat(float val){
-     static std::map<float, ConstFloat*> float_const_map;
-  if (float_const_map.find(val) == float_const_map.end())
-    float_const_map[val] = new ConstFloat(val);
-  return float_const_map[val];
+  // Floating values must be interned by representation rather than numeric
+  // ordering: +0.0 and -0.0 compare equal, while NaN is not a valid key for
+  // std::map<float>'s strict-weak-ordering requirements.
+  std::uint32_t Bits = 0;
+  static_assert(sizeof(Bits) == sizeof(val), "unexpected float width");
+  std::memcpy(&Bits, &val, sizeof(Bits));
+  static std::map<std::uint32_t, ConstFloat*> float_const_map;
+  auto It = float_const_map.find(Bits);
+  if (It == float_const_map.end()) {
+    It = float_const_map.emplace(Bits, new ConstFloat(val)).first;
+  }
+  return It->second;
 }
 
 

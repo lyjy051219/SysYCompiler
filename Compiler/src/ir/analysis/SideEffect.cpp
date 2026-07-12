@@ -206,86 +206,203 @@ void SideEffectAnalysis::processBuiltinCall(
             Info.RefSet.insert(Arg);
         }
     }
+    Info.hasBuiltin = true;
 }
 
 // SideEffectAnalysis::run
 SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    SideEffectInfo Info;
-    //1.构建函数 F 中每个指针值的 BaseAddressInfoMap
-    Info.ptrMap = buildBaseAddressInfoMap(F);
+    struct PendingCall {
+        Function *Callee = nullptr;
+        std::vector<Value*> Args;
+    };
+    struct FunctionState {
+        SideEffectInfo Info;
+        std::vector<PendingCall> Calls;
+    };
 
-    //2.遍历函数中每条指令，收集ModSet和RefSet
-    for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt) {
-        BasicBlock* BB = *BBIt;
-        for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
-            Instruction* I = *IIt;
+    // Do not recursively ask FAM for a callee result here.  Analysis manager
+    // caches are populated only after run() returns, so direct recursion would
+    // recurse forever for a mutually-recursive SCC.  Instead, build local
+    // summaries for the call graph reachable from F and solve all transitive
+    // effects with a monotone fixed point.  This is equivalent to processing
+    // call-graph SCCs bottom-up, while keeping the implementation independent
+    // of a particular SCC numbering.
+    std::unordered_map<Function*, FunctionState> States;
+    std::queue<Function*> WorkList;
+    std::unordered_set<Function*> Enqueued;
+    WorkList.push(&F);
+    Enqueued.insert(&F);
 
-            //2.1 LOAD：遍历基地址，如果基地址是全局变量或者是形参，那么标记为Ref（只读）
-            if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-                if (Value *Ptr = LI->getPointerOperand()) {
-                    auto it = Info.ptrMap.find(Ptr);
-                    if (it != Info.ptrMap.end())
-                        it->second.collectExternalBases(Info.RefSet);
-                    else if (Ptr && Ptr->isExternalVariable())
-                        Info.RefSet.insert(Ptr);
+    while (!WorkList.empty()) {
+        Function *Current = WorkList.front();
+        WorkList.pop();
+        if (!Current || States.count(Current)) continue;
+
+        FunctionState State;
+        SideEffectInfo &Info = State.Info;
+        Info.ptrMap = buildBaseAddressInfoMap(*Current);
+
+        // First collect effects that are local to Current.  User-function
+        // calls are recorded as transfer edges and handled by the fixed point
+        // below.
+        for (auto BBIt = Current->begin(); BBIt != Current->end(); ++BBIt) {
+            BasicBlock *BB = *BBIt;
+            for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
+                Instruction *I = *IIt;
+
+                if (auto *LI = dynamic_cast<LoadInst *>(I)) {
+                    if (Value *Ptr = LI->getPointerOperand()) {
+                        auto It = Info.ptrMap.find(Ptr);
+                        if (It != Info.ptrMap.end()) {
+                            It->second.collectExternalBases(Info.RefSet);
+                            if (It->second.untracked)
+                                Info.hasBuiltin = true;
+                        } else if (Ptr->isExternalVariable()) {
+                            Info.RefSet.insert(Ptr);
+                        } else {
+                            Info.hasBuiltin = true;
+                        }
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            //2.2 STORE:遍历基地址，如果基地址是全局变量或者是形参，那么标记为Mod（修改）
-            if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-                if (Value *Ptr = SI->getPointerOperand()) {
-                    auto it = Info.ptrMap.find(Ptr);
-                    if (it != Info.ptrMap.end())
-                        it->second.collectExternalBases(Info.ModSet);
-                    else if (Ptr && Ptr->isExternalVariable())
-                        Info.ModSet.insert(Ptr);
+                if (auto *SI = dynamic_cast<StoreInst *>(I)) {
+                    if (Value *Ptr = SI->getPointerOperand()) {
+                        auto It = Info.ptrMap.find(Ptr);
+                        if (It != Info.ptrMap.end()) {
+                            It->second.collectExternalBases(Info.ModSet);
+                            if (It->second.untracked)
+                                Info.hasBuiltin = true;
+                        } else if (Ptr->isExternalVariable()) {
+                            Info.ModSet.insert(Ptr);
+                        } else {
+                            Info.hasBuiltin = true;
+                        }
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            //2.3 CALL:
-            if (I->instType == Instruction::CALL) {
                 auto *CI = dynamic_cast<CallInst *>(I);
                 if (!CI) continue;
+
                 std::vector<Value*> Args = CI->getArgs();
-
-                //2.3.1如果这个Callee是用户写的函数
-                if (auto* CalleeFunc = CI->getDirectCallee()) {
-                    if (CalleeFunc == &F) continue;
-
-                    const SideEffectInfo& CalleeSEI =
-                        FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
-                    auto mapEntry = [&](Value* V, std::unordered_set<Value*>& Dest) {
-                        auto* Var = dynamic_cast<Variable*>(V);
-                        if (!Var) return;
-                        if (Var->isGlobal()) { Dest.insert(V); return; }
-                        if (Var->isParam()) {
-                            int Index = CalleeFunc->getParamIndex(V);
-                            if (Index < 0 || static_cast<size_t>(Index) >= Args.size() ||
-                                !Args[static_cast<size_t>(Index)]) return;
-                            Value *Arg = Args[static_cast<size_t>(Index)];
-                            auto it = Info.ptrMap.find(Arg);
-                            if (it != Info.ptrMap.end())
-                                it->second.collectExternalBases(Dest);
-                            else if (Arg->isExternalVariable())
-                                Dest.insert(Arg);
-                        }
-                    };
-
-                    for (Value* V : CalleeSEI.ModSet) mapEntry(V, Info.ModSet);
-                    for (Value* V : CalleeSEI.RefSet) mapEntry(V, Info.RefSet);
-                    if (CalleeSEI.hasBuiltin) Info.hasBuiltin = true;
-
-                //2.3.2如果Callee是一个内置函数
-                } else if (auto* BIF = CI->getBuiltinCallee()) {
+                if (Function *Callee = CI->getDirectCallee()) {
+                    State.Calls.push_back({Callee, std::move(Args)});
+                    if (Enqueued.insert(Callee).second)
+                        WorkList.push(Callee);
+                } else if (BuildInFunction *BIF = CI->getBuiltinCallee()) {
                     processBuiltinCall(BIF, Args, Info.ptrMap, Info);
+                } else {
+                    // An indirect/unknown call can read and write arbitrary
+                    // externally visible memory.  hasBuiltin is the existing
+                    // conservative "unknown call effect" bit used by clients.
+                    Info.hasBuiltin = true;
                 }
-                continue;
+            }
+        }
+
+        States.emplace(Current, std::move(State));
+    }
+
+    auto insertExternalBases = [](const BaseAddressInfo &Bases,
+                                  std::unordered_set<Value*> &Dest) {
+        bool Changed = false;
+        for (Value *Base : Bases.bases) {
+            if (Base && Base->isExternalVariable())
+                Changed |= Dest.insert(Base).second;
+        }
+        return Changed;
+    };
+
+    bool Changed = true;
+    while (Changed) {
+        Changed = false;
+        for (auto &Entry : States) {
+            FunctionState &CallerState = Entry.second;
+            SideEffectInfo &CallerInfo = CallerState.Info;
+
+            for (const PendingCall &Call : CallerState.Calls) {
+                auto CalleeIt = States.find(Call.Callee);
+                if (CalleeIt == States.end()) {
+                    if (!CallerInfo.hasBuiltin) {
+                        CallerInfo.hasBuiltin = true;
+                        Changed = true;
+                    }
+                    continue;
+                }
+
+                const SideEffectInfo &CalleeInfo = CalleeIt->second.Info;
+                // Caller and callee are the same object for a self-recursive
+                // edge.  Snapshot the current lattice value before mapping it
+                // back into the caller; inserting into an unordered_set while
+                // iterating that same set can rehash and invalidate iterators.
+                const std::vector<Value*> CalleeMods(
+                    CalleeInfo.ModSet.begin(), CalleeInfo.ModSet.end());
+                const std::vector<Value*> CalleeRefs(
+                    CalleeInfo.RefSet.begin(), CalleeInfo.RefSet.end());
+                const bool CalleeHasBuiltin = CalleeInfo.hasBuiltin;
+                auto mapEntry = [&](Value *V,
+                                    std::unordered_set<Value*> &Dest) {
+                    auto *Var = dynamic_cast<Variable*>(V);
+                    if (!Var) return false;
+                    if (Var->isGlobal()) return Dest.insert(V).second;
+                    if (!Var->isParam()) return false;
+
+                    int Index = Call.Callee->getParamIndex(V);
+                    if (Index < 0 ||
+                        static_cast<size_t>(Index) >= Call.Args.size())
+                        return false;
+
+                    Value *Arg = Call.Args[static_cast<size_t>(Index)];
+                    if (!Arg) return false;
+                    auto ArgIt = CallerInfo.ptrMap.find(Arg);
+                    if (ArgIt != CallerInfo.ptrMap.end()) {
+                        bool LocalChanged =
+                            insertExternalBases(ArgIt->second, Dest);
+                        // A pointer whose base cannot be tracked may designate
+                        // any external object.  Preserve soundness by upgrading
+                        // the caller summary to the conservative unknown state.
+                        if (ArgIt->second.untracked &&
+                            !CallerInfo.hasBuiltin) {
+                            CallerInfo.hasBuiltin = true;
+                            LocalChanged = true;
+                        }
+                        return LocalChanged;
+                    }
+                    if (Arg->isExternalVariable())
+                        return Dest.insert(Arg).second;
+                    if (Arg->isPointerValue() && !CallerInfo.hasBuiltin) {
+                        CallerInfo.hasBuiltin = true;
+                        return true;
+                    }
+                    return false;
+                };
+
+                for (Value *V : CalleeMods)
+                    Changed |= mapEntry(V, CallerInfo.ModSet);
+                for (Value *V : CalleeRefs)
+                    Changed |= mapEntry(V, CallerInfo.RefSet);
+                if (CalleeHasBuiltin && !CallerInfo.hasBuiltin) {
+                    CallerInfo.hasBuiltin = true;
+                    Changed = true;
+                }
             }
         }
     }
-    return Info;
+
+    auto ResultIt = States.find(&F);
+    if (ResultIt == States.end()) return SideEffectInfo{};
+
+    // The fixed point already computed every reachable callee.  Publish those
+    // companion summaries into FAM as one coherent generation; the requested
+    // function itself is returned to getResult(), which installs its cache
+    // entry after run() completes.
+    for (auto &Entry : States) {
+        if (Entry.first == &F) continue;
+        FAM.setCachedResult<SideEffectAnalysis>(
+            *Entry.first, std::move(Entry.second.Info));
+    }
+    return std::move(ResultIt->second.Info);
 }
 
 // 指令级副作用查询接口

@@ -38,8 +38,9 @@ GVNPRESolver::GVNPRESolver(Function &F,
                            FunctionAnalysisPassManager &FAM,
                            DominatorTree &DT,
                            LoopInfo &LI,
-                           BasicAAResult &AA)
-    : F(F), FAM(FAM), DT(DT), LI(LI), AA(AA) {}
+                           BasicAAResult &AA,
+                           bool EnablePRE)
+    : F(F), FAM(FAM), DT(DT), LI(LI), AA(AA), EnablePRE(EnablePRE) {}
 
 bool GVNPRESolver::run() {
     if (isFunctionTooLargeForGVNPRE()) {
@@ -48,7 +49,9 @@ bool GVNPRESolver::run() {
 
     bool AnyChanged = false;
     AnyChanged |= runGVNFixedPoint();
-    AnyChanged |= runPREFixedPoint();
+    if (EnablePRE) {
+        AnyChanged |= runPREFixedPoint();
+    }
     return AnyChanged;
 }
 
@@ -781,9 +784,11 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         return true;
     }
 
-    if (auto *CI = dynamic_cast<CallInst *>(I)) {
-        return getCallModRef(CI) != ModRefInfo::NoModRef;
-    }
+    // PRE may insert an expression on a path where it did not previously
+    // execute.  Even a memory-pure call may trap or fail to return, so calls
+    // are only eliminated by the dominating-call GVN path and are never
+    // speculated by PRE.
+    if (dynamic_cast<CallInst *>(I)) return true;
 
     return false;
 }
@@ -1110,7 +1115,7 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
 
-    GVNPRESolver Solver(F, FAM, DT, LI, AA);
+    GVNPRESolver Solver(F, FAM, DT, LI, AA, EnablePRE);
     bool Changed = Solver.run();
 
     if (!Changed) {

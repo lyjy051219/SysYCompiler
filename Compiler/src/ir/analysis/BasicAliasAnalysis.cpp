@@ -476,11 +476,36 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
                 return AliasInfo::MayAlias;
             }
 
-            AliasInfo Acc = aliasImpl(Phi->getIncomingValue(0), OtherPhi->getIncomingValue(0),
-                                      LI, UseIndexRange);
-            for (unsigned i = 1; i < N; ++i) {
-                AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i), OtherPhi->getIncomingValue(i),
-                                          LI, UseIndexRange);
+            // PHI incoming order is not semantic.  Pair values by predecessor
+            // block; matching by raw index can compare values from different
+            // control-flow edges and manufacture NoAlias/MustAlias.
+            std::unordered_map<BasicBlock *, Value *> OtherByPred;
+            for (unsigned i = 0; i < M; ++i) {
+                BasicBlock *Pred = OtherPhi->getIncomingBlock(i);
+                if (!Pred || !OtherByPred.emplace(
+                                 Pred, OtherPhi->getIncomingValue(i)).second)
+                    return AliasInfo::MayAlias;
+            }
+
+            std::unordered_set<BasicBlock *> SeenPreds;
+            AliasInfo Acc = AliasInfo::MayAlias;
+            bool First = true;
+            for (unsigned i = 0; i < N; ++i) {
+                BasicBlock *Pred = Phi->getIncomingBlock(i);
+                if (!Pred || !SeenPreds.insert(Pred).second)
+                    return AliasInfo::MayAlias;
+                auto OtherIt = OtherByPred.find(Pred);
+                if (OtherIt == OtherByPred.end())
+                    return AliasInfo::MayAlias;
+
+                AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i),
+                                          OtherIt->second, LI,
+                                          UseIndexRange);
+                if (First) {
+                    Acc = Cur;
+                    First = false;
+                    continue;
+                }
                 Acc = mergePhiAlias(Acc, Cur);
                 if (Acc == AliasInfo::MayAlias) {
                     break;

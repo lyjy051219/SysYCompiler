@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <cassert>
 #include <cstddef>
+#include <functional>
 #include <unordered_set>
 #include <cstdlib>
 #include <iostream>
@@ -23,6 +24,11 @@ struct alignas(8) PassID {};
 class PreservationStatus {
 private:
     bool PreservedAll = false;
+    // Module pipelines use this bit to distinguish an arbitrary module
+    // mutation (which must conservatively clear FAM) from a
+    // ModuleFunctionBridge mutation whose per-function invalidation has
+    // already been performed.
+    bool CrossUnitInvalidationHandled = false;
     std::set<PassID*> PreservedIDs;
     std::set<PassID*> AbandonedIDs;
 
@@ -66,6 +72,14 @@ public:
         return PreservedAll || PreservedIDs.count(ID);
     }
 
+    void markCrossUnitInvalidationHandled() {
+        CrossUnitInvalidationHandled = true;
+    }
+
+    bool requiresCrossUnitInvalidation() const {
+        return !areAllKept() && !CrossUnitInvalidationHandled;
+    }
+
     void merge(const PreservationStatus &Arg) {
         if (Arg.areAllKept()) return;
 
@@ -73,6 +87,13 @@ public:
             *this = Arg;
             return;
         }
+
+        // If either changed component did not perform its dependent-analysis
+        // invalidation, the combined status still requires the conservative
+        // callback.  Only an all-bridge change set remains handled.
+        CrossUnitInvalidationHandled =
+            CrossUnitInvalidationHandled &&
+            Arg.CrossUnitInvalidationHandled;
 
         for (auto id : Arg.AbandonedIDs) {
             PreservedIDs.erase(id);
@@ -99,6 +120,25 @@ struct AnalysisDescriptor : PassDescriptor<DerivedT> {
 
 template <typename IRUnitT> class AnalysisPassManager;
 template <typename IRUnitT> using AnalysisManager = AnalysisPassManager<IRUnitT>;
+
+// Most analyses only depend on the IR unit used as their cache key.  A small
+// number of analyses (for example a call-graph based function analysis) also
+// depend on other IR units managed by the same analysis manager.  Such an
+// analysis must invalidate all of its cached results when any one unit stops
+// preserving it, otherwise a cached caller summary can outlive a changed
+// callee.
+template <typename AnalysisT, typename = void>
+struct AnalysisInvalidationScope {
+    static constexpr bool AcrossIRUnits = false;
+};
+
+template <typename AnalysisT>
+struct AnalysisInvalidationScope<
+    AnalysisT,
+    std::void_t<decltype(AnalysisT::InvalidateAcrossIRUnits)>> {
+    static constexpr bool AcrossIRUnits =
+        AnalysisT::InvalidateAcrossIRUnits;
+};
 
 template <typename IRUnitT>
 struct AnalysisResultInterface {
@@ -151,6 +191,8 @@ private:
 
     std::map<PassID*, PassPtr> AnalysisPasses;
     std::map<CacheKey, ResultPtr> ResultCache;
+    std::set<PassID*> CrossUnitAnalysisIDs;
+    std::function<void()> IRMutationCallback;
 
 public:
     AnalysisPassManager() = default;
@@ -158,6 +200,10 @@ public:
     AnalysisPassManager& operator=(AnalysisPassManager &&) = default;
 
     void clear() { ResultCache.clear(); }
+
+    void setIRMutationCallback(std::function<void()> Callback) {
+        IRMutationCallback = std::move(Callback);
+    }
 
     template <typename PassT>
     typename PassT::Result &getResult(IRUnitT &IR) {
@@ -174,6 +220,22 @@ public:
         return static_cast<WrapperT &>(*ResultCache[Key]).Result;
     }
 
+    // Batch/interprocedural analyses may compute results for several IR units
+    // in one fixed-point solve.  Let them publish those companion results so a
+    // later query does not repeat the entire call-graph traversal.
+    template <typename PassT>
+    void setCachedResult(IRUnitT &IR, typename PassT::Result Result) {
+        assert(AnalysisPasses.count(PassT::ID()) && "Pass not registered");
+        using WrapperT =
+            AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
+        auto Key = CacheKey{PassT::ID(), &IR};
+        // Never replace a live cache entry: clients are allowed to retain a
+        // reference returned by getResult() while querying another IR unit.
+        if (ResultCache.count(Key)) return;
+        ResultCache.emplace(
+            Key, std::make_unique<WrapperT>(std::move(Result)));
+    }
+
     template <typename PassBuilderT>
     bool registerPass(PassBuilderT &&PassBuilder) {
         using PassT = std::remove_reference_t<decltype(PassBuilder())>;
@@ -181,6 +243,9 @@ public:
         auto &PassPtr = AnalysisPasses[PassT::ID()];
         if (PassPtr) return false;
         PassPtr.reset(new PassWrapperT(std::forward<PassBuilderT>(PassBuilder)()));
+        if constexpr (AnalysisInvalidationScope<PassT>::AcrossIRUnits) {
+            CrossUnitAnalysisIDs.insert(PassT::ID());
+        }
         return true;
     }
 
@@ -188,12 +253,22 @@ public:
         if (PA.areAllKept()) return;
 
         for (auto it = ResultCache.begin(); it != ResultCache.end(); ) {
-            if (it->first.second == &IR && !PA.isKept(it->first.first)) {
+            const bool IsCrossUnit =
+                CrossUnitAnalysisIDs.count(it->first.first) != 0;
+            if ((IsCrossUnit || it->first.second == &IR) &&
+                !PA.isKept(it->first.first)) {
                 it = ResultCache.erase(it);
             } else {
                 ++it;
             }
         }
+
+        // This hook is primarily used by the module analysis manager to
+        // invalidate function analyses.  Keeping it on the analysis manager
+        // (instead of only the outer PassManager) also covers module passes
+        // nested inside a FixedPointPass.
+        if (PA.requiresCrossUnitInvalidation() && IRMutationCallback)
+            IRMutationCallback();
     }
 };
 
@@ -207,16 +282,23 @@ class PassManager : public PassDescriptor<PassManager<IRUnitT, AnalysisManagerT>
 protected:
     using PassInterfaceT = PassInterface<IRUnitT, AnalysisManagerT>;
     std::vector<std::unique_ptr<PassInterfaceT>> Passes;
+    std::function<void()> IRMutationCallback;
 
 public:
     explicit PassManager() = default;
-    PassManager(PassManager &&Arg) : Passes(std::move(Arg.Passes)) {}
+    PassManager(PassManager &&Arg)
+        : Passes(std::move(Arg.Passes)),
+          IRMutationCallback(std::move(Arg.IRMutationCallback)) {}
     PassManager &operator=(PassManager &&RHS) {
         Passes = std::move(RHS.Passes);
+        IRMutationCallback = std::move(RHS.IRMutationCallback);
         return *this;
     }
 
     PreservationStatus run(IRUnitT &IR, AnalysisManagerT &AM) {
+        if (IRMutationCallback) {
+            AM.setIRMutationCallback(IRMutationCallback);
+        }
         PreservationStatus PA = PreservationStatus::all();
         for (auto &Pass : Passes) {
             PreservationStatus PassPA = Pass->run(IR, AM);
@@ -231,6 +313,10 @@ public:
         using PassWrapperT = PassWrapper<IRUnitT, PassT, AnalysisManagerT>;
         Passes.push_back(std::unique_ptr<PassInterfaceT>(
             new PassWrapperT(std::forward<PassT>(Pass))));
+    }
+
+    void setIRMutationCallback(std::function<void()> Callback) {
+        IRMutationCallback = std::move(Callback);
     }
 };
 
@@ -301,11 +387,18 @@ public:
 
     PreservationStatus run(Module &M, ModuleAnalysisPassManager &) {
         PreservationStatus PA = PreservationStatus::all();
+        bool Changed = false;
         for (auto& F : M.getFunctions()) {
             PreservationStatus FuncPA = Pass->run(*F, FAM);
-            if (!FuncPA.areAllKept())
+            // A bridge invokes the wrapped pass interface directly, so the
+            // normal FunctionPassManager invalidation hook is bypassed here.
+            FAM.invalidate(*F, FuncPA);
+            if (!FuncPA.areAllKept()) {
                 PA = PreservationStatus::none();
+                Changed = true;
+            }
         }
+        if (Changed) PA.markCrossUnitInvalidationHandled();
         return PA;
     }
 

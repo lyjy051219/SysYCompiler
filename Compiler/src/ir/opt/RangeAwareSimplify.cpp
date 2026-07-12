@@ -235,6 +235,11 @@ bool RangeAwareSimplifyPass::foldConstants(
             if (dynamic_cast<CallInst *>(I)) continue;
             if (dynamic_cast<LoadInst *>(I)) continue;
             if (dynamic_cast<StoreInst *>(I)) continue;
+            // A loop PHI may temporarily look like its initial singleton while
+            // feasible backedges are still converging.  Do not delete PHIs
+            // from a range result alone; SCCP/SCEV can fold them when every
+            // incoming edge is explicitly proven.
+            if (dynamic_cast<PhiInst *>(I)) continue;
 
             BasicBlock *block = I->getParent();
             if (!block) continue;
@@ -336,6 +341,10 @@ bool RangeAwareSimplifyPass::foldComparisons(
             IntRange lRange = queryIntExpr(lhs, BB, RI, DT);
             IntRange rRange = queryIntExpr(rhs, BB, RI, DT);
 
+            // Bottom is an absence of proof, not a range whose endpoints may
+            // participate in either interval or known-bits folding.
+            if (lRange.isBottom() || rRange.isBottom()) continue;
+
             // —— KB 位级互斥判 eq/ne —— range 没法判但 KB 能判的情形
             //   lhs 和 rhs 的 KB 在某位上互斥（一侧 zero=1 而另一侧 one=1）
             //   → 绝不相等 → eq 恒 false、ne 恒 true
@@ -352,8 +361,12 @@ bool RangeAwareSimplifyPass::foldComparisons(
                 }
             }
 
-            // 任一操作数范围是 Top（全范围），折叠不了
-            if (lRange.isTop() || rRange.isTop()) continue;
+            // Top means unknown and Bottom means the solver has no feasible
+            // value for this program point yet.  Neither is a proof.  In
+            // particular, Bottom is represented by min > max, so feeding it
+            // to the endpoint tests below can manufacture a constant result.
+            if (lRange.isTop() || rRange.isTop())
+                continue;
 
             int result = -1; // -1 = 未知, 0 = false, 1 = true
 
@@ -403,8 +416,11 @@ bool RangeAwareSimplifyPass::foldComparisons(
             FloatRange lRange = RI.queryFloat(lhs, BB, DT);
             FloatRange rRange = RI.queryFloat(rhs, BB, DT);
 
-            // 任一 Top（可能含 NaN 或无界）→ 保守不折
-            if (lRange.isTop() || rRange.isTop()) continue;
+            // Top（可能含 NaN/无界）和 Bottom（尚无可行值）都不能作为
+            // 常量比较的证明。
+            if (lRange.isTop() || rRange.isTop() ||
+                lRange.isBottom() || rRange.isBottom())
+                continue;
 
             int result = -1;
 
@@ -676,10 +692,11 @@ bool RangeAwareSimplifyPass::foldAbsViaSelect(
         BasicBlock *BB = SI->getParent();
         if (!BB) continue;
         IntRange xr = queryIntExpr(x, BB, RI, DT);
+        if (xr.isTop() || xr.isBottom()) continue;
         Value *chosen = nullptr;
         if (xr.isNonNegative())
             chosen = x;
-        else if (!xr.isTop() && !xr.isBottom() && xr.max <= 0)
+        else if (xr.max <= 0)
             chosen = neg;
         if (!chosen) continue;
 
@@ -740,7 +757,8 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
             IntRange(dynamic_cast<ConstInt *>(a)->getVal()) : queryIntExpr(a, BB, RI, DT);
         IntRange rb = dynamic_cast<ConstInt *>(b) ?
             IntRange(dynamic_cast<ConstInt *>(b)->getVal()) : queryIntExpr(b, BB, RI, DT);
-        if (ra.isTop() || rb.isTop()) continue;
+        if (ra.isTop() || rb.isTop() || ra.isBottom() || rb.isBottom())
+            continue;
 
         // 决定 cmp(a, b, op) 在当前 range 下是不是可判定的常数：
         // 必须区分严格（G/L）和非严格（GE/LE），a==b 时两者结论不同

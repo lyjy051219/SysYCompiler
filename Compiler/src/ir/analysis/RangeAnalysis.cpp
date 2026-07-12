@@ -9,19 +9,16 @@
 // =====================================================================
 // IntRange 算术运算
 //
-// 所有运算用 int64 防止 i32 溢出，结果 clamp 到 [I32_MIN, I32_MAX]。
-// 对 Top（全范围）操作数做保守处理。
+// 所有运算用 int64 检测 i32 溢出。普通 i32 IR 是 wrap 语义；一旦
+// 数学区间可能越界，饱和端点并不保守，必须退回 Top。
 // =====================================================================
-
-int64_t IntRange::clampI32(int64_t v) {
-    if (v < IntRange::I32_MIN) return IntRange::I32_MIN;
-    if (v > IntRange::I32_MAX) return IntRange::I32_MAX;
-    return v;
-}
 
 IntRange IntRange::add(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    IntRange r(clampI32(min + rhs.min), clampI32(max + rhs.max));
+    int64_t lo = min + rhs.min;
+    int64_t hi = max + rhs.max;
+    if (lo < I32_MIN || hi > I32_MAX) return IntRange();
+    IntRange r(lo, hi);
     // 对齐：a + b 的 trailing zeros ≥ min(a.tz, b.tz)
     r.knownTrailingZeros = std::min(knownTrailingZeros, rhs.knownTrailingZeros);
     return r;
@@ -29,7 +26,10 @@ IntRange IntRange::add(const IntRange &rhs) const {
 
 IntRange IntRange::sub(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    IntRange r(clampI32(min - rhs.max), clampI32(max - rhs.min));
+    int64_t lo = min - rhs.max;
+    int64_t hi = max - rhs.min;
+    if (lo < I32_MIN || hi > I32_MAX) return IntRange();
+    IntRange r(lo, hi);
     r.knownTrailingZeros = std::min(knownTrailingZeros, rhs.knownTrailingZeros);
     return r;
 }
@@ -43,7 +43,8 @@ IntRange IntRange::mul(const IntRange &rhs) const {
     int64_t v4 = max * rhs.max;
     int64_t lo = std::min({v1, v2, v3, v4});
     int64_t hi = std::max({v1, v2, v3, v4});
-    IntRange r(clampI32(lo), clampI32(hi));
+    if (lo < I32_MIN || hi > I32_MAX) return IntRange();
+    IntRange r(lo, hi);
     // 对齐：a * b 的 trailing zeros = a.tz + b.tz，上限 31
     int tz = knownTrailingZeros + rhs.knownTrailingZeros;
     r.knownTrailingZeros = std::min(tz, 31);
@@ -61,7 +62,8 @@ IntRange IntRange::sdiv(const IntRange &rhs) const {
     int64_t v4 = max / rhs.max;
     int64_t lo = std::min({v1, v2, v3, v4});
     int64_t hi = std::max({v1, v2, v3, v4});
-    return IntRange(clampI32(lo), clampI32(hi));
+    if (lo < I32_MIN || hi > I32_MAX) return IntRange();
+    return IntRange(lo, hi);
 }
 
 IntRange IntRange::srem(const IntRange &rhs) const {
@@ -625,7 +627,8 @@ public:
             if (intersected.isBottom()) return false;
             if (intersected == cur) return false;
             cur = intersected;
-            for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
+            for (auto it = V->getUseList().begin();
+                 it != V->getUseList().end(); ++it) {
                 auto *user = dynamic_cast<Instruction *>((*it)->getUser());
                 if (user) InstWorkList.push_back(user);
             }
@@ -654,11 +657,10 @@ public:
             cur = newRange;
         }
 
-        for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
+        for (auto it = V->getUseList().begin();
+             it != V->getUseList().end(); ++it) {
             auto *user = dynamic_cast<Instruction *>((*it)->getUser());
-            if (user) {
-                InstWorkList.push_back(user);
-            }
+            if (user) InstWorkList.push_back(user);
         }
         return true;
     }
@@ -671,7 +673,8 @@ public:
             if (intersected.isBottom()) return false;
             if (intersected == cur) return false;
             cur = intersected;
-            for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
+            for (auto it = V->getUseList().begin();
+                 it != V->getUseList().end(); ++it) {
                 auto *user = dynamic_cast<Instruction *>((*it)->getUser());
                 if (user) InstWorkList.push_back(user);
             }
@@ -689,7 +692,8 @@ public:
         } else {
             cur = newRange;
         }
-        for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
+        for (auto it = V->getUseList().begin();
+             it != V->getUseList().end(); ++it) {
             auto *user = dynamic_cast<Instruction *>((*it)->getUser());
             if (user) InstWorkList.push_back(user);
         }
@@ -913,11 +917,9 @@ public:
             // 浮点范围更新（带 widening / narrowing，由 updateFloatRange 统一处理）
             updateFloatRange(BI, fresult);
 
-            // Backward constraint propagation：浮点 ADD/SUB 同构成立
-            // narrowBinaryBackward 内部根据类型分派，这里把整数版本的 dummy 参数 传过去就行
-            if (NarrowingMode) {
-                narrowBinaryBackward(BI, lhs, rhs, IntRange(), IntRange());
-            }
+
+            // Do not backward-narrow floating ADD/SUB: f32 rounding means the
+            // real-number inverse interval is not a sound proof for operands.
             return;
         }
 
@@ -1002,11 +1004,8 @@ public:
     // 完整反推（ADD/SUB）：
     //   z = x + y ⟹ x = z - y,  y = z - x
     //   z = x - y ⟹ x = z + y,  y = x - z
-    // 弱反推（MUL/DIV/MOD）：端点反推非单调，只推符号
-    //   z = x * y, z 非负, y > 0  ⟹  x 非负
-    //   z = x / y, z 非负, y > 0  ⟹  x 非负
-    //   z = x % y (srem), z 非负  ⟹  x 非负 （srem 结果符号跟被除数）
-    // 浮点：FADD/FSUB 和整数同构成立（假定非 NaN；NaN 已被吸收到 Top）
+    // MUL/DIV/MOD 以及浮点运算不做反推：wrap、除法溢出和 f32 舍入都
+    // 需要比当前区间 lattice 更强的证明。
     void narrowBinaryBackward(BinaryInst *BI, Value *lhs, Value *rhs,
                               const IntRange &lRange, const IntRange &rRange) {
         auto ty = BI->getIRType();
@@ -1017,6 +1016,7 @@ public:
             IntRange zR = getRange(BI);
             switch (BI->getOp()) {
                 case BinaryInst::ADD: {
+                    if (lRange.add(rRange).isTop()) break;
                     if (!dynamic_cast<ConstInt *>(lhs))
                         updateRange(lhs, zR.sub(rRange));
                     if (!dynamic_cast<ConstInt *>(rhs))
@@ -1024,75 +1024,23 @@ public:
                     break;
                 }
                 case BinaryInst::SUB: {
+                    if (lRange.sub(rRange).isTop()) break;
                     if (!dynamic_cast<ConstInt *>(lhs))
                         updateRange(lhs, zR.add(rRange));
                     if (!dynamic_cast<ConstInt *>(rhs))
                         updateRange(rhs, lRange.sub(zR));
                     break;
                 }
-                // 弱 backward：z = x * y 且 z 非负、y 非负 ⟹ x 非负
-                // 对 SDIV / SREM 同理（SREM 只在除数非零时）
-                // 只推符号，不推具体边界（MUL/DIV 的端点反推非单调）
-                case BinaryInst::MUL: {
-                    if (zR.isNonNegative()) {
-                        if (rRange.isPositive() && !dynamic_cast<ConstInt *>(lhs))
-                            updateRange(lhs, IntRange::nonNegative());
-                        if (lRange.isPositive() && !dynamic_cast<ConstInt *>(rhs))
-                            updateRange(rhs, IntRange::nonNegative());
-                    }
-                    break;
-                }
-                case BinaryInst::DIV: {
-                    if (zR.isNonNegative() && rRange.isPositive() &&
-                        !dynamic_cast<ConstInt *>(lhs)) {
-                        updateRange(lhs, IntRange::nonNegative());
-                    }
-                    break;
-                }
-                case BinaryInst::MOD: {
-                    // srem 结果符号跟被除数，z 非负 ⟹ 被除数非负（仅当除数非零时）
-                    if (zR.isNonNegative() && !rRange.isTop() &&
-                        !dynamic_cast<ConstInt *>(lhs)) {
-                        updateRange(lhs, IntRange::nonNegative());
-                    }
-                    break;
-                }
+                // MUL/DIV/MOD backward sign inference is disabled.  MUL may
+                // wrap, and DIV/MOD need stronger nonzero/overflow facts than
+                // this interval lattice currently records.
                 default: break;
             }
             return;
         }
 
-        // 浮点路径
-        if (ty->getEnum() == IR_FLOAT) {
-            FloatRange zR = FloatValueRanges[BI];
-            FloatRange lF = dynamic_cast<ConstFloat *>(lhs) ?
-                FloatRange((double)dynamic_cast<ConstFloat *>(lhs)->getVal()) :
-                FloatValueRanges[lhs];
-            FloatRange rF = dynamic_cast<ConstFloat *>(rhs) ?
-                FloatRange((double)dynamic_cast<ConstFloat *>(rhs)->getVal()) :
-                FloatValueRanges[rhs];
-            // lRange / rRange 是传入的整数参数，浮点不用；用 lF/rF 替代
-            (void)lRange; (void)rRange;
-
-            switch (BI->getOp()) {
-                case BinaryInst::ADD: {
-                    if (!dynamic_cast<ConstFloat *>(lhs))
-                        updateFloatRange(lhs, zR.sub(rF));
-                    if (!dynamic_cast<ConstFloat *>(rhs))
-                        updateFloatRange(rhs, zR.sub(lF));
-                    break;
-                }
-                case BinaryInst::SUB: {
-                    if (!dynamic_cast<ConstFloat *>(lhs))
-                        updateFloatRange(lhs, zR.add(rF));
-                    if (!dynamic_cast<ConstFloat *>(rhs))
-                        updateFloatRange(rhs, lF.sub(zR));
-                    break;
-                }
-                default: break;
-            }
-            return;
-        }
+        // Floating-point backward narrowing is intentionally disabled because
+        // f32 arithmetic is not an exact real-number equation.
     }
 
     void visitBranch(BrInst *Br) {
@@ -1141,6 +1089,20 @@ public:
                     FloatRange rF = dynamic_cast<ConstFloat *>(rhs) ?
                         FloatRange((double)dynamic_cast<ConstFloat *>(rhs)->getVal()) :
                         FloatValueRanges[rhs];
+
+                    if (lF.isBottom() || rF.isBottom()) {
+                        if (trueSinglePred) {
+                            updateFloatContextual(lhs, trueBB, FloatRange());
+                            updateFloatContextual(rhs, trueBB, FloatRange());
+                        }
+                        if (falseSinglePred) {
+                            updateFloatContextual(lhs, falseBB, FloatRange());
+                            updateFloatContextual(rhs, falseBB, FloatRange());
+                        }
+                        markEdgeFeasible(fromBB, trueBB);
+                        markEdgeFeasible(fromBB, falseBB);
+                        return;
+                    }
 
                     double NINF = FloatRange::F_MIN_INF();
                     double PINF = FloatRange::F_MAX_INF();
@@ -1207,6 +1169,24 @@ public:
                     IntRange(dynamic_cast<ConstInt *>(lhs)->getVal()) : getRange(lhs);
                 IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
                     IntRange(dynamic_cast<ConstInt *>(rhs)->getVal()) : getRange(rhs);
+
+                if (lRange.isBottom() || rRange.isBottom()) {
+                    if (trueSinglePred) {
+                        updateContextual(lhs, trueBB, IntRange());
+                        updateContextual(rhs, trueBB, IntRange());
+                        updateBitsContextual(lhs, trueBB, KnownBits::top());
+                        updateBitsContextual(rhs, trueBB, KnownBits::top());
+                    }
+                    if (falseSinglePred) {
+                        updateContextual(lhs, falseBB, IntRange());
+                        updateContextual(rhs, falseBB, IntRange());
+                        updateBitsContextual(lhs, falseBB, KnownBits::top());
+                        updateBitsContextual(rhs, falseBB, KnownBits::top());
+                    }
+                    markEdgeFeasible(fromBB, trueBB);
+                    markEdgeFeasible(fromBB, falseBB);
+                    return;
+                }
 
                 // slt: lhs < rhs
                 if (op == BinaryInst::L) {
@@ -1646,7 +1626,7 @@ public:
     //   2) 二元运算 visitBinary 会调用 narrowBinaryBackward 做 z=x+y ⟹ x=z-y
     //      这种反推
     //   3) 轮次有上限（NARROW_ROUNDS=3），不追求极限精度，避免过度迭代
-    void runNarrowing(Function &F) {
+    bool runNarrowing(Function &F) {
         NarrowingMode = true;
         // 硬预算：narrowing 总访问指令次数上限，避免病态函数上跑飞
         // 经验值：指令数 * 4 足够大多数场景收敛
@@ -1677,9 +1657,10 @@ public:
             budget--;
         }
 
-        // 预算耗尽就清空剩余 worklist，保守放弃
+        const bool Complete = InstWorkList.empty();
         InstWorkList.clear();
         NarrowingMode = false;
+        return Complete;
     }
 
     // --- 主求解入口 ---
@@ -1699,11 +1680,32 @@ public:
         publishReturnRange(F);
 
         // Step 3: Narrowing（backward constraint propagation）
-        runNarrowing(F);
+        const bool NarrowingComplete = runNarrowing(F);
+
+        // A budget cutoff leaves a partially intersected (under-approximating)
+        // lattice.  Do not expose it to transforms: dropping all facts yields
+        // Top on query and is conservative, without copying every analysis map
+        // on the normal completed path.
+        if (!NarrowingComplete) {
+            ValueRanges.clear();
+            FloatValueRanges.clear();
+            ValueBits.clear();
+            BlockLocalRanges.clear();
+        }
+
+        // Branch/GEP contextual facts were derived while the global lattice
+        // was still changing.  They are not transform-visible until we have a
+        // final-fact rebuild with explicit source dependencies; clearing them
+        // here is conservative and prevents an early loop singleton from
+        // surviving as a stale path constraint.
+        ContextualRanges.clear();
+        FloatContextualRanges.clear();
+        ContextualBits.clear();
 
         // Step 4: 用 SCEV 证明出的有限归纳变量范围补充循环体上下文信息。
         // 只写 non-header loop blocks，保留 header/exit 判断的保守性。
-        applySCEVContextHints(SCEV);
+        if (NarrowingComplete)
+            applySCEVContextHints(SCEV);
 
         // Step 5: 构建结果
         RangeInfo info;

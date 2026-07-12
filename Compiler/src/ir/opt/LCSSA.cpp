@@ -335,7 +335,9 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();
     PA.keep<LoopAnalysis>();
-    PA.keep<BasicAliasAnalysis>();
-    PA.keep<SideEffectAnalysis>();
+    // LCSSA inserts PHIs, including pointer-typed PHIs.  Their base/offset and
+    // ModRef relationships are absent from cached AA/side-effect results.
+    PA.discard<BasicAliasAnalysis>();
+    PA.discard<SideEffectAnalysis>();
     return PA;
 }

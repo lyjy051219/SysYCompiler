@@ -5,6 +5,8 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 
+#include <cmath>
+
 // SCCPSolver 实现
 LatticeValue& SCCPSolver::getValueState(Value* V) {
     auto it = ValueState.find(V);
@@ -172,28 +174,48 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     Value* lhsConst = LV_LHS.isConstant() ? LV_LHS.getConstantValue() : nullptr;
     Value* rhsConst = LV_RHS.isConstant() ? LV_RHS.getConstantValue() : nullptr;
     const auto op = BI->getOp();
+    const bool IsFloat = IRType::isFloat(BI->getIRType());
+
+    auto isNegativeFloatZero = [](Value *V) {
+        float F = 0.0f;
+        return V && Value::tryGetFloatConst(V, F) && F == 0.0f &&
+               std::signbit(F);
+    };
+    auto isPositiveFloatZero = [](Value *V) {
+        float F = 0.0f;
+        return V && Value::tryGetFloatConst(V, F) && F == 0.0f &&
+               !std::signbit(F);
+    };
 
     // 代数恒等式：允许在一侧是 Bottom/NAC 时仍然精确传播。
     switch (op) {
     case BinaryInst::ADD:
-        if (lhsConst && lhsConst->isConstZero()) {
+        // In strict IEEE arithmetic only -0.0 is an additive identity:
+        // +0.0 + -0.0 produces +0.0, not the RHS -0.0.
+        if (lhsConst && lhsConst->isConstZero() &&
+            (!IsFloat || isNegativeFloatZero(lhsConst))) {
             mergeInValue(BI, LV_RHS);
             return;
         }
-        if (rhsConst && rhsConst->isConstZero()) {
+        if (rhsConst && rhsConst->isConstZero() &&
+            (!IsFloat || isNegativeFloatZero(rhsConst))) {
             mergeInValue(BI, LV_LHS);
             return;
         }
         break;
     case BinaryInst::SUB:
-        if (rhsConst && rhsConst->isConstZero()) {
+        // x - +0.0 is exact; x - -0.0 is not for x == -0.0.
+        if (rhsConst && rhsConst->isConstZero() &&
+            (!IsFloat || isPositiveFloatZero(rhsConst))) {
             mergeInValue(BI, LV_LHS);
             return;
         }
         break;
     case BinaryInst::MUL:
-        if ((lhsConst && lhsConst->isConstZero()) ||
-            (rhsConst && rhsConst->isConstZero())) {
+        // fmul 0.0, Inf/NaN is NaN and signed zero is observable.
+        if (!IsFloat &&
+            ((lhsConst && lhsConst->isConstZero()) ||
+             (rhsConst && rhsConst->isConstZero()))) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
@@ -219,7 +241,8 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         }
         break;
     case BinaryInst::MOD:
-        if (rhsConst && rhsConst->isConstOne()) {
+        // frem x, 1.0 is not generally zero.
+        if (!IsFloat && rhsConst && rhsConst->isConstOne()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
@@ -630,8 +653,11 @@ PreservationStatus SCCPPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
-        PA.keep<BasicAliasAnalysis>();
-        PA.keep<SideEffectAnalysis>();
+        // Replacing GEP indices/pointer PHIs or removing memory instructions
+        // can change alias and transitive side-effect answers even when the
+        // CFG itself is unchanged.
+        PA.discard<BasicAliasAnalysis>();
+        PA.discard<SideEffectAnalysis>();
     }
     return PA;
 }

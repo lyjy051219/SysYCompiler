@@ -7,9 +7,6 @@
 #include <utility>
 #include <vector>
 
-// Trace only the pointer forms emitted by the front end. Each aggregate GEP
-// starts with a zero pointer-dereference index; the remaining indices select
-// array elements and can therefore be concatenated across chained GEPs.
 LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     Value *V, std::unordered_set<Value *> &Visiting) {
     LocalAggregatePointerPath Result;

@@ -68,6 +68,12 @@ struct SideEffectInfo {
 class SideEffectAnalysis : public AnalysisDescriptor<SideEffectAnalysis> {
 public:
     using Result = SideEffectInfo;
+
+    // A function summary contains the transitive effects of its callees.  A
+    // changed callee therefore invalidates cached summaries for other
+    // functions in the same FunctionAnalysisPassManager as well.
+    static constexpr bool InvalidateAcrossIRUnits = true;
+
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 
 private:

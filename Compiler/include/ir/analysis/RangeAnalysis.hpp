@@ -35,10 +35,10 @@ class Loop;
 // 两者不走模板——分开写更清晰，也和别家实现保持结构差异
 //
 // 【上下文追踪】
-// per-block contextual range：条件分支 icmp slt %x, 10 的 true 分支上
-//   %x 收窄到 [MIN, 9]，记录在目标块上
-// 只在目标块单前驱时才记，避免多前驱块（如 loop header）的 over-constrain
-// 查询时沿支配树向上 intersect，最多 8 层深度
+// solver 内部会推导分支/GEP contextual fact，但这些 fact 可能早于 global
+// lattice 收敛。目前在返回 transform-facing RangeInfo 前统一清空，待实现
+// “用最终 global fact 重建 contextual”后再开放；SCEV 的显式 loop-local hint
+// 仍通过独立的 BlockLocalRanges 提供。
 //
 // 【收敛保证】
 // 每个值的范围更新次数累计超过 32 次时，直接 widen 到 Top 并锁定不再变窄
@@ -47,10 +47,11 @@ class Loop;
 //
 // 【Narrowing 阶段】
 // Forward 收敛后追加一轮 narrowing：updateRange 切到 intersect-only 语义
-// （不再 widen、Widened 锁失效），重新跑 visit 一轮。backward 推导覆盖：
-//   ADD/SUB：z = x op y 完整反推 x、y（整数和浮点同构成立）
-//   MUL/DIV/MOD：弱 backward，仅在 z 非负 + 另一操作数正时反推出操作数非负
-// 轮次由一个 O(instCount * 4) 预算硬兜底，避免病态函数跑飞。
+// （不再 widen、Widened 锁失效），重新跑 visit 一轮。backward 推导仅覆盖
+// 已证明不会 i32 wrap 的整数 ADD/SUB；浮点舍入与 MUL/DIV/MOD 溢出语义
+// 暂不做反推。
+// 轮次由一个 O(instCount * 4) 预算硬兜底；若预算耗尽，整份变换可见结果
+// 降级为 Top，绝不暴露部分 narrowing 的下近似。
 //
 // 【GEP 索引约束】
 // visitGEP 对每个 ARRAYType 维度给索引加 contextual 约束 [0, count-1]。
@@ -106,8 +107,8 @@ struct IntRange {
     bool isTop() const { return min == I32_MIN && max == I32_MAX; }
     bool isBottom() const { return min > max; }
     bool isSingleValue() const { return min == max && !isBottom(); }
-    bool isNonNegative() const { return min >= 0; }
-    bool isPositive() const { return min > 0; }
+    bool isNonNegative() const { return !isBottom() && min >= 0; }
+    bool isPositive() const { return !isBottom() && min > 0; }
     // 是否是 2^k 的倍数（k > 0 即至少偶数）
     bool isMultipleOf(int k) const { return knownTrailingZeros >= k; }
 
@@ -148,7 +149,6 @@ struct IntRange {
     IntRange band(const IntRange &rhs) const;
     IntRange bor(const IntRange &rhs) const;
 
-    static int64_t clampI32(int64_t Value);
     static IntRange bottom() { return IntRange(1, 0); }
     static IntRange nonNegative() { return IntRange(0, I32_MAX); }
 };
@@ -314,7 +314,7 @@ struct FloatRange {
     bool isBottom() const { return min > max; }
     bool isSingleValue() const { return min == max && !isBottom() &&
                                         !std::isinf(min); }
-    bool isNonNegative() const { return min >= 0.0; }
+    bool isNonNegative() const { return !isBottom() && min >= 0.0; }
 
     FloatRange unionWith(const FloatRange &other) const {
         if (isBottom()) return other;

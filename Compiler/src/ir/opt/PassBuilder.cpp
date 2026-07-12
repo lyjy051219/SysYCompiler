@@ -101,6 +101,18 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(SCCPPass());
     FPM.addPass(CFGSimplifyPass());
+
+    // Range/Constraint are intentionally not rerun on the cloned CFG yet.
+    // The old contextual range solve collapsed outer matrix loops on cloned
+    // CFGs.  Transform-visible contextual facts are currently disabled; keep
+    // this phase to local value/memory cleanup and re-enable Range/Constraint
+    // only after final-fact contextual rebuilding has dedicated regressions.
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
+    FPM.addPass(GepCombinePass());
+    FPM.addPass(GepEvaluatePass());
+    FPM.addPass(LoadEliminationPass());
+    FPM.addPass(DSEPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LatePhiCleanupPass());
     FPM.addPass(InstSimplifyPass());
@@ -152,6 +164,7 @@ FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
     FPM.addPass(LoadEliminationPass());
+    FPM.addPass(DSEPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LatePhiCleanupPass());
@@ -212,6 +225,11 @@ void PassBuilder::registerFunctionAnalyses(FunctionAnalysisPassManager &FAM){
 
 ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM) {
     ModulePassManager MPM;
+    // Module passes such as inlining/DAE/global cleanup can mutate function
+    // bodies without going through a function-pass bridge.  Clear function
+    // analyses after such a top-level mutation so no caller/callee summary or
+    // CFG analysis survives across an unknown module transformation.
+    MPM.setIRMutationCallback([&FAM] { FAM.clear(); });
 
     // O0 直接返回，不进行任何优化
     if (Level == OptimizationLevel::O0) {
@@ -230,6 +248,11 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 
     // Phase 2: Interprocedural Optimization (IPO，过程间优化)
     MPM.addPass(createModuleFunctionBridge(TailRecursionEliminationPass(), FAM));
+    // First eliminate dominated identical pure calls while they are still
+    // represented as calls.  After inlining, an entire callee loop would be
+    // duplicated and ordinary scalar GVN could no longer recover this CSE.
+    MPM.addPass(createModuleFunctionBridge(
+        GVNPREPass(/*EnablePRE=*/false), FAM));
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
     // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
@@ -246,9 +269,15 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     // 内联后会暴露出大量新的常数折叠、死代码和 Alloca 机会，再做一次轻量清理
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLightCleanupPipeline(), FAM), 2));
-
-
     MPM.addPass(createModuleFunctionBridge(LocalAggregateSimplifyPass(), FAM));
+    // LocalAggregateSimplify may split an aggregate into scalar allocas.  Make
+    // those values SSA immediately so the heavy memory and loop pipelines see
+    // PHIs/constants instead of waiting until the late backend-prep phase.
+    MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
 
     // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
@@ -287,7 +316,14 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
         /*RelaxScalarUses=*/true), FAM));
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(
+        GVNPREPass(/*EnablePRE=*/false), FAM));
+    MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(LoadEliminationPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(DSEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));

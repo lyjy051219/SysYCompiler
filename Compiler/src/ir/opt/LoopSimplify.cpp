@@ -243,7 +243,14 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
     //递归法实现的后序遍历
     for (Loop *topLoop : LI.getTopLevelLoops()) {
         if (!topLoop || !topLoop->getHeader()) continue;
-        changed |= runOnLoop(F, *topLoop, cfgChanged);
+        if (runOnLoop(F, *topLoop, cfgChanged)) {
+            changed = true;
+            // LoopInfo describes the CFG at pass entry.  Once one loop has
+            // changed, do not continue walking sibling/top-level Loop objects
+            // from that stale snapshot; a later pipeline invocation will
+            // rebuild LoopInfo and continue normalization.
+            break;
+        }
     }
 
     if (!changed) {
@@ -252,12 +259,13 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
 
     PreservationStatus PA;
     if (!cfgChanged) {
-        // 仅做了退化 PHI 简化，不改 CFG，不触及内存读写。
+        // 仅做了退化 PHI 简化，不改 CFG；但 pointer PHI replacement
+        // still changes alias and ModRef relationships.
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
-        PA.keep<BasicAliasAnalysis>();
-        PA.keep<SideEffectAnalysis>();
+        PA.discard<BasicAliasAnalysis>();
+        PA.discard<SideEffectAnalysis>();
         return PA;
     }
 
@@ -274,7 +282,12 @@ bool LoopSimplifyPass::runOnLoop(Function &F, Loop &L, bool &cfgChanged) {
     //后序遍历，先修改最内层的loop结构，然后从内到外修改其他loop结构
     for (Loop *subLoop : L.getSubLoops()) {
         if (!subLoop || !subLoop->getHeader()) continue;
-        changed |= runOnLoop(F, *subLoop, cfgChanged);
+        if (runOnLoop(F, *subLoop, cfgChanged)) {
+            // The parent Loop object belongs to the same now-stale LoopInfo
+            // snapshot.  Stop here and let the next pass invocation rebuild
+            // the forest before touching the parent.
+            return true;
+        }
     }
 
     if (insertPreHeader(F, L)) {

@@ -7,7 +7,38 @@
 #include "lib/TypeSystem.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
+
+namespace {
+
+bool isRecursiveFrom(Function *Root, const FunctionCallGraph &CallGraph) {
+	if (!Root) return false;
+
+	std::vector<Function *> WorkList;
+	std::unordered_set<Function *> Visited;
+	auto RootIt = CallGraph.find(Root);
+	if (RootIt == CallGraph.end()) return false;
+	for (Function *Callee : RootIt->second) {
+		if (Callee) WorkList.push_back(Callee);
+	}
+
+	while (!WorkList.empty()) {
+		Function *Current = WorkList.back();
+		WorkList.pop_back();
+		if (Current == Root) return true;
+		if (!Current || !Visited.insert(Current).second) continue;
+
+		auto It = CallGraph.find(Current);
+		if (It == CallGraph.end()) continue;
+		for (Function *Callee : It->second) {
+			if (Callee) WorkList.push_back(Callee);
+		}
+	}
+	return false;
+}
+
+} // namespace
 
 // For scalar globals, only allow very simple load/store users in main.
 // Complex pointer/address-taken patterns are deferred to avoid downstream IR issues.
@@ -34,9 +65,14 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 	Function *Main = M->getMainFunction();
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
-	auto &LI = FAM.getResult<LoopAnalysis>(F);
 
 	auto CallGraph = M->buildDirectCallGraph();
+	// A global has one shared instance across recursive invocations of main;
+	// replacing it with an alloca would create one instance per stack frame.
+	if (isRecursiveFrom(Main, CallGraph))
+		return PreservationStatus::all();
+
+	auto &LI = FAM.getResult<LoopAnalysis>(F);
 	auto ReachableFromMain =
 		Module::collectReachableFunctions(Main, CallGraph);
 
@@ -61,7 +97,6 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		bool ScalarHasStore = false;
 		bool ScalarHasLoopMemUse = false;
 		bool ScalarAllUsesInEntry = true;
-		bool ScalarHasNonEntryStore = false;
 		BasicBlock *MainEntry = Main->front();
 
 		for (auto it = GV->getUseList().begin(); it != GV->getUseList().end(); ++it) {
@@ -97,14 +132,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 				auto *UserI = dynamic_cast<Instruction *>(U->getUser());
 				auto *SI = dynamic_cast<StoreInst *>(UserI);
-				if (RelaxScalarUses) {
-					if (SI && SI->getPointerOperand() == GV) {
-						BasicBlock *SBB = SI->getParent();
-						if (SBB && SBB != MainEntry) {
-							ScalarHasNonEntryStore = true;
-						}
-					}
-				} else {
+				if (!RelaxScalarUses) {
 					BasicBlock *UBB = UserI ? UserI->getParent() : nullptr;
 					if (!UBB || UBB != MainEntry) {
 						ScalarAllUsesInEntry = false;
@@ -143,24 +171,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 		WorkList.push_back(
 			Global2LocalCandidateInfo{
-				GV, ElemTy, std::move(MainUses), ScalarHasNonEntryStore});
-	}
-
-	if (RelaxScalarUses) {
-		const size_t NonEntryStoredScalarCount = static_cast<size_t>(std::count_if(
-			WorkList.begin(), WorkList.end(), [](const Global2LocalCandidateInfo &C) {
-				return C.HasNonEntryStore;
-			}));
-
-
-		if (NonEntryStoredScalarCount > 1) {
-			WorkList.erase(
-				std::remove_if(WorkList.begin(), WorkList.end(),
-					[](const Global2LocalCandidateInfo &C) {
-						return C.HasNonEntryStore;
-					}),
-				WorkList.end());
-		}
+				GV, ElemTy, std::move(MainUses)});
 	}
 
 	if (WorkList.empty()) return PreservationStatus::all();

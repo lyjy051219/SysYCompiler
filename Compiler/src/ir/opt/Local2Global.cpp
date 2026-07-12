@@ -4,36 +4,76 @@
 #include "lib/TypeSystem.hpp"
 
 #include <memory>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace {
+
+// main 通常由运行时只调用一次，但语法并没有阻止 main 直接
+// 或间接递归。一旦递归，把 alloca 换成全局对象就会让不同栈帧
+// 共享同一份存储。
+bool isRecursiveFrom(Function *F, const FunctionCallGraph &CallGraph) {
+	if (!F) return false;
+
+	std::vector<Function *> WorkList;
+	std::unordered_set<Function *> Visited;
+	auto RootIt = CallGraph.find(F);
+	if (RootIt == CallGraph.end()) return false;
+	for (Function *Callee : RootIt->second) {
+		if (Callee) WorkList.push_back(Callee);
+	}
+
+	while (!WorkList.empty()) {
+		Function *Current = WorkList.back();
+		WorkList.pop_back();
+		if (Current == F) return true;
+		if (!Current || !Visited.insert(Current).second) continue;
+
+		auto It = CallGraph.find(Current);
+		if (It == CallGraph.end()) continue;
+		for (Function *Callee : It->second) {
+			if (Callee) WorkList.push_back(Callee);
+		}
+	}
+	return false;
+}
+
+} // namespace
 
 PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;
 
 	std::vector<std::pair<AllocaInst *, std::shared_ptr<IRType>>> WorkList;
 
-	for (auto &FuncPtr : M.getFunctions()) {
-		Function *F = FuncPtr.get();
-		if (!F) continue;
+	Function *Main = M.getMainFunction();
+	if (!Main) return PreservationStatus::all();
 
-		for (auto BBIt = F->begin(); BBIt != F->end(); ++BBIt) {
-			BasicBlock *BB = *BBIt;
-			if (!BB) continue;
+	FunctionCallGraph CallGraph = M.buildDirectCallGraph();
+	if (isRecursiveFrom(Main, CallGraph)) {
+		return PreservationStatus::all();
+	}
 
-			for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
-				auto *AI = dynamic_cast<AllocaInst *>(*IIt);
-				if (!AI) continue;
+	// 只有程序入口 main 的生存期能在现有 IR 信息下可靠地
+	// 视为单次执行。普通函数即使非递归，也可能在循环中或多个
+	// 调用点重入，不能只凭“非递归”就全局化其局部对象。
+	// 同时只处理 entry block alloca，避免改变循环/分支内动态
+	// alloca 每次执行都创建新对象的语义。
+	BasicBlock *EntryBB = Main->front();
+	if (!EntryBB) return PreservationStatus::all();
 
-				auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
-				if (!PtrTy) continue;
+	for (auto IIt = EntryBB->begin(); IIt != EntryBB->end(); ++IIt) {
+		auto *AI = dynamic_cast<AllocaInst *>(*IIt);
+		if (!AI) continue;
 
-				std::shared_ptr<IRType> ElemTy = PtrTy->getPointerType();
-				if (!ElemTy) continue;
+		auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
+		if (!PtrTy) continue;
 
-				if (ElemTy->getSize() > RISCVThreshold) {
-					WorkList.emplace_back(AI, ElemTy);
-				}
-			}
+		std::shared_ptr<IRType> ElemTy = PtrTy->getPointerType();
+		if (!ElemTy) continue;
+
+		if (ElemTy->getSize() > RISCVThreshold) {
+			WorkList.emplace_back(AI, ElemTy);
 		}
 	}
 

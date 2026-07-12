@@ -186,9 +186,6 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     Function(TypeSystem ts,std::string ident);
     //同时向侵入式链表和vector中插入BasicBlock
     void pushBlock(BasicBlock*);
-    //清理vector
-//TODO：这个函数主要在优化的时候才会使用，等到后面再去实现这个函数
-    //void insertBlock(BasicBlock* pre,BasicBlock* curr,BasicBlock* insert);
     //在curr之前插入 -- 这个函数用于初始化创建
     void insertBlock(BasicBlock* curr,BasicBlock* insert);
     //参数管理

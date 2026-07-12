@@ -11,6 +11,66 @@
 #include <unordered_set>
 #include <vector>
 
+namespace {
+
+bool isDivisionOrRemainder(const Instruction *I) {
+	if (!I) return false;
+	switch (I->instType) {
+		case Instruction::SDIV:
+		case Instruction::UDIV:
+		case Instruction::FDIV:
+		case Instruction::SREM:
+		case Instruction::UREM:
+		case Instruction::FREM:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// 在同一基本块中，即使候选指令的块支配了所有 exit/latch，
+// 它前面仍可能有不返回的 call 或会 fault 的内存/除法指令。
+// 把候选移到 preheader 会让它在这些指令之前执行，所以这种
+// 情况不能仅凭基本块支配关系宣称 must-execute。
+bool hasSafeExecutionPrefix(const Instruction *Candidate) {
+	BasicBlock *BB = Candidate ? Candidate->getParent() : nullptr;
+	if (!BB) return false;
+
+	for (Instruction *I : *BB) {
+		if (I == Candidate) return true;
+		if (!I) return false;
+		if (dynamic_cast<LoadInst *>(I) ||
+			dynamic_cast<StoreInst *>(I) ||
+			dynamic_cast<CallInst *>(I) ||
+			isDivisionOrRemainder(I)) {
+			return false;
+		}
+	}
+	return false;
+}
+
+// 无 must-execute 证明时，只允许提前执行明确不会除零的
+// div/rem。signed div/rem 的 INT_MIN, -1 在不同 IR/目标
+// 语义下可能产生 poison 或 trap，因此保守拒绝 -1。
+bool isSpeculatableDivisionOrRemainder(Instruction *I) {
+	auto *BI = dynamic_cast<BinaryInst *>(I);
+	Value *Dividend = nullptr;
+	Value *Divisor = nullptr;
+	if (!BI || !BI->getOperands(Dividend, Divisor) || !Divisor) return false;
+	(void)Dividend;
+
+	if (!dynamic_cast<ConstantSystem *>(Divisor) || Divisor->isConstZero())
+		return false;
+	if ((I->instType == Instruction::SDIV ||
+		 I->instType == Instruction::SREM) &&
+		Value::isConstMinusOne(Divisor)) {
+		return false;
+	}
+	return true;
+}
+
+} // namespace
+
 
 // 1) 检查所有 user 是否都在循环外
 bool LICMPass::areAllUsersOutsideLoop(Instruction *I, const Loop &L) {
@@ -79,18 +139,13 @@ bool LICMPass::isSafeToMove(
 		case Instruction::ALLOCA:
 			return false;
 		case Instruction::SDIV:
+		case Instruction::UDIV:
 		case Instruction::FDIV:
 		case Instruction::SREM:
-		case Instruction::FREM: {
-			auto *BI = dynamic_cast<BinaryInst *>(I);
-			Value *Dividend = nullptr;
-			Value *Divisor = nullptr;
-			if (!BI || !BI->getOperands(Dividend, Divisor)) return false;
-			if (!Divisor) return false;
-			if (!dynamic_cast<ConstantSystem *>(Divisor)) return false;
-			if (Divisor->isConstZero()) return false;
+		case Instruction::UREM:
+		case Instruction::FREM:
+			if (!isSpeculatableDivisionOrRemainder(I)) return false;
 			break;
-		}
 		default:
 			break;
 	}
@@ -100,6 +155,13 @@ bool LICMPass::isSafeToMove(
 
 	// LOAD：循环内任一指令若可能 Mod 该地址，则不可移动
 	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
+		// 没有 dereferenceable/nonnull 属性时，load 不是可无条件
+		// 推测执行的指令。Sink 会消除原本可能发生的 fault；
+		// Hoist 则只在指令已证明 must-execute 时允许。
+		if (ForSink) return false;
+		if (!AggressiveHoist || !hasSafeExecutionPrefix(I)) return false;
+		if (I->getParent() != L.getHeader()) return false;
+
 		Value *Ptr = LIst->getPointerOperand();
 		if (!Ptr) return false;
 		bool UseIndexRange = LIst->getIRType() &&
@@ -123,7 +185,7 @@ bool LICMPass::isSafeToMove(
 
     // STORE：Hoist 直接禁止；Sink 需证明“最后一次写”
 	if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-		if (!ForSink && AggressiveHoist) return false;
+		if (!ForSink) return false;
 		Value *Ptr = SI->getPointerOperand();
 		if (!Ptr) return false;
 
@@ -165,6 +227,13 @@ bool LICMPass::isSafeToMove(
 
 	// CALL：副作用分析 + ModRef + untracked + RefSet 逐点核对
 	if (auto *CI = dynamic_cast<CallInst *>(I)) {
+		// 目前 IR 没有 willreturn/nounwind/speculatable 属性。即使
+		// SideEffectAnalysis 证明 call 不写内存，它仍可能不返回。
+		// 因此不做 call sink，hoist 也必须是 must-execute。
+		if (ForSink) return false;
+		if (!AggressiveHoist || !hasSafeExecutionPrefix(I)) return false;
+		if (I->getParent() != L.getHeader()) return false;
+
 		auto *CalleeFunc = CI->getDirectCallee();
 		if (!CalleeFunc) return false;
 

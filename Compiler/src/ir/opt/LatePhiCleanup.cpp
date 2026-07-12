@@ -44,8 +44,6 @@ Value *LatePhiCleanupPass::safeReplacement(PhiInst *Phi, const DominatorTree &DT
 		BB && Preds.size() == 1 && BB->getPredecessors().size() == 1 &&
 		BB->getPredecessors().front() == *Preds.begin();
 
-	// Replacing PHIs with values from loop exits is only legal when the value
-	// dominates the PHI use, or when the block really has only that predecessor.
 	if (!SoleCFGPred && !DT.dominatesValue(Common, Phi)) return nullptr;
 
 	if (SawUndef && !DT.dominatesValue(Common, Phi) && !SoleCFGPred) return nullptr;

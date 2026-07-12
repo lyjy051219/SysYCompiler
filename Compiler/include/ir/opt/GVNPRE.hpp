@@ -57,7 +57,8 @@ public:
 				 FunctionAnalysisPassManager &FAM,
 				 DominatorTree &DT,
 				 LoopInfo &LI,
-				 BasicAAResult &AA);
+				 BasicAAResult &AA,
+				 bool EnablePRE = true);
 
 	bool run();
 
@@ -67,6 +68,7 @@ private:
 	DominatorTree &DT;
 	LoopInfo &LI;
 	BasicAAResult &AA;
+	bool EnablePRE = true;
 
 	int NextValueNum = 1;
 	std::unordered_map<Value *, int> ValueNum;
@@ -143,5 +145,9 @@ private:
 // - PRE：部分冗余消除（基于 PHITranslate + AVAIL_OUT 集合）
 class GVNPREPass : public PassDescriptor<GVNPREPass> {
 public:
+	explicit GVNPREPass(bool EnablePRE = true) : EnablePRE(EnablePRE) {}
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+	bool EnablePRE = true;
 };

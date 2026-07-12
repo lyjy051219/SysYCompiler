@@ -21,6 +21,11 @@ bool InstSimplifyPass::getBinaryOperandsForOp(
 }
 
 bool InstSimplifyPass::matchNegation(Value *V, Value *&Y) {
+	// `0 - x` is not an exact floating-point negation: for example,
+	// `+0.0 - +0.0` is +0.0 rather than -0.0.  This helper is used by
+	// algebraic identities, so keep it in the modular-integer domain.
+	if (!V || !IRType::isInt(V->getIRType())) return false;
+
 	Value *L = nullptr;
 	Value *R = nullptr;
 	if (!InstSimplifyPass::getBinaryOperandsForOp(V, BinaryInst::SUB, L, R)) return false;
@@ -37,15 +42,12 @@ bool InstSimplifyPass::matchSub(Value *V, Value *&LHS, Value *&RHS) {
 
 bool InstSimplifyPass::isNegationPair(Value *A, Value *B) {
 	if (!A || !B) return false;
+	if (!IRType::isInt(A->getIRType()) || !IRType::isInt(B->getIRType())) return false;
 
 	int32_t AI = 0, BI = 0;
 	if (Value::tryGetIntConst(A, AI) && Value::tryGetIntConst(B, BI)) {
-		return AI == -BI;
-	}
-
-	float AF = 0.0f, BF = 0.0f;
-	if (Value::tryGetFloatConst(A, AF) && Value::tryGetFloatConst(B, BF)) {
-		return AF == -BF;
+		// Widen before negating so INT_MIN does not trigger signed host UB.
+		return static_cast<int64_t>(AI) == -static_cast<int64_t>(BI);
 	}
 
 	Value *SL = nullptr, *SR = nullptr;
@@ -437,7 +439,13 @@ private:
 			return Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (Value::isConstZero(RHS)) {
+		// `fadd x, +0.0` is not an IEEE identity for x == -0.0.  Adding -0.0
+		// is an exact identity, however, so retain that strictly-safe case.
+		float FloatZero = 0.0f;
+		const bool IsNegativeFloatZero = IRType::isFloat(BI->getIRType()) &&
+			Value::tryGetFloatConst(RHS, FloatZero) && FloatZero == 0.0f &&
+			std::signbit(FloatZero);
+		if ((IsIntArith || IsNegativeFloatZero) && Value::isConstZero(RHS)) {
 			return LHS;
 		}
 
@@ -475,11 +483,18 @@ private:
 			return Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (Value::isConstZero(RHS)) {
+		// `fsub x, +0.0` is an exact IEEE identity; `fsub x, -0.0` is not
+		// (for example, -0.0 - -0.0 is +0.0).  Preserve only the safe sign.
+		float FloatZero = 0.0f;
+		const bool IsPositiveFloatZero = IRType::isFloat(BI->getIRType()) &&
+			Value::tryGetFloatConst(RHS, FloatZero) && FloatZero == 0.0f &&
+			!std::signbit(FloatZero);
+		if ((IsIntArith || IsPositiveFloatZero) && Value::isConstZero(RHS)) {
 			return LHS;
 		}
 
-		if (LHS == RHS) {
+		// `fsub x, x` is NaN for NaN/Inf and therefore is not always +0.0.
+		if (IsIntArith && LHS == RHS) {
 			return Value::makeZeroForType(BI->getIRType());
 		}
 
@@ -550,6 +565,8 @@ private:
 	}
 
 	Value *simplifyMul(BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed) {
+		const bool IsIntArith = IRType::isInt(BI->getIRType()) && !IRType::isBool(BI->getIRType());
+
 		if (LHS->isConst() && RHS->isConst()) {
 			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
@@ -557,10 +574,15 @@ private:
 		maybeSwapCommutative(BI, LHS, RHS, Changed);
 
 		if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
-			return Value::makeZeroForType(BI->getIRType());
+			// Choosing integer undef as zero is valid under the IR's undef
+			// semantics.  It is not valid for strict FP when the other operand
+			// may be Inf (0.0 * Inf is NaN).
+			return IsIntArith ? Value::makeZeroForType(BI->getIRType())
+			                  : Value::makeUndefForType(BI->getIRType());
 		}
 
-		if (Value::isConstZero(RHS)) {
+		// `fmul x, 0.0` is NaN for NaN/Inf and also carries signed-zero rules.
+		if (IsIntArith && Value::isConstZero(RHS)) {
 			return Value::makeZeroForType(BI->getIRType());
 		}
 
@@ -591,12 +613,15 @@ private:
 	Value *simplifyDiv(BinaryInst *BI, Value *LHS, Value *RHS) {
 		const auto Op = BI->getOp();
 		const auto Ty = BI->getIRType();
+		const bool IsFloat = IRType::isFloat(Ty);
+		const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
 
-		if (Op == BinaryInst::DIV && IRType::isInt(Ty) && InstSimplifyPass::isNegationPair(LHS, RHS)) {
-			return Value::makeMinusOneForType(Ty);
-		}
+		// Do not fold x / (0 - x) to -1 without a range/no-wrap proof:
+		// for signed INT_MIN, 0 - x wraps back to x and the quotient is 1.
 
 		if (LHS->isConst() && RHS->isConst()) {
+			// foldConstants distinguishes integer zero-divisor undef from IEEE
+			// fdiv Inf/NaN and is safe for fully constant operands.
 			return BinaryInst::foldConstants(Op, LHS, RHS);
 		}
 
@@ -605,6 +630,7 @@ private:
 		}
 
 		if (Value::isUndef(LHS)) {
+			if (IsFloat) return Value::makeUndefForType(Ty);
 			if (Value::isConstZero(RHS) || Value::isUndef(RHS)) {
 				return Value::makeUndefForType(Ty);
 			}
@@ -612,14 +638,16 @@ private:
 		}
 
 		if (Value::isConstZero(RHS)) {
-			return Value::makeUndefForType(Ty);
+			return IsFloat ? nullptr : Value::makeUndefForType(Ty);
 		}
 
-		if (Value::isConstZero(LHS)) {
+		// Strict FP 0/x is not constant: x may be zero, NaN, Inf or signed.
+		if (IsIntArith && Value::isConstZero(LHS)) {
 			return Value::makeZeroForType(Ty);
 		}
 
-		if (LHS == RHS) {
+		// Strict FP x/x is NaN for zero, Inf and NaN.
+		if (IsIntArith && LHS == RHS) {
 			return Value::makeOneForType(Ty);
 		}
 
@@ -627,7 +655,8 @@ private:
 			return LHS;
 		}
 
-		if (Op == BinaryInst::DIV && Value::isConstMinusOne(RHS)) {
+		// fdiv x, -1.0 and 0.0 - x disagree for signed zero.
+		if (IsIntArith && Op == BinaryInst::DIV && Value::isConstMinusOne(RHS)) {
 			return new BinaryInst(Value::makeZeroForType(Ty), BinaryInst::SUB, LHS);
 		}
 
@@ -636,23 +665,33 @@ private:
 
 	Value *simplifyRem(BinaryInst *BI, Value *LHS, Value *RHS) {
 		const auto Ty = BI->getIRType();
+		const bool IsFloat = IRType::isFloat(Ty);
+		const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
 
-		if (InstSimplifyPass::isNegationPair(LHS, RHS)) {
+		if (IsIntArith && InstSimplifyPass::isNegationPair(LHS, RHS)) {
 			return Value::makeZeroForType(Ty);
 		}
 
 		if (LHS->isConst() && RHS->isConst()) {
+			// Constant IEEE frem, including a zero divisor, is handled as NaN by
+			// foldConstants rather than integer-style undef.
 			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
 		if (Value::isUndef(RHS)) return Value::makeUndefForType(Ty);
-		if (Value::isUndef(LHS)) return Value::makeZeroForType(Ty);
+		if (Value::isUndef(LHS)) {
+			return IsFloat ? Value::makeUndefForType(Ty)
+			               : Value::makeZeroForType(Ty);
+		}
 
-		if (Value::isConstZero(LHS)) return Value::makeZeroForType(Ty);
-		if (Value::isConstZero(RHS)) return Value::makeUndefForType(Ty);
-		if (Value::isConstOne(RHS)) return Value::makeZeroForType(Ty);
-		if (BI->getOp() == BinaryInst::MOD && Value::isConstMinusOne(RHS)) return Value::makeZeroForType(Ty);
-		if (LHS == RHS) return Value::makeZeroForType(Ty);
+		if (IsIntArith && Value::isConstZero(LHS)) return Value::makeZeroForType(Ty);
+		if (Value::isConstZero(RHS)) {
+			return IsFloat ? nullptr : Value::makeUndefForType(Ty);
+		}
+		if (IsIntArith && Value::isConstOne(RHS)) return Value::makeZeroForType(Ty);
+		if (IsIntArith && BI->getOp() == BinaryInst::MOD && Value::isConstMinusOne(RHS))
+			return Value::makeZeroForType(Ty);
+		if (IsIntArith && LHS == RHS) return Value::makeZeroForType(Ty);
 
 		return nullptr;
 	}
@@ -741,6 +780,18 @@ private:
 
 	Value *simplifyCmp(BinaryInst *BI, Value *LHS, Value *RHS) {
 		if (LHS->isConst() && RHS->isConst()) {
+			// BinaryInst prints all floating predicates as unordered fcmp.
+			// C++ comparisons used by foldConstants are ordered for NaN, so
+			// handle the unordered case explicitly.
+			if (IRType::isFloat(LHS->getIRType())) {
+				float LV = 0.0f;
+				float RV = 0.0f;
+				if (Value::tryGetFloatConst(LHS, LV) &&
+					Value::tryGetFloatConst(RHS, RV) &&
+					(std::isnan(LV) || std::isnan(RV))) {
+					return ConstBool::newConstBool(true);
+				}
+			}
 			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 		}
 
@@ -821,7 +872,10 @@ private:
 			if (Value *R = tryModEqPow2(RHS, LHS)) return R;
 		}
 
-		if (LHS == RHS) {
+		// With strict FP, self-comparisons depend on NaN.  Even where one
+		// unordered predicate happens to be constant, keeping the fcmp here
+		// avoids silently assuming nnan in this generic integer/FP path.
+		if (LHS == RHS && !IRType::isFloat(LHS->getIRType())) {
 			switch (BI->getOp()) {
 			case BinaryInst::E:
 			case BinaryInst::GE:
@@ -944,13 +998,18 @@ private:
 			Value *CmpL = nullptr;
 			Value *CmpR = nullptr;
 			if (BinaryInst::getOperands(Cmp, CmpL, CmpR) && CmpL && CmpR) {
-				if (Cmp->getOp() == BinaryInst::E &&
+				const bool IsFloatCmp = IRType::isFloat(CmpL->getIRType());
+
+				if (!IsFloatCmp && Cmp->getOp() == BinaryInst::E &&
 					((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
-					return TV;
+					// select(x == y, x, y) is y on the false edge and x == y
+					// on the true edge, hence it is exactly the false value.
+					return FV;
 				}
 
-				if (Cmp->getOp() == BinaryInst::NE &&
+				if (!IsFloatCmp && Cmp->getOp() == BinaryInst::NE &&
 					((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
+					// Conversely, select(x != y, x, y) is the true value.
 					return TV;
 				}
 

@@ -26,10 +26,92 @@
 // =====================================================================
 
 // =====================================================================
-// Phase 1: 块内 DSE（保留现有逻辑）
+// Phase 1: 块内 DSE
 // =====================================================================
 
-bool DSEPass::eliminateInBlock(BasicBlock *BB) {
+namespace {
+
+bool storesHaveIdenticalCoverage(const StoreInst *First,
+                                 const StoreInst *Second) {
+    Value *FirstValue = First ? First->getValueOperand() : nullptr;
+    Value *SecondValue = Second ? Second->getValueOperand() : nullptr;
+    return FirstValue && SecondValue && FirstValue->getIRType() &&
+           FirstValue->getIRType() == SecondValue->getIRType();
+}
+
+bool storeFullyCoversPointer(Value *Pointer, const StoreInst *Store) {
+    std::shared_ptr<IRType> PointeeTy =
+        Pointer ? Pointer->getPointeeType() : nullptr;
+    Value *StoredValue = Store ? Store->getValueOperand() : nullptr;
+    return PointeeTy && StoredValue && StoredValue->getIRType() &&
+           PointeeTy == StoredValue->getIRType();
+}
+
+// A stack allocation is private at function exit only while none of its
+// derived pointers escapes.  Merely tracing P back to an alloca is not enough:
+// the address may have been stored elsewhere or retained by an earlier call.
+bool isNonEscapingLocalStackPointer(Value *Pointer) {
+    auto *Root = dynamic_cast<AllocaInst *>(
+        Value::stripPointerCastsAndGEP(Pointer));
+    if (!Root) return false;
+
+    std::unordered_set<Value *> Visited;
+    std::vector<Value *> Worklist{Root};
+    while (!Worklist.empty()) {
+        Value *Current = Worklist.back();
+        Worklist.pop_back();
+        if (!Current || !Visited.insert(Current).second) continue;
+
+        for (auto It = Current->getUseList().begin();
+             It != Current->getUseList().end(); ++It) {
+            Use *U = *It;
+            if (!U || U->getValue() != Current) continue;
+            User *Usr = U->getUser();
+            if (!Usr) return false;
+
+            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Usr)) {
+                if (GEP->getBasePointer() != Current) return false;
+                Worklist.push_back(GEP);
+                continue;
+            }
+            if (auto *BC = dynamic_cast<BitCastInst *>(Usr)) {
+                if (BC->getUnaryOperand() != Current) return false;
+                Worklist.push_back(BC);
+                continue;
+            }
+            if (auto *LI = dynamic_cast<LoadInst *>(Usr)) {
+                if (LI->getPointerOperand() != Current) return false;
+                continue;
+            }
+            if (auto *SI = dynamic_cast<StoreInst *>(Usr)) {
+                // Using Current as the destination is an ordinary access.
+                // Storing Current as the value publishes the address.
+                if (SI->getPointerOperand() != Current ||
+                    SI->getValueOperand() == Current)
+                    return false;
+                continue;
+            }
+
+            // Calls, returns, PHIs/selects and every unmodelled pointer use are
+            // conservatively considered captures.
+            return false;
+        }
+    }
+    return true;
+}
+
+// 块内逆向扫描时，PendingStores 表示“位于当前位置之后，可能
+// 覆盖更早 store”的候选。候选只能跨过确定 NoAlias 的内存事件：
+//
+//   store 1, p
+//   x = load q       ; q MayAlias p
+//   store 2, p
+//
+// 如果 load q 没有清除 p 的候选，第一个 store 会被错删。同理，
+// 一个仅 MayAlias 的 store 不能当作完整覆盖证明；这里也将它作为
+// 保守的候选边界，避免未来引入不同访存宽度后误判。
+bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
+                            const LoopInfo &LoopInfo) {
     if (BB == nullptr) {
         return false;
     }
@@ -46,10 +128,23 @@ bool DSEPass::eliminateInBlock(BasicBlock *BB) {
         Instruction *I = *it;
 
         if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-            if (Value *ptr = LI->getPointerOperand()) {
-                pendingStores.erase(ptr);
-            } else {
+            Value *LoadPtr = LI->getPointerOperand();
+            if (!LoadPtr) {
                 pendingStores.clear();
+                continue;
+            }
+
+            for (auto PendingIt = pendingStores.begin();
+                 PendingIt != pendingStores.end();) {
+                Value *StorePtr = PendingIt->first;
+                AliasInfo Alias = LoadPtr == StorePtr
+                                      ? AliasInfo::MustAlias
+                                      : AA.alias(LoadPtr, StorePtr, LoopInfo);
+                if (Alias != AliasInfo::NoAlias) {
+                    PendingIt = pendingStores.erase(PendingIt);
+                } else {
+                    ++PendingIt;
+                }
             }
             continue;
         }
@@ -60,13 +155,39 @@ bool DSEPass::eliminateInBlock(BasicBlock *BB) {
                 pendingStores.clear();
                 continue;
             }
-            auto pendingIt = pendingStores.find(ptr);
-            if (pendingIt != pendingStores.end()) {
+
+            auto ExactIt = pendingStores.find(ptr);
+            bool FullyOverwritten =
+                ExactIt != pendingStores.end() &&
+                storesHaveIdenticalCoverage(SI, ExactIt->second);
+            if (!FullyOverwritten) {
+                for (const auto &Pending : pendingStores) {
+                    if (AA.alias(ptr, Pending.first, LoopInfo) ==
+                            AliasInfo::MustAlias &&
+                        storesHaveIdenticalCoverage(SI, Pending.second)) {
+                        FullyOverwritten = true;
+                        break;
+                    }
+                }
+            }
+
+            if (FullyOverwritten) {
                 delete SI;
                 changed = true;
                 continue;
             }
 
+            // MayAlias store 不足以证明覆盖了 Pending store 的完整
+            // 对象。把这些候选停在此处，只保留 NoAlias 候选跨过它。
+            for (auto PendingIt = pendingStores.begin();
+                 PendingIt != pendingStores.end();) {
+                AliasInfo Alias = AA.alias(ptr, PendingIt->first, LoopInfo);
+                if (Alias != AliasInfo::NoAlias) {
+                    PendingIt = pendingStores.erase(PendingIt);
+                } else {
+                    ++PendingIt;
+                }
+            }
             pendingStores[ptr] = SI;
             continue;
         }
@@ -79,15 +200,25 @@ bool DSEPass::eliminateInBlock(BasicBlock *BB) {
     return changed;
 }
 
+} // namespace
+
+// 保留类内原有 helper 的 ABI；真正的块内 DSE 需要 AA/LoopInfo，
+// run() 会调用上面的 eliminateInBlockWithAA。没有别名信息时不做
+// 一个可能不安全的快速删除。
+bool DSEPass::eliminateInBlock(BasicBlock *BB) {
+    (void)BB;
+    return false;
+}
+
 // =====================================================================
 // Phase 2: 全局 DSE — Forward Kill Coverage
 // =====================================================================
 
 // 从 First 开始扫描，确定对指针 P 的第一个相关事件。
 //
-// 【假设】当前 IR 中 MustAlias 隐含完整覆盖（同类型同宽度）。
-// 若后续 IR 引入不同宽度/切片的 store 到同基地址，
-// 此处 KILL 判定需要额外加大小比较。
+// MustAlias 只能证明起始地址一致，不能单独证明覆盖宽度。
+// KILL 还要求 store value 与 P 的 pointee 是同一 IRType，防止
+// bitcast/不同宽度访存把部分覆盖误当成完整覆盖。
 DSEBlockColor DSEPass::classifyFrom(
     Instruction *First, Value *P,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -98,7 +229,8 @@ DSEBlockColor DSEPass::classifyFrom(
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             Value *StorePtr = SI->getPointerOperand();
             if (StorePtr &&
-                AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias) {
+                AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias &&
+                storeFullyCoversPointer(P, SI)) {
                 return DSEBlockColor::Kill;
             }
         }
@@ -152,7 +284,7 @@ bool DSEPass::isStoreDead(
     {
         auto b1Succs = B1->getSuccessors();
         if (b1Succs.empty()) {
-            if (Value::isLocalStackPointer(P)) {
+            if (isNonEscapingLocalStackPointer(P)) {
                 return true;   // 局部变量，返回后无人读，store 可删
             } else {
                 return false;  // 非局部指针，caller 可能读 → S1 alive
@@ -208,7 +340,7 @@ bool DSEPass::isStoreDead(
             // exit 块：函数即将返回。
             // 只有 P 是栈内存（返回后对 caller 不可见）时才可忽略此 exit。
             // 非局部指针（global/param）在函数返回后 caller 可能读 → S1 alive。
-            if (Value::isLocalStackPointer(P)) {
+            if (isNonEscapingLocalStackPointer(P)) {
                 continue;
             } else {
                 return false;
@@ -236,10 +368,10 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
     // === Phase 1: 块内 DSE ===
-    // 保留现有 eliminateInBlock 逻辑
-    // 此阶段会直接 delete 死 store
+    // 此阶段会直接 delete 死 store。所有跨内存事件的候选都必须
+    // 经过 AA 证明 NoAlias，不再只按 Value* 相等性清障。
     for (BasicBlock *BB : F) {
-        changed |= eliminateInBlock(BB);
+        changed |= eliminateInBlockWithAA(BB, AA, LI);
     }
 
     // === Phase 2: 全局 DSE — Forward Kill Coverage ===

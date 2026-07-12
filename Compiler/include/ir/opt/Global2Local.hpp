@@ -11,7 +11,6 @@ struct Global2LocalCandidateInfo {
 	Variable *GV = nullptr;
 	std::shared_ptr<IRType> ElemTy;
 	std::vector<Use *> MainUses;
-	bool HasNonEntryStore = false;
 };
 
 class Global2LocalPass : public PassDescriptor<Global2LocalPass> {
