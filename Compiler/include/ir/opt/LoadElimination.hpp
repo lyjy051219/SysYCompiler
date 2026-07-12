@@ -40,7 +40,23 @@ public:
 
 private:
     static constexpr int MaxQueryDepth = 8;
+
+    static constexpr int MaxDominatorSearchDepth = 16;
+    static constexpr int MaxPathScanBlocks = 64;
+    static constexpr int MaxPathScanInstructions = 2048;
+    static constexpr int MaxDominatingQueriesPerFunction = 64;
     static bool isTypeCompatible(Value *Source, LoadInst *TargetLoad);
+    static bool mayModifyPointer(
+        Value *P, Instruction *I, BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
+    static bool isUnmodifiedOnAllPaths(
+        LoadInst *Candidate, LoadInst *Target, Value *P,
+        DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
+    static LoadInst *findAvailableDominatingLoad(
+        LoadInst *Target, BasicBlock *BB, DominatorTree &DT,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
     static LoadElimQueryResult scanBlockBackward(
         BasicBlock *BB, Value *P, Instruction *StopBefore,
         LoadInst *TargetLoad, BasicAAResult &AA, const LoopInfo &LI,
@@ -52,8 +68,9 @@ private:
         BasicAAResult &AA, const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM);
     static bool processLoad(
-        LoadInst *Load, BasicBlock *BB, BasicAAResult &AA,
-        const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
+        LoadInst *Load, BasicBlock *BB, DominatorTree &DT,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM, int &DominatingQueryBudget);
     static bool processFunction(
         Function &F, DominatorTree &DT, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM);

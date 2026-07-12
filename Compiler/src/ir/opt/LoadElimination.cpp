@@ -30,19 +30,167 @@
 // - AA MustAlias + 类型检查，不只做精确指针匹配
 // - if-else PHI synthesis（分支两边不同值 → 自动造 PHI）
 // - onStack + memo 正确处理钻石图和循环
+// - 支配 load 跨透明回边复用（完整路径无 Mod 证明）
 // =====================================================================
 
 // =====================================================================
 // 辅助函数
 // =====================================================================
 
-// 【假设】当前 IR 中同一 MustAlias 地址上的 load/store 类型一定一致。
-// 若后续 IR 出现 bitcast / 不同宽度访问同址，此处需增加宽度检查。
+// MustAlias only identifies an address; it does not make differently-sized
+// or differently-shaped accesses interchangeable.
 bool LoadEliminationPass::isTypeCompatible(
     Value *source, LoadInst *targetLoad) {
     if (!source || !targetLoad) return false;
     if (!source->getIRType() || !targetLoad->getIRType()) return false;
-    return source->getIRType()->getEnum() == targetLoad->getIRType()->getEnum();
+    return source->getIRType()->hasSameShape(*targetLoad->getIRType());
+}
+
+// Return true whenever I may change the memory read through P.  Keep the
+// extra pointer-argument check used by the local scanner: a temporarily
+// incomplete interprocedural summary must never turn a call into a false
+// NoModRef result.
+bool LoadEliminationPass::mayModifyPointer(
+    Value *P, Instruction *I, BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM)
+{
+    if (!P || !I) return true;
+
+    ModRefInfo MR = getInstModRefInfo(P, I, AA, LI, FAM);
+    if (isModSet(MR)) return true;
+
+    if (auto *CI = dynamic_cast<CallInst *>(I)) {
+        if (isNoModRef(MR) && AA.callMayAliasPointer(CI, P, LI)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check the complete CFG region between Candidate and Target.  Block
+// dominance alone is insufficient: a backedge may execute a store after the
+// dominating load and before a later dynamic execution of Target.  Walking
+// backwards over every predecessor (including loop backedges) and rejecting
+// any possible Mod proves that Candidate's value is still available.
+//
+// Reaching Candidate cuts a path: an execution through Candidate refreshes
+// the SSA value, so instructions before it are irrelevant.  The visited set
+// makes transparent cycles converge.  DT dominance guarantees that no finite
+// entry-to-Target path can bypass Candidate.
+bool LoadEliminationPass::isUnmodifiedOnAllPaths(
+    LoadInst *Candidate, LoadInst *Target, Value *P,
+    DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM)
+{
+    if (!Candidate || !Target || !P) return false;
+    BasicBlock *CandidateBB = Candidate->getParent();
+    BasicBlock *TargetBB = Target->getParent();
+    if (!CandidateBB || !TargetBB || CandidateBB == TargetBB) return false;
+    if (!DT.dominates(CandidateBB, TargetBB)) return false;
+
+    struct ScanState {
+        BasicBlock *BB;
+        bool TargetPrefixOnly;
+    };
+    std::vector<ScanState> worklist{{TargetBB, true}};
+    std::unordered_set<BasicBlock *> visited;
+    int scannedBlocks = 0;
+    int scannedInstructions = 0;
+
+    while (!worklist.empty()) {
+        ScanState State = worklist.back();
+        worklist.pop_back();
+        BasicBlock *BB = State.BB;
+        if (!BB) return false;
+
+        // The initial Target state scans only instructions before the load.
+        // If a loop backedge reaches TargetBB again, it must be scanned as a
+        // complete block so that a store *after* Target in the previous
+        // iteration is not missed.
+        if (!State.TargetPrefixOnly && !visited.insert(BB).second) continue;
+        if (++scannedBlocks > MaxPathScanBlocks) return false;
+
+        Instruction *I = State.TargetPrefixOnly ? Target->getPrev() : BB->back();
+        bool reachedCandidate = false;
+        for (; I; I = I->getPrev()) {
+            if (++scannedInstructions > MaxPathScanInstructions) return false;
+            if (BB == CandidateBB && I == Candidate) {
+                reachedCandidate = true;
+                break;
+            }
+            if (mayModifyPointer(P, I, AA, LI, FAM)) return false;
+        }
+
+        if (BB == CandidateBB) {
+            // Candidate must physically belong to this block and precede all
+            // instructions that were scanned above.
+            if (!reachedCandidate) return false;
+            continue;
+        }
+
+        auto preds = BB->getPredecessors();
+        if (preds.empty()) return false;
+        for (BasicBlock *Pred : preds) {
+            if (!Pred) return false;
+            worklist.push_back({Pred, false});
+        }
+    }
+    return true;
+}
+
+// The recursive predecessor solver intentionally treats a CFG cycle as
+// Unknown.  That is correct for arbitrary reaching definitions, but misses a
+// common nested-loop case:
+//
+//   invariant = load A[i][k]       // dominates the inner loop
+//   while (j < n) use load A[i][k]
+//
+// Search the dominator chain for such a load and separately prove that the
+// entire intervening CFG region contains no possible Mod of the address.
+LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
+    LoadInst *Target, BasicBlock *BB, DominatorTree &DT,
+    BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM)
+{
+    Value *P = Target ? Target->getPointerOperand() : nullptr;
+    if (!Target || !BB || !P) return nullptr;
+
+    // This fallback exists specifically for a predecessor query stopped by a
+    // loop backedge.  Outside loops the normal dataflow is cheaper.  Reusing a
+    // value across iterations also requires the address itself to be defined
+    // outside the innermost loop.
+    Loop *TargetLoop = LI.getLoopFor(BB);
+    if (!TargetLoop) return nullptr;
+    if (auto *PtrI = dynamic_cast<Instruction *>(P)) {
+        BasicBlock *PtrBB = PtrI->getParent();
+        if (!PtrBB || TargetLoop->contains(PtrBB)) return nullptr;
+    }
+
+    BasicBlock *Ancestor = DT.getIDom(BB);
+    int depth = 0;
+    for (; Ancestor && depth < MaxDominatorSearchDepth;
+         Ancestor = DT.getIDom(Ancestor), ++depth) {
+        if (TargetLoop->contains(Ancestor)) continue;
+        if (!DT.dominates(Ancestor, TargetLoop->getHeader())) continue;
+
+        for (Instruction *I = Ancestor->back(); I; I = I->getPrev()) {
+            auto *Candidate = dynamic_cast<LoadInst *>(I);
+            if (!Candidate || !isTypeCompatible(Candidate, Target)) continue;
+
+            Value *CandidateP = Candidate->getPointerOperand();
+            if (!CandidateP ||
+                AA.aliasWithIndexRange(P, CandidateP, LI) !=
+                    AliasInfo::MustAlias) {
+                continue;
+            }
+
+            if (isUnmodifiedOnAllPaths(Candidate, Target, P, DT, AA, LI,
+                                       FAM)) {
+                return Candidate;
+            }
+        }
+    }
+    return nullptr;
 }
 
 // =====================================================================
@@ -216,8 +364,8 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
 // =====================================================================
 bool LoadEliminationPass::processLoad(
     LoadInst *loadInst, BasicBlock *BB,
-    BasicAAResult &AA, const LoopInfo &LI,
-    FunctionAnalysisPassManager &FAM)
+    DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM, int &DominatingQueryBudget)
 {
     Value *P = loadInst ? loadInst->getPointerOperand() : nullptr;
     if (!P) return false;
@@ -233,6 +381,19 @@ bool LoadEliminationPass::processLoad(
 
     if (result.kind != LoadElimQueryResult::NEED_PREDECESSORS) {
         return false;   // CLOBBERED 或其他
+    }
+
+    // The predecessor query below cannot solve transparent CFG cycles.  A
+    // dominating MustAlias load is nevertheless reusable when every path
+    // from it to this load is proven free of possible modifications.
+    if (DominatingQueryBudget > 0) {
+        --DominatingQueryBudget;
+        if (LoadInst *available = findAvailableDominatingLoad(
+                loadInst, BB, DT, AA, LI, FAM)) {
+            loadInst->replaceAllUsesWith(available);
+            delete loadInst;
+            return true;
+        }
     }
 
     // Step 2: 查前驱
@@ -292,6 +453,7 @@ bool LoadEliminationPass::processFunction(
     FunctionAnalysisPassManager &FAM)
 {
     bool changed = false;
+    int DominatingQueryBudget = MaxDominatingQueriesPerFunction;
 
     // DFS 前序遍历支配树
     std::stack<DominatorNode*> dtStack;
@@ -314,7 +476,8 @@ bool LoadEliminationPass::processFunction(
         for (LoadInst *LI2 : loads) {
             // 检查 load 是否还活着（可能被前一轮 processLoad 间接影响）
             if (LI2->getParent() != BB) continue;
-            changed |= processLoad(LI2, BB, AA, LI, FAM);
+            changed |= processLoad(LI2, BB, DT, AA, LI, FAM,
+                                   DominatingQueryBudget);
         }
 
         // 推入子节点（逆序推入保持前序遍历顺序）

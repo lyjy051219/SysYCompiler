@@ -1623,23 +1623,74 @@ LoopUnrollPass::LoopUnrollPass(UnrollConfig ConfigValue)
 
 PreservationStatus LoopUnrollPass::run(Function &F,
                                        FunctionAnalysisPassManager &FAM) {
-    auto &LI = FAM.getResult<LoopAnalysis>(F);
-    if (LI.getTopLevelLoops().empty()) {
-        return PreservationStatus::all();
-    }
-
-    auto &DT = FAM.getResult<DominantAnalysis>(F);
-    auto &SE = FAM.getResult<SCEVAnalysis>(F);
-
-    for (Loop *L : LI.getLoopsInPostOrder(true)) {
-        LoopUnrollResult Result = tryToUnrollLoop(F, L, LI, DT, SE);
-        if (Result != LoopUnrollResult::Unmodified) {
-            SE.clear();
-            return PreservationStatus::none();
+    auto &AlreadyTransformed = TransformedLoopHeaders[&F];
+    // Capture only the loops present at pass entry.  A successful original
+    // header is remembered across invocations of this pass object, preventing
+    // an enclosing fixed point from multiplying one partial unroll again
+    // (4x -> 16x -> 32x).  Newly-created residual/remainder headers remain
+    // eligible in a later bounded round.
+    std::vector<BasicBlock *> CandidateHeaders;
+    {
+        auto &InitialLI = FAM.getResult<LoopAnalysis>(F);
+        for (Loop *L : InitialLI.getLoopsInPostOrder(true)) {
+            if (L && L->getHeader() &&
+                AlreadyTransformed.count(L->getHeader()->getIdent()) == 0)
+                CandidateHeaders.push_back(L->getHeader());
         }
     }
 
-    return PreservationStatus::all();
+    if (CandidateHeaders.empty()) return PreservationStatus::all();
+
+    // Keep whole-function code growth and analysis rebuild cost bounded.  A
+    // function may contain dozens of individually profitable small loops
+    // (82_long_func has about ninety); unrolling all of them in one pass can
+    // multiply compile time and IR size.  Four successful transforms per
+    // invocation still give broader coverage than the old one-loop limit,
+    // while the enclosing three-round pipeline retains a hard global budget.
+    static constexpr size_t MaxTransformsPerRun = 4;
+    size_t TransformCount = 0;
+    bool Changed = false;
+    for (BasicBlock *Header : CandidateHeaders) {
+        // An earlier full unroll of a containing loop may have erased this
+        // candidate.  Check membership using pointer identity only; never
+        // dereference a header until it is found in the live function list.
+        bool HeaderIsLive = false;
+        for (BasicBlock *BB : F) {
+            if (BB == Header) {
+                HeaderIsLive = true;
+                break;
+            }
+        }
+        if (!HeaderIsLive) continue;
+
+        auto &LI = FAM.getResult<LoopAnalysis>(F);
+        Loop *L = LI.getLoopFor(Header);
+        if (!L || L->getHeader() != Header) continue;
+
+        auto &DT = FAM.getResult<DominantAnalysis>(F);
+        auto &SE = FAM.getResult<SCEVAnalysis>(F);
+        const std::string HeaderIdent = Header->getIdent();
+        LoopUnrollResult Result = tryToUnrollLoop(F, L, LI, DT, SE);
+        if (Result == LoopUnrollResult::Unmodified) continue;
+
+        AlreadyTransformed.insert(HeaderIdent);
+        Changed = true;
+        ++TransformCount;
+        SE.clear();
+
+        // The transform invalidates every Loop*/DT/SCEV reference above.
+        // Rebuild them before considering the next entry-snapshot loop.
+        PreservationStatus RoundPA = PreservationStatus::all();
+        RoundPA.discard<DominantAnalysis>();
+        RoundPA.discard<LoopAnalysis>();
+        RoundPA.discard<SCEVAnalysis>();
+        FAM.invalidate(F, RoundPA);
+
+        if (TransformCount >= MaxTransformsPerRun) break;
+    }
+
+    return Changed ? PreservationStatus::none()
+                   : PreservationStatus::all();
 }
 
 LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,

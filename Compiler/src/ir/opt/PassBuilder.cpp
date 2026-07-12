@@ -94,7 +94,7 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
 // 2.5 展开后深度清理 Pipeline
 // LoopUnroll 会复制控制流、扩大基本块并暴露退化 PHI / 常量分支 / 死副本。
 // 这里使用偏局部、确定性的清理组合，收敛展开带来的直接噪声，再把循环形态
-// 修回 LoopSimplify + LCSSA，供后续 LICM / LSR 继续消费。
+// 修回 LoopSimplify + LCSSA，并立即让 LICM 消费最后一轮展开暴露的不变式。
 FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
@@ -118,8 +118,12 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(LoopSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 4));
     FPM.addPass(LCSSAPass());
+    // Do not rely on the next outer fixed-point iteration: the final allowed
+    // unroll round must also get a chance to hoist newly exposed invariants.
+    FPM.addPass(LICMPass());
     return FPM;
 }
 
@@ -128,18 +132,24 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
 FunctionPassManager PassBuilder::buildLoopPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(BreakCriticalEdgesPass());
-    FPM.addPass(LoopSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
 
     // 先旋转/规范化，再重新建立 LoopSimplify + LCSSA，让 Unroll 看到更稳定的
     // trip-count 和 latch/header 形态。
     FPM.addPass(LoopRotatePass());
     FPM.addPass(CFGSimplifyPass());
-    FPM.addPass(LoopSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
     FPM.addPass(LICMPass());         // 循环不变量外提
     FPM.addPass(LoopDeletionPass()); // 消除死循环或无用循环
     FPM.addPass(LoopStrengthReductionPass()); // GEP 地址归纳变量强度削弱
+    // One invocation considers loops from its entry snapshot, subject to a
+    // function-wide transform budget.  Each CFG mutation rebuilds DT/LI/SCEV;
+    // an original header is not partially unrolled again in a later fixed-
+    // point round, while newly-created residual loops remain eligible.
     FPM.addPass(LoopUnrollPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildPostUnrollCleanupPipeline(), 2));

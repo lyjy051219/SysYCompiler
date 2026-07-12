@@ -130,8 +130,6 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
         }
     }
 
-    bool changed = false;
-
     for (auto &it : exitInsidePreds) {
         BasicBlock *exitBB = it.first;
         const std::set<BasicBlock *> &insidePredSet = it.second;
@@ -157,10 +155,15 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
 
         rewritePhisForMergedPreds(exitBB, insidePreds, dedExit);
         dedExit->genUnCondInst(exitBB);
-        changed = true;
+
+        // LoopInfo belongs to the CFG snapshot at pass entry.  Even though a
+        // dedicated exit is outside the loop, do not perform another CFG
+        // rewrite with that snapshot.  The caller invalidates/rebuilds the
+        // dominator tree and LoopInfo before continuing with the next exit.
+        return true;
     }
 
-    return changed;
+    return false;
 }
 
 bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
@@ -238,17 +241,18 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     bool changed = false;
     bool cfgChanged = false;
-    //只访问顶层循环，然后对每个顶层使用后序遍历（先修改最内层的loop结构，然后从内到外修改其他loop结构）
-    //在LoopInfo中，每个顶层循环都是一棵森林
-    //递归法实现的后序遍历
-    for (Loop *topLoop : LI.getTopLevelLoops()) {
-        if (!topLoop || !topLoop->getHeader()) continue;
-        if (runOnLoop(F, *topLoop, cfgChanged)) {
-            changed = true;
-            // LoopInfo describes the CFG at pass entry.  Once one loop has
-            // changed, do not continue walking sibling/top-level Loop objects
-            // from that stale snapshot; a later pipeline invocation will
-            // rebuild LoopInfo and continue normalization.
+    // LoopInfo belongs to the CFG snapshot at pass entry.  Process the loop
+    // forest in post-order, but stop immediately after the first structural
+    // rewrite.  A surrounding FixedPointPass is responsible for invalidating
+    // analyses and invoking us again with fresh DT/LoopInfo where convergence
+    // is required.  This keeps ordinary cleanup invocations cheap.
+    for (Loop *L : LI.getLoopsInPostOrder()) {
+        if (!L || !L->getHeader()) continue;
+
+        bool loopCFGChanged = false;
+        if (runOnLoop(F, *L, loopCFGChanged)) changed = true;
+        if (loopCFGChanged) {
+            cfgChanged = true;
             break;
         }
     }
@@ -278,31 +282,21 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
 }
 
 bool LoopSimplifyPass::runOnLoop(Function &F, Loop &L, bool &cfgChanged) {
-    bool changed = false;
-    //后序遍历，先修改最内层的loop结构，然后从内到外修改其他loop结构
-    for (Loop *subLoop : L.getSubLoops()) {
-        if (!subLoop || !subLoop->getHeader()) continue;
-        if (runOnLoop(F, *subLoop, cfgChanged)) {
-            // The parent Loop object belongs to the same now-stale LoopInfo
-            // snapshot.  Stop here and let the next pass invocation rebuild
-            // the forest before touching the parent.
-            return true;
-        }
-    }
-
+    // The loop list is already in post-order.  Return immediately after any
+    // CFG rewrite so the caller can rebuild LoopInfo before attempting the
+    // next canonicalization step (including another step on this same loop).
     if (insertPreHeader(F, L)) {
-        changed = true;
         cfgChanged = true;
+        return true;
     }
     if (insertDedicatedExits(F, L)) {
-        changed = true;
         cfgChanged = true;
+        return true;
     }
     if (insertLatch(F, L)) {
-        changed = true;
         cfgChanged = true;
+        return true;
     }
-    changed |= simplifyHeaderPhis(L);
 
-    return changed;
+    return simplifyHeaderPhis(L);
 }

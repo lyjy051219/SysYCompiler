@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 enum class UnrollKind {
@@ -196,6 +197,13 @@ public:
 
 private:
     UnrollConfig Config;
+
+    // The loop pipeline itself is a bounded fixed point and reuses this pass
+    // object across rounds.  Remember original headers already transformed so
+    // a partial unroll is not multiplied again (for example 4x -> 16x -> 32x)
+    // merely because the outer pipeline ran another cleanup round.
+    std::unordered_map<Function *, std::unordered_set<std::string>>
+        TransformedLoopHeaders;
 
     static int nextUnrollSerial();
     static std::string makeUnrollBlockIdent(

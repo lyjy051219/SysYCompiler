@@ -69,6 +69,181 @@ bool isSpeculatableDivisionOrRemainder(Instruction *I) {
 	return true;
 }
 
+// A loop-invariant call may be evaluated lazily on the first iteration and
+// cached for later iterations without requiring willreturn/speculatable: the
+// first evaluation stays at the original program point.  Reusing the returned
+// value is nevertheless only valid when the call is deterministic with
+// respect to the loop.  SideEffectAnalysis supplies the memory summary; reject
+// unknown/builtin effects, all writes, and any read location that the loop may
+// modify.
+bool isReusableLoopInvariantCall(
+	CallInst *CI,
+	const std::vector<Instruction *> &LoopInsts,
+	BasicAAResult &AA,
+	const LoopInfo &LI,
+	FunctionAnalysisPassManager &FAM) {
+	if (!CI) return false;
+	auto *CalleeFunc = CI->getDirectCallee();
+	if (!CalleeFunc || !CalleeFunc->front()) return false;
+
+	const SideEffectInfo &SEI =
+		FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
+	if (SEI.hasBuiltin) return false;
+	for (const auto &KV : SEI.ptrMap)
+		if (KV.second.untracked) return false;
+
+	ModRefInfo FMRI = getFunctionModRefInfo(SEI);
+	if (!(FMRI == ModRefInfo::NoModRef || FMRI == ModRefInfo::Ref))
+		return false;
+	if (!SEI.ModSet.empty()) return false;
+
+	std::vector<Value *> ReadPtrs;
+	for (Value *RV : SEI.RefSet) {
+		auto *Var = dynamic_cast<Variable *>(RV);
+		if (!Var) continue;
+		if (Var->isGlobal()) {
+			ReadPtrs.push_back(RV);
+			continue;
+		}
+		if (!Var->isParam()) continue;
+
+		int ParamIndex = CalleeFunc->getParamIndex(RV);
+		if (ParamIndex < 0) continue;
+		Value *Arg = CI->getArg(static_cast<unsigned>(ParamIndex));
+		if (!Arg || !Arg->isPointerValue()) continue;
+		ReadPtrs.push_back(Arg);
+	}
+
+	for (Value *Ptr : ReadPtrs) {
+		for (Instruction *J : LoopInsts) {
+			if (!J || J == CI) continue;
+			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+			if (isModSet(MRI)) return false;
+		}
+	}
+
+	return true;
+}
+
+// Lazily evaluate CI at its original point on the first iteration, then carry
+// the value around the backedge and bypass the call on subsequent iterations:
+//
+//   header:
+//     first  = phi [true, preheader], [false, latch]
+//     cached = phi [undef, preheader], [value, latch]
+//   original-prefix:
+//     br first, compute, merge
+//   compute: value.first = call ...; br merge
+//   merge:
+//     value = phi [value.first, compute], [cached, original-prefix]
+//     original-suffix
+//
+// Unlike ordinary preheader hoisting this preserves zero-trip loops, the
+// ordering relative to every instruction before CI, and the behaviour of a
+// trapping or non-returning first call.  BB must dominate the unique latch so
+// every iteration that continues to the next one has produced ValuePhi.
+bool cacheLoopInvariantCall(
+	Function &F,
+	CallInst *CI,
+	Loop &L,
+	BasicBlock *PreHeader,
+	BasicBlock *Latch,
+	const DominatorTree &DT) {
+	if (!CI || !PreHeader || !Latch) return false;
+	// Splitting the call away from its original terminator would invalidate a
+	// tail-call marker even if the returned value itself were cacheable.
+	if (CI->isTailCall()) return false;
+	BasicBlock *BB = CI->getParent();
+	BasicBlock *Header = L.getHeader();
+	if (!BB || !Header || BB == Header) return false;
+	if (!L.contains(BB) || !DT.dominates(BB, Latch)) return false;
+	if (!CI->getIRType() || CI->getIRType()->getEnum() == IR_VOID)
+		return false;
+	if (CI->getUseList().is_empty()) return false;
+
+	// A well-formed basic block must retain a terminator in the continuation.
+	std::vector<Instruction *> Tail;
+	bool SeenCall = false;
+	for (Instruction *I : *BB) {
+		if (I == CI) {
+			SeenCall = true;
+			continue;
+		}
+		if (SeenCall) Tail.push_back(I);
+	}
+	if (!SeenCall || Tail.empty()) return false;
+	Instruction *OldTerminator = Tail.back();
+	if (!dynamic_cast<BrInst *>(OldTerminator) &&
+		!dynamic_cast<RetInst *>(OldTerminator)) {
+		return false;
+	}
+
+	std::vector<BasicBlock *> OldSuccessors = BB->getSuccessors();
+
+	auto *ComputeBB = new BasicBlock();
+	auto *MergeBB = new BasicBlock();
+	ComputeBB->setIdent(F.makeUniqueBlockIdent(
+		BB->getIdent() + ".licm.compute"));
+	MergeBB->setIdent(F.makeUniqueBlockIdent(
+		BB->getIdent() + ".licm.merge"));
+	F.pushBlock(ComputeBB);
+	F.pushBlock(MergeBB);
+
+	CI->EraseFromParent();
+	ComputeBB->push_back(CI);
+	for (Instruction *I : Tail) {
+		I->EraseFromParent();
+		MergeBB->push_back(I);
+	}
+
+	// The old terminator now belongs to MergeBB, hence all of its successor
+	// PHIs must name MergeBB rather than the prefix block.  Do this before
+	// taking snapshots of CI's uses because rebuilding a PHI invalidates its
+	// old Use objects.
+	std::unordered_set<BasicBlock *> SeenSuccessors;
+	for (BasicBlock *Succ : OldSuccessors) {
+		if (!Succ || !SeenSuccessors.insert(Succ).second) continue;
+		BasicBlock::replaceIncomingPredInSuccPhis(Succ, BB, MergeBB);
+	}
+
+	std::vector<Use *> OriginalUses;
+	for (auto It = CI->getUseList().begin();
+		 It != CI->getUseList().end(); ++It) {
+		Use *U = *It;
+		if (U && U->getValue() == CI) OriginalUses.push_back(U);
+	}
+
+	auto *ValuePhi = new PhiInst(CI->getIRType());
+	ValuePhi->setIdent(ValuePhi->getIdent() + ".licm.value");
+	ValuePhi->addIncoming(CI, ComputeBB);
+
+	BasicBlock *BackedgePred = (Latch == BB) ? MergeBB : Latch;
+	auto *FirstTrue = ConstBool::newConstBool(true);
+	auto *FirstFalse = ConstBool::newConstBool(false);
+	auto *FirstPhi = new PhiInst(FirstTrue->getIRType());
+	FirstPhi->setIdent(FirstPhi->getIdent() + ".licm.first");
+	FirstPhi->addIncoming(FirstTrue, PreHeader);
+	FirstPhi->addIncoming(FirstFalse, BackedgePred);
+
+	auto *CachedPhi = new PhiInst(CI->getIRType());
+	CachedPhi->setIdent(CachedPhi->getIdent() + ".licm.cached");
+	CachedPhi->addIncoming(
+		UndefValue::NewUndefValue(CI->getIRType()), PreHeader);
+	CachedPhi->addIncoming(ValuePhi, BackedgePred);
+
+	ValuePhi->addIncoming(CachedPhi, BB);
+	MergeBB->push_front(ValuePhi);
+	Header->push_front(CachedPhi);
+	Header->push_front(FirstPhi);
+
+	for (Use *U : OriginalUses)
+		if (U && U->getValue() == CI) U->replaceUseeWith(ValuePhi);
+
+	BB->genCondInst(FirstPhi, ComputeBB, MergeBB);
+	ComputeBB->genUnCondInst(MergeBB);
+	return true;
+}
+
 } // namespace
 
 
@@ -234,47 +409,7 @@ bool LICMPass::isSafeToMove(
 		if (!AggressiveHoist || !hasSafeExecutionPrefix(I)) return false;
 		if (I->getParent() != L.getHeader()) return false;
 
-		auto *CalleeFunc = CI->getDirectCallee();
-		if (!CalleeFunc) return false;
-
-		const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
-		if (SEI.hasBuiltin) return false;
-		for (const auto &KV : SEI.ptrMap)
-			if (KV.second.untracked) return false;
-
-		ModRefInfo FMRI = getFunctionModRefInfo(SEI);
-		if (!(FMRI == ModRefInfo::NoModRef || FMRI == ModRefInfo::Ref)) return false;
-		if (!SEI.ModSet.empty()) return false;
-
-		if (!SEI.RefSet.empty()) {
-			std::vector<Value *> ReadPtrs;
-
-			for (Value *RV : SEI.RefSet) {
-				auto *Var = dynamic_cast<Variable *>(RV);
-				if (!Var) continue;
-				if (Var->isGlobal()) {
-					ReadPtrs.push_back(RV);
-					continue;
-				}
-				if (!Var->isParam()) continue;
-
-				int ParamIndex = CalleeFunc->getParamIndex(RV);
-				if (ParamIndex < 0) continue;
-				Value *Arg = CI->getArg(static_cast<unsigned>(ParamIndex));
-				if (!Arg || !Arg->isPointerValue()) continue;
-				ReadPtrs.push_back(Arg);
-			}
-
-			for (Value *Ptr : ReadPtrs) {
-				for (Instruction *J : LoopInsts) {
-					if (!J || J == CI) continue;
-					ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
-					if (isModSet(MRI)) return false;
-				}
-			}
-		}
-
-		return true;
+		return isReusableLoopInvariantCall(CI, LoopInsts, AA, LI, FAM);
 	}
 
 	return true;
@@ -285,6 +420,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
 	auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
 	bool Changed = false;
+	bool CFGChanged = false;
 	std::unordered_map<ExitValueKey, PhiInst *, ExitValueKeyHash> ExitPhiCache;
 
 	std::function<bool(Loop *)> processLoop = [&](Loop *L) -> bool {
@@ -294,6 +430,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		// 后序处理子循环
 		for (Loop *Sub : L->getSubLoops()) {
 			LocalChanged |= processLoop(Sub);
+			if (CFGChanged) return true;
 		}
 
 		// 前置检查
@@ -461,7 +598,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				for (BasicBlock *LatchBB : Latches)
 					if (!DT.dominates(BB, LatchBB)) Aggressive = false;
 
-				if (!isSafeToMove(
+				bool SafeToPreheader = isSafeToMove(
 						I,
 						*L,
 						DT,
@@ -472,7 +609,28 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						LI,
 						FAM,
 						/*ForSink=*/false,
-						/*AggressiveHoist=*/Aggressive)) {
+						/*AggressiveHoist=*/Aggressive);
+
+				if (!SafeToPreheader) {
+					// A pure invariant call in a per-iteration must-pass block may
+					// still be cached without speculating it into a zero-trip
+					// preheader.  Keep its first execution at the exact original
+					// point, then bypass it after the first backedge.
+					auto *CI = dynamic_cast<CallInst *>(I);
+					if (!CI || BB == L->getHeader() ||
+						!DT.dominates(BB, Latch) ||
+						!isReusableLoopInvariantCall(
+							CI, LoopInsts, AA, LI, FAM) ||
+						!isInvariant(I, *L, DT, HoistInvariant)) {
+						continue;
+					}
+
+					if (cacheLoopInvariantCall(
+							F, CI, *L, PreHeader, Latch, DT)) {
+						CFGChanged = true;
+						LocalChanged = true;
+						return true;
+					}
 					continue;
 				}
 
@@ -494,9 +652,11 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 	for (Loop *TopL : LI.getTopLevelLoops()) {
 		Changed |= processLoop(TopL);
+		if (CFGChanged) break;
 	}
 
 	if (!Changed) return PreservationStatus::all();
+	if (CFGChanged) return PreservationStatus::none();
 
 	PreservationStatus PA;
 	PA.keep<DominantAnalysis>();
