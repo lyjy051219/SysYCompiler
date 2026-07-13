@@ -7,6 +7,7 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -65,6 +66,66 @@ bool hasNoObservableLoopInstruction(Loop *L) {
         }
     }
     return true;
+}
+
+// A header-tested signed unit-stride loop with a strict bound is finite for
+// every pair of i32 inputs.  If Start < Bound, repeated +1 reaches Bound
+// before INT_MAX can be crossed; the decreasing case is symmetric.  This is
+// intentionally narrower than a general symbolic trip-count proof: it is
+// used only to remove a loop whose body and live-outs have independently
+// proved unobservable.
+bool isProvablyFiniteStrictUnitStepLoop(SCEVResult &SE,
+                                        const LoopTripCountInfo &TCI) {
+    if (!TCI.Valid || !TCI.IsRuntime || !TCI.L || !TCI.Header ||
+        TCI.ExitingBlock != TCI.Header || !TCI.ExitCmp || !TCI.IndVar) {
+        return false;
+    }
+
+    auto IV = SE.getCanonicalInduction(TCI.L);
+    if (!IV || !IV->Valid || IV->Phi != TCI.IndVar || !IV->StartValue ||
+        !IV->UpdateValue || !IV->ConstantStep ||
+        (*IV->ConstantStep != 1 && *IV->ConstantStep != -1)) {
+        return false;
+    }
+
+    auto IsI32 = [](Value *V) {
+        auto Ty = V ? V->getIRType() : nullptr;
+        return Ty && Ty->isInt() && Ty->getIntegerBitWidth(32) == 32;
+    };
+    if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
+
+    // Accept only the literal SSA update.  An equal SCEV expression is not
+    // enough because it could contain an operation that wrapped earlier.
+    auto *Update = dynamic_cast<BinaryInst *>(IV->UpdateValue);
+    if (!Update) return false;
+    Value *UpdateL = Update->getOperand(0);
+    Value *UpdateR = Update->getOperand(1);
+    auto *LeftC = dynamic_cast<ConstInt *>(UpdateL);
+    auto *RightC = dynamic_cast<ConstInt *>(UpdateR);
+    bool DirectStep = false;
+    if (*IV->ConstantStep == 1 && Update->getOp() == BinaryInst::ADD) {
+        DirectStep =
+            (UpdateL == IV->Phi && RightC && RightC->getVal() == 1) ||
+            (UpdateR == IV->Phi && LeftC && LeftC->getVal() == 1);
+    } else if (*IV->ConstantStep == -1 &&
+               Update->getOp() == BinaryInst::SUB) {
+        DirectStep = UpdateL == IV->Phi && RightC && RightC->getVal() == 1;
+    }
+    if (!DirectStep) return false;
+
+    BinaryInst::Operation Pred = TCI.ContinueOnTrue
+        ? TCI.ExitCmp->getOp()
+        : BinaryInst::negatePredicate(TCI.ExitCmp->getOp());
+    Value *LHS = TCI.ExitCmp->getOperand(0);
+    Value *RHS = TCI.ExitCmp->getOperand(1);
+    if (RHS == IV->Phi) {
+        std::swap(LHS, RHS);
+        Pred = BinaryInst::reversePredicate(Pred);
+    }
+    if (LHS != IV->Phi || !IsI32(RHS)) return false;
+
+    return (*IV->ConstantStep == 1 && Pred == BinaryInst::L) ||
+           (*IV->ConstantStep == -1 && Pred == BinaryInst::G);
 }
 
 Value *resolveZeroTripValue(Value *V, Loop *L, BasicBlock *PreHeader,
@@ -228,12 +289,24 @@ PreservationStatus LoopDeletionPass::run(
         }
 
         auto TCI = SE.analyzeLoopTripCount(L);
+        if (!TCI || !TCI->Valid || !TCI->ExitBlock) {
+            continue;
+        }
+
         // Deleting a side-effect-free loop still changes semantics if it may
-        // be infinite.  A proven finite constant count is the deliberately
-        // conservative progress proof used here.
-        if (!TCI || !TCI->Valid || !TCI->ConstantTripCount ||
-            *TCI->ConstantTripCount < 0 || !TCI->ProvenNoWrap ||
-            !TCI->ExitBlock) {
+        // be infinite.  Positive constant counts need SCEV's no-wrap proof.
+        // Exact zero-trip header tests execute no recurrence update, while a
+        // symbolic strict unit-stride loop has the direct finiteness proof
+        // above and does not need an expanded arithmetic trip count.
+        bool ZeroTrip = TCI->ConstantTripCount &&
+                        *TCI->ConstantTripCount == 0;
+        bool FiniteConstant = TCI->ConstantTripCount &&
+                              *TCI->ConstantTripCount >= 0 &&
+                              (ZeroTrip || TCI->ProvenNoWrap);
+        bool FiniteRuntime = !TCI->ConstantTripCount &&
+                             isProvablyFiniteStrictUnitStepLoop(SE, *TCI);
+        if ((!FiniteConstant && !FiniteRuntime) ||
+            (ZeroTrip && TCI->ExitingBlock != TCI->Header)) {
             continue;
         }
 
@@ -241,7 +314,6 @@ PreservationStatus LoopDeletionPass::run(
         if (Blocks.empty()) continue;
 
         PhiReplacementMap PhiPlan;
-        bool ZeroTrip = *TCI->ConstantTripCount == 0;
         if (ZeroTrip) {
             // A header-tested zero-trip loop still executes its header once.
             // Only bypass it when that header has no observable/trapping work.

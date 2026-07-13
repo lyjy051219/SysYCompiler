@@ -102,13 +102,14 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
 
 // A bounded scalar closure used after transforms that expose a large new
 // expression graph (inlining, aggregate splitting, unrolling and relaxed
-// Global2Local).  The order is intentional: local canonicalization gives
-// reassociation a stable tree, global value numbering merges the resulting
-// expressions, and DCE/CFG remove both old trees and newly constant edges.
+// Global2Local).  The order is intentional: local canonicalization gives the
+// latency-aware reassociation pass a stable tree, global value numbering merges
+// the resulting expressions, and DCE/CFG removes both old trees and newly
+// constant edges.
 FunctionPassManager PassBuilder::buildScalarCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(ReassociatePass());
+    FPM.addPass(ReassociatePass(/*PreserveAddressArithmetic=*/true));
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
     FPM.addPass(DCEPass());
@@ -182,7 +183,7 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(ReassociatePass());
+    FPM.addPass(ReassociatePass(/*PreserveAddressArithmetic=*/true));
     FPM.addPass(SCCPPass());
     FPM.addPass(CFGSimplifyPass());
     // Full/partial unrolling frequently turns dynamic aggregate indices into
@@ -200,13 +201,13 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(ConstraintEliminationPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(ReassociatePass());
+    FPM.addPass(ReassociatePass(/*PreserveAddressArithmetic=*/true));
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
-    // Close the scalar graph immediately after unrolling.  Keep this exact
-    // InstSimplify/Reassociate/GVN/DCE/CFG suffix contiguous so cloned dead
+    // Close the scalar graph immediately after unrolling so cloned dead
     // expressions and newly constant branches do not survive into the
-    // memory-address cleanup below.
+    // memory-address cleanup below.  Reassociation keeps high-latency lane
+    // dependencies near the root instead of extending the serial chain.
     FPM.addPass(DCEPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(GepCombinePass());
@@ -251,11 +252,15 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     // memory intrinsics before unrolling duplicates the scalar operations.
     FPM.addPass(LoopIdiomRecognizePass());
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(ReassociatePass());
+    FPM.addPass(ReassociatePass(/*PreserveAddressArithmetic=*/true));
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
     FPM.addPass(ADCEPass());
-    FPM.addPass(CFGSimplifyPass());
+    // Preserve affine GEP chains until LSR has converted them to pointer
+    // recurrences.  CFG simplification at this exact point rewrites the chain
+    // just before LSR and makes memory-heavy stencil loops recompute
+    // multidimensional addresses.  CFG cleanup already runs in the
+    // post-unroll and post-loop pipelines after the recurrence is captured.
     FPM.addPass(DCEPass());
     FPM.addPass(LoopDeletionPass()); // 消除死循环或无用循环
     FPM.addPass(LoopStrengthReductionPass()); // GEP 地址归纳变量强度削弱
@@ -311,7 +316,7 @@ FunctionPassManager PassBuilder::buildLateLoopRediscoveryPipeline() {
     FPM.addPass(LICMPass());
     FPM.addPass(LoopIdiomRecognizePass());
     FPM.addPass(InstSimplifyPass());
-    FPM.addPass(ReassociatePass());
+    FPM.addPass(ReassociatePass(/*PreserveAddressArithmetic=*/true));
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
     FPM.addPass(ADCEPass());

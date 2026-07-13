@@ -62,8 +62,10 @@ bool ReassociatePass::isAlreadyBuilt(
 
 class ReassociateEngine {
 public:
-	ReassociateEngine(Function &F, FunctionAnalysisPassManager &FAM)
-		: F(F), FAM(FAM) {}
+	ReassociateEngine(Function &F, FunctionAnalysisPassManager &FAM,
+		bool PreserveAddressArithmetic)
+		: F(F), FAM(FAM),
+		  PreserveAddressArithmetic(PreserveAddressArithmetic) {}
 
 	bool run() {
 		initRankMap();
@@ -98,7 +100,10 @@ public:
 private:
 	Function &F;
 	FunctionAnalysisPassManager &FAM;
+	bool PreserveAddressArithmetic = false;
 	RankMap Ranks;
+	std::unordered_map<Value *, uint64_t> StableOrder;
+	uint64_t NextStableOrder = 0;
 	std::unordered_map<BasicBlock *, uint32_t> BlockBase;
 	std::unordered_map<BasicBlock *, uint32_t> BlockSeq;
 	std::vector<Instruction *> Todo;
@@ -106,6 +111,8 @@ private:
 
 	void initRankMap() {
 		Ranks.clear();
+		StableOrder.clear();
+		NextStableOrder = 0;
 		BlockBase.clear();
 		BlockSeq.clear();
 		Todo.clear();
@@ -115,6 +122,7 @@ private:
 		for (auto &P : F.getParams()) {
 			Value *V = P.get();
 			if (!V) continue;
+			StableOrder[V] = ++NextStableOrder;
 			Ranks[V] = ++Rank;
 		}
 
@@ -128,6 +136,7 @@ private:
 			uint32_t Seq = 0;
 			for (auto *I : *BB) {
 				if (!I) continue;
+				StableOrder[I] = ++NextStableOrder;
 
 				bool ShouldSkip = false;
 				if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
@@ -146,13 +155,45 @@ private:
 	uint32_t getRank(Value *V) const {
 		if (!V) return 0;
 		if (V && V->isConst()) return 1;
+		// Rebuilding an unrolled reduction from purely textual ranks can bury an
+		// earlier divide/remainder at the bottom of a long add tree.  Those
+		// operations dominate the latency of the next unrolled lane, so rank their
+		// results above ordinary same-block values and attach them near the root of
+		// the rebuilt tree.  This changes only operand association for integer
+		// associative operators; it does not move or speculate the operation.
+		if (auto *I = dynamic_cast<Instruction *>(V)) {
+			switch (I->instType) {
+				case Instruction::SDIV:
+				case Instruction::UDIV:
+				case Instruction::SREM:
+				case Instruction::UREM:
+					return UINT32_MAX;
+				default:
+					break;
+			}
+		}
 		auto It = Ranks.find(V);
 		if (It != Ranks.end()) return It->second;
 		return 2;
 	}
 
+	bool rankComesBefore(Value *A, Value *B) const {
+		uint32_t RA = getRank(A);
+		uint32_t RB = getRank(B);
+		if (RA != RB) return RA > RB;
+		auto AI = StableOrder.find(A);
+		auto BI = StableOrder.find(B);
+		if (AI != StableOrder.end() && BI != StableOrder.end())
+			return AI->second > BI->second;
+		if (AI != StableOrder.end()) return true;
+		if (BI != StableOrder.end()) return false;
+		return false;
+	}
+
 	void stampRank(Instruction *I) {
 		if (!I) return;
+		if (!StableOrder.count(I))
+			StableOrder[I] = ++NextStableOrder;
 		if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
 			if (I->getIRType() && I->getIRType()->isInt() &&
 				BinaryInst::isReassociateOp(BI->getOp())) {
@@ -191,6 +232,34 @@ private:
 			Changed |= optimizeInst(I);
 		}
 		return Changed;
+	}
+
+	bool feedsAddressComputation(Instruction *Root) const {
+		if (!Root) return false;
+		std::vector<Instruction *> WorkList{Root};
+		std::unordered_set<Instruction *> Visited;
+		while (!WorkList.empty()) {
+			Instruction *I = WorkList.back();
+			WorkList.pop_back();
+			if (!I || !Visited.insert(I).second) continue;
+			for (auto It = I->getUseList().begin(); It != I->getUseList().end();
+				 ++It) {
+				Use *U = *It;
+				if (!U || U->getValue() != I) continue;
+				auto *UserI = dynamic_cast<Instruction *>(U->getUser());
+				if (!UserI) continue;
+				if (dynamic_cast<GetElementPtrInst *>(UserI)) return true;
+				// Address indices may be widened before the GEP.  Follow only these
+				// lossless/width-changing integer wrappers; arbitrary arithmetic users
+				// belong to a different expression and are reconsidered at their root.
+				if (UserI->instType == Instruction::ZEXT ||
+					UserI->instType == Instruction::SEXT ||
+					UserI->instType == Instruction::TRUNC) {
+					WorkList.push_back(UserI);
+				}
+			}
+		}
+		return false;
 	}
 
 	Instruction *createBinaryBefore(Instruction *Pos, BinaryInst::Operation Op, Value *LHS, Value *RHS) {
@@ -256,10 +325,14 @@ private:
 			ByPow[KV.second].push_back(KV.first);
 		}
 
+		std::vector<int> Powers;
+		Powers.reserve(ByPow.size());
+		for (const auto &KV : ByPow) Powers.push_back(KV.first);
+		std::sort(Powers.begin(), Powers.end());
+
 		std::vector<std::pair<Value *, int>> Normalized;
-		for (auto &KV : ByPow) {
-			int P = KV.first;
-			auto &Bases = KV.second;
+		for (int P : Powers) {
+			auto &Bases = ByPow[P];
 			if (Bases.size() == 1) {
 				Normalized.push_back({Bases[0], P});
 				continue;
@@ -474,7 +547,9 @@ private:
 				Value *BestFactor = nullptr;
 				int BestCount = 1;
 				for (auto &KV : FactorFreq) {
-					if (KV.second > BestCount) {
+					if (KV.second > BestCount ||
+						(KV.second == BestCount && BestFactor &&
+						 rankComesBefore(KV.first, BestFactor))) {
 						BestFactor = KV.first;
 						BestCount = KV.second;
 					}
@@ -537,7 +612,11 @@ private:
 			if (HasDup) {
 				std::vector<std::pair<Value *, int>> PowList;
 				PowList.reserve(PowCnt.size());
-				for (auto &KV : PowCnt) PowList.push_back(KV);
+				std::unordered_set<Value *> Seen;
+				for (Value *V : Ops) {
+					if (Seen.insert(V).second)
+						PowList.push_back({V, PowCnt[V]});
+				}
 
 				bool LocalPowChanged = false;
 				Value *PowRebuild = buildMulPowProduct(Root, PowList, LocalPowChanged);
@@ -563,6 +642,12 @@ private:
 
 		BinaryInst::Operation Op = BI->getOp();
 		if (!BinaryInst::isReassociateOp(Op)) return false;
+		// Once loop/address canonicalization has started, GEP index expressions
+		// are owned by GEPCombine/LSR.  Reassociating them again can replace short
+		// pointer recurrences with several simultaneously-live integer IVs and
+		// force spills in memory-bound nests.  The early source cleanup keeps the
+		// unrestricted mode; repeated late cleanup uses this guarded mode.
+		if (PreserveAddressArithmetic && feedsAddressComputation(I)) return false;
 
 		Value *LHS = nullptr;
 		Value *RHS = nullptr;
@@ -637,11 +722,12 @@ private:
 			return false;
 		}
 
+		// Use the function's deterministic SSA order as the tie-breaker.  Comparing
+		// allocation addresses made otherwise identical compilations choose
+		// different expression trees under ASLR.  A total SSA order also avoids the
+		// rebuild oscillation that a merely stable sort can cause across rounds.
 		std::sort(Ops.begin(), Ops.end(), [&](Value *A, Value *B) {
-			uint32_t RA = getRank(A);
-			uint32_t RB = getRank(B);
-			if (RA != RB) return RA > RB;
-			return A < B;
+			return rankComesBefore(A, B);
 		});
 
 		bool Changed = false;
@@ -687,7 +773,7 @@ private:
 };
 
 PreservationStatus ReassociatePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-	ReassociateEngine Engine(F, FAM);
+	ReassociateEngine Engine(F, FAM, PreserveAddressArithmetic);
 	bool Changed = Engine.run();
 	if (!Changed) return PreservationStatus::all();
 

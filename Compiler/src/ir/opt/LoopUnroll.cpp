@@ -393,6 +393,28 @@ std::optional<ProvenStablePeelState> findProvenStablePeelState(
     if (!Outer || Outer->isInnermost() || !Outer->getHeader())
         return std::nullopt;
 
+    // If the sibling work is already visible as another direct subloop,
+    // peeling would clone it without proving any benefit for that sibling.
+    // Keep the enlarged stable-state budget for the single-child shape.  A
+    // not-yet-inlined sibling is handled by the call/bound check below.
+    if (Outer->getSubLoops().size() != 1)
+        return std::nullopt;
+    Loop *StableInner = Outer->getSubLoops().front();
+    if (!StableInner) return std::nullopt;
+
+    // A sibling's work may still be represented as a call at this stage and
+    // turn into another full loop after inlining.  Remember that shape here;
+    // once the stabilizing bound is known below, only grant the enlarged
+    // cloning budget when the bound is compile-time constant.  That retains
+    // the profitable fixed-size array case while avoiding speculative code
+    // duplication for an input-sized sibling computation.
+    bool ContainsCall = false;
+    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB)
+            if (dynamic_cast<CallInst *>(I)) ContainsCall = true;
+    }
+
     BasicBlock *OuterPreHeader = nullptr;
     BasicBlock *OuterLatch = nullptr;
     if (!Outer->getLoopSimplifyForm(OuterPreHeader, OuterLatch) ||
@@ -408,7 +430,7 @@ std::optional<ProvenStablePeelState> findProvenStablePeelState(
         Value *Backedge = StatePhi->getIncomingFromPred(OuterLatch);
         if (!Initial || !Backedge || Initial == Backedge) continue;
         for (Loop *Inner : Outer->getSubLoops()) {
-            if (!Inner) continue;
+            if (Inner != StableInner) continue;
             auto TCI = SE.analyzeLoopTripCount(Inner);
             auto IV = SE.getCanonicalInduction(Inner);
             std::unordered_set<Value *> ForwardActive;
@@ -429,6 +451,8 @@ std::optional<ProvenStablePeelState> findProvenStablePeelState(
                     Bound, Outer, OuterPreHeader, DT)) {
                 continue;
             }
+            if (ContainsCall && !dynamic_cast<ConstInt *>(Bound))
+                continue;
 
             std::unordered_set<Value *> Active;
             if (containsUndef(Initial, Active)) continue;
