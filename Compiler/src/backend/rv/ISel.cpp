@@ -815,12 +815,9 @@ MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
     return materializeFloat(mf, mbb, floatValue->getVal());
   }
   if (auto *instruction = dynamic_cast<Instruction *>(value)) {
-    if (isScalarResultType(instruction->getIRType())) {
+    if (!isVoidType(instruction->getIRType())) {
       return getOrCreateResultReg(
           mf, *instruction, regClassForType(instruction->getIRType()));
-    }
-    if (dynamic_cast<GetElementPtrInst *>(instruction)) {
-      return getOrCreateResultReg(mf, *instruction, RegClass::GPR64);
     }
   }
 

@@ -4,8 +4,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace riscv {
@@ -81,6 +87,8 @@ std::vector<uint32_t> virtualDefs(const MachineInstr &instr) {
 MachinePassID MachineInstrStatsAnalysis::Key;
 MachinePassID MachineCFGAnalysis::Key;
 MachinePassID MachineLivenessAnalysis::Key;
+MachinePassID MachineLoopAnalysis::Key;
+MachinePassID MachineBlockFrequencyAnalysis::Key;
 
 MachineInstrStatsAnalysis::Result
 MachineInstrStatsAnalysis::run(MachineFunction &mf,
@@ -205,6 +213,373 @@ MachineLivenessAnalysis::run(MachineFunction &mf,
     }
   }
   return live;
+}
+
+MachineLoopAnalysis::Result
+MachineLoopAnalysis::run(MachineFunction &mf,
+                         MachineFunctionAnalysisManager &am) const {
+  Result result;
+  const auto &cfg = am.getResult<MachineCFGAnalysis>(mf);
+  const std::size_t count = mf.blocks.size();
+  result.depth.assign(count, 0);
+  if (count == 0) {
+    return result;
+  }
+
+  std::vector<bool> reachable(count, false);
+  std::vector<int> reachWork{0};
+  reachable[0] = true;
+  while (!reachWork.empty()) {
+    const int block = reachWork.back();
+    reachWork.pop_back();
+    for (int succ : cfg.succs[static_cast<std::size_t>(block)]) {
+      if (succ < 0 || succ >= static_cast<int>(count)) {
+        throw BackendError("invalid CFG successor during loop reachability");
+      }
+      if (!reachable[static_cast<std::size_t>(succ)]) {
+        reachable[static_cast<std::size_t>(succ)] = true;
+        reachWork.push_back(succ);
+      }
+    }
+  }
+
+  std::vector<std::set<int>> dominators(count);
+  std::set<int> all;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (reachable[i]) {
+      all.insert(static_cast<int>(i));
+    }
+  }
+  dominators[0].insert(0);
+  for (std::size_t i = 1; i < count; ++i) {
+    if (reachable[i]) {
+      dominators[i] = all;
+    }
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (std::size_t i = 1; i < count; ++i) {
+      if (!reachable[i]) {
+        continue;
+      }
+      std::set<int> next;
+      bool firstPred = true;
+      for (int pred : cfg.preds[i]) {
+        if (pred < 0 || pred >= static_cast<int>(count)) {
+          throw BackendError("invalid CFG predecessor during loop analysis");
+        }
+        if (!reachable[static_cast<std::size_t>(pred)]) {
+          continue;
+        }
+        if (firstPred) {
+          next = dominators[static_cast<std::size_t>(pred)];
+          firstPred = false;
+        } else {
+          std::set<int> intersection;
+          std::set_intersection(
+              next.begin(), next.end(),
+              dominators[static_cast<std::size_t>(pred)].begin(),
+              dominators[static_cast<std::size_t>(pred)].end(),
+              std::inserter(intersection, intersection.begin()));
+          next = std::move(intersection);
+        }
+      }
+      if (firstPred) {
+        next.clear();
+      }
+      next.insert(static_cast<int>(i));
+      if (next != dominators[i]) {
+        dominators[i] = std::move(next);
+        changed = true;
+      }
+    }
+  }
+
+  // 同一 header 的多个 latch 属于同一个自然循环。先保留所有回边明细，
+  // 再按 header 合并成员，避免把 latch 数误当成嵌套深度。
+  std::map<int, std::set<int>> latchesByHeader;
+  for (std::size_t from = 0; from < count; ++from) {
+    if (!reachable[from]) {
+      continue;
+    }
+    for (int succ : cfg.succs[from]) {
+      if (succ < 0 || succ >= static_cast<int>(count)) {
+        throw BackendError("invalid CFG successor during loop analysis");
+      }
+      if (dominators[from].count(succ) == 0) {
+        continue;
+      }
+
+      result.backedges.emplace(static_cast<int>(from), succ);
+      latchesByHeader[succ].insert(static_cast<int>(from));
+    }
+  }
+
+  for (const auto &[header, latches] : latchesByHeader) {
+    std::set<int> members{header};
+    std::vector<int> work;
+    for (int latch : latches) {
+      members.insert(latch);
+      // 自环的自然循环只有 header；绝不能从 header 反向走到 preheader。
+      if (latch != header) {
+        work.push_back(latch);
+      }
+    }
+    while (!work.empty()) {
+      const int block = work.back();
+      work.pop_back();
+      for (int pred : cfg.preds[static_cast<std::size_t>(block)]) {
+        if (pred < 0 || pred >= static_cast<int>(count)) {
+          throw BackendError("invalid natural-loop predecessor");
+        }
+        if (pred != header && reachable[static_cast<std::size_t>(pred)] &&
+            dominators[static_cast<std::size_t>(pred)].count(header) != 0 &&
+            members.insert(pred).second) {
+          work.push_back(pred);
+        }
+      }
+    }
+    for (int block : members) {
+      ++result.depth[static_cast<std::size_t>(block)];
+    }
+  }
+  return result;
+}
+
+namespace {
+
+uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs) {
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  return rhs > limit - lhs ? limit : lhs + rhs;
+}
+
+uint64_t saturatingAddChecked(uint64_t lhs, uint64_t rhs, bool &saturated) {
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  if (rhs > limit - lhs) {
+    saturated = true;
+    return limit;
+  }
+  return lhs + rhs;
+}
+
+uint64_t scaledProduct(uint64_t value, uint32_t probability) {
+  constexpr uint64_t scale = MachineBlockFrequencyAnalysis::ProbabilityScale;
+  const uint64_t whole = value / scale;
+  const uint64_t remainder = value % scale;
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  if (whole != 0 && probability > limit / whole) {
+    return limit;
+  }
+  return saturatingAdd(whole * probability, remainder * probability / scale);
+}
+
+uint32_t edgePreference(const MachineLoopAnalysis::Result &loops, int from,
+                        int to) {
+  if (loops.backedges.count({from, to}) != 0) {
+    return 8;
+  }
+  const int fromDepth = loops.depth[static_cast<std::size_t>(from)];
+  const int toDepth = loops.depth[static_cast<std::size_t>(to)];
+  if (toDepth > fromDepth) {
+    return 4;
+  }
+  if (toDepth < fromDepth) {
+    return 1;
+  }
+  return 2;
+}
+
+bool hasClosedCyclicSCC(const std::vector<std::vector<int>> &successors) {
+  const std::size_t count = successors.size();
+  if (count == 0) {
+    return false;
+  }
+  std::vector<bool> reachable(count, false);
+  std::vector<int> reachWork{0};
+  reachable[0] = true;
+  while (!reachWork.empty()) {
+    const int node = reachWork.back();
+    reachWork.pop_back();
+    for (int succ : successors[static_cast<std::size_t>(node)]) {
+      if (succ < 0 || succ >= static_cast<int>(count)) {
+        throw BackendError("invalid CFG successor during SCC reachability");
+      }
+      if (!reachable[static_cast<std::size_t>(succ)]) {
+        reachable[static_cast<std::size_t>(succ)] = true;
+        reachWork.push_back(succ);
+      }
+    }
+  }
+  std::vector<int> index(count, -1);
+  std::vector<int> lowlink(count, -1);
+  std::vector<int> stack;
+  std::vector<bool> onStack(count, false);
+  std::vector<int> componentMark(count, 0);
+  int componentEpoch = 0;
+  int nextIndex = 0;
+  bool found = false;
+
+  std::function<void(int)> visit = [&](int node) {
+    const std::size_t nodeIndex = static_cast<std::size_t>(node);
+    index[nodeIndex] = lowlink[nodeIndex] = nextIndex++;
+    stack.push_back(node);
+    onStack[nodeIndex] = true;
+    for (int succ : successors[nodeIndex]) {
+      if (succ < 0 || succ >= static_cast<int>(count)) {
+        throw BackendError("invalid CFG successor during SCC analysis");
+      }
+      const std::size_t succIndex = static_cast<std::size_t>(succ);
+      if (!reachable[succIndex]) {
+        continue;
+      }
+      if (index[succIndex] < 0) {
+        visit(succ);
+        lowlink[nodeIndex] = std::min(lowlink[nodeIndex], lowlink[succIndex]);
+      } else if (onStack[succIndex]) {
+        lowlink[nodeIndex] = std::min(lowlink[nodeIndex], index[succIndex]);
+      }
+    }
+    if (lowlink[nodeIndex] != index[nodeIndex]) {
+      return;
+    }
+
+    std::vector<int> component;
+    while (true) {
+      const int member = stack.back();
+      stack.pop_back();
+      onStack[static_cast<std::size_t>(member)] = false;
+      component.push_back(member);
+      if (member == node) {
+        break;
+      }
+    }
+    ++componentEpoch;
+    for (int member : component) {
+      componentMark[static_cast<std::size_t>(member)] = componentEpoch;
+    }
+    bool cyclic = component.size() > 1;
+    bool closed = true;
+    for (int member : component) {
+      for (int succ : successors[static_cast<std::size_t>(member)]) {
+        if (succ == member) {
+          cyclic = true;
+        }
+        if (componentMark[static_cast<std::size_t>(succ)] != componentEpoch) {
+          closed = false;
+        }
+      }
+    }
+    found = found || (cyclic && closed);
+  };
+
+  for (std::size_t node = 0; node < count; ++node) {
+    if (reachable[node] && index[node] < 0) {
+      visit(static_cast<int>(node));
+    }
+  }
+  return found;
+}
+
+} // namespace
+
+MachineBlockFrequencyAnalysis::Result
+MachineBlockFrequencyAnalysis::run(MachineFunction &mf,
+                                   MachineFunctionAnalysisManager &am) const {
+  Result result;
+  const auto &cfg = am.getResult<MachineCFGAnalysis>(mf);
+  const auto &loops = am.getResult<MachineLoopAnalysis>(mf);
+  const std::size_t count = mf.blocks.size();
+  result.blockFrequency.assign(count, 0);
+  result.successors = cfg.succs;
+  result.edgeProbability.resize(count);
+  result.edgeWeight.resize(count);
+  if (count == 0) {
+    result.converged = true;
+    result.reliable = true;
+    return result;
+  }
+  result.reliable = cfg.preds[0].empty() && !hasClosedCyclicSCC(cfg.succs);
+
+  for (std::size_t from = 0; from < count; ++from) {
+    const auto &succs = cfg.succs[from];
+    auto &probabilities = result.edgeProbability[from];
+    probabilities.assign(succs.size(), 0);
+    if (succs.empty()) {
+      continue;
+    }
+    if (succs.size() == 1) {
+      probabilities[0] = ProbabilityScale;
+      continue;
+    }
+
+    std::vector<uint32_t> preferences;
+    preferences.reserve(succs.size());
+    uint32_t totalPreference = 0;
+    for (int succ : succs) {
+      if (succ < 0 || succ >= static_cast<int>(count)) {
+        throw BackendError("invalid CFG successor during frequency analysis");
+      }
+      const uint32_t preference =
+          edgePreference(loops, static_cast<int>(from), succ);
+      preferences.push_back(preference);
+      totalPreference += preference;
+    }
+    uint32_t assigned = 0;
+    for (std::size_t i = 0; i < succs.size(); ++i) {
+      probabilities[i] = ProbabilityScale * preferences[i] / totalPreference;
+      assigned += probabilities[i];
+    }
+    // 整除余数按原 successor 顺序发放；该顺序由原块下标确定。
+    for (std::size_t i = 0; assigned < ProbabilityScale; ++assigned) {
+      ++probabilities[i % probabilities.size()];
+    }
+  }
+
+  // entry 的基准频率为 1（用 1024 表示）。这是最多 96 轮、确定性的
+  // expected-visit 有界估计。converged 只记录是否达到精确定点；普通
+  // 可退出循环即使尚未精确稳定，估计仍可用于布局。
+  std::vector<uint64_t> frequencies(count, 0);
+  frequencies[0] = ProbabilityScale;
+  bool propagationSaturated = false;
+  for (int iteration = 0; iteration < 96; ++iteration) {
+    std::vector<uint64_t> next(count, 0);
+    next[0] = ProbabilityScale;
+    for (std::size_t from = 0; from < count; ++from) {
+      for (std::size_t edge = 0; edge < cfg.succs[from].size(); ++edge) {
+        const int to = cfg.succs[from][edge];
+        if (to == 0) {
+          continue;
+        }
+        const uint64_t contribution = scaledProduct(
+            frequencies[from], result.edgeProbability[from][edge]);
+        next[static_cast<std::size_t>(to)] =
+            saturatingAddChecked(next[static_cast<std::size_t>(to)],
+                                 contribution, propagationSaturated);
+      }
+    }
+    if (next == frequencies) {
+      frequencies = std::move(next);
+      result.converged = true;
+      break;
+    }
+    frequencies = std::move(next);
+  }
+  result.blockFrequency = std::move(frequencies);
+  if (propagationSaturated) {
+    result.reliable = false;
+  }
+
+  for (std::size_t from = 0; from < count; ++from) {
+    auto &weights = result.edgeWeight[from];
+    weights.reserve(cfg.succs[from].size());
+    for (uint32_t probability : result.edgeProbability[from]) {
+      weights.push_back(
+          scaledProduct(result.blockFrequency[from], probability));
+    }
+  }
+  return result;
 }
 
 } // namespace riscv

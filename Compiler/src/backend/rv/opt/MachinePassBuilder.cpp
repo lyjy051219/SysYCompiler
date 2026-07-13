@@ -90,6 +90,29 @@ void addDebugPasses(MachineFunctionPassManager &MPM, const char *tag) {
   }
 }
 
+MachineFunctionPassManager buildPreRALinearPipeline(
+    const BackendOptions &Options) {
+  MachineFunctionPassManager MPM;
+  addOptionalPass(MPM, Options, "pre-ra-copy-prop",
+                  PreRACopyPropagationPass());
+  addOptionalPass(MPM, Options, "pre-ra-address-combine",
+                  PreRAAddressCombinePass());
+  addOptionalPass(MPM, Options, "pre-ra-local-cse", PreRALocalCSEPass());
+  addOptionalPass(MPM, Options, "pre-ra-machine-dce",
+                  PreRAMachineDCEPass());
+  return MPM;
+}
+
+MachineFunctionPassManager buildPreRAFixedPointCorePipeline(
+    const BackendOptions &Options) {
+  MachineFunctionPassManager MPM;
+  addOptionalPass(MPM, Options, "pre-ra-copy-prop",
+                  PreRACopyPropagationPass());
+  addOptionalPass(MPM, Options, "pre-ra-machine-dce",
+                  PreRAMachineDCEPass());
+  return MPM;
+}
+
 } // namespace
 
 void MachinePassBuilder::registerFunctionAnalyses(
@@ -98,6 +121,8 @@ void MachinePassBuilder::registerFunctionAnalyses(
   MFAM.registerPass([] { return MachineInstrStatsAnalysis(); });
   MFAM.registerPass([] { return MachineCFGAnalysis(); });
   MFAM.registerPass([] { return MachineLivenessAnalysis(); });
+  MFAM.registerPass([] { return MachineLoopAnalysis(); });
+  MFAM.registerPass([] { return MachineBlockFrequencyAnalysis(); });
 }
 
 void MachinePassBuilder::registerModuleAnalyses(
@@ -113,14 +138,36 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
     return MPM;
   }
   // 分配前优化挂在这里，此时仍是带虚拟寄存器的 MIR
-  // 例如拷贝合并，机器层公共子表达式删除，块布局调整
+  // 例如拷贝合并，机器层公共子表达式删除，块布局调整。
   addOptionalPass(MPM, Options, "branch-compare-folding",
                   BranchCompareFoldingPass());
   addOptionalPass(MPM, Options, "pre-ra-global-address-reuse",
                   PreRAGlobalAddressReusePass());
-  addOptionalPass(MPM, Options, "pre-ra-copy-prop",
-                  PreRACopyPropagationPass());
-  addOptionalPass(MPM, Options, "pre-ra-local-cse", PreRALocalCSEPass());
+
+  // copy-prop / local CSE / DCE 里，只有 copy-prop 和 DCE 需要反复喂回；
+  // local CSE 只跑一轮，减少重复 local CSE 带来的活跃区间膨胀。
+  if (passDisabled(Options, "pre-ra-fixed-point")) {
+    MachineFunctionPassManager linear = buildPreRALinearPipeline(Options);
+    if (!linear.empty()) {
+      MPM.addPass(std::move(linear));
+    }
+  } else {
+    MachineFunctionPassManager prefix;
+    addOptionalPass(prefix, Options, "pre-ra-copy-prop",
+                    PreRACopyPropagationPass());
+    addOptionalPass(prefix, Options, "pre-ra-address-combine",
+                    PreRAAddressCombinePass());
+    addOptionalPass(prefix, Options, "pre-ra-local-cse", PreRALocalCSEPass());
+    if (!prefix.empty()) {
+      MPM.addPass(std::move(prefix));
+    }
+
+    MachineFunctionPassManager core = buildPreRAFixedPointCorePipeline(Options);
+    if (!core.empty()) {
+      MPM.addPass(createMachineFixedPointPass<MachineFunction>(
+          std::move(core), 3));
+    }
+  }
   return MPM;
 }
 
@@ -137,6 +184,10 @@ MachinePassBuilder::buildPostRAOptPipeline(const BackendOptions &Options) {
   MPM.addPass(RebuildCFGPass());
   addOptionalPass(MPM, Options, "post-ra-cleanup-cfg", CleanupCFGPass());
   addOptionalPass(MPM, Options, "block-placement", BlockPlacementPass());
+  MPM.addPass(RebuildCFGPass());
+  // 最后做块内 list scheduling，不再改变 CFG，只重排单个基本块内部顺序。
+  addOptionalPass(MPM, Options, "post-ra-list-schedule",
+                  PostRAListSchedulePass());
   return MPM;
 }
 

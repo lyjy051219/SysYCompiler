@@ -11,6 +11,18 @@
 
 namespace riscv {
 
+namespace {
+
+MachinePreservationStatus preserveBlockStructureAnalyses() {
+  auto PA = MachinePreservationStatus::none();
+  PA.keep<MachineCFGAnalysis>();
+  PA.keep<MachineLoopAnalysis>();
+  PA.keep<MachineBlockFrequencyAnalysis>();
+  return PA;
+}
+
+} // namespace
+
 MachinePreservationStatus
 RebuildCFGPass::run(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
   (void)am;
@@ -66,7 +78,7 @@ BranchCompareFoldingPass::run(MachineFunction &mf,
                               MachineFunctionAnalysisManager &am) {
   (void)am;
   const bool changed = runBranchCompareFolding(mf);
-  return changed ? MachinePreservationStatus::none()
+  return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
 }
 
@@ -75,7 +87,16 @@ PreRAGlobalAddressReusePass::run(MachineFunction &mf,
                                  MachineFunctionAnalysisManager &am) {
   (void)am;
   const bool changed = runPreRAGlobalAddressReuse(mf);
-  return changed ? MachinePreservationStatus::none()
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+PreRAAddressCombinePass::run(MachineFunction &mf,
+                             MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runPreRAAddressCombine(mf);
+  return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
 }
 
@@ -84,7 +105,7 @@ PreRACopyPropagationPass::run(MachineFunction &mf,
                               MachineFunctionAnalysisManager &am) {
   (void)am;
   const bool changed = runPreRACopyPropagation(mf);
-  return changed ? MachinePreservationStatus::none()
+  return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
 }
 
@@ -93,8 +114,23 @@ PreRALocalCSEPass::run(MachineFunction &mf,
                        MachineFunctionAnalysisManager &am) {
   (void)am;
   const bool changed = runPreRALocalCSE(mf);
-  return changed ? MachinePreservationStatus::none()
+  return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+PreRAMachineDCEPass::run(MachineFunction &mf,
+                         MachineFunctionAnalysisManager &am) {
+  const bool changed = runPreRAMachineDCE(mf, am);
+  if (!changed) {
+    return MachinePreservationStatus::all();
+  }
+
+  auto PA = MachinePreservationStatus::none();
+  PA.keep<MachineCFGAnalysis>();
+  PA.keep<MachineLoopAnalysis>();
+  PA.keep<MachineBlockFrequencyAnalysis>();
+  return PA;
 }
 
 MachinePreservationStatus
@@ -107,10 +143,29 @@ PostRAPeepholePass::run(MachineFunction &mf,
 }
 
 MachinePreservationStatus
+PostRAListSchedulePass::run(MachineFunction &mf,
+                            MachineFunctionAnalysisManager &am) {
+  const auto &frequencies = am.getResult<MachineBlockFrequencyAnalysis>(mf);
+  const bool changed = runPostRAListSchedule(mf, frequencies);
+  if (!changed) {
+    return MachinePreservationStatus::all();
+  }
+
+  auto PA = MachinePreservationStatus::none();
+  PA.keep<MachineCFGAnalysis>();
+  PA.keep<MachineLoopAnalysis>();
+  PA.keep<MachineBlockFrequencyAnalysis>();
+  PA.keep<MachineLivenessAnalysis>();
+  PA.keep<MachineInstrStatsAnalysis>();
+  return PA;
+}
+
+MachinePreservationStatus
 BlockPlacementPass::run(MachineFunction &mf,
-                         MachineFunctionAnalysisManager &am) {
-  (void)am;
-  const bool changed = runBlockPlacement(mf);
+                        MachineFunctionAnalysisManager &am) {
+  const auto &loops = am.getResult<MachineLoopAnalysis>(mf);
+  const auto &frequencies = am.getResult<MachineBlockFrequencyAnalysis>(mf);
+  const bool changed = runBlockPlacement(mf, loops, frequencies);
   return changed ? MachinePreservationStatus::none()
                  : MachinePreservationStatus::all();
 }

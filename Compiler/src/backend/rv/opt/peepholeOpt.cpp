@@ -806,6 +806,211 @@ MachineInstr makeCopy(MachineReg dst, MachineReg src,
   return instr;
 }
 
+int64_t abs64(int64_t value) { return value < 0 ? -value : value; }
+
+bool fitsSigned12(int64_t value) { return value >= -2048 && value <= 2047; }
+
+std::string addressCombineGroupKey(const MachineReg &base,
+                                  uint64_t baseVersion) {
+  return regKey(base) + "#" + std::to_string(baseVersion);
+}
+
+bool knownAddressConstant(const MachineOperand &operand,
+                          const std::map<std::string, int64_t> &constants,
+                          int64_t &value) {
+  if (operand.kind != OperandKind::Reg) {
+    return false;
+  }
+  if (operand.regValue.physical) {
+    if (operand.regValue.phys == PhysReg::X0 &&
+        operand.regValue.rc == RegClass::GPR64) {
+      value = 0;
+      return true;
+    }
+    return false;
+  }
+  if (operand.regValue.rc != RegClass::GPR64) {
+    return false;
+  }
+  auto found = constants.find(regKey(operand.regValue));
+  if (found == constants.end()) {
+    return false;
+  }
+  value = found->second;
+  return true;
+}
+
+struct AddressCombineInfo {
+  MachineReg reg;
+  MachineReg base;
+  int64_t offset = 0;
+  uint64_t baseVersion = 0;
+  std::string groupKey;
+  std::size_t defIndex = 0;
+};
+
+bool isAddressCombineDef(const MachineInstr &instr,
+                         const std::map<std::string, int64_t> &constants,
+                         const std::map<std::string, uint64_t> &versions,
+                         std::size_t defIndex, AddressCombineInfo &info) {
+  if (instr.sideEffects || instr.terminator || instr.defs.size() != 1 ||
+      instr.defs[0].kind != OperandKind::Reg ||
+      instr.defs[0].regValue.rc != RegClass::GPR64) {
+    return false;
+  }
+
+  const MachineReg dst = instr.defs[0].regValue;
+
+  if (instr.opcode == Opcode::ADDI && instr.uses.size() == 2 &&
+      instr.uses[0].kind == OperandKind::Reg &&
+      instr.uses[0].regValue.rc == RegClass::GPR64 &&
+      instr.uses[1].kind == OperandKind::Imm &&
+      !sameRegister(dst, instr.uses[0].regValue)) {
+    info.reg = dst;
+    info.base = instr.uses[0].regValue;
+    info.offset = instr.uses[1].immValue;
+    info.baseVersion = [&] {
+      auto found = versions.find(regKey(info.base));
+      return found == versions.end() ? uint64_t{0} : found->second;
+    }();
+    info.groupKey = addressCombineGroupKey(info.base, info.baseVersion);
+    info.defIndex = defIndex;
+    return true;
+  }
+
+  if (instr.opcode == Opcode::ADD && instr.uses.size() == 2) {
+    int64_t constant = 0;
+    int64_t otherConstant = 0;
+    if (knownAddressConstant(instr.uses[0], constants, constant) &&
+        instr.uses[1].kind == OperandKind::Reg &&
+        instr.uses[1].regValue.rc == RegClass::GPR64 &&
+        !knownAddressConstant(instr.uses[1], constants, otherConstant) &&
+        !sameRegister(dst, instr.uses[1].regValue)) {
+      info.reg = dst;
+      info.base = instr.uses[1].regValue;
+      info.offset = constant;
+    } else if (knownAddressConstant(instr.uses[1], constants, constant) &&
+               instr.uses[0].kind == OperandKind::Reg &&
+               instr.uses[0].regValue.rc == RegClass::GPR64 &&
+               !knownAddressConstant(instr.uses[0], constants,
+                                     otherConstant) &&
+               !sameRegister(dst, instr.uses[0].regValue)) {
+      info.reg = dst;
+      info.base = instr.uses[0].regValue;
+      info.offset = constant;
+    } else {
+      return false;
+    }
+
+    info.baseVersion = [&] {
+      auto found = versions.find(regKey(info.base));
+      return found == versions.end() ? uint64_t{0} : found->second;
+    }();
+    info.groupKey = addressCombineGroupKey(info.base, info.baseVersion);
+    info.defIndex = defIndex;
+    return true;
+  }
+
+  return false;
+}
+
+bool rewriteAddressUse(MachineInstr &instr, std::size_t baseIndex,
+                       std::size_t offsetIndex,
+                       const std::map<std::string, AddressCombineInfo>
+                           &activeCandidates,
+                       const std::map<std::string, uint64_t> &versions) {
+  if (baseIndex >= instr.uses.size() || offsetIndex >= instr.uses.size() ||
+      instr.uses[baseIndex].kind != OperandKind::Reg ||
+      instr.uses[offsetIndex].kind != OperandKind::Imm) {
+    return false;
+  }
+
+  const MachineReg baseReg = instr.uses[baseIndex].regValue;
+  const std::string baseKey = regKey(baseReg);
+  auto candidateIt = activeCandidates.find(baseKey);
+  if (candidateIt == activeCandidates.end()) {
+    return false;
+  }
+
+  const AddressCombineInfo &candidate = candidateIt->second;
+  const int64_t effectiveOffset = candidate.offset + instr.uses[offsetIndex].immValue;
+
+  // 优先尝试把当前使用折到更早的共同基址 pivot 上。
+  bool havePivot = false;
+  MachineReg pivotReg;
+  int64_t pivotOffset = 0;
+  int64_t pivotScore = 0;
+  std::size_t pivotDefIndex = 0;
+  for (const auto &[pivotKey, pivot] : activeCandidates) {
+    if (pivotKey == baseKey || pivot.groupKey != candidate.groupKey) {
+      continue;
+    }
+    const int64_t candidateOffset = effectiveOffset - pivot.offset;
+    if (!fitsSigned12(candidateOffset)) {
+      continue;
+    }
+    const int64_t score = abs64(candidateOffset);
+    if (!havePivot || score < pivotScore ||
+        (score == pivotScore && pivot.defIndex < pivotDefIndex) ||
+        (score == pivotScore && pivot.defIndex == pivotDefIndex &&
+         regKey(pivot.reg) < regKey(pivotReg))) {
+      havePivot = true;
+      pivotReg = pivot.reg;
+      pivotOffset = candidateOffset;
+      pivotScore = score;
+      pivotDefIndex = pivot.defIndex;
+    }
+  }
+
+  if (havePivot) {
+    instr.uses[baseIndex] = MachineOperand::reg(pivotReg);
+    instr.uses[offsetIndex] = MachineOperand::imm(pivotOffset);
+    return true;
+  }
+
+  auto foundVersion = versions.find(regKey(candidate.base));
+  const uint64_t currentVersion =
+      foundVersion == versions.end() ? uint64_t{0} : foundVersion->second;
+  if (currentVersion == candidate.baseVersion &&
+      fitsSigned12(effectiveOffset)) {
+    instr.uses[baseIndex] = MachineOperand::reg(candidate.base);
+    instr.uses[offsetIndex] = MachineOperand::imm(effectiveOffset);
+    return true;
+  }
+
+  return false;
+}
+
+void bumpPhysicalVersions(
+    const std::vector<PhysReg> &regs,
+    std::map<std::string, uint64_t> &versions) {
+  for (PhysReg reg : regs) {
+    ++versions[regKey(MachineReg::preg(reg, RegClass::GPR64))];
+    ++versions[regKey(MachineReg::preg(reg, RegClass::FPR32))];
+  }
+}
+
+void invalidateDefinedRegisters(const MachineInstr &instr,
+                                std::map<std::string, AddressCombineInfo>
+                                    &activeCandidates,
+                                std::map<std::string, int64_t> &constants,
+                                std::map<std::string, uint64_t> &versions) {
+  for (const MachineOperand &def : instr.defs) {
+    if (def.kind != OperandKind::Reg) {
+      continue;
+    }
+    const std::string key = regKey(def.regValue);
+    activeCandidates.erase(key);
+    constants.erase(key);
+    ++versions[key];
+  }
+
+  for (PhysReg reg : instr.implicitDefs) {
+    ++versions[regKey(MachineReg::preg(reg, RegClass::GPR64))];
+    ++versions[regKey(MachineReg::preg(reg, RegClass::FPR32))];
+  }
+}
+
 } // namespace
 
 bool runBranchCompareFolding(MachineFunction &mf) {
@@ -938,6 +1143,86 @@ bool runPreRAGlobalAddressReuse(MachineFunction &mf) {
   }
 
   return true;
+}
+
+bool runPreRAAddressCombine(MachineFunction &mf) {
+  if (mf.blocks.empty()) {
+    return false;
+  }
+
+  bool changed = false;
+
+  for (MachineBasicBlock &block : mf.blocks) {
+    std::map<std::string, AddressCombineInfo> activeCandidates;
+    std::map<std::string, int64_t> constants;
+    std::map<std::string, uint64_t> versions;
+    std::size_t instrIndex = 0;
+
+    std::vector<MachineInstr> rewritten;
+    rewritten.reserve(block.instrs.size());
+
+    for (const MachineInstr &original : block.instrs) {
+      MachineInstr instr = original;
+      AddressCombineInfo candidateInfo;
+      const bool hasCandidate =
+          isAddressCombineDef(original, constants, versions, instrIndex,
+                              candidateInfo);
+
+      bool localChanged = false;
+      if (isLoadOpcode(instr.opcode)) {
+        localChanged = rewriteAddressUse(instr, 0, 1, activeCandidates,
+                                         versions);
+      } else if (isMemoryStoreOpcode(instr.opcode)) {
+        localChanged = rewriteAddressUse(instr, 1, 2, activeCandidates,
+                                         versions);
+      }
+      changed = changed || localChanged;
+
+      rewritten.push_back(std::move(instr));
+
+      invalidateDefinedRegisters(original, activeCandidates, constants,
+                                 versions);
+      if (original.opcode == Opcode::CALL) {
+        bumpPhysicalVersions(callerSavedRegs(RegClass::GPR64), versions);
+        bumpPhysicalVersions(callerSavedRegs(RegClass::FPR32), versions);
+      }
+
+      for (const MachineOperand &def : original.defs) {
+        if (def.kind != OperandKind::Reg) {
+          continue;
+        }
+        const std::string key = regKey(def.regValue);
+        if (original.opcode == Opcode::LI && original.defs.size() == 1 &&
+            original.uses.size() == 1 &&
+            original.uses[0].kind == OperandKind::Imm &&
+            def.regValue.rc == RegClass::GPR64) {
+          constants[key] = original.uses[0].immValue;
+        } else if (original.opcode == Opcode::COPY &&
+                   original.defs.size() == 1 &&
+                   original.uses.size() == 1 &&
+                   def.regValue.rc == RegClass::GPR64) {
+          int64_t value = 0;
+          if (knownAddressConstant(original.uses[0], constants, value)) {
+            constants[key] = value;
+          } else {
+            constants.erase(key);
+          }
+        } else {
+          constants.erase(key);
+        }
+      }
+
+      if (hasCandidate) {
+        activeCandidates[regKey(original.defs[0].regValue)] = candidateInfo;
+      }
+
+      ++instrIndex;
+    }
+
+    block.instrs = std::move(rewritten);
+  }
+
+  return changed;
 }
 
 bool runPreRACopyPropagation(MachineFunction &mf) {

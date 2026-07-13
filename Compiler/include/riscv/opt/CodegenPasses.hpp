@@ -63,6 +63,12 @@ struct PreRAGlobalAddressReusePass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前折叠 common-base 地址临时和 load/store 偏移
+struct PreRAAddressCombinePass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配前保守拷贝传播
 struct PreRACopyPropagationPass {
   MachinePreservationStatus run(MachineFunction &mf,
@@ -75,13 +81,25 @@ struct PreRALocalCSEPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前机器层死代码删除
+struct PreRAMachineDCEPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配后窥孔优化
 struct PostRAPeepholePass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };
 
-// 分配后消除相邻块中的条件跳转加无条件跳转双跳。
+// 分配后块内 list scheduling
+struct PostRAListSchedulePass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配后按静态频率重排机器块，并规范化 fallthrough 分支。
 struct BlockPlacementPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);

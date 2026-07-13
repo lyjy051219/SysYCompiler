@@ -3,9 +3,10 @@
 #include "riscv/MIR.hpp"
 #include "riscv/opt/MachinePassManager.hpp"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <set>
+#include <utility>
 #include <vector>
 
 // 后端分析 pass 集合
@@ -64,6 +65,42 @@ public:
     std::vector<RegSet> defs;
     std::vector<RegSet> liveIn;
     std::vector<RegSet> liveOut;
+  };
+
+  Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;
+};
+
+// 自然循环分析：复用寄存器分配原有的支配、回边和反向可达算法。
+// 结果只含旧布局下标；任何块顺序变换都会使其失效。
+class MachineLoopAnalysis
+    : public MachineAnalysisDescriptor<MachineLoopAnalysis> {
+public:
+  static MachinePassID Key;
+
+  struct Result {
+    std::vector<int> depth;
+    std::set<std::pair<int, int>> backedges;
+  };
+
+  Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;
+};
+
+// 确定性的静态块频率和边概率。概率使用定点数，避免浮点排序差异。
+class MachineBlockFrequencyAnalysis
+    : public MachineAnalysisDescriptor<MachineBlockFrequencyAnalysis> {
+public:
+  static MachinePassID Key;
+  static constexpr uint32_t ProbabilityScale = 1024;
+
+  struct Result {
+    std::vector<uint64_t> blockFrequency;
+    std::vector<std::vector<int>> successors;
+    std::vector<std::vector<uint32_t>> edgeProbability;
+    std::vector<std::vector<uint64_t>> edgeWeight;
+    // converged 仅诊断有限迭代是否达到精确定点。reliable 表示该有界估计
+    // 可安全用于布局：入口无入边、无可达闭合循环 SCC，且传播未饱和。
+    bool converged = false;
+    bool reliable = false;
   };
 
   Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;

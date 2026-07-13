@@ -1,6 +1,7 @@
 #pragma once
 
 #include "riscv/MIR.hpp"
+#include "riscv/opt/MachineAnalysis.hpp"
 
 namespace riscv {
 
@@ -8,10 +9,17 @@ namespace riscv {
 // 新增 optional pass 时优先把实现和声明放在 rv/opt 这一层。
 bool runBranchCompareFolding(MachineFunction &mf);
 bool runPreRAGlobalAddressReuse(MachineFunction &mf);
+bool runPreRAAddressCombine(MachineFunction &mf);
 bool runPreRACopyPropagation(MachineFunction &mf);
 bool runPreRALocalCSE(MachineFunction &mf);
+bool runPreRAMachineDCE(MachineFunction &mf,
+                        MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);
 bool runPostRAPeephole(MachineFunction &mf);
-bool runBlockPlacement(MachineFunction &mf);
+bool runPostRAListSchedule(
+    MachineFunction &mf, const MachineBlockFrequencyAnalysis::Result &frequencies);
+bool runBlockPlacement(
+    MachineFunction &mf, const MachineLoopAnalysis::Result &loops,
+    const MachineBlockFrequencyAnalysis::Result &frequencies);
 
 } // namespace riscv

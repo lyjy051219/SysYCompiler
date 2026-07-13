@@ -121,83 +121,16 @@ void invalidateAnalysesAfterRewrite(MachineFunction &mf,
   }
 }
 
-std::vector<int> computeLoopDepth(const MachineFunction &mf) {
-  const std::size_t count = mf.blocks.size();
-  std::vector<int> depth(count, 0);
-  if (count == 0) {
-    return depth;
+std::vector<int> getLoopDepth(MachineFunction &mf,
+                              MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    return am->getResult<MachineLoopAnalysis>(mf).depth;
   }
 
-  std::vector<std::set<int>> dominators(count);
-  std::set<int> all;
-  for (std::size_t i = 0; i < count; ++i) {
-    all.insert(static_cast<int>(i));
-  }
-  dominators[0].insert(0);
-  for (std::size_t i = 1; i < count; ++i) {
-    dominators[i] = all;
-  }
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (std::size_t i = 1; i < count; ++i) {
-      std::set<int> next;
-      bool firstPred = true;
-      for (int pred : mf.blocks[i].preds) {
-        if (pred < 0 || pred >= static_cast<int>(count)) {
-          throw BackendError(
-              "invalid CFG predecessor during register allocation");
-        }
-        if (firstPred) {
-          next = dominators[static_cast<std::size_t>(pred)];
-          firstPred = false;
-        } else {
-          std::set<int> intersection;
-          std::set_intersection(
-              next.begin(), next.end(),
-              dominators[static_cast<std::size_t>(pred)].begin(),
-              dominators[static_cast<std::size_t>(pred)].end(),
-              std::inserter(intersection, intersection.begin()));
-          next = std::move(intersection);
-        }
-      }
-      if (firstPred) {
-        next.clear();
-      }
-      next.insert(static_cast<int>(i));
-      if (next != dominators[i]) {
-        dominators[i] = std::move(next);
-        changed = true;
-      }
-    }
-  }
-
-  for (std::size_t from = 0; from < count; ++from) {
-    for (int succ : mf.blocks[from].succs) {
-      if (succ < 0 || succ >= static_cast<int>(count) ||
-          dominators[from].count(succ) == 0) {
-        continue;
-      }
-
-      // 回边源到支配头之间的反向可达块构成自然循环。
-      std::set<int> members{succ, static_cast<int>(from)};
-      std::vector<int> work{static_cast<int>(from)};
-      while (!work.empty()) {
-        int block = work.back();
-        work.pop_back();
-        for (int pred : mf.blocks[static_cast<std::size_t>(block)].preds) {
-          if (members.insert(pred).second && pred != succ) {
-            work.push_back(pred);
-          }
-        }
-      }
-      for (int block : members) {
-        ++depth[static_cast<std::size_t>(block)];
-      }
-    }
-  }
-  return depth;
+  MachineFunctionAnalysisManager localAM;
+  localAM.registerPass([] { return MachineCFGAnalysis(); });
+  localAM.registerPass([] { return MachineLoopAnalysis(); });
+  return localAM.getResult<MachineLoopAnalysis>(mf).depth;
 }
 
 struct ProgramInfo {
@@ -208,14 +141,13 @@ struct ProgramInfo {
 };
 
 ProgramInfo analyzeProgram(const MachineFunction &mf,
-                           const std::set<uint32_t> &generatedBySpill) {
+                           const std::set<uint32_t> &generatedBySpill,
+                           const std::vector<int> &loopDepth) {
   ProgramInfo info;
   info.classes = collectVRegs(mf);
   info.generatedBySpill = generatedBySpill;
   std::map<uint32_t, int> defCount;
   std::map<uint32_t, MachineInstr> candidates;
-  const std::vector<int> loopDepth = computeLoopDepth(mf);
-
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
     uint64_t blockHeat = 1;
@@ -1179,7 +1111,8 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
     if (stats != nullptr) {
       ++stats->rounds;
     }
-    ProgramInfo info = analyzeProgram(mf, generatedBySpill);
+    const std::vector<int> loopDepth = getLoopDepth(mf, am);
+    ProgramInfo info = analyzeProgram(mf, generatedBySpill, loopDepth);
     if (info.classes.empty()) {
       return;
     }
