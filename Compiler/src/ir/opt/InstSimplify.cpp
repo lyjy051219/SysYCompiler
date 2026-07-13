@@ -143,7 +143,8 @@ private:
 				SeenLoad = (I == L);
 				continue;
 			}
-			ModRefInfo MRI = getInstModRefInfo(Ptr, I, *AA, *LI, *FAM);
+			ModRefInfo MRI = getInstModRefInfo(
+				MemoryLocation::get(L), I, *AA, *LI, *FAM);
 			if (isModSet(MRI)) return false;
 		}
 
@@ -709,7 +710,35 @@ private:
 
 		if (LHS == RHS) return LHS;
 		if (Value::isConstZero(RHS)) return Value::makeZeroForType(BI->getIRType());
+		if (IRType::isBool(BI->getIRType()) && Value::isConstOne(RHS))
+			return LHS;
 		if (Value::isConstMinusOne(RHS)) return LHS;
+
+		// Boolean complements are represented canonically as xor i1 X, true.
+		if (IRType::isBool(BI->getIRType())) {
+			auto isNotOf = [](Value *MaybeNot, Value *X) {
+				auto *Not = dynamic_cast<BinaryInst *>(MaybeNot);
+				Value *NL = nullptr;
+				Value *NR = nullptr;
+				return Not && Not->getOp() == BinaryInst::XOR &&
+					BinaryInst::getOperands(Not, NL, NR) && NL == X &&
+					Value::isConstOne(NR);
+			};
+			if (isNotOf(LHS, RHS) || isNotOf(RHS, LHS))
+				return ConstBool::newConstBool(false);
+		}
+
+		// x & (x | y) == x.  This is valid for both booleans and integer
+		// bitmasks and often collapses short-circuit CFGs after if-conversion.
+		auto absorbsOr = [](Value *X, Value *MaybeOr) {
+			auto *Or = dynamic_cast<BinaryInst *>(MaybeOr);
+			Value *OL = nullptr;
+			Value *OR = nullptr;
+			return Or && Or->getOp() == BinaryInst::OR &&
+				BinaryInst::getOperands(Or, OL, OR) && (OL == X || OR == X);
+		};
+		if (absorbsOr(LHS, RHS)) return LHS;
+		if (absorbsOr(RHS, LHS)) return RHS;
 
 		return nullptr;
 	}
@@ -728,6 +757,32 @@ private:
 		if (Value::isConstMinusOne(RHS)) return Value::makeMinusOneForType(BI->getIRType());
 		if (LHS == RHS) return LHS;
 		if (Value::isConstZero(RHS)) return LHS;
+		if (IRType::isBool(BI->getIRType()) && Value::isConstOne(RHS))
+			return ConstBool::newConstBool(true);
+
+		if (IRType::isBool(BI->getIRType())) {
+			auto isNotOf = [](Value *MaybeNot, Value *X) {
+				auto *Not = dynamic_cast<BinaryInst *>(MaybeNot);
+				Value *NL = nullptr;
+				Value *NR = nullptr;
+				return Not && Not->getOp() == BinaryInst::XOR &&
+					BinaryInst::getOperands(Not, NL, NR) && NL == X &&
+					Value::isConstOne(NR);
+			};
+			if (isNotOf(LHS, RHS) || isNotOf(RHS, LHS))
+				return ConstBool::newConstBool(true);
+		}
+
+		// x | (x & y) == x.
+		auto absorbsAnd = [](Value *X, Value *MaybeAnd) {
+			auto *And = dynamic_cast<BinaryInst *>(MaybeAnd);
+			Value *AL = nullptr;
+			Value *AR = nullptr;
+			return And && And->getOp() == BinaryInst::AND &&
+				BinaryInst::getOperands(And, AL, AR) && (AL == X || AR == X);
+		};
+		if (absorbsAnd(LHS, RHS)) return LHS;
+		if (absorbsAnd(RHS, LHS)) return RHS;
 
 		// (x > a) || (x < b) -> true, when a < b
 		if (IRType::isBool(BI->getIRType())) {
@@ -774,6 +829,19 @@ private:
 
 		if (Value::isConstZero(RHS)) return LHS;
 		if (LHS == RHS) return Value::makeZeroForType(BI->getIRType());
+
+		if (IRType::isBool(BI->getIRType()) && Value::isConstOne(RHS)) {
+			// !!x -> x, while a single xor true remains the canonical boolean
+			// negation used by CFGSimplify.
+			auto *Inner = dynamic_cast<BinaryInst *>(LHS);
+			Value *IL = nullptr;
+			Value *IR = nullptr;
+			if (Inner && Inner->getOp() == BinaryInst::XOR &&
+				BinaryInst::getOperands(Inner, IL, IR) &&
+				Value::isConstOne(IR)) {
+				return IL;
+			}
+		}
 
 		return nullptr;
 	}
@@ -827,6 +895,70 @@ private:
 
 			if (Value *V = tryBoolCmpConst(LHS, RHS)) return V;
 			if (Value *V = tryBoolCmpConst(RHS, LHS)) return V;
+		}
+
+		// Recognize an integer min/max select and compare it with either source
+		// operand.  Only order-theoretic facts are folded, so this needs no
+		// overflow assumption:
+		//   max(a,b) <  a/b  -> false    max(a,b) >= a/b -> true
+		//   min(a,b) >  a/b  -> false    min(a,b) <= a/b -> true
+		enum class ExtremumKind { None, Minimum, Maximum };
+		auto matchExtremum = [](Value *V, Value *Bound) {
+			auto *Sel = dynamic_cast<SelectInst *>(V);
+			if (!Sel || !Bound || !IRType::isInt(Sel->getIRType()) ||
+				IRType::isBool(Sel->getIRType())) {
+				return ExtremumKind::None;
+			}
+			Value *TV = Sel->getTrueValue();
+			Value *FV = Sel->getFalseValue();
+			if (!TV || !FV || (Bound != TV && Bound != FV) ||
+				Value::isUndef(TV) || Value::isUndef(FV)) {
+				return ExtremumKind::None;
+			}
+			auto *Cmp = dynamic_cast<BinaryInst *>(Sel->getCondition());
+			Value *CL = nullptr;
+			Value *CR = nullptr;
+			if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp()) ||
+				!BinaryInst::getOperands(Cmp, CL, CR) || !CL || !CR ||
+				IRType::isFloat(CL->getIRType())) {
+				return ExtremumKind::None;
+			}
+
+			auto Pred = Cmp->getOp();
+			if (CL == FV && CR == TV) {
+				Pred = BinaryInst::reversePredicate(Pred);
+			} else if (CL != TV || CR != FV) {
+				return ExtremumKind::None;
+			}
+
+			if (Pred == BinaryInst::G || Pred == BinaryInst::GE)
+				return ExtremumKind::Maximum;
+			if (Pred == BinaryInst::L || Pred == BinaryInst::LE)
+				return ExtremumKind::Minimum;
+			return ExtremumKind::None;
+		};
+
+		if (ExtremumKind Kind = matchExtremum(LHS, RHS);
+			Kind != ExtremumKind::None) {
+			if (Kind == ExtremumKind::Maximum && BI->getOp() == BinaryInst::L)
+				return ConstBool::newConstBool(false);
+			if (Kind == ExtremumKind::Maximum && BI->getOp() == BinaryInst::GE)
+				return ConstBool::newConstBool(true);
+			if (Kind == ExtremumKind::Minimum && BI->getOp() == BinaryInst::G)
+				return ConstBool::newConstBool(false);
+			if (Kind == ExtremumKind::Minimum && BI->getOp() == BinaryInst::LE)
+				return ConstBool::newConstBool(true);
+		}
+		if (ExtremumKind Kind = matchExtremum(RHS, LHS);
+			Kind != ExtremumKind::None) {
+			if (Kind == ExtremumKind::Maximum && BI->getOp() == BinaryInst::G)
+				return ConstBool::newConstBool(false);
+			if (Kind == ExtremumKind::Maximum && BI->getOp() == BinaryInst::LE)
+				return ConstBool::newConstBool(true);
+			if (Kind == ExtremumKind::Minimum && BI->getOp() == BinaryInst::L)
+				return ConstBool::newConstBool(false);
+			if (Kind == ExtremumKind::Minimum && BI->getOp() == BinaryInst::GE)
+				return ConstBool::newConstBool(true);
 		}
 
 		// x % (2^n) == t  -> (x & (2^n - 1)) == t

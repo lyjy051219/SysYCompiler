@@ -2,6 +2,7 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 #include <optional>
+#include <cstddef>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
@@ -17,6 +18,23 @@ enum class AliasInfo {
     NoAlias,    // 一定不同
     MayAlias,   // 可能相同，也可能没关系
     MustAlias   // 一定相同
+};
+
+// A pointer together with the byte range touched through it.  Keeping the
+// access width in the query avoids conflating pointer identity with memory
+// overlap (for example, an i8 store next to an i32 load).  Unknown widths are
+// represented explicitly and simply fall back to the conservative pointer
+// query.
+struct MemoryLocation {
+    Value *Pointer = nullptr;
+    std::optional<std::size_t> Size;
+
+    MemoryLocation() = default;
+    MemoryLocation(Value *P, std::optional<std::size_t> S)
+        : Pointer(P), Size(S) {}
+
+    static MemoryLocation get(const LoadInst *Load);
+    static MemoryLocation get(const StoreInst *Store);
 };
 
 
@@ -35,6 +53,16 @@ public:
     //即时查询指针两者之间的别名关系
     AliasInfo alias(Value* V1, Value* V2, const LoopInfo& LI);
     AliasInfo aliasWithIndexRange(Value* V1, Value* V2, const LoopInfo& LI);
+    AliasInfo alias(const MemoryLocation &L1, const MemoryLocation &L2,
+                    const LoopInfo &LI);
+    AliasInfo aliasWithIndexRange(const MemoryLocation &L1,
+                                  const MemoryLocation &L2,
+                                  const LoopInfo &LI);
+    // Allocation-object disjointness deliberately ignores the immediate
+    // pointee-sized offsets used by alias().  It is the safe fallback for a
+    // dynamic-length memory intrinsic: two different elements of one array
+    // are not disjoint objects because an unknown byte range may span both.
+    bool haveKnownDistinctUnderlyingObjects(Value *V1, Value *V2) const;
     bool callMayAliasPointer(CallInst *CI, Value *P, const LoopInfo &LI);
 
 private:
@@ -57,6 +85,7 @@ private:
 
     std::unordered_map<std::pair<Value*, Value*>, AliasInfo, ValuePairHash> AliasCache;
     std::unordered_set<std::pair<Value*, Value*>, ValuePairHash> ObjectNoAlias;
+    std::unordered_set<std::pair<Value*, Value*>, ValuePairHash> ActiveSelectQueries;
 
     struct AdditiveDecomposition {
         Value* Base = nullptr;
@@ -75,14 +104,19 @@ private:
     // Unlike alias(), this answers an allocation-object question rather than
     // whether the two immediate pointee-sized access ranges overlap.  Only
     // facts proved here may be promoted to a callee-wide ObjectNoAlias fact.
-    bool haveKnownDistinctUnderlyingObjects(Value* V1, Value* V2) const;
     bool isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const;
     bool hasObjectNoAlias(Value* V1, Value* V2) const;
 
     AliasInfo aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
                         bool UseIndexRange);
+    AliasInfo aliasLocationImpl(
+        const MemoryLocation &L1, const MemoryLocation &L2,
+        const LoopInfo &LI, bool UseIndexRange, unsigned Depth,
+        std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> &Active);
     AliasInfo aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI,
                        bool UseIndexRange);
+    AliasInfo aliasSelect(SelectInst *Select, Value *Other,
+                          const LoopInfo &LI, bool UseIndexRange);
     AliasInfo mergePhiAlias(AliasInfo A, AliasInfo B) const;
     std::pair<Value*, Value*> makeCanonicalPair(Value* A, Value* B) const;
 
@@ -91,7 +125,9 @@ private:
 
     //分析两个GEP的偏移量关系
     AliasInfo aliasGEP(Value* GEP1, Value* GEP2,
-                       const LoopInfo& LI, bool UseIndexRange);
+                       const LoopInfo& LI, bool UseIndexRange,
+                       std::optional<std::size_t> AccessSize1 = std::nullopt,
+                       std::optional<std::size_t> AccessSize2 = std::nullopt);
 
     std::size_t getPointeeAccessSize(Value* V) const;
     AdditiveDecomposition decomposeAdditive(Value* V) const;

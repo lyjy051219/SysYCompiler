@@ -40,6 +40,13 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    static bool isWholeProgramReadOnlyVariable(Variable *Source);
+    static bool traceConstantGlobalPointer(
+        Value *Pointer, Variable *&Root, std::vector<int> &Path,
+        std::shared_ptr<IRType> &PointeeTy);
+    static bool foldReadOnlyGlobalLoads(
+        Function &F, FunctionAnalysisPassManager &FAM);
+    static void deleteDeadPointerChain(Value *Pointer);
     static LocalAggregatePointerPath tracePointer(
         Value *V, std::unordered_set<Value *> &Visiting);
     static LocalAggregatePointerPath tracePointer(Value *V);

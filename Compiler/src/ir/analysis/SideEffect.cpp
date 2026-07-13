@@ -43,6 +43,8 @@ IntrinsicID getIntrinsicID(BuildInFunction* BIF) {
     const std::string& N = BIF->getIdent();
     if (BuildInFunction::isMemcpyName(N))
         return IntrinsicID::Memcpy;
+    if (BuildInFunction::isMemmoveName(N))
+        return IntrinsicID::Memmove;
     if (BuildInFunction::isMemsetName(N))
         return IntrinsicID::Memset;
     return IntrinsicID::None;
@@ -146,7 +148,9 @@ FuncAttr classifyBuiltin(BuildInFunction* BIF) {
     if (BuildInFunction::isArrayOutputName(N)) return FuncAttr::MemReadOnly;
 
     // 5. 内存拷贝函数：既读又写
-    if (BuildInFunction::isMemcpyName(N)) return FuncAttr::MemReadWrite;
+    if (BuildInFunction::isMemcpyName(N) ||
+        BuildInFunction::isMemmoveName(N))
+        return FuncAttr::MemReadWrite;
 
     // 6. 内存填充函数：只写第一个指针实参。
     if (BuildInFunction::isMemsetName(N)) return FuncAttr::MemWriteOnly;
@@ -163,7 +167,8 @@ void SideEffectAnalysis::processBuiltinCall(
     SideEffectInfo& Info)
 {
     //1.Memcpy：目标地址被写，源地址被读
-    if (getIntrinsicID(BIF) == IntrinsicID::Memcpy) {
+    if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
+        getIntrinsicID(BIF) == IntrinsicID::Memmove) {
         auto addArgBases = [&](Value* Arg, std::unordered_set<Value*>& Dest) {
             if (!Arg) return;
             auto it = CallerPtrMap.find(Arg);
@@ -421,22 +426,66 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
     return std::move(ResultIt->second.Info);
 }
 
+namespace {
+
+MemoryLocation getUnknownSizeMemoryLocation(Value *Pointer) {
+    return {Pointer, std::nullopt};
+}
+
+std::optional<std::size_t> getConstantMemoryIntrinsicLength(
+    const std::vector<Value *> &Args) {
+    if (Args.size() < 3 || !Args[2]) return std::nullopt;
+    int32_t RawLength = 0;
+    if (!Args[2]->tryGetIntConst(RawLength)) return std::nullopt;
+
+    // The intrinsic length is an i32 bit pattern, not a signed C count.
+    // Preserve its full unsigned range when representing it as a host size.
+    return static_cast<std::size_t>(static_cast<uint32_t>(RawLength));
+}
+
+} // namespace
+
 // 指令级副作用查询接口
-ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
+ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                              BasicAAResult& AA, const LoopInfo& LI,
                              FunctionAnalysisPassManager& FAM)
 {
+    Value *V = Location.Pointer;
+    if (!V || !I) return ModRefInfo::ModRef;
     ModRefInfo Result = ModRefInfo::NoModRef;
 
-    // 辅助：别名分析是否重叠（非 NoAlias 即重叠）
+    // Call summaries and ordinary pointer parameters describe an unknown
+    // range within the underlying object.  Different immediate GEP offsets
+    // cannot make those effects disjoint.
     auto overlaps = [&](Value* Ptr) -> bool {
-        return AA.alias(V, Ptr, LI) != AliasInfo::NoAlias;
+        return Ptr && !AA.haveKnownDistinctUnderlyingObjects(V, Ptr);
+    };
+    auto overlapsLocation = [&](const MemoryLocation &Other) -> bool {
+        if (!Other.Pointer) return true;
+        if (!Location.Size || !Other.Size)
+            return !AA.haveKnownDistinctUnderlyingObjects(V, Other.Pointer);
+        return AA.aliasWithIndexRange(Location, Other, LI) !=
+               AliasInfo::NoAlias;
+    };
+
+    // For a known byte count, compare the two complete ranges.  With a
+    // dynamic count, immediate GEP offsets cannot prove disjointness: the
+    // range may extend beyond either pointer's nominal pointee.  Only distinct
+    // allocation objects are a valid NoAlias proof in that case.
+    auto overlapsMemoryIntrinsicRange =
+        [&](Value *Start, const std::optional<std::size_t> &Length) -> bool {
+        if (!Start) return true;
+        if (Length && *Length == 0) return false;
+        if (Length && Location.Size) {
+            return overlapsLocation(MemoryLocation(Start, *Length));
+        }
+        return !AA.haveKnownDistinctUnderlyingObjects(V, Start);
     };
 
     //LOAD
-    if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-        if (Value *Ptr = LI->getPointerOperand()) {
-            if (overlaps(Ptr))
+    if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+        if (Value *Ptr = Load->getPointerOperand()) {
+            if (overlapsLocation(MemoryLocation::get(Load)))
                 Result = unionModRef(Result, ModRefInfo::Ref);
         }
         return Result;
@@ -445,7 +494,7 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
     //STORE
     if (auto *SI = dynamic_cast<StoreInst *>(I)) {
         if (Value *Ptr = SI->getPointerOperand()) {
-            if (overlaps(Ptr))
+            if (overlapsLocation(MemoryLocation::get(SI)))
                 Result = unionModRef(Result, ModRefInfo::Mod);
         }
         return Result;
@@ -454,23 +503,31 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
     // CALL
     if (I->instType == Instruction::CALL) {
         auto *CI = dynamic_cast<CallInst *>(I);
-        if (!CI) return ModRefInfo::NoModRef;
+        if (!CI) return ModRefInfo::ModRef;
 
         std::vector<Value*> Args = CI->getArgs();
 
         // 1. 内置函数
         if (auto* BIF = CI->getBuiltinCallee()) {
             // 1a. memcpy：第0实参写，第1实参读
-            if (getIntrinsicID(BIF) == IntrinsicID::Memcpy) {
-                if (Args.size() >= 1 && Args[0] && overlaps(Args[0]))
+            if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
+                getIntrinsicID(BIF) == IntrinsicID::Memmove) {
+                if (Args.size() < 2 || !Args[0] || !Args[1])
+                    return ModRefInfo::ModRef;
+                std::optional<std::size_t> Length =
+                    getConstantMemoryIntrinsicLength(Args);
+                if (overlapsMemoryIntrinsicRange(Args[0], Length))
                     Result = unionModRef(Result, ModRefInfo::Mod);
                 if (Result == ModRefInfo::ModRef) return Result;
-                if (Args.size() >= 2 && Args[1] && overlaps(Args[1]))
+                if (overlapsMemoryIntrinsicRange(Args[1], Length))
                     Result = unionModRef(Result, ModRefInfo::Ref);
                 return Result;
             }
             if (getIntrinsicID(BIF) == IntrinsicID::Memset) {
-                if (!Args.empty() && Args[0] && overlaps(Args[0]))
+                if (Args.empty() || !Args[0]) return ModRefInfo::ModRef;
+                std::optional<std::size_t> Length =
+                    getConstantMemoryIntrinsicLength(Args);
+                if (overlapsMemoryIntrinsicRange(Args[0], Length))
                     Result = unionModRef(Result, ModRefInfo::Mod);
                 return Result;
             }
@@ -555,6 +612,15 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
     return ModRefInfo::NoModRef;
 }
 
+ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
+                             BasicAAResult& AA, const LoopInfo& LI,
+                             FunctionAnalysisPassManager& FAM) {
+    // A bare pointer carries no access width.  Do not infer the pointee width:
+    // callers asking about an aggregate/range may intentionally pass its first
+    // element, and memory intrinsics can span beyond that nominal element.
+    return getInstModRefInfo(getUnknownSizeMemoryLocation(V), I, AA, LI, FAM);
+}
+
 // 函数级副作用查询接口
 ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI)
 {
@@ -635,7 +701,8 @@ bool BasicBlockSideEffect(BasicBlock* BB,
 
             // 沿 CFG 向下扫描：若后续有 Ref/ModRef 命中该指针，视为有副作用
             for (Instruction* Next = I->getNext(); Next != nullptr; Next = Next->getNext()) {
-                ModRefInfo MRI = getInstModRefInfo(Ptr, Next, AA, LI, FAM);
+                ModRefInfo MRI = getInstModRefInfo(
+                    MemoryLocation::get(SI), Next, AA, LI, FAM);
                 if (isRefSet(MRI)) {
                     return true;
                 }
@@ -655,7 +722,8 @@ bool BasicBlockSideEffect(BasicBlock* BB,
                 for (auto II = Cur->begin(); II != Cur->end(); ++II) {
                     Instruction* J = *II;
                     if (!J) continue;
-                    ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+                    ModRefInfo MRI = getInstModRefInfo(
+                        MemoryLocation::get(SI), J, AA, LI, FAM);
                     if (isRefSet(MRI)) {
                         return true;
                     }

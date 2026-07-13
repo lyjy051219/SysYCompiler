@@ -749,6 +749,7 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
       return VOIDType::NewVoid();
     if (ident == "llvm.memcpy.p0i8.p0i8.i32" ||
         ident == "llvm.memcpy.p0.p0.i32" ||
+        ident == "llvm.memmove.p0.p0.i32" ||
         ident == "llvm.memset.p0i8.i32" ||
         ident == "llvm.memset.p0.i32")
         return VOIDType::NewVoid();
@@ -780,13 +781,18 @@ bool BuildInFunction::isSupportedName(const std::string &Name) {
       "getint", "getch", "getfloat", "getarray", "getfarray",
       "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
       "starttime", "stoptime", "llvm.memcpy.p0i8.p0i8.i32",
-      "llvm.memcpy.p0.p0.i32", "llvm.memset.p0i8.i32",
+      "llvm.memcpy.p0.p0.i32", "llvm.memmove.p0.p0.i32",
+      "llvm.memset.p0i8.i32",
       "llvm.memset.p0.i32"};
   return SupportedNames.count(Name) != 0;
 }
 
 bool BuildInFunction::isMemcpyName(const std::string &Name) {
   return Name.find("memcpy") != std::string::npos;
+}
+
+bool BuildInFunction::isMemmoveName(const std::string &Name) {
+  return Name.find("memmove") != std::string::npos;
 }
 
 bool BuildInFunction::isMemsetName(const std::string &Name) {
@@ -826,6 +832,10 @@ const char *BuildInFunction::getDefaultMemcpyName() {
   return "llvm.memcpy.p0.p0.i32";
 }
 
+const char *BuildInFunction::getDefaultMemmoveName() {
+  return "llvm.memmove.p0.p0.i32";
+}
+
 const char *BuildInFunction::getDefaultMemsetName() {
   return "llvm.memset.p0.i32";
 }
@@ -839,6 +849,7 @@ bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
   if (SysyLibNames.count(Name) || isSupportedName(Name)) return true;
   if (Name.find("_sysy_") != std::string::npos) return true;
   if (isMemcpyName(Name)) return true;
+  if (isMemmoveName(Name)) return true;
   if (isMemsetName(Name)) return true;
   if (Name.find("llvm.") == 0) return true;
   return false;

@@ -7,15 +7,17 @@
 #include <vector>
 
 class DominatorTree;
+class Function;
 class Loop;
 class SCEVResult;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
 
-// Recognize the deliberately small, fully-provable subset of scalar memory
-// loops that can be replaced by llvm.memcpy/llvm.memset.  This pass does not
-// infer general dependence facts: copy roots must be distinct globals/allocas,
-// and the loop must have a constant trip count and no unrelated operation.
+// Recognize a deliberately small, fully-provable subset of scalar memory
+// loops.  Constant and guarded runtime copy/fill loops become memcpy/memset;
+// memmove is emitted only for an adjacent two-loop transaction through a
+// private temporary.  The pass never guesses general dependence facts and
+// keeps the original scalar loop as the fallback for dynamic short lengths.
 class LoopIdiomRecognizePass
     : public PassDescriptor<LoopIdiomRecognizePass> {
 public:
@@ -28,6 +30,22 @@ private:
         std::vector<Value *> Indices;
         size_t InductionIndex = 0;
         std::shared_ptr<IRType> ElementTy;
+    };
+
+    struct CopyLoopMatch {
+        Loop *L = nullptr;
+        BasicBlock *PreHeader = nullptr;
+        BasicBlock *Header = nullptr;
+        BasicBlock *ExitBlock = nullptr;
+        PhiInst *IndVar = nullptr;
+        StoreInst *Store = nullptr;
+        LoadInst *Load = nullptr;
+        LinearAccess Destination;
+        LinearAccess Source;
+        Value *RuntimeBound = nullptr;
+        int64_t Start = 0;
+        int64_t TripCount = 0;
+        bool IsRuntime = false;
     };
 
     static bool matchLinearAccess(GetElementPtrInst *GEP, PhiInst *IndVar,
@@ -44,5 +62,13 @@ private:
     static GetElementPtrInst *materializeStartPointer(
         const LinearAccess &Access, PhiInst *IndVar, int64_t Start,
         BasicBlock *PreHeader);
-    static bool transformLoop(Loop *L, SCEVResult &SE, DominatorTree &DT);
+    static bool matchSimpleCopyLoop(Loop *L, SCEVResult &SE,
+                                    DominatorTree &DT,
+                                    CopyLoopMatch &Match);
+    static bool transformTemporaryCopyPair(
+        Function &F, const CopyLoopMatch &First,
+        const CopyLoopMatch &Second, DominatorTree &DT,
+        bool &CFGChanged);
+    static bool transformLoop(Function &F, Loop *L, SCEVResult &SE,
+                              DominatorTree &DT, bool &CFGChanged);
 };

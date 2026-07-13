@@ -167,6 +167,13 @@ public:
     std::optional<LoopRemainderInfo> getRemainderInfo(const Loop *L,
                                                       int64_t Factor);
     std::optional<InductionDescriptor> getCanonicalInduction(const Loop *L);
+    // Contextual proof for a symbolic, header-tested unit-stride loop.  The
+    // mathematical SCEV count is usable only when both the recurrence and the
+    // eagerly expanded distance are proved not to wrap on every path reaching
+    // the preheader.
+    bool proveRuntimeNoWrapAtPreheader(const LoopTripCountInfo &Info,
+                                       RangeInfo &RI,
+                                       DominatorTree &DT);
     const SCEVExpr *getSCEVAtIteration(const SCEVExpr *E,
                                        const SCEVExpr *Iter,
                                        const Loop *L);

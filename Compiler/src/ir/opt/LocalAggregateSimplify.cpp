@@ -1,11 +1,249 @@
 #include "ir/opt/LocalAggregateSimplify.hpp"
+#include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/RangeAnalysis.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <set>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace {
+
+bool sameScalarConstant(Value *A, Value *B) {
+    if (A == B) return true;
+    if (!A || !B || !A->getIRType() || !B->getIRType() ||
+        !A->getIRType()->hasSameShape(*B->getIRType()))
+        return false;
+    if (auto *AI = dynamic_cast<ConstInt *>(A)) {
+        auto *BI = dynamic_cast<ConstInt *>(B);
+        return BI && AI->getVal() == BI->getVal();
+    }
+    if (auto *AF = dynamic_cast<ConstFloat *>(A)) {
+        auto *BF = dynamic_cast<ConstFloat *>(B);
+        if (!BF) return false;
+        uint32_t ABits = 0;
+        uint32_t BBits = 0;
+        float AV = AF->getVal();
+        float BV = BF->getVal();
+        std::memcpy(&ABits, &AV, sizeof(ABits));
+        std::memcpy(&BBits, &BV, sizeof(BBits));
+        return ABits == BBits;
+    }
+    return false;
+}
+
+} // namespace
+
+bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
+    Variable *Source) {
+    if (!Source || (Source->vartag != Variable::Constant &&
+                    Source->vartag != Variable::GlobalVariable))
+        return false;
+
+    std::vector<Value *> Worklist{Source};
+    std::unordered_set<Value *> Seen;
+    while (!Worklist.empty()) {
+        Value *Pointer = Worklist.back();
+        Worklist.pop_back();
+        if (!Pointer || !Seen.insert(Pointer).second) continue;
+
+        for (auto It = Pointer->getUseList().begin();
+             It != Pointer->getUseList().end(); ++It) {
+            Use *U = *It;
+            if (!U || U->getValue() != Pointer) continue;
+            auto *I = dynamic_cast<Instruction *>(U->getUser());
+            if (!I) return false;
+            int OperandIndex = I->getUserIndex(U);
+
+            if ((dynamic_cast<GetElementPtrInst *>(I) ||
+                 dynamic_cast<BitCastInst *>(I)) &&
+                OperandIndex == 0) {
+                Worklist.push_back(I);
+                continue;
+            }
+            if (dynamic_cast<LoadInst *>(I) && OperandIndex == 0)
+                continue;
+            if (auto *CI = dynamic_cast<CallInst *>(I);
+                CI && CI->isNonVolatileMemcpy() &&
+                CI->getArgIndex(U) == 1)
+                continue;
+
+            // Passing the address to an arbitrary call, storing through it,
+            // or storing the address itself can make the initializer stale or
+            // observable.  Keep the proof whole-program and structural.
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
+    Value *Pointer, Variable *&Root, std::vector<int> &Path,
+    std::shared_ptr<IRType> &PointeeTy) {
+    Root = nullptr;
+    Path.clear();
+    PointeeTy = nullptr;
+    if (!Pointer) return false;
+
+    std::vector<GetElementPtrInst *> Chain;
+    std::unordered_set<Value *> Seen;
+    Value *Current = Pointer;
+    while (Current && Seen.insert(Current).second) {
+        if (auto *BC = dynamic_cast<BitCastInst *>(Current)) {
+            Current = BC->getUnaryOperand();
+            continue;
+        }
+        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Current)) {
+            Chain.push_back(GEP);
+            Current = GEP->getBasePointer();
+            continue;
+        }
+        Root = dynamic_cast<Variable *>(Current);
+        break;
+    }
+    if (!Root || (Root->vartag != Variable::Constant &&
+                  Root->vartag != Variable::GlobalVariable))
+        return false;
+
+    std::shared_ptr<IRType> Ty = Root->getPointeeType();
+    for (auto It = Chain.rbegin(); It != Chain.rend(); ++It) {
+        GetElementPtrInst *GEP = *It;
+        if (!GEP || GEP->getNumIndices() < 1) return false;
+        int PointerIndex = 0;
+        if (!Value::tryGetIntIndex(GEP->getIndex(0), PointerIndex) ||
+            PointerIndex != 0)
+            return false;
+
+        for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
+            int Index = 0;
+            if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
+                return false;
+            auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
+            if (!ArrayTy || Index < 0 ||
+                Index >= ArrayTy->getElementCount())
+                return false;
+            Path.push_back(Index);
+            Ty = ArrayTy->getElementType();
+        }
+    }
+    PointeeTy = Ty;
+    return !Path.empty() && PointeeTy && IRType::isScalar(PointeeTy);
+}
+
+void LocalAggregateSimplifyPass::deleteDeadPointerChain(Value *Pointer) {
+    while (auto *I = dynamic_cast<Instruction *>(Pointer)) {
+        if (!I->getUseList().is_empty()) return;
+        if (!dynamic_cast<GetElementPtrInst *>(I) &&
+            !dynamic_cast<BitCastInst *>(I))
+            return;
+        Value *Parent = I->getOperand(0);
+        delete I;
+        Pointer = Parent;
+    }
+}
+
+bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
+    Function &F, FunctionAnalysisPassManager &FAM) {
+    auto &DT = FAM.getResult<DominantAnalysis>(F);
+    auto &RI = FAM.getResult<RangeAnalysis>(F);
+    std::unordered_map<Variable *, bool> ReadOnlyCache;
+    std::vector<std::pair<LoadInst *, Value *>> Replacements;
+
+    for (BasicBlock *BB : F) {
+        for (Instruction *I : *BB) {
+            auto *Load = dynamic_cast<LoadInst *>(I);
+            if (!Load) continue;
+            Value *Pointer = Load->getPointerOperand();
+
+            Variable *Root = nullptr;
+            std::vector<int> Path;
+            std::shared_ptr<IRType> ElementTy;
+            if (traceConstantGlobalPointer(Pointer, Root, Path, ElementTy)) {
+                auto CacheIt = ReadOnlyCache.find(Root);
+                bool ReadOnly = CacheIt != ReadOnlyCache.end()
+                                    ? CacheIt->second
+                                    : (ReadOnlyCache[Root] =
+                                           isWholeProgramReadOnlyVariable(Root));
+                if (!ReadOnly) continue;
+                Value *Constant = Root->getConstantElement(Path);
+                if (Constant && Value::hasSameStorageType(Load, Constant))
+                    Replacements.push_back({Load, Constant});
+                continue;
+            }
+
+            // Recognize a compact immutable power-of-two table.  A proven
+            // in-range dynamic lookup is exactly `1 << index`, which removes
+            // both the address calculation and the memory dependence without
+            // building an expensive select chain.  This is shape-driven, not
+            // tied to a source-level variable name such as SHIFT_TABLE.
+            auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
+            auto *CandidateRoot = GEP && GEP->getBasePointer()
+                                      ? dynamic_cast<Variable *>(
+                                            GEP->getBasePointer())
+                                      : nullptr;
+            if (!GEP || !CandidateRoot || GEP->getNumIndices() != 2)
+                continue;
+            int Zero = 0;
+            if (!Value::tryGetIntIndex(GEP->getIndex(0), Zero) || Zero != 0)
+                continue;
+            Value *Index = GEP->getIndex(1);
+            if (!Index || dynamic_cast<ConstInt *>(Index)) continue;
+
+            auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(
+                CandidateRoot->getPointeeType());
+            int Count = ArrayTy ? ArrayTy->getElementCount() : 0;
+            if (!ArrayTy || Count <= 0 || Count > 31 ||
+                !IRType::isScalar(ArrayTy->getElementType()))
+                continue;
+            auto CacheIt = ReadOnlyCache.find(CandidateRoot);
+            bool ReadOnly = CacheIt != ReadOnlyCache.end()
+                                ? CacheIt->second
+                                : (ReadOnlyCache[CandidateRoot] =
+                                       isWholeProgramReadOnlyVariable(
+                                           CandidateRoot));
+            if (!ReadOnly) continue;
+
+            bool IsPowerTable = true;
+            for (int N = 0; N < Count; ++N) {
+                auto *C = dynamic_cast<ConstInt *>(
+                    CandidateRoot->getConstantElement({N}));
+                if (!C || static_cast<uint32_t>(C->getVal()) !=
+                              (uint32_t{1} << N)) {
+                    IsPowerTable = false;
+                    break;
+                }
+            }
+            if (!IsPowerTable) continue;
+
+            IntRange IndexRange = RI.query(Index, BB, DT);
+            if (IndexRange.isBottom() || IndexRange.min < 0 ||
+                IndexRange.max >= Count)
+                continue;
+            Value *One = Value::makeIntegerLike(Index, 1);
+            if (!One || !Value::hasSameStorageType(Load, One)) continue;
+            auto *Shift = new BinaryInst(One, BinaryInst::SHL, Index);
+            if (!Load->insertBefore(Shift)) {
+                delete Shift;
+                continue;
+            }
+            Replacements.push_back({Load, Shift});
+        }
+    }
+
+    for (auto &Replacement : Replacements) {
+        LoadInst *Load = Replacement.first;
+        if (!Load || !Load->getParent()) continue;
+        Value *Pointer = Load->getPointerOperand();
+        Load->replaceAllUsesWith(Replacement.second);
+        delete Load;
+        deleteDeadPointerChain(Pointer);
+    }
+    return !Replacements.empty();
+}
 
 LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     Value *V, std::unordered_set<Value *> &Visiting) {
@@ -449,6 +687,15 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
         Elements.push_back(Elem);
     }
 
+    bool AllSame = true;
+    for (size_t I = 1; I < Elements.size(); ++I) {
+        if (!sameScalarConstant(Elements[0], Elements[I])) {
+            AllSame = false;
+            break;
+        }
+    }
+    if (AllSame) return Elements[0];
+
     Value *Result = Elements[0];
     for (int I = 1; I < Count; ++I) {
         Value *Needle = Value::makeIntegerLike(Index, I);
@@ -499,8 +746,14 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
             HasDynamicIndex = true;
         }
     }
-    if (HasDynamicIndex && Count > kMaxDynamicSelectArrayElements)
-        return false;
+    if (HasDynamicIndex && Count > kMaxDynamicSelectArrayElements) {
+        Value *First = Variable::getConstantElement(Plan.Source, {0});
+        bool Uniform = First != nullptr;
+        for (int I = 1; Uniform && I < Count; ++I)
+            Uniform = sameScalarConstant(
+                First, Variable::getConstantElement(Plan.Source, {I}));
+        if (!Uniform) return false;
+    }
 
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
     Replacements.reserve(Plan.Loads.size());
@@ -887,9 +1140,10 @@ LocalAggregateSimplifyPass::collectArrayAllocas(Function &F) {
 
 PreservationStatus
 LocalAggregateSimplifyPass::run(Function &F,
-                                FunctionAnalysisPassManager &) {
+                                FunctionAnalysisPassManager &FAM) {
     bool Changed = false;
 
+    Changed |= foldReadOnlyGlobalLoads(F, FAM);
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= forwardConstantLoads(AI);
     for (AllocaInst *AI : collectArrayAllocas(F))

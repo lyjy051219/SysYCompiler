@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+class MemorySSAResult;
+
 // LICM (Loop Invariant Code Motion) - 循环不变量外提
 // 依赖：DominatorTree, LoopInfo, BasicAliasAnalysis,SideEffect
 
@@ -37,7 +39,8 @@ private:
         const std::vector<BasicBlock *> &ExitBlocks,
         const std::vector<BasicBlock *> &Latches,
         const std::vector<Instruction *> &LoopInstructions,
-        BasicAAResult &AA, const LoopInfo &LI,
+        BasicAAResult &AA, MemorySSAResult &MSSA, bool MemorySSAUsable,
+        const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM, bool ForSink,
         bool AggressiveHoist);
 };

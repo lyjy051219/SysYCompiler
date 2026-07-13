@@ -178,11 +178,54 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
 
     if (K == SCEVCastKind::BitCast && Op->Ty == Ty) return Op;
 
-    if (Op->Kind == SCEVExprKind::Constant) {
-        int64_t V = Op->ConstValue;
-        if (K == SCEVCastKind::Trunc && Ty && Ty == INTType::NewBool())
-            V = (V != 0);
-        return makeConstant(V, Ty);
+    if (Op->Kind == SCEVExprKind::Constant && Op->Ty && Ty &&
+        Op->Ty->isInt() && Ty->isInt()) {
+        const int SourceBits = Op->Ty->getIntegerBitWidth(32);
+        const int TargetBits = Ty->getIntegerBitWidth(32);
+        if (SourceBits > 0 && SourceBits <= 32 && TargetBits > 0 &&
+            TargetBits <= 32) {
+            auto Mask = [](int Bits) -> uint64_t {
+                return Bits == 64 ? ~uint64_t{0}
+                                  : ((uint64_t{1} << Bits) - 1);
+            };
+            const uint64_t SourceRaw =
+                static_cast<uint64_t>(Op->ConstValue) & Mask(SourceBits);
+            int64_t V = 0;
+            bool Folded = true;
+            switch (K) {
+            case SCEVCastKind::Trunc: {
+                const uint64_t Raw = SourceRaw & Mask(TargetBits);
+                V = TargetBits == 32
+                        ? static_cast<int32_t>(static_cast<uint32_t>(Raw))
+                        : static_cast<int64_t>(Raw);
+                break;
+            }
+            case SCEVCastKind::ZExt:
+                if (TargetBits < SourceBits) Folded = false;
+                else V = static_cast<int64_t>(SourceRaw);
+                break;
+            case SCEVCastKind::SExt:
+                if (TargetBits < SourceBits) {
+                    Folded = false;
+                } else {
+                    const uint64_t Sign = uint64_t{1} << (SourceBits - 1);
+                    V = (SourceRaw & Sign)
+                            ? static_cast<int64_t>(SourceRaw) -
+                                  static_cast<int64_t>(uint64_t{1}
+                                                       << SourceBits)
+                            : static_cast<int64_t>(SourceRaw);
+                }
+                break;
+            case SCEVCastKind::BitCast:
+                if (TargetBits != SourceBits) Folded = false;
+                else V = TargetBits == 32
+                             ? static_cast<int32_t>(
+                                   static_cast<uint32_t>(SourceRaw))
+                             : static_cast<int64_t>(SourceRaw);
+                break;
+            }
+            if (Folded) return makeConstant(V, Ty);
+        }
     }
 
     if (Op->Kind == SCEVExprKind::Cast) {
@@ -427,10 +470,13 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
     case BinaryInst::ADD: return add(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::SUB: return sub(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::MUL: return mul(getSCEV(LHS), getSCEV(RHS));
-    case BinaryInst::DIV:
-    case BinaryInst::UDIV: return div(getSCEV(LHS), getSCEV(RHS));
-    case BinaryInst::MOD:
-    case BinaryInst::UREM: return mod(getSCEV(LHS), getSCEV(RHS));
+    case BinaryInst::DIV: return div(getSCEV(LHS), getSCEV(RHS));
+    case BinaryInst::MOD: return mod(getSCEV(LHS), getSCEV(RHS));
+    // The compact SCEV language currently has only signed Div/Mod kinds.
+    // Keep unsigned operations opaque instead of conflating their value
+    // semantics with signed arithmetic.
+    case BinaryInst::UDIV:
+    case BinaryInst::UREM: return makeUnknown(BI);
     default: break;
     }
     return makeUnknown(BI);
@@ -819,6 +865,77 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
     if (!fillTripCountFromComparison(Info)) return std::nullopt;
     Info.Valid = true;
     return Info;
+}
+
+bool SCEVResult::proveRuntimeNoWrapAtPreheader(
+    const LoopTripCountInfo &Info, RangeInfo &RI, DominatorTree &DomTree) {
+    if (!Info.Valid || !Info.IsRuntime || !Info.L || !Info.PreHeader ||
+        !Info.Header || Info.ExitingBlock != Info.Header || !Info.ExitCmp) {
+        return false;
+    }
+
+    auto IV = getCanonicalInduction(Info.L);
+    if (!IV || !IV->Valid || !IV->Phi || !IV->StartValue ||
+        !IV->ConstantStep ||
+        (*IV->ConstantStep != 1 && *IV->ConstantStep != -1)) {
+        return false;
+    }
+
+    auto IsI32 = [](Value *V) {
+        auto Ty = V ? V->getIRType() : nullptr;
+        return Ty && Ty->isInt() && Ty->getIntegerBitWidth(32) == 32;
+    };
+    if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
+
+    auto *Update = dynamic_cast<BinaryInst *>(IV->UpdateValue);
+    if (!Update) return false;
+    Value *A = Update->getOperand(0);
+    Value *B = Update->getOperand(1);
+    auto *CA = dynamic_cast<ConstInt *>(A);
+    auto *CB = dynamic_cast<ConstInt *>(B);
+    bool DirectStep = false;
+    if (*IV->ConstantStep == 1 && Update->getOp() == BinaryInst::ADD) {
+        DirectStep = (A == IV->Phi && CB && CB->getVal() == 1) ||
+                     (B == IV->Phi && CA && CA->getVal() == 1);
+    } else if (*IV->ConstantStep == -1 &&
+               Update->getOp() == BinaryInst::SUB) {
+        DirectStep = A == IV->Phi && CB && CB->getVal() == 1;
+    }
+    if (!DirectStep) return false;
+
+    BinaryInst::Operation Pred = Info.ContinueOnTrue
+        ? Info.ExitCmp->getOp()
+        : BinaryInst::negatePredicate(Info.ExitCmp->getOp());
+    Value *LHS = Info.ExitCmp->getOperand(0);
+    Value *RHS = Info.ExitCmp->getOperand(1);
+    if (RHS == IV->Phi) {
+        std::swap(LHS, RHS);
+        Pred = BinaryInst::reversePredicate(Pred);
+    }
+    if (LHS != IV->Phi || !IsI32(RHS)) return false;
+    if ((*IV->ConstantStep == 1 && Pred != BinaryInst::L) ||
+        (*IV->ConstantStep == -1 && Pred != BinaryInst::G)) {
+        return false;
+    }
+
+    IntRange StartRange = RI.query(IV->StartValue, Info.PreHeader, DomTree);
+    IntRange BoundRange = RI.query(RHS, Info.PreHeader, DomTree);
+    if (StartRange.isBottom() || BoundRange.isBottom()) return false;
+
+    // SCEV expands max(0, Bound-Start) for an increasing loop and the
+    // symmetric Start-Bound for a decreasing loop.  Prove that subtraction
+    // in the source integer width, not merely in mathematical integers.
+    __int128 MinDistance = 0;
+    __int128 MaxDistance = 0;
+    if (*IV->ConstantStep == 1) {
+        MinDistance = static_cast<__int128>(BoundRange.min) - StartRange.max;
+        MaxDistance = static_cast<__int128>(BoundRange.max) - StartRange.min;
+    } else {
+        MinDistance = static_cast<__int128>(StartRange.min) - BoundRange.max;
+        MaxDistance = static_cast<__int128>(StartRange.max) - BoundRange.min;
+    }
+    return MinDistance >= IntRange::I32_MIN &&
+           MaxDistance <= IntRange::I32_MAX;
 }
 
 bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {

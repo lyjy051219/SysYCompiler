@@ -2,6 +2,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/PostDominant.hpp"
 
@@ -51,16 +52,19 @@ bool LoadEliminationPass::isTypeCompatible(
 // incomplete interprocedural summary must never turn a call into a false
 // NoModRef result.
 bool LoadEliminationPass::mayModifyPointer(
-    Value *P, Instruction *I, BasicAAResult &AA, const LoopInfo &LI,
+    const MemoryLocation &Location, Instruction *I, BasicAAResult &AA,
+    const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    Value *P = Location.Pointer;
     if (!P || !I) return true;
 
-    ModRefInfo MR = getInstModRefInfo(P, I, AA, LI, FAM);
+    ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
     if (isModSet(MR)) return true;
 
     if (auto *CI = dynamic_cast<CallInst *>(I)) {
-        if (isNoModRef(MR) && AA.callMayAliasPointer(CI, P, LI)) {
+        if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
+            AA.callMayAliasPointer(CI, P, LI)) {
             return true;
         }
     }
@@ -118,7 +122,9 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
                 reachedCandidate = true;
                 break;
             }
-            if (mayModifyPointer(P, I, AA, LI, FAM)) return false;
+            if (mayModifyPointer(MemoryLocation::get(Target), I, AA, LI,
+                                 FAM))
+                return false;
         }
 
         if (BB == CandidateBB) {
@@ -239,19 +245,22 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
         }
         // CallInst: 先查 ModRef（主判据），helper 做 fallback
         else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
-            ModRefInfo MR = getInstModRefInfo(P, cur, AA, LI, FAM);
+            ModRefInfo MR = getInstModRefInfo(
+                MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
             if (isModSet(MR)) {
                 return LoadElimQueryResult::clobbered();
             }
             // 纯 Ref → 不阻断 load forwarding，继续
             // 安全网：ModRef 说 NoModRef 但传了 aliasing pointer → Clobbered
-            if (isNoModRef(MR) && AA.callMayAliasPointer(CI, P, LI)) {
+            if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
+                AA.callMayAliasPointer(CI, P, LI)) {
                 return LoadElimQueryResult::clobbered();
             }
         }
         // 其他指令
         else {
-            ModRefInfo MR = getInstModRefInfo(P, cur, AA, LI, FAM);
+            ModRefInfo MR = getInstModRefInfo(
+                MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
             if (isModSet(MR)) {
                 return LoadElimQueryResult::clobbered();
             }
@@ -499,7 +508,90 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
-    bool changed = processFunction(F, DT, AA, LI, FAM);
+    // MemorySSA can answer the common cross-block case without recursively
+    // rebuilding a reaching-value lattice for each load.  Only forward from
+    // one concrete, dominating, full-width store.  A Phi/LiveOnEntry result,
+    // a MayAlias address, or a walker budget miss is deliberately ignored and
+    // falls through to the existing path solver below.
+    auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
+    constexpr std::size_t MaxMSSAQueries = 512;
+    constexpr std::size_t MaxMSSAWalk = 256;
+    std::vector<std::pair<LoadInst *, Value *>> MSSAReplacements;
+    std::size_t QueryCount = 0;
+    for (BasicBlock *BB : F) {
+        for (Instruction *I : *BB) {
+            auto *Load = dynamic_cast<LoadInst *>(I);
+            if (!Load || QueryCount++ >= MaxMSSAQueries) continue;
+
+            MemoryAccess *Clobber = MSSA.getClobberingAccess(
+                Load, MemoryLocation::get(Load), AA, LI, FAM,
+                MaxMSSAWalk);
+            auto *Store = Clobber && Clobber->isDef()
+                              ? dynamic_cast<StoreInst *>(
+                                    Clobber->getInstruction())
+                              : nullptr;
+            if (!Store || !Store->getParent()) continue;
+            if (!DT.dominates(Store->getParent(), BB)) continue;
+            if (Store->getParent() == BB &&
+                !Instruction::comesBefore(Store, Load))
+                continue;
+            if (AA.aliasWithIndexRange(MemoryLocation::get(Load),
+                                       MemoryLocation::get(Store), LI) !=
+                AliasInfo::MustAlias)
+                continue;
+            Value *Stored = Store->getValueOperand();
+            if (!isTypeCompatible(Stored, Load)) continue;
+            MSSAReplacements.push_back({Load, Stored});
+        }
+    }
+
+    // A forwarded store value can itself be an earlier load that is also in
+    // the replacement set.  Resolve that relation before mutating anything;
+    // otherwise deleting the earlier load first can leave a later
+    // replacement pointing at freed IR.  Cycles are not expected in valid
+    // dominance order, but are rejected conservatively rather than relying on
+    // that assumption.
+    std::unordered_map<LoadInst *, Value *> Planned;
+    for (const auto &Replacement : MSSAReplacements)
+        Planned.emplace(Replacement.first, Replacement.second);
+
+    std::function<Value *(Value *, std::unordered_set<LoadInst *> &)>
+        ResolveReplacement = [&](Value *V,
+                                 std::unordered_set<LoadInst *> &Active)
+            -> Value * {
+        auto *AsLoad = dynamic_cast<LoadInst *>(V);
+        auto It = AsLoad ? Planned.find(AsLoad) : Planned.end();
+        if (It == Planned.end()) return V;
+        if (!Active.insert(AsLoad).second) return nullptr;
+        Value *Resolved = ResolveReplacement(It->second, Active);
+        Active.erase(AsLoad);
+        return Resolved;
+    };
+
+    std::vector<std::pair<LoadInst *, Value *>> ResolvedReplacements;
+    ResolvedReplacements.reserve(MSSAReplacements.size());
+    for (const auto &Replacement : MSSAReplacements) {
+        LoadInst *Load = Replacement.first;
+        if (!Load || !Load->getParent()) continue;
+        std::unordered_set<LoadInst *> Active;
+        Value *Resolved = ResolveReplacement(Replacement.second, Active);
+        if (!Resolved || Resolved == Load ||
+            !isTypeCompatible(Resolved, Load))
+            continue;
+        ResolvedReplacements.push_back({Load, Resolved});
+    }
+
+    bool changed = false;
+    for (const auto &Replacement : ResolvedReplacements)
+        Replacement.first->replaceAllUsesWith(Replacement.second);
+    for (const auto &Replacement : ResolvedReplacements) {
+        LoadInst *Load = Replacement.first;
+        if (!Load || !Load->getParent()) continue;
+        delete Load;
+        changed = true;
+    }
+
+    changed |= processFunction(F, DT, AA, LI, FAM);
 
     if (!changed) {
         return PreservationStatus::all();
@@ -510,6 +602,7 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     PA.keep<PostDominantAnalysis>();
     PA.keep<LoopAnalysis>();
     PA.discard<BasicAliasAnalysis>();
+    PA.discard<MemorySSAAnalysis>();
     PA.discard<SideEffectAnalysis>();
     return PA;
 }

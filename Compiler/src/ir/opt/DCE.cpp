@@ -63,17 +63,19 @@ bool isGuaranteedRemovableFunction(
 
 	for (BasicBlock *BB : F) {
 		for (Instruction *I : *BB) {
-			// SideEffectAnalysis intentionally summarizes only externally
-			// visible memory.  A local load/store can still fault on an invalid
-			// address, so memory-free is required before deleting the whole call.
-			if (dynamic_cast<LoadInst *>(I) || dynamic_cast<StoreInst *>(I)) {
+			// Stores are observable even when their destination is local to the
+			// callee because the call boundary is the unit being removed.  An
+			// ordinary non-volatile load, however, has no observable result once
+			// all of its users are dead; an invalid address already makes the
+			// source program undefined in this IR.
+			if (dynamic_cast<StoreInst *>(I)) {
 				Memo[&F] = ReturnProofState::Failed;
 				return false;
 			}
 
-			// Keep this scan in lockstep with ordinary/aggressive DCE.  In
-			// particular, a shift is removable only when its amount is a constant
-			// smaller than the actual integer width of its left operand.
+			// Keep this scan in lockstep with ordinary/aggressive DCE for future
+			// instruction kinds that carry an explicit observable-execution flag
+			// (for example a future volatile/atomic operation).
 			if (dceInstructionMustBePreserved(I)) {
 				Memo[&F] = ReturnProofState::Failed;
 				return false;
@@ -131,7 +133,60 @@ bool hasDefinedConstantShiftAmount(const Instruction *I) {
 
 bool dceInstructionMustBePreserved(Instruction *I) {
 	if (!I) return true;
-	if (dynamic_cast<LoadInst *>(I)) return true;
+	// The current IR has only ordinary (non-volatile, non-atomic) loads and
+	// unconstrained arithmetic/conversions.  Their invalid-input behaviour is
+	// represented as undefined/poison semantics, not as an observable trap.
+	// Consequently an unused load, div/rem, shift, or fptosi can be removed.
+	// Stores, control flow and calls are classified separately by the caller.
+	// If volatile/atomic/constrained instructions are introduced later, their
+	// explicit flags belong in this predicate.  Keep unknown instruction kinds
+	// conservative so extending InstType cannot silently weaken DCE.
+	switch (I->instType) {
+		case Instruction::RET:
+		case Instruction::BR:
+		case Instruction::ALLOCA:
+		case Instruction::STORE:
+		case Instruction::LOAD:
+		case Instruction::GEP:
+		case Instruction::ADD:
+		case Instruction::FADD:
+		case Instruction::SUB:
+		case Instruction::FSUB:
+		case Instruction::MUL:
+		case Instruction::FMUL:
+		case Instruction::SDIV:
+		case Instruction::UDIV:
+		case Instruction::FDIV:
+		case Instruction::SREM:
+		case Instruction::UREM:
+		case Instruction::FREM:
+		case Instruction::AND:
+		case Instruction::OR:
+		case Instruction::XOR:
+		case Instruction::ICMP:
+		case Instruction::FCMP:
+		case Instruction::SHL:
+		case Instruction::LSHR:
+		case Instruction::ASHR:
+		case Instruction::SELECT:
+		case Instruction::PHI:
+		case Instruction::CALL:
+		case Instruction::TRUNC:
+		case Instruction::ZEXT:
+		case Instruction::SEXT:
+		case Instruction::FPTOSI:
+		case Instruction::SITOFP:
+		case Instruction::BITCAST:
+			return false;
+		case Instruction::BinaryUnknown:
+		default:
+			return true;
+	}
+}
+
+bool instructionMayFaultOrProducePoison(const Instruction *I) {
+	if (!I) return true;
+	if (dynamic_cast<const LoadInst *>(I)) return true;
 
 	switch (I->instType) {
 		case Instruction::SDIV:
@@ -200,7 +255,7 @@ bool DCEPass::isDeletableInstruction(
 	return true;
 }
 
-PreservationStatus DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	bool Changed = false;
 
 	std::queue<Instruction*> WorkQ;
@@ -279,7 +334,7 @@ PreservationStatus DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		}
 	}
 
-	if (!Changed) return PreservationStatus::all();
+	if (!Changed) return PassResult::unchanged();
 
 	PreservationStatus PA;
 	PA.keep<DominantAnalysis>();
@@ -287,5 +342,5 @@ PreservationStatus DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	PA.keep<LoopAnalysis>();
 	PA.discard<BasicAliasAnalysis>();
 	PA.discard<SideEffectAnalysis>();
-	return PA;
+	return PassResult::changed(std::move(PA));
 }

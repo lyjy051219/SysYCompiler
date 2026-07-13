@@ -6,6 +6,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
+#include "ir/analysis/SCEVExpander.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
 
@@ -55,59 +56,16 @@ bool LoopStrengthReductionPass::canUseInPreheader(Value *V, BasicBlock *PreHeade
 bool LoopStrengthReductionPass::canMaterializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
                                           BasicBlock *PreHeader,
                                           const DominatorTree &DT) {
-    if (!E || E->mentionsLoop(L)) return false;
-
-    switch (E->Kind) {
-    case SCEVExprKind::Constant:
-        return E->ConstValue >= std::numeric_limits<int>::min() &&
-               E->ConstValue <= std::numeric_limits<int>::max();
-    case SCEVExprKind::Unknown:
-        return E->RawValue &&
-               canUseInPreheader(E->RawValue, PreHeader, DT);
-    case SCEVExprKind::Add:
-    case SCEVExprKind::Sub:
-        return E->Operands.size() == 2 &&
-               canMaterializeSCEVAtPreheader(E->Operands[0], L, PreHeader,
-                                             DT) &&
-               canMaterializeSCEVAtPreheader(E->Operands[1], L, PreHeader,
-                                             DT);
-    case SCEVExprKind::Mul:
-        return E->Operands.size() == 2 &&
-               (E->Operands[0]->Kind == SCEVExprKind::Constant ||
-                E->Operands[1]->Kind == SCEVExprKind::Constant) &&
-               canMaterializeSCEVAtPreheader(E->Operands[0], L, PreHeader,
-                                             DT) &&
-               canMaterializeSCEVAtPreheader(E->Operands[1], L, PreHeader,
-                                             DT);
-    case SCEVExprKind::Cast:
-        return E->Ty && E->Operands.size() == 1 &&
-               canMaterializeSCEVAtPreheader(E->Operands[0], L, PreHeader,
-                                             DT);
-    default:
-        return false;
-    }
+    SCEVExpander Expander(L, PreHeader, DT, 32);
+    return Expander.canExpand(E);
 }
 
 int LoopStrengthReductionPass::estimateMaterializeCost(const SCEVExpr *E, const Loop *L,
                                    BasicBlock *PreHeader,
                                    const DominatorTree &DT) {
-    if (!canMaterializeSCEVAtPreheader(E, L, PreHeader, DT))
-        return UnsupportedMaterializeCost;
-
-    switch (E->Kind) {
-    case SCEVExprKind::Constant:
-    case SCEVExprKind::Unknown:
-        return 0;
-    case SCEVExprKind::Add:
-    case SCEVExprKind::Sub:
-    case SCEVExprKind::Mul:
-        return 1 + estimateMaterializeCost(E->Operands[0], L, PreHeader, DT) +
-               estimateMaterializeCost(E->Operands[1], L, PreHeader, DT);
-    case SCEVExprKind::Cast:
-        return 1 + estimateMaterializeCost(E->Operands[0], L, PreHeader, DT);
-    default:
-        return UnsupportedMaterializeCost;
-    }
+    SCEVExpander Expander(L, PreHeader, DT, 32);
+    int Cost = Expander.estimateCost(E);
+    return Cost < 0 ? UnsupportedMaterializeCost : Cost;
 }
 
 Value *LoopStrengthReductionPass::makeSCEVConstant(int64_t V, const SCEVExpr *E) {
@@ -130,52 +88,8 @@ Value *LoopStrengthReductionPass::makeSCEVConstant(int64_t V, const SCEVExpr *E)
 Value *LoopStrengthReductionPass::materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
                                          BasicBlock *PreHeader,
                                          const DominatorTree &DT) {
-    if (!canMaterializeSCEVAtPreheader(E, L, PreHeader, DT)) return nullptr;
-
-    if (E->Kind == SCEVExprKind::Constant)
-        return makeSCEVConstant(E->ConstValue, E);
-    if (E->Kind == SCEVExprKind::Unknown) return E->RawValue;
-
-    Instruction *NewI = nullptr;
-    if (E->Kind == SCEVExprKind::Add || E->Kind == SCEVExprKind::Sub ||
-        E->Kind == SCEVExprKind::Mul) {
-        Value *LHS =
-            materializeSCEVAtPreheader(E->Operands[0], L, PreHeader, DT);
-        Value *RHS =
-            materializeSCEVAtPreheader(E->Operands[1], L, PreHeader, DT);
-        if (!LHS || !RHS) return nullptr;
-
-        BinaryInst::Operation Op = BinaryInst::ADD;
-        if (E->Kind == SCEVExprKind::Sub) Op = BinaryInst::SUB;
-        if (E->Kind == SCEVExprKind::Mul) Op = BinaryInst::MUL;
-        NewI = new BinaryInst(LHS, Op, RHS);
-    } else if (E->Kind == SCEVExprKind::Cast &&
-               E->Operands.size() == 1) {
-        Value *OpV =
-            materializeSCEVAtPreheader(E->Operands[0], L, PreHeader, DT);
-        if (!OpV) return nullptr;
-        switch (E->CastKind) {
-        case SCEVCastKind::Trunc:
-            NewI = new TruncInst(E->Ty);
-            NewI->addUse(OpV);
-            break;
-        case SCEVCastKind::ZExt:
-            NewI = new ZextInst(E->Ty);
-            NewI->addUse(OpV);
-            break;
-        case SCEVCastKind::SExt:
-            NewI = new SextInst(E->Ty);
-            NewI->addUse(OpV);
-            break;
-        case SCEVCastKind::BitCast:
-            NewI = new BitCastInst(OpV, E->Ty);
-            break;
-        }
-    }
-
-    if (!NewI) return nullptr;
-    PreHeader->insertBeforeTerminator(NewI);
-    return NewI;
+    SCEVExpander Expander(L, PreHeader, DT, 32);
+    return Expander.expand(E);
 }
 
 int LoopStrengthReductionPass::estimatePrefixMaterializeCost(

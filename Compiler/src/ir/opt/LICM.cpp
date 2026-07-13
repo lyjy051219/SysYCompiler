@@ -1,5 +1,6 @@
 #include "ir/opt/LICM.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
@@ -27,7 +28,7 @@ bool hasSafeExecutionPrefix(const Instruction *Candidate) {
 		if (!I) return false;
 		if (dynamic_cast<StoreInst *>(I) ||
 			dynamic_cast<CallInst *>(I) ||
-			dceInstructionMustBePreserved(I)) {
+			instructionMayFaultOrProducePoison(I)) {
 			return false;
 		}
 	}
@@ -335,6 +336,8 @@ bool LICMPass::isSafeToMove(
 	const std::vector<BasicBlock *> &Latches,
 	const std::vector<Instruction *> &LoopInsts,
 	BasicAAResult &AA,
+	MemorySSAResult &MSSA,
+	bool MemorySSAUsable,
 	const LoopInfo &LI,
 	FunctionAnalysisPassManager &FAM,
 	bool ForSink,
@@ -367,7 +370,7 @@ bool LICMPass::isSafeToMove(
 		case Instruction::SHL:
 		case Instruction::LSHR:
 		case Instruction::ASHR:
-			if (dceInstructionMustBePreserved(I) &&
+			if (instructionMayFaultOrProducePoison(I) &&
 				(!AggressiveHoist || I->getParent() != L.getHeader() ||
 				 !hasSafeExecutionPrefix(I))) {
 				return false;
@@ -405,20 +408,45 @@ bool LICMPass::isSafeToMove(
 
 		Value *Ptr = LIst->getPointerOperand();
 		if (!Ptr) return false;
-		bool UseIndexRange = LIst->getIRType() &&
-			LIst->getIRType()->getEnum() != IR_FLOAT;
-		for (Instruction *J : LoopInsts) {
-			if (!J || J == I) continue;
-			if (UseIndexRange) {
-				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
-					Value *StorePtr = SI->getPointerOperand();
-					if (!StorePtr) return false;
-					if (AA.aliasWithIndexRange(Ptr, StorePtr, LI) == AliasInfo::NoAlias)
-						continue;
-					return false;
-				}
+
+		// A unique reaching memory state outside the loop proves that every
+		// dynamic execution of this load (including executions reached through
+		// a backedge) sees no in-loop clobber before it.  This is stronger than
+		// a flat instruction scan for transparent CFG cycles and remains
+		// conservative when paths disagree: the walker then returns a Phi or
+		// nullptr and we use the traditional scan below.
+		bool MSSAProvesNoLoopClobber = false;
+		if (MemorySSAUsable)
+		if (MemoryAccess *Clobber = MSSA.getClobberingAccess(
+				LIst, MemoryLocation::get(LIst), AA, LI, FAM, 256)) {
+			if (Clobber->isLiveOnEntry()) {
+				MSSAProvesNoLoopClobber = true;
+			} else if (Clobber->isDef()) {
+				Instruction *DefI = Clobber->getInstruction();
+				BasicBlock *DefBB = DefI ? DefI->getParent() : nullptr;
+				MSSAProvesNoLoopClobber = DefBB && !L.contains(DefBB);
 			}
-			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+		}
+		if (MSSAProvesNoLoopClobber) return true;
+
+			bool UseIndexRange = LIst->getIRType() &&
+				LIst->getIRType()->getEnum() != IR_FLOAT;
+			MemoryLocation LoadLocation = MemoryLocation::get(LIst);
+			for (Instruction *J : LoopInsts) {
+				if (!J || J == I) continue;
+				if (UseIndexRange) {
+					if (auto *SI = dynamic_cast<StoreInst *>(J)) {
+						Value *StorePtr = SI->getPointerOperand();
+						if (!StorePtr) return false;
+						if (AA.aliasWithIndexRange(
+								LoadLocation, MemoryLocation::get(SI), LI) ==
+							AliasInfo::NoAlias)
+							continue;
+						return false;
+					}
+				}
+				ModRefInfo MRI = getInstModRefInfo(
+					LoadLocation, J, AA, LI, FAM);
 			if (isModSet(MRI)) return false;
 		}
 		return true;
@@ -459,7 +487,8 @@ bool LICMPass::isSafeToMove(
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == SI) continue;
 
-			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
+				ModRefInfo MRI = getInstModRefInfo(
+					MemoryLocation::get(SI), J, AA, LI, FAM);
 			if (isModSet(MRI) || isRefSet(MRI)) return false;
 		}
 		return true;
@@ -498,6 +527,12 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 	auto &DT = FAM.getResult<DominantAnalysis>(F);
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
 	auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+	auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
+	// Store sinking clones a MemoryDef and deletes the original instruction.
+	// This compact MemorySSA has no incremental updater, so consumers in the
+	// remainder of this LICM invocation must stop dereferencing its snapshot
+	// after the first successful store sink.
+	bool MemorySSAUsable = true;
 	bool Changed = false;
 	bool CFGChanged = false;
 	std::unordered_map<ExitValueKey, PhiInst *, ExitValueKeyHash> ExitPhiCache;
@@ -579,6 +614,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						Latches,
 						LoopInsts,
 						AA,
+						MSSA,
+						MemorySSAUsable,
 						LI,
 						FAM,
 						/*ForSink=*/true,
@@ -682,6 +719,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				if (!RewriteOK) continue;
 
 				I->EraseFromParent();
+				MemorySSAUsable = false;
 				delete I;
 				LocalChanged = true;
 			}
@@ -718,6 +756,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						Latches,
 						LoopInsts,
 						AA,
+						MSSA,
+						MemorySSAUsable,
 						LI,
 						FAM,
 						/*ForSink=*/false,
@@ -782,6 +822,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 	PA.keep<PostDominantAnalysis>();
 	PA.keep<LoopAnalysis>();
 	PA.discard<BasicAliasAnalysis>();
+	PA.discard<MemorySSAAnalysis>();
 	PA.discard<SideEffectAnalysis>();
 	return PA;
 }

@@ -10,6 +10,7 @@
 #include <vector>
 
 class BasicAAResult;
+struct MemoryLocation;
 class LoopInfo;
 
 // A deliberately small, conservative MemorySSA for this IR.  It models one
@@ -75,12 +76,22 @@ public:
         Instruction *At, Value *Ptr, BasicAAResult &AA, const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
+    MemoryAccess *getClobberingAccess(
+        Instruction *At, const MemoryLocation &Location,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM,
+        std::size_t MaxVisitedAccesses = 256) const;
 
     // Same query starting at an already known memory state.  This is useful
     // when a consumer walks several accesses in one block.
     MemoryAccess *getClobberingAccess(
         MemoryAccess *Start, Value *Ptr, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
+        std::size_t MaxVisitedAccesses = 256) const;
+    MemoryAccess *getClobberingAccess(
+        MemoryAccess *Start, const MemoryLocation &Location,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
 
     // Prove that Store writes the value already held by its destination on
@@ -102,7 +113,8 @@ private:
 
     MemoryAccess *createAccess(MemoryAccess::Kind K, BasicBlock *BB = nullptr,
                                Instruction *I = nullptr);
-    bool mayClobber(MemoryAccess *Access, Value *Ptr, BasicAAResult &AA,
+    bool mayClobber(MemoryAccess *Access, const MemoryLocation &Location,
+                    BasicAAResult &AA,
                     const LoopInfo &LI,
                     FunctionAnalysisPassManager &FAM) const;
 

@@ -11,6 +11,7 @@
 class BasicAAResult;
 class DominatorTree;
 class LoopInfo;
+struct MemoryLocation;
 
 struct LoadElimQueryResult {
     enum Kind {
@@ -47,7 +48,8 @@ private:
     static constexpr int MaxDominatingQueriesPerFunction = 64;
     static bool isTypeCompatible(Value *Source, LoadInst *TargetLoad);
     static bool mayModifyPointer(
-        Value *P, Instruction *I, BasicAAResult &AA, const LoopInfo &LI,
+        const MemoryLocation &Location, Instruction *I, BasicAAResult &AA,
+        const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM);
     static bool isUnmodifiedOnAllPaths(
         LoadInst *Candidate, LoadInst *Target, Value *P,

@@ -81,6 +81,12 @@ struct UnrollDecision {
     // remapped to the original initial value.
     PhiInst *StabilizedPhi = nullptr;
     Value *StabilizedValue = nullptr;
+    // Some one-shot state loops converge to max(Initial, Bound), rather than
+    // to Bound unconditionally.  Keep the two pre-loop operands in the
+    // decision and materialize the exact value only after peeling commits;
+    // decision making itself must never mutate IR.
+    Value *StabilizedInitial = nullptr;
+    Value *StabilizedBound = nullptr;
 
     std::string Reason;
 };

@@ -60,8 +60,9 @@ bool ADCEPass::isRootLive(
     // 2. RetInst → always root live
     if (dynamic_cast<RetInst *>(I)) return true;
 
-    // Preserve potentially faulting/undefined evaluation even when its SSA
-    // result is unused.  This mirrors local DCE so ADCE cannot re-delete it.
+    // Preserve instruction kinds with explicit observable execution.  Pure
+    // operations that merely produce poison/undefined results are removable
+    // when dead, matching local DCE.
     if (dceInstructionMustBePreserved(I)) return true;
 
     // 3. CallInst → 看副作用

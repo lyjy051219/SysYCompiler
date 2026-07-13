@@ -312,7 +312,11 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     }
 
     if(Allocas.empty()) {
-        return false;
+        // Earlier rounds may already have promoted or deleted allocas.  Do
+        // not lose that mutation merely because the final discovery round is
+        // empty: fixed-point convergence and analysis invalidation consume
+        // the cumulative answer.
+        return changed;
     }
 
     // 简单优化: 删除无用 alloca / 单 store / 单 block
@@ -549,11 +553,11 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     return changed;
 }
 
-PreservationStatus PromotePass::run(Function &F, FunctionAnalysisPassManager &FAM){
+PassResult PromotePass::run(Function &F, FunctionAnalysisPassManager &FAM){
     auto &dominant = FAM.getResult<DominantAnalysis>(F);
 
     if(!promoteMemoryToRegister(F, dominant)) {
-        return PreservationStatus::all();
+        return PassResult::unchanged();
     }
 
     PreservationStatus PA;
@@ -562,7 +566,7 @@ PreservationStatus PromotePass::run(Function &F, FunctionAnalysisPassManager &FA
     PA.keep<LoopAnalysis>();
     PA.discard<BasicAliasAnalysis>();
     PA.discard<SideEffectAnalysis>();
-    return PA;
+    return PassResult::changed(std::move(PA));
 }
 
 void PromotePass::computeLiveInBlocks(

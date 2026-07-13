@@ -39,6 +39,7 @@
 #include "ir/opt/LatePhiCleanup.hpp"
 #include "ir/opt/LateStrengthReduce.hpp"
 #include "ir/opt/LoopStrengthReduction.hpp"
+#include "ir/opt/IndVarSimplify.hpp"
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/opt/GlobalInitializerFold.hpp"
 #include "ir/opt/LoopIdiomRecognize.hpp"
@@ -99,6 +100,22 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
     return FPM;
 }
 
+// A bounded scalar closure used after transforms that expose a large new
+// expression graph (inlining, aggregate splitting, unrolling and relaxed
+// Global2Local).  The order is intentional: local canonicalization gives
+// reassociation a stable tree, global value numbering merges the resulting
+// expressions, and DCE/CFG remove both old trees and newly constant edges.
+FunctionPassManager PassBuilder::buildScalarCleanupPipeline() {
+    FunctionPassManager FPM;
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(ReassociatePass());
+    FPM.addPass(LocalGVNPass());
+    FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
+    FPM.addPass(DCEPass());
+    FPM.addPass(CFGSimplifyPass());
+    return FPM;
+}
+
 // 2.25 Early guarded peeling, before function inlining.
 //
 // Keeping this phase before inline is important for a general pattern where
@@ -136,10 +153,21 @@ FunctionPassManager PassBuilder::buildEarlyPeelingPipeline() {
     CallAndInvariantCleanup.addPass(createFixedPointPass<Function,
         FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
     CallAndInvariantCleanup.addPass(LCSSAPass());
+    CallAndInvariantCleanup.addPass(IndVarSimplifyPass());
     CallAndInvariantCleanup.addPass(LICMPass());
     CallAndInvariantCleanup.addPass(LocalGVNPass());
-    CallAndInvariantCleanup.addPass(GVNPREPass(/*EnablePRE=*/false));
+    // Peeling splits the one-time prefix from the stable residual loop.  PRE
+    // is most profitable at precisely this boundary and remains bounded by
+    // the surrounding two-round fixed point.
+    CallAndInvariantCleanup.addPass(GVNPREPass(/*EnablePRE=*/true));
+    CallAndInvariantCleanup.addPass(LoadEliminationPass());
+    CallAndInvariantCleanup.addPass(DSEPass());
     CallAndInvariantCleanup.addPass(DCEPass());
+    CallAndInvariantCleanup.addPass(CFGSimplifyPass());
+    CallAndInvariantCleanup.addPass(createFixedPointPass<Function,
+        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
+    CallAndInvariantCleanup.addPass(LCSSAPass());
+    CallAndInvariantCleanup.addPass(LoopDeletionPass());
     CallAndInvariantCleanup.addPass(CFGSimplifyPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         std::move(CallAndInvariantCleanup), 2));
@@ -154,8 +182,15 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
+    FPM.addPass(ReassociatePass());
     FPM.addPass(SCCPPass());
     FPM.addPass(CFGSimplifyPass());
+    // Full/partial unrolling frequently turns dynamic aggregate indices into
+    // a small constant set.  Split/fold those accesses immediately and
+    // promote the newly exposed scalar allocas before value numbering.
+    FPM.addPass(LocalAggregateSimplifyPass());
+    FPM.addPass(PromotePass());
+    FPM.addPass(InstSimplifyPass());
 
     // RangeAnalysis discards its convergence-time path state and rebuilds
     // transform-visible integer facts once from the current cloned CFG and
@@ -165,8 +200,15 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(ConstraintEliminationPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
+    FPM.addPass(ReassociatePass());
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
+    // Close the scalar graph immediately after unrolling.  Keep this exact
+    // InstSimplify/Reassociate/GVN/DCE/CFG suffix contiguous so cloned dead
+    // expressions and newly constant branches do not survive into the
+    // memory-address cleanup below.
+    FPM.addPass(DCEPass());
+    FPM.addPass(CFGSimplifyPass());
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
     FPM.addPass(LoadEliminationPass());
@@ -179,6 +221,8 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 4));
     FPM.addPass(LCSSAPass());
+    FPM.addPass(IndVarSimplifyPass());
+    FPM.addPass(LoopDeletionPass());
     // Do not rely on the next outer fixed-point iteration: the final allowed
     // unroll round must also get a chance to hoist newly exposed invariants.
     FPM.addPass(LICMPass());
@@ -201,10 +245,17 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
+    FPM.addPass(IndVarSimplifyPass());
     FPM.addPass(LICMPass());         // 循环不变量外提
     // Convert the fully-proven constant-trip contiguous copy/fill subset to
     // memory intrinsics before unrolling duplicates the scalar operations.
     FPM.addPass(LoopIdiomRecognizePass());
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(ReassociatePass());
+    FPM.addPass(LocalGVNPass());
+    FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
+    FPM.addPass(ADCEPass());
+    FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LoopDeletionPass()); // 消除死循环或无用循环
     FPM.addPass(LoopStrengthReductionPass()); // GEP 地址归纳变量强度削弱
@@ -241,6 +292,36 @@ FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LatePhiCleanupPass());
+    FPM.addPass(CFGSimplifyPass());
+    return FPM;
+}
+
+// Relaxed Global2Local intentionally runs late because it can expose scalar
+// state that earlier range reasoning treated as memory.  Rediscover only the
+// analyses and transforms that can profit from the new PHIs; do not unroll a
+// second time or perform another large CFG clone at this stage.
+FunctionPassManager PassBuilder::buildLateLoopRediscoveryPipeline() {
+    FunctionPassManager FPM;
+    FPM.addPass(BreakCriticalEdgesPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 4));
+    FPM.addPass(LCSSAPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        IndVarSimplifyPass(), 2));
+    FPM.addPass(LICMPass());
+    FPM.addPass(LoopIdiomRecognizePass());
+    FPM.addPass(InstSimplifyPass());
+    FPM.addPass(ReassociatePass());
+    FPM.addPass(LocalGVNPass());
+    FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
+    FPM.addPass(ADCEPass());
+    FPM.addPass(DCEPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(LoopDeletionPass());
+    FPM.addPass(LoopStrengthReductionPass());
+    FPM.addPass(LoadEliminationPass());
+    FPM.addPass(DSEPass());
+    FPM.addPass(DCEPass());
     FPM.addPass(CFGSimplifyPass());
     return FPM;
 }
@@ -339,6 +420,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
     // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
     // 早期仍使用保守模式，避免把循环携带的全局状态提前暴露给
     // Range/Constraint 链；晚期会在这些分析全部结束后做放宽版局部化。
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(), FAM));
@@ -361,6 +444,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
 
     // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
@@ -400,10 +485,10 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
-    MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
-    MPM.addPass(createModuleFunctionBridge(LocalGVNPass(), FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
     MPM.addPass(createModuleFunctionBridge(
-        GVNPREPass(/*EnablePRE=*/false), FAM));
+        buildLateLoopRediscoveryPipeline(), FAM));
     MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(LoadEliminationPass(), FAM));

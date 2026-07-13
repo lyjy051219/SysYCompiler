@@ -40,6 +40,7 @@ enum class IntrinsicID {
     None   = 0,
     Memcpy = 1,
     Memset = 2,
+    Memmove = 3,
 };
 
 // BaseAddressInfo:指针的基地址信息
@@ -93,6 +94,9 @@ IntrinsicID getIntrinsicID(BuildInFunction* BIF);
 
 // 指令级副作用查询接口
 // 查询 Instruction I 对内存地址 V 的读写行为
+ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction *I,
+                             BasicAAResult &AA, const LoopInfo &LI,
+                             FunctionAnalysisPassManager &FAM);
 ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
                              BasicAAResult& AA, const LoopInfo& LI,
                              FunctionAnalysisPassManager& FAM);

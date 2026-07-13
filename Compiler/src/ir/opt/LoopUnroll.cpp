@@ -41,7 +41,7 @@ bool isStructurallyLoopInvariant(Value *V, Loop *L,
     // operands (division/remainder, FPTOSI, or an unproved shift) as evidence
     // that later stores repeat the first peeled value.  This keeps the memory
     // optimization independent of source-level undefined behaviour.
-    if (dceInstructionMustBePreserved(I)) return false;
+	if (instructionMayFaultOrProducePoison(I)) return false;
 
     bool PureProducer = dynamic_cast<GetElementPtrInst *>(I) ||
                         dynamic_cast<SelectInst *>(I) ||
@@ -175,7 +175,21 @@ std::vector<StoreInst *> collectPeelRedundantStoreCandidates(
 struct ProvenStablePeelState {
     PhiInst *Phi = nullptr;
     Value *StableValue = nullptr;
+    Value *Initial = nullptr;
+    Value *Bound = nullptr;
 };
+
+bool isDirectUnitIncrement(const InductionDescriptor &IV) {
+    auto *Update = dynamic_cast<BinaryInst *>(IV.UpdateValue);
+    if (!Update || Update->getOp() != BinaryInst::ADD || !IV.Phi)
+        return false;
+    Value *A = Update->getOperand(0);
+    Value *B = Update->getOperand(1);
+    auto *CA = dynamic_cast<ConstInt *>(A);
+    auto *CB = dynamic_cast<ConstInt *>(B);
+    return (A == IV.Phi && CB && CB->getVal() == 1) ||
+           (B == IV.Phi && CA && CA->getVal() == 1);
+}
 
 // Return the invariant operand of a strict, signed, increasing header test
 //     IV < Bound
@@ -203,40 +217,11 @@ Value *getStrictIncreasingHeaderBound(const LoopTripCountInfo &TCI,
     return RHS;
 }
 
-bool proveRuntimeTripCountAtPreheader(const LoopTripCountInfo &TCI,
-                                      const InductionDescriptor &IV,
+bool proveRuntimeTripCountAtPreheader(SCEVResult &SE,
+                                      const LoopTripCountInfo &TCI,
                                       RangeInfo &RI,
                                       DominatorTree &DT) {
-    Value *Bound = getStrictIncreasingHeaderBound(TCI, IV);
-    if (!Bound || !IV.StartValue || !TCI.PreHeader) return false;
-
-    // Do not accept a unit step obtained by mathematically folding an
-    // invariant expression that may already have wrapped in IR.
-    auto *Update = dynamic_cast<BinaryInst *>(IV.UpdateValue);
-    if (!Update || Update->getOp() != BinaryInst::ADD) return false;
-    Value *UA = Update->getOperand(0);
-    Value *UB = Update->getOperand(1);
-    auto *CA = dynamic_cast<ConstInt *>(UA);
-    auto *CB = dynamic_cast<ConstInt *>(UB);
-    const bool DirectUnitStep =
-        (UA == IV.Phi && CB && CB->getVal() == 1) ||
-        (UB == IV.Phi && CA && CA->getVal() == 1);
-    if (!DirectUnitStep) return false;
-
-    // SCEV materializes max(0, Bound - Start) in i32.  Prove the subtraction
-    // itself fits for every value reaching this preheader; proving only the
-    // taken-loop case would still allow the eagerly materialized subtraction
-    // to wrap on a zero-trip path.
-    IntRange StartRange = RI.query(IV.StartValue, TCI.PreHeader, DT);
-    IntRange BoundRange = RI.query(Bound, TCI.PreHeader, DT);
-    if (StartRange.isBottom() || BoundRange.isBottom()) return false;
-
-    const __int128 MinDistance =
-        static_cast<__int128>(BoundRange.min) - StartRange.max;
-    const __int128 MaxDistance =
-        static_cast<__int128>(BoundRange.max) - StartRange.min;
-    return MinDistance >= IntRange::I32_MIN &&
-           MaxDistance <= IntRange::I32_MAX;
+    return SE.proveRuntimeNoWrapAtPreheader(TCI, RI, DT);
 }
 
 bool isExactInnerExitIV(Value *V, const LoopTripCountInfo &TCI,
@@ -394,11 +379,15 @@ bool proveInitialNotAboveBound(Value *Initial, Value *Bound, Loop *Outer,
 //   InnerExit = J
 //
 // Bound must be available before and invariant across the outer loop, the
-// inner exit must dominate the outer latch, and contextual integer ranges at
-// the outer preheader must prove Initial <= Bound.  Consequently the peeled
-// first iteration leaves P == Bound; induction then proves every residual
-// iteration starts at Bound and the inner loop is zero-trip.  This proof uses
-// only IR semantics and applies independently of source/test identifiers.
+// inner exit must dominate the outer latch, and the induction update must be
+// the exact integer operation J + 1.  The first iteration then leaves
+// P == max(Initial, Bound): when Initial < Bound the monotone unit recurrence
+// reaches Bound without wrapping; otherwise the header test is false and P
+// remains Initial.  Every residual iteration therefore starts at a value
+// greater than or equal to Bound and the inner loop is zero-trip.  If ranges
+// already prove Initial <= Bound we retain the cheaper value Bound; otherwise
+// execution materializes the exact max in the outer preheader.  The proof is
+// based only on IR structure and applies independently of source/test names.
 std::optional<ProvenStablePeelState> findProvenStablePeelState(
     Loop *Outer, SCEVResult &SE, RangeInfo &RI, DominatorTree &DT) {
     if (!Outer || Outer->isInnermost() || !Outer->getHeader())
@@ -425,7 +414,8 @@ std::optional<ProvenStablePeelState> findProvenStablePeelState(
             std::unordered_set<Value *> ForwardActive;
             if (!TCI || !TCI->Valid || !IV || !IV->Valid ||
                 !isTrivialForwardOf(
-                    IV->StartValue, StatePhi, ForwardActive)) {
+                    IV->StartValue, StatePhi, ForwardActive) ||
+                !isDirectUnitIncrement(*IV)) {
                 continue;
             }
 
@@ -450,9 +440,11 @@ std::optional<ProvenStablePeelState> findProvenStablePeelState(
             bool EntryOrderProven = proveInitialNotAboveBound(
                 Initial, Bound, Outer, OuterPreHeader, SE, RI, DT,
                 InitialRange, BoundRange);
-            if (!EntryOrderProven) continue;
 
-            return ProvenStablePeelState{StatePhi, Bound};
+            if (EntryOrderProven)
+                return ProvenStablePeelState{StatePhi, Bound, nullptr,
+                                             nullptr};
+            return ProvenStablePeelState{StatePhi, nullptr, Initial, Bound};
         }
     }
     return std::nullopt;
@@ -2685,6 +2677,8 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 if (StableState) {
                     Decision.StabilizedPhi = StableState->Phi;
                     Decision.StabilizedValue = StableState->StableValue;
+                    Decision.StabilizedInitial = StableState->Initial;
+                    Decision.StabilizedBound = StableState->Bound;
                 }
                 Decision.Reason = CanGuardRuntime
                     ? "peeling: guarded initial-state specialization"
@@ -2757,12 +2751,9 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         TCI.IsRuntime &&
         BodyCost <= Config.MaxLoopBodyCostForRuntime &&
         isCheapSCEV(TCI.TripCount, Config)) {
-        auto RuntimeIV = SE.getCanonicalInduction(L);
         const bool RuntimeTripCountIsProven =
             TCI.ProvenNoWrap ||
-            (RuntimeIV && RuntimeIV->Valid &&
-             proveRuntimeTripCountAtPreheader(
-                 TCI, *RuntimeIV, RI, DT));
+            proveRuntimeTripCountAtPreheader(SE, TCI, RI, DT);
         if (!RuntimeTripCountIsProven)
             return makeNoUnrollDecision("runtime trip count may wrap");
         int RuntimeCountLimit = std::min(Config.RuntimeDefaultCount,
@@ -3260,15 +3251,34 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
-    if (Decision.StabilizedPhi && Decision.StabilizedValue) {
+    Value *StableResidualValue = Decision.StabilizedValue;
+    if (!StableResidualValue && Decision.StabilizedInitial &&
+        Decision.StabilizedBound) {
+        // Exact signed maximum for the stabilized one-shot state.  Both
+        // operands were proved available before the outer loop while making
+        // the decision, so placing it in the preheader preserves dominance
+        // and computes it only once.
+        auto *ChooseInitial = new BinaryInst(
+            Decision.StabilizedInitial, BinaryInst::G,
+            Decision.StabilizedBound);
+        BasicBlock::insertBeforeTerminator(Core->Shape.PreHeader,
+                                           ChooseInitial);
+        auto *StableMax = new SelectInst(ChooseInitial,
+                                         Decision.StabilizedInitial,
+                                         Decision.StabilizedBound);
+        BasicBlock::insertBeforeTerminator(Core->Shape.PreHeader, StableMax);
+        StableResidualValue = StableMax;
+    }
+
+    if (Decision.StabilizedPhi && StableResidualValue) {
         auto It = HeaderPhiReplacements.find(Decision.StabilizedPhi);
         Value *ResidualState =
             It == HeaderPhiReplacements.end() ? nullptr : It->second;
-        if (ResidualState && ResidualState != Decision.StabilizedValue) {
+        if (ResidualState && ResidualState != StableResidualValue) {
             auto *ResidualPhi = dynamic_cast<PhiInst *>(ResidualState);
             if (ResidualPhi &&
                 ResidualPhi->getParent() == Core->Shape.Header) {
-                ResidualPhi->replaceAllUsesWith(Decision.StabilizedValue);
+                ResidualPhi->replaceAllUsesWith(StableResidualValue);
                 delete ResidualPhi;
             }
         }

@@ -3,6 +3,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -58,6 +59,7 @@ public:
 				 DominatorTree &DT,
 				 LoopInfo &LI,
 				 BasicAAResult &AA,
+				 MemorySSAResult &MSSA,
 				 bool EnablePRE = true);
 
 	bool run();
@@ -68,6 +70,7 @@ private:
 	DominatorTree &DT;
 	LoopInfo &LI;
 	BasicAAResult &AA;
+	MemorySSAResult &MSSA;
 	bool EnablePRE = true;
 
 	int NextValueNum = 1;
@@ -84,11 +87,24 @@ private:
 	// AVAIL_OUT[BB]: num -> {inst, defBB}  (built top-down on domtree)
 	std::unordered_map<BasicBlock *, AvailSet> AvailOut;
 
+	struct MemoryLoadRecord {
+		MemoryAccess *Clobber = nullptr;
+		MemoryLocation Location;
+		LoadInst *Load = nullptr;
+		BasicBlock *Block = nullptr;
+	};
+	std::vector<MemoryLoadRecord> AvailableMemoryLoads;
+	std::size_t MemorySSAQueries = 0;
+	bool MemorySSAValid = true;
+
 	static constexpr int kBackwardScanLimit = 64;
 	static constexpr int kMaxFunctionInsts  = 1500;
 	static constexpr int kMaxBlockInsts     = 400;
 	static constexpr int kMaxGVNRounds      = 12;
 	static constexpr int kMaxPRERounds      = 12;
+	static constexpr std::size_t kMaxMemorySSAQueries = 512;
+	static constexpr std::size_t kMaxMemoryLoadRecords = 512;
+	static constexpr std::size_t kMaxMemoryLoadComparisons = 64;
 
 	bool runGVNFixedPoint();
 	bool runPREFixedPoint();
@@ -120,6 +136,10 @@ private:
 	void markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc);
 	void processBranchForDeadBlocks(Instruction *I);
 
+	// Merge loop-carried PHIs that define the same recurrence.  This is kept
+	// separate from ordinary expression numbering because cyclic PHIs need a
+	// co-inductive comparison instead of a one-pass operand hash.
+	bool eliminateCongruentPhis();
 	bool processLoad(Instruction *I);
 	bool processCall(Instruction *I);
 	bool runGVN();

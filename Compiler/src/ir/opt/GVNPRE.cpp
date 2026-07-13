@@ -35,13 +35,165 @@ std::size_t PhiTranslateKeyHash::operator()(const PhiTranslateKey &K) const {
     return H;
 }
 
+namespace {
+
+// Cyclic SSA recurrences cannot be compared by assigning fresh numbers to
+// PHIs: the distinct seed numbers keep otherwise identical backedge
+// expressions apart forever.  This matcher compares two pure SSA subgraphs
+// co-inductively.  Encountering the same pair while it is being checked means
+// that both recurrences have advanced through the same cycle; equality still
+// has to be established by their non-cyclic inputs (normally the preheader
+// values).
+struct ValuePair {
+    Value *A = nullptr;
+    Value *B = nullptr;
+
+    bool operator==(const ValuePair &Other) const {
+        return A == Other.A && B == Other.B;
+    }
+};
+
+struct ValuePairHash {
+    std::size_t operator()(const ValuePair &P) const {
+        std::size_t H = reinterpret_cast<std::uintptr_t>(P.A);
+        const auto R = reinterpret_cast<std::uintptr_t>(P.B);
+        H ^= R + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+        return H;
+    }
+};
+
+class PhiCongruenceMatcher {
+public:
+    bool equivalent(Value *A, Value *B) {
+        return equivalentImpl(A, B, 0);
+    }
+
+private:
+    enum class State : unsigned char { Visiting, Equal, Different };
+    std::unordered_map<ValuePair, State, ValuePairHash> States;
+
+    static ValuePair canonicalPair(Value *A, Value *B) {
+        if (std::less<Value *>{}(B, A)) std::swap(A, B);
+        return {A, B};
+    }
+
+    static bool isSupportedPureInstruction(Instruction *I) {
+        if (!I) return false;
+        if (dynamic_cast<BinaryInst *>(I) || dynamic_cast<PhiInst *>(I))
+            return true;
+        switch (I->instType) {
+        case Instruction::GEP:
+        case Instruction::SELECT:
+        case Instruction::TRUNC:
+        case Instruction::ZEXT:
+        case Instruction::SEXT:
+        case Instruction::FPTOSI:
+        case Instruction::SITOFP:
+        case Instruction::BITCAST:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    bool equivalentPhis(PhiInst *A, PhiInst *B, unsigned Depth) {
+        if (!A || !B || A->getParent() != B->getParent() ||
+            A->getNumIncomingValues() != B->getNumIncomingValues()) {
+            return false;
+        }
+
+        // Match by predecessor rather than operand order.  Duplicate incoming
+        // blocks are edge-sensitive in this IR and cannot be translated
+        // unambiguously, so leave those uncommon forms alone.
+        std::unordered_set<BasicBlock *> SeenA;
+        std::unordered_set<BasicBlock *> SeenB;
+        for (unsigned I = 0; I < A->getNumIncomingValues(); ++I) {
+            BasicBlock *Pred = A->getIncomingBlock(I);
+            if (!Pred || !SeenA.insert(Pred).second) return false;
+
+            Value *OtherIncoming = nullptr;
+            unsigned Matches = 0;
+            for (unsigned J = 0; J < B->getNumIncomingValues(); ++J) {
+                if (B->getIncomingBlock(J) != Pred) continue;
+                OtherIncoming = B->getIncomingValue(J);
+                ++Matches;
+            }
+            if (Matches != 1 || !SeenB.insert(Pred).second ||
+                !equivalentImpl(A->getIncomingValue(I), OtherIncoming,
+                                Depth + 1)) {
+                return false;
+            }
+        }
+        return SeenA.size() == SeenB.size();
+    }
+
+    bool equivalentImpl(Value *A, Value *B, unsigned Depth) {
+        if (A == B) return A && !Value::isUndef(A);
+        if (!A || !B || Value::isUndef(A) || Value::isUndef(B) ||
+            Depth > 128 || A->getIRType().get() != B->getIRType().get()) {
+            return false;
+        }
+
+        auto *IA = dynamic_cast<Instruction *>(A);
+        auto *IB = dynamic_cast<Instruction *>(B);
+        if (!IA || !IB || IA->instType != IB->instType ||
+            !isSupportedPureInstruction(IA) ||
+            !isSupportedPureInstruction(IB)) {
+            // Constants are interned by representation, and parameters/globals
+            // are only equal by identity (handled above).
+            return false;
+        }
+
+        ValuePair Pair = canonicalPair(A, B);
+        auto It = States.find(Pair);
+        if (It != States.end()) {
+            if (It->second == State::Visiting || It->second == State::Equal)
+                return true;
+            return false;
+        }
+        States.emplace(Pair, State::Visiting);
+
+        bool Equal = false;
+        if (auto *PA = dynamic_cast<PhiInst *>(IA)) {
+            Equal = equivalentPhis(PA, dynamic_cast<PhiInst *>(IB), Depth);
+        } else if (auto *BA = dynamic_cast<BinaryInst *>(IA)) {
+            auto *BB = dynamic_cast<BinaryInst *>(IB);
+            Value *AL = nullptr;
+            Value *AR = nullptr;
+            Value *BL = nullptr;
+            Value *BR = nullptr;
+            Equal = BB && BA->getOp() == BB->getOp() &&
+                    BinaryInst::getOperands(BA, AL, AR) &&
+                    BinaryInst::getOperands(BB, BL, BR) &&
+                    equivalentImpl(AL, BL, Depth + 1) &&
+                    equivalentImpl(AR, BR, Depth + 1);
+        } else if (IA->getNumOperands() == IB->getNumOperands()) {
+            Equal = true;
+            for (size_t I = 0; I < IA->getNumOperands(); ++I) {
+                if (!equivalentImpl(IA->getOperand(I), IB->getOperand(I),
+                                    Depth + 1)) {
+                    Equal = false;
+                    break;
+                }
+            }
+        }
+
+        States[Pair] = Equal ? State::Equal : State::Different;
+        return Equal;
+    }
+};
+
+} // namespace
+
 GVNPRESolver::GVNPRESolver(Function &F,
                            FunctionAnalysisPassManager &FAM,
                            DominatorTree &DT,
                            LoopInfo &LI,
                            BasicAAResult &AA,
+                           MemorySSAResult &MSSA,
                            bool EnablePRE)
-    : F(F), FAM(FAM), DT(DT), LI(LI), AA(AA), EnablePRE(EnablePRE) {}
+    : F(F), FAM(FAM), DT(DT), LI(LI), AA(AA), MSSA(MSSA),
+      EnablePRE(EnablePRE) {}
 
 bool GVNPRESolver::run() {
     if (isFunctionTooLargeForGVNPRE()) {
@@ -113,6 +265,8 @@ void GVNPRESolver::clearIterationState() {
     DeadBlocks.clear();
     PhiTranslateTable.clear();
     AvailOut.clear();
+    AvailableMemoryLoads.clear();
+    MemorySSAQueries = 0;
 }
 
 bool GVNPRESolver::hasResultValue(Instruction *I) {
@@ -464,7 +618,8 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
     std::vector<Value *> Args = CI->getArgs();
 
     if (auto *BIF = CI->getBuiltinCallee()) {
-        if (getIntrinsicID(BIF) == IntrinsicID::Memcpy) {
+        if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
+            getIntrinsicID(BIF) == IntrinsicID::Memmove) {
             if (Args.size() >= 2 && Args[1] && Args[1]->isPointerValue()) {
                 pushUnique(Args[1]);
             }
@@ -586,6 +741,72 @@ bool GVNPRESolver::processLoad(Instruction *I) {
     BasicBlock *BB = I->getParent();
     if (!BB) return false;
 
+    auto TypeCompatible = [&](Value *V) {
+        return V && V->getIRType() && LIst->getIRType() &&
+               V->getIRType()->hasSameShape(*LIst->getIRType());
+    };
+
+    MemoryLocation Location = MemoryLocation::get(LIst);
+    MemoryAccess *Clobber = nullptr;
+    if (MemorySSAValid && MemorySSAQueries < kMaxMemorySSAQueries) {
+        ++MemorySSAQueries;
+        Clobber = MSSA.getClobberingAccess(
+            LIst, Location, AA, LI, FAM, 256);
+    }
+
+    if (Clobber && Clobber->isDef()) {
+        if (auto *Store = dynamic_cast<StoreInst *>(
+                Clobber->getInstruction())) {
+            BasicBlock *StoreBB = Store->getParent();
+            bool Dominates = StoreBB && DT.dominates(StoreBB, BB) &&
+                (StoreBB != BB || Instruction::comesBefore(Store, LIst));
+            if (Dominates && TypeCompatible(Store->getValueOperand()) &&
+                AA.aliasWithIndexRange(Location,
+                                       MemoryLocation::get(Store), LI) ==
+                    AliasInfo::MustAlias) {
+                I->replaceAllUsesWith(Store->getValueOperand());
+                forgetInstruction(I);
+                delete I;
+                return true;
+            }
+        }
+    }
+
+    // Two dominating loads with the same reaching memory state and the same
+    // byte location observe the same value.  Keying by the MemorySSA clobber
+    // prevents a syntactically identical address from being reused across an
+    // intervening store/call.  The bounded reverse search favors nearby
+    // leaders and caps compile time on load-heavy functions.
+    if (Clobber) {
+        std::size_t Compared = 0;
+        for (auto It = AvailableMemoryLoads.rbegin();
+             It != AvailableMemoryLoads.rend() &&
+             Compared < kMaxMemoryLoadComparisons; ++It, ++Compared) {
+            if (It->Clobber != Clobber || !It->Load || !It->Block ||
+                !It->Load->getParent() ||
+                !TypeCompatible(It->Load) ||
+                !DT.dominates(It->Block, BB) ||
+                (It->Block == BB &&
+                 !Instruction::comesBefore(It->Load, LIst)))
+                continue;
+            if (AA.aliasWithIndexRange(Location, It->Location, LI) !=
+                AliasInfo::MustAlias)
+                continue;
+            I->replaceAllUsesWith(It->Load);
+            forgetInstruction(I);
+            delete I;
+            return true;
+        }
+    }
+
+    auto RememberAndFail = [&]() {
+        if (Clobber &&
+            AvailableMemoryLoads.size() < kMaxMemoryLoadRecords) {
+            AvailableMemoryLoads.push_back({Clobber, Location, LIst, BB});
+        }
+        return false;
+    };
+
     BasicBlock *ScanBB = BB;
     Instruction *StartI = I->getPrev();
 
@@ -594,29 +815,31 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         Instruction *Cur = (ScanBB == BB) ? StartI : ScanBB->back();
 
         for (; Cur != nullptr; Cur = Cur->getPrev()) {
-            if (++ScanCount > kBackwardScanLimit) return false;
+            if (++ScanCount > kBackwardScanLimit) return RememberAndFail();
 
             if (auto *SI = dynamic_cast<StoreInst *>(Cur)) {
                 Value *SPtr = SI->getPointerOperand();
                 if (!SPtr) continue;
-                AliasInfo AI = AA.alias(Ptr, SPtr, LI);
+                AliasInfo AI = AA.aliasWithIndexRange(
+                    Location, MemoryLocation::get(SI), LI);
                 if (AI == AliasInfo::MustAlias) {
                     Value *Stored = SI->getValueOperand();
-                    if (!Stored) return false;
+                    if (!TypeCompatible(Stored)) return RememberAndFail();
                     I->replaceAllUsesWith(Stored);
                     forgetInstruction(I);
                     delete I;
                     return true;
                 }
-                if (AI == AliasInfo::MayAlias) return false;
+                if (AI == AliasInfo::MayAlias) return RememberAndFail();
                 continue;
             }
 
             if (auto *LI2 = dynamic_cast<LoadInst *>(Cur)) {
                 Value *PrevPtr = LI2->getPointerOperand();
                 if (!PrevPtr) continue;
-                AliasInfo AI = AA.alias(Ptr, PrevPtr, LI);
-                if (AI == AliasInfo::MustAlias) {
+                AliasInfo AI = AA.aliasWithIndexRange(
+                    Location, MemoryLocation::get(LI2), LI);
+                if (AI == AliasInfo::MustAlias && TypeCompatible(LI2)) {
                     I->replaceAllUsesWith(LI2);
                     forgetInstruction(I);
                     delete I;
@@ -625,9 +848,13 @@ bool GVNPRESolver::processLoad(Instruction *I) {
                 continue;
             }
 
-            if (dynamic_cast<CallInst *>(Cur)) {
-                ModRefInfo MRI = getInstModRefInfo(Ptr, Cur, AA, LI, FAM);
-                if (isModSet(MRI)) return false;
+            if (auto *CI = dynamic_cast<CallInst *>(Cur)) {
+                ModRefInfo MRI = getInstModRefInfo(
+                    Location, Cur, AA, LI, FAM);
+                if (isModSet(MRI) ||
+                    (isNoModRef(MRI) && !CI->getBuiltinCallee() &&
+                     AA.callMayAliasPointer(CI, Ptr, LI)))
+                    return RememberAndFail();
             }
         }
 
@@ -635,7 +862,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         if (Preds.size() != 1 || isDeadBlock(Preds[0])) break;
         ScanBB = Preds[0];
     }
-    return false;
+    return RememberAndFail();
 }
 
 bool GVNPRESolver::processCall(Instruction *I) {
@@ -665,7 +892,11 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 for (Value *RP : ReadPtrs) {
                     if (!RP || !RP->isPointerValue())
                         continue;
-                    if (AA.alias(RP, SPtr, LI) != AliasInfo::NoAlias) return false;
+                    // A callee RefSet entry describes an unknown range in the
+                    // referenced object.  A different GEP offset is not enough
+                    // to move the call across this store.
+                    if (!AA.haveKnownDistinctUnderlyingObjects(RP, SPtr))
+                        return false;
                 }
                 continue;
             }
@@ -674,6 +905,11 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
+                    // MemorySSA models every call as a Def node.  This solver
+                    // has no incremental updater, so stop consulting the
+                    // snapshot after deleting one; scalar GVN may continue.
+                    MemorySSAValid = false;
+                    AvailableMemoryLoads.clear();
                     delete I;
                     return true;
                 }
@@ -681,7 +917,11 @@ bool GVNPRESolver::processCall(Instruction *I) {
                     if (!RP || !RP->isPointerValue())
                         continue;
                     ModRefInfo MRI = getInstModRefInfo(RP, PrevCall, AA, LI, FAM);
-                    if (isModSet(MRI)) return false;
+                    if (isModSet(MRI) ||
+                        (isNoModRef(MRI) &&
+                         !PrevCall->getBuiltinCallee() &&
+                         AA.callMayAliasPointer(PrevCall, RP, LI)))
+                        return false;
                 }
             }
         }
@@ -694,7 +934,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
 }
 
 bool GVNPRESolver::runGVN() {
-    bool Changed = false;
+    bool Changed = eliminateCongruentPhis();
 
     for (BasicBlock *BB : RPO) {
         if (isDeadBlock(BB)) continue;
@@ -753,8 +993,51 @@ bool GVNPRESolver::runGVN() {
 
             I->replaceAllUsesWith(Leader);
             forgetInstruction(I);
+            if (dynamic_cast<CallInst *>(I)) {
+                MemorySSAValid = false;
+                AvailableMemoryLoads.clear();
+            }
             delete I;
             Changed = true;
+        }
+    }
+
+    return Changed;
+}
+
+bool GVNPRESolver::eliminateCongruentPhis() {
+    bool Changed = false;
+
+    for (BasicBlock *BB : RPO) {
+        if (!BB || isDeadBlock(BB)) continue;
+        auto Phis = BB->collectPhiNodes();
+        std::unordered_set<PhiInst *> Removed;
+
+        for (size_t I = 0; I < Phis.size(); ++I) {
+            PhiInst *Leader = Phis[I];
+            if (!Leader || Removed.count(Leader)) continue;
+
+            for (size_t J = I + 1; J < Phis.size(); ++J) {
+                PhiInst *Candidate = Phis[J];
+                if (!Candidate || Removed.count(Candidate) ||
+                    Leader->getIRType().get() !=
+                        Candidate->getIRType().get() ||
+                    Leader->getNumIncomingValues() !=
+                        Candidate->getNumIncomingValues()) {
+                    continue;
+                }
+
+                PhiCongruenceMatcher Matcher;
+                if (!Matcher.equivalent(Leader, Candidate)) continue;
+
+                Candidate->replaceAllUsesWith(Leader);
+                Removed.insert(Candidate);
+                Changed = true;
+            }
+        }
+
+        for (PhiInst *Phi : Removed) {
+            if (Phi) delete Phi;
         }
     }
 
@@ -1115,8 +1398,9 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
 
-    GVNPRESolver Solver(F, FAM, DT, LI, AA, EnablePRE);
+    GVNPRESolver Solver(F, FAM, DT, LI, AA, MSSA, EnablePRE);
     bool Changed = Solver.run();
 
     if (!Changed) {
@@ -1128,6 +1412,7 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
     PA.keep<PostDominantAnalysis>();
     PA.keep<LoopAnalysis>();
     PA.discard<BasicAliasAnalysis>();
+    PA.discard<MemorySSAAnalysis>();
     PA.discard<SideEffectAnalysis>();
     return PA;
 }

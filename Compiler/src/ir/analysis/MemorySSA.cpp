@@ -52,8 +52,10 @@ MemoryAccess *MemorySSAResult::getBlockExit(BasicBlock *BB) const {
 }
 
 bool MemorySSAResult::mayClobber(
-    MemoryAccess *Access, Value *Ptr, BasicAAResult &AA, const LoopInfo &LI,
+    MemoryAccess *Access, const MemoryLocation &Location,
+    BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM) const {
+    Value *Ptr = Location.Pointer;
     if (!Access || !Access->isDef() || !Ptr) return true;
     Instruction *I = Access->getInstruction();
     if (!I) return true;
@@ -61,19 +63,20 @@ bool MemorySSAResult::mayClobber(
     if (auto *SI = dynamic_cast<StoreInst *>(I)) {
         Value *StorePtr = SI->getPointerOperand();
         return !StorePtr ||
-               AA.aliasWithIndexRange(Ptr, StorePtr, LI) !=
+               AA.aliasWithIndexRange(Location, MemoryLocation::get(SI), LI) !=
                    AliasInfo::NoAlias;
     }
 
     if (auto *CI = dynamic_cast<CallInst *>(I)) {
-        ModRefInfo MRI = getInstModRefInfo(Ptr, I, AA, LI, FAM);
+        ModRefInfo MRI = getInstModRefInfo(Location, I, AA, LI, FAM);
         if (isModSet(MRI)) return true;
 
         // Side-effect summaries can be temporarily incomplete for a call
         // graph SCC.  Do not let a false NoModRef result make an aliasing
         // pointer argument transparent.  A proven readonly call remains
         // transparent because its result is Ref rather than NoModRef.
-        return isNoModRef(MRI) && AA.callMayAliasPointer(CI, Ptr, LI);
+        return isNoModRef(MRI) && !CI->getBuiltinCallee() &&
+               AA.callMayAliasPointer(CI, Ptr, LI);
     }
 
     // The builder currently creates Defs only for stores and calls.  Keep the
@@ -87,15 +90,36 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
     std::size_t MaxVisitedAccesses) const {
     MemoryAccess *MA = getMemoryAccess(At);
     if (!MA) return nullptr;
-    return getClobberingAccess(MA->getDefiningAccess(), Ptr, AA, LI, FAM,
-                               MaxVisitedAccesses);
+    return getClobberingAccess(
+        MA->getDefiningAccess(), MemoryLocation(Ptr, std::nullopt), AA, LI,
+        FAM, MaxVisitedAccesses);
+}
+
+MemoryAccess *MemorySSAResult::getClobberingAccess(
+    Instruction *At, const MemoryLocation &Location, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
+    std::size_t MaxVisitedAccesses) const {
+    MemoryAccess *MA = getMemoryAccess(At);
+    if (!MA) return nullptr;
+    return getClobberingAccess(MA->getDefiningAccess(), Location, AA, LI,
+                               FAM, MaxVisitedAccesses);
 }
 
 MemoryAccess *MemorySSAResult::getClobberingAccess(
     MemoryAccess *Start, Value *Ptr, BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM,
     std::size_t MaxVisitedAccesses) const {
-    if (!Start || !Ptr || MaxVisitedAccesses == 0) return nullptr;
+    return getClobberingAccess(
+        Start, MemoryLocation(Ptr, std::nullopt), AA, LI, FAM,
+        MaxVisitedAccesses);
+}
+
+MemoryAccess *MemorySSAResult::getClobberingAccess(
+    MemoryAccess *Start, const MemoryLocation &Location, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
+    std::size_t MaxVisitedAccesses) const {
+    if (!Start || !Location.Pointer || MaxVisitedAccesses == 0)
+        return nullptr;
 
     std::vector<MemoryAccess *> Worklist{Start};
     std::unordered_set<MemoryAccess *> Visited;
@@ -117,7 +141,7 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
         }
 
         if (Current->isDef()) {
-            if (mayClobber(Current, Ptr, AA, LI, FAM)) {
+            if (mayClobber(Current, Location, AA, LI, FAM)) {
                 FirstClobbers.insert(Current);
                 continue;
             }
@@ -233,9 +257,11 @@ bool MemorySSAResult::isStoreValueRedundant(
         }
 
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            ModRefInfo MRI = getInstModRefInfo(Ptr, I, AA, LI, FAM);
+            ModRefInfo MRI = getInstModRefInfo(
+                MemoryLocation::get(Store), I, AA, LI, FAM);
             if (isModSet(MRI) ||
-                (isNoModRef(MRI) && AA.callMayAliasPointer(CI, Ptr, LI)))
+                (isNoModRef(MRI) && !CI->getBuiltinCallee() &&
+                 AA.callMayAliasPointer(CI, Ptr, LI)))
                 return false;
             // Ref-only calls do not change the value being proved.
             Worklist.push_back(Current->getDefiningAccess());

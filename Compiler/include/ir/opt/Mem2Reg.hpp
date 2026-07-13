@@ -23,7 +23,7 @@ struct Mem2RegRenameFrame {
 
 class PromotePass : public PassDescriptor<PromotePass> {
 public:
-    PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+    PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
     bool promoteMemoryToRegister(Function& F, DominatorTree& dominant);
     bool isAllocaPromotable(const AllocaInst* AI);

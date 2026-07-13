@@ -6,7 +6,7 @@
 //函数内级联删除死代码
 class DCEPass : public PassDescriptor<DCEPass> {
 public:
-    PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+    PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
 	static bool isDeletableInstruction(
 		Instruction *I, FunctionAnalysisPassManager &FAM);
@@ -17,13 +17,22 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM);
 
 // Return true only when I is an integer shift whose constant amount is in the
 // half-open range [0, bitwidth(lhs)).  A dynamic, ill-typed or out-of-range
-// shift is deliberately not classified as safe to speculate/remove.
+// shift is deliberately not classified as safe to speculate or reuse as a
+// defined-value proof.  Dead-code removal itself follows poison semantics.
 //
 // This legality predicate is shared by DCE's whole-function scan,
 // IfConversion and LICM so they cannot silently disagree for non-i32 values.
 bool hasDefinedConstantShiftAmount(const Instruction *I);
 
-// Instructions whose mere evaluation may fault or rely on an undefined input
-// must remain live even when their SSA result is unused.  Shared with ADCE so
-// the aggressive sweep cannot undo DCE's legality policy.
+// Return true for context-independent observable execution not already
+// classified by each caller (stores, calls and terminators are handled there).
+// At present the IR has no volatile, atomic, or constrained arithmetic
+// instruction, so ordinary loads and poison-producing arithmetic are
+// deliberately not preserved.
 bool dceInstructionMustBePreserved(Instruction *I);
+
+// A separate predicate for motion/speculation.  Pure operations may be legal
+// to delete when dead but illegal to move onto paths where they did not execute
+// originally.  Keeping this separate prevents DCE policy from silently
+// weakening LICM or peeling legality.
+bool instructionMayFaultOrProducePoison(const Instruction *I);

@@ -30,9 +30,9 @@ std::vector<BasicBlock *> collectLoopBlocks(Loop *L, Function *F) {
 bool isSafeToSkipOnZeroTrip(Instruction *I) {
     if (!I) return false;
     if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
-    // Use the same exceptional/undefined-input policy as DCE/ADCE.  A loop
-    // deletion must not remove an FPTOSI, div/rem, load, or an unproved shift
-    // merely because its SSA result is dead.
+    // Use the same observable-execution policy as DCE/ADCE.  Ordinary pure
+    // operations may disappear with a dead loop; future volatile/atomic or
+    // constrained instructions must opt out through this shared predicate.
     if (dceInstructionMustBePreserved(I)) return false;
     if (dynamic_cast<BinaryInst *>(I)) return true;
     if (dynamic_cast<SelectInst *>(I) ||

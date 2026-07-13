@@ -314,7 +314,8 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
                 Value *Ptr = LIInst->getPointerOperand();
                 auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
                 auto &LI = FAM.getResult<LoopAnalysis>(F);
-                ModRefInfo MRI = getInstModRefInfo(Ptr, CI, AA, LI, FAM);
+                ModRefInfo MRI = getInstModRefInfo(
+                    MemoryLocation::get(LIInst), CI, AA, LI, FAM);
                 if (isModSet(MRI)) return false;
             }
         }

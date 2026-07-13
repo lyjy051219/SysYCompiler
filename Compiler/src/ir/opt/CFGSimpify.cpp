@@ -521,6 +521,173 @@ bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 
 	return Changed;
 }
+
+// Thread every incoming edge through a branch whose condition is a constant
+// PHI on that edge:
+//
+//   P0 --\                 P0 ----> T
+//         B: c = phi       P1 ----> F
+//   P1 --/   br c
+//
+// B must contain only PHIs and the branch.  Unlike cloning-based jump
+// threading this never duplicates work.  Successor PHIs are expanded with the
+// edge-specific values from B before the block is removed.
+bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
+	if (!BB || BB == F.front()) return false;
+	auto *Br = BB->getBranchTerminator();
+	if (!BasicBlock::isCondBr(Br)) return false;
+
+	PhiInst *CondPhi = dynamic_cast<PhiInst *>(Br->getCondition());
+	BinaryInst *CondNot = nullptr;
+	bool Negated = false;
+	if (!CondPhi) {
+		auto *MaybeNot = dynamic_cast<BinaryInst *>(Br->getCondition());
+		Value *L = nullptr;
+		Value *R = nullptr;
+		if (!MaybeNot || MaybeNot->getOp() != BinaryInst::XOR ||
+			!BinaryInst::getOperands(MaybeNot, L, R)) {
+			return false;
+		}
+		if (Value::isConstOne(R))
+			CondPhi = dynamic_cast<PhiInst *>(L);
+		else if (Value::isConstOne(L))
+			CondPhi = dynamic_cast<PhiInst *>(R);
+		if (!CondPhi) return false;
+		CondNot = MaybeNot;
+		Negated = true;
+	}
+	if (!CondPhi || CondPhi->getParent() != BB) return false;
+
+	for (Instruction *I : *BB) {
+		if (I == Br || I == CondNot || dynamic_cast<PhiInst *>(I)) continue;
+		return false;
+	}
+	if (CondNot) {
+		for (auto It = CondNot->getUseList().begin();
+			 It != CondNot->getUseList().end(); ++It) {
+			Use *U = *It;
+			if (!U || U->getValue() != CondNot) continue;
+			if (U->getUser() != Br) return false;
+		}
+	}
+
+	BasicBlock *TrueBB = Br->getTrueSuccessor();
+	BasicBlock *FalseBB = Br->getFalseSuccessor();
+	if (!TrueBB || !FalseBB || TrueBB == FalseBB || TrueBB == BB ||
+		FalseBB == BB) {
+		return false;
+	}
+
+	auto Preds = BB->getPredecessors();
+	if (Preds.empty() || CondPhi->getNumIncomingValues() != Preds.size())
+		return false;
+
+	std::unordered_set<BasicBlock *> UniquePreds;
+	std::unordered_map<BasicBlock *, BasicBlock *> Destination;
+	for (BasicBlock *Pred : Preds) {
+		if (!Pred || !UniquePreds.insert(Pred).second ||
+			Pred->countEdgesToSucc(BB) != 1) {
+			return false;
+		}
+		Value *Incoming = CondPhi->getIncomingFromPred(Pred);
+		bool Bit = false;
+		if (!Incoming || !Incoming->tryGetBoolConst(Bit)) return false;
+		Bit ^= Negated;
+		Destination[Pred] = Bit ? TrueBB : FalseBB;
+	}
+
+	// Every PHI in B must have one unambiguous value per incoming block.  Its
+	// uses may only be the branch or a successor PHI on B's outgoing edge.
+	auto BBPhis = BB->collectPhiNodes();
+	for (PhiInst *Phi : BBPhis) {
+		if (!Phi || Phi->getNumIncomingValues() != Preds.size()) return false;
+		std::unordered_set<BasicBlock *> IncomingPreds;
+		for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+			BasicBlock *Pred = Phi->getIncomingBlock(I);
+			if (!Pred || !UniquePreds.count(Pred) ||
+				!IncomingPreds.insert(Pred).second) {
+				return false;
+			}
+		}
+
+		for (auto It = Phi->getUseList().begin(); It != Phi->getUseList().end();
+			 ++It) {
+			Use *U = *It;
+			if (!U || U->getValue() != Phi) continue;
+			auto *UserI = dynamic_cast<Instruction *>(U->getUser());
+			if (Phi == CondPhi &&
+				((!CondNot && UserI == Br) || (CondNot && UserI == CondNot)))
+				continue;
+			auto *SuccPhi = dynamic_cast<PhiInst *>(UserI);
+			if (!SuccPhi ||
+				(SuccPhi->getParent() != TrueBB &&
+				 SuccPhi->getParent() != FalseBB) ||
+				SuccPhi->getIncomingFromPred(BB) != Phi) {
+				return false;
+			}
+		}
+	}
+
+	// A predecessor that already reaches the chosen destination would create
+	// duplicate predecessor entries.  The IR cannot attach distinct PHI values
+	// to those edges, so reject that shape whenever the destination has PHIs.
+	for (BasicBlock *Pred : Preds) {
+		BasicBlock *Dest = Destination[Pred];
+		if (!Dest->collectPhiNodes().empty() && Pred->countEdgesToSucc(Dest) != 0)
+			return false;
+	}
+
+	// Build all successor-PHI rewrites before mutating the CFG.  An incoming
+	// value defined by a PHI in B is translated to that PHI's value on Pred->B.
+	struct PhiRewrite {
+		PhiInst *Phi = nullptr;
+		std::vector<PhiInst::IncomingEdge> Incoming;
+	};
+	std::vector<PhiRewrite> Rewrites;
+	for (BasicBlock *Dest : {TrueBB, FalseBB}) {
+		for (PhiInst *Phi : Dest->collectPhiNodes()) {
+			if (!Phi) return false;
+			auto Old = Phi->collectIncomingEdges();
+			unsigned FromBBCount = 0;
+			PhiRewrite Rewrite;
+			Rewrite.Phi = Phi;
+			for (const auto &Edge : Old) {
+				if (Edge.Pred != BB) {
+					Rewrite.Incoming.push_back(Edge);
+					continue;
+				}
+				++FromBBCount;
+				for (BasicBlock *Pred : Preds) {
+					if (Destination[Pred] != Dest) continue;
+					Value *Translated = Edge.V;
+					if (auto *FromPhi = dynamic_cast<PhiInst *>(Translated)) {
+						if (FromPhi->getParent() == BB)
+							Translated = FromPhi->getIncomingFromPred(Pred);
+					}
+					if (!Translated ||
+						(dynamic_cast<Instruction *>(Translated) &&
+						 dynamic_cast<Instruction *>(Translated)->getParent() == BB)) {
+						return false;
+					}
+					Rewrite.Incoming.push_back({Translated, Pred});
+				}
+			}
+			if (FromBBCount != 1) return false;
+			Rewrites.push_back(std::move(Rewrite));
+		}
+	}
+
+	for (auto &Rewrite : Rewrites)
+		PhiInst::rebuildFromIncoming(Rewrite.Phi, Rewrite.Incoming);
+
+	for (BasicBlock *Pred : Preds) {
+		if (!BasicBlock::redirectBranchTarget(Pred, BB, Destination[Pred]))
+			return false;
+	}
+
+	BB->eraseBlockSafely();
+	return true;
+}
 //合并基本块
 bool CFGSimplifyPass::mergeBlocks(Function &F) {
 	bool Changed = false;
@@ -684,6 +851,10 @@ bool CFGSimplifyPass::simplifyBranches(Function &F) {
 		for (BasicBlock *BB : F) Blocks.push_back(BB);
 		for (BasicBlock *BB : Blocks) {
 			if (!BB) continue;
+			if (threadBranchOnPhi(F, BB)) {
+				Changed = true;
+				continue;
+			}
 			Changed |= simplifyUncondBranch(F, BB);
 		}
 	}
@@ -701,6 +872,17 @@ PreservationStatus CFGSimplifyPass::run(Function &F, FunctionAnalysisPassManager
 		Changed |= foldTerminatorBranches(F);
 		Changed |= foldKnownBranchConditions(F);
 		Changed |= eliminateDuplicatePhis(F);
+		// Thread while the edge-specific constants are still represented by a
+		// PHI.  normalizeBooleanPhis may replace a two-arm PHI with its remote
+		// controller condition, which is useful algebraically but would lose the
+		// local edge facts needed by this zero-duplication transform.
+		{
+			std::vector<BasicBlock *> Blocks;
+			for (BasicBlock *BB : F) Blocks.push_back(BB);
+			for (BasicBlock *BB : Blocks) {
+				if (BB) Changed |= threadBranchOnPhi(F, BB);
+			}
+		}
 		Changed |= normalizeBooleanPhis(F);
 		Changed |= mergeBlocks(F);
 		Changed |= simplifyBranches(F);

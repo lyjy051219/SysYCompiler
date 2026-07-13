@@ -5,6 +5,7 @@
 
 class BasicAAResult;
 class LoopInfo;
+struct MemoryLocation;
 
 enum class DSEBlockColor {
     Kill,
@@ -20,7 +21,7 @@ public:
 private:
     static bool eliminateInBlock(BasicBlock *BB);
     static DSEBlockColor classifyFrom(
-        Instruction *First, Value *Ptr, BasicAAResult &AA,
+        Instruction *First, const MemoryLocation &Location, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
     static bool isStoreDead(StoreInst *Store, BasicAAResult &AA,
                             const LoopInfo &LI,

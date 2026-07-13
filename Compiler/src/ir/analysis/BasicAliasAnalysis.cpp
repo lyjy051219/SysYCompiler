@@ -80,6 +80,21 @@ bool hasUndefPointerOrigin(Value *V, std::unordered_set<Value *> &Active,
 
 } // namespace
 
+MemoryLocation MemoryLocation::get(const LoadInst *Load) {
+    if (!Load) return {};
+    std::shared_ptr<IRType> Ty = Load->getIRType();
+    return {Load->getPointerOperand(),
+            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
+}
+
+MemoryLocation MemoryLocation::get(const StoreInst *Store) {
+    if (!Store) return {};
+    Value *Stored = Store->getValueOperand();
+    std::shared_ptr<IRType> Ty = Stored ? Stored->getIRType() : nullptr;
+    return {Store->getPointerOperand(),
+            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
+}
+
 bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(BasicAliasAnalysis::ID())) {
         return false;
@@ -106,10 +121,14 @@ bool BasicAAResult::hasObjectNoAlias(Value* V1, Value* V2) const {
 bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
                                         const LoopInfo &LI) {
     if (!CI || !P) return false;
+    (void)LI;
     for (unsigned I = 0; I < CI->getArgCount(); ++I) {
         Value *Arg = CI->getArg(I);
         if (!Arg || !Arg->isPointerValue()) continue;
-        if (alias(P, Arg, LI) != AliasInfo::NoAlias) {
+        // A call parameter describes an object-range access, not merely one
+        // pointee-sized access at the argument's immediate address.  Distinct
+        // GEP offsets into one array therefore remain potentially aliasing.
+        if (!haveKnownDistinctUnderlyingObjects(P, Arg)) {
             return true;
         }
     }
@@ -512,10 +531,72 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
 AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     const std::unordered_map<Value*, long long>& DiffVars,
     long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
-    (void)DiffVars;
-    (void)ConstDiff;
-    (void)Threshold;
     (void)LI;
+
+    // First handle an affine relation encoded directly in SSA, such as
+    //   j = i + 1;  A[j] versus A[i].
+    // This proof does not assume no-wrap.  For signed i32 ADD/SUB, `j - i`
+    // has at most two mathematical representatives: C and C +/- 2^32.  If
+    // both byte distances are outside the touched range, the accesses cannot
+    // overlap even on the wrapping execution.
+    if (DiffVars.size() == 2 && Threshold > 0 &&
+        Threshold <= static_cast<std::size_t>(
+                         std::numeric_limits<long long>::max())) {
+        auto It = DiffVars.begin();
+        Value *A = It->first;
+        long long Scale = It->second;
+        ++It;
+        Value *B = It->first;
+        long long OtherScale = It->second;
+        if (Scale != 0 &&
+            Scale != std::numeric_limits<long long>::min() &&
+            OtherScale == -Scale) {
+            if (Scale < 0) {
+                Scale = -Scale;
+                std::swap(A, B);
+            }
+
+            std::optional<long long> Offset = getAdditiveOffsetFrom(A, B);
+            if (!Offset) {
+                if (auto Reverse = getAdditiveOffsetFrom(B, A);
+                    Reverse &&
+                    *Reverse != std::numeric_limits<long long>::min())
+                    Offset = -*Reverse;
+            }
+
+            auto Ty = A ? A->getIRType() : nullptr;
+            auto BTy = B ? B->getIRType() : nullptr;
+            if (Offset && Ty && BTy && Ty->isInt() &&
+                BTy->isInt() && Ty->getIntegerBitWidth(32) == 32 &&
+                BTy->getIntegerBitWidth(32) == 32) {
+                constexpr long long Modulus = 1LL << 32;
+                // A chain of i32 additions can accumulate more than one full
+                // modulus in the mathematical decomposition.  Normalize it
+                // first; the signed difference of the two final i32 values
+                // is then either R or R-2^32 (only zero when R is zero).
+                long long Residue = *Offset % Modulus;
+                if (Residue < 0) Residue += Modulus;
+                std::vector<long long> Representatives{Residue};
+                if (Residue != 0)
+                    Representatives.push_back(Residue - Modulus);
+
+                bool AllDisjoint = true;
+                for (long long IndexDiff : Representatives) {
+                    long long Scaled = 0;
+                    long long ByteDiff = 0;
+                    if (!checkedMul(Scale, IndexDiff, Scaled) ||
+                        !checkedAdd(ConstDiff, Scaled, ByteDiff) ||
+                        ByteDiff == std::numeric_limits<long long>::min() ||
+                        std::llabs(ByteDiff) <
+                            static_cast<long long>(Threshold)) {
+                        AllDisjoint = false;
+                        break;
+                    }
+                }
+                if (AllDisjoint) return AliasInfo::NoAlias;
+            }
+        }
+    }
 
     // Integer ADD/SUB and PHI recurrences in this IR carry no no-wrap flag.
     // A syntactically positive step can wrap and invalidate every mathematical
@@ -575,8 +656,10 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
 #endif
 }
 
-AliasInfo BasicAAResult::aliasGEP(Value* GEP1, Value* GEP2,
-                                  const LoopInfo& LI, bool UseIndexRange) {
+AliasInfo BasicAAResult::aliasGEP(
+    Value* GEP1, Value* GEP2, const LoopInfo& LI, bool UseIndexRange,
+    std::optional<std::size_t> AccessSize1,
+    std::optional<std::size_t> AccessSize2) {
     auto E1 = fillLinearGEP(GEP1);
     auto E2 = fillLinearGEP(GEP2);
 
@@ -606,8 +689,8 @@ AliasInfo BasicAAResult::aliasGEP(Value* GEP1, Value* GEP2,
     if (!checkedSub(E1.ConstantOffset, E2.ConstantOffset, ConstDiff))
         return AliasInfo::MayAlias;
 
-    std::size_t Access1 = getPointeeAccessSize(GEP1);
-    std::size_t Access2 = getPointeeAccessSize(GEP2);
+    std::size_t Access1 = AccessSize1.value_or(getPointeeAccessSize(GEP1));
+    std::size_t Access2 = AccessSize2.value_or(getPointeeAccessSize(GEP2));
     // A zero size here means that the pointer's pointee width is unknown to
     // this IR, not that every access through the pointer touches zero bytes.
     // Equal offsets are still MustAlias, but distance cannot prove NoAlias.
@@ -632,8 +715,14 @@ AliasInfo BasicAAResult::aliasGEP(Value* GEP1, Value* GEP2,
 
     if (ConstDiff == std::numeric_limits<long long>::min())
         return AliasInfo::MayAlias;
-    long long Distance = std::llabs(ConstDiff);
-    if (Distance >= static_cast<long long>(Threshold)) {
+    // D = address(GEP1) - address(GEP2).  For unequal access widths the two
+    // separating distances are asymmetric: a positive D is compared against
+    // Access2, while a negative D is compared against Access1.
+    if ((ConstDiff > 0 &&
+         ConstDiff >= static_cast<long long>(Access2)) ||
+        (ConstDiff < 0 &&
+         ConstDiff != std::numeric_limits<long long>::min() &&
+         -ConstDiff >= static_cast<long long>(Access1))) {
         return AliasInfo::NoAlias;
     }
     return AliasInfo::MayAlias;
@@ -706,6 +795,45 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
     return Acc;
 }
 
+AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
+                                     const LoopInfo &LI,
+                                     bool UseIndexRange) {
+    if (!Select || !Other) return AliasInfo::MayAlias;
+
+    auto Key = makeCanonicalPair(Select, Other);
+    if (!ActiveSelectQueries.insert(Key).second)
+        return AliasInfo::MayAlias;
+
+    auto Finish = [&](AliasInfo Result) {
+        ActiveSelectQueries.erase(Key);
+        return Result;
+    };
+
+    Value *TrueValue = Select->getOperand(1);
+    Value *FalseValue = Select->getOperand(2);
+    if (!TrueValue || !FalseValue)
+        return Finish(AliasInfo::MayAlias);
+
+    // Correlated selects with the same condition choose corresponding arms in
+    // every execution.  Pairing all four combinations would lose useful
+    // NoAlias/MustAlias facts and is unnecessarily pessimistic.
+    if (auto *OtherSelect = dynamic_cast<SelectInst *>(Other)) {
+        if (Select->getOperand(0) == OtherSelect->getOperand(0)) {
+            AliasInfo OnTrue = aliasImpl(TrueValue,
+                                         OtherSelect->getOperand(1), LI,
+                                         UseIndexRange);
+            AliasInfo OnFalse = aliasImpl(FalseValue,
+                                          OtherSelect->getOperand(2), LI,
+                                          UseIndexRange);
+            return Finish(mergePhiAlias(OnTrue, OnFalse));
+        }
+    }
+
+    AliasInfo OnTrue = aliasImpl(TrueValue, Other, LI, UseIndexRange);
+    AliasInfo OnFalse = aliasImpl(FalseValue, Other, LI, UseIndexRange);
+    return Finish(mergePhiAlias(OnTrue, OnFalse));
+}
+
 AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
     return aliasImpl(V1, V2, LI, false);
 }
@@ -713,6 +841,169 @@ AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
 AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
                                              const LoopInfo& LI) {
     return aliasImpl(V1, V2, LI, true);
+}
+
+AliasInfo BasicAAResult::aliasLocationImpl(
+    const MemoryLocation &L1, const MemoryLocation &L2,
+    const LoopInfo &LI, bool UseIndexRange, unsigned Depth,
+    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> &Active) {
+    auto NormalizeControlPointer = [](Value *P,
+                                      const std::optional<std::size_t> &Size) {
+        // Once an explicit byte width is present, bitcasts and zero-offset
+        // GEPs no longer contribute access-width information.  Peel them so a
+        // wrapped select/phi is still expanded with that explicit width.
+        if (!Size) return P;
+        std::unordered_set<Value *> Seen;
+        while (P && Seen.insert(P).second) {
+            if (auto *BC = dynamic_cast<BitCastInst *>(P)) {
+                P = BC->getUnaryOperand();
+                continue;
+            }
+            auto *GEP = dynamic_cast<GetElementPtrInst *>(P);
+            if (!GEP || !GEP->hasOnlyConstantIndices()) break;
+            bool AllZero = true;
+            for (Value *Index : GEP->getIndices()) {
+                if (!Index || !Index->isConstIntZero()) {
+                    AllZero = false;
+                    break;
+                }
+            }
+            if (!AllZero) break;
+            P = GEP->getBasePointer();
+        }
+        return P;
+    };
+
+    Value *P1 = NormalizeControlPointer(L1.Pointer, L1.Size);
+    Value *P2 = NormalizeControlPointer(L2.Pointer, L2.Size);
+    if (!P1 || !P2 || Depth > 32) return AliasInfo::MayAlias;
+
+    // Equal SSA pointers start at the same byte even when their access widths
+    // differ.  Let aliasImpl retain its undef-origin safeguards.
+    if (P1 == P2) return aliasImpl(P1, P2, LI, UseIndexRange);
+
+    auto Key = makeCanonicalPair(P1, P2);
+    if (!Active.insert(Key).second) return AliasInfo::MayAlias;
+    auto Finish = [&](AliasInfo Result) {
+        Active.erase(Key);
+        return Result;
+    };
+    auto Merge = [&](AliasInfo A, AliasInfo B) {
+        return mergePhiAlias(A, B);
+    };
+
+    auto *S1 = dynamic_cast<SelectInst *>(P1);
+    auto *S2 = dynamic_cast<SelectInst *>(P2);
+    if (S1 && S2 && S1->getOperand(0) == S2->getOperand(0)) {
+        AliasInfo OnTrue = aliasLocationImpl(
+            {S1->getOperand(1), L1.Size}, {S2->getOperand(1), L2.Size},
+            LI, UseIndexRange, Depth + 1, Active);
+        AliasInfo OnFalse = aliasLocationImpl(
+            {S1->getOperand(2), L1.Size}, {S2->getOperand(2), L2.Size},
+            LI, UseIndexRange, Depth + 1, Active);
+        return Finish(Merge(OnTrue, OnFalse));
+    }
+    if (S1) {
+        AliasInfo OnTrue = aliasLocationImpl(
+            {S1->getOperand(1), L1.Size}, L2, LI, UseIndexRange,
+            Depth + 1, Active);
+        AliasInfo OnFalse = aliasLocationImpl(
+            {S1->getOperand(2), L1.Size}, L2, LI, UseIndexRange,
+            Depth + 1, Active);
+        return Finish(Merge(OnTrue, OnFalse));
+    }
+    if (S2) {
+        AliasInfo OnTrue = aliasLocationImpl(
+            L1, {S2->getOperand(1), L2.Size}, LI, UseIndexRange,
+            Depth + 1, Active);
+        AliasInfo OnFalse = aliasLocationImpl(
+            L1, {S2->getOperand(2), L2.Size}, LI, UseIndexRange,
+            Depth + 1, Active);
+        return Finish(Merge(OnTrue, OnFalse));
+    }
+
+    auto *Phi1 = dynamic_cast<PhiInst *>(P1);
+    auto *Phi2 = dynamic_cast<PhiInst *>(P2);
+    if (Phi1 && Phi2 && Phi1->getParent() == Phi2->getParent() &&
+        Phi1->getNumIncomingValues() == Phi2->getNumIncomingValues() &&
+        Phi1->getNumIncomingValues() != 0) {
+        std::unordered_map<BasicBlock *, Value *> Incoming2;
+        for (unsigned I = 0; I < Phi2->getNumIncomingValues(); ++I) {
+            BasicBlock *Pred = Phi2->getIncomingBlock(I);
+            if (!Pred || !Incoming2.emplace(
+                             Pred, Phi2->getIncomingValue(I)).second)
+                return Finish(AliasInfo::MayAlias);
+        }
+        bool First = true;
+        AliasInfo Result = AliasInfo::MayAlias;
+        std::unordered_set<BasicBlock *> Seen;
+        for (unsigned I = 0; I < Phi1->getNumIncomingValues(); ++I) {
+            BasicBlock *Pred = Phi1->getIncomingBlock(I);
+            auto It = Incoming2.find(Pred);
+            if (!Pred || !Seen.insert(Pred).second || It == Incoming2.end())
+                return Finish(AliasInfo::MayAlias);
+            AliasInfo Current = aliasLocationImpl(
+                {Phi1->getIncomingValue(I), L1.Size}, {It->second, L2.Size},
+                LI, UseIndexRange, Depth + 1, Active);
+            Result = First ? Current : Merge(Result, Current);
+            First = false;
+            if (Result == AliasInfo::MayAlias) break;
+        }
+        return Finish(Result);
+    }
+
+    auto ExpandPhi = [&](PhiInst *Phi, const MemoryLocation &Other,
+                         bool PhiIsFirst) {
+        if (!Phi || Phi->getNumIncomingValues() == 0)
+            return AliasInfo::MayAlias;
+        bool First = true;
+        AliasInfo Result = AliasInfo::MayAlias;
+        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+            MemoryLocation Incoming(Phi->getIncomingValue(I),
+                                    PhiIsFirst ? L1.Size : L2.Size);
+            AliasInfo Current = PhiIsFirst
+                ? aliasLocationImpl(Incoming, Other, LI, UseIndexRange,
+                                    Depth + 1, Active)
+                : aliasLocationImpl(Other, Incoming, LI, UseIndexRange,
+                                    Depth + 1, Active);
+            Result = First ? Current : Merge(Result, Current);
+            First = false;
+            if (Result == AliasInfo::MayAlias) break;
+        }
+        return Result;
+    };
+    if (Phi1) return Finish(ExpandPhi(Phi1, L2, true));
+    if (Phi2) return Finish(ExpandPhi(Phi2, L1, false));
+
+    AliasInfo Result = aliasImpl(P1, P2, LI, UseIndexRange);
+    if (L1.Size && L2.Size) {
+        Value *V1 = stripBaseInst(P1);
+        Value *V2 = stripBaseInst(P2);
+        // An explicit access width is more authoritative than the pointer's
+        // nominal pointee width.  Re-run same-object GEP queries even if the
+        // pointer-only query already returned NoAlias.
+        if (V1 && V2 && getBaseAddress(V1) == getBaseAddress(V2) &&
+            (dynamic_cast<GetElementPtrInst *>(V1) ||
+             dynamic_cast<GetElementPtrInst *>(V2))) {
+            Result = aliasGEP(V1, V2, LI, UseIndexRange,
+                              L1.Size, L2.Size);
+        }
+    }
+    return Finish(Result);
+}
+
+AliasInfo BasicAAResult::alias(const MemoryLocation &L1,
+                               const MemoryLocation &L2,
+                               const LoopInfo &LI) {
+    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
+    return aliasLocationImpl(L1, L2, LI, false, 0, Active);
+}
+
+AliasInfo BasicAAResult::aliasWithIndexRange(
+    const MemoryLocation &L1, const MemoryLocation &L2,
+    const LoopInfo &LI) {
+    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
+    return aliasLocationImpl(L1, L2, LI, true, 0, Active);
 }
 
 AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
@@ -748,6 +1039,15 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     if (isEqualAlias(V1, V2, LI)) {
         return AliasInfo::MustAlias;
     }
+
+    // A select is a path-sensitive pointer union.  Resolve its arms before
+    // comparing underlying roots: the select instruction itself is not an
+    // allocation object and therefore cannot participate in the usual root
+    // distinction rule.
+    if (auto *S1 = dynamic_cast<SelectInst *>(V1))
+        return aliasSelect(S1, V2, LI, UseIndexRange);
+    if (auto *S2 = dynamic_cast<SelectInst *>(V2))
+        return aliasSelect(S2, V1, LI, UseIndexRange);
 
     //5.如果底层对象不同
     if (O1 != O2) {

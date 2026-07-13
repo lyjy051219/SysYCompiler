@@ -140,7 +140,11 @@ bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 Value *StorePtr = PendingIt->first;
                 AliasInfo Alias = LoadPtr == StorePtr
                                       ? AliasInfo::MustAlias
-                                      : AA.alias(LoadPtr, StorePtr, LoopInfo);
+                                      : AA.alias(
+                                            MemoryLocation::get(LI),
+                                            MemoryLocation::get(
+                                                PendingIt->second),
+                                            LoopInfo);
                 if (Alias != AliasInfo::NoAlias) {
                     PendingIt = pendingStores.erase(PendingIt);
                 } else {
@@ -163,7 +167,9 @@ bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 storesHaveIdenticalCoverage(SI, ExactIt->second);
             if (!FullyOverwritten) {
                 for (const auto &Pending : pendingStores) {
-                    if (AA.alias(ptr, Pending.first, LoopInfo) ==
+                    if (AA.alias(MemoryLocation::get(SI),
+                                 MemoryLocation::get(Pending.second),
+                                 LoopInfo) ==
                             AliasInfo::MustAlias &&
                         storesHaveIdenticalCoverage(SI, Pending.second)) {
                         FullyOverwritten = true;
@@ -182,7 +188,9 @@ bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
             // 对象。把这些候选停在此处，只保留 NoAlias 候选跨过它。
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
-                AliasInfo Alias = AA.alias(ptr, PendingIt->first, LoopInfo);
+                AliasInfo Alias = AA.alias(
+                    MemoryLocation::get(SI),
+                    MemoryLocation::get(PendingIt->second), LoopInfo);
                 if (Alias != AliasInfo::NoAlias) {
                     PendingIt = pendingStores.erase(PendingIt);
                 } else {
@@ -221,16 +229,20 @@ bool DSEPass::eliminateInBlock(BasicBlock *BB) {
 // KILL 还要求 store value 与 P 的 pointee 是同一 IRType，防止
 // bitcast/不同宽度访存把部分覆盖误当成完整覆盖。
 DSEBlockColor DSEPass::classifyFrom(
-    Instruction *First, Value *P,
+    Instruction *First, const MemoryLocation &Location,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    Value *P = Location.Pointer;
+    if (!P) return DSEBlockColor::Clobber;
     for (Instruction *I = First; I; I = I->getNext()) {
         // 先检查 KILL：MustAlias store
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             Value *StorePtr = SI->getPointerOperand();
             if (StorePtr &&
-                AA.alias(P, StorePtr, LI) == AliasInfo::MustAlias &&
+                AA.aliasWithIndexRange(
+                    Location, MemoryLocation::get(SI), LI) ==
+                    AliasInfo::MustAlias &&
                 storeFullyCoversPointer(P, SI)) {
                 return DSEBlockColor::Kill;
             }
@@ -241,7 +253,8 @@ DSEBlockColor DSEPass::classifyFrom(
         // 这是对 getInstModRefInfo 的补充，因为 SideEffectAnalysis
         // 对自递归调用可能返回不完整的 ModRef 信息。
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (AA.callMayAliasPointer(CI, P, LI)) {
+            if (!CI->getBuiltinCallee() &&
+                AA.callMayAliasPointer(CI, P, LI)) {
                 return DSEBlockColor::Clobber;
             }
         }
@@ -251,7 +264,7 @@ DSEBlockColor DSEPass::classifyFrom(
         //   READ:    I 可能读 P（isRefSet）
         //   BARRIER: I 可能改 P 但无法证明完整覆盖（isModSet 且非 MustAlias store）
         // 后续若需区分，在此拆分。
-        ModRefInfo MR = getInstModRefInfo(P, I, AA, LI, FAM);
+        ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
 
         if (isRefSet(MR) || isModSet(MR)) return DSEBlockColor::Clobber;
     }
@@ -274,7 +287,9 @@ bool DSEPass::isStoreDead(
     if (!B1) return false;
 
     // Phase A: 检查 S1 所在块的剩余指令
-    DSEBlockColor tailColor = classifyFrom(S1->getNext(), P, AA, LI, FAM);
+    MemoryLocation StoreLocation = MemoryLocation::get(S1);
+    DSEBlockColor tailColor = classifyFrom(
+        S1->getNext(), StoreLocation, AA, LI, FAM);
     if (tailColor == DSEBlockColor::Kill) return true;   // 同块覆盖
     if (tailColor == DSEBlockColor::Clobber) return false;  // 同块就被读了
 
@@ -325,7 +340,8 @@ bool DSEPass::isStoreDead(
             return false;  // 超出预算，保守放弃
         }
 
-        DSEBlockColor color = classifyFrom(BB->front(), P, AA, LI, FAM);
+        DSEBlockColor color = classifyFrom(
+            BB->front(), StoreLocation, AA, LI, FAM);
 
         if (color == DSEBlockColor::Kill) {
             continue;  // 这条路径被覆盖 store 挡住，不再探索后继
