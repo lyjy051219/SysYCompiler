@@ -114,6 +114,10 @@ struct LoopTripCountInfo {
 
     bool IsRuntime = false;
     bool MayBeZeroTrip = true;
+    // True only when the recurrence values needed to reach the modeled exit
+    // are proved to stay within the signed i32 domain.  A mathematical trip
+    // count alone is not a termination proof for wrapping IR arithmetic.
+    bool ProvenNoWrap = false;
     bool Valid = false;
 };
 

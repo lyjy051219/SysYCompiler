@@ -1,5 +1,7 @@
 #include "ir/opt/LoopUnroll.hpp"
+#include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -8,6 +10,488 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+namespace {
+
+bool containsUndef(Value *V, std::unordered_set<Value *> &Active, int Depth);
+
+bool isStructurallyLoopInvariant(Value *V, Loop *L,
+                                 std::unordered_set<Value *> &Active) {
+    // `undef` is represented in the constant hierarchy, but it is not a
+    // repeatable value that can justify deleting later stores.  Reject it
+    // before the generic constant case; recursive operand checks also reject
+    // every pointer/value derived from undef.
+    if (!V || !L || Value::isUndef(V)) return false;
+    std::unordered_set<Value *> UndefActive;
+    if (containsUndef(V, UndefActive, 0)) return false;
+    if (dynamic_cast<ConstantSystem *>(V) ||
+        dynamic_cast<Variable *>(V) ||
+        dynamic_cast<Function *>(V) ||
+        dynamic_cast<BuildInFunction *>(V)) {
+        return true;
+    }
+
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I || !I->getParent() || !L->contains(I->getParent())) return true;
+    if (dynamic_cast<PhiInst *>(I) || dynamic_cast<LoadInst *>(I) ||
+        dynamic_cast<CallInst *>(I) || dynamic_cast<AllocaInst *>(I)) {
+        return false;
+    }
+    // Do not use an invariant expression that can be undefined for its
+    // operands (division/remainder, FPTOSI, or an unproved shift) as evidence
+    // that later stores repeat the first peeled value.  This keeps the memory
+    // optimization independent of source-level undefined behaviour.
+    if (dceInstructionMustBePreserved(I)) return false;
+
+    bool PureProducer = dynamic_cast<GetElementPtrInst *>(I) ||
+                        dynamic_cast<SelectInst *>(I) ||
+                        dynamic_cast<BinaryInst *>(I) ||
+                        I->instType == Instruction::TRUNC ||
+                        I->instType == Instruction::ZEXT ||
+                        I->instType == Instruction::SEXT ||
+                        I->instType == Instruction::BITCAST;
+    if (!PureProducer || !Active.insert(V).second) return false;
+
+    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+        Value *Operand = I->getOperand(Op);
+        if (dynamic_cast<BasicBlock *>(Operand)) continue;
+        if (!isStructurallyLoopInvariant(Operand, L, Active)) {
+            Active.erase(V);
+            return false;
+        }
+    }
+    Active.erase(V);
+    return true;
+}
+
+std::vector<StoreInst *> collectPeelRedundantStoreCandidates(
+    Loop *L, LoopInfo &LI, BasicAAResult &AA,
+    const DominatorTree &DT) {
+    std::vector<StoreInst *> Result;
+    if (!L) return Result;
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, OuterLatch) ||
+        !PreHeader || !OuterLatch) {
+        return Result;
+    }
+
+    // If a candidate does not dominate the outer latch, its execution is
+    // justified below by invariant direct-loop control.  That argument is
+    // invalid when a nested-loop exit can reach the store during the same
+    // outer iteration: different inner exits may skip/execute it.  Compute all
+    // such downstream blocks once, without crossing the canonical outer
+    // backedge.  Stores before a nested loop (the profitable common case)
+    // remain eligible because the nested loop cannot reach backwards to them.
+    std::unordered_set<BasicBlock *> NestedControlledBlocks;
+    std::vector<BasicBlock *> NestedWorklist;
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (BB && LI.getLoopFor(BB) != L) NestedWorklist.push_back(BB);
+    }
+    while (!NestedWorklist.empty()) {
+        BasicBlock *BB = NestedWorklist.back();
+        NestedWorklist.pop_back();
+        if (!BB || !NestedControlledBlocks.insert(BB).second) continue;
+        for (BasicBlock *Succ : BB->getSuccessors()) {
+            if (!Succ || !L->contains(Succ)) continue;
+            if (BB == OuterLatch && Succ == L->getHeader()) continue;
+            NestedWorklist.push_back(Succ);
+        }
+    }
+
+    // Every direct-loop control decision (apart from the loop exit itself)
+    // must repeat across iterations.  Then a conditional store either runs
+    // in both the peeled and residual iterations or in neither.
+    for (BasicBlock *BB : L->getBlocks()) {
+        if (!BB) return {};
+        auto *Br = BB->getBranchTerminator();
+        if (!Br || !Br->isConditional() || L->isExitingBlock(BB))
+            continue;
+        std::unordered_set<Value *> Active;
+        if (!isStructurallyLoopInvariant(Br->getCondition(), L, Active))
+            return {};
+    }
+
+    // Without a complete call ModRef proof here, calls conservatively block
+    // the memory-state optimization (they do not block semantics-preserving
+    // peeling itself).
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (!BB) return {};
+        for (Instruction *I : *BB)
+            if (dynamic_cast<CallInst *>(I)) return {};
+    }
+
+    for (BasicBlock *BB : L->getBlocks()) {
+        if (!BB) return {};
+        for (Instruction *I : *BB) {
+            auto *SI = dynamic_cast<StoreInst *>(I);
+            if (!SI) continue;
+
+            // Either every completed peeled iteration executed this store, or
+            // its conditional reachability is controlled solely by the
+            // invariant direct-loop branches checked above.  Nested-loop
+            // control is never guessed.
+            if (!DT.dominates(BB, OuterLatch) &&
+                NestedControlledBlocks.count(BB)) {
+                continue;
+            }
+
+            std::unordered_set<Value *> Active;
+            if (!isStructurallyLoopInvariant(
+                    SI->getPointerOperand(), L, Active)) {
+                continue;
+            }
+            Active.clear();
+            if (!isStructurallyLoopInvariant(
+                    SI->getValueOperand(), L, Active)) {
+                continue;
+            }
+
+            bool HasCompetingMod = false;
+            for (BasicBlock *OtherBB : L->getBlocksIncludingSubLoops()) {
+                if (!OtherBB) {
+                    HasCompetingMod = true;
+                    break;
+                }
+                for (Instruction *OtherI : *OtherBB) {
+                    auto *OtherStore = dynamic_cast<StoreInst *>(OtherI);
+                    if (!OtherStore || OtherStore == SI) continue;
+                    if (AA.alias(SI->getPointerOperand(),
+                                 OtherStore->getPointerOperand(), LI) !=
+                        AliasInfo::NoAlias) {
+                        HasCompetingMod = true;
+                        break;
+                    }
+                }
+                if (HasCompetingMod) break;
+            }
+            if (!HasCompetingMod) Result.push_back(SI);
+        }
+    }
+    return Result;
+}
+
+struct ProvenStablePeelState {
+    PhiInst *Phi = nullptr;
+    Value *StableValue = nullptr;
+};
+
+// Return the invariant operand of a strict, signed, increasing header test
+//     IV < Bound
+// and reject every less precise shape.  In particular, comparing IV.next or
+// using <= would need a different exit-value proof and is intentionally not
+// inferred here.
+Value *getStrictIncreasingHeaderBound(const LoopTripCountInfo &TCI,
+                                      const InductionDescriptor &IV) {
+    if (!TCI.Valid || !TCI.ExitCmp || !TCI.ExitingBlock || !TCI.Header ||
+        TCI.ExitingBlock != TCI.Header || !IV.Valid || !IV.Phi ||
+        !IV.ConstantStep || *IV.ConstantStep != 1) {
+        return nullptr;
+    }
+
+    BinaryInst::Operation Pred = TCI.ContinueOnTrue
+        ? TCI.ExitCmp->getOp()
+        : BinaryInst::negatePredicate(TCI.ExitCmp->getOp());
+    Value *LHS = TCI.ExitCmp->getOperand(0);
+    Value *RHS = TCI.ExitCmp->getOperand(1);
+    if (RHS == IV.Phi) {
+        std::swap(LHS, RHS);
+        Pred = BinaryInst::reversePredicate(Pred);
+    }
+    if (LHS != IV.Phi || Pred != BinaryInst::L) return nullptr;
+    return RHS;
+}
+
+bool proveRuntimeTripCountAtPreheader(const LoopTripCountInfo &TCI,
+                                      const InductionDescriptor &IV,
+                                      RangeInfo &RI,
+                                      DominatorTree &DT) {
+    Value *Bound = getStrictIncreasingHeaderBound(TCI, IV);
+    if (!Bound || !IV.StartValue || !TCI.PreHeader) return false;
+
+    // Do not accept a unit step obtained by mathematically folding an
+    // invariant expression that may already have wrapped in IR.
+    auto *Update = dynamic_cast<BinaryInst *>(IV.UpdateValue);
+    if (!Update || Update->getOp() != BinaryInst::ADD) return false;
+    Value *UA = Update->getOperand(0);
+    Value *UB = Update->getOperand(1);
+    auto *CA = dynamic_cast<ConstInt *>(UA);
+    auto *CB = dynamic_cast<ConstInt *>(UB);
+    const bool DirectUnitStep =
+        (UA == IV.Phi && CB && CB->getVal() == 1) ||
+        (UB == IV.Phi && CA && CA->getVal() == 1);
+    if (!DirectUnitStep) return false;
+
+    // SCEV materializes max(0, Bound - Start) in i32.  Prove the subtraction
+    // itself fits for every value reaching this preheader; proving only the
+    // taken-loop case would still allow the eagerly materialized subtraction
+    // to wrap on a zero-trip path.
+    IntRange StartRange = RI.query(IV.StartValue, TCI.PreHeader, DT);
+    IntRange BoundRange = RI.query(Bound, TCI.PreHeader, DT);
+    if (StartRange.isBottom() || BoundRange.isBottom()) return false;
+
+    const __int128 MinDistance =
+        static_cast<__int128>(BoundRange.min) - StartRange.max;
+    const __int128 MaxDistance =
+        static_cast<__int128>(BoundRange.max) - StartRange.min;
+    return MinDistance >= IntRange::I32_MIN &&
+           MaxDistance <= IntRange::I32_MAX;
+}
+
+bool isExactInnerExitIV(Value *V, const LoopTripCountInfo &TCI,
+                        PhiInst *IV) {
+    if (!V || !IV) return false;
+    if (V == IV) return true;
+
+    auto *ExitPhi = dynamic_cast<PhiInst *>(V);
+    if (!ExitPhi || ExitPhi->getParent() != TCI.ExitBlock ||
+        ExitPhi->getNumIncomingValues() != 1) {
+        return false;
+    }
+    return ExitPhi->getIncomingBlock(0) == TCI.ExitingBlock &&
+           ExitPhi->getIncomingValue(0) == IV;
+}
+
+bool isValueAvailableBeforeOuterLoop(Value *V, Loop *Outer,
+                                     BasicBlock *PreHeader,
+                                     DominatorTree &DT) {
+    if (!V || !Outer || !PreHeader) return false;
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I) return true;
+    BasicBlock *DefBB = I->getParent();
+    if (!DefBB || Outer->contains(DefBB)) return false;
+    return DT.dominates(DefBB, PreHeader);
+}
+
+bool containsUndef(Value *V, std::unordered_set<Value *> &Active,
+                   int Depth = 0) {
+    if (!V || Value::isUndef(V)) return true;
+    if (Depth > 32) return true;
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I) return false;
+    if (!Active.insert(V).second) return true;
+    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+        Value *Operand = I->getOperand(Op);
+        if (dynamic_cast<BasicBlock *>(Operand)) continue;
+        if (containsUndef(Operand, Active, Depth + 1)) {
+            Active.erase(V);
+            return true;
+        }
+    }
+    Active.erase(V);
+    return false;
+}
+
+bool isTrivialForwardOf(Value *Candidate, Value *Source,
+                        std::unordered_set<Value *> &Active,
+                        int Depth = 0) {
+    if (Candidate == Source) return true;
+    if (!Candidate || !Source || Depth > 16 ||
+        !Active.insert(Candidate).second) {
+        return false;
+    }
+
+    bool Result = false;
+    if (auto *Phi = dynamic_cast<PhiInst *>(Candidate)) {
+        Result = Phi->getNumIncomingValues() != 0;
+        for (unsigned I = 0; Result && I < Phi->getNumIncomingValues(); ++I)
+            Result = isTrivialForwardOf(
+                Phi->getIncomingValue(I), Source, Active, Depth + 1);
+    } else if (auto *Sel = dynamic_cast<SelectInst *>(Candidate)) {
+        Result = isTrivialForwardOf(
+                     Sel->getTrueValue(), Source, Active, Depth + 1) &&
+                 isTrivialForwardOf(
+                     Sel->getFalseValue(), Source, Active, Depth + 1);
+    }
+    Active.erase(Candidate);
+    return Result;
+}
+
+std::pair<IntRange, IntRange> getFirstOuterEntryRanges(
+    Value *Initial, Value *Bound, Loop *Outer, BasicBlock *OuterPreHeader,
+    SCEVResult &SE, RangeInfo &RI, DominatorTree &DT) {
+    IntRange InitialRange = RI.query(Initial, OuterPreHeader, DT);
+    IntRange BoundRange = RI.query(Bound, OuterPreHeader, DT);
+
+    // A dedicated preheader can sit immediately after a conditional guard.
+    // Facts on that unique incoming edge are valid for the first peeled
+    // iteration even though they need not hold at the loop header globally.
+    auto Preds = OuterPreHeader->getPredecessors();
+    if (Preds.size() == 1 && Preds.front() &&
+        !Outer->contains(Preds.front())) {
+        InitialRange = InitialRange.intersectWith(
+            RI.queryOnEdge(Initial, Preds.front(), OuterPreHeader, DT));
+        BoundRange = BoundRange.intersectWith(
+            RI.queryOnEdge(Bound, Preds.front(), OuterPreHeader, DT));
+    }
+
+    // For a header-tested loop, only the continue edge reaches the peeled
+    // body.  Its condition is therefore another exact first-iteration fact.
+    auto OuterTCI = SE.analyzeLoopTripCount(Outer);
+    if (OuterTCI && OuterTCI->Valid &&
+        OuterTCI->ExitingBlock == OuterTCI->Header) {
+        auto *Br = OuterTCI->Header->getBranchTerminator();
+        BasicBlock *Continue = nullptr;
+        if (Br && Br->isConditional()) {
+            Continue = OuterTCI->ContinueOnTrue
+                ? Br->getTrueSuccessor() : Br->getFalseSuccessor();
+        }
+        if (Continue && Outer->contains(Continue)) {
+            InitialRange = InitialRange.intersectWith(
+                RI.queryOnEdge(Initial, OuterTCI->Header, Continue, DT));
+            BoundRange = BoundRange.intersectWith(
+                RI.queryOnEdge(Bound, OuterTCI->Header, Continue, DT));
+        }
+    }
+    return {InitialRange, BoundRange};
+}
+
+bool proveInitialNotAboveBound(Value *Initial, Value *Bound, Loop *Outer,
+                               BasicBlock *OuterPreHeader, SCEVResult &SE,
+                               RangeInfo &RI, DominatorTree &DT,
+                               IntRange &InitialRange,
+                               IntRange &BoundRange) {
+    auto Ranges = getFirstOuterEntryRanges(
+        Initial, Bound, Outer, OuterPreHeader, SE, RI, DT);
+    InitialRange = Ranges.first;
+    BoundRange = Ranges.second;
+    if (!InitialRange.isBottom() && !BoundRange.isBottom() &&
+        InitialRange.max <= BoundRange.min) {
+        return true;
+    }
+
+    // Interval facts intentionally do not retain relations between two SSA
+    // values.  Recover one exact first-iteration relation directly from a
+    // canonical header guard: if the peeled body is reached through
+    //     OuterIV < Bound
+    // then Bound >= OuterStart + 1.  Prove Initial <= OuterStart + 1 using
+    // independent ranges.  This is integer-order reasoning, not a no-wrap
+    // assumption; OuterStart + 1 is also required to stay in i32.
+    auto OuterTCI = SE.analyzeLoopTripCount(Outer);
+    auto OuterIV = SE.getCanonicalInduction(Outer);
+    if (!OuterTCI || !OuterTCI->Valid || !OuterIV || !OuterIV->Valid ||
+        getStrictIncreasingHeaderBound(*OuterTCI, *OuterIV) != Bound ||
+        !OuterIV->StartValue) {
+        return false;
+    }
+
+    IntRange StartRange =
+        RI.query(OuterIV->StartValue, OuterPreHeader, DT);
+    if (InitialRange.isBottom() || StartRange.isBottom() ||
+        StartRange.max >= IntRange::I32_MAX) {
+        return false;
+    }
+    return InitialRange.max <= StartRange.min + 1;
+}
+
+// Prove the one-shot nested-loop state pattern rather than merely matching
+// its syntax:
+//
+//   P = phi [Initial, outer.preheader], [InnerExit, outer.latch]
+//   J = phi [P, inner.preheader], [J + 1, inner.latch]
+//   while (J < Bound) ...
+//   InnerExit = J
+//
+// Bound must be available before and invariant across the outer loop, the
+// inner exit must dominate the outer latch, and contextual integer ranges at
+// the outer preheader must prove Initial <= Bound.  Consequently the peeled
+// first iteration leaves P == Bound; induction then proves every residual
+// iteration starts at Bound and the inner loop is zero-trip.  This proof uses
+// only IR semantics and applies independently of source/test identifiers.
+std::optional<ProvenStablePeelState> findProvenStablePeelState(
+    Loop *Outer, SCEVResult &SE, RangeInfo &RI, DominatorTree &DT) {
+    if (!Outer || Outer->isInnermost() || !Outer->getHeader())
+        return std::nullopt;
+
+    BasicBlock *OuterPreHeader = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    if (!Outer->getLoopSimplifyForm(OuterPreHeader, OuterLatch) ||
+        !OuterPreHeader || !OuterLatch) {
+        return std::nullopt;
+    }
+    for (PhiInst *StatePhi : Outer->getHeader()->collectPhiNodes()) {
+        if (!StatePhi || !StatePhi->getIRType() ||
+            StatePhi->getIRType()->getEnum() != IR_INT) {
+            continue;
+        }
+        Value *Initial = StatePhi->getIncomingFromPred(OuterPreHeader);
+        Value *Backedge = StatePhi->getIncomingFromPred(OuterLatch);
+        if (!Initial || !Backedge || Initial == Backedge) continue;
+        for (Loop *Inner : Outer->getSubLoops()) {
+            if (!Inner) continue;
+            auto TCI = SE.analyzeLoopTripCount(Inner);
+            auto IV = SE.getCanonicalInduction(Inner);
+            std::unordered_set<Value *> ForwardActive;
+            if (!TCI || !TCI->Valid || !IV || !IV->Valid ||
+                !isTrivialForwardOf(
+                    IV->StartValue, StatePhi, ForwardActive)) {
+                continue;
+            }
+
+            Value *Bound = getStrictIncreasingHeaderBound(*TCI, *IV);
+            if (!Bound || !Bound->getIRType() ||
+                Bound->getIRType()->getEnum() != IR_INT ||
+                !isExactInnerExitIV(Backedge, *TCI, IV->Phi) ||
+                !TCI->ExitBlock ||
+                !DT.dominates(TCI->ExitBlock, OuterLatch) ||
+                !isValueAvailableBeforeOuterLoop(
+                    Bound, Outer, OuterPreHeader, DT)) {
+                continue;
+            }
+
+            std::unordered_set<Value *> Active;
+            if (containsUndef(Initial, Active)) continue;
+            Active.clear();
+            if (containsUndef(Bound, Active)) continue;
+
+            IntRange InitialRange;
+            IntRange BoundRange;
+            bool EntryOrderProven = proveInitialNotAboveBound(
+                Initial, Bound, Outer, OuterPreHeader, SE, RI, DT,
+                InitialRange, BoundRange);
+            if (!EntryOrderProven) continue;
+
+            return ProvenStablePeelState{StatePhi, Bound};
+        }
+    }
+    return std::nullopt;
+}
+
+void discardUncommittedPeelClones(PeeledBodyCore &Core) {
+    std::vector<BasicBlock *> Blocks;
+    std::unordered_set<BasicBlock *> Seen;
+    for (const auto &Iteration : Core.IterBlocks)
+        for (BasicBlock *BB : Iteration)
+            if (BB && Seen.insert(BB).second) Blocks.push_back(BB);
+
+    // First sever all SSA cross-links while every defining instruction is
+    // alive, then clear all instruction lists (which removes block operands),
+    // and only then destroy the block nodes.  The clones are unreachable until
+    // the preheader commit, so no original instruction can legitimately use a
+    // cloned definition at this point.
+    for (BasicBlock *BB : Blocks) {
+        for (Instruction *I : *BB) {
+            if (!I || !I->getIRType() ||
+                I->getIRType()->getEnum() == IR_VOID) {
+                continue;
+            }
+            if (!I->getUseList().is_empty())
+                I->replaceAllUsesWith(
+                    UndefValue::NewUndefValue(I->getIRType()));
+        }
+    }
+    for (BasicBlock *BB : Blocks) BB->clear();
+    for (BasicBlock *BB : Blocks) delete BB;
+
+    Core.IterBlocks.clear();
+    Core.Headers.clear();
+    Core.Latches.clear();
+    Core.Exitings.clear();
+    Core.ValueMaps.clear();
+}
+
+} // namespace
 
 int LoopUnrollPass::nextUnrollSerial() {
     static int Serial = 0;
@@ -530,7 +1014,7 @@ LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
 
 std::optional<PeeledBodyCore>
 LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
-    if (!L || PeelCount <= 0 || !L->isInnermost()) return std::nullopt;
+    if (!L || PeelCount <= 0) return std::nullopt;
 
     auto Shape = getLoopExecutionShape(L, SE);
     if (!Shape || !Shape->Header || !Shape->PreHeader || !Shape->Latch ||
@@ -553,6 +1037,10 @@ LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
     Core.Latches.resize(PeelCount);
     Core.Exitings.resize(PeelCount);
     Core.ValueMaps.resize(PeelCount);
+    auto Fail = [&]() -> std::optional<PeeledBodyCore> {
+        discardUncommittedPeelClones(Core);
+        return std::nullopt;
+    };
 
     for (int Iter = 0; Iter < PeelCount; ++Iter) {
         auto &VMap = Core.ValueMaps[Iter];
@@ -572,16 +1060,16 @@ LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
         Core.Exitings[Iter] = BlockMap[Shape->Exiting];
         if (!Core.Headers[Iter] || !Core.Latches[Iter] ||
             !Core.Exitings[Iter]) {
-            return std::nullopt;
+            return Fail();
         }
 
         for (BasicBlock *BB : LoopBlocks) {
             BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
+            if (!NewBB) return Fail();
 
             for (Instruction *I : *BB) {
                 Instruction *NewI = I->clone(VMap);
-                if (!NewI) return std::nullopt;
+                if (!NewI) return Fail();
                 NewBB->push_back(NewI);
                 VMap[I] = NewI;
             }
@@ -589,14 +1077,14 @@ LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
 
         for (BasicBlock *BB : LoopBlocks) {
             BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
+            if (!NewBB) return Fail();
             for (Instruction *I : *NewBB) {
                 replaceOperandsUsingMap(I, VMap);
             }
         }
 
         if (!removePeeledHeaderPhis(Core, Iter)) {
-            return std::nullopt;
+            return Fail();
         }
     }
 
@@ -687,7 +1175,9 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
     return true;
 }
 
-bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core) {
+bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(
+    PeeledBodyCore &Core, bool ValidateOnly,
+    std::unordered_map<PhiInst *, Value *> *Replacements) {
     BasicBlock *Header = Core.Shape.Header;
     BasicBlock *PreHeader = Core.Shape.PreHeader;
     BasicBlock *OrigLatch = Core.Shape.Latch;
@@ -702,12 +1192,15 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core)
     }
 
     auto HeaderPhis = Header->collectPhiNodes();
+    std::vector<PhiRewritePlan> Plans;
+    Plans.reserve(HeaderPhis.size());
     for (PhiInst *Phi : HeaderPhis) {
         if (!Phi) continue;
 
         auto Incoming = Phi->collectIncomingEdges();
-        std::vector<PhiInst::IncomingEdge> NewIncoming;
-        NewIncoming.reserve(Incoming.size());
+        PhiRewritePlan Plan;
+        Plan.OldPhi = Phi;
+        Plan.Incoming.reserve(Incoming.size());
 
         Value *BackedgeValue = nullptr;
         for (const auto &Edge : Incoming) {
@@ -719,7 +1212,7 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core)
                 BackedgeValue = Edge.V;
             }
 
-            NewIncoming.push_back(Edge);
+            Plan.Incoming.push_back(Edge);
         }
 
         if (!BackedgeValue) return false;
@@ -730,17 +1223,47 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core)
             return false;
         }
 
-        NewIncoming.push_back({NewInitial, LastPeeledLatch});
+        Plan.Incoming.push_back({NewInitial, LastPeeledLatch});
 
-        if (!rebuildPhiFromIncomingChecked(Phi, NewIncoming)) {
-            return false;
+        for (const auto &Edge : Plan.Incoming) {
+            if (!Edge.Pred || !isValueCompatibleWithPhi(Edge.V, Phi))
+                return false;
+        }
+        Plans.push_back(std::move(Plan));
+    }
+
+    if (ValidateOnly) return true;
+
+    // Commit only after every PHI has been validated.  This avoids leaving a
+    // partially rewritten loop header if a later PHI is malformed.
+    for (PhiRewritePlan &Plan : Plans) {
+        if (Plan.Incoming.empty()) {
+            Plan.Replacement =
+                UndefValue::NewUndefValue(Plan.OldPhi->getIRType());
+        } else if (Plan.Incoming.size() == 1) {
+            Plan.Replacement = Plan.Incoming.front().V;
+        } else {
+            Plan.NewPhi = new PhiInst(Plan.OldPhi->getIRType());
+            for (const auto &Edge : Plan.Incoming)
+                Plan.NewPhi->addIncoming(Edge.V, Edge.Pred);
+            Plan.Replacement = Plan.NewPhi;
         }
     }
+    for (PhiRewritePlan &Plan : Plans)
+        Plan.OldPhi->replaceAllUsesWith(Plan.Replacement);
+    if (Replacements) {
+        for (const PhiRewritePlan &Plan : Plans)
+            (*Replacements)[Plan.OldPhi] = Plan.Replacement;
+    }
+    for (PhiRewritePlan &Plan : Plans)
+        if (Plan.NewPhi) Plan.OldPhi->replaceWith(Plan.NewPhi);
+    for (PhiRewritePlan &Plan : Plans) delete Plan.OldPhi;
 
     return true;
 }
 
-bool LoopUnrollPass::removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &Core) {
+bool LoopUnrollPass::removeIncomingFromExitPhisForPeeledBlocks(
+    PeeledBodyCore &Core, bool ValidateOnly) {
     BasicBlock *Exit = Core.Shape.Exit;
     if (!Exit) return false;
 
@@ -749,21 +1272,76 @@ bool LoopUnrollPass::removeIncomingFromExitPhisForPeeledBlocks(PeeledBodyCore &C
         if (BB) RemovedPreds.insert(BB);
     }
 
+    struct Plan {
+        PhiInst *Phi = nullptr;
+        std::vector<PhiInst::IncomingEdge> Incoming;
+    };
+    std::vector<Plan> Plans;
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
         if (!Phi) continue;
 
-        std::vector<PhiInst::IncomingEdge> Incoming;
+        Plan P;
+        P.Phi = Phi;
         for (const auto &Edge : Phi->collectIncomingEdges()) {
             if (!RemovedPreds.count(Edge.Pred)) {
-                Incoming.push_back(Edge);
+                if (!Edge.Pred || !isValueCompatibleWithPhi(Edge.V, Phi))
+                    return false;
+                P.Incoming.push_back(Edge);
             }
         }
-
-        if (!rebuildPhiFromIncomingChecked(Phi, Incoming)) {
-            return false;
-        }
+        Plans.push_back(std::move(P));
     }
 
+    if (ValidateOnly) return true;
+    for (Plan &P : Plans)
+        if (!rebuildPhiFromIncomingChecked(P.Phi, P.Incoming)) return false;
+
+    return true;
+}
+
+bool LoopUnrollPass::addIncomingToExitPhisForPeeledBlocks(
+    PeeledBodyCore &Core, bool ValidateOnly) {
+    BasicBlock *Exit = Core.Shape.Exit;
+    BasicBlock *OrigExiting = Core.Shape.Exiting;
+    if (!Exit || !OrigExiting || Core.Exitings.size() !=
+                                      static_cast<size_t>(Core.PeelCount)) {
+        return false;
+    }
+
+    // Guarded peeling keeps each cloned exit edge live.  Mirror the original
+    // exiting value through that iteration's value map before changing CFG;
+    // otherwise a zero/short-trip path would reach Exit with a missing PHI
+    // incoming edge.
+    struct Plan {
+        PhiInst *Phi = nullptr;
+        std::vector<PhiInst::IncomingEdge> Incoming;
+    };
+    std::vector<Plan> Plans;
+    for (PhiInst *Phi : Exit->collectPhiNodes()) {
+        if (!Phi) return false;
+        Value *OrigValue = Phi->getIncomingFromPred(OrigExiting);
+        if (!OrigValue) return false;
+
+        Plan P;
+        P.Phi = Phi;
+        P.Incoming = Phi->collectIncomingEdges();
+        for (const auto &Edge : P.Incoming)
+            if (!Edge.Pred || !isValueCompatibleWithPhi(Edge.V, Phi))
+                return false;
+        for (int Iter = 0; Iter < Core.PeelCount; ++Iter) {
+            BasicBlock *Pred = Core.Exitings[Iter];
+            Value *Mapped =
+                mapDataValueAtPeelIteration(OrigValue, Iter, Core);
+            if (!Pred || !isValueCompatibleWithPhi(Mapped, Phi))
+                return false;
+            P.Incoming.push_back({Mapped, Pred});
+        }
+        Plans.push_back(std::move(P));
+    }
+
+    if (ValidateOnly) return true;
+    for (Plan &P : Plans)
+        if (!rebuildPhiFromIncomingChecked(P.Phi, P.Incoming)) return false;
     return true;
 }
 
@@ -1621,6 +2199,25 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
 LoopUnrollPass::LoopUnrollPass(UnrollConfig ConfigValue)
     : Config(std::move(ConfigValue)) {}
 
+namespace {
+UnrollConfig makePeelingOnlyConfig(UnrollConfig Config) {
+    Config.AllowFull = false;
+    Config.AllowPartial = false;
+    Config.AllowRuntime = false;
+    Config.AllowRemainder = false;
+    Config.AllowPeeling = true;
+    return Config;
+}
+} // namespace
+
+LoopPeelingPass::LoopPeelingPass(UnrollConfig Config)
+    : Impl(makePeelingOnlyConfig(std::move(Config))) {}
+
+PreservationStatus LoopPeelingPass::run(
+    Function &F, FunctionAnalysisPassManager &FAM) {
+    return Impl.run(F, FAM);
+}
+
 PreservationStatus LoopUnrollPass::run(Function &F,
                                        FunctionAnalysisPassManager &FAM) {
     auto &AlreadyTransformed = TransformedLoopHeaders[&F];
@@ -1642,9 +2239,9 @@ PreservationStatus LoopUnrollPass::run(Function &F,
     if (CandidateHeaders.empty()) return PreservationStatus::all();
 
     // Keep whole-function code growth and analysis rebuild cost bounded.  A
-    // function may contain dozens of individually profitable small loops
-    // (82_long_func has about ninety); unrolling all of them in one pass can
-    // multiply compile time and IR size.  Four successful transforms per
+    // A function may contain dozens of individually profitable small loops;
+    // unrolling all of them in one pass can multiply compile time and IR
+    // size.  Four successful transforms per
     // invocation still give broader coverage than the old one-loop limit,
     // while the enclosing three-round pipeline retains a hard global budget.
     static constexpr size_t MaxTransformsPerRun = 4;
@@ -1669,8 +2266,11 @@ PreservationStatus LoopUnrollPass::run(Function &F,
 
         auto &DT = FAM.getResult<DominantAnalysis>(F);
         auto &SE = FAM.getResult<SCEVAnalysis>(F);
+        auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+        auto &RI = FAM.getResult<RangeAnalysis>(F);
         const std::string HeaderIdent = Header->getIdent();
-        LoopUnrollResult Result = tryToUnrollLoop(F, L, LI, DT, SE);
+        LoopUnrollResult Result =
+            tryToUnrollLoop(F, L, LI, DT, SE, AA, RI);
         if (Result == LoopUnrollResult::Unmodified) continue;
 
         AlreadyTransformed.insert(HeaderIdent);
@@ -1680,11 +2280,11 @@ PreservationStatus LoopUnrollPass::run(Function &F,
 
         // The transform invalidates every Loop*/DT/SCEV reference above.
         // Rebuild them before considering the next entry-snapshot loop.
-        PreservationStatus RoundPA = PreservationStatus::all();
-        RoundPA.discard<DominantAnalysis>();
-        RoundPA.discard<LoopAnalysis>();
-        RoundPA.discard<SCEVAnalysis>();
-        FAM.invalidate(F, RoundPA);
+        // Cloning and rewiring CFG/memory invalidates every cached
+        // function analysis, including Range, BasicAA and MemorySSA.  Keeping
+        // any of them here would let the next candidate consume pre-clone
+        // facts.
+        FAM.invalidate(F, PreservationStatus::none());
 
         if (TransformCount >= MaxTransformsPerRun) break;
     }
@@ -1697,7 +2297,9 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
                                                  Loop *L,
                                                  LoopInfo &LI,
                                                  DominatorTree &DT,
-                                                 SCEVResult &SE) {
+                                                 SCEVResult &SE,
+                                                 BasicAAResult &AA,
+                                                 RangeInfo &RI) {
     (void)F;
 
     if (!L) {
@@ -1719,7 +2321,8 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
 
     int BodyCost = estimateLoopBodyCost(L, LI);
     UnrollDecision Decision =
-        computeUnrollDecision(L, *TripInfo, BodyCost, Config, LI, SE);
+        computeUnrollDecision(
+            L, *TripInfo, BodyCost, Config, LI, SE, AA, RI, DT);
 
     if (!Decision.ShouldUnroll || Decision.Kind == UnrollKind::None) {
         return LoopUnrollResult::Unmodified;
@@ -1736,7 +2339,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
     case UnrollKind::Runtime:
         return executeRuntimeUnroll(L, Decision, SE, LI, DT);
     case UnrollKind::Peeling:
-        return executePeeling(L, Decision, SE, LI, DT);
+        return executePeeling(L, Decision, SE, LI, DT, AA);
     case UnrollKind::None:
         break;
     }
@@ -1960,7 +2563,10 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     int BodyCost,
     const UnrollConfig &Config,
     LoopInfo &LI,
-    SCEVResult &SE) const {
+    SCEVResult &SE,
+    BasicAAResult &AA,
+    RangeInfo &RI,
+    DominatorTree &DT) const {
     if (!L || !TCI.Valid || BodyCost <= 0) {
         return makeNoUnrollDecision("not profitable");
     }
@@ -1968,7 +2574,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     bool HasCall = containsCall(L, LI);
     bool Nested = !L->isInnermost();
 
-    if (Config.AllowFull && TCI.ConstantTripCount) {
+    if (Config.AllowFull && TCI.ProvenNoWrap && TCI.ConstantTripCount) {
         int64_t TripCount = *TCI.ConstantTripCount;
         int64_t MaxCount = (BodyCost <= 4)
                                ? Config.TinyLoopFullUnrollMaxCount
@@ -1993,17 +2599,82 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         }
     }
 
-    if (HasCall || Nested) {
-        return makeNoUnrollDecision("not profitable");
-    }
-
-    if (Config.AllowPeeling && TCI.ConstantTripCount &&
-        *TCI.ConstantTripCount > 2 && BodyCost <= Config.PeelThreshold) {
+    if (Config.AllowPeeling) {
         auto IV = SE.getCanonicalInduction(L);
-        if (IV && IV->Valid) {
-            int PeelCount = detectPeelCount(L, *IV, Config);
-            if (PeelCount > 0 && PeelCount <= 2 &&
-                PeelCount < *TCI.ConstantTripCount) {
+        int PeelCount =
+            (IV && IV->Valid) ? detectPeelCount(L, *IV, Config) : 0;
+        auto StableState = findProvenStablePeelState(L, SE, RI, DT);
+        // The fixed-point proof establishes everything after exactly the
+        // first iteration.  Never let its enlarged clone budget justify a
+        // second peeled copy.
+        if (StableState) PeelCount = 1;
+        const int InvariantStoreCount = static_cast<int>(
+            collectPeelRedundantStoreCandidates(L, LI, AA, DT).size());
+        // Repeated loop-invariant stores provide a structural dynamic-benefit
+        // signal: peeling establishes their first-iteration memory state and
+        // exposes the residual repetitions to memory dependence cleanup.  A
+        // high count justifies a larger, still hard-bounded clone budget.
+        // This is based solely on generic IR properties, never on identifiers
+        // or expected inputs.
+        const bool HighStoreBenefit = InvariantStoreCount >= 8;
+        if (PeelCount == 0 && HighStoreBenefit) PeelCount = 1;
+        int EffectiveThreshold = Config.PeelThreshold;
+        int EffectiveBlockLimit = Config.MaxPeelBlocks;
+        if (StableState) {
+            // The residual nested loop is proven zero-trip after the peeled
+            // iteration, so permit enough room to clone the one-time work.
+            // The limits remain absolute and source-independent.
+            EffectiveThreshold = std::max(EffectiveThreshold, 192);
+            EffectiveBlockLimit = std::max(EffectiveBlockLimit, 96);
+        }
+        if (HighStoreBenefit) {
+            EffectiveThreshold = std::max(
+                EffectiveThreshold,
+                std::min(1024, 128 + InvariantStoreCount * 8));
+            EffectiveBlockLimit = std::max(EffectiveBlockLimit, 320);
+        }
+
+        int PeelCloneCost = 0;
+        int PeelBlockCount = 0;
+        for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+            if (!BB) {
+                PeelCloneCost = EffectiveThreshold + 1;
+                break;
+            }
+            ++PeelBlockCount;
+            for (Instruction *I : *BB) {
+                if (!I || dynamic_cast<PhiInst *>(I)) continue;
+                int LocalCost = 1;
+                if (dynamic_cast<CallInst *>(I)) LocalCost = 8;
+                else if (I->instType == Instruction::SDIV ||
+                         I->instType == Instruction::UDIV ||
+                         I->instType == Instruction::FDIV ||
+                         I->instType == Instruction::SREM ||
+                         I->instType == Instruction::UREM ||
+                         I->instType == Instruction::FREM) {
+                    LocalCost = 4;
+                }
+                if (PeelCloneCost > EffectiveThreshold - LocalCost) {
+                    PeelCloneCost = EffectiveThreshold + 1;
+                    break;
+                }
+                PeelCloneCost += LocalCost;
+            }
+        }
+
+        if (IV && IV->Valid && PeelBlockCount <= EffectiveBlockLimit &&
+            PeelCloneCost > 0 && PeelCloneCost <= EffectiveThreshold) {
+            bool ConstantLongEnough =
+                TCI.ProvenNoWrap && TCI.ConstantTripCount &&
+                *TCI.ConstantTripCount > PeelCount;
+            bool CanGuardRuntime =
+                (TCI.IsRuntime || !TCI.ProvenNoWrap) && PeelCount > 0 &&
+                PeelCount <= Config.MaxGuardedPeelCount;
+            if (PeelCount > 0 &&
+                PeelCount <= Config.MaxPeelCount &&
+                (ConstantLongEnough || CanGuardRuntime) &&
+                static_cast<int64_t>(PeelCloneCost) * PeelCount <=
+                    EffectiveThreshold) {
                 UnrollDecision Decision;
                 Decision.Kind = UnrollKind::Peeling;
                 Decision.Count = PeelCount;
@@ -2011,13 +2682,23 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 Decision.NeedRemainder = false;
                 Decision.IsRuntime = false;
                 Decision.IsPeeling = true;
-                Decision.Reason = "peeling: initial special iterations";
+                if (StableState) {
+                    Decision.StabilizedPhi = StableState->Phi;
+                    Decision.StabilizedValue = StableState->StableValue;
+                }
+                Decision.Reason = CanGuardRuntime
+                    ? "peeling: guarded initial-state specialization"
+                    : "peeling: proven initial special iterations";
                 return Decision;
             }
         }
     }
 
-    if (Config.AllowPartial && TCI.ConstantTripCount &&
+    if (HasCall || Nested) {
+        return makeNoUnrollDecision("not profitable");
+    }
+
+    if (Config.AllowPartial && TCI.ProvenNoWrap && TCI.ConstantTripCount &&
         BodyCost <= Config.MaxLoopBodyCostForPartial) {
         int64_t TripCount = *TCI.ConstantTripCount;
         int Factor = chooseFactorBySize(BodyCost,
@@ -2073,8 +2754,17 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     }
 
     if (Config.AllowRuntime && Config.AllowRemainder &&
-        TCI.IsRuntime && BodyCost <= Config.MaxLoopBodyCostForRuntime &&
+        TCI.IsRuntime &&
+        BodyCost <= Config.MaxLoopBodyCostForRuntime &&
         isCheapSCEV(TCI.TripCount, Config)) {
+        auto RuntimeIV = SE.getCanonicalInduction(L);
+        const bool RuntimeTripCountIsProven =
+            TCI.ProvenNoWrap ||
+            (RuntimeIV && RuntimeIV->Valid &&
+             proveRuntimeTripCountAtPreheader(
+                 TCI, *RuntimeIV, RI, DT));
+        if (!RuntimeTripCountIsProven)
+            return makeNoUnrollDecision("runtime trip count may wrap");
         int RuntimeCountLimit = std::min(Config.RuntimeDefaultCount,
                                          Config.RuntimeMaxCount);
         int Factor = chooseFactorBySize(BodyCost,
@@ -2090,6 +2780,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 Decision.NeedRemainder = true;
                 Decision.IsRuntime = true;
                 Decision.IsPeeling = false;
+                Decision.TripCountIsProven = true;
                 Decision.Reason = "runtime: cheap runtime trip count";
                 return Decision;
             }
@@ -2111,9 +2802,8 @@ LoopUnrollResult LoopUnrollPass::executeFullUnroll(
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
-
     auto TCI = SE.analyzeLoopTripCount(L);
-    if (!TCI || !TCI->ConstantTripCount ||
+    if (!TCI || !TCI->ProvenNoWrap || !TCI->ConstantTripCount ||
         *TCI->ConstantTripCount != Decision.Count ||
         TCI->ExitingBlock != TCI->Latch) {
         return LoopUnrollResult::Unmodified;
@@ -2153,7 +2843,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
     }
 
     auto TCI = SE.analyzeLoopTripCount(L);
-    if (!TCI || !TCI->ConstantTripCount ||
+    if (!TCI || !TCI->ProvenNoWrap || !TCI->ConstantTripCount ||
         *TCI->ConstantTripCount % Decision.Count != 0 ||
         (TCI->ExitingBlock != TCI->Latch &&
          TCI->ExitingBlock != TCI->Header)) {
@@ -2231,7 +2921,6 @@ LoopUnrollResult LoopUnrollPass::executePartialWithRemainder(
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
-
     auto RI = SE.getRemainderInfo(L, Decision.Count);
     if (!RI || !RI->Valid || !RI->NeedRemainderLoop) {
         return LoopUnrollResult::Unmodified;
@@ -2269,11 +2958,12 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
     LoopInfo &LI,
     DominatorTree &DT) {
     (void)LI;
-    (void)DT;
 
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
+    if (!Decision.TripCountIsProven)
+        return LoopUnrollResult::Unmodified;
 
     auto RI = SE.getRemainderInfo(L, Decision.Count);
     if (!RI || !RI->Valid || !RI->IsRuntimeRemainder) {
@@ -2288,24 +2978,97 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
+    // Runtime-unroll bookkeeping belongs at the outermost loop preheader at
+    // which the trip-count expression is still available.  Materializing it
+    // unconditionally in the inner preheader makes an outer-invariant bound
+    // execute once per outer iteration.  LICM can normally repair that, but a
+    // max(0, N) SCEV contains a SelectInst and used to strand the whole chain
+    // in the parent loop.  Choosing the placement here is both cheaper and
+    // independent of a later cleanup pass.
+    Loop *ExpansionLoop = L;
+    BasicBlock *ExpansionBlock = TCI->PreHeader;
+    for (Loop *Ancestor = TCI->ProvenNoWrap ? L->getParentLoop() : nullptr;
+         Ancestor; Ancestor = Ancestor->getParentLoop()) {
+        // A rotated parent may have a guard predecessor whose other edge is
+        // the zero-trip bypass.  Such a block is not a canonical preheader
+        // (it has two successors), but it is still the unique entry edge and
+        // is a valid placement for this non-trapping integer expression.
+        BasicBlock *AncestorEntry = nullptr;
+        bool AmbiguousEntry = false;
+        for (BasicBlock *Pred : Ancestor->getHeader()->getPredecessors()) {
+            if (!Pred || Ancestor->contains(Pred)) continue;
+            if (!AncestorEntry) {
+                AncestorEntry = Pred;
+            } else if (AncestorEntry != Pred) {
+                AmbiguousEntry = true;
+                break;
+            }
+        }
+        if (AmbiguousEntry || !AncestorEntry ||
+            !canMaterializeSCEV(RI->TripCount, Ancestor,
+                                AncestorEntry, DT)) {
+            break;
+        }
+        ExpansionLoop = Ancestor;
+        ExpansionBlock = AncestorEntry;
+    }
+
     std::unordered_map<const SCEVExpr *, Value *> Cache;
     Value *TripCount =
-        materializeSCEV(RI->TripCount, L, TCI->PreHeader, DT, Cache);
-    Value *Factor =
-        makeTypedIntConstant(Decision.Count, TripCount
-                                                 ? TripCount->getIRType()
-                                                 : nullptr);
-    if (!TripCount || !Factor) return LoopUnrollResult::Unmodified;
+        materializeSCEV(RI->TripCount, ExpansionLoop, ExpansionBlock,
+                        DT, Cache);
+    if (!TripCount || !TripCount->getIRType() ||
+        !TripCount->getIRType()->isInt()) {
+        return LoopUnrollResult::Unmodified;
+    }
 
-    auto *Remainder =
-        new BinaryInst(TripCount, BinaryInst::MOD, Factor);
-    BasicBlock::insertBeforeTerminator(TCI->PreHeader, Remainder);
-    auto *MainTripCount =
-        new BinaryInst(TripCount, BinaryInst::SUB, Remainder);
-    BasicBlock::insertBeforeTerminator(TCI->PreHeader, MainTripCount);
-    auto *NumGroups =
-        new BinaryInst(MainTripCount, BinaryInst::DIV, Factor);
-    BasicBlock::insertBeforeTerminator(TCI->PreHeader, NumGroups);
+    Value *Remainder = nullptr;
+    Value *NumGroups = nullptr;
+
+    // For a header-tested runtime loop SCEV constructs TripCount as
+    // max(0, raw-distance), so it is signed-nonnegative.  Runtime factors are
+    // currently selected from {2, 4}; for any positive power of two we can
+    // therefore generate the exact quotient/remainder directly.  Besides
+    // avoiding DIV/REM, this records the nonnegative fact in the generated IR
+    // instead of asking a later range pass to rediscover it.
+    const bool CanUsePowerOfTwoForm =
+        TCI->ExitingBlock == TCI->Header &&
+        IRMath::isPowerOf2(Decision.Count);
+    if (CanUsePowerOfTwoForm) {
+        Value *Mask = makeTypedIntConstant(
+            Decision.Count - 1, TripCount->getIRType());
+        Value *Shift = makeTypedIntConstant(
+            IRMath::log2i(Decision.Count), TripCount->getIRType());
+        if (!Mask || !Shift) return LoopUnrollResult::Unmodified;
+
+        auto *RemainderInst =
+            new BinaryInst(TripCount, BinaryInst::AND, Mask);
+        BasicBlock::insertBeforeTerminator(ExpansionBlock, RemainderInst);
+        auto *NumGroupsInst =
+            new BinaryInst(TripCount, BinaryInst::LSHR, Shift);
+        BasicBlock::insertBeforeTerminator(ExpansionBlock, NumGroupsInst);
+        Remainder = RemainderInst;
+        NumGroups = NumGroupsInst;
+    } else {
+        // A latch-tested symbolic count is max(0, distance) + 1.  Without a
+        // no-overflow proof that final add is not guaranteed nonnegative, so
+        // retain signed DIV/MOD semantics for this uncommon shape.
+        Value *Factor = makeTypedIntConstant(
+            Decision.Count, TripCount->getIRType());
+        if (!Factor) return LoopUnrollResult::Unmodified;
+
+        auto *RemainderInst =
+            new BinaryInst(TripCount, BinaryInst::MOD, Factor);
+        BasicBlock::insertBeforeTerminator(ExpansionBlock, RemainderInst);
+        auto *MainTripCount =
+            new BinaryInst(TripCount, BinaryInst::SUB, RemainderInst);
+        BasicBlock::insertBeforeTerminator(ExpansionBlock, MainTripCount);
+        auto *NumGroupsInst =
+            new BinaryInst(MainTripCount, BinaryInst::DIV, Factor);
+        BasicBlock::insertBeforeTerminator(ExpansionBlock, NumGroupsInst);
+        Remainder = RemainderInst;
+        NumGroups = NumGroupsInst;
+    }
 
     return executeUnrollWithTail(L, Decision.Count, Decision.Count - 1,
                                  NumGroups, Remainder, true, SE);
@@ -2316,18 +3079,13 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     const UnrollDecision &Decision,
     SCEVResult &SE,
     LoopInfo &LI,
-    DominatorTree &DT) {
-    (void)LI;
-    (void)DT;
-
+    DominatorTree &DT,
+    BasicAAResult &AA) {
     if (!L || Decision.Count <= 0) {
         return LoopUnrollResult::Unmodified;
     }
 
     int PeelCount = Decision.Count;
-    if (!L->isInnermost()) {
-        return LoopUnrollResult::Unmodified;
-    }
 
     std::vector<BasicBlock *> ExitBlocks = L->getExitBlocks();
     if (ExitBlocks.size() != 1 || !ExitBlocks.front()) {
@@ -2345,8 +3103,19 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     }
 
     auto TCI = SE.analyzeLoopTripCount(L);
-    if (!TCI || !TCI->Valid || !TCI->ConstantTripCount ||
-        *TCI->ConstantTripCount <= PeelCount) {
+    if (!TCI || !TCI->Valid) {
+        return LoopUnrollResult::Unmodified;
+    }
+    // A mathematical constant count without a no-wrap proof cannot justify
+    // deleting the cloned exit checks.  Peeling is still legal when every
+    // cloned iteration retains its original guard.
+    const bool GuardedPeeling =
+        !TCI->ConstantTripCount.has_value() || !TCI->ProvenNoWrap;
+    if (GuardedPeeling) {
+        if ((!TCI->IsRuntime && TCI->ProvenNoWrap) ||
+            PeelCount > Config.MaxGuardedPeelCount)
+            return LoopUnrollResult::Unmodified;
+    } else if (*TCI->ConstantTripCount <= PeelCount) {
         return LoopUnrollResult::Unmodified;
     }
 
@@ -2367,9 +3136,58 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
+    std::vector<StoreInst *> RedundantResidualStores =
+        collectPeelRedundantStoreCandidates(L, LI, AA, DT);
+
     auto Core = clonePeeledIterations(L, PeelCount, SE);
     if (!Core) {
         return LoopUnrollResult::Unmodified;
+    }
+    auto FailUncommitted = [&]() {
+        discardUncommittedPeelClones(*Core);
+        return LoopUnrollResult::Unmodified;
+    };
+    if (!rewriteOriginalHeaderPhisAfterPeeling(
+            *Core, /*ValidateOnly=*/true)) {
+        return FailUncommitted();
+    }
+    if (GuardedPeeling) {
+        if (!addIncomingToExitPhisForPeeledBlocks(
+                *Core, /*ValidateOnly=*/true)) {
+            return FailUncommitted();
+        }
+    } else if (!removeIncomingFromExitPhisForPeeledBlocks(
+                   *Core, /*ValidateOnly=*/true)) {
+        return FailUncommitted();
+    }
+
+    auto *PreBr = Core->Shape.PreHeader->getBranchTerminator();
+    if (!BasicBlock::isUncondBr(PreBr) ||
+        PreBr->getSuccessor(0) != Core->Shape.Header) {
+        return FailUncommitted();
+    }
+    for (int Iter = 0; Iter < PeelCount; ++Iter) {
+        if (LatchExiting) {
+            auto *Br = Core->Exitings[Iter]
+                ? Core->Exitings[Iter]->getBranchTerminator() : nullptr;
+            if (!Br || !Br->isConditional())
+                return FailUncommitted();
+            bool HasBackedge = false;
+            for (BasicBlock *Succ : Core->Exitings[Iter]->getSuccessors())
+                HasBackedge |= Succ == Core->Headers[Iter];
+            if (!HasBackedge) return FailUncommitted();
+        } else {
+            auto *HeaderBr = Core->Headers[Iter]
+                ? Core->Headers[Iter]->getBranchTerminator() : nullptr;
+            auto *LatchBr = Core->Latches[Iter]
+                ? Core->Latches[Iter]->getBranchTerminator() : nullptr;
+            if (!HeaderBr || !HeaderBr->isConditional() || !LatchBr)
+                return FailUncommitted();
+            bool LatchTargetsHeader = false;
+            for (BasicBlock *Succ : Core->Latches[Iter]->getSuccessors())
+                LatchTargetsHeader |= Succ == Core->Headers[Iter];
+            if (!LatchTargetsHeader) return FailUncommitted();
+        }
     }
 
     if (LatchExiting) {
@@ -2378,20 +3196,32 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
                 Iter + 1 < PeelCount ? Core->Headers[Iter + 1]
                                      : Core->Shape.Header;
 
-            if (!Core->Exitings[Iter] || !Target ||
-                !BasicBlock::replaceCondBrWithUncond(Core->Exitings[Iter],
-                                                     Target)) {
-                return LoopUnrollResult::Unmodified;
+            if (!Core->Exitings[Iter] || !Target) {
+                return FailUncommitted();
+            }
+            if (GuardedPeeling) {
+                // Preserve the short-trip/exit edge and retarget only the
+                // cloned backedge to the next peeled/original iteration.
+                if (!BasicBlock::redirectBranchTarget(
+                        Core->Exitings[Iter], Core->Headers[Iter], Target)) {
+                    return FailUncommitted();
+                }
+            } else if (!BasicBlock::replaceCondBrWithUncond(
+                           Core->Exitings[Iter], Target)) {
+                return FailUncommitted();
             }
         }
     } else if (HeaderExiting) {
         for (int Iter = 0; Iter < PeelCount; ++Iter) {
             BasicBlock *Body =
                 getNonExitSuccessor(Core->Headers[Iter], Core->Shape.Exit);
-            if (!Body ||
+            if (!Body) {
+                return FailUncommitted();
+            }
+            if (!GuardedPeeling &&
                 !BasicBlock::replaceCondBrWithUncond(Core->Headers[Iter],
                                                      Body)) {
-                return LoopUnrollResult::Unmodified;
+                return FailUncommitted();
             }
 
             BasicBlock *Target =
@@ -2402,9 +3232,19 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
                 !BasicBlock::redirectBranchTarget(Core->Latches[Iter],
                                                   Core->Headers[Iter],
                                                   Target)) {
-                return LoopUnrollResult::Unmodified;
+                return FailUncommitted();
             }
         }
+    }
+
+    // Exit PHIs must be made consistent before the new guarded exit edges
+    // become reachable.  For a proven-long constant trip those edges were
+    // removed and their cloned incoming entries must instead disappear.
+    if (GuardedPeeling) {
+        if (!addIncomingToExitPhisForPeeledBlocks(*Core))
+            return LoopUnrollResult::Unmodified;
+    } else if (!removeIncomingFromExitPhisForPeeledBlocks(*Core)) {
+        return LoopUnrollResult::Unmodified;
     }
 
     if (Core->Headers.empty() || !Core->Headers[0] ||
@@ -2414,12 +3254,37 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
-    if (!rewriteOriginalHeaderPhisAfterPeeling(*Core)) {
+    std::unordered_map<PhiInst *, Value *> HeaderPhiReplacements;
+    if (!rewriteOriginalHeaderPhisAfterPeeling(
+            *Core, /*ValidateOnly=*/false, &HeaderPhiReplacements)) {
         return LoopUnrollResult::Unmodified;
     }
 
-    if (!removeIncomingFromExitPhisForPeeledBlocks(*Core)) {
-        return LoopUnrollResult::Unmodified;
+    if (Decision.StabilizedPhi && Decision.StabilizedValue) {
+        auto It = HeaderPhiReplacements.find(Decision.StabilizedPhi);
+        Value *ResidualState =
+            It == HeaderPhiReplacements.end() ? nullptr : It->second;
+        if (ResidualState && ResidualState != Decision.StabilizedValue) {
+            auto *ResidualPhi = dynamic_cast<PhiInst *>(ResidualState);
+            if (ResidualPhi &&
+                ResidualPhi->getParent() == Core->Shape.Header) {
+                ResidualPhi->replaceAllUsesWith(Decision.StabilizedValue);
+                delete ResidualPhi;
+            }
+        }
+    }
+
+    // Any path entering the residual loop has completed a peeled iteration.
+    // For a store selected above, direct control is iteration-invariant, its
+    // address/value are invariant, and no competing write can change the
+    // location.  Therefore the peeled iteration either established the exact
+    // value (and every residual iteration would repeat it), or the invariant
+    // control skipped it and will keep skipping it.  Loads remain untouched.
+    for (StoreInst *SI : RedundantResidualStores) {
+        if (!SI || !SI->getParent() || !L->contains(SI->getParent()))
+            continue;
+        SI->EraseFromParent();
+        delete SI;
     }
 
     SE.clear();

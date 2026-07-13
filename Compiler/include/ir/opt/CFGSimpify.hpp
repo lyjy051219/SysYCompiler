@@ -17,6 +17,8 @@ private:
 	bool removeDeadBlocks(Function &F);
 	bool foldTerminatorBranches(Function &F);
 	bool eliminateDuplicatePhis(Function &F);
+	bool normalizeBooleanPhis(Function &F);
+	bool foldKnownBranchConditions(Function &F);
 	bool mergeBlocks(Function &F);
 	bool simplifyUncondBranch(Function &F, BasicBlock *BB);
 	bool simplifyCondBranch(Function &F, BasicBlock *BB);

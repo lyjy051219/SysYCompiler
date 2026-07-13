@@ -4,6 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 
 #include <vector>
 
@@ -58,6 +59,10 @@ bool ADCEPass::isRootLive(
 
     // 2. RetInst → always root live
     if (dynamic_cast<RetInst *>(I)) return true;
+
+    // Preserve potentially faulting/undefined evaluation even when its SSA
+    // result is unused.  This mirrors local DCE so ADCE cannot re-delete it.
+    if (dceInstructionMustBePreserved(I)) return true;
 
     // 3. CallInst → 看副作用
     if (auto *CI = dynamic_cast<CallInst *>(I))

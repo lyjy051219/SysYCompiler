@@ -4,23 +4,64 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 
 #include <vector>
 
-bool IfConversionPass::isForbiddenInst(const Instruction *I) {
+// If-conversion executes both arm computations before the select.  Use an
+// allow-list rather than a side-effect deny-list so a newly-added instruction
+// cannot accidentally become speculatable by default.
+bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 	if (!I) return false;
 	switch (I->instType) {
-		case Instruction::STORE:
-		case Instruction::LOAD:
-		case Instruction::CALL:
-		case Instruction::SDIV:
-		case Instruction::UDIV:
-		case Instruction::SREM:
-		case Instruction::FDIV:
-		case Instruction::FREM:
+		case Instruction::ADD:
+		case Instruction::FADD:
+		case Instruction::SUB:
+		case Instruction::FSUB:
+		case Instruction::MUL:
+		case Instruction::FMUL:
+		case Instruction::AND:
+		case Instruction::OR:
+		case Instruction::XOR:
+		case Instruction::ICMP:
+		case Instruction::FCMP:
 			return true;
+		case Instruction::SHL:
+		case Instruction::LSHR:
+		case Instruction::ASHR:
+			return hasDefinedConstantShiftAmount(I);
+		case Instruction::GEP:
+		case Instruction::SELECT:
+		case Instruction::TRUNC:
+		case Instruction::ZEXT:
+		case Instruction::SEXT:
+		case Instruction::SITOFP:
+		case Instruction::BITCAST:
+			return true;
+		// Loads/calls/stores can fault, diverge or expose memory effects.  All
+		// integer/FP divisions and remainders are also excluded: besides their
+		// latency, integer division may observe a zero divisor on the untaken
+		// arm.  FPTOSI is excluded because NaN/out-of-range inputs do not have a
+		// defined integer result; SITOFP remains safe for every i32.  Unknown/new
+		// opcodes remain non-speculatable by default.
 		default:
 			return false;
+	}
+}
+
+int IfConversionPass::instructionCost(const Instruction *I) {
+	if (!I) return 1000;
+	switch (I->instType) {
+		case Instruction::MUL:
+		case Instruction::FMUL:
+		case Instruction::FADD:
+		case Instruction::FSUB:
+		case Instruction::FCMP:
+			return 2;
+		case Instruction::SITOFP:
+			return 3;
+		default:
+			return 1;
 	}
 }
 
@@ -35,12 +76,22 @@ int IfConversionPass::countCandidateInsts(BasicBlock *BB) {
 	return Cnt;
 }
 
+int IfConversionPass::candidateCost(BasicBlock *BB) {
+	if (!BB) return 0;
+	int Cost = 0;
+	for (Instruction *I : *BB) {
+		if (!I || dynamic_cast<BrInst *>(I)) continue;
+		Cost += instructionCost(I);
+	}
+	return Cost;
+}
+
 bool IfConversionPass::checkBlockConvertible(BasicBlock *BB) {
 	if (!BB) return false;
 	for (Instruction *I : *BB) {
 		if (!I) continue;
 		if (dynamic_cast<BrInst *>(I)) continue;
-		if (isForbiddenInst(I)) return false;
+		if (!isSafeToSpeculativelyExecute(I)) return false;
 	}
 	return true;
 }
@@ -88,6 +139,12 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	BasicBlock *Pred = Preds[0];
 	BasicBlock *Succ = Succs[0];
 	if (!Pred || !Succ) return false;
+	// A convertible triangle/diamond is an acyclic local region.  Allowing
+	// Succ == Pred would misclassify a loop backedge as the merge edge; moving
+	// the arm into Pred can then create a self-referential select and destroy
+	// the loop CFG.  The optional else block is checked against the same three
+	// blocks below, so this makes every region block pairwise distinct.
+	if (Pred == TrueBB || Succ == TrueBB || Succ == Pred) return false;
 
 	BrInst *PredBr = Pred->getBranchTerminator();
 	if (!PredBr || !BasicBlock::isCondBr(PredBr)) return false;
@@ -96,7 +153,9 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	auto *Dest0 = PredBr->getTrueSuccessor();
 	auto *Dest1 = PredBr->getFalseSuccessor();
 	bool ConstCond = false;
-	if (!Cond || !Dest0 || !Dest1 || Cond->tryGetBoolConst(ConstCond)) return false;
+	if (!Cond || !IRType::isBool(Cond->getIRType()) || !Dest0 || !Dest1 ||
+		Cond->tryGetBoolConst(ConstCond))
+		return false;
 
 	BasicBlock *ElseBB = nullptr;
 	bool HasElse = false;
@@ -156,10 +215,40 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	if (HasElse && !usersAreSafeForHoist(ElseBB, Succ)) return false;
 
 	// 没有 PHI 的汇合块不做 IfConversion：收益低，且常引入无谓投机执行。
-	if (Succ->collectPhiNodes().empty()) return false;
+	auto SuccPhis = Succ->collectPhiNodes();
+	if (SuccPhis.empty()) return false;
+
+	// 不为结构不完整的 PHI 凭空制造 undef。精确两前驱的
+	// diamond/triangle 中，每个 PHI 都必须每条边恰好一个 incoming。
+	BasicBlock *OtherArmBB = HasElse ? ElseBB : Pred;
+	for (PhiInst *Phi : SuccPhis) {
+		if (!Phi || Phi->getNumIncomingValues() != 2 ||
+			!Phi->getIRType() || Phi->getIRType()->getEnum() == IR_VOID)
+			return false;
+		Value *TrueIncoming = Phi->getIncomingFromPred(TrueBB);
+		Value *OtherIncoming = Phi->getIncomingFromPred(OtherArmBB);
+		if (!TrueIncoming || !OtherIncoming) return false;
+		// A loop-carried PHI may refer to itself (or another PHI in the same
+		// header).  Replacing it with a select inserted in Pred would then make
+		// the select self-referential or fail to dominate the old header uses.
+		// Such values cannot occur in an acyclic if-region and are rejected.
+		auto IsDefinedInMerge = [Succ](Value *V) {
+			auto *I = dynamic_cast<Instruction *>(V);
+			return I && I->getParent() == Succ;
+		};
+		if (TrueIncoming == Phi || OtherIncoming == Phi ||
+			IsDefinedInMerge(TrueIncoming) || IsDefinedInMerge(OtherIncoming))
+			return false;
+	}
 
 	int InstCnt = countCandidateInsts(TrueBB) + (HasElse ? countCandidateInsts(ElseBB) : 0);
 	if (InstCnt > 4) return false;
+	// PHI 原本是边上拷贝，转成 select 后是真实指令。将 select
+	// 也纳入成本，防止“空分支 + 大量 PHI”反而显著增加代码。
+	int WeightedCost = candidateCost(TrueBB) +
+		(HasElse ? candidateCost(ElseBB) : 0) +
+		static_cast<int>(SuccPhis.size());
+	if (SuccPhis.size() > 3 || WeightedCost > 6) return false;
 
 	M.Pred = Pred;
 	M.TrueBB = TrueBB;
@@ -204,8 +293,9 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 		Value *VFromTrueBB = Phi->getIncomingFromPred(M.TrueBB);
 		BasicBlock *OtherArmBB = M.HasElse ? M.ElseBB : M.Pred;
 		Value *VFromOtherArm = Phi->getIncomingFromPred(OtherArmBB);
-		if (!VFromTrueBB) VFromTrueBB = UndefValue::NewUndefValue(Phi->getIRType());
-		if (!VFromOtherArm) VFromOtherArm = UndefValue::NewUndefValue(Phi->getIRType());
+		// matchPattern proved both incoming values exist; unlike the old path,
+		// malformed PHIs are rejected before any CFG mutation instead of being
+		// repaired with undef.
 
 		Value *SelTrueV = M.CondTrueToTrueBB ? VFromTrueBB : VFromOtherArm;
 		Value *SelFalseV = M.CondTrueToTrueBB ? VFromOtherArm : VFromTrueBB;

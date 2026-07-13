@@ -40,6 +40,7 @@ static void dumpRuntimeDeclarationsForExternalLink() {
     std::cout << "declare void @_sysy_starttime(i32)\n";
     std::cout << "declare void @_sysy_stoptime(i32)\n\n";
     std::cout << "declare void @llvm.memcpy.p0.p0.i32(ptr, ptr, i32, i1)\n\n";
+    std::cout << "declare void @llvm.memset.p0.i32(ptr, i8, i32, i1)\n\n";
 }
 
 int main(int argc, const char *argv[]) {

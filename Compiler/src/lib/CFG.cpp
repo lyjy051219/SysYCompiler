@@ -8,7 +8,6 @@
 #include <sstream>
 #include <map>
 #include <unordered_set>
-#include <variant>
 #include <limits>
 #include <queue>
 
@@ -748,7 +747,10 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
       return VOIDType::NewVoid();
     if (ident == "putf")
       return VOIDType::NewVoid();
-    if (ident == "llvm.memcpy.p0i8.p0i8.i32" || ident == "llvm.memcpy.p0.p0.i32")
+    if (ident == "llvm.memcpy.p0i8.p0i8.i32" ||
+        ident == "llvm.memcpy.p0.p0.i32" ||
+        ident == "llvm.memset.p0i8.i32" ||
+        ident == "llvm.memset.p0.i32")
         return VOIDType::NewVoid();
     if (ident == "memcpy@plt")
       return VOIDType::NewVoid();
@@ -778,12 +780,17 @@ bool BuildInFunction::isSupportedName(const std::string &Name) {
       "getint", "getch", "getfloat", "getarray", "getfarray",
       "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
       "starttime", "stoptime", "llvm.memcpy.p0i8.p0i8.i32",
-      "llvm.memcpy.p0.p0.i32"};
+      "llvm.memcpy.p0.p0.i32", "llvm.memset.p0i8.i32",
+      "llvm.memset.p0.i32"};
   return SupportedNames.count(Name) != 0;
 }
 
 bool BuildInFunction::isMemcpyName(const std::string &Name) {
   return Name.find("memcpy") != std::string::npos;
+}
+
+bool BuildInFunction::isMemsetName(const std::string &Name) {
+  return Name.find("memset") != std::string::npos;
 }
 
 bool BuildInFunction::isTimingName(const std::string &Name) {
@@ -819,6 +826,10 @@ const char *BuildInFunction::getDefaultMemcpyName() {
   return "llvm.memcpy.p0.p0.i32";
 }
 
+const char *BuildInFunction::getDefaultMemsetName() {
+  return "llvm.memset.p0.i32";
+}
+
 bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
   static const std::unordered_set<std::string> SysyLibNames = {
       "getint", "getch", "getfloat", "getarray", "getfarray",
@@ -828,6 +839,7 @@ bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
   if (SysyLibNames.count(Name) || isSupportedName(Name)) return true;
   if (Name.find("_sysy_") != std::string::npos) return true;
   if (isMemcpyName(Name)) return true;
+  if (isMemsetName(Name)) return true;
   if (Name.find("llvm.") == 0) return true;
   return false;
 }
@@ -1009,97 +1021,36 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
 
 Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation op,Value* _B){
   if (_A->isConst() && _B->isConst()) {
-    if ((op == BinaryInst::DIV || op == BinaryInst::MOD ||
-         op == BinaryInst::UDIV || op == BinaryInst::UREM) &&
-        _B->isConstZero()) {
-      if (_A->getIRType() == INTType::NewInt(4) &&
-          _B->getIRType() == INTType::NewInt(4))
-        return UndefValue::NewUndefValue(INTType::NewInt(4));
-      else
-        return UndefValue::NewUndefValue(FLOATType::NewFloat());
+    Value *A = _A;
+    Value *B = _B;
+
+    // Apply the same usual arithmetic conversion as the non-constant path.
+    // Keeping this conversion here also lets the shared folder distinguish
+    // integer division-by-zero (undef) from IEEE floating division-by-zero
+    // (Inf/NaN).  The former hand-written evaluator classified both as undef
+    // and additionally evaluated overflowing division/invalid shifts in C++.
+    if (!isIntOnlyBinaryOp(op) &&
+        (IRType::isFloat(A->getIRType()) ||
+         IRType::isFloat(B->getIRType()))) {
+      float AV = 0.0f;
+      float BV = 0.0f;
+      if (!A->tryGetNumericFloatConst(AV) ||
+          !B->tryGetNumericFloatConst(BV))
+        return nullptr;
+      A = ConstFloat::newConstFloat(AV);
+      B = ConstFloat::newConstFloat(BV);
     }
-    auto calc = [](auto a, BinaryInst::Operation op,
-                   auto b) -> std::variant<float, int> {
-      switch (op) {
-      case BinaryInst::ADD:
-        return a + b;
-      case BinaryInst::SUB:
-        return a - b;
-      case BinaryInst::MUL:
-        return a * b;
-      case BinaryInst::DIV:
-        return a / b;
-      case BinaryInst::UDIV:
-        return static_cast<int>(static_cast<unsigned int>(a) /
-                                static_cast<unsigned int>(b));
-      case BinaryInst::AND:
-        return (a != 0) && (b != 0);
-      case BinaryInst::OR:
-        return (a != 0) || (b != 0);
-      case BinaryInst::MOD:
-        return (int)a % (int)b;
-      case BinaryInst::UREM:
-        return static_cast<int>(static_cast<unsigned int>(a) %
-                                static_cast<unsigned int>(b));
-      case BinaryInst::SHL:
-        return static_cast<int>(a) << static_cast<int>(b);
-      case BinaryInst::LSHR:
-        return static_cast<int>(static_cast<unsigned int>(a) >> static_cast<int>(b));
-      case BinaryInst::ASHR:
-        return static_cast<int>(a) >> static_cast<int>(b);
-      case BinaryInst::E:
-        return a == b;
-      case BinaryInst::NE:
-        return a != b;
-      case BinaryInst::G:
-        return a > b;
-      case BinaryInst::GE:
-        return a >= b;
-      case BinaryInst::L:
-        return a < b;
-      case BinaryInst::LE:
-        return a <= b;
-      default:
-        assert(0);
-        return 0;
-      }
-    };
-    std::variant<float, int> fuc;
-    if (auto A = dynamic_cast<ConstInt *>(_A)) {
-      if (auto B = dynamic_cast<ConstInt *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstFloat *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstBool *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else
-        assert(0);
-    } else if (auto A = dynamic_cast<ConstFloat *>(_A)) {
-      if (auto B = dynamic_cast<ConstInt *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstFloat *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstBool *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else
-        assert(0);
-    } else if (auto A = dynamic_cast<ConstBool *>(_A)) {
-      if (auto B = dynamic_cast<ConstInt *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstFloat *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else if (auto B = dynamic_cast<ConstBool *>(_B))
-        fuc = calc(A->getVal(), op, B->getVal());
-      else
-        assert(0);
-    } else
-      assert(0);
-    if (BinaryInst::isCompareOp(op))
-      return ConstBool::newConstBool(std::get<int>(fuc));
-    else if (std::holds_alternative<int>(fuc))
-      return ConstInt::newConstInt(std::get<int>(fuc));
-    else
-      return ConstFloat::newConstFloat(std::get<float>(fuc));
+
+    if (Value *Folded = BinaryInst::foldConstants(op, A, B, true))
+      return Folded;
+    // NormalizeIntegerWidth deliberately handles only the integer spelling
+    // of remainder.  Keep IEEE frem available for internal IR producers.
+    if (IRType::isFloat(A->getIRType()))
+      if (Value *Folded = BinaryInst::foldConstants(op, A, B, false))
+        return Folded;
+
+    assert(false && "unsupported constant binary expression");
+    return nullptr;
   } else {
     assert(bb != nullptr);
     return bb->genBinaryInst(_A, op, _B);
@@ -1884,9 +1835,9 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
     // Integer division/remainder by zero is undefined.  IEEE fdiv/frem by
     // zero instead produces Inf/NaN and must reach the floating fold below.
     if (IntTy && (Op == DIV || Op == UDIV) && RHS->isConstZero())
-      return Value::makeUndefForType(INTType::NewInt(4));
+      return Value::makeUndefForType(Ty);
     if (IntTy && (Op == MOD || Op == UREM) && RHS->isConstZero())
-      return Value::makeUndefForType(INTType::NewInt(4));
+      return Value::makeUndefForType(Ty);
 
     if (isCompareOp(Op)) {
       if (IntTy) {
@@ -1914,8 +1865,10 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
       if (!LHS->tryGetNumericFloatConst(LV) ||
           !RHS->tryGetNumericFloatConst(RV))
         return nullptr;
+      // SysY follows C/IEEE ordered comparisons: NaN makes every relational
+      // comparison and equality false; only != is true.
       if (std::isnan(LV) || std::isnan(RV))
-        return ConstBool::newConstBool(true);
+        return ConstBool::newConstBool(Op == NE);
       switch (Op) {
       case E:  return ConstBool::newConstBool(LV == RV);
       case NE: return ConstBool::newConstBool(LV != RV);
@@ -2011,7 +1964,7 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
           !Value::tryGetFloatConst(RHS, RV))
         return nullptr;
       if (std::isnan(LV) || std::isnan(RV))
-        return ConstBool::newConstBool(true);
+        return ConstBool::newConstBool(Op == NE);
       switch (Op) {
       case E:  return ConstBool::newConstBool(LV == RV);
       case NE: return ConstBool::newConstBool(LV != RV);
@@ -2161,7 +2114,7 @@ void BinaryInst::dumpIR(){
     std::cout << "ashr ";
     break;
   case BinaryInst::E:
-    if (tp == IR_FLOAT) std::cout << "fcmp ueq ";
+    if (tp == IR_FLOAT) std::cout << "fcmp oeq ";
     else                std::cout << "icmp eq ";
     break;
   case BinaryInst::NE:
@@ -2169,19 +2122,19 @@ void BinaryInst::dumpIR(){
     else                std::cout << "icmp ne ";
     break;
   case BinaryInst::G:
-    if (tp == IR_FLOAT) std::cout << "fcmp ugt ";
+    if (tp == IR_FLOAT) std::cout << "fcmp ogt ";
     else                std::cout << "icmp sgt ";
     break;
   case BinaryInst::GE:
-    if (tp == IR_FLOAT) std::cout << "fcmp uge ";
+    if (tp == IR_FLOAT) std::cout << "fcmp oge ";
     else                std::cout << "icmp sge ";
     break;
   case BinaryInst::L:
-    if (tp == IR_FLOAT) std::cout << "fcmp ult ";
+    if (tp == IR_FLOAT) std::cout << "fcmp olt ";
     else                std::cout << "icmp slt ";
     break;
   case BinaryInst::LE:
-    if (tp == IR_FLOAT) std::cout << "fcmp ule ";
+    if (tp == IR_FLOAT) std::cout << "fcmp ole ";
     else                std::cout << "icmp sle ";
     break;
   default:

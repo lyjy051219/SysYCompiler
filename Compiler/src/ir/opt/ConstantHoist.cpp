@@ -4,8 +4,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -48,6 +46,62 @@ BasicBlock *ConstantHoistPass::pickInsertionBlock(
     return entry;
 }
 
+bool ConstantHoistPass::isLiteralSensitiveUse(
+    const Instruction *User, size_t OperandIndex) {
+    if (!User) return true;
+
+    // GEP 的第 0 个 operand 是 base pointer，后续 operand 是 index。
+    // 后端会把字面 index 直接合并进地址偏移，不能改成 SSA。
+    if (dynamic_cast<const GetElementPtrInst *>(User))
+        return OperandIndex > 0;
+
+    // 调用约定中可能有必须保持 literal 的参数。例如 RISC-V
+    // memcpy lowering 要求 size 是非负常量。普通调用也保守处理，
+    // 避免在 ABI lowering 前隐藏参数常量。
+    if (dynamic_cast<const CallInst *>(User)) return true;
+
+    // select 常量臂会影响后端分支/条件物化决策；并且提前
+    // hoist 会把原本只在某一条路径需要的常量变成无条件物化。
+    if (dynamic_cast<const SelectInst *>(User)) return true;
+
+    if (auto *BI = dynamic_cast<const BinaryInst *>(User)) {
+        BinaryInst::Operation Op = BI->getOp();
+        if (BinaryInst::isCompareOp(Op)) return true;
+
+        switch (Op) {
+        case BinaryInst::DIV:
+        case BinaryInst::UDIV:
+        case BinaryInst::MOD:
+        case BinaryInst::UREM:
+            // 保留 divisor，让 div/rem-by-constant 强度削弱可见。
+            return OperandIndex == 1;
+        case BinaryInst::SHL:
+        case BinaryInst::LSHR:
+        case BinaryInst::ASHR:
+            // RISC-V 立即数 shift 必须看到字面 shift amount。
+            return OperandIndex == 1;
+        case BinaryInst::MUL:
+        case BinaryInst::AND:
+        case BinaryInst::OR:
+        case BinaryInst::XOR:
+            // 常量乘法和位掩码都有 literal-specific 后端匹配。
+            return true;
+        case BinaryInst::ADD:
+        case BinaryInst::SUB:
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    // 常量 cast/branch 等应在这个 late pass 之前折叠。对未显式证明
+    // 可安全的指令保守保留 literal，也使将来增加 switch 指令时
+    // case value 不会被无意改写。只有 store 的大整数 value 在这里
+    // 明确视为可共享；ret 保留字面量，避免把冷返回路径的物化
+    // 提到公共支配块。
+    return User->instType != Instruction::STORE;
+}
+
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
     Function &F, const LoopInfo &LI) {
     ConstantHoistCollectResult R;
@@ -64,21 +118,18 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
                 if (!u) continue;
                 Value *v = u->getValue();
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
-                    int32_t val = (int32_t)ci->getVal();
-                    if ((int64_t)std::abs(val) < ImmediateThreshold) continue;
+                    if (isLiteralSensitiveUse(I, OperandIndex)) continue;
+                    const int32_t val = static_cast<int32_t>(ci->getVal());
+                    // 先拓宽再取绝对值，避免 abs(INT_MIN) 的 C++ UB。
+                    const int64_t wideVal = static_cast<int64_t>(val);
+                    const int64_t magnitude = wideVal < 0 ? -wideVal : wideVal;
+                    if (magnitude < ImmediateThreshold) continue;
                     auto &C = R.intBuckets[val];
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
                     if (depth > C.maxDepth) C.maxDepth = depth;
-                } else if (auto *cf = dynamic_cast<ConstFloat *>(v)) {
-                    float fv = cf->getVal();
-                    uint32_t bits;
-                    std::memcpy(&bits, &fv, sizeof(bits));
-                    auto &C = R.floatBuckets[bits];
-                    C.value = (int32_t)bits;  // 复用字段存 bit pattern
-                    C.uses.push_back({u, I, BB, depth});
-                    if (depth > C.maxDepth) C.maxDepth = depth;
                 }
+                // 严格浮点下不用 fadd wrapper 物化 ConstFloat。
             }
         }
     }
@@ -180,22 +231,6 @@ bool ConstantHoistPass::materializeGroup(
     return anyChange;
 }
 
-bool ConstantHoistPass::materializeFloatCandidate(
-    ConstantHoistCandidate &C, BasicBlock *insertBB) {
-    uint32_t bits = (uint32_t)C.value;
-    float fv;
-    std::memcpy(&fv, &bits, sizeof(fv));
-    // IEEE 754 下 -0.0 + x = x 对所有 x（含 ±0.0）严格成立，+0.0 会把
-    // -0.0 翻正。注：本 IR 的 ConstFloat 对 ±0.0 做了 interning 合并，
-    // 真实落到的可能仍是 +0.0；但写成 -0.0 让意图显式、将来解除合并时直接正确
-    auto *baseSSA = new BinaryInst(
-        ConstFloat::newConstFloat(-0.0f), BinaryInst::ADD,
-        ConstFloat::newConstFloat(fv));
-    insertBB->insertAfterPhiNodes(baseSSA);
-    for (ConstantHoistUseSite &us : C.uses) us.u->replaceUseeWith(baseSSA);
-    return true;
-}
-
 PreservationStatus ConstantHoistPass::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) {
     if (F.Size() == 0) return PreservationStatus::all();
@@ -238,18 +273,6 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         if (!insertBB) insertBB = entry;
 
         changed |= materializeGroup(G, insertBB);
-    }
-
-    for (auto &kv : R.floatBuckets) {
-        ConstantHoistCandidate &C = kv.second;
-        if ((int)C.uses.size() < UseThreshold) continue;
-        if (C.maxDepth == 0 &&
-            (int)C.uses.size() < StraightLineUseThreshold)
-            continue;
-        BasicBlock *common = foldCommonDominator(DT, C.uses);
-        BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);
-        if (!insertBB) insertBB = entry;
-        changed |= materializeFloatCandidate(C, insertBB);
     }
 
     if (!changed) return PreservationStatus::all();

@@ -38,6 +38,8 @@ public:
     bool callMayAliasPointer(CallInst *CI, Value *P, const LoopInfo &LI);
 
 private:
+    friend class BasicAliasAnalysis;
+
     struct ValuePairHash {
         std::size_t operator()(const std::pair<Value*, Value*>& P) const {
             auto H1 = static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(P.first));
@@ -70,6 +72,10 @@ private:
 
     Value* stripBaseInst(Value* V) const;
     Value* getBaseAddress(Value* V) const;
+    // Unlike alias(), this answers an allocation-object question rather than
+    // whether the two immediate pointee-sized access ranges overlap.  Only
+    // facts proved here may be promoted to a callee-wide ObjectNoAlias fact.
+    bool haveKnownDistinctUnderlyingObjects(Value* V1, Value* V2) const;
     bool isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const;
     bool hasObjectNoAlias(Value* V1, Value* V2) const;
 
@@ -84,7 +90,7 @@ private:
     LinearGEP fillLinearGEP(Value* V) const;
 
     //分析两个GEP的偏移量关系
-    AliasInfo aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2,
+    AliasInfo aliasGEP(Value* GEP1, Value* GEP2,
                        const LoopInfo& LI, bool UseIndexRange);
 
     std::size_t getPointeeAccessSize(Value* V) const;
@@ -105,6 +111,10 @@ private:
 class BasicAliasAnalysis : public AnalysisDescriptor<BasicAliasAnalysis> {
 public:
     using Result = BasicAAResult;
+    // The result may contain facts inferred from every direct call site of
+    // the analysed function.  A caller mutation can therefore invalidate a
+    // cached callee result even though the callee body itself did not change.
+    static constexpr bool InvalidateAcrossIRUnits = true;
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 
 private:

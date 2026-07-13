@@ -29,18 +29,13 @@ struct ConstantHoistGroup {
 
 struct ConstantHoistCollectResult {
     std::unordered_map<int32_t, ConstantHoistCandidate> intBuckets;
-    std::unordered_map<uint32_t, ConstantHoistCandidate> floatBuckets;
 };
 
 // 常量提升：共享的大整数做 value-key 分桶 + base/offset 重组（相近值用
-// `add base, offset` rebase）；共享的浮点用 `fadd -0.0, fv` wrapper 拎出
-// 一个 SSA 值，只共享不做 base/offset。
-//
-// 给后续迭代看：浮点路径的实际收益依赖后端对 ConstFloat use 的 lowering 策略
-// 若后端 per-use 发射常量装载，IR 层 wrapper 让这些 load 合并为一条；若
-// 后端已经按 ConstFloat 指针做全局 dedup，本 pass 的 wrapper 是净增一条
-// fadd，反而 regress。IR 层 ConstFloat 本身是 interning 的，所以 dedup
-// 不是目的，暴露"跨 use 活的 SSA 值"给后端寄存器分配才是。
+// `add base, offset` rebase）。只改写不依赖 literal 形态的 use：除余的
+// divisor、shift amount、GEP index、compare/call 等仍保留原字面量，
+// 以便后续强度削弱和后端目标匹配。浮点常量暂不物化：在没有
+// fast-math/目标成本证明时，用 fadd wrapper 会引入真实浮点运算和活跃区间。
 class ConstantHoistPass : public PassDescriptor<ConstantHoistPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -54,6 +49,8 @@ private:
         const std::vector<ConstantHoistUseSite> &Uses);
     static BasicBlock *pickInsertionBlock(
         BasicBlock *Common, BasicBlock *Entry, const LoopInfo &LI);
+    static bool isLiteralSensitiveUse(
+        const Instruction *User, size_t OperandIndex);
     static ConstantHoistCollectResult collectCandidates(
         Function &F, const LoopInfo &LI);
     static void closeGroup(
@@ -63,6 +60,4 @@ private:
         std::vector<ConstantHoistCandidate> &Sorted);
     static bool materializeGroup(
         ConstantHoistGroup &Group, BasicBlock *InsertBB);
-    static bool materializeFloatCandidate(
-        ConstantHoistCandidate &Candidate, BasicBlock *InsertBB);
 };

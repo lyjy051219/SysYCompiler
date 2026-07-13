@@ -39,6 +39,7 @@ enum class FuncAttr : unsigned {
 enum class IntrinsicID {
     None   = 0,
     Memcpy = 1,
+    Memset = 2,
 };
 
 // BaseAddressInfo:指针的基地址信息

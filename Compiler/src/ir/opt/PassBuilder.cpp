@@ -21,6 +21,7 @@
 #include "ir/opt/Global2Local.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/UnifyFuncExits.hpp"
@@ -39,6 +40,8 @@
 #include "ir/opt/LateStrengthReduce.hpp"
 #include "ir/opt/LoopStrengthReduction.hpp"
 #include "ir/opt/LocalAggregateSimplify.hpp"
+#include "ir/opt/GlobalInitializerFold.hpp"
+#include "ir/opt/LoopIdiomRecognize.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -71,6 +74,11 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
     FunctionPassManager FPM;
     FPM.addPass(BreakCriticalEdgesPass());
 
+    // Always run the linear local value-numbering tier.  Full GVN/PRE keeps
+    // its compile-time budget and may reject very large functions, whereas
+    // LocalGVN still removes same-block GEP/arithmetic/cast redundancy.
+    FPM.addPass(LocalGVNPass());
+
     // Step 1: 标量冗余消除 (GVN-PRE)
     FPM.addPass(GVNPREPass());
 
@@ -91,6 +99,53 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
     return FPM;
 }
 
+// 2.25 Early guarded peeling, before function inlining.
+//
+// Keeping this phase before inline is important for a general pattern where
+// the first outer iteration initializes loop-carried state consumed by a
+// nested loop, while a readonly helper call remains in every outer iteration.
+// Peeling exposes the one-time initialization first; cleanup deletes the
+// zero-trip residual nest; LICM can then cache the still-small direct call.
+// Every trigger is based on loop/SSA/control and memory proofs, never source
+// identifiers, input values, or benchmark-specific constants.
+FunctionPassManager PassBuilder::buildEarlyPeelingPipeline() {
+    FunctionPassManager FPM;
+    FPM.addPass(BreakCriticalEdgesPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 6));
+    FPM.addPass(LCSSAPass());
+    FPM.addPass(LoopPeelingPass());
+
+    FunctionPassManager PeelCleanup;
+    PeelCleanup.addPass(SCCPPass());
+    PeelCleanup.addPass(InstSimplifyPass());
+    PeelCleanup.addPass(RangeAwareSimplifyPass());
+    PeelCleanup.addPass(ConstraintEliminationPass());
+    PeelCleanup.addPass(CFGSimplifyPass());
+    PeelCleanup.addPass(DCEPass());
+    PeelCleanup.addPass(createFixedPointPass<Function,
+        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
+    PeelCleanup.addPass(LCSSAPass());
+    PeelCleanup.addPass(LoopDeletionPass());
+    PeelCleanup.addPass(CFGSimplifyPass());
+    PeelCleanup.addPass(DCEPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        std::move(PeelCleanup), 3));
+
+    FunctionPassManager CallAndInvariantCleanup;
+    CallAndInvariantCleanup.addPass(createFixedPointPass<Function,
+        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
+    CallAndInvariantCleanup.addPass(LCSSAPass());
+    CallAndInvariantCleanup.addPass(LICMPass());
+    CallAndInvariantCleanup.addPass(LocalGVNPass());
+    CallAndInvariantCleanup.addPass(GVNPREPass(/*EnablePRE=*/false));
+    CallAndInvariantCleanup.addPass(DCEPass());
+    CallAndInvariantCleanup.addPass(CFGSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        std::move(CallAndInvariantCleanup), 2));
+    return FPM;
+}
+
 // 2.5 展开后深度清理 Pipeline
 // LoopUnroll 会复制控制流、扩大基本块并暴露退化 PHI / 常量分支 / 死副本。
 // 这里使用偏局部、确定性的清理组合，收敛展开带来的直接噪声，再把循环形态
@@ -102,12 +157,15 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(SCCPPass());
     FPM.addPass(CFGSimplifyPass());
 
-    // Range/Constraint are intentionally not rerun on the cloned CFG yet.
-    // The old contextual range solve collapsed outer matrix loops on cloned
-    // CFGs.  Transform-visible contextual facts are currently disabled; keep
-    // this phase to local value/memory cleanup and re-enable Range/Constraint
-    // only after final-fact contextual rebuilding has dedicated regressions.
+    // RangeAnalysis discards its convergence-time path state and rebuilds
+    // transform-visible integer facts once from the current cloned CFG and
+    // final global lattice.  It is therefore safe to consume those facts here
+    // without carrying stale pre-unroll context into the clone.
+    FPM.addPass(RangeAwareSimplifyPass());
+    FPM.addPass(ConstraintEliminationPass());
+    FPM.addPass(CFGSimplifyPass());
     FPM.addPass(InstSimplifyPass());
+    FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass(/*EnablePRE=*/false));
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
@@ -144,6 +202,10 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
     FPM.addPass(LICMPass());         // 循环不变量外提
+    // Convert the fully-proven constant-trip contiguous copy/fill subset to
+    // memory intrinsics before unrolling duplicates the scalar operations.
+    FPM.addPass(LoopIdiomRecognizePass());
+    FPM.addPass(DCEPass());
     FPM.addPass(LoopDeletionPass()); // 消除死循环或无用循环
     FPM.addPass(LoopStrengthReductionPass()); // GEP 地址归纳变量强度削弱
     // One invocation considers loops from its entry snapshot, subject to a
@@ -168,6 +230,7 @@ FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
+    FPM.addPass(LocalGVNPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LateStrengthReducePass());
     FPM.addPass(InstSimplifyPass());
@@ -235,10 +298,6 @@ void PassBuilder::registerFunctionAnalyses(FunctionAnalysisPassManager &FAM){
 
 ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM) {
     ModulePassManager MPM;
-    // Module passes such as inlining/DAE/global cleanup can mutate function
-    // bodies without going through a function-pass bridge.  Clear function
-    // analyses after such a top-level mutation so no caller/callee summary or
-    // CFG analysis survives across an unknown module transformation.
     MPM.setIRMutationCallback([&FAM] { FAM.clear(); });
 
     // O0 直接返回，不进行任何优化
@@ -246,6 +305,10 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
         return MPM;
     }
 
+    // A full-object memcpy in main's side-effect-free entry prefix is
+    // equivalent to the destination's static initializer.  Fold it before
+    // function passes obscure the direct global/source relationship.
+    MPM.addPass(GlobalInitializerFoldPass());
 
     // Phase 1: Early Simplification (早期清理)
     // 目标：清理前端生成的冗余 Alloca、控制流，为 Inline 做准备
@@ -255,14 +318,24 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 
     // 全局化大数组
     MPM.addPass(Local2GlobalPass());
+    // Local2Global can expose large entry allocas as direct global objects;
+    // retry the initializer fold once that representation is available.
+    MPM.addPass(GlobalInitializerFoldPass());
+
+    // Propagate genuinely read-only scalar global initializers before loop
+    // analysis.  This is a module-wide write/escape proof, so loop bounds can
+    // become constants without relying on a global's name or source spelling.
+    // The later invocation remains useful after inlining exposes more dead
+    // stores and globals.
+    MPM.addPass(StoreOnlyGlobalEliminationPass(FAM));
 
     // Phase 2: Interprocedural Optimization (IPO，过程间优化)
     MPM.addPass(createModuleFunctionBridge(TailRecursionEliminationPass(), FAM));
-    // First eliminate dominated identical pure calls while they are still
-    // represented as calls.  After inlining, an entire callee loop would be
-    // duplicated and ordinary scalar GVN could no longer recover this CSE.
+    MPM.addPass(createModuleFunctionBridge(LocalGVNPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(
         GVNPREPass(/*EnablePRE=*/false), FAM));
+    MPM.addPass(createModuleFunctionBridge(
+        buildEarlyPeelingPipeline(), FAM));
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
     // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
@@ -328,6 +401,7 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(InstSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(LocalGVNPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(
         GVNPREPass(/*EnablePRE=*/false), FAM));
     MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));

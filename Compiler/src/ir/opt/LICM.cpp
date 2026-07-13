@@ -1,6 +1,7 @@
 #include "ir/opt/LICM.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 
 #include <algorithm>
@@ -13,21 +14,6 @@
 
 namespace {
 
-bool isDivisionOrRemainder(const Instruction *I) {
-	if (!I) return false;
-	switch (I->instType) {
-		case Instruction::SDIV:
-		case Instruction::UDIV:
-		case Instruction::FDIV:
-		case Instruction::SREM:
-		case Instruction::UREM:
-		case Instruction::FREM:
-			return true;
-		default:
-			return false;
-	}
-}
-
 // 在同一基本块中，即使候选指令的块支配了所有 exit/latch，
 // 它前面仍可能有不返回的 call 或会 fault 的内存/除法指令。
 // 把候选移到 preheader 会让它在这些指令之前执行，所以这种
@@ -39,10 +25,9 @@ bool hasSafeExecutionPrefix(const Instruction *Candidate) {
 	for (Instruction *I : *BB) {
 		if (I == Candidate) return true;
 		if (!I) return false;
-		if (dynamic_cast<LoadInst *>(I) ||
-			dynamic_cast<StoreInst *>(I) ||
+		if (dynamic_cast<StoreInst *>(I) ||
 			dynamic_cast<CallInst *>(I) ||
-			isDivisionOrRemainder(I)) {
+			dceInstructionMustBePreserved(I)) {
 			return false;
 		}
 	}
@@ -67,6 +52,57 @@ bool isSpeculatableDivisionOrRemainder(Instruction *I) {
 		return false;
 	}
 	return true;
+}
+
+// Sinking a store removes all of its intermediate executions.  That is only
+// valid when the destination is known to be a non-faulting object and no
+// other instruction in the loop can observe or overwrite the location.  In
+// particular, checking only instructions *after* the store is insufficient:
+// a load before the store in iteration N+1 observes the store from iteration
+// N and creates a loop-carried memory dependence.
+//
+// This IR has no dereferenceable/inbounds attributes, so keep the
+// non-faulting proof deliberately narrow: a direct global/alloca object or a
+// structurally in-bounds, all-constant GEP rooted at one.  Casts, parameters
+// and symbolic indices are rejected instead of guessing object bounds.
+bool isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
+	if (!Ptr || !StoredValue || !StoredValue->getIRType()) return false;
+	auto IsOwnedRoot = [](Value *V) {
+		if (auto *Var = dynamic_cast<Variable *>(V)) return Var->isGlobal();
+		return dynamic_cast<AllocaInst *>(V) != nullptr;
+	};
+
+	Value *Base = Ptr;
+	std::vector<Value *> Indices;
+	if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Ptr)) {
+		if (!GEP->flattenZeroBasedChain(Base, Indices)) return false;
+	}
+	if (!IsOwnedRoot(Base) || !Base->getIRType()) return false;
+
+	std::shared_ptr<IRType> Current = Base->getIRType();
+	for (Value *Index : Indices) {
+		auto *CI = dynamic_cast<ConstInt *>(Index);
+		if (!CI) return false;
+		int64_t I = CI->getVal();
+
+		if (auto PT = std::dynamic_pointer_cast<POINTERType>(Current)) {
+			// The root denotes one complete object, not an arbitrary C pointer
+			// range.  Only its zero-th object can be proven in-bounds.
+			if (I != 0) return false;
+			Current = PT->getPointerType();
+		} else if (auto AT = std::dynamic_pointer_cast<ARRAYType>(Current)) {
+			if (I < 0 || I >= AT->getElementCount()) return false;
+			Current = AT->getElementType();
+		} else {
+			return false;
+		}
+		if (!Current) return false;
+	}
+
+	if (auto PT = std::dynamic_pointer_cast<POINTERType>(Current))
+		Current = PT->getPointerType();
+	return Current &&
+		StoredValue->getIRType()->getSize() <= Current->getSize();
 }
 
 // A loop-invariant call may be evaluated lazily on the first iteration and
@@ -321,12 +357,42 @@ bool LICMPass::isSafeToMove(
 		case Instruction::FREM:
 			if (!isSpeculatableDivisionOrRemainder(I)) return false;
 			break;
+		case Instruction::FPTOSI:
+			// Out-of-range/NaN conversion is not speculatable in this IR.
+			// Hoist it only when the original instruction executes on every
+			// loop path and no earlier instruction can trap or fail to return.
+			if (!AggressiveHoist || I->getParent() != L.getHeader() ||
+				!hasSafeExecutionPrefix(I)) return false;
+			break;
+		case Instruction::SHL:
+		case Instruction::LSHR:
+		case Instruction::ASHR:
+			if (dceInstructionMustBePreserved(I) &&
+				(!AggressiveHoist || I->getParent() != L.getHeader() ||
+				 !hasSafeExecutionPrefix(I))) {
+				return false;
+			}
+			break;
 		default:
 			break;
 	}
 
+	// Keep the sinking transform memory-specific.  Pure invariant SSA
+	// expressions are handled by hoisting below; cloning them into multiple
+	// exits needs full SSAUpdater support and the old ad-hoc bridge construction
+	// could create an exit PHI whose incoming value was defined in the exit
+	// block itself.
+	if (ForSink && !dynamic_cast<StoreInst *>(I)) return false;
+
 	// 普通 Binary（排除上面的四个危险算术）可移动
 	if (dynamic_cast<BinaryInst *>(I)) return true;
+
+	// select only chooses between already-computed SSA values and has no
+	// trapping behaviour of its own.  Treating it as immovable used to break
+	// otherwise-pure invariant chains such as max(0, trip-count): the compare
+	// could move, but the select and all of its quotient/remainder users stayed
+	// in an inner-loop preheader and were then recomputed by the parent loop.
+	if (dynamic_cast<SelectInst *>(I)) return true;
 
 	// LOAD：循环内任一指令若可能 Mod 该地址，则不可移动
 	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
@@ -362,40 +428,39 @@ bool LICMPass::isSafeToMove(
 	if (auto *SI = dynamic_cast<StoreInst *>(I)) {
 		if (!ForSink) return false;
 		Value *Ptr = SI->getPointerOperand();
-		if (!Ptr) return false;
+		if (!isNonFaultingStoreObject(Ptr, SI->getValueOperand())) return false;
+		for (Value *Operand :
+			 {SI->getValueOperand(), SI->getPointerOperand()}) {
+			auto *Def = dynamic_cast<Instruction *>(Operand);
+			if (Def && Def->getParent() && L.contains(Def->getParent()))
+				return false;
+		}
 
 		BasicBlock *SBB = SI->getParent();
 		if (!SBB) return false;
 
-		for (BasicBlock *ExitBB : ExitBlocks)
-			if (!DT.dominates(SBB, ExitBB)) return false;
+		// Every path which actually exits the loop must have executed this
+		// store.  Check exiting blocks rather than merely exit destinations;
+		// the latter can have additional predecessors in malformed/non-
+		// dedicated CFGs.
+		bool SawExitingBlock = false;
+		for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
+			if (!BB || !L.isExitingBlock(BB)) continue;
+			SawExitingBlock = true;
+			if (!DT.dominates(SBB, BB)) return false;
+		}
+		if (!SawExitingBlock) return false;
 		for (BasicBlock *LatchBB : Latches)
 			if (!DT.dominates(SBB, LatchBB)) return false;
 
+		// Reject *every* competing Mod/Ref, including accesses before SI.
+		// This is the conservative MemorySSA-equivalent legality condition
+		// until the dedicated memory dependence graph is available.
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == SI) continue;
 
 			ModRefInfo MRI = getInstModRefInfo(Ptr, J, AA, LI, FAM);
-			if (!isModSet(MRI) && !isRefSet(MRI)) continue;
-
-			BasicBlock *JBB = J->getParent();
-			if (!JBB) return false;
-
-			if (JBB == SBB) {
-				std::vector<Instruction *> Seq;
-				for (auto *K : *SBB) Seq.push_back(K);
-				bool seenSI = false;
-				for (Instruction *K : Seq) {
-					if (K == SI) {
-						seenSI = true;
-						continue;
-					}
-					if (!seenSI) continue;
-					if (K == J) return false;
-				}
-			} else if (DT.dominates(SBB, JBB)) {
-				return false;
-			}
+			if (isModSet(MRI) || isRefSet(MRI)) return false;
 		}
 		return true;
 	}
@@ -412,7 +477,21 @@ bool LICMPass::isSafeToMove(
 		return isReusableLoopInvariantCall(CI, LoopInsts, AA, LI, FAM);
 	}
 
-	return true;
+	// Keep the fallback a pure-operation allowlist.  New instruction kinds
+	// must opt in with an explicit speculation rule instead of being hoisted
+	// by default.
+	if (dynamic_cast<GetElementPtrInst *>(I)) return true;
+	switch (I->instType) {
+		case Instruction::TRUNC:
+		case Instruction::ZEXT:
+		case Instruction::SEXT:
+		case Instruction::FPTOSI:
+		case Instruction::SITOFP:
+		case Instruction::BITCAST:
+			return true;
+		default:
+			return false;
+	}
 }
 
 PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
@@ -433,12 +512,34 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			if (CFGChanged) return true;
 		}
 
-		// 前置检查
-		if (!LCSSAPass::isLCSSAForm(L)) return LocalChanged;
+		// A rotated loop commonly has a unique guard predecessor whose second
+		// edge is the zero-trip bypass.  It is a valid insertion point for
+		// speculatable pure instructions, but getLoopSimplifyForm deliberately
+		// rejects it because it is not an unconditional preheader.  Keep the
+		// stronger form for sinking/CFG rewrites and use the weaker unique-entry
+		// shape for pure hoisting only.
+		bool InLCSSA = LCSSAPass::isLCSSAForm(L);
 		BasicBlock *PreHeader = nullptr;
 		BasicBlock *Latch = nullptr;
-		if (!L->getLoopSimplifyForm(PreHeader, Latch)) return LocalChanged;
+		bool HasLoopSimplifyForm =
+			L->getLoopSimplifyForm(PreHeader, Latch);
+		if (!HasLoopSimplifyForm) {
+			std::vector<BasicBlock *> OutsidePreds;
+			std::vector<BasicBlock *> InsidePreds;
+			BasicBlock *Header = L->getHeader();
+			if (!Header) return LocalChanged;
+			for (BasicBlock *Pred : Header->getPredecessors()) {
+				if (!Pred) continue;
+				if (L->contains(Pred)) InsidePreds.push_back(Pred);
+				else OutsidePreds.push_back(Pred);
+			}
+			if (OutsidePreds.size() != 1 || InsidePreds.size() != 1)
+				return LocalChanged;
+			PreHeader = OutsidePreds.front();
+			Latch = InsidePreds.front();
+		}
 		if (!PreHeader || !Latch) return LocalChanged;
+		const bool CanSink = HasLoopSimplifyForm && InLCSSA;
 
 		auto ExitBlocks = L->getExitBlocks();
 		if (ExitBlocks.empty()) return LocalChanged;
@@ -455,7 +556,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 		// Sink：后序块 + 逆序指令
 		std::unordered_set<Instruction *> SinkInvariant;
-		auto SinkBlocksRPO = L->getBlocksInRPO();
+		auto SinkBlocksRPO = CanSink
+			? L->getBlocksInRPO()
+			: std::vector<BasicBlock *>{};
 		for (auto BIt = SinkBlocksRPO.rbegin(); BIt != SinkBlocksRPO.rend(); ++BIt) {
 			BasicBlock *BB = *BIt;
 			if (!BB) continue;
@@ -543,7 +646,11 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					ExitClone[ExitBB] = Cloned;
 				}
 
-				if (ExitClone.empty()) continue;
+				if (ExitClone.size() != ExitBlocks.size()) {
+					for (auto &KV : ExitClone)
+						if (KV.second) delete KV.second;
+					continue;
+				}
 
 				bool RewriteOK = true;
 				std::vector<Use *> Uses;
@@ -590,6 +697,11 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 			for (Instruction *I : Insts) {
 				if (!I || I->getParent() != BB) continue;
+				if (!HasLoopSimplifyForm &&
+					!dynamic_cast<BinaryInst *>(I) &&
+					!dynamic_cast<SelectInst *>(I)) {
+					continue;
+				}
 				auto LoopInsts = collectLiveLoopInsts();
 
 				bool Aggressive = true;
@@ -617,7 +729,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					// preheader.  Keep its first execution at the exact original
 					// point, then bypass it after the first backedge.
 					auto *CI = dynamic_cast<CallInst *>(I);
-					if (!CI || BB == L->getHeader() ||
+					if (!HasLoopSimplifyForm || !InLCSSA ||
+						!CI || BB == L->getHeader() ||
 						!DT.dominates(BB, Latch) ||
 						!isReusableLoopInvariantCall(
 							CI, LoopInsts, AA, LI, FAM) ||
@@ -651,7 +764,13 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 	};
 
 	for (Loop *TopL : LI.getTopLevelLoops()) {
-		Changed |= processLoop(TopL);
+		bool LocalChanged = processLoop(TopL);
+		Changed |= LocalChanged;
+		// The first round hoists invariant address/value producers.  A second
+		// bounded round lets store sinking consume those now-preheader values
+		// without manufacturing invalid exit PHIs for loop-local operands.
+		if (LocalChanged && !CFGChanged)
+			Changed |= processLoop(TopL);
 		if (CFGChanged) break;
 	}
 

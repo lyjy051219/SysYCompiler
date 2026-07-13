@@ -151,3 +151,11 @@ public:
 private:
 	bool EnablePRE = true;
 };
+
+// A deliberately linear, block-local value numbering pass.  It handles only
+// side-effect-free SSA expressions and therefore remains cheap enough to run
+// even when the full GVN/PRE solver rejects a very large function.
+class LocalGVNPass : public PassDescriptor<LocalGVNPass> {
+public:
+	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+};

@@ -27,7 +27,7 @@
 // 3) 比较折叠（整数 + 浮点）：
 //    BinaryInst::L/LE/G/GE/E/NE 整数浮点共用，靠操作数类型分派。
 //    整数走 IntRange 端点比较；浮点走 FloatRange 端点比较
-//    （FloatRange 非 Top 时假定不含 NaN —— NaN 已被吸收到 Top）
+//    FloatRange 显式跟踪 NaN；只在 mayNaN=false 时使用端点证明。
 //    六种比较（L/LE/G/GE/E/NE）都覆盖
 //    折叠后如果比较结果被 branch 使用，死分支会被后续 CFGSimplify 清理
 //
@@ -284,7 +284,12 @@ bool RangeAwareSimplifyPass::foldConstants(
             if (!kb.isFullyKnown()) continue;
             cval = kb.getConstant();
         }
-        I->replaceAllUsesWith(ConstInt::newConstInt(cval));
+        auto Ty = I->getIRType();
+        if (!Ty || !Ty->isInt()) continue;
+        Value *Folded = Ty->isBool()
+            ? static_cast<Value *>(ConstBool::newConstBool((cval & 1) != 0))
+            : static_cast<Value *>(ConstInt::newConstInt(cval, Ty->getSize()));
+        I->replaceAllUsesWith(Folded);
         delete I;
         changed = true;
     }
@@ -295,8 +300,15 @@ bool RangeAwareSimplifyPass::foldConstants(
         FloatRange range = RI.queryFloat(I, block, DT);
         if (!range.isSingleValue()) continue;
 
-        // double → float：我们的 IR ConstFloat 存 float（SysY 只有 f32）
-        I->replaceAllUsesWith(ConstFloat::newConstFloat((float)range.min));
+        // double → float：数值 0 需按显式 zero-sign fact 恢复。
+        // 例如 exact -0 和一个 [0, 1] contextual range 取交集时，
+        // 区间端点的 std::max 可能选到 +0，但符号集仍能
+        // 正确证明只有 -0。
+        float Folded = static_cast<float>(range.min);
+        if (range.min == 0.0 && range.mayNegativeZero &&
+            !range.mayPositiveZero)
+            Folded = -0.0f;
+        I->replaceAllUsesWith(ConstFloat::newConstFloat(Folded));
         delete I;
         changed = true;
     }
@@ -408,18 +420,16 @@ bool RangeAwareSimplifyPass::foldComparisons(
             continue;
         }
 
-        // 浮点比较（fcmp uXX）。FloatRange 的 Top 表示"不追踪/NaN 污染"，
-        // 非 Top 时假定操作数不含 NaN（NaN 已被吸收到 Top）。
-        // 对不含 NaN 的操作数，fcmp uXX 的语义等价于 olt/ole/ogt/oge/oeq/one
-        // 区间比较，可以像整数一样按端点判定。
+        // 浮点比较遵循 C/IEEE ordered 关系（!= 对 NaN 为真）。只有两个操作数
+        // 都明确排除 NaN 时，才能统一用下面的数值端点规则证明结果。
+        // 有界区间也仍可能含 NaN，不能再用 "!isTop" 代替
+        // nnan 证明。
         if (opTy == IR_FLOAT && rhs->getIRType()->getEnum() == IR_FLOAT) {
             FloatRange lRange = RI.queryFloat(lhs, BB, DT);
             FloatRange rRange = RI.queryFloat(rhs, BB, DT);
 
-            // Top（可能含 NaN/无界）和 Bottom（尚无可行值）都不能作为
-            // 常量比较的证明。
-            if (lRange.isTop() || rRange.isTop() ||
-                lRange.isBottom() || rRange.isBottom())
+            if (!lRange.hasNumericValues() || !rRange.hasNumericValues() ||
+                lRange.mayContainNaN() || rRange.mayContainNaN())
                 continue;
 
             int result = -1;

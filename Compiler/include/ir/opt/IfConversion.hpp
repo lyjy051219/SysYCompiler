@@ -20,8 +20,10 @@ public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-	static bool isForbiddenInst(const Instruction *I);
+	static bool isSafeToSpeculativelyExecute(const Instruction *I);
+	static int instructionCost(const Instruction *I);
 	static int countCandidateInsts(BasicBlock *BB);
+	static int candidateCost(BasicBlock *BB);
 	static bool checkBlockConvertible(BasicBlock *BB);
 	static bool usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ);
 	static bool hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *B);

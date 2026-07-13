@@ -3,6 +3,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 
 #include <unordered_map>
@@ -367,6 +368,33 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
+    // === Phase 0: MemorySSA-backed idempotent stores ===
+    // MemorySSA describes the IR at the point it is requested.  Query every
+    // candidate before deleting anything, then mutate in one batch; otherwise
+    // the first deletion would make the cached def-use graph stale.  The
+    // function-wide query cap and per-walk budget bound compile time.  Failure
+    // to prove a candidate within either budget is conservatively ignored.
+    auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
+    constexpr std::size_t MaxMemorySSAStoreQueries = 256;
+    constexpr std::size_t MaxVisitedMemoryAccesses = 256;
+    std::vector<StoreInst *> redundantValueStores;
+    std::size_t queriedStores = 0;
+    for (BasicBlock *BB : F) {
+        for (Instruction *I : *BB) {
+            auto *SI = dynamic_cast<StoreInst *>(I);
+            if (!SI || queriedStores >= MaxMemorySSAStoreQueries) continue;
+            ++queriedStores;
+            if (MSSA.isStoreValueRedundant(
+                    SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
+                redundantValueStores.push_back(SI);
+            }
+        }
+    }
+    for (StoreInst *SI : redundantValueStores) {
+        delete SI;
+        changed = true;
+    }
+
     // === Phase 1: 块内 DSE ===
     // 此阶段会直接 delete 死 store。所有跨内存事件的候选都必须
     // 经过 AA 证明 NoAlias，不再只按 Value* 相等性清障。
@@ -410,5 +438,6 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     PA.keep<LoopAnalysis>();
     PA.discard<SideEffectAnalysis>();
     PA.discard<BasicAliasAnalysis>();
+    PA.discard<MemorySSAAnalysis>();
     return PA;
 }

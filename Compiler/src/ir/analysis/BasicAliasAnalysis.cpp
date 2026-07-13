@@ -5,6 +5,80 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
+
+namespace {
+
+bool checkedAdd(long long A, long long B, long long &Result) {
+    if ((B > 0 && A > std::numeric_limits<long long>::max() - B) ||
+        (B < 0 && A < std::numeric_limits<long long>::min() - B))
+        return false;
+    Result = A + B;
+    return true;
+}
+
+bool checkedSub(long long A, long long B, long long &Result) {
+    if (B == std::numeric_limits<long long>::min()) {
+        if (A >= 0) return false;
+        Result = A - B;
+        return true;
+    }
+    return checkedAdd(A, -B, Result);
+}
+
+bool checkedMul(long long A, long long B, long long &Result) {
+    if (A == 0 || B == 0) {
+        Result = 0;
+        return true;
+    }
+    if ((A == -1 && B == std::numeric_limits<long long>::min()) ||
+        (B == -1 && A == std::numeric_limits<long long>::min()))
+        return false;
+    if (A > 0) {
+        if (B > 0) {
+            if (A > std::numeric_limits<long long>::max() / B) return false;
+        } else if (B < std::numeric_limits<long long>::min() / A) {
+            return false;
+        }
+    } else {
+        if (B > 0) {
+            if (A < std::numeric_limits<long long>::min() / B) return false;
+        } else if (A < std::numeric_limits<long long>::max() / B) {
+            return false;
+        }
+    }
+    Result = A * B;
+    return true;
+}
+
+bool hasUndefPointerOrigin(Value *V, std::unordered_set<Value *> &Active,
+                           unsigned Depth = 0) {
+    if (!V || Value::isUndef(V)) return true;
+    if (Depth > 32) return true;
+
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I) return false;
+    const bool TransparentPointerProducer =
+        dynamic_cast<GetElementPtrInst *>(I) ||
+        dynamic_cast<BitCastInst *>(I) ||
+        dynamic_cast<PhiInst *>(I) ||
+        dynamic_cast<SelectInst *>(I);
+    if (!TransparentPointerProducer) return false;
+    if (!Active.insert(V).second) return false;
+
+    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
+        Value *Operand = I->getOperand(Op);
+        if (dynamic_cast<BasicBlock *>(Operand)) continue;
+        if (hasUndefPointerOrigin(Operand, Active, Depth + 1)) {
+            Active.erase(V);
+            return true;
+        }
+    }
+    Active.erase(V);
+    return false;
+}
+
+} // namespace
 
 bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(BasicAliasAnalysis::ID())) {
@@ -70,10 +144,12 @@ Value* BasicAAResult::stripBaseInst(Value* V) const {
             continue;
         }
 
-        if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
-            V = BC->getUnaryOperand();
-            continue;
-        }
+        // Keep bitcasts in the query value.  Although getBaseAddress() and
+        // fillLinearGEP() may look through a cast to identify the allocation,
+        // aliasGEP must still see the cast result's pointee width.  Stripping
+        // it here can turn a wide access into the source's narrow access and
+        // manufacture NoAlias for overlapping byte ranges.
+        if (dynamic_cast<BitCastInst*>(V)) return V;
 
         if (auto *Phi = dynamic_cast<PhiInst*>(V)) {
             if (Phi->getNumIncomingValues() == 1) {
@@ -112,20 +188,44 @@ Value* BasicAAResult::getBaseAddress(Value* V) const {
     return V;
 }
 
-bool BasicAAResult::isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const {
-    if (V1 != V2) {
+bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
+                                                        Value* V2) const {
+    Value *O1 = getBaseAddress(V1);
+    Value *O2 = getBaseAddress(V2);
+    if (!O1 || !O2 || O1 == O2 || O1->isUndef() || O2->isUndef())
         return false;
-    }
 
-    auto *I = dynamic_cast<Instruction*>(V1);
-    if (!I) {
+    auto *Var1 = dynamic_cast<Variable*>(O1);
+    auto *Var2 = dynamic_cast<Variable*>(O2);
+    bool IsAlloca1 = dynamic_cast<AllocaInst*>(O1) != nullptr;
+    bool IsAlloca2 = dynamic_cast<AllocaInst*>(O2) != nullptr;
+    bool IsParam1 = Var1 && Var1->vartag == Variable::Param;
+    bool IsParam2 = Var2 && Var2->vartag == Variable::Param;
+    bool IsGlobal1 = Var1 && Var1->vartag == Variable::GlobalVariable;
+    bool IsGlobal2 = Var2 && Var2->vartag == Variable::GlobalVariable;
+    bool IsConst1 = Var1 && Var1->vartag == Variable::Constant;
+    bool IsConst2 = Var2 && Var2->vartag == Variable::Constant;
+
+    if (IsAlloca1 && IsAlloca2)
         return true;
-    }
-    BasicBlock* Parent = I->getParent();
-    if (!Parent) {
+    if ((IsGlobal1 || IsConst1) && (IsGlobal2 || IsConst2))
         return true;
-    }
-    return LI.getLoopFor(Parent) == nullptr;
+    if ((IsParam1 && IsAlloca2) || (IsParam2 && IsAlloca1))
+        return true;
+    if ((IsAlloca1 && (IsGlobal2 || IsConst2)) ||
+        (IsAlloca2 && (IsGlobal1 || IsConst1)))
+        return true;
+
+    return hasObjectNoAlias(O1, O2);
+}
+
+bool BasicAAResult::isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const {
+    (void)LI;
+    // Alias queries describe two SSA pointer values in the same execution.
+    // A loop-carried dependence question is a different analysis problem:
+    // weakening `alias(P, P)` merely because P is defined in a loop loses the
+    // fundamental reflexivity property and prevents safe local forwarding.
+    return V1 == V2;
 }
 
 AliasInfo BasicAAResult::mergePhiAlias(AliasInfo A, AliasInfo B) const {
@@ -171,9 +271,27 @@ bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr
 
         Value* Idx = GEP->getIndex(i);
         if (auto *CI = dynamic_cast<ConstInt*>(Idx)) {
-            Expr.ConstantOffset += static_cast<long long>(CI->getVal()) * static_cast<long long>(Stride);
+            if (Stride > static_cast<std::size_t>(
+                             std::numeric_limits<long long>::max()))
+                return false;
+            long long Scaled = 0;
+            long long Updated = 0;
+            if (!checkedMul(static_cast<long long>(CI->getVal()),
+                            static_cast<long long>(Stride), Scaled) ||
+                !checkedAdd(Expr.ConstantOffset, Scaled, Updated))
+                return false;
+            Expr.ConstantOffset = Updated;
         } else if (Idx) {
-            Expr.VariableOffsets[Idx] += static_cast<long long>(Stride);
+            if (Stride > static_cast<std::size_t>(
+                             std::numeric_limits<long long>::max()))
+                return false;
+            long long Updated = 0;
+            if (!checkedAdd(Expr.VariableOffsets[Idx],
+                            static_cast<long long>(Stride), Updated))
+                return false;
+            Expr.VariableOffsets[Idx] = Updated;
+        } else {
+            return false;
         }
     }
 
@@ -233,17 +351,35 @@ BasicAAResult::decomposeAdditive(Value* V) const {
 
         if (BI->getOp() == BinaryInst::ADD) {
             if (RC) {
-                Result.Offset += RC->getVal();
+                long long Updated = 0;
+                if (!checkedAdd(Result.Offset,
+                                static_cast<long long>(RC->getVal()), Updated)) {
+                    Result.Valid = false;
+                    return Result;
+                }
+                Result.Offset = Updated;
                 Result.Base = LHS;
                 continue;
             }
             if (LC) {
-                Result.Offset += LC->getVal();
+                long long Updated = 0;
+                if (!checkedAdd(Result.Offset,
+                                static_cast<long long>(LC->getVal()), Updated)) {
+                    Result.Valid = false;
+                    return Result;
+                }
+                Result.Offset = Updated;
                 Result.Base = RHS;
                 continue;
             }
         } else if (BI->getOp() == BinaryInst::SUB && RC) {
-            Result.Offset -= RC->getVal();
+            long long Updated = 0;
+            if (!checkedSub(Result.Offset,
+                            static_cast<long long>(RC->getVal()), Updated)) {
+                Result.Valid = false;
+                return Result;
+            }
+            Result.Offset = Updated;
             Result.Base = LHS;
             continue;
         }
@@ -365,7 +501,8 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
         return std::nullopt;
     }
 
-    long long LB = *StartOff + Dec.Offset;
+    long long LB = 0;
+    if (!checkedAdd(*StartOff, Dec.Offset, LB)) return std::nullopt;
     if (LB < 0) {
         return std::nullopt;
     }
@@ -375,6 +512,18 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
 AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     const std::unordered_map<Value*, long long>& DiffVars,
     long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
+    (void)DiffVars;
+    (void)ConstDiff;
+    (void)Threshold;
+    (void)LI;
+
+    // Integer ADD/SUB and PHI recurrences in this IR carry no no-wrap flag.
+    // A syntactically positive step can wrap and invalidate every mathematical
+    // lower-bound argument below.  Until SCEV can attach an explicit finite
+    // no-wrap proof, variable-distance GEPs must remain MayAlias.
+    return AliasInfo::MayAlias;
+
+#if 0
     if (DiffVars.size() != 2) {
         return AliasInfo::MayAlias;
     }
@@ -386,7 +535,10 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     Value* B = It->first;
     long long OtherScale = It->second;
 
-    if (Scale == 0 || Scale != -OtherScale) {
+    if (Scale == 0 ||
+        Scale == std::numeric_limits<long long>::min() ||
+        OtherScale == std::numeric_limits<long long>::min() ||
+        Scale != -OtherScale) {
         return AliasInfo::MayAlias;
     }
     if (Scale < 0) {
@@ -395,23 +547,35 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     }
 
     Threshold = std::max<std::size_t>(1, Threshold);
+    if (Threshold > static_cast<std::size_t>(
+                        std::numeric_limits<long long>::max()))
+        return AliasInfo::MayAlias;
     if (auto LB = lowerBoundDiff(A, B, LI)) {
-        long long MinDiff = ConstDiff + Scale * (*LB);
+        long long ScaledLB = 0;
+        long long MinDiff = 0;
+        if (!checkedMul(Scale, *LB, ScaledLB) ||
+            !checkedAdd(ConstDiff, ScaledLB, MinDiff))
+            return AliasInfo::MayAlias;
         if (MinDiff >= static_cast<long long>(Threshold)) {
             return AliasInfo::NoAlias;
         }
     }
     if (auto LB = lowerBoundDiff(B, A, LI)) {
-        long long MaxDiff = ConstDiff - Scale * (*LB);
+        long long ScaledLB = 0;
+        long long MaxDiff = 0;
+        if (!checkedMul(Scale, *LB, ScaledLB) ||
+            !checkedSub(ConstDiff, ScaledLB, MaxDiff))
+            return AliasInfo::MayAlias;
         if (MaxDiff <= -static_cast<long long>(Threshold)) {
             return AliasInfo::NoAlias;
         }
     }
 
     return AliasInfo::MayAlias;
+#endif
 }
 
-AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GEP2,
+AliasInfo BasicAAResult::aliasGEP(Value* GEP1, Value* GEP2,
                                   const LoopInfo& LI, bool UseIndexRange) {
     auto E1 = fillLinearGEP(GEP1);
     auto E2 = fillLinearGEP(GEP2);
@@ -425,7 +589,10 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
 
     std::unordered_map<Value*, long long> DiffVars = E1.VariableOffsets;
     for (auto &KV : E2.VariableOffsets) {
-        DiffVars[KV.first] -= KV.second;
+        long long Updated = 0;
+        if (!checkedSub(DiffVars[KV.first], KV.second, Updated))
+            return AliasInfo::MayAlias;
+        DiffVars[KV.first] = Updated;
     }
     for (auto It = DiffVars.begin(); It != DiffVars.end();) {
         if (It->second == 0) {
@@ -435,11 +602,22 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
         }
     }
 
-    const long long ConstDiff = E1.ConstantOffset - E2.ConstantOffset;
+    long long ConstDiff = 0;
+    if (!checkedSub(E1.ConstantOffset, E2.ConstantOffset, ConstDiff))
+        return AliasInfo::MayAlias;
 
     std::size_t Access1 = getPointeeAccessSize(GEP1);
     std::size_t Access2 = getPointeeAccessSize(GEP2);
+    // A zero size here means that the pointer's pointee width is unknown to
+    // this IR, not that every access through the pointer touches zero bytes.
+    // Equal offsets are still MustAlias, but distance cannot prove NoAlias.
+    if (Access1 == 0 || Access2 == 0)
+        return ConstDiff == 0 && DiffVars.empty() ? AliasInfo::MustAlias
+                                                  : AliasInfo::MayAlias;
     std::size_t Threshold = std::max<std::size_t>(1, std::max(Access1, Access2));
+    if (Threshold > static_cast<std::size_t>(
+                        std::numeric_limits<long long>::max()))
+        return AliasInfo::MayAlias;
 
     if (!DiffVars.empty()) {
         if (UseIndexRange) {
@@ -452,6 +630,8 @@ AliasInfo BasicAAResult::aliasGEP(GetElementPtrInst* GEP1, GetElementPtrInst* GE
         return AliasInfo::MustAlias;
     }
 
+    if (ConstDiff == std::numeric_limits<long long>::min())
+        return AliasInfo::MayAlias;
     long long Distance = std::llabs(ConstDiff);
     if (Distance >= static_cast<long long>(Threshold)) {
         return AliasInfo::NoAlias;
@@ -466,7 +646,7 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
     }
     unsigned N = Phi->getNumIncomingValues();
     if (N == 0) {
-        return AliasInfo::NoAlias;
+        return AliasInfo::MayAlias;
     }
 
     if (auto *OtherPhi = dynamic_cast<PhiInst*>(Other)) {
@@ -537,62 +717,41 @@ AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
 
 AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
                                    bool UseIndexRange) {
-    //1.如果任一者访问的内存大小为0,直接判定为NoAlias
-    std::size_t Access1 = getPointeeAccessSize(V1);
-    std::size_t Access2 = getPointeeAccessSize(V2);
-
-    if (Access1 == 0 || Access2 == 0) {
-        return AliasInfo::NoAlias;
-    }
-
-    //2.进行初步剥离
+    //1.进行初步剥离
     V1 = stripBaseInst(V1);
     V2 = stripBaseInst(V2);
 
     if (!V1 || !V2 || !V1->isPointerValue() || !V2->isPointerValue()) {
-        return AliasInfo::NoAlias;
+        return AliasInfo::MayAlias;
     }
 
-    //3.如果有UndefValue参与，直接判定为NoAlias
+    //2. An undef pointer is not a distinct allocation.  Treating it as
+    // NoAlias lets a client move/delete real memory operations across it.
     if (V1->isUndef() || V2->isUndef()) {
-        return AliasInfo::NoAlias;
+        return AliasInfo::MayAlias;
     }
-    //4.判断相等性及拦截跨迭代相等性的情况
+    std::unordered_set<Value *> UndefActive;
+    if (hasUndefPointerOrigin(V1, UndefActive))
+        return AliasInfo::MayAlias;
+    UndefActive.clear();
+    if (hasUndefPointerOrigin(V2, UndefActive))
+        return AliasInfo::MayAlias;
+    //3. Obtain the underlying roots before reflexivity.  A GEP/bitcast whose
+    // root is undef is not a stable object identity, even when the same
+    // derived SSA value appears on both sides of the query.
+    Value* O1 = getBaseAddress(V1);
+    Value* O2 = getBaseAddress(V2);
+    if (!O1 || !O2 || O1->isUndef() || O2->isUndef())
+        return AliasInfo::MayAlias;
+
+    //4.判断相等性
     if (isEqualAlias(V1, V2, LI)) {
         return AliasInfo::MustAlias;
     }
 
-    //5.获取基地址
-    Value* O1 = getBaseAddress(V1);
-    Value* O2 = getBaseAddress(V2);
-
-    //6.如果底层对象不同
+    //5.如果底层对象不同
     if (O1 != O2) {
-        auto *Var1 = dynamic_cast<Variable*>(O1);
-        auto *Var2 = dynamic_cast<Variable*>(O2);
-        bool IsAlloca1 = dynamic_cast<AllocaInst*>(O1) != nullptr;
-        bool IsAlloca2 = dynamic_cast<AllocaInst*>(O2) != nullptr;
-        bool IsParam1 = Var1 && Var1->vartag == Variable::Param;
-        bool IsParam2 = Var2 && Var2->vartag == Variable::Param;
-        bool IsGlobal1 = Var1 && Var1->vartag == Variable::GlobalVariable;
-        bool IsGlobal2 = Var2 && Var2->vartag == Variable::GlobalVariable;
-        bool IsConst1 = Var1 && Var1->vartag == Variable::Constant;
-        bool IsConst2 = Var2 && Var2->vartag == Variable::Constant;
-
-        if (IsAlloca1 && IsAlloca2) {
-            return AliasInfo::NoAlias;
-        }
-        if ((IsGlobal1 || IsConst1) && (IsGlobal2 || IsConst2)) {
-            return AliasInfo::NoAlias;
-        }
-        if ((IsParam1 && IsAlloca2) || (IsParam2 && IsAlloca1)) {
-            return AliasInfo::NoAlias;
-        }
-        if ((IsAlloca1 && (IsGlobal2 || IsConst2)) ||
-            (IsAlloca2 && (IsGlobal1 || IsConst1))) {
-            return AliasInfo::NoAlias;
-        }
-        if (hasObjectNoAlias(O1, O2)) {
+        if (haveKnownDistinctUnderlyingObjects(O1, O2)) {
             return AliasInfo::NoAlias;
         }
 
@@ -612,8 +771,11 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     AliasInfo Result = AliasInfo::MayAlias;
     auto *G1 = dynamic_cast<GetElementPtrInst*>(V1);
     auto *G2 = dynamic_cast<GetElementPtrInst*>(V2);
-    if (G1 && G2) {
-        Result = aliasGEP(G1, G2, LI, UseIndexRange);
+    if (G1 || G2) {
+        // fillLinearGEP also accepts a plain pointer as a zero-offset
+        // expression, which lets BasicAA distinguish an object root from a
+        // constant non-zero GEP into that same object.
+        Result = aliasGEP(V1, V2, LI, UseIndexRange);
     } else if (auto *P1 = dynamic_cast<PhiInst*>(V1)) {
         Result = aliasPHI(P1, V2, LI, UseIndexRange);
     } else if (auto *P2 = dynamic_cast<PhiInst*>(V2)) {
@@ -632,7 +794,7 @@ PassID BasicAliasAnalysis::Key;
 
 BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
     BasicAAResult Result;
-    auto &LI = FAM.getResult<LoopAnalysis>(F);
+    (void)FAM;
 
     std::vector<unsigned> PointerParams;
     PointerParams.reserve(F.getParamCount());
@@ -660,7 +822,12 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
             for (CallInst* CI : Calls) {
                 Value* ArgI = CI->getArg(PI);
                 Value* ArgJ = CI->getArg(PJ);
-                if (!ArgI || !ArgJ || SeedAA.alias(ArgI, ArgJ, LI) != AliasInfo::NoAlias) {
+                // A NoAlias answer for the immediate access ranges is not an
+                // allocation-object fact.  In particular, &a[0] and &a[1]
+                // are disjoint i32 accesses but p + 1 may still equal q in
+                // the callee.  Promote only structurally distinct objects.
+                if (!ArgI || !ArgJ ||
+                    !SeedAA.haveKnownDistinctUnderlyingObjects(ArgI, ArgJ)) {
                     AllNoAlias = false;
                     break;
                 }
@@ -684,7 +851,8 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
             bool AllNoAlias = true;
             for (CallInst* CI : Calls) {
                 Value* Arg = CI->getArg(PI);
-                if (!Arg || SeedAA.alias(Arg, Global, LI) != AliasInfo::NoAlias) {
+                if (!Arg ||
+                    !SeedAA.haveKnownDistinctUnderlyingObjects(Arg, Global)) {
                     AllNoAlias = false;
                     break;
                 }

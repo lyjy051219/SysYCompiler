@@ -780,16 +780,17 @@ private:
 
 	Value *simplifyCmp(BinaryInst *BI, Value *LHS, Value *RHS) {
 		if (LHS->isConst() && RHS->isConst()) {
-			// BinaryInst prints all floating predicates as unordered fcmp.
-			// C++ comparisons used by foldConstants are ordered for NaN, so
-			// handle the unordered case explicitly.
+				// Strict SysY/C comparisons are ordered except !=.  Keep this
+				// explicit so every constant-folding entry point agrees with the
+				// textual IR and the RISC-V lowering.
 			if (IRType::isFloat(LHS->getIRType())) {
 				float LV = 0.0f;
 				float RV = 0.0f;
 				if (Value::tryGetFloatConst(LHS, LV) &&
 					Value::tryGetFloatConst(RHS, RV) &&
 					(std::isnan(LV) || std::isnan(RV))) {
-					return ConstBool::newConstBool(true);
+					return ConstBool::newConstBool(
+						BI->getOp() == BinaryInst::NE);
 				}
 			}
 			return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);

@@ -8,6 +8,45 @@
 
 PassID SCEVAnalysis::Key;
 
+namespace {
+
+// Resolve only SSA forwarding that is constant by construction.  This is not
+// mathematical constant folding: PHI/select forwarding cannot hide an
+// overflowing arithmetic operation, so the returned value is the exact IR
+// value on every incoming path.
+std::optional<int64_t> getTrivialExactIntConstant(
+    Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0) {
+    if (!V || Value::isUndef(V) || Depth > 32) return std::nullopt;
+    if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal();
+    if (!Active.insert(V).second) return std::nullopt;
+
+    std::optional<int64_t> Result;
+    if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
+        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+            Value *Incoming = Phi->getIncomingValue(I);
+            if (Incoming == V) continue;
+            auto C = getTrivialExactIntConstant(Incoming, Active, Depth + 1);
+            if (!C || (Result && *Result != *C)) {
+                Active.erase(V);
+                return std::nullopt;
+            }
+            Result = *C;
+        }
+    } else if (auto *Sel = dynamic_cast<SelectInst *>(V)) {
+        if (Sel->getNumOperands() >= 3) {
+            auto T = getTrivialExactIntConstant(
+                Sel->getOperand(1), Active, Depth + 1);
+            auto F = getTrivialExactIntConstant(
+                Sel->getOperand(2), Active, Depth + 1);
+            if (T && F && *T == *F) Result = *T;
+        }
+    }
+    Active.erase(V);
+    return Result;
+}
+
+} // namespace
+
 bool SCEVExpr::isRecurrence() const {
     SCEVExprKind K = Kind;
     return K == SCEVExprKind::AddRec ||
@@ -707,8 +746,12 @@ const SCEVExpr *SCEVResult::computeTripCount(const Loop *L) {
 
 const SCEVExpr *SCEVResult::tripFromComparison(const Loop *L, BinaryInst *Cmp,
                                                bool ContinueOnTrue) {
+    if (!L || !Cmp) return nullptr;
     LoopTripCountInfo Info;
     Info.L = L;
+    Info.Header = L->getHeader();
+    Info.ExitingBlock = Cmp->getParent();
+    L->getLoopSimplifyForm(Info.PreHeader, Info.Latch);
     Info.ExitCmp = Cmp;
     Info.ContinueOnTrue = ContinueOnTrue;
     if (!fillTripCountFromComparison(Info)) return nullptr;
@@ -873,12 +916,87 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
 
     if (!TC) return false;
 
-    // A latch test observes the value after the current iteration.  The
-    // comparison therefore counts taken backedges, while TripCount includes
-    // the first iteration that reached the latch.
-    if (Info.ExitingBlock && Info.ExitingBlock != Info.Header) {
+    // Classify the compared recurrence by SSA identity, not by the block that
+    // happens to contain the branch.  In particular, a one-block do-while has
+    // Header == Latch, so the old `ExitingBlock != Header` test treated a
+    // comparison of the backedge value as a zero-trip header test and was off
+    // by one.
+    bool ComparesExactHeaderPhi = false;
+    bool ComparesExactBackedgeUpdate = false;
+    if (auto *ComparedPhi = dynamic_cast<PhiInst *>(LHSVal)) {
+        auto ComparedAffine = getAffine(ComparedPhi);
+        if (ComparedPhi->getParent() == Info.Header && ComparedAffine &&
+            ComparedAffine->RecLoop == L &&
+            sameExpr(ComparedAffine->Start, Affine->Start) &&
+            sameExpr(ComparedAffine->Step, Affine->Step)) {
+            Info.IndVar = ComparedPhi;
+            ComparesExactHeaderPhi = true;
+        }
+    }
+
+    // A canonical latch test also commonly compares the exact backedge update
+    // (`next = phi +/- C`).  Associate it only when that very instruction is
+    // the unique in-loop incoming value of the candidate header PHI.  Merely
+    // having an equal SCEV step (for example `i + C` used only by the compare)
+    // is insufficient.
+    if (!Info.IndVar) {
+        auto *Update = dynamic_cast<BinaryInst *>(LHSVal);
+        PhiInst *Candidate = nullptr;
+        if (Update) {
+            Value *A = Update->getOperand(0);
+            Value *B = Update->getOperand(1);
+            auto *PA = dynamic_cast<PhiInst *>(A);
+            auto *PB = dynamic_cast<PhiInst *>(B);
+            auto *CA = dynamic_cast<ConstInt *>(A);
+            auto *CB = dynamic_cast<ConstInt *>(B);
+            if (Update->getOp() == BinaryInst::ADD) {
+                if (PA && CB) Candidate = PA;
+                else if (PB && CA) Candidate = PB;
+            } else if (Update->getOp() == BinaryInst::SUB && PA && CB) {
+                Candidate = PA;
+            }
+        }
+        if (Candidate && Candidate->getParent() == Info.Header) {
+            bool UpdateIsBackedge = false;
+            bool BadIncoming = false;
+            for (unsigned I = 0; I < Candidate->getNumIncomingValues(); ++I) {
+                BasicBlock *PredBB = Candidate->getIncomingBlock(I);
+                Value *Incoming = Candidate->getIncomingValue(I);
+                if (!PredBB || !Incoming) {
+                    BadIncoming = true;
+                    break;
+                }
+                if (L->contains(PredBB)) {
+                    if (UpdateIsBackedge || Incoming != Update ||
+                        (Info.Latch && PredBB != Info.Latch)) {
+                        BadIncoming = true;
+                        break;
+                    }
+                    UpdateIsBackedge = true;
+                }
+            }
+            auto CandidateAffine = getAffine(Candidate);
+            if (!BadIncoming && UpdateIsBackedge && CandidateAffine &&
+                CandidateAffine->RecLoop == L &&
+                sameExpr(CandidateAffine->Step, Affine->Step)) {
+                Info.IndVar = Candidate;
+                ComparesExactBackedgeUpdate = true;
+            }
+        }
+    }
+
+    // The distance derived from an exact backedge update counts successful
+    // continuations after the first iteration has already executed, so the
+    // first iteration must always be included -- even when Header == Latch.
+    // An exact header PHI needs the same adjustment only for a latch test; a
+    // normal header test can execute zero iterations.  Unknown affine aliases
+    // are rejected rather than assigned a guessed iteration phase.
+    if (ComparesExactBackedgeUpdate ||
+        (ComparesExactHeaderPhi && Info.ExitingBlock == Info.Latch)) {
         TC = add(TC, makeConstant(1, TC->Ty));
         if (!TC) return false;
+    } else if (!ComparesExactHeaderPhi) {
+        return false;
     }
 
     Info.Start = Start;
@@ -888,8 +1006,80 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     Info.ConstantTripCount = asConstant(TC);
     Info.IsRuntime = !Info.ConstantTripCount.has_value();
     Info.MayBeZeroTrip = !Info.ConstantTripCount || *Info.ConstantTripCount == 0;
-    Info.IndVar = findPhiForAffineRec(L, *Affine);
 
+    // Constant arithmetic above is mathematical arithmetic.  The source IR
+    // recurrence is signed i32 and may wrap, in which case that mathematical
+    // count is neither a termination proof nor a legal range fact.  For now we
+    // publish a no-wrap proof only when the comparison was tied to an exact
+    // header PHI/backedge update and the value at the modeled exit also fits
+    // i32.  Monotonicity then implies every intermediate recurrence value fits
+    // as well.
+    if ((Info.ExitingBlock == Info.Header ||
+         Info.ExitingBlock == Info.Latch) && Info.IndVar &&
+        Info.ConstantTripCount && *Info.ConstantTripCount >= 0) {
+        auto StepConst = asConstant(Affine->Step);
+        auto Ty = Info.IndVar->getIRType();
+        std::optional<int64_t> ExactStart;
+        Value *DirectUpdate = nullptr;
+        for (unsigned I = 0; I < Info.IndVar->getNumIncomingValues(); ++I) {
+            BasicBlock *PredBB = Info.IndVar->getIncomingBlock(I);
+            Value *Incoming = Info.IndVar->getIncomingValue(I);
+            if (!PredBB || !Incoming) {
+                ExactStart.reset();
+                DirectUpdate = nullptr;
+                break;
+            }
+            if (L->contains(PredBB)) {
+                if (DirectUpdate && DirectUpdate != Incoming) {
+                    DirectUpdate = nullptr;
+                    break;
+                }
+                DirectUpdate = Incoming;
+            } else {
+                std::unordered_set<Value *> Active;
+                auto C = getTrivialExactIntConstant(Incoming, Active);
+                if (!C || (ExactStart && *ExactStart != *C)) {
+                    ExactStart.reset();
+                    break;
+                }
+                ExactStart = *C;
+            }
+        }
+
+        // Confirm that the backedge is exactly `phi +/- ConstInt`; otherwise
+        // a mathematically folded invariant step could already have wrapped in
+        // the source IR before entering this recurrence.
+        std::optional<int64_t> DirectStep;
+        if (auto *Update = dynamic_cast<BinaryInst *>(DirectUpdate)) {
+            Value *A = Update->getOperand(0);
+            Value *B = Update->getOperand(1);
+            auto *CA = dynamic_cast<ConstInt *>(A);
+            auto *CB = dynamic_cast<ConstInt *>(B);
+            if (Update->getOp() == BinaryInst::ADD) {
+                if (A == Info.IndVar && CB) DirectStep = CB->getVal();
+                else if (B == Info.IndVar && CA) DirectStep = CA->getVal();
+            } else if (Update->getOp() == BinaryInst::SUB &&
+                       A == Info.IndVar && CB &&
+                       CB->getVal() != std::numeric_limits<int32_t>::min()) {
+                DirectStep = -static_cast<int64_t>(CB->getVal());
+            }
+        }
+
+        auto *DirectBound = dynamic_cast<ConstInt *>(RHSVal);
+        if (ExactStart && DirectBound && DirectStep && StepConst &&
+            *DirectStep == *StepConst && Ty && Ty->getEnum() == IR_INT &&
+            Ty->getIntegerBitWidth(32) == 32) {
+            const int64_t StartValue = *ExactStart;
+            const __int128 ExitValue = static_cast<__int128>(StartValue) +
+                static_cast<__int128>(*StepConst) *
+                    static_cast<__int128>(*Info.ConstantTripCount);
+            Info.ProvenNoWrap =
+                StartValue >= IntRange::I32_MIN &&
+                StartValue <= IntRange::I32_MAX &&
+                ExitValue >= IntRange::I32_MIN &&
+                ExitValue <= IntRange::I32_MAX;
+        }
+    }
     if (Info.ConstantTripCount) {
         int64_t BE = *Info.ConstantTripCount <= 0 ? 0 : *Info.ConstantTripCount - 1;
         Info.BackedgeTakenCount = makeConstant(BE, TC->Ty);
@@ -938,9 +1128,12 @@ PhiInst *SCEVResult::findPhiForAffineRec(const Loop *L,
         auto PhiAff = getAffine(Phi);
         if (!PhiAff || PhiAff->RecLoop != L) continue;
 
-        // Match the canonical header PHI for expressions such as i + c by
-        // requiring the same step and rejecting ambiguous same-step PHIs.
-        if (!sameExpr(PhiAff->Step, Affine.Step)) continue;
+        // An equal step is not enough: with two recurrences, or a comparison
+        // of `i + c`, it can associate the exit with the wrong header PHI.
+        // Consumers that rewrite CFG/iterations require the exact recurrence.
+        if (!sameExpr(PhiAff->Start, Affine.Start) ||
+            !sameExpr(PhiAff->Step, Affine.Step))
+            continue;
         if (Found && Found != Phi) return nullptr;
         Found = Phi;
     }
@@ -951,21 +1144,21 @@ PhiInst *SCEVResult::findPhiForAffineRec(const Loop *L,
 std::optional<int64_t>
 SCEVResult::getSmallConstantTripCount(const Loop *L) {
     auto Info = analyzeLoopTripCount(L);
-    if (!Info) return std::nullopt;
+    if (!Info || !Info->ProvenNoWrap) return std::nullopt;
     return Info->ConstantTripCount;
 }
 
 std::optional<int64_t>
 SCEVResult::getSmallConstantBackedgeTakenCount(const Loop *L) {
     auto Info = analyzeLoopTripCount(L);
-    if (!Info) return std::nullopt;
+    if (!Info || !Info->ProvenNoWrap) return std::nullopt;
     return Info->ConstantBackedgeTakenCount;
 }
 
 std::optional<int64_t>
 SCEVResult::getSmallConstantTripMultiple(const Loop *L) {
     auto Info = analyzeLoopTripCount(L);
-    if (!Info) return std::nullopt;
+    if (!Info || !Info->ProvenNoWrap) return std::nullopt;
     if (!Info->ConstantTripCount) return 1;
 
     int64_t C = *Info->ConstantTripCount;
@@ -977,7 +1170,7 @@ SCEVResult::getSmallConstantTripMultiple(const Loop *L) {
 bool SCEVResult::isTripCountMultipleOf(const Loop *L, int64_t Factor) {
     if (Factor <= 0) return false;
     auto Info = analyzeLoopTripCount(L);
-    if (!Info || !Info->ConstantTripCount) return false;
+    if (!Info || !Info->ProvenNoWrap || !Info->ConstantTripCount) return false;
     return (*Info->ConstantTripCount % Factor) == 0;
 }
 
@@ -985,7 +1178,13 @@ std::optional<LoopRemainderInfo>
 SCEVResult::getRemainderInfo(const Loop *L, int64_t Factor) {
     if (!L || Factor <= 1) return std::nullopt;
     auto TCInfo = analyzeLoopTripCount(L);
-    if (!TCInfo || !TCInfo->TripCount) return std::nullopt;
+    if (!TCInfo || !TCInfo->TripCount)
+        return std::nullopt;
+    // A constant mathematical count must never be consumed when the i32
+    // recurrence can wrap.  Runtime consumers may add a contextual proof at
+    // the exact expansion point, which SCEV itself cannot see.
+    if (TCInfo->ConstantTripCount && !TCInfo->ProvenNoWrap)
+        return std::nullopt;
 
     LoopRemainderInfo Info;
     Info.L = L;
@@ -1158,11 +1357,19 @@ SCEVResult::getLoopInductions() {
             Info.initial = *Aff->ConstantStart;
             Info.step = *Aff->ConstantStep;
 
-            if (const SCEVExpr *TC = getTripCount(Aff->RecLoop)) {
-                if (auto C = asConstant(TC)) {
-                    if (*C > 0) {
+            if (auto TCI = analyzeLoopTripCount(Aff->RecLoop)) {
+                if (TCI->ProvenNoWrap && TCI->ConstantTripCount) {
+                    const int64_t C = *TCI->ConstantTripCount;
+                    if (C > 0) {
+                        const __int128 Last = static_cast<__int128>(Info.initial) +
+                            static_cast<__int128>(Info.step) *
+                                static_cast<__int128>(C - 1);
+                        if (Last < IntRange::I32_MIN ||
+                            Last > IntRange::I32_MAX)
+                            continue;
                         Info.hasUpperBound = true;
-                        Info.upperBound = Info.initial + Info.step * (*C - 1);
+                        Info.noWrap = true;
+                        Info.upperBound = static_cast<int64_t>(Last);
                     }
                 }
             }

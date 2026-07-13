@@ -30,15 +30,16 @@ class Loop;
 //
 // 【范围表示】
 // 整数：IntRange，用 int64_t 存 i32 范围避免算术溢出
-// 浮点：FloatRange，用 double 存 float 范围，用 ±infinity 表示 Top
-//        对 NaN 输入保守处理为 Top
+// 浮点：FloatRange 用 double 存 f32 数值包络，并显式跟踪 NaN
+//        与 +/-0。这些状态不能只靠 [min,max] 表示：NaN 不参与
+//        有序比较，而 +0/-0 在数值上相等但可被后续除法区分。
 // 两者不走模板——分开写更清晰，也和别家实现保持结构差异
 //
 // 【上下文追踪】
-// solver 内部会推导分支/GEP contextual fact，但这些 fact 可能早于 global
-// lattice 收敛。目前在返回 transform-facing RangeInfo 前统一清空，待实现
-// “用最终 global fact 重建 contextual”后再开放；SCEV 的显式 loop-local hint
-// 仍通过独立的 BlockLocalRanges 提供。
+// solver 内部的临时分支/GEP fact 可能早于 global lattice 收敛。
+// 求解完成后会丢弃这些临时状态，再从当前 CFG 和最终 global fact
+// 线性重建整数 contextual fact，避免把收敛前的过窄约束暴露给变换。
+// SCEV 的显式 loop-local hint 仍通过独立的 BlockLocalRanges 提供。
 //
 // 【收敛保证】
 // 每个值的范围更新次数累计超过 32 次时，直接 widen 到 Top 并锁定不再变窄
@@ -53,18 +54,17 @@ class Loop;
 // 轮次由一个 O(instCount * 4) 预算硬兜底；若预算耗尽，整份变换可见结果
 // 降级为 Top，绝不暴露部分 narrowing 的下近似。
 //
-// 【GEP 索引约束】
-// visitGEP 对每个 ARRAYType 维度给索引加 contextual 约束 [0, count-1]。
-// SysY 无 UB 假设：执行到 arr[i] 意味着 i 在边界内。约束通过支配关系
-// 传播到被 GEP 块支配的所有使用。
+// GEP/Load/Store 不作为值范围证明。仅因程序执行了
+// arr[i] 就假定 i 合法，属于利用源程序未定义行为，不能
+// 用于竞赛优化。变换可见范围只来自显式分支事实和
+// SCEV 已证明的有限循环归纳范围。
 //
-// 【跨函数 Return Range 传播】
-// 文件内 static 的 InterprocCache 记录每个 Function 的 RetRanges。
-// 分析 F 时用 Top 参数（保守）；publishReturnRange 把所有 RetInst 的操作数
-// union 作为 F 的返回值 range 写入 cache。后续分析 H 时若调用 F，直接
-// 从 cache 拿 Ret range 代替 Top。
-// 重要：一律不 seed 参数 —— 若用"所有 call site 实参 union"做参数初值，
-// 会让函数被偏紧参数分析，导致返回值被低估（验证为 WA 的正确性 bug）。
+// 【跨函数 Return Range】
+// Function analysis cache 没有 module/call-graph proxy，callee IR 改写后
+// caller 可能先重算并读到旧的 singleton summary。因此当前版本
+// 不消费 process-static return cache：用户函数调用结果一律 Top。
+// 只有实现 Module 级 call-graph SCC fixed-point 和正确 invalidation proxy
+// 后才能重新开启。内联后的函数内 range 优化不受影响。
 // =====================================================================
 
 // ---------------------------------------------------------------------
@@ -265,17 +265,19 @@ struct KnownBits {
     KnownBits add(const KnownBits &o) const {
         int tz = std::min(getTrailingZeros(), o.getTrailingZeros());
         if (tz == 0) return top();
+        if (tz >= 32) return {~0u, 0};
         return {(uint32_t)((1u << tz) - 1), 0};
     }
     KnownBits sub(const KnownBits &o) const {
         int tz = std::min(getTrailingZeros(), o.getTrailingZeros());
         if (tz == 0) return top();
+        if (tz >= 32) return {~0u, 0};
         return {(uint32_t)((1u << tz) - 1), 0};
     }
     // mul：trailing zeros 相加；其余位全退 unknown
     KnownBits mul(const KnownBits &o) const {
         int tz = getTrailingZeros() + o.getTrailingZeros();
-        if (tz >= 32) tz = 31;
+        if (tz >= 32) return {~0u, 0};
         if (tz == 0) return top();
         return {(uint32_t)((1u << tz) - 1), 0};
     }
@@ -286,47 +288,95 @@ struct KnownBits {
 
 // ---------------------------------------------------------------------
 // 浮点范围
-// 用 double 存 float 的 [min, max]，±infinity 表示 Top 端点。
-// NaN 输入一律保守处理为 Top（-inf, +inf）。
+//
+// [min,max] 只包络非 NaN 数值。mayNaN 单独表示 NaN 成员；
+// mayPositiveZero/mayNegativeZero 保留 IEEE-754 零的符号。所有
+// transform-facing 的“单值”证明都必须同时排除 NaN/Inf，并且
+// 对数值 0 只能有一种符号。
 // ---------------------------------------------------------------------
 struct FloatRange {
     double min;
     double max;
+    bool mayNaN;
+    bool mayPositiveZero;
+    bool mayNegativeZero;
 
     static constexpr double F_MIN_INF() { return -std::numeric_limits<double>::infinity(); }
     static constexpr double F_MAX_INF() { return std::numeric_limits<double>::infinity(); }
 
-    FloatRange() : min(F_MIN_INF()), max(F_MAX_INF()) {}
+    // Top: any f32 value, including NaN and either signed zero.
+    FloatRange()
+        : min(F_MIN_INF()), max(F_MAX_INF()), mayNaN(true),
+          mayPositiveZero(true), mayNegativeZero(true) {}
+
+    // Exact IEEE value.  In particular this preserves the sign of zero and
+    // represents an exact NaN as "NaN-only", not as an unconstrained number.
     explicit FloatRange(double val)
-        : min(std::isnan(val) ? F_MIN_INF() : val),
-          max(std::isnan(val) ? F_MAX_INF() : val) {}
+        : min(val), max(val), mayNaN(std::isnan(val)),
+          mayPositiveZero(false), mayNegativeZero(false) {
+        if (mayNaN) {
+            min = 1.0;
+            max = 0.0;
+        } else if (val == 0.0) {
+            mayNegativeZero = std::signbit(val);
+            mayPositiveZero = !mayNegativeZero;
+        }
+    }
+
+    // Numeric interval known not to contain NaN.  An interval boundary at
+    // numerical zero cannot distinguish its sign, so both zeros are retained.
     FloatRange(double lo, double hi) {
         if (std::isnan(lo) || std::isnan(hi)) {
             min = F_MIN_INF();
             max = F_MAX_INF();
+            mayNaN = true;
+            mayPositiveZero = true;
+            mayNegativeZero = true;
         } else {
             min = lo;
             max = hi;
+            mayNaN = false;
+            bool ContainsZero = lo <= 0.0 && hi >= 0.0;
+            mayPositiveZero = ContainsZero;
+            mayNegativeZero = ContainsZero;
         }
     }
 
-    bool isTop() const { return min == F_MIN_INF() && max == F_MAX_INF(); }
-    bool isBottom() const { return min > max; }
-    bool isSingleValue() const { return min == max && !isBottom() &&
-                                        !std::isinf(min); }
-    bool isNonNegative() const { return !isBottom() && min >= 0.0; }
-
-    FloatRange unionWith(const FloatRange &other) const {
-        if (isBottom()) return other;
-        if (other.isBottom()) return *this;
-        return FloatRange(std::min(min, other.min), std::max(max, other.max));
+    bool hasNumericValues() const { return min <= max; }
+    bool mayContainNaN() const { return mayNaN; }
+    bool containsZero() const {
+        return hasNumericValues() && min <= 0.0 && max >= 0.0 &&
+               (mayPositiveZero || mayNegativeZero);
+    }
+    bool mayContainInfinity() const {
+        return hasNumericValues() && (std::isinf(min) || std::isinf(max));
+    }
+    bool isTop() const {
+        return min == F_MIN_INF() && max == F_MAX_INF() && mayNaN &&
+               mayPositiveZero && mayNegativeZero;
+    }
+    bool isBottom() const { return !hasNumericValues() && !mayNaN; }
+    bool isNaNOnly() const { return !hasNumericValues() && mayNaN; }
+    bool isExactNumericValue() const {
+        if (mayNaN || !hasNumericValues() || min != max) return false;
+        if (min != 0.0) return true;
+        return mayPositiveZero != mayNegativeZero;
+    }
+    bool isSingleValue() const {
+        return isExactNumericValue() && !std::isinf(min);
+    }
+    bool isNonNegative() const {
+        return !mayNaN && hasNumericValues() && min >= 0.0;
     }
 
-    FloatRange intersectWith(const FloatRange &other) const {
-        return FloatRange(std::max(min, other.min), std::min(max, other.max));
-    }
+    FloatRange unionWith(const FloatRange &other) const;
+    FloatRange intersectWith(const FloatRange &other) const;
 
-    bool operator==(const FloatRange &o) const { return min == o.min && max == o.max; }
+    bool operator==(const FloatRange &o) const {
+        return min == o.min && max == o.max && mayNaN == o.mayNaN &&
+               mayPositiveZero == o.mayPositiveZero &&
+               mayNegativeZero == o.mayNegativeZero;
+    }
     bool operator!=(const FloatRange &o) const { return !(*this == o); }
 
     FloatRange add(const FloatRange &rhs) const;
@@ -334,8 +384,14 @@ struct FloatRange {
     FloatRange mul(const FloatRange &rhs) const;
     FloatRange fdiv(const FloatRange &rhs) const;
 
-    static FloatRange sanitize(double Lo, double Hi);
-    static FloatRange bottom() { return FloatRange(1.0, 0.0); }
+    static FloatRange sanitize(double Lo, double Hi, bool MayNaN = false);
+    static FloatRange bottom() {
+        FloatRange R(1.0, 0.0);
+        R.mayNaN = false;
+        R.mayPositiveZero = false;
+        R.mayNegativeZero = false;
+        return R;
+    }
 };
 
 // ---------------------------------------------------------------------
@@ -348,16 +404,10 @@ struct LoopInductionInfo {
     int64_t step;        // 每轮增量
     bool hasUpperBound;  // 是否已知上界
     int64_t upperBound;  // 上界（有效当且仅当 hasUpperBound）
+    bool noWrap;         // 活动迭代中的递推已证明不回绕
 
     LoopInductionInfo() : RecLoop(nullptr), initial(0), step(0),
-                          hasUpperBound(false), upperBound(0) {}
-};
-
-struct InterprocRangeCache {
-    std::unordered_map<Function*, IntRange> RetRanges;
-    std::unordered_map<Function*, FloatRange> FloatRetRanges;
-
-    static InterprocRangeCache &get();
+                          hasUpperBound(false), upperBound(0), noWrap(false) {}
 };
 
 // ---------------------------------------------------------------------
@@ -369,6 +419,12 @@ public:
     std::unordered_map<Value*, IntRange> GlobalRanges;
     // 整数 per-block contextual 范围
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> ContextualRanges;
+    // 最终 CFG 上的边事实。和 per-block 事实分开存储，因为
+    // loop header 等多前驱块不能把某一条入边的条件当成
+    // 整块上下文。键结构为 value -> pred -> succ -> fact。
+    std::unordered_map<
+        Value*, std::unordered_map<
+            BasicBlock*, std::unordered_map<BasicBlock*, IntRange>>> EdgeRanges;
     // 只在精确 ctxBlock 生效的局部范围提示；不沿支配树继承
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> BlockLocalRanges;
 
@@ -380,6 +436,9 @@ public:
     // KnownBits（和 IntRange 并行的位级事实）
     std::unordered_map<Value*, KnownBits> GlobalBits;
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, KnownBits>> ContextualBits;
+    std::unordered_map<
+        Value*, std::unordered_map<
+            BasicBlock*, std::unordered_map<BasicBlock*, KnownBits>>> EdgeBits;
 
     // SCEV 归纳变量信息。RangeAnalysis 当前只把它作为查询期的局部上下文提示，
     // 不用它覆盖 PHI 的全局范围。

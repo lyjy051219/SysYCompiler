@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/opt/NewPassManager.hpp"
@@ -52,7 +53,9 @@ struct UnrollConfig {
     int MaxLoopBodyCostForRuntime = 48;
 
     int MaxPeelCount = 2;
+    int MaxGuardedPeelCount = 1;
     int PeelThreshold = 64;
+    int MaxPeelBlocks = 24;
 
     int SCEVExpansionBudget = 8;
     bool AllowExpensiveTripCount = false;
@@ -67,6 +70,17 @@ struct UnrollDecision {
     bool NeedRemainder = false;
     bool IsRuntime = false;
     bool IsPeeling = false;
+    // Required by runtime count materialization.  This may come from a global
+    // SCEV no-wrap proof or from contextual ranges at the loop preheader.
+    bool TripCountIsProven = false;
+
+    // A guarded peel may prove that a non-IV header PHI reaches an
+    // outer-loop-invariant fixed point after the peeled iteration.  Keeping
+    // the proof result in the decision lets executePeeling specialize only
+    // the residual loop; cloned first-iteration uses have already been
+    // remapped to the original initial value.
+    PhiInst *StabilizedPhi = nullptr;
+    Value *StabilizedValue = nullptr;
 
     std::string Reason;
 };
@@ -143,7 +157,9 @@ public:
                                      Loop *L,
                                      LoopInfo &LI,
                                      DominatorTree &DT,
-                                     SCEVResult &SE);
+                                     SCEVResult &SE,
+                                     BasicAAResult &AA,
+                                     RangeInfo &RI);
 
     bool isCanonicalLoop(Loop *L) const;
     bool canCloneLoopBody(Loop *L, LoopInfo &LI) const;
@@ -163,7 +179,10 @@ public:
                                          int BodyCost,
                                          const UnrollConfig &Config,
                                          LoopInfo &LI,
-                                         SCEVResult &SE) const;
+                                         SCEVResult &SE,
+                                         BasicAAResult &AA,
+                                         RangeInfo &RI,
+                                         DominatorTree &DT) const;
 
     LoopUnrollResult executeFullUnroll(Loop *L,
                                        const UnrollDecision &Decision,
@@ -193,7 +212,8 @@ public:
                                     const UnrollDecision &Decision,
                                     SCEVResult &SE,
                                     LoopInfo &LI,
-                                    DominatorTree &DT);
+                                    DominatorTree &DT,
+                                    BasicAAResult &AA);
 
 private:
     UnrollConfig Config;
@@ -259,9 +279,13 @@ private:
     static bool rewriteOriginalHeaderPhisForPartial(
         UnrolledBodyCore &Core, int LastIter,
         std::unordered_map<PhiInst *, Value *> *Replacements = nullptr);
-    static bool rewriteOriginalHeaderPhisAfterPeeling(PeeledBodyCore &Core);
+    static bool rewriteOriginalHeaderPhisAfterPeeling(
+        PeeledBodyCore &Core, bool ValidateOnly = false,
+        std::unordered_map<PhiInst *, Value *> *Replacements = nullptr);
     static bool removeIncomingFromExitPhisForPeeledBlocks(
-        PeeledBodyCore &Core);
+        PeeledBodyCore &Core, bool ValidateOnly = false);
+    static bool addIncomingToExitPhisForPeeledBlocks(
+        PeeledBodyCore &Core, bool ValidateOnly = false);
     static bool hasLatchExitShape(const UnrolledBodyCore &Core);
     static std::unordered_set<BasicBlock *> collectCoreExitings(
         const UnrolledBodyCore &Core);
@@ -325,4 +349,18 @@ private:
     static LoopUnrollResult executeUnrollWithTail(
         Loop *L, int MainCount, int TailCopies, Value *NumGroups,
         Value *RemainderValue, bool IsRuntime, SCEVResult &SE);
+};
+
+// A peeling-only entry point for an early loop-specialization phase.  It
+// deliberately shares the generic LoopUnroll implementation and legality
+// checks; the separate descriptor merely lets PassBuilder schedule peeling
+// before the heavier unroll decisions without recognizing source names or
+// benchmark-specific patterns.
+class LoopPeelingPass : public PassDescriptor<LoopPeelingPass> {
+public:
+    explicit LoopPeelingPass(UnrollConfig Config = UnrollConfig());
+    PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+    LoopUnrollPass Impl;
 };

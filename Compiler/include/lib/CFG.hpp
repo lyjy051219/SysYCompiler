@@ -224,6 +224,7 @@ class BuildInFunction : public Value{
     static bool isSupportedName(const std::string &Name);
     static bool isKnownRuntimeName(const std::string &Name);
     static bool isMemcpyName(const std::string &Name);
+    static bool isMemsetName(const std::string &Name);
     static bool isTimingName(const std::string &Name);
     static bool isScalarIOName(const std::string &Name);
     static bool isScalarOutputName(const std::string &Name);
@@ -231,6 +232,7 @@ class BuildInFunction : public Value{
     static bool isArrayOutputName(const std::string &Name);
     static bool isOutputName(const std::string &Name);
     static const char *getDefaultMemcpyName();
+    static const char *getDefaultMemsetName();
     std::string getIdent() const { return ident;}
 };
 

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <functional>
 #include <queue>
+#include <tuple>
 #include <utility>
 
 bool ExprKey::operator==(const ExprKey &RHS) const {
@@ -1122,6 +1123,127 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
         return PreservationStatus::all();
     }
 
+    PreservationStatus PA;
+    PA.keep<DominantAnalysis>();
+    PA.keep<PostDominantAnalysis>();
+    PA.keep<LoopAnalysis>();
+    PA.discard<BasicAliasAnalysis>();
+    PA.discard<SideEffectAnalysis>();
+    return PA;
+}
+
+namespace {
+
+struct LocalExprKey {
+    unsigned Opcode = 0;
+    unsigned SubOpcode = 0;
+    const IRType *ResultType = nullptr;
+    std::vector<Value *> Operands;
+
+    bool operator==(const LocalExprKey &Other) const {
+        return Opcode == Other.Opcode && SubOpcode == Other.SubOpcode &&
+               ResultType == Other.ResultType && Operands == Other.Operands;
+    }
+};
+
+struct LocalExprKeyHash {
+    std::size_t operator()(const LocalExprKey &K) const {
+        std::size_t H = static_cast<std::size_t>(K.Opcode);
+        auto mix = [&](std::size_t V) {
+            H ^= V + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+        };
+        mix(static_cast<std::size_t>(K.SubOpcode));
+        mix(reinterpret_cast<std::uintptr_t>(K.ResultType));
+        for (Value *V : K.Operands)
+            mix(reinterpret_cast<std::uintptr_t>(V));
+        return H;
+    }
+};
+
+bool buildLocalExprKey(Instruction *I, LocalExprKey &K) {
+    if (!I || !I->getIRType() || I->getIRType()->getEnum() == IR_VOID)
+        return false;
+
+    K = LocalExprKey{};
+    K.Opcode = static_cast<unsigned>(I->instType);
+    K.ResultType = I->getIRType().get();
+
+    if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
+        Value *LHS = nullptr;
+        Value *RHS = nullptr;
+        if (!BinaryInst::getOperands(BI, LHS, RHS) || !LHS || !RHS ||
+            Value::isUndef(LHS) || Value::isUndef(RHS)) {
+            return false;
+        }
+        K.SubOpcode = static_cast<unsigned>(BI->getOp());
+        K.Operands = {LHS, RHS};
+        if (BinaryInst::isCommutativeOp(BI->getOp()) &&
+            std::less<Value *>{}(K.Operands[1], K.Operands[0])) {
+            std::swap(K.Operands[0], K.Operands[1]);
+        }
+        return true;
+    }
+
+    switch (I->instType) {
+    case Instruction::GEP:
+    case Instruction::SELECT:
+    case Instruction::TRUNC:
+    case Instruction::ZEXT:
+    case Instruction::SEXT:
+    case Instruction::FPTOSI:
+    case Instruction::SITOFP:
+    case Instruction::BITCAST:
+        break;
+    default:
+        return false;
+    }
+
+    K.Operands.reserve(I->getNumOperands());
+    for (size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+        Value *Operand = I->getOperand(Index);
+        if (!Operand || Value::isUndef(Operand)) return false;
+        K.Operands.push_back(Operand);
+    }
+    return !K.Operands.empty();
+}
+
+} // namespace
+
+PreservationStatus LocalGVNPass::run(Function &F,
+                                     FunctionAnalysisPassManager &) {
+    bool Changed = false;
+
+    for (BasicBlock *BB : F) {
+        if (!BB) continue;
+        std::unordered_map<LocalExprKey, Instruction *, LocalExprKeyHash> Leaders;
+
+        std::vector<Instruction *> Insts;
+        for (Instruction *I : *BB) Insts.push_back(I);
+
+        for (Instruction *I : Insts) {
+            if (!I || I->getParent() != BB) continue;
+            LocalExprKey Key;
+            if (!buildLocalExprKey(I, Key)) continue;
+
+            auto It = Leaders.find(Key);
+            if (It == Leaders.end()) {
+                Leaders.emplace(std::move(Key), I);
+                continue;
+            }
+
+            Instruction *Leader = It->second;
+            if (!Leader || Leader->getParent() != BB || Leader == I) {
+                It->second = I;
+                continue;
+            }
+
+            I->replaceAllUsesWith(Leader);
+            delete I;
+            Changed = true;
+        }
+    }
+
+    if (!Changed) return PreservationStatus::all();
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

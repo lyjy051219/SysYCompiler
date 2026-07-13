@@ -1,306 +1,276 @@
 #include "ir/opt/LoopDeletion.hpp"
-#include "ir/analysis/BasicAliasAnalysis.hpp"
-#include "ir/analysis/Dominant.hpp"
+
 #include "ir/analysis/LoopInfo.hpp"
-#include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SCEV.hpp"
-#include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 
-#include <functional>
-#include <utility>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-PreservationStatus LoopDeletionPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-	auto& DT = FAM.getResult<DominantAnalysis>(F);
-	auto& LI = FAM.getResult<LoopAnalysis>(F);
-	auto& AA = FAM.getResult<BasicAliasAnalysis>(F);
+namespace {
 
-	bool Changed = false;
+using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;
 
-	std::vector<Loop*> PostOrderLoops = LI.getLoopsInPostOrder(true);
-    //TopLevel+后序遍历所有循环
-	for (Loop* L : PostOrderLoops) {
-		if (!L || !L->getHeader()) continue;
-		if (L->getHeader()->getParent() != &F) continue;
-		if (!L->getSubLoops().empty()) continue;
+std::vector<BasicBlock *> collectLoopBlocks(Loop *L, Function *F) {
+    std::vector<BasicBlock *> Result;
+    if (!L || !F) return Result;
+    std::unordered_set<BasicBlock *> InLoop;
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops())
+        if (BB && BB->getParent() == F) InLoop.insert(BB);
 
-		// 1) 必须满足 LCSSA
-		if (!LCSSAPass::isLCSSAForm(L)) continue;
+    // Function order makes deletion deterministic and avoids dereferencing
+    // loop-analysis nodes after their blocks have been destroyed.
+    for (BasicBlock *BB : *F)
+        if (InLoop.count(BB)) Result.push_back(BB);
+    return Result;
+}
 
-		// 2) 必须满足 LoopSimplify，并拿到 PreHeader/Latch
-		BasicBlock* PreHeader = nullptr;
-		BasicBlock* Latch = nullptr;
-		if (!L->getLoopSimplifyForm(PreHeader, Latch)) continue;
-		if (!PreHeader) continue;
+bool isSafeToSkipOnZeroTrip(Instruction *I) {
+    if (!I) return false;
+    if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
+    // Use the same exceptional/undefined-input policy as DCE/ADCE.  A loop
+    // deletion must not remove an FPTOSI, div/rem, load, or an unproved shift
+    // merely because its SSA result is dead.
+    if (dceInstructionMustBePreserved(I)) return false;
+    if (dynamic_cast<BinaryInst *>(I)) return true;
+    if (dynamic_cast<SelectInst *>(I) ||
+        dynamic_cast<GetElementPtrInst *>(I)) {
+        return true;
+    }
+    switch (I->instType) {
+    case Instruction::TRUNC:
+    case Instruction::ZEXT:
+    case Instruction::SEXT:
+    case Instruction::FPTOSI:
+    case Instruction::SITOFP:
+    case Instruction::BITCAST:
+        return true;
+    default:
+        // Calls, memory operations, allocation and returns may be observable,
+        // trap, or fail to return.  The IR has no speculatable/willreturn
+        // attributes, so skipping them would be a guess.
+        return false;
+    }
+}
 
-		// 3) 先获取 ExitBlock 列表
-		auto ExitBlocks = L->getExitBlocks();
-		if (ExitBlocks.empty()) continue;
-		BasicBlock* ExitBlock = (ExitBlocks.size() == 1) ? ExitBlocks.front() : nullptr;
+bool hasNoObservableLoopInstruction(Loop *L) {
+    if (!L) return false;
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I) return false;
+            if (!isSafeToSkipOnZeroTrip(I)) return false;
+        }
+    }
+    return true;
+}
 
-		// 4) 循环永远不执行：检查不可进入时直接删
-		bool CanEnter = true;
-	    if (F.front() == PreHeader) {
-			CanEnter = true;
-		} else {
-			auto Preds = PreHeader->getPredecessors();
-			for (BasicBlock* Pred : Preds) {
-				if (!Pred || Pred->Size() == 0) {
-					CanEnter = true;
-					break;
-				}
-				auto *Br = dynamic_cast<BrInst *>(Pred->back());
-				if (!Br) {
-					CanEnter = true;
-					break;
-				}
+Value *resolveZeroTripValue(Value *V, Loop *L, BasicBlock *PreHeader,
+                            std::unordered_set<Value *> &Active) {
+    if (!V || !L || !PreHeader) return nullptr;
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I || !I->getParent() || !L->contains(I->getParent())) return V;
 
-				if (!Br->isConditional()) {
-					CanEnter = true;
-					break;
-				}
+    // On the zero-trip edge only a header PHI has an unambiguous value: its
+    // preheader incoming.  Do not try to symbolically execute arbitrary
+    // header instructions here.
+    auto *Phi = dynamic_cast<PhiInst *>(I);
+    if (!Phi || Phi->getParent() != L->getHeader()) return nullptr;
+    if (!Active.insert(V).second) return nullptr;
+    Value *Incoming = Phi->getIncomingFromPred(PreHeader);
+    Value *Resolved = resolveZeroTripValue(Incoming, L, PreHeader, Active);
+    Active.erase(V);
+    return Resolved;
+}
 
-				Value* Cond = Br->getCondition();
-				auto* TrueBB = Br->getTrueSuccessor();
-				auto* FalseBB = Br->getFalseSuccessor();
-				if (!TrueBB || !FalseBB) {
-					CanEnter = true;
-					break;
-				}
+bool planZeroTripPhiReplacements(Loop *L,
+                                 const LoopTripCountInfo &TCI,
+                                 PhiReplacementMap &Plan) {
+    if (!L || !TCI.PreHeader || !TCI.ExitingBlock || !TCI.ExitBlock)
+        return false;
 
-				bool CondVal = false;
-				if (!Cond || !Cond->tryGetBoolConst(CondVal)) {
-					CanEnter = true;
-					break;
-				}
+    for (PhiInst *Phi : TCI.ExitBlock->collectPhiNodes()) {
+        if (!Phi) return false;
+        Value *OnExit = Phi->getIncomingFromPred(TCI.ExitingBlock);
+        if (!OnExit) return false;
+        std::unordered_set<Value *> Active;
+        Value *Replacement =
+            resolveZeroTripValue(OnExit, L, TCI.PreHeader, Active);
+        if (!Replacement || !Replacement->getIRType() ||
+            !Phi->getIRType() ||
+            Replacement->getIRType()->getEnum() !=
+                Phi->getIRType()->getEnum() ||
+            Replacement->getIRType()->getSize() !=
+                Phi->getIRType()->getSize()) {
+            return false;
+        }
+        Plan[Phi] = Replacement;
+    }
+    return true;
+}
 
-				BasicBlock* Taken = CondVal ? TrueBB : FalseBB;
-				if (Taken == PreHeader) {
-					CanEnter = true;
-					break;
-				}
+bool planDeadLoopPhiReplacements(Loop *L, BasicBlock *Exit,
+                                 PhiReplacementMap &Plan) {
+    if (!L || !Exit) return false;
+    for (PhiInst *Phi : Exit->collectPhiNodes()) {
+        if (!Phi) return false;
+        unsigned N = Phi->getNumIncomingValues();
+        if (N == 0) {
+            Plan[Phi] = UndefValue::NewUndefValue(Phi->getIRType());
+            continue;
+        }
 
-				CanEnter = false;
-			}
-		}
+        Value *Keep = Phi->getIncomingValue(0);
+        if (!Keep) return false;
+        for (unsigned I = 1; I < N; ++I)
+            if (Phi->getIncomingValue(I) != Keep) return false;
 
-		if (!CanEnter) {
-			if (PreHeader->Size() > 0) {
-				if (Instruction* OldTerm = PreHeader->back()) {
-					delete OldTerm;
-				}
-			}
-			PreHeader->genUnCondInst(ExitBlock);
+        auto *Def = dynamic_cast<Instruction *>(Keep);
+        if (Def && Def->getParent() && L->contains(Def->getParent()))
+            return false;
+        Plan[Phi] = Keep;
+    }
+    return true;
+}
 
-			auto ExitPhis = ExitBlock->collectPhiNodes();
-			for (PhiInst* Phi : ExitPhis) {
-				if (!Phi) continue;
-				unsigned N = Phi->getNumIncomingValues();
-				if (N == 0) {
-					Phi->replaceAllUsesWith(UndefValue::NewUndefValue(Phi->getIRType()));
-					delete Phi;
-					continue;
-				}
+bool outsideUsesAreCovered(
+    Loop *L, const std::vector<BasicBlock *> &Blocks,
+    const PhiReplacementMap &Plan) {
+    if (!L) return false;
+    for (BasicBlock *BB : Blocks) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I) return false;
+            for (auto It = I->getUseList().begin();
+                 It != I->getUseList().end(); ++It) {
+                Use *U = *It;
+                if (!U || U->getValue() != I) continue;
+                auto *UserI = dynamic_cast<Instruction *>(U->getUser());
+                if (!UserI || !UserI->getParent()) return false;
+                if (L->contains(UserI->getParent())) continue;
+                auto *Phi = dynamic_cast<PhiInst *>(UserI);
+                if (!Phi || !Plan.count(Phi)) return false;
+            }
+        }
+    }
+    return true;
+}
 
-				Value* KeepV = Phi->getIncomingValue(0);
-				auto* NewPhi = new PhiInst(Phi->getIRType());
-				NewPhi->addIncoming(KeepV, PreHeader);
-				Phi->replaceAllUsesWith(NewPhi);
-				Phi->replaceWith(NewPhi);
-				delete Phi;
-			}
+void applyPhiReplacements(const PhiReplacementMap &Plan) {
+    for (const auto &KV : Plan) {
+        PhiInst *Phi = KV.first;
+        Value *Replacement = KV.second;
+        if (Phi && Replacement) Phi->replaceAllUsesWith(Replacement);
+    }
+    for (const auto &KV : Plan)
+        if (KV.first) delete KV.first;
+}
 
-			std::vector<BasicBlock*> LoopBlocks;
-			std::vector<Loop*> Stack;
-			Stack.push_back(L);
-			std::unordered_set<BasicBlock*> Seen;
-			while (!Stack.empty()) {
-				Loop* Cur = Stack.back();
-				Stack.pop_back();
-				if (!Cur) continue;
-				for (BasicBlock* BB : Cur->getBlocks()) {
-					if (BB && BB->getParent() == &F &&
-						Seen.insert(BB).second) {
-						LoopBlocks.push_back(BB);
-					}
-				}
-				for (Loop* Sub : Cur->getSubLoops()) {
-					if (Sub) Stack.push_back(Sub);
-				}
-			}
+bool deleteLoopCFG(Loop *L, Function &F, BasicBlock *PreHeader,
+                   BasicBlock *Exit,
+                   const std::vector<BasicBlock *> &LoopBlocks,
+                   const PhiReplacementMap &PhiPlan) {
+    if (!L || !PreHeader || !Exit || LoopBlocks.empty()) return false;
+    auto *OldTerm = PreHeader->getBranchTerminator();
+    if (!BasicBlock::isUncondBr(OldTerm) ||
+        OldTerm->getSuccessor(0) != L->getHeader()) {
+        return false;
+    }
 
-			for (BasicBlock* BB : LoopBlocks) {
-				if (!BB) continue;
-				for (auto It = BB->begin(); It != BB->end(); ++It) {
-					Instruction* I = *It;
-					if (!I) continue;
-					if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
+    if (!PreHeader->replaceTerminator(new BrInst(Exit))) return false;
+    applyPhiReplacements(PhiPlan);
 
-					std::vector<Use*> Uses;
-					for (auto Uit = I->getUseList().begin(); Uit != I->getUseList().end(); ++Uit) {
-						if (*Uit) Uses.push_back(*Uit);
-					}
+    // Tear down in three phases.  Deleting one BasicBlock while another loop
+    // terminator/PHI still names it would make Value::~Value recursively
+    // destroy that user and leave the remaining block list half-mutated.
+    for (BasicBlock *BB : LoopBlocks) {
+        if (!BB || BB->getParent() != &F) continue;
+        for (Instruction *I : *BB) {
+            if (!I || !I->getIRType() ||
+                I->getIRType()->getEnum() == IR_VOID) {
+                continue;
+            }
+            if (!I->getUseList().is_empty())
+                I->replaceAllUsesWith(
+                    UndefValue::NewUndefValue(I->getIRType()));
+        }
+    }
+    for (BasicBlock *BB : LoopBlocks) {
+        if (BB && BB->getParent() == &F) BB->clear();
+    }
+    for (BasicBlock *BB : LoopBlocks)
+        if (BB && BB->getParent() == &F) delete BB;
+    return true;
+}
 
-					for (Use* U : Uses) {
-						if (!U || U->getValue() != I) continue;
-						auto* UserI = dynamic_cast<Instruction*>(U->getUser());
-						if (!UserI) continue;
-						BasicBlock* UserBB = UserI->getParent();
-						if (!UserBB || !L->contains(UserBB)) {
-							U->replaceUseeWith(UndefValue::NewUndefValue(I->getIRType()));
-						}
-					}
-				}
-			}
+} // namespace
 
-			for (BasicBlock* BB : LoopBlocks) {
-				if (!BB) continue;
-				for (auto It = BB->begin(); It != BB->end(); ++It) {
-					Instruction* I = *It;
-					if (!I) continue;
-					if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
-					if (!I->getUseList().is_empty()) {
-						I->replaceAllUsesWith(UndefValue::NewUndefValue(I->getIRType()));
-					}
-				}
-				BB->clear();
-				BB->EraseFromParent();
-			}
+PreservationStatus LoopDeletionPass::run(
+    Function &F, FunctionAnalysisPassManager &FAM) {
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+    auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
-			Changed = true;
-			break;
-		}
+    bool Changed = false;
+    // One CFG deletion invalidates every Loop* in the snapshot.  The enclosing
+    // bounded fixed point will rebuild analyses and find another candidate.
+    for (Loop *L : LI.getLoopsInPostOrder(true)) {
+        if (!L || !L->getHeader() || !L->getSubLoops().empty()) continue;
+        if (L->getHeader()->getParent() != &F) continue;
+        if (!LCSSAPass::isLCSSAForm(L)) continue;
 
-		// 5) 多出口的情况：直接返回（跳过该循环）
-		if (ExitBlocks.size() > 1) continue;
+        BasicBlock *PreHeader = nullptr;
+        BasicBlock *Latch = nullptr;
+        if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+            !PreHeader || !Latch) {
+            continue;
+        }
 
-		// 6.1) 常规循环删除前检查 Exit PHI 是否平凡
-		bool ExitPhiOK = true;
-		for (PhiInst* Phi : ExitBlock->collectPhiNodes()) {
-			if (!Phi) continue;
-			unsigned N = Phi->getNumIncomingValues();
-			if (N == 0) continue;
+        auto TCI = SE.analyzeLoopTripCount(L);
+        // Deleting a side-effect-free loop still changes semantics if it may
+        // be infinite.  A proven finite constant count is the deliberately
+        // conservative progress proof used here.
+        if (!TCI || !TCI->Valid || !TCI->ConstantTripCount ||
+            *TCI->ConstantTripCount < 0 || !TCI->ProvenNoWrap ||
+            !TCI->ExitBlock) {
+            continue;
+        }
 
-			Value* First = Phi->getIncomingValue(0);
-			for (unsigned i = 1; i < N; ++i) {
-				if (Phi->getIncomingValue(i) != First) {
-					ExitPhiOK = false;
-					break;
-				}
-			}
-			if (!ExitPhiOK) break;
+        std::vector<BasicBlock *> Blocks = collectLoopBlocks(L, &F);
+        if (Blocks.empty()) continue;
 
-			if (auto* DefI = dynamic_cast<Instruction*>(First)) {
-				BasicBlock* DefBB = DefI->getParent();
-				if (DefBB && L->contains(DefBB)) {
-					ExitPhiOK = false;
-					break;
-				}
-			}
-		}
-		if (!ExitPhiOK) continue;
+        PhiReplacementMap PhiPlan;
+        bool ZeroTrip = *TCI->ConstantTripCount == 0;
+        if (ZeroTrip) {
+            // A header-tested zero-trip loop still executes its header once.
+            // Only bypass it when that header has no observable/trapping work.
+            bool HeaderSafe = true;
+            for (Instruction *I : *L->getHeader())
+                if (!isSafeToSkipOnZeroTrip(I)) {
+                    HeaderSafe = false;
+                    break;
+                }
+            if (!HeaderSafe ||
+                !planZeroTripPhiReplacements(L, *TCI, PhiPlan)) {
+                continue;
+            }
+        } else {
+            if (!hasNoObservableLoopInstruction(L) ||
+                !planDeadLoopPhiReplacements(L, TCI->ExitBlock, PhiPlan)) {
+                continue;
+            }
+        }
 
-		// 6.1) 常规循环删除前检查循环级副作用
-		if (LoopSideEffect(*L, AA, LI, FAM)) continue;
+        if (!outsideUsesAreCovered(L, Blocks, PhiPlan)) continue;
+        if (!deleteLoopCFG(L, F, PreHeader, TCI->ExitBlock,
+                           Blocks, PhiPlan)) {
+            continue;
+        }
+        Changed = true;
+        break;
+    }
 
-		// 6.2) 执行删除（与 4.2 同逻辑）
-		if (PreHeader->Size() > 0) {
-			if (Instruction* OldTerm = PreHeader->back()) {
-				delete OldTerm;
-			}
-		}
-		PreHeader->genUnCondInst(ExitBlock);
-
-		auto ExitPhis = ExitBlock->collectPhiNodes();
-		for (PhiInst* Phi : ExitPhis) {
-			if (!Phi) continue;
-			unsigned N = Phi->getNumIncomingValues();
-			if (N == 0) {
-				Phi->replaceAllUsesWith(UndefValue::NewUndefValue(Phi->getIRType()));
-				delete Phi;
-				continue;
-			}
-
-			Value* KeepV = Phi->getIncomingValue(0);
-			auto* NewPhi = new PhiInst(Phi->getIRType());
-			NewPhi->addIncoming(KeepV, PreHeader);
-			Phi->replaceAllUsesWith(NewPhi);
-			Phi->replaceWith(NewPhi);
-			delete Phi;
-		}
-
-		std::vector<BasicBlock*> LoopBlocks;
-		std::vector<Loop*> Stack;
-		Stack.push_back(L);
-		std::unordered_set<BasicBlock*> Seen;
-		while (!Stack.empty()) {
-			Loop* Cur = Stack.back();
-			Stack.pop_back();
-			if (!Cur) continue;
-			for (BasicBlock* BB : Cur->getBlocks()) {
-				if (BB && BB->getParent() == &F &&
-					Seen.insert(BB).second) {
-					LoopBlocks.push_back(BB);
-				}
-			}
-			for (Loop* Sub : Cur->getSubLoops()) {
-				if (Sub) Stack.push_back(Sub);
-			}
-		}
-
-		for (BasicBlock* BB : LoopBlocks) {
-			if (!BB) continue;
-			for (auto It = BB->begin(); It != BB->end(); ++It) {
-				Instruction* I = *It;
-				if (!I) continue;
-				if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
-
-				std::vector<Use*> Uses;
-				for (auto Uit = I->getUseList().begin(); Uit != I->getUseList().end(); ++Uit) {
-					if (*Uit) Uses.push_back(*Uit);
-				}
-
-				for (Use* U : Uses) {
-					if (!U || U->getValue() != I) continue;
-					auto* UserI = dynamic_cast<Instruction*>(U->getUser());
-					if (!UserI) continue;
-					BasicBlock* UserBB = UserI->getParent();
-					if (!UserBB || !L->contains(UserBB)) {
-						U->replaceUseeWith(UndefValue::NewUndefValue(I->getIRType()));
-					}
-				}
-			}
-		}
-
-		for (BasicBlock* BB : LoopBlocks) {
-			if (!BB) continue;
-			for (auto It = BB->begin(); It != BB->end(); ++It) {
-				Instruction* I = *It;
-				if (!I) continue;
-				if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
-				if (!I->getUseList().is_empty()) {
-					I->replaceAllUsesWith(UndefValue::NewUndefValue(I->getIRType()));
-				}
-			}
-			BB->clear();
-			BB->EraseFromParent();
-		}
-
-		Changed = true;
-		break;
-	}
-
-	(void)DT;
-	if (!Changed) return PreservationStatus::all();
-
-	PreservationStatus PA;
-	PA.discard<DominantAnalysis>();
-	PA.discard<PostDominantAnalysis>();
-	PA.discard<LoopAnalysis>();
-	PA.discard<BasicAliasAnalysis>();
-	PA.discard<SideEffectAnalysis>();
-	PA.discard<SCEVAnalysis>();
-	return PA;
+    if (!Changed) return PreservationStatus::all();
+    return PreservationStatus::none();
 }

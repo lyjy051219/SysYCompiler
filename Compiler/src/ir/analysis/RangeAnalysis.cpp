@@ -228,53 +228,220 @@ IntRange IntRange::bor(const IntRange &rhs) const {
 // =====================================================================
 // FloatRange 算术运算
 //
-// 用 double 存 float 范围，NaN 输入保守返回 Top。
-// 无穷大参与运算按 IEEE 754 规则传播（inf + 正数 = inf, inf - inf = NaN→Top）。
+// 用 float 完成端点运算，再提升为 double 存储。如果直接用
+// double 运算，FLT_MAX + FLT_MAX 会被误认为有限数，而真实 f32
+// 结果是 +Inf。NaN 和 +/-0 与数值区间分开传播。
 // =====================================================================
 
-// 规范化：如果计算结果含 NaN，返回 Top
-FloatRange FloatRange::sanitize(double lo, double hi) {
+namespace {
+
+bool containsPosInf(const FloatRange &R) {
+    return R.hasNumericValues() && R.max == FloatRange::F_MAX_INF();
+}
+
+bool containsNegInf(const FloatRange &R) {
+    return R.hasNumericValues() && R.min == FloatRange::F_MIN_INF();
+}
+
+float exactF32Value(const FloatRange &R) {
+    if (R.min == 0.0 && R.mayNegativeZero && !R.mayPositiveZero)
+        return -0.0f;
+    return static_cast<float>(R.min);
+}
+
+template <typename Fn>
+FloatRange evaluateFloatEndpoints(const FloatRange &L, const FloatRange &R,
+                                  bool MayNaN, Fn Eval) {
+    FloatRange Result = FloatRange::bottom();
+    Result.mayNaN = MayNaN;
+
+    if (!L.hasNumericValues() || !R.hasNumericValues()) return Result;
+
+    // Exact values are important for the sign of zero.  Interval envelopes
+    // intentionally retain both signs when zero is reachable.
+    if (L.isExactNumericValue() && R.isExactNumericValue()) {
+        float V = Eval(exactF32Value(L), exactF32Value(R));
+        FloatRange Exact(static_cast<double>(V));
+        Exact.mayNaN = Exact.mayNaN || MayNaN;
+        return Exact;
+    }
+
+    const float LVals[2] = {static_cast<float>(L.min),
+                            static_cast<float>(L.max)};
+    const float RVals[2] = {static_cast<float>(R.min),
+                            static_cast<float>(R.max)};
+    bool HaveNumeric = false;
+    double Lo = 0.0;
+    double Hi = 0.0;
+    bool SawNaN = MayNaN;
+    for (float LV : LVals) {
+        for (float RV : RVals) {
+            float V = Eval(LV, RV);
+            if (std::isnan(V)) {
+                SawNaN = true;
+                continue;
+            }
+            double D = static_cast<double>(V);
+            if (!HaveNumeric) {
+                Lo = Hi = D;
+                HaveNumeric = true;
+            } else {
+                if (D < Lo) Lo = D;
+                if (D > Hi) Hi = D;
+            }
+        }
+    }
+
+    if (!HaveNumeric) {
+        Result.mayNaN = SawNaN;
+        return Result;
+    }
+
+    Result = FloatRange(Lo, Hi);
+    Result.mayNaN = SawNaN;
+    // An interval operation whose envelope crosses numerical zero may round
+    // to either signed zero.  Keeping both is conservative and prevents a
+    // later constant fold from choosing the wrong sign.
+    if (Lo <= 0.0 && Hi >= 0.0) {
+        Result.mayPositiveZero = true;
+        Result.mayNegativeZero = true;
+    }
+    return Result;
+}
+
+bool eitherNaNPropagates(const FloatRange &L, const FloatRange &R) {
+    bool LHasAny = L.hasNumericValues() || L.mayNaN;
+    bool RHasAny = R.hasNumericValues() || R.mayNaN;
+    return (L.mayNaN && RHasAny) || (R.mayNaN && LHasAny);
+}
+
+} // namespace
+
+FloatRange FloatRange::sanitize(double lo, double hi, bool MayNaN) {
     if (std::isnan(lo) || std::isnan(hi)) return FloatRange();
-    if (lo > hi) return FloatRange::bottom();
-    return FloatRange(lo, hi);
+    FloatRange R = (lo > hi) ? FloatRange::bottom() : FloatRange(lo, hi);
+    R.mayNaN = MayNaN;
+    return R;
+}
+
+FloatRange FloatRange::unionWith(const FloatRange &other) const {
+    FloatRange R = FloatRange::bottom();
+    R.mayNaN = mayNaN || other.mayNaN;
+
+    if (hasNumericValues() && other.hasNumericValues()) {
+        R.min = std::min(min, other.min);
+        R.max = std::max(max, other.max);
+    } else if (hasNumericValues()) {
+        R.min = min;
+        R.max = max;
+    } else if (other.hasNumericValues()) {
+        R.min = other.min;
+        R.max = other.max;
+    }
+
+    if (R.hasNumericValues() && R.min <= 0.0 && R.max >= 0.0) {
+        R.mayPositiveZero = mayPositiveZero || other.mayPositiveZero;
+        R.mayNegativeZero = mayNegativeZero || other.mayNegativeZero;
+    }
+    return R;
+}
+
+FloatRange FloatRange::intersectWith(const FloatRange &other) const {
+    FloatRange R = FloatRange::bottom();
+    R.mayNaN = mayNaN && other.mayNaN;
+    if (hasNumericValues() && other.hasNumericValues()) {
+        R.min = std::max(min, other.min);
+        R.max = std::min(max, other.max);
+        if (R.hasNumericValues() && R.min <= 0.0 && R.max >= 0.0) {
+            R.mayPositiveZero = mayPositiveZero && other.mayPositiveZero;
+            R.mayNegativeZero = mayNegativeZero && other.mayNegativeZero;
+            // If zero was the only numerical intersection but neither sign
+            // is present, the numerical intersection is empty.
+            if (R.min == 0.0 && R.max == 0.0 &&
+                !R.mayPositiveZero && !R.mayNegativeZero) {
+                R.min = 1.0;
+                R.max = 0.0;
+            }
+        }
+    }
+    return R;
 }
 
 FloatRange FloatRange::add(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    return sanitize(min + rhs.min, max + rhs.max);
+    bool MayNaN = eitherNaNPropagates(*this, rhs) ||
+                  (containsPosInf(*this) && containsNegInf(rhs)) ||
+                  (containsNegInf(*this) && containsPosInf(rhs));
+    return evaluateFloatEndpoints(*this, rhs, MayNaN,
+                                  [](float A, float B) { return A + B; });
 }
 
 FloatRange FloatRange::sub(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    return sanitize(min - rhs.max, max - rhs.min);
+    bool MayNaN = eitherNaNPropagates(*this, rhs) ||
+                  (containsPosInf(*this) && containsPosInf(rhs)) ||
+                  (containsNegInf(*this) && containsNegInf(rhs));
+    return evaluateFloatEndpoints(*this, rhs, MayNaN,
+                                  [](float A, float B) { return A - B; });
 }
 
 FloatRange FloatRange::mul(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    double v1 = min * rhs.min;
-    double v2 = min * rhs.max;
-    double v3 = max * rhs.min;
-    double v4 = max * rhs.max;
-    if (std::isnan(v1) || std::isnan(v2) || std::isnan(v3) || std::isnan(v4))
-        return FloatRange();
-    double lo = std::min({v1, v2, v3, v4});
-    double hi = std::max({v1, v2, v3, v4});
-    return sanitize(lo, hi);
+    bool MayNaN = eitherNaNPropagates(*this, rhs) ||
+                  (containsZero() && rhs.mayContainInfinity()) ||
+                  (rhs.containsZero() && mayContainInfinity());
+    FloatRange R = evaluateFloatEndpoints(
+        *this, rhs, MayNaN, [](float A, float B) { return A * B; });
+    auto HasFiniteNumeric = [](const FloatRange &X) {
+        return X.hasNumericValues() &&
+               X.min < FloatRange::F_MAX_INF() &&
+               X.max > FloatRange::F_MIN_INF();
+    };
+    // Endpoint-only evaluation of [-inf,+inf] * 0 sees NaN at both
+    // endpoints, but finite interior values also produce signed zero.
+    if ((containsZero() && HasFiniteNumeric(rhs)) ||
+        (rhs.containsZero() && HasFiniteNumeric(*this)))
+        R = R.unionWith(FloatRange(0.0, 0.0));
+    return R;
 }
 
 FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    // 除数区间跨 0 → 结果可能是 inf 或 -inf，保守返回 Top
-    if (rhs.min <= 0.0 && rhs.max >= 0.0) return FloatRange();
-    double v1 = min / rhs.min;
-    double v2 = min / rhs.max;
-    double v3 = max / rhs.min;
-    double v4 = max / rhs.max;
-    if (std::isnan(v1) || std::isnan(v2) || std::isnan(v3) || std::isnan(v4))
-        return FloatRange();
-    double lo = std::min({v1, v2, v3, v4});
-    double hi = std::max({v1, v2, v3, v4});
-    return sanitize(lo, hi);
+    bool MayNaN = eitherNaNPropagates(*this, rhs) ||
+                  (containsZero() && rhs.containsZero()) ||
+                  (mayContainInfinity() && rhs.mayContainInfinity());
+
+    // Preserve exact 0/0, inf/inf and signed-zero behaviour before the
+    // discontinuous interval fallback below.
+    if (isExactNumericValue() && rhs.isExactNumericValue()) {
+        float V = exactF32Value(*this) / exactF32Value(rhs);
+        FloatRange Exact(static_cast<double>(V));
+        Exact.mayNaN = Exact.mayNaN || MayNaN;
+        return Exact;
+    }
+
+    // A denominator envelope touching/crossing numerical zero is
+    // discontinuous even when the zero-sign set says exact zero itself is
+    // absent (for example a PHI of {-1,+1}).  The interval abstraction does
+    // not track a minimum nonzero magnitude, so only the full numerical
+    // envelope is sound.  MayNaN separately records whether exact 0/0 exists.
+    bool DenominatorTouchesZero = rhs.hasNumericValues() &&
+                                  rhs.min <= 0.0 && rhs.max >= 0.0;
+    if (DenominatorTouchesZero) {
+        FloatRange R(F_MIN_INF(), F_MAX_INF());
+        R.mayNaN = MayNaN;
+        return R;
+    }
+
+    FloatRange R = evaluateFloatEndpoints(
+        *this, rhs, MayNaN, [](float A, float B) { return A / B; });
+    // As above, an unbounded numerator divided by exact infinity has NaN at
+    // its infinite endpoints but signed-zero results for finite interiors.
+    bool NumeratorHasFinite = hasNumericValues() &&
+                              min < F_MAX_INF() && max > F_MIN_INF();
+    if (NumeratorHasFinite && rhs.mayContainInfinity())
+        R = R.unionWith(FloatRange(0.0, 0.0));
+    return R;
 }
 
 // =====================================================================
@@ -350,28 +517,27 @@ FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
 }
 
 // =====================================================================
-// 边敏感查询（沿 predBB → succBB 边进入 succBB 时的值）
-//
-// 我们在 visitBranch 里已经把条件分支的收窄写进"succ 块的 contextual"，
-// 前提是 succ 是唯一前驱。所以：
-//   - succ 单前驱 → 直接查 succ 的 per-block contextual，取和 global 的交集
-//   - succ 多前驱 → 该边上的收窄没被存，退化为 query(val, predBB, DT)
-//     这返回的是 predBB 视角下 val 的最紧 range，等价于"进入 succ 那一刻"
-//     的保守上界（不考虑 predBB 内条件对 val 的进一步收窄，无害）。
+// 边敏感查询（沿 predBB → succBB 边进入 succBB 时的值）。
+// 先取 pred 处的支配上下文，再和最终 CFG rebuild 产生的
+// edge fact 取交集。这也适用于 loop header 等多前驱块，
+// 不会把某一条入边的条件泄漏到其他入边。
 // =====================================================================
 IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
                                  BasicBlock *succBB,
                                  const DominatorTree &DT) const {
     if (auto *CI = dynamic_cast<ConstInt *>(val)) return IntRange(CI->getVal());
-    if (!succBB) return query(val, predBB, DT);
-
-    bool singlePred = (succBB->getPredecessors().size() == 1);
-    if (!singlePred) {
-        // 多前驱：边上信息没存，退到 pred 视角
-        return query(val, predBB, DT);
+    IntRange R = query(val, predBB, DT);
+    if (!predBB || !succBB) return R;
+    auto VIt = EdgeRanges.find(val);
+    if (VIt != EdgeRanges.end()) {
+        auto PIt = VIt->second.find(predBB);
+        if (PIt != VIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                R = R.intersectWith(SIt->second);
+        }
     }
-    // 单前驱：succ 块的 contextual 已经是"条件后"的范围
-    return query(val, succBB, DT);
+    return R;
 }
 
 // =====================================================================
@@ -416,10 +582,18 @@ KnownBits RangeInfo::queryBitsOnEdge(Value *val, BasicBlock *predBB,
                                       const DominatorTree &DT) const {
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return KnownBits::fromConst(CI->getVal());
-    if (!succBB) return queryBits(val, predBB, DT);
-    bool singlePred = (succBB->getPredecessors().size() == 1);
-    if (!singlePred) return queryBits(val, predBB, DT);
-    return queryBits(val, succBB, DT);
+    KnownBits KB = queryBits(val, predBB, DT);
+    if (!predBB || !succBB) return KB;
+    auto VIt = EdgeBits.find(val);
+    if (VIt != EdgeBits.end()) {
+        auto PIt = VIt->second.find(predBB);
+        if (PIt != VIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                KB = KB.intersectWith(SIt->second);
+        }
+    }
+    return KB;
 }
 
 FloatRange RangeInfo::queryFloatOnEdge(Value *val, BasicBlock *predBB,
@@ -436,34 +610,6 @@ FloatRange RangeInfo::queryFloatOnEdge(Value *val, BasicBlock *predBB,
 bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(RangeAnalysis::ID())) return false;
     return true;
-}
-
-// =====================================================================
-// 跨函数 Range Summary 缓存（文件内 static）
-//
-// RangeAnalysis 是 Function-level pass，但 visitCall 需要查 callee 的
-// 返回值 range，因此用一个 process-scope 的静态缓存做"懒更新"：
-//
-//   1) 分析 F 结束时，把 F 所有 RetInst 操作数 union 成 F 的 return range
-//      写入 cache.RetRanges[F]
-//   2) 后续分析 H（调用 F）时，visitCall 从 cache 拿 F 的 return range，
-//      没 cache 就退到 Top
-//
-// 分析顺序敏感：如果 G 在 F 之前被分析，F 分析时 cache[G].RetRange 可用；
-// 反之第一次看 cache 为空只能拿 Top。pipeline 后续调用（有 invalidate 触发
-// 重算时）能渐进收敛。
-//
-// 递归（F 调 F）：cache 不触发递归分析，visitCall 只查表，查不到就 Top。
-//
-// 参数 range 传播：当前版本**不做**。若把"所有 call site 实参的 union"作为
-// 参数初值 seed，会让 F 被偏紧参数分析，return range 被低估 → caller 拿到
-// 错误 range → RangeAwareSimplify 做错误常量折叠 → WA（已验证）。安全实现
-// 需要 pipeline 级多轮不动点迭代，复杂度不值得现在上。
-// =====================================================================
-
-InterprocRangeCache& InterprocRangeCache::get() {
-    static InterprocRangeCache cache;
-    return cache;
 }
 
 // =====================================================================
@@ -497,11 +643,17 @@ public:
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>> ContextualRanges;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>> BlockLocalRanges;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, FloatRange>> FloatContextualRanges;
+    std::unordered_map<
+        Value *, std::unordered_map<
+            BasicBlock *, std::unordered_map<BasicBlock *, IntRange>>> EdgeRanges;
 
     // KnownBits：和 IntRange 并列的位级 lattice（forward/narrowing 语义
     // 和 IntRange 对齐；edge-sensitive contextual 也对齐）
     std::unordered_map<Value *, KnownBits> ValueBits;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, KnownBits>> ContextualBits;
+    std::unordered_map<
+        Value *, std::unordered_map<
+            BasicBlock *, std::unordered_map<BasicBlock *, KnownBits>>> EdgeBits;
 
     // 收敛控制
     static constexpr int MAX_ENQUEUE = 32;
@@ -779,7 +931,7 @@ public:
 
     // 根据 SCEV 归纳变量信息推断活动迭代范围
     IntRange rangeFromInduction(const LoopInductionInfo &info) const {
-        if (!info.hasUpperBound) return IntRange(); // Top
+        if (!info.hasUpperBound || !info.noWrap) return IntRange(); // Top
         if (info.step > 0)
             return IntRange(info.initial, info.upperBound);
         if (info.step < 0)
@@ -797,6 +949,7 @@ public:
             Value *V = entry.first;
             const LoopInductionInfo &info = entry.second;
             if (!V || !info.RecLoop) continue;
+            if (!info.noWrap) continue;
             if (!V->getIRType() || V->getIRType()->getEnum() != IR_INT) continue;
 
             IntRange activeRange = rangeFromInduction(info);
@@ -935,17 +1088,31 @@ public:
         IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
             IntRange(dynamic_cast<ConstInt *>(rhs)->getVal()) : getRange(rhs);
 
+        const int ResultBitWidth = resultTy && resultTy->isInt()
+            ? (resultTy->isBool() ? 1 : resultTy->getIntegerBitWidth(0))
+            : 0;
+        const bool IsModeledI32 = ResultBitWidth == 32;
+        auto HasModeledShiftAmount = [&]() {
+            if (!rRange.isSingleValue() || rRange.min < 0 ||
+                rRange.min >= ResultBitWidth)
+                return false;
+            // IntRange/KnownBits model 32-bit arithmetic.  A zero shift is an
+            // identity at every width; other narrow-width shifts conservatively
+            // stay Top until the lattices become width-parametric.
+            return IsModeledI32 || rRange.min == 0;
+        };
+
         IntRange result;
         switch (BI->getOp()) {
-            case BinaryInst::ADD:  result = lRange.add(rRange);  break;
-            case BinaryInst::SUB:  result = lRange.sub(rRange);  break;
-            case BinaryInst::MUL:  result = lRange.mul(rRange);  break;
-            case BinaryInst::DIV:  result = lRange.sdiv(rRange); break;
-            case BinaryInst::MOD:  result = lRange.srem(rRange); break;
+            case BinaryInst::ADD:  result = IsModeledI32 ? lRange.add(rRange) : IntRange();  break;
+            case BinaryInst::SUB:  result = IsModeledI32 ? lRange.sub(rRange) : IntRange();  break;
+            case BinaryInst::MUL:  result = IsModeledI32 ? lRange.mul(rRange) : IntRange();  break;
+            case BinaryInst::DIV:  result = IsModeledI32 ? lRange.sdiv(rRange) : IntRange(); break;
+            case BinaryInst::MOD:  result = IsModeledI32 ? lRange.srem(rRange) : IntRange(); break;
             // 位运算/移位：走扩展的 IntRange 方法
-            case BinaryInst::SHL:  result = lRange.shl(rRange);  break;
-            case BinaryInst::ASHR: result = lRange.ashr(rRange); break;
-            case BinaryInst::LSHR: result = lRange.lshr(rRange); break;
+            case BinaryInst::SHL:  result = HasModeledShiftAmount() ? lRange.shl(rRange) : IntRange();  break;
+            case BinaryInst::ASHR: result = HasModeledShiftAmount() ? lRange.ashr(rRange) : IntRange(); break;
+            case BinaryInst::LSHR: result = HasModeledShiftAmount() ? lRange.lshr(rRange) : IntRange(); break;
             case BinaryInst::AND:  result = lRange.band(rRange); break;
             case BinaryInst::OR:   result = lRange.bor(rRange);  break;
             // XOR / UDIV / UREM 等当前 SysY 中端不会直接产出，保守 Top
@@ -963,25 +1130,28 @@ public:
             return -1;
         };
         switch (BI->getOp()) {
-            case BinaryInst::ADD: resKB = lKB.add(rKB); break;
-            case BinaryInst::SUB: resKB = lKB.sub(rKB); break;
-            case BinaryInst::MUL: resKB = lKB.mul(rKB); break;
+            case BinaryInst::ADD: if (IsModeledI32) resKB = lKB.add(rKB); break;
+            case BinaryInst::SUB: if (IsModeledI32) resKB = lKB.sub(rKB); break;
+            case BinaryInst::MUL: if (IsModeledI32) resKB = lKB.mul(rKB); break;
             case BinaryInst::AND: resKB = lKB.band(rKB); break;
             case BinaryInst::OR:  resKB = lKB.bor(rKB); break;
             case BinaryInst::XOR: resKB = lKB.bxor(rKB); break;
             case BinaryInst::SHL: {
                 int k = rhsAsConstK();
-                if (k >= 0 && k < 32) resKB = lKB.shl(k);
+                if (HasModeledShiftAmount() && k == rRange.min)
+                    resKB = lKB.shl(k);
                 break;
             }
             case BinaryInst::LSHR: {
                 int k = rhsAsConstK();
-                if (k >= 0 && k < 32) resKB = lKB.lshr(k);
+                if (HasModeledShiftAmount() && k == rRange.min)
+                    resKB = lKB.lshr(k);
                 break;
             }
             case BinaryInst::ASHR: {
                 int k = rhsAsConstK();
-                if (k >= 0 && k < 32) resKB = lKB.ashr(k);
+                if (HasModeledShiftAmount() && k == rRange.min)
+                    resKB = lKB.ashr(k);
                 break;
             }
             default: break;
@@ -994,7 +1164,7 @@ public:
         // Backward constraint propagation：只在 narrowing 阶段做
         // 对 ADD/SUB 做 z = x op y ⟹ 反推 x / y 的范围
         // 例：z ∈ [0, 10], y 是常量 3 ⟹ x ∈ [-3, 7]
-        if (NarrowingMode) {
+        if (NarrowingMode && IsModeledI32) {
             narrowBinaryBackward(BI, lhs, rhs, lRange, rRange);
         }
     }
@@ -1075,10 +1245,11 @@ public:
             if (cmpInst->getOperands(lhs, rhs)) {
                 auto op = cmpInst->getOp();
 
-                // 浮点分支收窄：操作数类型 IR_FLOAT 时走浮点路径
-                // FloatRange 的 Top 保守含 NaN；非 Top 的操作数我们假定不含 NaN
-                // （NaN 已被吸收到 Top），此时 fcmp uXX 等价 olt/ole/... 按端点收窄
-                // 和整数路径语义一致，只是不用 ±1（浮点没有"紧邻前一个/后一个"的概念）
+                // 浮点分支收窄：操作数类型 IR_FLOAT 时走浮点路径。
+                // 比较遵循 C/IEEE ordered 关系（!= 对 NaN 为真）。当前
+                // 实现只消费“两侧全局范围都排除 NaN”的强证明；若任一侧
+                // 可能为 NaN 就保守保留 Top，不把某条边错误解释为纯数值
+                // 关系。
                 auto lhsTy = lhs->getIRType();
                 auto rhsTy = rhs->getIRType();
                 if (lhsTy && rhsTy &&
@@ -1090,7 +1261,8 @@ public:
                         FloatRange((double)dynamic_cast<ConstFloat *>(rhs)->getVal()) :
                         FloatValueRanges[rhs];
 
-                    if (lF.isBottom() || rF.isBottom()) {
+                    if (!lF.hasNumericValues() || !rF.hasNumericValues() ||
+                        lF.mayContainNaN() || rF.mayContainNaN()) {
                         if (trueSinglePred) {
                             updateFloatContextual(lhs, trueBB, FloatRange());
                             updateFloatContextual(rhs, trueBB, FloatRange());
@@ -1310,12 +1482,22 @@ public:
         Value *callee = CI->getCallee();
         if (!callee) return;
 
+        auto SetTopForResultType = [&]() {
+            auto Ty = CI->getIRType();
+            if (!Ty) return;
+            if (Ty->getEnum() == IR_INT) updateRange(CI, IntRange());
+            else if (Ty->getEnum() == IR_FLOAT)
+                updateFloatRange(CI, FloatRange());
+        };
+
         // 内置函数范围推断
         if (auto *BIF = dynamic_cast<BuildInFunction *>(callee)) {
             std::string name = BIF->getIdent();
             if (name == "getch") {
-                // getch 返回 ASCII 字符，范围 [0, 127]
-                updateRange(CI, IntRange(0, 127));
+                // Runtime loads an i8 and sign-extends it to i32.  Bytes above
+                // 0x7f therefore produce negative values; ASCII-only [0,127]
+                // is not a valid proof for arbitrary input bytes.
+                updateRange(CI, IntRange(-128, 127));
                 return;
             }
             if (name == "getint") {
@@ -1323,77 +1505,20 @@ public:
                 updateRange(CI, IntRange());
                 return;
             }
-            // 其他内置函数（putint 等）返回值当 Top
-            updateRange(CI, IntRange());
+            // 其他内置函数返回值当 Top
+            SetTopForResultType();
             return;
         }
 
-        // 用户定义函数：查跨函数 return range summary
-        // 注意：不做参数 range 传播（参数被 seed 成"所有 call site 实参 union"
-        // 后，函数会被用偏紧的参数分析，返回值可能被低估；修这个需要 pipeline
-        // 级不动点迭代，超出单次 analysis 的范围）
-        if (auto *F = dynamic_cast<Function *>(callee)) {
-            InterprocRangeCache &cache = InterprocRangeCache::get();
-            auto callTy = CI->getIRType();
-            if (callTy && callTy->getEnum() == IR_INT) {
-                auto it = cache.RetRanges.find(F);
-                if (it != cache.RetRanges.end()) {
-                    updateRange(CI, it->second);
-                    return;
-                }
-                updateRange(CI, IntRange());
-                return;
-            }
-            if (callTy && callTy->getEnum() == IR_FLOAT) {
-                auto it = cache.FloatRetRanges.find(F);
-                if (it != cache.FloatRetRanges.end()) {
-                    updateFloatRange(CI, it->second);
-                    return;
-                }
-                updateFloatRange(CI, FloatRange());
-                return;
-            }
+        // 用户函数 return summary 在没有 module/call-graph invalidation
+        // proxy 时可能过期。不消费 process-static cache，一律 Top。
+        if (dynamic_cast<Function *>(callee)) {
+            SetTopForResultType();
             return;
         }
 
         // 无法识别的 callee → Top
-        updateRange(CI, IntRange());
-    }
-
-    void visitGEP(GetElementPtrInst *GEP) {
-        if (!GEP || GEP->getNumIndices() == 0) return;
-        Value *basePtr = GEP->getBasePointer();
-        if (!basePtr || !basePtr->getIRType()) return;
-        BasicBlock *BB = GEP->getParent();
-        if (!BB) return;
-
-        auto currentType = basePtr->getIRType();
-
-        // 按 updateType 的逻辑走类型链；对每个 ARRAYType 位置的索引加约束
-        for (size_t i = 0; i < GEP->getNumIndices(); i++) {
-            if (auto arr = std::dynamic_pointer_cast<ARRAYType>(currentType)) {
-                int count = arr->getElementCount();
-                if (count > 0) {
-                    Value *idx = GEP->getIndex(i);
-                    if (idx && idx->getIRType() &&
-                        idx->getIRType()->getEnum() == IR_INT &&
-                        !dynamic_cast<ConstInt *>(idx)) {
-                        // 约束 idx ∈ [0, count - 1]
-                        IntRange bound(0, count - 1);
-                        IntRange cur = ContextualRanges[idx].count(BB) ?
-                            ContextualRanges[idx][BB] : IntRange();
-                        IntRange narrowed = cur.intersectWith(bound);
-                        updateContextual(idx, BB, narrowed);
-                    }
-                }
-                currentType = arr->getElementType();
-            } else if (auto ptr = std::dynamic_pointer_cast<POINTERType>(currentType)) {
-                // 指针算术，没有天然的数组边界 → 跳过
-                currentType = ptr->getPointerType();
-            } else {
-                break;
-            }
-        }
+        SetTopForResultType();
     }
 
     // =====================================================================
@@ -1479,7 +1604,16 @@ public:
             IntRange r = dynamic_cast<ConstInt *>(src) ?
                 IntRange(dynamic_cast<ConstInt *>(src)->getVal()) : getRange(src);
             if (r.isBottom()) { updateFloatRange(I, FloatRange::bottom()); return; }
-            updateFloatRange(I, FloatRange((double)r.min, (double)r.max));
+            // sitofp rounds to f32.  Store the actual rounded endpoints rather
+            // than the exact integer endpoints represented in double.
+            if (r.isSingleValue()) {
+                updateFloatRange(I, FloatRange(
+                    static_cast<double>(static_cast<float>(r.min))));
+            } else {
+                updateFloatRange(I, FloatRange(
+                    static_cast<double>(static_cast<float>(r.min)),
+                    static_cast<double>(static_cast<float>(r.max))));
+            }
             return;
         }
         if (dynamic_cast<FPTOSIInst *>(I)) {
@@ -1492,7 +1626,10 @@ public:
             FloatRange r = dynamic_cast<ConstFloat *>(src) ?
                 FloatRange((double)dynamic_cast<ConstFloat *>(src)->getVal()) :
                 FloatValueRanges[src];
-            if (r.isBottom() || r.isTop()) { updateRange(I, IntRange()); return; }
+            if (r.isBottom() || !r.hasNumericValues() || r.mayContainNaN()) {
+                updateRange(I, IntRange());
+                return;
+            }
             double lo = std::trunc(r.min);
             double hi = std::trunc(r.max);
             if (!std::isfinite(lo) || !std::isfinite(hi)) { updateRange(I, IntRange()); return; }
@@ -1519,8 +1656,6 @@ public:
             visitBranch(Br);
         } else if (auto *CI = dynamic_cast<CallInst *>(I)) {
             visitCall(CI);
-        } else if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I)) {
-            visitGEP(GEP);
         } else if (auto *SI = dynamic_cast<SelectInst *>(I)) {
             visitSelect(SI);
         } else if (dynamic_cast<ZextInst *>(I) || dynamic_cast<SextInst *>(I) ||
@@ -1532,66 +1667,6 @@ public:
             updateRange(I, IntRange());
         }
         // store, ret 等不产生 i32 值的指令不处理
-    }
-
-    // 扫描本函数所有 RetInst，把返回值 range 的 union 写入跨函数 cache
-    // 下次分析其他调用本函数的函数时能直接查到
-    void publishReturnRange(Function &F) {
-        InterprocRangeCache &cache = InterprocRangeCache::get();
-        IntRange retR = IntRange::bottom();
-        FloatRange fretR = FloatRange::bottom();
-        bool hasInt = false, hasFloat = false;
-
-        for (BasicBlock *BB : F) {
-            if (!ExecutableBlocks.count(BB)) continue;
-            for (Instruction *I : *BB) {
-                auto *Ret = dynamic_cast<RetInst *>(I);
-                if (!Ret) continue;
-                Value *rv = Ret->getReturnValue();
-                if (!rv) continue;   // ret void
-                if (!rv || !rv->getIRType()) continue;
-                auto ty = rv->getIRType();
-
-                if (ty->getEnum() == IR_INT) {
-                    IntRange r;
-                    if (auto *CI = dynamic_cast<ConstInt *>(rv))
-                        r = IntRange(CI->getVal());
-                    else {
-                        auto it = ValueRanges.find(rv);
-                        r = (it != ValueRanges.end()) ? it->second : IntRange();
-                    }
-                    retR = retR.unionWith(r);
-                    hasInt = true;
-                } else if (ty->getEnum() == IR_FLOAT) {
-                    FloatRange r;
-                    if (auto *CF = dynamic_cast<ConstFloat *>(rv))
-                        r = FloatRange((double)CF->getVal());
-                    else {
-                        auto it = FloatValueRanges.find(rv);
-                        r = (it != FloatValueRanges.end()) ? it->second : FloatRange();
-                    }
-                    fretR = fretR.unionWith(r);
-                    hasFloat = true;
-                }
-            }
-        }
-
-        if (hasInt) {
-            // 多次分析同一函数（pipeline 多次调用）可能得到不同 return range
-            // 正确做法是 union 保守保留所有可能值，不能 intersect（会漏掉实际返回值）
-            auto it = cache.RetRanges.find(&F);
-            if (it == cache.RetRanges.end())
-                cache.RetRanges[&F] = retR;
-            else
-                cache.RetRanges[&F] = it->second.unionWith(retR);
-        }
-        if (hasFloat) {
-            auto it = cache.FloatRetRanges.find(&F);
-            if (it == cache.FloatRetRanges.end())
-                cache.FloatRetRanges[&F] = fretR;
-            else
-                cache.FloatRetRanges[&F] = it->second.unionWith(fretR);
-        }
     }
 
     // Forward 不动点迭代主循环
@@ -1663,6 +1738,190 @@ public:
         return Complete;
     }
 
+    // Rebuild transform-visible integer path facts from the *final* value
+    // lattice and the *current* CFG.  Forward solving deliberately uses a
+    // mutable contextual map to accelerate convergence; exposing that map
+    // after widening/narrowing can retain a fact derived from an earlier,
+    // narrower operand state.  A single final scan is both sound and O(CFG).
+    void rebuildIntegerContextualFacts(Function &F) {
+        ContextualRanges.clear();
+        ContextualBits.clear();
+        EdgeRanges.clear();
+        EdgeBits.clear();
+
+        auto FinalRange = [&](Value *V) -> IntRange {
+            if (auto *CI = dynamic_cast<ConstInt *>(V))
+                return IntRange(CI->getVal());
+            auto It = ValueRanges.find(V);
+            return It == ValueRanges.end() ? IntRange() : It->second;
+        };
+        auto FinalBits = [&](Value *V) -> KnownBits {
+            if (auto *CI = dynamic_cast<ConstInt *>(V))
+                return KnownBits::fromConst(CI->getVal());
+            auto It = ValueBits.find(V);
+            return It == ValueBits.end() ? KnownBits::top() : It->second;
+        };
+        auto HasUniqueIncomingEdge = [](BasicBlock *Pred, BasicBlock *Succ) {
+            if (!Pred || !Succ) return false;
+            auto Preds = Succ->getPredecessors();
+            return Preds.size() == 1 && Preds.front() == Pred &&
+                   Pred->countEdgesToSucc(Succ) == 1;
+        };
+
+        auto RecordRange = [&](Value *V, BasicBlock *Pred, BasicBlock *Succ,
+                               const IntRange &Constraint) {
+            if (!V || !Pred || !Succ || Constraint.isTop() ||
+                Constraint.isBottom())
+                return;
+            IntRange Fact = FinalRange(V).intersectWith(Constraint);
+            if (Fact.isTop() || Fact.isBottom()) return;
+
+            auto &EdgeMap = EdgeRanges[V][Pred];
+            auto Existing = EdgeMap.find(Succ);
+            if (Existing != EdgeMap.end()) {
+                Fact = Existing->second.intersectWith(Fact);
+                if (Fact.isBottom()) {
+                    // The edge is infeasible, but this analysis does not hand
+                    // an explicit reachability proof to transforms.  Dropping
+                    // the fact is safer than exposing Bottom as a value range.
+                    EdgeMap.erase(Existing);
+                    if (HasUniqueIncomingEdge(Pred, Succ)) {
+                        auto CIt = ContextualRanges.find(V);
+                        if (CIt != ContextualRanges.end())
+                            CIt->second.erase(Succ);
+                    }
+                    return;
+                }
+            }
+            EdgeMap[Succ] = Fact;
+
+            if (HasUniqueIncomingEdge(Pred, Succ)) {
+                auto &BlockMap = ContextualRanges[V];
+                auto BIt = BlockMap.find(Succ);
+                if (BIt == BlockMap.end()) {
+                    BlockMap[Succ] = Fact;
+                } else {
+                    IntRange Combined = BIt->second.intersectWith(Fact);
+                    if (Combined.isBottom()) BlockMap.erase(BIt);
+                    else BlockMap[Succ] = Combined;
+                }
+            }
+        };
+
+        auto RecordBits = [&](Value *V, BasicBlock *Pred, BasicBlock *Succ,
+                              const KnownBits &Constraint) {
+            if (!V || !Pred || !Succ || Constraint.isTop()) return;
+            KnownBits Fact = FinalBits(V).intersectWith(Constraint);
+            if (Fact.isTop() || Fact.isConflict()) return;
+
+            auto &Slot = EdgeBits[V][Pred][Succ];
+            Slot = Slot.intersectWith(Fact);
+            if (HasUniqueIncomingEdge(Pred, Succ))
+                ContextualBits[V][Succ] =
+                    ContextualBits[V][Succ].intersectWith(Fact);
+        };
+
+        for (BasicBlock *Pred : F) {
+            if (!Pred) continue;
+            auto *Br = Pred->getBranchTerminator();
+            if (!Br || !Br->isConditional()) continue;
+            BasicBlock *TrueBB = Br->getTrueSuccessor();
+            BasicBlock *FalseBB = Br->getFalseSuccessor();
+            // If both branch labels are the same there is no distinguishable
+            // true/false edge in this IR's (pred,succ) edge key.
+            if (!TrueBB || !FalseBB || TrueBB == FalseBB) continue;
+
+            auto *Cmp = dynamic_cast<BinaryInst *>(Br->getCondition());
+            if (!Cmp) continue;
+            Value *LHS = nullptr;
+            Value *RHS = nullptr;
+            if (!Cmp->getOperands(LHS, RHS) || !LHS || !RHS ||
+                !LHS->getIRType() || !RHS->getIRType() ||
+                LHS->getIRType()->getEnum() != IR_INT ||
+                RHS->getIRType()->getEnum() != IR_INT)
+                continue;
+
+            IntRange L = FinalRange(LHS);
+            IntRange R = FinalRange(RHS);
+            if (L.isBottom() || R.isBottom()) continue;
+
+            switch (Cmp->getOp()) {
+                case BinaryInst::L:
+                    RecordRange(LHS, Pred, TrueBB,
+                                IntRange(IntRange::I32_MIN, R.max - 1));
+                    RecordRange(RHS, Pred, TrueBB,
+                                IntRange(L.min + 1, IntRange::I32_MAX));
+                    RecordRange(LHS, Pred, FalseBB,
+                                IntRange(R.min, IntRange::I32_MAX));
+                    RecordRange(RHS, Pred, FalseBB,
+                                IntRange(IntRange::I32_MIN, L.max));
+                    break;
+                case BinaryInst::LE:
+                    RecordRange(LHS, Pred, TrueBB,
+                                IntRange(IntRange::I32_MIN, R.max));
+                    RecordRange(RHS, Pred, TrueBB,
+                                IntRange(L.min, IntRange::I32_MAX));
+                    RecordRange(LHS, Pred, FalseBB,
+                                IntRange(R.min + 1, IntRange::I32_MAX));
+                    RecordRange(RHS, Pred, FalseBB,
+                                IntRange(IntRange::I32_MIN, L.max - 1));
+                    break;
+                case BinaryInst::G:
+                    RecordRange(LHS, Pred, TrueBB,
+                                IntRange(R.min + 1, IntRange::I32_MAX));
+                    RecordRange(RHS, Pred, TrueBB,
+                                IntRange(IntRange::I32_MIN, L.max - 1));
+                    RecordRange(LHS, Pred, FalseBB,
+                                IntRange(IntRange::I32_MIN, R.max));
+                    RecordRange(RHS, Pred, FalseBB,
+                                IntRange(L.min, IntRange::I32_MAX));
+                    break;
+                case BinaryInst::GE:
+                    RecordRange(LHS, Pred, TrueBB,
+                                IntRange(R.min, IntRange::I32_MAX));
+                    RecordRange(RHS, Pred, TrueBB,
+                                IntRange(IntRange::I32_MIN, L.max));
+                    RecordRange(LHS, Pred, FalseBB,
+                                IntRange(IntRange::I32_MIN, R.max - 1));
+                    RecordRange(RHS, Pred, FalseBB,
+                                IntRange(L.min + 1, IntRange::I32_MAX));
+                    break;
+                case BinaryInst::E:
+                    RecordRange(LHS, Pred, TrueBB, R);
+                    RecordRange(RHS, Pred, TrueBB, L);
+                    RecordBits(LHS, Pred, TrueBB, FinalBits(RHS));
+                    RecordBits(RHS, Pred, TrueBB, FinalBits(LHS));
+                    break;
+                case BinaryInst::NE:
+                    RecordRange(LHS, Pred, FalseBB, R);
+                    RecordRange(RHS, Pred, FalseBB, L);
+                    RecordBits(LHS, Pred, FalseBB, FinalBits(RHS));
+                    RecordBits(RHS, Pred, FalseBB, FinalBits(LHS));
+                    break;
+                default:
+                    break;
+            }
+
+            // Preserve the common sign-bit facts without deriving them from
+            // any source-level UB or array bound assumption.
+            if (auto *RC = dynamic_cast<ConstInt *>(RHS)) {
+                if (RC->getVal() == 0) {
+                    if (Cmp->getOp() == BinaryInst::L) {
+                        RecordBits(LHS, Pred, TrueBB,
+                                   KnownBits(0, 0x80000000u));
+                        RecordBits(LHS, Pred, FalseBB,
+                                   KnownBits(0x80000000u, 0));
+                    } else if (Cmp->getOp() == BinaryInst::GE) {
+                        RecordBits(LHS, Pred, TrueBB,
+                                   KnownBits(0x80000000u, 0));
+                        RecordBits(LHS, Pred, FalseBB,
+                                   KnownBits(0, 0x80000000u));
+                    }
+                }
+            }
+        }
+    }
+
     // --- 主求解入口 ---
 
     RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr) {
@@ -1674,12 +1933,8 @@ public:
         markBlockExecutable(F.front());
         runForward();
 
-        // Step 2: 把本函数的返回值 range 写到跨函数 cache
-        // 因为 Step 1 用 Top 参数分析，这里得到的 return range 覆盖了所有
-        // 可能输入，对任何 caller 都是 safe 的保守估计
-        publishReturnRange(F);
-
-        // Step 3: Narrowing（backward constraint propagation）
+        // Step 2: Narrowing（backward constraint propagation）。
+        // 跨函数 return cache 当前禁用，不发布顺序敏感 summary。
         const bool NarrowingComplete = runNarrowing(F);
 
         // A budget cutoff leaves a partially intersected (under-approximating)
@@ -1693,14 +1948,18 @@ public:
             BlockLocalRanges.clear();
         }
 
-        // Branch/GEP contextual facts were derived while the global lattice
-        // was still changing.  They are not transform-visible until we have a
-        // final-fact rebuild with explicit source dependencies; clearing them
-        // here is conservative and prevents an early loop singleton from
-        // surviving as a stale path constraint.
+        // Branch/GEP contextual facts derived while the lattice was changing
+        // are never exposed.  Rebuild integer branch facts once from the
+        // current CFG and final global lattice.  This naturally includes newly
+        // cloned/peeled blocks whenever RangeAnalysis is recomputed after the
+        // CFG-transform invalidation.
         ContextualRanges.clear();
         FloatContextualRanges.clear();
         ContextualBits.clear();
+        EdgeRanges.clear();
+        EdgeBits.clear();
+        if (NarrowingComplete)
+            rebuildIntegerContextualFacts(F);
 
         // Step 4: 用 SCEV 证明出的有限归纳变量范围补充循环体上下文信息。
         // 只写 non-header loop blocks，保留 header/exit 判断的保守性。
@@ -1711,11 +1970,13 @@ public:
         RangeInfo info;
         info.GlobalRanges = std::move(ValueRanges);
         info.ContextualRanges = std::move(ContextualRanges);
+        info.EdgeRanges = std::move(EdgeRanges);
         info.BlockLocalRanges = std::move(BlockLocalRanges);
         info.FloatGlobalRanges = std::move(FloatValueRanges);
         info.FloatContextualRanges = std::move(FloatContextualRanges);
         info.GlobalBits = std::move(ValueBits);
         info.ContextualBits = std::move(ContextualBits);
+        info.EdgeBits = std::move(EdgeBits);
         if (ScevInductions)
             info.LoopInductions = *ScevInductions;
         return info;

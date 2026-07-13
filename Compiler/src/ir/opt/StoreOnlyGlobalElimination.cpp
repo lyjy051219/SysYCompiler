@@ -214,11 +214,19 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     // 内置函数：按 FuncAttr 判定
                     if (auto *BIF = dynamic_cast<BuildInFunction*>(callee)) {
                         FuncAttr attr = classifyBuiltin(BIF);
+                        // An untracked external routine may observe globals even
+                        // when no pointer is passed explicitly.  It is therefore
+                        // not legal to delete stores merely because its argument
+                        // list contains no traceable global pointer.
+                        if (attr == FuncAttr::Untracked) {
+                            for (Variable *G : candidates)
+                                reads[G].anyIndexRead = true;
+                            continue;
+                        }
                         bool maybeRead =
                             attr == FuncAttr::Sylib ||
                             attr == FuncAttr::MemReadOnly ||
-                            attr == FuncAttr::MemReadWrite ||
-                            attr == FuncAttr::Untracked;
+                            attr == FuncAttr::MemReadWrite;
                         if (maybeRead) {
                             // 实参里若有指针指向 global，保守标该 global anyIndexRead
                             for (unsigned k = 0; k < CI->getArgCount(); k++) {
@@ -245,25 +253,11 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     // 用户函数：查 callee 的 SideEffectInfo，只在 RefSet 里才算读
                     if (auto *calleeF = dynamic_cast<Function*>(callee)) {
                         auto &SEI = FAM.getResult<SideEffectAnalysis>(*calleeF);
-                        // hasBuiltin：callee 内部调过 Untracked 的东西 → 保守全读
+                        // A transitive untracked call can access a global without
+                        // receiving its address as a formal argument.
                         if (SEI.hasBuiltin) {
-                            for (unsigned k = 0; k < CI->getArgCount(); k++) {
-                                Value *arg = CI->getArg(k);
-                                if (!arg || !arg->getIRType()) continue;
-                                if (arg->getIRType()->getEnum() != IR_POINTER) continue;
-                                std::unordered_set<Value*> bases;
-                                std::unordered_set<Value*> visited;
-                                bool escape = false;
-                                collectReachableBases(arg, bases, visited, escape);
-                                if (escape) {
-                                    for (Variable *G : candidates) reads[G].anyIndexRead = true;
-                                } else {
-                                    for (Value *b : bases) {
-                                        if (auto *v = dynamic_cast<Variable*>(b))
-                                            if (v->isGlobal()) markGlobalRead(v, nullptr, reads);
-                                    }
-                                }
-                            }
+                            for (Variable *G : candidates)
+                                reads[G].anyIndexRead = true;
                             continue;
                         }
                         // 1) 直接读的 global（callee 的 RefSet 里若有 Variable 类型）
@@ -371,20 +365,31 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         auto innerEnum = inner->getEnum();
         if (innerEnum != IR_INT && innerEnum != IR_FLOAT) continue;
 
-        // 扫全模块：G 是否还有 store 写它？
+        // Scan the whole module for any instruction that may modify G.  Looking
+        // only for syntactically direct stores is unsound: a store through a
+        // PHI/select/parameter, memcpy/memset, or an unknown call may all write
+        // the same object.  BasicAA + the call summaries provide a conservative
+        // ModRef proof; a MayAlias result deliberately blocks propagation.
         bool anyWrite = false;
         // 同时收集所有 load
         std::vector<LoadInst*> loads;
         for (auto &funcPtr : M.getFunctions()) {
             Function *F = funcPtr.get();
             if (!F) continue;
+            auto &AA = FAM.getResult<BasicAliasAnalysis>(*F);
+            auto &LI = FAM.getResult<LoopAnalysis>(*F);
             for (BasicBlock *BB : *F) {
                 for (Instruction *I : *BB) {
                     if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
-                        Value *ptr = SI2->getPointerOperand();
-                        if (!ptr) continue;
-                        StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
-                        if (tr.base == G) { anyWrite = true; }
+                        if (isModSet(getInstModRefInfo(G, SI2, AA, LI, FAM))) {
+                            anyWrite = true;
+                            break;
+                        }
+                    } else if (auto *CI = dynamic_cast<CallInst*>(I)) {
+                        if (isModSet(getInstModRefInfo(G, CI, AA, LI, FAM))) {
+                            anyWrite = true;
+                            break;
+                        }
                     } else if (auto *LI = dynamic_cast<LoadInst*>(I)) {
                         Value *ptr = LI->getPointerOperand();
                         if (!ptr) continue;
@@ -399,6 +404,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         }
                     }
                 }
+                if (anyWrite) break;
             }
             if (anyWrite) break;
         }

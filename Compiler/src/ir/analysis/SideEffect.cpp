@@ -43,6 +43,8 @@ IntrinsicID getIntrinsicID(BuildInFunction* BIF) {
     const std::string& N = BIF->getIdent();
     if (BuildInFunction::isMemcpyName(N))
         return IntrinsicID::Memcpy;
+    if (BuildInFunction::isMemsetName(N))
+        return IntrinsicID::Memset;
     return IntrinsicID::None;
 }
 
@@ -146,7 +148,10 @@ FuncAttr classifyBuiltin(BuildInFunction* BIF) {
     // 5. 内存拷贝函数：既读又写
     if (BuildInFunction::isMemcpyName(N)) return FuncAttr::MemReadWrite;
 
-    // 6. 兜底策略：未知的内置函数，保守退让
+    // 6. 内存填充函数：只写第一个指针实参。
+    if (BuildInFunction::isMemsetName(N)) return FuncAttr::MemWriteOnly;
+
+    // 7. 兜底策略：未知的内置函数，保守退让
     return FuncAttr::Untracked;
 }
 
@@ -167,6 +172,17 @@ void SideEffectAnalysis::processBuiltinCall(
         };
         if (Args.size() >= 1) addArgBases(Args[0], Info.ModSet);
         if (Args.size() >= 2) addArgBases(Args[1], Info.RefSet);
+        return;
+    }
+    // memset：仅目标地址被写；填充值和长度均不访问内存。
+    if (getIntrinsicID(BIF) == IntrinsicID::Memset) {
+        if (!Args.empty() && Args[0]) {
+            auto it = CallerPtrMap.find(Args[0]);
+            if (it != CallerPtrMap.end())
+                it->second.collectExternalBases(Info.ModSet);
+            else if (Args[0]->isExternalVariable())
+                Info.ModSet.insert(Args[0]);
+        }
         return;
     }
     //2.获取内置函数属性，并处理内置函数的 Mod/Ref 影响
@@ -451,6 +467,11 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
                 if (Result == ModRefInfo::ModRef) return Result;
                 if (Args.size() >= 2 && Args[1] && overlaps(Args[1]))
                     Result = unionModRef(Result, ModRefInfo::Ref);
+                return Result;
+            }
+            if (getIntrinsicID(BIF) == IntrinsicID::Memset) {
+                if (!Args.empty() && Args[0] && overlaps(Args[0]))
+                    Result = unionModRef(Result, ModRefInfo::Mod);
                 return Result;
             }
 

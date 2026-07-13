@@ -4,6 +4,7 @@
 
 FUNCTION_ANALYSIS("DominatorTree", DominantAnalysis())
 FUNCTION_ANALYSIS("BasicAA", BasicAliasAnalysis())
+FUNCTION_ANALYSIS("MemorySSA", MemorySSAAnalysis())
 FUNCTION_ANALYSIS("LoopInfo", LoopAnalysis())
 FUNCTION_ANALYSIS("SideEffect", SideEffectAnalysis())
 FUNCTION_ANALYSIS("PostDominatorTree", PostDominantAnalysis())
