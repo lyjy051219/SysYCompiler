@@ -9,9 +9,12 @@ namespace riscv {
 // 新增 optional pass 时优先把实现和声明放在 rv/opt 这一层。
 bool runBranchCompareFolding(MachineFunction &mf);
 bool runPreRAGlobalAddressReuse(MachineFunction &mf);
+bool runPreRAAffineCombine(MachineFunction &mf);
 bool runPreRAAddressCombine(MachineFunction &mf);
 bool runPreRACopyPropagation(MachineFunction &mf);
 bool runPreRALocalCSE(MachineFunction &mf);
+bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
+                                  MachineFunctionAnalysisManager &am);
 bool runPreRAMachineDCE(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);

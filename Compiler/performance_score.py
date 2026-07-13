@@ -79,7 +79,10 @@ BUILD_DIR = PROJECT / "build-riscv"
 COMPILER = BUILD_DIR / "compiler"
 MIDDLE_BUILD_DIR = PROJECT / "build-middle"
 MIDDLE_COMPILER = MIDDLE_BUILD_DIR / "compiler_middle_end"
-RUNTIME_C = PROJECT / "runtime" / "sylib.c"
+OFFICIAL_RUNTIME_LL = PROJECT / "runtime" / "runtime.ll"
+PERFORMANCE_RUNTIME_DIR = WORKSPACE / "性能替代版"
+RUNTIME_C = PERFORMANCE_RUNTIME_DIR / "sylib.c"
+RUNTIME_LL = PERFORMANCE_RUNTIME_DIR / "runtime.ll"
 
 
 @dataclass
@@ -513,6 +516,14 @@ def compile_gcc_o3(case: Path, case_dir: Path, header: Path, args: argparse.Name
 
 def sanitize_ir_for_clang_riscv(input_file: Path, output_file: Path) -> None:
     text = input_file.read_text(encoding="utf-8")
+    official_runtime = OFFICIAL_RUNTIME_LL.read_text(encoding="utf-8")
+    if not text.startswith(official_runtime):
+        raise RuntimeError(
+            "middle-end IR does not start with the official runtime; "
+            "cannot safely substitute the performance runtime"
+        )
+    performance_runtime = RUNTIME_LL.read_text(encoding="utf-8")
+    text = performance_runtime + text[len(official_runtime):]
     # runtime/runtime.ll is produced on the host and may carry x86 function
     # target attributes. Keep the IR body intact, but let clang's RISC-V target
     # options select the CPU/features for the baseline code generation.
@@ -805,6 +816,10 @@ def main() -> int:
         fail(f"tests directory not found: {TESTS_ROOT}")
     if not RUNTIME_C.exists():
         fail(f"runtime library not found: {RUNTIME_C}")
+    if not RUNTIME_LL.exists():
+        fail(f"runtime IR not found: {RUNTIME_LL}")
+    if not OFFICIAL_RUNTIME_LL.exists():
+        fail(f"official runtime IR not found: {OFFICIAL_RUNTIME_LL}")
     if args.baseline == "clang-ir" and shutil.which(args.clang) is None:
         fail(f"clang executable not found: {args.clang}")
 
@@ -827,6 +842,10 @@ def main() -> int:
         f"{Color.YELLOW}[SETUP]{Color.RESET} "
         f"suite={args.suite}, cases={len(cases)}, warmups={args.warmups}, "
         f"timed-runs={args.runs}, time-stat={args.time_stat}"
+    )
+    print(
+        f"{Color.YELLOW}[SETUP]{Color.RESET} runtime: "
+        f"{PERFORMANCE_RUNTIME_DIR} (CLOCK_MONOTONIC)"
     )
     if args.baseline == "gcc-o3":
         baseline_flags = [f"-ffp-contract={args.gcc_fp_contract}"] + args.gcc_extra

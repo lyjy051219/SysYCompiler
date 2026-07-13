@@ -377,6 +377,8 @@ AsmPrinter::AsmPrinter(std::ostream &out) : out_(out) {}
 
 void AsmPrinter::emitModule(const MachineModule &module) {
   out_ << "# myCompiler RV64GC backend\n";
+  out_ << "    .attribute arch, \"rv64gc\"\n";
+  out_ << "    .option rvc\n";
   for (const GlobalObject &global : module.globals) {
     emitGlobal(global);
   }

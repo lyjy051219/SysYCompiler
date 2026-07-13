@@ -10,8 +10,8 @@
 #include <functional>
 #include <initializer_list>
 #include <iterator>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1560,6 +1560,220 @@ void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
   state.addresses[&inst] = Address::regBase(dst);
 }
 
+bool exactIntegerConstant(Value *value, int64_t &out) {
+  if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+    out = intValue->getVal();
+    return true;
+  }
+  if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+    out = boolValue->getVal() ? 1 : 0;
+    return true;
+  }
+  return false;
+}
+
+bool hasAllZeroBytes(Value *value, const std::shared_ptr<IRType> &type) {
+  if (!type) {
+    return false;
+  }
+  if (!value) {
+    return true;
+  }
+
+  if (auto *init = dynamic_cast<Initializer *>(value)) {
+    if (init->empty()) {
+      return true;
+    }
+    auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
+    if (!arrayType || arrayType->getElementCount() < 0 ||
+        init->size() > static_cast<std::size_t>(arrayType->getElementCount())) {
+      return false;
+    }
+    for (Value *element : *init) {
+      if (!hasAllZeroBytes(element, arrayType->getElementType())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (isPointerType(type)) {
+    return dynamic_cast<ConstPtr *>(value) != nullptr;
+  }
+  if (isBoolType(type)) {
+    if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+      return !boolValue->getVal();
+    }
+    if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+      return intValue->getVal() == 0;
+    }
+    return false;
+  }
+  if (type->getEnum() == IR_INT) {
+    if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+      return intValue->getVal() == 0;
+    }
+    if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+      return !boolValue->getVal();
+    }
+    return false;
+  }
+  if (isFloatType(type)) {
+    auto *floatValue = dynamic_cast<ConstFloat *>(value);
+    if (!floatValue) {
+      return false;
+    }
+    uint32_t bits = 0;
+    float raw = floatValue->getVal();
+    std::memcpy(&bits, &raw, sizeof(bits));
+    return bits == 0;
+  }
+  return false;
+}
+
+bool addScaledOffset(int64_t index, int64_t scale, int64_t &offset) {
+  if (scale <= 0 || index > std::numeric_limits<int64_t>::max() / scale ||
+      index < std::numeric_limits<int64_t>::min() / scale) {
+    return false;
+  }
+  const int64_t delta = index * scale;
+  if ((delta > 0 && offset > std::numeric_limits<int64_t>::max() - delta) ||
+      (delta < 0 && offset < std::numeric_limits<int64_t>::min() - delta)) {
+    return false;
+  }
+  offset += delta;
+  return true;
+}
+
+bool traceConstantPointer(Value *value, Variable *&base, int64_t &offset,
+                          unsigned depth = 0) {
+  if (!value || depth >= 16) {
+    return false;
+  }
+  if (auto *variable = dynamic_cast<Variable *>(value)) {
+    if (variable->vartag != Variable::Constant) {
+      return false;
+    }
+    base = variable;
+    offset = 0;
+    return true;
+  }
+  if (auto *bitCast = dynamic_cast<BitCastInst *>(value)) {
+    Value *source = useValue(*bitCast, 0);
+    if (!source || !isPointerType(source->getIRType()) ||
+        !isPointerType(bitCast->getIRType())) {
+      return false;
+    }
+    return traceConstantPointer(source, base, offset, depth + 1);
+  }
+
+  auto *gep = dynamic_cast<GetElementPtrInst *>(value);
+  if (!gep) {
+    return false;
+  }
+  Value *pointer = useValue(*gep, 0);
+  if (!traceConstantPointer(pointer, base, offset, depth + 1)) {
+    return false;
+  }
+  auto pointerType =
+      pointer ? std::dynamic_pointer_cast<POINTERType>(pointer->getIRType())
+              : nullptr;
+  if (!pointerType) {
+    return false;
+  }
+
+  auto currentType = pointerType->getPointerType();
+  auto &uses = gep->getUserList();
+  for (std::size_t i = 1; i < uses.size(); ++i) {
+    int64_t scale = 0;
+    currentType = advanceGepType(currentType, i == 1, scale);
+    int64_t index = 0;
+    if (scale <= 0 || !exactIntegerConstant(uses[i]->getValue(), index) ||
+        !addScaledOffset(index, scale, offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isAllZeroConstantSource(Value *src, int64_t size) {
+  Variable *base = nullptr;
+  int64_t offset = 0;
+  if (size < 0 || !traceConstantPointer(src, base, offset) || !base) {
+    return false;
+  }
+
+  auto pointerType = std::dynamic_pointer_cast<POINTERType>(base->getIRType());
+  if (!pointerType) {
+    return false;
+  }
+  auto objectType = pointerType->getPointerType();
+  const int64_t objectSize = typeSizeBytes(objectType);
+  if (objectSize < 0 || offset < 0 || offset > objectSize ||
+      size > objectSize - offset) {
+    return false;
+  }
+  return hasAllZeroBytes(base->getUsee(), objectType);
+}
+
+bool isNonVolatileMemcpy(CallInst &inst) {
+  int64_t isVolatile = 0;
+  return exactIntegerConstant(useValue(inst, 4), isVolatile) && isVolatile == 0;
+}
+
+bool prepareZeroMemcpyDestination(MachineFunction &mf, const Address &address,
+                                  int64_t size) {
+  if (address.kind != Address::Kind::FrameIndex || address.frameIndex < 0 ||
+      address.frameIndex >= static_cast<int>(mf.stackObjects.size())) {
+    return false;
+  }
+  StackObject &object = mf.stackObjects[address.frameIndex];
+  if (object.fixed || object.size < 0 || address.offset < 0 ||
+      address.offset > object.size || size < 0 ||
+      size > object.size - address.offset) {
+    return false;
+  }
+
+  // Frame layout has not run yet, so strengthening this object's requested
+  // alignment makes every subsequently selected natural-width store safe.
+  const int64_t requiredAlign = size >= 8 ? 8 : (size >= 4 ? 4 : 1);
+  const int64_t currentAlign = std::max<int64_t>(1, object.align);
+  if ((currentAlign <= requiredAlign && requiredAlign % currentAlign != 0) ||
+      (currentAlign > requiredAlign && currentAlign % requiredAlign != 0)) {
+    return false;
+  }
+  object.align = std::max(currentAlign, requiredAlign);
+  return true;
+}
+
+void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
+                            int64_t size) {
+  const MachineReg zero64 = MachineReg::preg(PhysReg::X0, RegClass::GPR64);
+  const MachineReg zero32 = MachineReg::preg(PhysReg::X0, RegClass::GPR32);
+
+  int64_t offset = 0;
+  while (offset < size) {
+    const int64_t remaining = size - offset;
+    const int64_t absoluteOffset = dstAddress.offset + offset;
+    Opcode opcode = Opcode::SB;
+    MachineReg zero = zero32;
+    int64_t width = 1;
+    if (remaining >= 8 && absoluteOffset % 8 == 0) {
+      opcode = Opcode::SD;
+      zero = zero64;
+      width = 8;
+    } else if (remaining >= 4 && absoluteOffset % 4 == 0) {
+      opcode = Opcode::SW;
+      width = 4;
+    }
+
+    Address storeAddress = dstAddress;
+    storeAddress.offset += offset;
+    appendStore(mbb, opcode, zero, storeAddress);
+    offset += width;
+  }
+}
+
 void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
                  LoweringState &state, CallInst &inst,
                  const std::string &name) {
@@ -1575,6 +1789,13 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   Address dstAddress = addressForValue(mf, mbb, state, dst, name);
+  if (size <= kLoopMemcpyThreshold && isNonVolatileMemcpy(inst) &&
+      isAllZeroConstantSource(src, size) &&
+      prepareZeroMemcpyDestination(mf, dstAddress, size)) {
+    appendZeroMemcpyStores(mbb, dstAddress, size);
+    return;
+  }
+
   Address srcAddress = addressForValue(mf, mbb, state, src, name);
   if (size > kLoopMemcpyThreshold) {
     MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);

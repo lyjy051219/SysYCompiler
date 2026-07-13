@@ -95,6 +95,8 @@ MachineFunctionPassManager buildPreRALinearPipeline(
   MachineFunctionPassManager MPM;
   addOptionalPass(MPM, Options, "pre-ra-copy-prop",
                   PreRACopyPropagationPass());
+  addOptionalPass(MPM, Options, "pre-ra-affine-combine",
+                  PreRAAffineCombinePass());
   addOptionalPass(MPM, Options, "pre-ra-address-combine",
                   PreRAAddressCombinePass());
   addOptionalPass(MPM, Options, "pre-ra-local-cse", PreRALocalCSEPass());
@@ -155,6 +157,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
     MachineFunctionPassManager prefix;
     addOptionalPass(prefix, Options, "pre-ra-copy-prop",
                     PreRACopyPropagationPass());
+    addOptionalPass(prefix, Options, "pre-ra-affine-combine",
+                    PreRAAffineCombinePass());
     addOptionalPass(prefix, Options, "pre-ra-address-combine",
                     PreRAAddressCombinePass());
     addOptionalPass(prefix, Options, "pre-ra-local-cse", PreRALocalCSEPass());
@@ -168,6 +172,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
           std::move(core), 3));
     }
   }
+  addOptionalPass(MPM, Options, "pre-ra-guarded-loop-preheader",
+                  PreRAGuardedLoopPreheaderPass());
   return MPM;
 }
 

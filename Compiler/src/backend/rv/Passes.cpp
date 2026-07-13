@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -387,8 +388,65 @@ bool findAddWithFalseValue(const std::vector<MachineInstr> &lowered,
   return false;
 }
 
+std::map<uint32_t, std::size_t>
+collectVirtualUseCounts(const MachineFunction &mf) {
+  std::map<uint32_t, std::size_t> counts;
+  for (const MachineBasicBlock &block : mf.blocks) {
+    for (const MachineInstr &instr : block.instrs) {
+      for (const MachineOperand &use : instr.uses) {
+        if (use.kind == OperandKind::Reg && !use.regValue.physical) {
+          ++counts[use.regValue.id];
+        }
+      }
+    }
+  }
+  return counts;
+}
+
+bool conditionProducerFoldsIntoBranch(
+    const std::vector<MachineInstr> &lowered, const MachineReg &condition,
+    const std::map<uint32_t, std::size_t> &useCounts) {
+  if (condition.physical) {
+    return false;
+  }
+  auto count = useCounts.find(condition.id);
+  if (count == useCounts.end() || count->second != 1) {
+    return false;
+  }
+
+  if (lowered.empty()) {
+    return false;
+  }
+  const MachineInstr &producer = lowered.back();
+  if (producer.defs.size() != 1 || producer.defs.front().kind != OperandKind::Reg ||
+      !sameMachineReg(producer.defs.front().regValue, condition) ||
+      producer.sideEffects || producer.terminator ||
+      !producer.implicitDefs.empty() || !producer.implicitUses.empty()) {
+    return false;
+  }
+
+  // BranchCompareFolding only recognizes an adjacent producer and branch.
+  // In that exact shape, keeping a four-ALU mask sequence is always dearer.
+  switch (producer.opcode) {
+  case Opcode::SLT:
+  case Opcode::XOR:
+    return producer.uses.size() == 2 && isRegUse(producer, 0) &&
+           isRegUse(producer, 1);
+  case Opcode::SEQZ:
+  case Opcode::SNEZ:
+    return producer.uses.size() == 1 && isRegUse(producer, 0);
+  case Opcode::XORI:
+    return producer.uses.size() == 2 && isRegUse(producer, 0) &&
+           producer.uses[1].kind == OperandKind::Imm &&
+           producer.uses[1].immValue == 0;
+  default:
+    return false;
+  }
+}
+
 bool lowerBranchlessSelects(MachineFunction &mf) {
   bool changed = false;
+  const auto useCounts = collectVirtualUseCounts(mf);
   for (MachineBasicBlock &block : mf.blocks) {
     std::vector<MachineReg> knownBooleans;
     std::vector<MachineInstr> lowered;
@@ -407,11 +465,11 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
             isKnownBoolean(knownBooleans, cond) &&
             trueValue.rc == dst.rc && falseValue.rc == dst.rc) {
           const MachineReg zero = MachineReg::preg(PhysReg::X0, dst.rc);
-          const MachineReg mask = mf.createVReg(dst.rc);
           MachineReg increment;
           Opcode addOpcode = Opcode::ADDW;
           if (findAddWithFalseValue(lowered, trueValue, falseValue, increment,
                                      addOpcode)) {
+            const MachineReg mask = mf.createVReg(dst.rc);
             const MachineReg selected = mf.createVReg(dst.rc);
             lowered.push_back(makeRegInstr(
                 dst.rc == RegClass::GPR32 ? Opcode::SUBW : Opcode::SUB, mask,
@@ -420,7 +478,9 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
                 makeRegInstr(Opcode::AND, selected, {increment, mask}));
             lowered.push_back(
                 makeRegInstr(addOpcode, dst, {falseValue, selected}));
-          } else {
+          } else if (!conditionProducerFoldsIntoBranch(lowered, cond,
+                                                        useCounts)) {
+            const MachineReg mask = mf.createVReg(dst.rc);
             const MachineReg difference = mf.createVReg(dst.rc);
             const MachineReg selected = mf.createVReg(dst.rc);
             lowered.push_back(makeRegInstr(
@@ -432,6 +492,10 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
                                             {difference, mask}));
             lowered.push_back(
                 makeRegInstr(Opcode::XOR, dst, {selected, falseValue}));
+          } else {
+            forgetKnownBoolean(knownBooleans, dst);
+            lowered.push_back(instr);
+            continue;
           }
           forgetKnownBoolean(knownBooleans, dst);
           changed = true;

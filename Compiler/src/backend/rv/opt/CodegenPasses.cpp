@@ -118,6 +118,13 @@ PreRALocalCSEPass::run(MachineFunction &mf,
                  : MachinePreservationStatus::all();
 }
 
+MachinePreservationStatus PreRAGuardedLoopPreheaderPass::run(
+    MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  const bool changed = runPreRAGuardedLoopPreheader(mf, am);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
 MachinePreservationStatus
 PreRAMachineDCEPass::run(MachineFunction &mf,
                          MachineFunctionAnalysisManager &am) {

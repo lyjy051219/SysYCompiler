@@ -63,6 +63,12 @@ struct PreRAGlobalAddressReusePass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前把局部 i32 加减/左移 DAG 归一化为更短的仿射表达式
+struct PreRAAffineCombinePass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配前折叠 common-base 地址临时和 load/store 偏移
 struct PreRAAddressCombinePass {
   MachinePreservationStatus run(MachineFunction &mf,
@@ -77,6 +83,12 @@ struct PreRACopyPropagationPass {
 
 // 分配前基本块内局部公共子表达式删除
 struct PreRALocalCSEPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 分配前在零次内循环入口前跳过只供循环体使用的昂贵纯计算
+struct PreRAGuardedLoopPreheaderPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };

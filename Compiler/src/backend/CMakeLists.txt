@@ -31,6 +31,28 @@ if(BUILD_BACKEND_TESTS)
     set_tests_properties(pre_ra_machine_dce_tests PROPERTIES
         ENVIRONMENT "BACKEND_VERIFY_MIR=1")
 
+    add_executable(pre_ra_affine_combine_tests
+        rv/tests/PreRAAffineCombineTests.cpp)
+    target_link_libraries(pre_ra_affine_combine_tests PRIVATE Backend)
+    add_test(NAME pre_ra_affine_combine_tests
+        COMMAND pre_ra_affine_combine_tests)
+    set_tests_properties(pre_ra_affine_combine_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
+    add_executable(pre_ra_guarded_loop_preheader_tests
+        rv/tests/PreRAGuardedLoopPreheaderTests.cpp)
+    target_link_libraries(pre_ra_guarded_loop_preheader_tests PRIVATE Backend)
+    add_test(NAME pre_ra_guarded_loop_preheader_tests
+        COMMAND pre_ra_guarded_loop_preheader_tests)
+    set_tests_properties(pre_ra_guarded_loop_preheader_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
+    add_executable(select_lowering_tests rv/tests/SelectLoweringTests.cpp)
+    target_link_libraries(select_lowering_tests PRIVATE Backend)
+    add_test(NAME select_lowering_tests COMMAND select_lowering_tests)
+    set_tests_properties(select_lowering_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
     add_executable(codegen_prepare_tests rv/tests/CodeGenPrepareTests.cpp)
     target_link_libraries(codegen_prepare_tests PRIVATE Backend)
     add_test(NAME codegen_prepare_tests COMMAND codegen_prepare_tests)

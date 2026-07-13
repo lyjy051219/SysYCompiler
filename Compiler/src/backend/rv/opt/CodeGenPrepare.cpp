@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace riscv {
@@ -19,11 +21,20 @@ struct PrepareCandidate {
   BasicBlock *preheader = nullptr;
   BasicBlock *latch = nullptr;
   GetElementPtrInst *gep = nullptr;
+  Value *originalIndex = nullptr;
+  Value *induction = nullptr;
   unsigned varyingIndex = 0;
   int64_t start = 0;
   int64_t step = 0;
   std::size_t indexSize = 4;
   std::size_t score = 0;
+  std::unordered_set<Value *> cloneValues;
+};
+
+struct AffineIndexInfo {
+  Value *induction = nullptr;
+  int coefficient = 0;
+  unsigned occurrences = 0;
 };
 
 bool fitsInt32(int64_t value) {
@@ -31,17 +42,21 @@ bool fitsInt32(int64_t value) {
          value <= std::numeric_limits<int>::max();
 }
 
-std::optional<int64_t>
-estimateTripCount(const LoopInductionInfo &Info) {
-  if (!Info.hasUpperBound || Info.step == 0) return std::nullopt;
+std::optional<int64_t> estimateTripCount(const LoopInductionInfo &Info) {
+  if (!Info.hasUpperBound || Info.step == 0)
+    return std::nullopt;
 
   const int64_t span = Info.upperBound - Info.initial;
-  if (span == 0) return int64_t(1);
-  if ((span > 0) != (Info.step > 0)) return std::nullopt;
-  if (span % Info.step != 0) return std::nullopt;
+  if (span == 0)
+    return int64_t(1);
+  if ((span > 0) != (Info.step > 0))
+    return std::nullopt;
+  if (span % Info.step != 0)
+    return std::nullopt;
 
   int64_t steps = span / Info.step;
-  if (steps < 0) steps = -steps;
+  if (steps < 0)
+    steps = -steps;
   return steps + 1;
 }
 
@@ -52,15 +67,86 @@ bool isParamOrGlobal(Value *V) {
 
 bool dominatesPreheader(Value *V, BasicBlock *PreHeader,
                         const DominatorTree &DT) {
-  if (!V) return false;
-  if (V->isConst() || isParamOrGlobal(V)) return true;
+  if (!V)
+    return false;
+  if (V->isConst() || isParamOrGlobal(V))
+    return true;
   auto *Inst = dynamic_cast<Instruction *>(V);
-  if (!Inst || !PreHeader || !PreHeader->back()) return false;
+  if (!Inst || !PreHeader || !PreHeader->back())
+    return false;
   return DT.dominatesValue(V, PreHeader->back());
 }
 
+bool isSupportedIndexValue(Value *V) {
+  return V && V->getIRType() && V->getIRType()->getEnum() == IR_INT &&
+         (V->getIRType()->getSize() == 4 || V->getIRType()->getSize() == 8);
+}
+
+bool analyzeAffineIndex(
+    Value *V, const Loop *L, BasicBlock *PreHeader, const DominatorTree &DT,
+    const std::unordered_map<Value *, LoopInductionInfo> &LoopInductions,
+    bool AllowExpressions, std::unordered_set<Value *> &CloneValues,
+    std::unordered_set<Value *> &Active, AffineIndexInfo &Result) {
+  if (!isSupportedIndexValue(V))
+    return false;
+
+  auto InductionIt = LoopInductions.find(V);
+  if (InductionIt != LoopInductions.end() && InductionIt->second.RecLoop == L) {
+    Result.induction = V;
+    Result.coefficient = 1;
+    Result.occurrences = 1;
+    return true;
+  }
+
+  if (dominatesPreheader(V, PreHeader, DT))
+    return true;
+  if (!AllowExpressions)
+    return false;
+
+  auto *Bin = dynamic_cast<BinaryInst *>(V);
+  if (!Bin || Bin->getUserList().size() != 2 || Active.count(V))
+    return false;
+  const auto Op = Bin->getOp();
+  if (Op != BinaryInst::ADD && Op != BinaryInst::SUB && Op != BinaryInst::MUL) {
+    return false;
+  }
+
+  Active.insert(V);
+  AffineIndexInfo LHS;
+  AffineIndexInfo RHS;
+  Value *LHSValue = Bin->getUserList()[0]->getValue();
+  Value *RHSValue = Bin->getUserList()[1]->getValue();
+  const bool Valid =
+      analyzeAffineIndex(LHSValue, L, PreHeader, DT, LoopInductions,
+                         AllowExpressions, CloneValues, Active, LHS) &&
+      analyzeAffineIndex(RHSValue, L, PreHeader, DT, LoopInductions,
+                         AllowExpressions, CloneValues, Active, RHS);
+  Active.erase(V);
+  if (!Valid || LHS.occurrences + RHS.occurrences > 1)
+    return false;
+  if (LHS.induction && RHS.induction && LHS.induction != RHS.induction)
+    return false;
+
+  Result.induction = LHS.induction ? LHS.induction : RHS.induction;
+  Result.occurrences = LHS.occurrences + RHS.occurrences;
+  if (Op == BinaryInst::MUL) {
+    // Multiplication is cloneable only in a loop-invariant subtree.
+    if (Result.occurrences != 0)
+      return false;
+    Result.coefficient = 0;
+  } else if (Op == BinaryInst::ADD) {
+    Result.coefficient = LHS.coefficient + RHS.coefficient;
+  } else {
+    Result.coefficient = LHS.coefficient - RHS.coefficient;
+  }
+
+  CloneValues.insert(V);
+  return true;
+}
+
 bool collectLoopOrder(const Loop *L, std::vector<const Loop *> &Loops) {
-  if (!L) return false;
+  if (!L)
+    return false;
   Loops.push_back(L);
   for (const Loop *Sub : L->getSubLoops()) {
     collectLoopOrder(Sub, Loops);
@@ -69,15 +155,18 @@ bool collectLoopOrder(const Loop *L, std::vector<const Loop *> &Loops) {
 }
 
 bool insertBeforeTerminator(BasicBlock *BB, Instruction *Inst) {
-  if (!BB || !Inst || BB->empty()) return false;
+  if (!BB || !Inst || BB->empty())
+    return false;
   auto It = BB->rbegin();
-  if (It == BB->rend()) return false;
+  if (It == BB->rend())
+    return false;
   It.insertBefore(Inst);
   return true;
 }
 
 bool insertBeforeFirstNonPhi(BasicBlock *BB, Instruction *Inst) {
-  if (!BB || !Inst) return false;
+  if (!BB || !Inst)
+    return false;
   for (auto It = BB->begin(); It != BB->end(); ++It) {
     Instruction *Cur = *It;
     if (!dynamic_cast<PhiInst *>(Cur)) {
@@ -90,18 +179,19 @@ bool insertBeforeFirstNonPhi(BasicBlock *BB, Instruction *Inst) {
     return true;
   }
   auto It = BB->rbegin();
-  if (It == BB->rend()) return false;
+  if (It == BB->rend())
+    return false;
   It.insertBefore(Inst);
   return true;
 }
 
-std::optional<PrepareCandidate>
-tryBuildCandidate(GetElementPtrInst &GEP, const Loop *L, BasicBlock *PreHeader,
-                  BasicBlock *Latch, const DominatorTree &DT,
-                  const std::unordered_map<Value *, LoopInductionInfo>
-                      &LoopInductions) {
+std::optional<PrepareCandidate> tryBuildCandidate(
+    GetElementPtrInst &GEP, const Loop *L, BasicBlock *PreHeader,
+    BasicBlock *Latch, const DominatorTree &DT,
+    const std::unordered_map<Value *, LoopInductionInfo> &LoopInductions) {
   auto &Ops = GEP.getUserList();
-  if (Ops.size() <= 1) return std::nullopt;
+  if (Ops.size() <= 1)
+    return std::nullopt;
   if (!PreHeader || !Latch || !PreHeader->back() || !Latch->back())
     return std::nullopt;
 
@@ -110,48 +200,81 @@ tryBuildCandidate(GetElementPtrInst &GEP, const Loop *L, BasicBlock *PreHeader,
   int64_t Step = 0;
   std::size_t IndexSize = 4;
   bool FoundVarying = false;
+  Value *OriginalIndex = nullptr;
+  Value *Induction = nullptr;
+  std::unordered_set<Value *> CloneValues;
+  const bool AllowAffineExpressions =
+      std::getenv("BACKEND_DISABLE_AFFINE_POINTER_IV") == nullptr;
 
   for (unsigned I = 0; I < Ops.size(); ++I) {
     Value *Op = Ops[I] ? Ops[I]->getValue() : nullptr;
-    if (!Op) return std::nullopt;
+    if (!Op)
+      return std::nullopt;
 
     if (I == 0) {
-      if (!dominatesPreheader(Op, PreHeader, DT)) return std::nullopt;
+      if (!dominatesPreheader(Op, PreHeader, DT))
+        return std::nullopt;
       continue;
     }
 
-    if (!FoundVarying) {
-      auto It = LoopInductions.find(Op);
-      if (It != LoopInductions.end() && It->second.RecLoop == L &&
-          fitsInt32(It->second.initial) &&
-          fitsInt32(It->second.step)) {
+    if (I + 1 == Ops.size()) {
+      AffineIndexInfo IndexInfo;
+      std::unordered_set<Value *> Active;
+      std::unordered_set<Value *> IndexCloneValues;
+      if (analyzeAffineIndex(Op, L, PreHeader, DT, LoopInductions,
+                             AllowAffineExpressions, IndexCloneValues, Active,
+                             IndexInfo) &&
+          IndexInfo.occurrences == 1 && IndexInfo.induction &&
+          (IndexInfo.coefficient == 1 || IndexInfo.coefficient == -1)) {
+        auto It = LoopInductions.find(IndexInfo.induction);
+        if (It == LoopInductions.end() || It->second.RecLoop != L ||
+            !fitsInt32(It->second.initial) || !fitsInt32(It->second.step)) {
+          return std::nullopt;
+        }
         const auto TripCount = estimateTripCount(It->second);
-        if (TripCount && *TripCount <= 1) return std::nullopt;
-        // 首版只处理末尾归纳索引；前缀索引必须全是循环不变量。
-        if (I + 1 != Ops.size()) return std::nullopt;
+        if (TripCount && *TripCount <= 1)
+          return std::nullopt;
+
+        int64_t EffectiveStep = It->second.step;
+        if (IndexInfo.coefficient == -1) {
+          if (EffectiveStep == std::numeric_limits<int>::min())
+            return std::nullopt;
+          EffectiveStep = -EffectiveStep;
+        }
+        if (EffectiveStep == 0 || !fitsInt32(EffectiveStep))
+          return std::nullopt;
+
         FoundVarying = true;
         VaryingIndex = I;
+        OriginalIndex = Op;
+        Induction = IndexInfo.induction;
         Start = It->second.initial;
-        Step = It->second.step;
-        IndexSize = Op->getIRType() ? Op->getIRType()->getSize() : 4;
-        if (Step == 0) return std::nullopt;
+        Step = EffectiveStep;
+        IndexSize = Op->getIRType()->getSize();
+        CloneValues = std::move(IndexCloneValues);
         continue;
       }
     }
 
-    if (!dominatesPreheader(Op, PreHeader, DT)) return std::nullopt;
+    if (!dominatesPreheader(Op, PreHeader, DT))
+      return std::nullopt;
   }
 
-  if (!FoundVarying) return std::nullopt;
+  if (!FoundVarying)
+    return std::nullopt;
 
   for (auto It = GEP.getUseList().begin(); It != GEP.getUseList().end(); ++It) {
     Use *UseNode = *It;
-    if (!UseNode) return std::nullopt;
+    if (!UseNode)
+      return std::nullopt;
     auto *UserInst = dynamic_cast<Instruction *>(UseNode->getUser());
-    if (!UserInst) return std::nullopt;
+    if (!UserInst)
+      return std::nullopt;
     BasicBlock *UserBB = UserInst->getParent();
-    if (!UserBB || !L->contains(UserBB)) return std::nullopt;
-    if (dynamic_cast<PhiInst *>(UserInst)) return std::nullopt;
+    if (!UserBB || !L->contains(UserBB))
+      return std::nullopt;
+    if (dynamic_cast<PhiInst *>(UserInst))
+      return std::nullopt;
   }
 
   PrepareCandidate Candidate;
@@ -159,31 +282,37 @@ tryBuildCandidate(GetElementPtrInst &GEP, const Loop *L, BasicBlock *PreHeader,
   Candidate.preheader = PreHeader;
   Candidate.latch = Latch;
   Candidate.gep = &GEP;
+  Candidate.originalIndex = OriginalIndex;
+  Candidate.induction = Induction;
   Candidate.varyingIndex = VaryingIndex;
   Candidate.start = Start;
   Candidate.step = Step;
   Candidate.indexSize = IndexSize;
   Candidate.score = GEP.getUseList().size;
+  Candidate.cloneValues = std::move(CloneValues);
   return Candidate;
 }
 
-std::vector<PrepareCandidate>
-collectCandidatesForLoop(const Loop *L, const DominatorTree &DT,
-                         const std::unordered_map<Value *, LoopInductionInfo>
-                             &LoopInductions) {
+std::vector<PrepareCandidate> collectCandidatesForLoop(
+    const Loop *L, const DominatorTree &DT,
+    const std::unordered_map<Value *, LoopInductionInfo> &LoopInductions) {
   BasicBlock *PreHeader = nullptr;
   BasicBlock *Latch = nullptr;
-  if (!L->getLoopSimplifyForm(PreHeader, Latch)) return {};
+  if (!L->getLoopSimplifyForm(PreHeader, Latch))
+    return {};
 
   std::vector<PrepareCandidate> Candidates;
   for (BasicBlock *BB : L->getBlocks()) {
-    if (!BB) continue;
+    if (!BB)
+      continue;
     for (Instruction *Inst : *BB) {
       auto *GEP = dynamic_cast<GetElementPtrInst *>(Inst);
-      if (!GEP) continue;
+      if (!GEP)
+        continue;
       auto Candidate =
           tryBuildCandidate(*GEP, L, PreHeader, Latch, DT, LoopInductions);
-      if (!Candidate) continue;
+      if (!Candidate)
+        continue;
       Candidates.push_back(std::move(*Candidate));
     }
   }
@@ -209,7 +338,8 @@ GetElementPtrInst *cloneGEPWithReplacement(GetElementPtrInst &Orig,
                                            unsigned ReplacedIndex,
                                            Value *Replacement) {
   auto &Ops = Orig.getUserList();
-  if (Ops.empty() || !Ops[0]) return nullptr;
+  if (Ops.empty() || !Ops[0])
+    return nullptr;
 
   auto *Clone = new GetElementPtrInst(Ops[0]->getValue());
   for (unsigned I = 1; I < Ops.size(); ++I) {
@@ -224,23 +354,60 @@ GetElementPtrInst *cloneGEPWithReplacement(GetElementPtrInst &Orig,
   return Clone;
 }
 
+Value *
+materializeInitialIndex(Value *V, const PrepareCandidate &Candidate,
+                        Value *Start,
+                        std::unordered_map<Value *, Value *> &Materialized) {
+  if (V == Candidate.induction)
+    return Start;
+  if (!Candidate.cloneValues.count(V))
+    return V;
+  auto It = Materialized.find(V);
+  if (It != Materialized.end())
+    return It->second;
+
+  auto *Bin = dynamic_cast<BinaryInst *>(V);
+  if (!Bin || Bin->getUserList().size() != 2)
+    return nullptr;
+  Value *LHS = materializeInitialIndex(Bin->getUserList()[0]->getValue(),
+                                       Candidate, Start, Materialized);
+  Value *RHS = materializeInitialIndex(Bin->getUserList()[1]->getValue(),
+                                       Candidate, Start, Materialized);
+  if (!LHS || !RHS)
+    return nullptr;
+
+  auto *Clone = new BinaryInst(LHS, Bin->getOp(), RHS);
+  if (!insertBeforeTerminator(Candidate.preheader, Clone)) {
+    delete Clone;
+    return nullptr;
+  }
+  Materialized[V] = Clone;
+  return Clone;
+}
+
 bool rewriteCandidate(const PrepareCandidate &Candidate) {
   GetElementPtrInst *Orig = Candidate.gep;
   if (!Orig || !Candidate.loop || !Candidate.preheader || !Candidate.latch)
     return false;
   auto OrigType = Orig->getIRType();
-  if (!OrigType) return false;
+  if (!OrigType)
+    return false;
 
-  auto *StartConst =
-      ConstInt::newConstInt(static_cast<int>(Candidate.start),
-                            Candidate.indexSize);
-  auto *StepConst =
-      ConstInt::newConstInt(static_cast<int>(Candidate.step),
-                            Candidate.indexSize);
+  auto *StartConst = ConstInt::newConstInt(static_cast<int>(Candidate.start),
+                                           Candidate.indexSize);
+  auto *StepConst = ConstInt::newConstInt(static_cast<int>(Candidate.step),
+                                          Candidate.indexSize);
 
-  GetElementPtrInst *InitGEP = cloneGEPWithReplacement(
-      *Orig, Candidate.varyingIndex, StartConst);
-  if (!InitGEP) return false;
+  std::unordered_map<Value *, Value *> Materialized;
+  Value *InitialIndex = materializeInitialIndex(
+      Candidate.originalIndex, Candidate, StartConst, Materialized);
+  if (!InitialIndex)
+    return false;
+
+  GetElementPtrInst *InitGEP =
+      cloneGEPWithReplacement(*Orig, Candidate.varyingIndex, InitialIndex);
+  if (!InitGEP)
+    return false;
 
   auto *PtrPhi = new PhiInst(OrigType);
   // latch 只做一步推进；前缀索引已体现在 PtrPhi 里。
@@ -262,7 +429,8 @@ bool rewriteCandidate(const PrepareCandidate &Candidate) {
   }
 
   Orig->replaceAllUsesWith(PtrPhi);
-  if (!Orig->getUseList().is_empty()) return false;
+  if (!Orig->getUseList().is_empty())
+    return false;
   delete Orig;
   return true;
 }
@@ -281,9 +449,11 @@ bool runCodeGenPrepare(Module &module) {
 
   bool Changed = false;
   for (auto &FuncPtr : module.getFunctions()) {
-    if (!FuncPtr) continue;
+    if (!FuncPtr)
+      continue;
     Function &F = *FuncPtr;
-    if (F.Size() == 0) continue;
+    if (F.Size() == 0)
+      continue;
 
     const auto &DT = FAM.getResult<DominantAnalysis>(F);
     const auto &LI = FAM.getResult<LoopAnalysis>(F);
@@ -303,7 +473,8 @@ bool runCodeGenPrepare(Module &module) {
                      });
 
     for (const Loop *L : Loops) {
-      if (!L) continue;
+      if (!L)
+        continue;
       auto Candidates = collectCandidatesForLoop(L, DT, LoopInductions);
       const std::size_t Limit = maxTransformsForLoop(Candidates.size());
       for (std::size_t I = 0; I < Limit; ++I) {
