@@ -2926,6 +2926,20 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 
 
+##### LoopUnswitch
+
+将循环内部依赖于**循环不变量**的分支移动到循环外
+
+先运行LICM再运行LoopUnswitch
+
+
+
+
+
+
+
+
+
 ##### LoopUnroll循环展开
 
 依赖的AnalysisPass：LoopInfo，SCEV
@@ -3531,7 +3545,7 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
               pendingStores.clear()       // call 保守清空
   ```
 
--
+
 
 
 
