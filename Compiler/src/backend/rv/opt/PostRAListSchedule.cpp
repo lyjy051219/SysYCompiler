@@ -78,7 +78,8 @@ bool isBarrierInstruction(const MachineInstr &instr) {
   if (instr.terminator || isTerminatorOpcode(instr.opcode)) {
     return true;
   }
-  if (instr.opcode == Opcode::CALL || instr.opcode == Opcode::MEMCPY_INLINE) {
+  if (instr.opcode == Opcode::CALL || instr.opcode == Opcode::MEMCPY_INLINE ||
+      instr.opcode == Opcode::MEMSET_INLINE) {
     return true;
   }
   return instr.sideEffects && !isStoreOpcode(instr.opcode);
@@ -87,6 +88,7 @@ bool isBarrierInstruction(const MachineInstr &instr) {
 bool isMemoryOrderInstruction(const MachineInstr &instr) {
   return isLoadOpcode(instr.opcode) || isStoreOpcode(instr.opcode) ||
          instr.opcode == Opcode::CALL || instr.opcode == Opcode::MEMCPY_INLINE ||
+         instr.opcode == Opcode::MEMSET_INLINE ||
          (instr.sideEffects && !isStoreOpcode(instr.opcode));
 }
 
@@ -165,6 +167,8 @@ uint32_t opcodeLatency(Opcode opcode) {
   case Opcode::CALL:
     return 20;
   case Opcode::MEMCPY_INLINE:
+    return 8;
+  case Opcode::MEMSET_INLINE:
     return 8;
   case Opcode::RET:
   case Opcode::J:

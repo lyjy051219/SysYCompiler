@@ -1872,6 +1872,55 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 }
 
+void lowerMemset(MachineFunction &mf, MachineBasicBlock &mbb,
+                 LoweringState &state, CallInst &inst,
+                 const std::string &name) {
+  constexpr int64_t kLoopMemsetThreshold = 256;
+  Value *dst = requiredUseValue(inst, 1, name);
+  Value *byteValue = requiredUseValue(inst, 2, name);
+  Value *sizeValue = requiredUseValue(inst, 3, name);
+
+  int64_t byte = 0;
+  int64_t size = 0;
+  if (!intConstant(byteValue, byte) || byte < 0 || byte > 255) {
+    throw BackendError("unsupported " + name +
+                       " fill value; only constant bytes are lowered");
+  }
+  if (!intConstant(sizeValue, size) || size < 0) {
+    throw BackendError("unsupported " + name +
+                       " size; only non-negative constant sizes are lowered");
+  }
+
+  Address dstAddress = addressForValue(mf, mbb, state, dst, name);
+  if (size > kLoopMemsetThreshold) {
+    MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);
+    MachineInstr loop;
+    loop.opcode = Opcode::MEMSET_INLINE;
+    loop.uses.push_back(MachineOperand::reg(dstReg));
+    loop.uses.push_back(MachineOperand::imm(byte));
+    loop.uses.push_back(MachineOperand::imm(size));
+    loop.implicitDefs = {PhysReg::T3, PhysReg::T5, PhysReg::T6};
+    loop.sideEffects = true;
+    mbb.instrs.push_back(std::move(loop));
+    return;
+  }
+
+  const uint32_t repeated = static_cast<uint32_t>(byte) * 0x01010101u;
+  MachineReg word = materializeInt(mf, mbb, static_cast<int64_t>(repeated),
+                                   RegClass::GPR32);
+  int64_t offset = 0;
+  for (; offset + 4 <= size; offset += 4) {
+    Address address = dstAddress;
+    address.offset += offset;
+    appendStore(mbb, Opcode::SW, word, address);
+  }
+  for (; offset < size; ++offset) {
+    Address address = dstAddress;
+    address.offset += offset;
+    appendStore(mbb, Opcode::SB, word, address);
+  }
+}
+
 void lowerUnsupported(MachineFunction &mf, MachineBasicBlock &mbb,
                       Instruction &inst);
 
@@ -1883,6 +1932,11 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   if (name == "llvm.memcpy.p0.p0.i32" ||
       name == "llvm.memcpy.p0i8.p0i8.i32") {
     lowerMemcpy(mf, mbb, state, inst, name);
+    return;
+  }
+  if (name == "llvm.memset.p0.i32" || name == "llvm.memset.p0i8.i32" ||
+      name == "llvm.memset.p0i8.i64" || name == "llvm.memset.p0.i64") {
+    lowerMemset(mf, mbb, state, inst, name);
     return;
   }
 
