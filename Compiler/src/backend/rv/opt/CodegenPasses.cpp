@@ -149,6 +149,14 @@ PostRAPeepholePass::run(MachineFunction &mf,
                  : MachinePreservationStatus::all();
 }
 
+MachinePreservationStatus PostRALoopBackedgeBypassPass::run(
+    MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runPostRALoopBackedgeBypass(mf);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
 MachinePreservationStatus
 PostRAListSchedulePass::run(MachineFunction &mf,
                             MachineFunctionAnalysisManager &am) {

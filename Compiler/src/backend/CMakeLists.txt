@@ -53,6 +53,29 @@ if(BUILD_BACKEND_TESTS)
     set_tests_properties(select_lowering_tests PROPERTIES
         ENVIRONMENT "BACKEND_VERIFY_MIR=1")
 
+    add_executable(isel_integer_lowering_tests
+        rv/tests/ISelIntegerLoweringTests.cpp)
+    target_link_libraries(isel_integer_lowering_tests PRIVATE Backend)
+    add_test(NAME isel_integer_lowering_tests
+        COMMAND isel_integer_lowering_tests)
+    set_tests_properties(isel_integer_lowering_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
+    add_executable(branch_compare_folding_tests
+        rv/tests/BranchCompareFoldingTests.cpp)
+    target_link_libraries(branch_compare_folding_tests PRIVATE Backend)
+    add_test(NAME branch_compare_folding_tests
+        COMMAND branch_compare_folding_tests)
+    set_tests_properties(branch_compare_folding_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
+    add_executable(phi_elimination_tests
+        rv/tests/PhiEliminationTests.cpp)
+    target_link_libraries(phi_elimination_tests PRIVATE Backend)
+    add_test(NAME phi_elimination_tests COMMAND phi_elimination_tests)
+    set_tests_properties(phi_elimination_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
     add_executable(codegen_prepare_tests rv/tests/CodeGenPrepareTests.cpp)
     target_link_libraries(codegen_prepare_tests PRIVATE Backend)
     add_test(NAME codegen_prepare_tests COMMAND codegen_prepare_tests)
@@ -60,4 +83,12 @@ if(BUILD_BACKEND_TESTS)
     add_executable(post_ra_list_schedule_tests rv/tests/PostRAListScheduleTests.cpp)
     target_link_libraries(post_ra_list_schedule_tests PRIVATE Backend)
     add_test(NAME post_ra_list_schedule_tests COMMAND post_ra_list_schedule_tests)
+
+    add_executable(post_ra_loop_backedge_bypass_tests
+        rv/tests/PostRALoopBackedgeBypassTests.cpp)
+    target_link_libraries(post_ra_loop_backedge_bypass_tests PRIVATE Backend)
+    add_test(NAME post_ra_loop_backedge_bypass_tests
+        COMMAND post_ra_loop_backedge_bypass_tests)
+    set_tests_properties(post_ra_loop_backedge_bypass_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
 endif()

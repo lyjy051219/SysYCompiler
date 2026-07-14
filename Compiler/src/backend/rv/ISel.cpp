@@ -448,6 +448,25 @@ MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
 void appendImmInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
                     MachineOperand base, int64_t imm);
 
+MachineReg buildSignedPowerOfTwoAdjusted(MachineFunction &mf,
+                                         MachineBasicBlock &mbb,
+                                         MachineReg lhs, int64_t divisor) {
+  const int shift = log2PowerOfTwo(divisor);
+  MachineReg bias = mf.createVReg(RegClass::GPR32);
+  if (divisor == 2) {
+    appendImmInstr(mbb, Opcode::SRLIW, bias, MachineOperand::reg(lhs), 31);
+  } else {
+    MachineReg sign = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::SRAIW, sign, MachineOperand::reg(lhs), 31);
+    appendImmInstr(mbb, Opcode::SRLIW, bias, MachineOperand::reg(sign),
+                   32 - shift);
+  }
+
+  MachineReg adjusted = mf.createVReg(RegClass::GPR32);
+  appendRegInstr(mbb, Opcode::ADDW, adjusted, {lhs, bias});
+  return adjusted;
+}
+
 void lowerSignedDivByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
                                 MachineReg dst, MachineReg lhs,
                                 int64_t divisor) {
@@ -456,26 +475,10 @@ void lowerSignedDivByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
     return;
   }
 
-  const int shift = log2PowerOfTwo(divisor);
-  MachineReg bias = mf.createVReg(RegClass::GPR32);
-  if (divisor == 2) {
-    appendImmInstr(mbb, Opcode::SRLIW, bias, MachineOperand::reg(lhs), 31);
-  } else {
-    MachineReg sign = mf.createVReg(RegClass::GPR32);
-    appendImmInstr(mbb, Opcode::SRAIW, sign, MachineOperand::reg(lhs), 31);
-    if (fitsSigned12(divisor - 1)) {
-      appendImmInstr(mbb, Opcode::ANDI, bias, MachineOperand::reg(sign),
-                     divisor - 1);
-    } else {
-      MachineReg mask = materializeInt(mf, mbb, divisor - 1, RegClass::GPR32);
-      appendRegInstr(mbb, Opcode::AND, bias, {sign, mask});
-    }
-  }
-
-  MachineReg adjusted = mf.createVReg(RegClass::GPR32);
-  appendRegInstr(mbb, Opcode::ADDW, adjusted, {lhs, bias});
+  MachineReg adjusted =
+      buildSignedPowerOfTwoAdjusted(mf, mbb, lhs, divisor);
   appendImmInstr(mbb, Opcode::SRAIW, dst, MachineOperand::reg(adjusted),
-                 shift);
+                 log2PowerOfTwo(divisor));
 }
 
 void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
@@ -499,9 +502,40 @@ void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
     appendCopyInstr(mbb, dst, MachineReg::preg(PhysReg::X0, RegClass::GPR32));
     return;
   }
+  if (fitsSigned12(-divisor)) {
+    MachineReg adjusted =
+        buildSignedPowerOfTwoAdjusted(mf, mbb, lhs, divisor);
+    MachineReg multiple = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::ANDI, multiple,
+                   MachineOperand::reg(adjusted), -divisor);
+    appendRegInstr(mbb, Opcode::SUBW, dst, {lhs, multiple});
+    return;
+  }
+
   MachineReg quotient = mf.createVReg(RegClass::GPR32);
   lowerSignedDivByPowerOfTwo(mf, mbb, quotient, lhs, divisor);
   lowerSignedRemByPowerOfTwo(mf, mbb, dst, lhs, divisor, quotient);
+}
+
+bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
+                             const BinaryInst *remainder) {
+  if (!lhs || !block)
+    return false;
+  for (auto It = lhs->getUseList().begin(); It != lhs->getUseList().end(); ++It) {
+    Use *UseNode = *It;
+    auto *Bin = UseNode ? dynamic_cast<BinaryInst *>(UseNode->getUser()) : nullptr;
+    if (!Bin || Bin == remainder || Bin->getParent() != block ||
+        Bin->getOp() != BinaryInst::DIV || Bin->getUserList().size() != 2 ||
+        Bin->getUserList()[0]->getValue() != lhs) {
+      continue;
+    }
+    int64_t OtherDivisor = 0;
+    if (intConstant(Bin->getUserList()[1]->getValue(), OtherDivisor) &&
+        OtherDivisor == divisor) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void lowerSignedDivByPositiveConstant(MachineFunction &mf,
@@ -614,12 +648,16 @@ bool lowerIntegerPowerOfTwoOp(MachineFunction &mf, MachineBasicBlock &mbb,
   case BinaryInst::MOD:
     if (rhsValue > 1) {
       MachineReg quotient;
-      if (!findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+      if (findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue, quotient);
+      } else if (hasMatchingSignedDivUse(lhs, rhsValue, mbb.irBlock, &inst)) {
         quotient = mf.createVReg(RegClass::GPR32);
         lowerSignedDivByPowerOfTwo(mf, mbb, quotient, left, rhsValue);
         rememberDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient);
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue, quotient);
+      } else {
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue);
       }
-      lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue, quotient);
     } else {
       lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue);
     }

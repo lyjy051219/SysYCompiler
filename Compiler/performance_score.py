@@ -17,6 +17,9 @@
   ./performance_score.py --suite all
       合并前两类用例，默认方案。
 
+  ./performance_score.py --suite 26 --baseline llc-ir
+      只用 LLVM codegen 处理我方前中端 IR，并与我方链接同一个 runtime 对象。
+
   ./performance_score.py --suite 26 --disable-backend-pass cleanup-cfg \
       --work-root perf_score_work_cleanup_off
       关闭指定后端可选 pass 后评分。
@@ -29,7 +32,8 @@
 
   1. 我方和 baseline 在所有预热、计时轮次都 AC，case 才计分。
   2. baseline 默认是我方前中端 IR 交给 clang-18 -O3 -ffp-contract=off
-     生成的 RISC-V 程序，避免 FMA 改变严格浮点输出。
+     生成的 RISC-V 程序；llc-ir 跳过 clang 的 IR 优化，只运行 LLVM codegen，
+     并使用 static relocation 匹配我方后端。两种 baseline 的分数不可直接相减。
   3. 默认每个可执行文件预热 5 轮，再计时 5 轮。
   4. 单项分 = baseline_平均时间 / 我方平均时间 * 100，默认不封顶。
   5. 总分 = 所有单项分的几何平均。
@@ -83,6 +87,28 @@ OFFICIAL_RUNTIME_LL = PROJECT / "runtime" / "runtime.ll"
 PERFORMANCE_RUNTIME_DIR = WORKSPACE / "性能替代版"
 RUNTIME_C = PERFORMANCE_RUNTIME_DIR / "sylib.c"
 RUNTIME_LL = PERFORMANCE_RUNTIME_DIR / "runtime.ll"
+LLVM_RISCV_TRIPLE = "riscv64-linux-gnu"
+LLVM_RISCV_CPU = "generic-rv64"
+LLVM_RISCV_FEATURES = "+m,+a,+f,+d,+c,+zicsr,+zifencei,+relax"
+LLVM_RISCV_ABI = "lp64d"
+DEFAULT_LLC_RELOCATION_MODEL = "static"
+LLVM_RUNTIME_DECLARATIONS = """\
+declare i32 @getint()
+declare i32 @getch()
+declare float @getfloat()
+declare i32 @getarray(i32*)
+declare i32 @getfarray(float*)
+declare void @putint(i32)
+declare void @putch(i32)
+declare void @putfloat(float)
+declare void @putarray(i32, i32*)
+declare void @putfarray(i32, float*)
+declare void @putf(i8*, ...)
+declare void @_sysy_starttime(i32)
+declare void @_sysy_stoptime(i32)
+declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg)
+
+"""
 
 
 @dataclass
@@ -113,7 +139,7 @@ class CaseResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Score RISC-V backend performance against a clang-optimized IR baseline.",
+        description="Score RISC-V backend performance against a selectable reference baseline.",
         add_help=False,
     )
     parser._optionals.title = "options"
@@ -139,7 +165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-timeout", type=int, default=300)
     parser.add_argument("--build-timeout", type=int, default=900)
     parser.add_argument("--cxx", default=os.environ.get("CXX", "clang++-18"))
-    parser.add_argument("--baseline", choices=["clang-ir", "gcc-o3"], default="clang-ir",
+    parser.add_argument("--baseline", choices=["clang-ir", "llc-ir", "gcc-o3"], default="clang-ir",
                         help="baseline executable source; default: clang-ir")
     parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-18"),
                         help="clang used for the clang-ir baseline")
@@ -150,6 +176,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clang-fp-contract", default="off",
                         choices=["off", "on", "fast"],
                         help="clang baseline -ffp-contract mode; default: off")
+    parser.add_argument("--llc", default=os.environ.get("LLC", "llc-18"),
+                        help="llc used for the llc-ir baseline")
+    parser.add_argument("--llc-opt-level", choices=["O0", "O1", "O2", "O3"],
+                        default="O3", help="llc codegen optimization level; default: O3")
+    parser.add_argument("--llc-relocation-model", choices=["static", "pic"],
+                        default=DEFAULT_LLC_RELOCATION_MODEL,
+                        help="llc relocation model; default: static (matches our backend)")
+    parser.add_argument("--llc-extra", action="append", default=[],
+                        help="extra argument passed to llc baseline; repeatable")
+    parser.add_argument("--llc-fp-contract", default="off",
+                        choices=["off", "on", "fast"],
+                        help="llc baseline -fp-contract mode; default: off")
     parser.add_argument("--gcc-extra", action="append", default=[],
                         help="extra argument passed to the gcc baseline; repeatable")
     parser.add_argument("--gcc-fp-contract", default="off",
@@ -195,6 +233,24 @@ def run_command(args, cwd=WORKSPACE, timeout=60, stdin_path=None, env=None) -> C
     finally:
         if stdin_file:
             stdin_file.close()
+
+
+def probe_llc(args: argparse.Namespace) -> None:
+    resolved = shutil.which(args.llc)
+    if resolved is None:
+        fail(f"llc executable not found: {args.llc}")
+    try:
+        ret = run_command([resolved, "--version"], timeout=10)
+    except subprocess.TimeoutExpired:
+        fail(f"timed out while querying llc version: {resolved}")
+    version_text = (ret.stdout + ret.stderr).decode("utf-8", errors="replace")
+    if ret.returncode != 0:
+        fail(f"cannot query llc version: {args.llc}")
+    if not re.search(r"(?m)^\s*riscv64\s+-", version_text):
+        fail(f"llc has no registered RISC-V 64 target: {resolved}")
+    version_lines = [line.strip() for line in version_text.splitlines() if line.strip()]
+    args.llc_resolved = str(Path(resolved).resolve())
+    args.llc_version = version_lines[0] if version_lines else "unknown"
 
 
 def run_setup_command(args, stage: str, timeout: int) -> None:
@@ -278,7 +334,7 @@ def build_compiler(args: argparse.Namespace) -> None:
         args,
         "riscv backend compiler",
     )
-    if args.baseline == "clang-ir":
+    if args.baseline in ("clang-ir", "llc-ir"):
         build_cmake_target(
             MIDDLE_BUILD_DIR,
             "compiler_middle_end",
@@ -514,7 +570,8 @@ def compile_gcc_o3(case: Path, case_dir: Path, header: Path, args: argparse.Name
     return exe_file
 
 
-def sanitize_ir_for_clang_riscv(input_file: Path, output_file: Path) -> None:
+def sanitize_ir_for_llvm_riscv(input_file: Path, output_file: Path,
+                               runtime_prefix: str) -> None:
     text = input_file.read_text(encoding="utf-8")
     official_runtime = OFFICIAL_RUNTIME_LL.read_text(encoding="utf-8")
     if not text.startswith(official_runtime):
@@ -522,22 +579,19 @@ def sanitize_ir_for_clang_riscv(input_file: Path, output_file: Path) -> None:
             "middle-end IR does not start with the official runtime; "
             "cannot safely substitute the performance runtime"
         )
-    performance_runtime = RUNTIME_LL.read_text(encoding="utf-8")
-    text = performance_runtime + text[len(official_runtime):]
+    text = runtime_prefix + text[len(official_runtime):]
     # runtime/runtime.ll is produced on the host and may carry x86 function
-    # target attributes. Keep the IR body intact, but let clang's RISC-V target
-    # options select the CPU/features for the baseline code generation.
+    # target attributes. Keep the IR body intact, but let the selected LLVM
+    # code generator choose the RISC-V CPU/features.
     text = re.sub(r'\s+"target-(?:cpu|features)"="[^"]*"', "", text)
     output_file.write_text(text, encoding="utf-8")
 
 
-def compile_clang_ir_baseline(case: Path, case_dir: Path,
-                              args: argparse.Namespace) -> Path:
+def prepare_llvm_ir_baseline(case: Path, case_dir: Path,
+                             args: argparse.Namespace,
+                             runtime_prefix: str) -> Path:
     ir_file = case_dir / "baseline.ll"
-    clang_ir_file = case_dir / "baseline_sanitized.ll"
-    asm_file = case_dir / "baseline_clang.s"
-    obj_file = case_dir / "baseline_clang.o"
-    exe_file = case_dir / "baseline_clang.exe"
+    llvm_ir_file = case_dir / "baseline_sanitized.ll"
 
     ret = run_command([str(MIDDLE_COMPILER), "-S", "-o", str(ir_file), str(case)],
                       timeout=args.compile_timeout)
@@ -547,19 +601,31 @@ def compile_clang_ir_baseline(case: Path, case_dir: Path,
             ret.stderr.decode("utf-8", errors="replace")[-3000:]
         )
 
-    sanitize_ir_for_clang_riscv(ir_file, clang_ir_file)
+    sanitize_ir_for_llvm_riscv(ir_file, llvm_ir_file, runtime_prefix)
+    return llvm_ir_file
+
+
+def compile_clang_ir_baseline(case: Path, case_dir: Path,
+                              args: argparse.Namespace) -> Path:
+    performance_runtime = RUNTIME_LL.read_text(encoding="utf-8")
+    llvm_ir_file = prepare_llvm_ir_baseline(
+        case, case_dir, args, performance_runtime
+    )
+    asm_file = case_dir / "baseline_clang.s"
+    obj_file = case_dir / "baseline_clang.o"
+    exe_file = case_dir / "baseline_clang.exe"
 
     opt_flag = "-" + args.clang_opt_level
     clang_cmd = [
         args.clang,
-        "--target=riscv64-linux-gnu",
+        f"--target={LLVM_RISCV_TRIPLE}",
         "-march=rv64gc",
-        "-mabi=lp64d",
+        f"-mabi={LLVM_RISCV_ABI}",
         opt_flag,
         "-fno-addrsig",
         f"-ffp-contract={args.clang_fp_contract}",
         "-S",
-        str(clang_ir_file),
+        str(llvm_ir_file),
         "-o",
         str(asm_file),
     ] + args.clang_extra
@@ -588,13 +654,75 @@ def compile_clang_ir_baseline(case: Path, case_dir: Path,
     return exe_file
 
 
+def llc_codegen_flags(args: argparse.Namespace) -> list:
+    return [
+        f"-mtriple={LLVM_RISCV_TRIPLE}",
+        "-march=riscv64",
+        f"-mcpu={LLVM_RISCV_CPU}",
+        f"-mattr={LLVM_RISCV_FEATURES}",
+        f"-target-abi={LLVM_RISCV_ABI}",
+        f"-relocation-model={args.llc_relocation_model}",
+        f"-O={args.llc_opt_level[1:]}",
+        f"-fp-contract={args.llc_fp_contract}",
+    ]
+
+
+def compile_llc_ir_baseline(case: Path, case_dir: Path, runtime_obj: Path,
+                            args: argparse.Namespace) -> Path:
+    llvm_ir_file = prepare_llvm_ir_baseline(
+        case, case_dir, args, LLVM_RUNTIME_DECLARATIONS
+    )
+    asm_file = case_dir / "baseline_llc.s"
+    obj_file = case_dir / "baseline_llc.o"
+    exe_file = case_dir / "baseline_llc.exe"
+
+    llc_cmd = [
+        args.llc_resolved,
+        *llc_codegen_flags(args),
+        *args.llc_extra,
+        "-filetype=asm",
+        str(llvm_ir_file),
+        "-o",
+        str(asm_file),
+    ]
+    ret = run_command(llc_cmd, timeout=args.compile_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "llc IR baseline compile error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+
+    ret = run_command([RISCV_AS, str(asm_file), "-o", str(obj_file)],
+                      timeout=args.assemble_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "llc IR baseline assembler error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+
+    ret = run_command([RISCV_GCC, "-static", str(obj_file), str(runtime_obj),
+                       "-o", str(exe_file)],
+                      timeout=args.link_timeout)
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "llc IR baseline linker error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+    return exe_file
+
+
 def compile_baseline(case: Path, case_dir: Path, header: Path | None,
+                     runtime_obj: Path,
                      args: argparse.Namespace) -> Path:
     if args.baseline == "gcc-o3":
         if header is None:
             raise RuntimeError("gcc baseline header was not prepared")
         return compile_gcc_o3(case, case_dir, header, args)
-    return compile_clang_ir_baseline(case, case_dir, args)
+    if args.baseline == "clang-ir":
+        return compile_clang_ir_baseline(case, case_dir, args)
+    if args.baseline == "llc-ir":
+        return compile_llc_ir_baseline(case, case_dir, runtime_obj, args)
+    raise RuntimeError(f"unsupported baseline: {args.baseline}")
 
 
 def parse_sysy_total_seconds(stderr_bytes: bytes) -> float | None:
@@ -669,7 +797,7 @@ def run_and_compare_stable(exe: Path, input_file: Path, expected_text: str,
 
 
 def baseline_label(args: argparse.Namespace) -> str:
-    return "gcc-o3" if args.baseline == "gcc-o3" else "clang-ir"
+    return args.baseline
 
 
 def measure_pair(ours_exe: Path, baseline_exe: Path, case: Path,
@@ -788,8 +916,21 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
         "clang_opt_level": args.clang_opt_level if args.baseline == "clang-ir" else None,
         "clang_fp_contract": args.clang_fp_contract if args.baseline == "clang-ir" else None,
         "clang_extra": args.clang_extra if args.baseline == "clang-ir" else None,
-        "gcc_fp_contract": args.gcc_fp_contract,
-        "gcc_extra": args.gcc_extra,
+        "clang_relocation_model": "driver-default" if args.baseline == "clang-ir" else None,
+        "llc": args.llc if args.baseline == "llc-ir" else None,
+        "llc_resolved": args.llc_resolved if args.baseline == "llc-ir" else None,
+        "llc_version": args.llc_version if args.baseline == "llc-ir" else None,
+        "llc_opt_level": args.llc_opt_level if args.baseline == "llc-ir" else None,
+        "llc_fp_contract": args.llc_fp_contract if args.baseline == "llc-ir" else None,
+        "llc_extra": args.llc_extra if args.baseline == "llc-ir" else None,
+        "llc_triple": LLVM_RISCV_TRIPLE if args.baseline == "llc-ir" else None,
+        "llc_cpu": LLVM_RISCV_CPU if args.baseline == "llc-ir" else None,
+        "llc_features": LLVM_RISCV_FEATURES if args.baseline == "llc-ir" else None,
+        "llc_abi": LLVM_RISCV_ABI if args.baseline == "llc-ir" else None,
+        "llc_relocation_model": args.llc_relocation_model if args.baseline == "llc-ir" else None,
+        "llc_shared_runtime_object": args.baseline == "llc-ir",
+        "gcc_fp_contract": args.gcc_fp_contract if args.baseline == "gcc-o3" else None,
+        "gcc_extra": args.gcc_extra if args.baseline == "gcc-o3" else None,
         "baseline_total_timed_runtime": baseline_total_runtime,
         "ours_total_timed_runtime": ours_total_runtime,
         "baseline_average_timed_runtime": baseline_total_runtime / timed_run_count if timed_run_count else None,
@@ -816,18 +957,20 @@ def main() -> int:
         fail(f"tests directory not found: {TESTS_ROOT}")
     if not RUNTIME_C.exists():
         fail(f"runtime library not found: {RUNTIME_C}")
-    if not RUNTIME_LL.exists():
+    if args.baseline == "clang-ir" and not RUNTIME_LL.exists():
         fail(f"runtime IR not found: {RUNTIME_LL}")
-    if not OFFICIAL_RUNTIME_LL.exists():
+    if args.baseline in ("clang-ir", "llc-ir") and not OFFICIAL_RUNTIME_LL.exists():
         fail(f"official runtime IR not found: {OFFICIAL_RUNTIME_LL}")
     if args.baseline == "clang-ir" and shutil.which(args.clang) is None:
         fail(f"clang executable not found: {args.clang}")
+    if args.baseline == "llc-ir":
+        probe_llc(args)
 
     if not args.skip_build:
         build_compiler(args)
     if not COMPILER.exists():
         fail(f"compiler not found: {COMPILER}")
-    if args.baseline == "clang-ir" and not MIDDLE_COMPILER.exists():
+    if args.baseline in ("clang-ir", "llc-ir") and not MIDDLE_COMPILER.exists():
         fail(f"middle-end compiler not found: {MIDDLE_COMPILER}")
 
     cases = collect_cases(args)
@@ -850,7 +993,7 @@ def main() -> int:
     if args.baseline == "gcc-o3":
         baseline_flags = [f"-ffp-contract={args.gcc_fp_contract}"] + args.gcc_extra
         print(f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: {RISCV_GCC} -O3 {' '.join(baseline_flags)}")
-    else:
+    elif args.baseline == "clang-ir":
         clang_flags = [
             "-" + args.clang_opt_level,
             f"-ffp-contract={args.clang_fp_contract}",
@@ -858,6 +1001,13 @@ def main() -> int:
         print(
             f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: "
             f"{MIDDLE_COMPILER} IR -> {args.clang} {' '.join(clang_flags)}"
+        )
+    else:
+        llc_flags = llc_codegen_flags(args) + args.llc_extra
+        print(
+            f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: "
+            f"{MIDDLE_COMPILER} app IR -> {args.llc_resolved} {' '.join(llc_flags)}; "
+            f"shared runtime object={runtime_obj}"
         )
     disabled_passes = disabled_backend_passes(args)
     if disabled_passes:
@@ -871,7 +1021,7 @@ def main() -> int:
         case_dir.mkdir(parents=True, exist_ok=True)
         try:
             ours_exe = compile_ours(case, case_dir, runtime_obj, args)
-            base_exe = compile_baseline(case, case_dir, gcc_header, args)
+            base_exe = compile_baseline(case, case_dir, gcc_header, runtime_obj, args)
             baseline_runs, ours_runs = measure_pair(ours_exe, base_exe, case, args)
             baseline_avg = runtime_statistic(baseline_runs, args.time_stat)
             ours_avg = runtime_statistic(ours_runs, args.time_stat)

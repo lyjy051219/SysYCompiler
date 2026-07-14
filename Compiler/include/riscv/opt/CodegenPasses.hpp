@@ -105,6 +105,12 @@ struct PostRAPeepholePass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配后将单块循环的回边直接改为条件回 body，跳过重复 header 判断。
+struct PostRALoopBackedgeBypassPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配后块内 list scheduling
 struct PostRAListSchedulePass {
   MachinePreservationStatus run(MachineFunction &mf,

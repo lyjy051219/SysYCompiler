@@ -11,8 +11,8 @@ namespace riscv {
 namespace {
 
 bool sameRegister(const MachineReg &lhs, const MachineReg &rhs) {
-  return lhs.physical == rhs.physical && lhs.id == rhs.id &&
-         lhs.rc == rhs.rc && lhs.phys == rhs.phys;
+  return lhs.physical == rhs.physical && lhs.id == rhs.id && lhs.rc == rhs.rc &&
+         lhs.phys == rhs.phys;
 }
 
 bool hasSingleRegDefUse(const MachineInstr &instr) {
@@ -36,8 +36,9 @@ bool isZeroReg(const MachineOperand &operand) {
 }
 
 bool isSafeToRewrite(const MachineInstr &instr) {
-  return !instr.sideEffects && !instr.terminator && instr.implicitDefs.empty() &&
-         instr.implicitUses.empty() && hasSingleRegDef(instr);
+  return !instr.sideEffects && !instr.terminator &&
+         instr.implicitDefs.empty() && instr.implicitUses.empty() &&
+         hasSingleRegDef(instr);
 }
 
 MachineInstr makeCopyFrom(const MachineInstr &instr,
@@ -102,8 +103,7 @@ bool foldBinaryZeroIdentity(const MachineInstr &instr, MachineInstr &folded) {
 
   if ((instr.opcode == Opcode::SUB || instr.opcode == Opcode::SUBW ||
        instr.opcode == Opcode::SLL || instr.opcode == Opcode::SLLW ||
-       instr.opcode == Opcode::SRAW ||
-       instr.opcode == Opcode::SRLW) &&
+       instr.opcode == Opcode::SRAW || instr.opcode == Opcode::SRLW) &&
       isZeroReg(instr.uses[1])) {
     folded = makeCopyFrom(instr, instr.uses[0]);
     return true;
@@ -191,8 +191,9 @@ bool isVirtualRegOperand(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical;
 }
 
-MachineReg resolveReplacement(
-    MachineReg reg, const std::map<uint32_t, MachineReg> &replacements) {
+MachineReg
+resolveReplacement(MachineReg reg,
+                   const std::map<uint32_t, MachineReg> &replacements) {
   while (!reg.physical) {
     auto found = replacements.find(reg.id);
     if (found == replacements.end()) {
@@ -349,9 +350,9 @@ std::string cseKey(const MachineInstr &instr) {
     std::sort(uses.begin(), uses.end());
   }
 
-  std::string key = std::to_string(static_cast<int>(instr.opcode)) + ":" +
-                    std::to_string(static_cast<int>(
-                        instr.defs.front().regValue.rc));
+  std::string key =
+      std::to_string(static_cast<int>(instr.opcode)) + ":" +
+      std::to_string(static_cast<int>(instr.defs.front().regValue.rc));
   for (const std::string &use : uses) {
     key += "|" + use;
   }
@@ -371,8 +372,8 @@ std::string cseDependencyKey(const MachineReg &reg) {
 }
 
 void removeCSEKey(const std::string &key, CSETable &exprs, CSETable &loads,
-                 CSEKeyDependencies &keyDependencies,
-                 CSERegisterDependencies &registerDependencies) {
+                  CSEKeyDependencies &keyDependencies,
+                  CSERegisterDependencies &registerDependencies) {
   exprs.erase(key);
   loads.erase(key);
 
@@ -403,8 +404,8 @@ void clearCSETables(CSETable &exprs, CSETable &loads,
 }
 
 bool isMemoryStoreOpcode(Opcode opcode) {
-  return opcode == Opcode::SB || opcode == Opcode::SW ||
-         opcode == Opcode::SD || opcode == Opcode::FSW;
+  return opcode == Opcode::SB || opcode == Opcode::SW || opcode == Opcode::SD ||
+         opcode == Opcode::FSW;
 }
 
 void clearCSELoads(CSETable &loads, CSETable &exprs,
@@ -420,8 +421,7 @@ void clearCSELoads(CSETable &loads, CSETable &exprs,
     return result;
   }();
   for (const std::string &key : keys) {
-    removeCSEKey(key, exprs, loads, keyDependencies,
-                 registerDependencies);
+    removeCSEKey(key, exprs, loads, keyDependencies, registerDependencies);
   }
 }
 
@@ -439,18 +439,16 @@ void recordCSEKey(const std::string &key, const MachineInstr &instr,
   }
 }
 
-void invalidateCSERegister(
-    const MachineReg &reg, CSETable &exprs, CSETable &loads,
-    CSEKeyDependencies &keyDependencies,
-    CSERegisterDependencies &registerDependencies,
-    std::map<uint32_t, MachineReg> &replacements) {
+void invalidateCSERegister(const MachineReg &reg, CSETable &exprs,
+                           CSETable &loads, CSEKeyDependencies &keyDependencies,
+                           CSERegisterDependencies &registerDependencies,
+                           std::map<uint32_t, MachineReg> &replacements) {
   auto dependency = registerDependencies.find(cseDependencyKey(reg));
   if (dependency != registerDependencies.end()) {
     const std::vector<std::string> keys(dependency->second.begin(),
                                         dependency->second.end());
     for (const std::string &key : keys) {
-      removeCSEKey(key, exprs, loads, keyDependencies,
-                   registerDependencies);
+      removeCSEKey(key, exprs, loads, keyDependencies, registerDependencies);
     }
   }
 
@@ -466,11 +464,11 @@ void invalidateCSERegister(
   }
 }
 
-void invalidateCSEDefinitions(
-    const MachineInstr &instr, CSETable &exprs, CSETable &loads,
-    CSEKeyDependencies &keyDependencies,
-    CSERegisterDependencies &registerDependencies,
-    std::map<uint32_t, MachineReg> &replacements) {
+void invalidateCSEDefinitions(const MachineInstr &instr, CSETable &exprs,
+                              CSETable &loads,
+                              CSEKeyDependencies &keyDependencies,
+                              CSERegisterDependencies &registerDependencies,
+                              std::map<uint32_t, MachineReg> &replacements) {
   for (const MachineOperand &def : instr.defs) {
     if (def.kind == OperandKind::Reg) {
       invalidateCSERegister(def.regValue, exprs, loads, keyDependencies,
@@ -478,12 +476,10 @@ void invalidateCSEDefinitions(
     }
   }
   for (PhysReg def : instr.implicitDefs) {
-    invalidateCSERegister(MachineReg::preg(def, RegClass::GPR64), exprs,
-                          loads, keyDependencies, registerDependencies,
-                          replacements);
-    invalidateCSERegister(MachineReg::preg(def, RegClass::FPR32), exprs,
-                          loads, keyDependencies, registerDependencies,
-                          replacements);
+    invalidateCSERegister(MachineReg::preg(def, RegClass::GPR64), exprs, loads,
+                          keyDependencies, registerDependencies, replacements);
+    invalidateCSERegister(MachineReg::preg(def, RegClass::FPR32), exprs, loads,
+                          keyDependencies, registerDependencies, replacements);
   }
 }
 
@@ -503,9 +499,9 @@ collectUseBlocks(const MachineFunction &mf) {
   return useBlocks;
 }
 
-bool allUsesInBlock(uint32_t regId, std::size_t blockIndex,
-                    const std::map<uint32_t, std::set<std::size_t>>
-                        &useBlocks) {
+bool allUsesInBlock(
+    uint32_t regId, std::size_t blockIndex,
+    const std::map<uint32_t, std::set<std::size_t>> &useBlocks) {
   auto found = useBlocks.find(regId);
   if (found == useBlocks.end()) {
     return true;
@@ -606,8 +602,7 @@ bool branchUsesDef(const MachineInstr &branch, const MachineInstr &defInstr) {
 bool zeroCompareUsesDef(const MachineInstr &zeroCompare,
                         const MachineInstr &defInstr) {
   return isZeroCompare(zeroCompare) &&
-         sameRegister(zeroCompare.uses[0].regValue,
-                      defInstr.defs[0].regValue);
+         sameRegister(zeroCompare.uses[0].regValue, defInstr.defs[0].regValue);
 }
 
 Opcode branchOpcodeForSlt(Opcode branchOpcode) {
@@ -619,8 +614,7 @@ Opcode branchOpcodeForXor(Opcode branchOpcode) {
 }
 
 Opcode branchOpcodeForZeroCompare(Opcode zeroOpcode, Opcode branchOpcode,
-                                  Opcode nonZeroBranch,
-                                  Opcode zeroBranch) {
+                                  Opcode nonZeroBranch, Opcode zeroBranch) {
   const bool branchOnConditionTrue = branchOpcode == Opcode::BNEZ;
   const bool conditionIsNonZero = zeroOpcode == Opcode::SNEZ;
   return branchOnConditionTrue == conditionIsNonZero ? nonZeroBranch
@@ -677,17 +671,17 @@ bool foldCompareAndBranch(const MachineInstr &cmp, const MachineInstr &branch,
   return false;
 }
 
-bool foldZeroCompareAndBranch(
-    const MachineInstr &zeroCompare, const MachineInstr &branch,
-    const std::map<uint32_t, std::size_t> &useCounts, MachineInstr &folded) {
+bool foldZeroCompareAndBranch(const MachineInstr &zeroCompare,
+                              const MachineInstr &branch,
+                              const std::map<uint32_t, std::size_t> &useCounts,
+                              MachineInstr &folded) {
   if (!isZeroCompare(zeroCompare) || !branchUsesDef(branch, zeroCompare) ||
       !hasSingleVirtualUse(zeroCompare.defs[0], useCounts)) {
     return false;
   }
 
-  const Opcode opcode =
-      branchOpcodeForZeroCompare(zeroCompare.opcode, branch.opcode,
-                                 Opcode::BNEZ, Opcode::BEQZ);
+  const Opcode opcode = branchOpcodeForZeroCompare(
+      zeroCompare.opcode, branch.opcode, Opcode::BNEZ, Opcode::BEQZ);
   folded = makeRegZeroBranch(opcode, zeroCompare.uses[0], branch.uses[1]);
   return true;
 }
@@ -705,31 +699,89 @@ bool foldCompareZeroCompareAndBranch(
   }
 
   if (cmp.opcode == Opcode::SLT && isBinaryRegCompareProducer(cmp)) {
-    const Opcode opcode =
-        branchOpcodeForZeroCompare(zeroCompare.opcode, branch.opcode,
-                                   Opcode::BLT, Opcode::BGE);
-    folded = makeRegRegBranch(opcode, cmp.uses[0], cmp.uses[1],
-                              branch.uses[1]);
+    const Opcode opcode = branchOpcodeForZeroCompare(
+        zeroCompare.opcode, branch.opcode, Opcode::BLT, Opcode::BGE);
+    folded = makeRegRegBranch(opcode, cmp.uses[0], cmp.uses[1], branch.uses[1]);
     return true;
   }
 
   if (cmp.opcode == Opcode::XOR && isBinaryRegCompareProducer(cmp)) {
-    const Opcode opcode =
-        branchOpcodeForZeroCompare(zeroCompare.opcode, branch.opcode,
-                                   Opcode::BNE, Opcode::BEQ);
-    folded = makeRegRegBranch(opcode, cmp.uses[0], cmp.uses[1],
-                              branch.uses[1]);
+    const Opcode opcode = branchOpcodeForZeroCompare(
+        zeroCompare.opcode, branch.opcode, Opcode::BNE, Opcode::BEQ);
+    folded = makeRegRegBranch(opcode, cmp.uses[0], cmp.uses[1], branch.uses[1]);
     return true;
   }
 
   if (isXoriZeroProducer(cmp)) {
-    const Opcode opcode =
-        branchOpcodeForZeroCompare(zeroCompare.opcode, branch.opcode,
-                                   Opcode::BNEZ, Opcode::BEQZ);
+    const Opcode opcode = branchOpcodeForZeroCompare(
+        zeroCompare.opcode, branch.opcode, Opcode::BNEZ, Opcode::BEQZ);
     folded = makeRegZeroBranch(opcode, cmp.uses[0], branch.uses[1]);
     return true;
   }
 
+  return false;
+}
+
+constexpr std::size_t kMaxCompareBranchGap = 4;
+
+bool definesRegister(const MachineInstr &instr, const MachineReg &reg) {
+  return std::any_of(
+      instr.defs.begin(), instr.defs.end(), [&](const MachineOperand &def) {
+        return def.kind == OperandKind::Reg && sameRegister(def.regValue, reg);
+      });
+}
+
+bool gapPreservesCompareInputs(const std::vector<MachineInstr> &instrs,
+                               std::size_t producerIndex,
+                               std::size_t branchIndex) {
+  const MachineInstr &producer = instrs[producerIndex];
+  for (std::size_t i = producerIndex + 1; i < branchIndex; ++i) {
+    for (const MachineOperand &use : producer.uses) {
+      if (use.kind == OperandKind::Reg &&
+          definesRegister(instrs[i], use.regValue)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool foldSeparatedCompareAndBranch(
+    std::vector<MachineInstr> &instrs, std::size_t branchIndex,
+    const std::map<uint32_t, std::size_t> &useCounts) {
+  if (branchIndex >= instrs.size() || !isBranchOnZeroReg(instrs[branchIndex])) {
+    return false;
+  }
+
+  const MachineInstr branch = instrs[branchIndex];
+  const MachineReg condition = branch.uses[0].regValue;
+  std::size_t cursor = branchIndex;
+  std::size_t gapSize = 0;
+  while (cursor > 0) {
+    const std::size_t candidateIndex = cursor - 1;
+    const MachineInstr &candidate = instrs[candidateIndex];
+    if (definesRegister(candidate, condition)) {
+      if (gapSize == 0 ||
+          !gapPreservesCompareInputs(instrs, candidateIndex, branchIndex)) {
+        return false;
+      }
+
+      MachineInstr folded;
+      if (!foldCompareAndBranch(candidate, branch, useCounts, folded) &&
+          !foldZeroCompareAndBranch(candidate, branch, useCounts, folded)) {
+        return false;
+      }
+      instrs[branchIndex] = std::move(folded);
+      instrs.erase(instrs.begin() + static_cast<long>(candidateIndex));
+      return true;
+    }
+
+    if (gapSize == kMaxCompareBranchGap || !isLocalCSECandidate(candidate)) {
+      return false;
+    }
+    ++gapSize;
+    cursor = candidateIndex;
+  }
   return false;
 }
 
@@ -762,8 +814,8 @@ bool isCopyPropagationCandidate(
   return copySourceAllowed(instr.defs[0].regValue, instr.uses[0].regValue);
 }
 
-void killCopyReplacementsForDef(
-    const MachineReg &def, std::map<uint32_t, MachineReg> &replacements) {
+void killCopyReplacementsForDef(const MachineReg &def,
+                                std::map<uint32_t, MachineReg> &replacements) {
   if (!def.physical) {
     replacements.erase(def.id);
   }
@@ -811,7 +863,7 @@ int64_t abs64(int64_t value) { return value < 0 ? -value : value; }
 bool fitsSigned12(int64_t value) { return value >= -2048 && value <= 2047; }
 
 std::string addressCombineGroupKey(const MachineReg &base,
-                                  uint64_t baseVersion) {
+                                   uint64_t baseVersion) {
   return regKey(base) + "#" + std::to_string(baseVersion);
 }
 
@@ -892,8 +944,7 @@ bool isAddressCombineDef(const MachineInstr &instr,
     } else if (knownAddressConstant(instr.uses[1], constants, constant) &&
                instr.uses[0].kind == OperandKind::Reg &&
                instr.uses[0].regValue.rc == RegClass::GPR64 &&
-               !knownAddressConstant(instr.uses[0], constants,
-                                     otherConstant) &&
+               !knownAddressConstant(instr.uses[0], constants, otherConstant) &&
                !sameRegister(dst, instr.uses[0].regValue)) {
       info.reg = dst;
       info.base = instr.uses[0].regValue;
@@ -914,11 +965,10 @@ bool isAddressCombineDef(const MachineInstr &instr,
   return false;
 }
 
-bool rewriteAddressUse(MachineInstr &instr, std::size_t baseIndex,
-                       std::size_t offsetIndex,
-                       const std::map<std::string, AddressCombineInfo>
-                           &activeCandidates,
-                       const std::map<std::string, uint64_t> &versions) {
+bool rewriteAddressUse(
+    MachineInstr &instr, std::size_t baseIndex, std::size_t offsetIndex,
+    const std::map<std::string, AddressCombineInfo> &activeCandidates,
+    const std::map<std::string, uint64_t> &versions) {
   if (baseIndex >= instr.uses.size() || offsetIndex >= instr.uses.size() ||
       instr.uses[baseIndex].kind != OperandKind::Reg ||
       instr.uses[offsetIndex].kind != OperandKind::Imm) {
@@ -933,7 +983,8 @@ bool rewriteAddressUse(MachineInstr &instr, std::size_t baseIndex,
   }
 
   const AddressCombineInfo &candidate = candidateIt->second;
-  const int64_t effectiveOffset = candidate.offset + instr.uses[offsetIndex].immValue;
+  const int64_t effectiveOffset =
+      candidate.offset + instr.uses[offsetIndex].immValue;
 
   // 优先尝试把当前使用折到更早的共同基址 pivot 上。
   bool havePivot = false;
@@ -981,20 +1032,19 @@ bool rewriteAddressUse(MachineInstr &instr, std::size_t baseIndex,
   return false;
 }
 
-void bumpPhysicalVersions(
-    const std::vector<PhysReg> &regs,
-    std::map<std::string, uint64_t> &versions) {
+void bumpPhysicalVersions(const std::vector<PhysReg> &regs,
+                          std::map<std::string, uint64_t> &versions) {
   for (PhysReg reg : regs) {
     ++versions[regKey(MachineReg::preg(reg, RegClass::GPR64))];
     ++versions[regKey(MachineReg::preg(reg, RegClass::FPR32))];
   }
 }
 
-void invalidateDefinedRegisters(const MachineInstr &instr,
-                                std::map<std::string, AddressCombineInfo>
-                                    &activeCandidates,
-                                std::map<std::string, int64_t> &constants,
-                                std::map<std::string, uint64_t> &versions) {
+void invalidateDefinedRegisters(
+    const MachineInstr &instr,
+    std::map<std::string, AddressCombineInfo> &activeCandidates,
+    std::map<std::string, int64_t> &constants,
+    std::map<std::string, uint64_t> &versions) {
   for (const MachineOperand &def : instr.defs) {
     if (def.kind != OperandKind::Reg) {
       continue;
@@ -1018,6 +1068,15 @@ bool runBranchCompareFolding(MachineFunction &mf) {
   const auto useCounts = collectVirtualUseCounts(mf);
 
   for (MachineBasicBlock &block : mf.blocks) {
+    for (std::size_t i = 0; i < block.instrs.size();) {
+      if (foldSeparatedCompareAndBranch(block.instrs, i, useCounts)) {
+        changed = true;
+        --i;
+        continue;
+      }
+      ++i;
+    }
+
     std::vector<MachineInstr> rewritten;
     rewritten.reserve(block.instrs.size());
 
@@ -1034,8 +1093,8 @@ bool runBranchCompareFolding(MachineFunction &mf) {
       }
 
       if (i + 1 < block.instrs.size() &&
-          foldCompareAndBranch(block.instrs[i], block.instrs[i + 1],
-                               useCounts, folded)) {
+          foldCompareAndBranch(block.instrs[i], block.instrs[i + 1], useCounts,
+                               folded)) {
         rewritten.push_back(std::move(folded));
         i += 2;
         changed = true;
@@ -1091,13 +1150,13 @@ bool runPreRAGlobalAddressReuse(MachineFunction &mf) {
       candidates.push_back({symbol, count});
     }
   }
-  std::sort(candidates.begin(), candidates.end(), [](const auto &lhs,
-                                                     const auto &rhs) {
-    if (lhs.second != rhs.second) {
-      return lhs.second > rhs.second;
-    }
-    return lhs.first < rhs.first;
-  });
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto &lhs, const auto &rhs) {
+              if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+              }
+              return lhs.first < rhs.first;
+            });
   constexpr std::size_t kMaxCachedGlobals = 3;
   if (candidates.size() > kMaxCachedGlobals) {
     candidates.resize(kMaxCachedGlobals);
@@ -1164,17 +1223,16 @@ bool runPreRAAddressCombine(MachineFunction &mf) {
     for (const MachineInstr &original : block.instrs) {
       MachineInstr instr = original;
       AddressCombineInfo candidateInfo;
-      const bool hasCandidate =
-          isAddressCombineDef(original, constants, versions, instrIndex,
-                              candidateInfo);
+      const bool hasCandidate = isAddressCombineDef(
+          original, constants, versions, instrIndex, candidateInfo);
 
       bool localChanged = false;
       if (isLoadOpcode(instr.opcode)) {
-        localChanged = rewriteAddressUse(instr, 0, 1, activeCandidates,
-                                         versions);
+        localChanged =
+            rewriteAddressUse(instr, 0, 1, activeCandidates, versions);
       } else if (isMemoryStoreOpcode(instr.opcode)) {
-        localChanged = rewriteAddressUse(instr, 1, 2, activeCandidates,
-                                         versions);
+        localChanged =
+            rewriteAddressUse(instr, 1, 2, activeCandidates, versions);
       }
       changed = changed || localChanged;
 
@@ -1198,8 +1256,7 @@ bool runPreRAAddressCombine(MachineFunction &mf) {
             def.regValue.rc == RegClass::GPR64) {
           constants[key] = original.uses[0].immValue;
         } else if (original.opcode == Opcode::COPY &&
-                   original.defs.size() == 1 &&
-                   original.uses.size() == 1 &&
+                   original.defs.size() == 1 && original.uses.size() == 1 &&
                    def.regValue.rc == RegClass::GPR64) {
           int64_t value = 0;
           if (knownAddressConstant(original.uses[0], constants, value)) {
@@ -1248,8 +1305,8 @@ bool runPreRACopyPropagation(MachineFunction &mf) {
 
       if (isCopyPropagationCandidate(instr, defCounts)) {
         const MachineReg dst = instr.defs[0].regValue;
-        const MachineReg src = resolveReplacement(instr.uses[0].regValue,
-                                                  replacements);
+        const MachineReg src =
+            resolveReplacement(instr.uses[0].regValue, replacements);
         replacements[dst.id] = src;
         if (sameRegister(dst, src) ||
             allUsesInBlock(dst.id, blockIndex, useBlocks)) {
@@ -1287,13 +1344,11 @@ bool runPreRALocalCSE(MachineFunction &mf) {
 
       if (instr.opcode == Opcode::CALL ||
           (instr.sideEffects && !isMemoryStoreOpcode(instr.opcode))) {
-        clearCSETables(exprs, loads, keyDependencies,
-                       registerDependencies);
+        clearCSETables(exprs, loads, keyDependencies, registerDependencies);
       } else if (instr.sideEffects) {
         // Stores invalidate memory-derived CSE entries, but cannot change a
         // pure ALU expression whose operands are virtual registers or X0.
-        clearCSELoads(loads, exprs, keyDependencies,
-                      registerDependencies);
+        clearCSELoads(loads, exprs, keyDependencies, registerDependencies);
       }
       invalidateCSEDefinitions(instr, exprs, loads, keyDependencies,
                                registerDependencies, replacements);

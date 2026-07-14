@@ -205,7 +205,8 @@ MachineReg materializeConstant(MachineFunction &mf,
     detail += " type=" + std::to_string(value->getIRType()->getEnum());
   }
   if (auto *instruction = dynamic_cast<Instruction *>(value)) {
-    detail += " inst=" + std::to_string(static_cast<int>(instruction->instType));
+    detail +=
+        " inst=" + std::to_string(static_cast<int>(instruction->instType));
   }
   throw BackendError("unsupported PHI constant incoming value " + detail);
 }
@@ -225,8 +226,8 @@ MachineReg materializePointerValue(MachineFunction &mf,
     return reg;
   }
 
-  if (auto *global = dynamic_cast<Variable *>(value); global &&
-                                                     global->isGlobal()) {
+  if (auto *global = dynamic_cast<Variable *>(value);
+      global && global->isGlobal()) {
     MachineReg reg = mf.createVReg(RegClass::GPR64);
     MachineInstr addr;
     addr.opcode = Opcode::LA;
@@ -250,15 +251,16 @@ MachineReg valueRegInBlock(MachineFunction &mf, MachineBasicBlock &block,
   if (mapped != mf.valueRegs.end()) {
     return mapped->second;
   }
-  if (value && value->getIRType() && value->getIRType()->getEnum() == IR_POINTER) {
+  if (value && value->getIRType() &&
+      value->getIRType()->getEnum() == IR_POINTER) {
     return materializePointerValue(mf, instrs, value);
   }
   return materializeConstant(mf, instrs, value);
 }
 
 bool sameMachineReg(const MachineReg &lhs, const MachineReg &rhs) {
-  return lhs.physical == rhs.physical && lhs.id == rhs.id &&
-         lhs.rc == rhs.rc && lhs.phys == rhs.phys;
+  return lhs.physical == rhs.physical && lhs.id == rhs.id && lhs.rc == rhs.rc &&
+         lhs.phys == rhs.phys;
 }
 
 bool isGPR(MachineReg reg) {
@@ -323,7 +325,8 @@ bool producesKnownBoolean(const MachineInstr &instr,
   case Opcode::FLE_S:
     return true;
   case Opcode::LI:
-    return instr.uses.size() == 1 && instr.uses.front().kind == OperandKind::Imm &&
+    return instr.uses.size() == 1 &&
+           instr.uses.front().kind == OperandKind::Imm &&
            (instr.uses.front().immValue == 0 ||
             instr.uses.front().immValue == 1);
   case Opcode::COPY:
@@ -362,11 +365,12 @@ MachineInstr makeRegInstr(Opcode opcode, MachineReg dst,
 
 bool findAddWithFalseValue(const std::vector<MachineInstr> &lowered,
                            const MachineReg &trueValue,
-                           const MachineReg &falseValue,
-                           MachineReg &increment, Opcode &addOpcode) {
+                           const MachineReg &falseValue, MachineReg &increment,
+                           Opcode &addOpcode) {
   for (auto it = lowered.rbegin(); it != lowered.rend(); ++it) {
     const MachineInstr &candidate = *it;
-    if (candidate.defs.size() != 1 || candidate.defs.front().kind != OperandKind::Reg ||
+    if (candidate.defs.size() != 1 ||
+        candidate.defs.front().kind != OperandKind::Reg ||
         !sameMachineReg(candidate.defs.front().regValue, trueValue)) {
       continue;
     }
@@ -418,15 +422,17 @@ bool conditionProducerFoldsIntoBranch(
     return false;
   }
   const MachineInstr &producer = lowered.back();
-  if (producer.defs.size() != 1 || producer.defs.front().kind != OperandKind::Reg ||
+  if (producer.defs.size() != 1 ||
+      producer.defs.front().kind != OperandKind::Reg ||
       !sameMachineReg(producer.defs.front().regValue, condition) ||
       producer.sideEffects || producer.terminator ||
       !producer.implicitDefs.empty() || !producer.implicitUses.empty()) {
     return false;
   }
 
-  // BranchCompareFolding only recognizes an adjacent producer and branch.
-  // In that exact shape, keeping a four-ALU mask sequence is always dearer.
+  // Keep this SELECT decision deliberately local. The later compare-folder may
+  // cross a small proven-safe gap, but reproducing that legality scan here
+  // would make the lowering cost model depend on instructions not yet emitted.
   switch (producer.opcode) {
   case Opcode::SLT:
   case Opcode::XOR:
@@ -455,20 +461,20 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
     for (const MachineInstr &instr : block.instrs) {
       if (instr.opcode == Opcode::SELECT && instr.defs.size() == 1 &&
           instr.defs.front().kind == OperandKind::Reg &&
-          instr.uses.size() == 3 && isRegUse(instr, 0) &&
-          isRegUse(instr, 1) && isRegUse(instr, 2)) {
+          instr.uses.size() == 3 && isRegUse(instr, 0) && isRegUse(instr, 1) &&
+          isRegUse(instr, 2)) {
         const MachineReg dst = instr.defs.front().regValue;
         const MachineReg cond = instr.uses[0].regValue;
         const MachineReg trueValue = instr.uses[1].regValue;
         const MachineReg falseValue = instr.uses[2].regValue;
         if (isGPR(dst) && dst.rc != RegClass::FPR32 &&
-            isKnownBoolean(knownBooleans, cond) &&
-            trueValue.rc == dst.rc && falseValue.rc == dst.rc) {
+            isKnownBoolean(knownBooleans, cond) && trueValue.rc == dst.rc &&
+            falseValue.rc == dst.rc) {
           const MachineReg zero = MachineReg::preg(PhysReg::X0, dst.rc);
           MachineReg increment;
           Opcode addOpcode = Opcode::ADDW;
           if (findAddWithFalseValue(lowered, trueValue, falseValue, increment,
-                                     addOpcode)) {
+                                    addOpcode)) {
             const MachineReg mask = mf.createVReg(dst.rc);
             const MachineReg selected = mf.createVReg(dst.rc);
             lowered.push_back(makeRegInstr(
@@ -479,17 +485,17 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
             lowered.push_back(
                 makeRegInstr(addOpcode, dst, {falseValue, selected}));
           } else if (!conditionProducerFoldsIntoBranch(lowered, cond,
-                                                        useCounts)) {
+                                                       useCounts)) {
             const MachineReg mask = mf.createVReg(dst.rc);
             const MachineReg difference = mf.createVReg(dst.rc);
             const MachineReg selected = mf.createVReg(dst.rc);
             lowered.push_back(makeRegInstr(
                 dst.rc == RegClass::GPR32 ? Opcode::SUBW : Opcode::SUB, mask,
                 {zero, cond}));
-            lowered.push_back(makeRegInstr(Opcode::XOR, difference,
-                                            {trueValue, falseValue}));
-            lowered.push_back(makeRegInstr(Opcode::AND, selected,
-                                            {difference, mask}));
+            lowered.push_back(
+                makeRegInstr(Opcode::XOR, difference, {trueValue, falseValue}));
+            lowered.push_back(
+                makeRegInstr(Opcode::AND, selected, {difference, mask}));
             lowered.push_back(
                 makeRegInstr(Opcode::XOR, dst, {selected, falseValue}));
           } else {
@@ -589,15 +595,47 @@ std::vector<MachineInstr> buildPhiCopies(MachineFunction &mf,
     }
   }
 
-  std::vector<CopyPair> tempCopies;
-  tempCopies.reserve(pendingCopies.size());
-  for (const CopyPair &copy : pendingCopies) {
-    MachineReg temp = mf.createVReg(copy.dst.rc);
-    copies.push_back(makeCopy(temp, copy.src));
-    tempCopies.push_back({copy.dst, temp});
-  }
-  for (const CopyPair &copy : tempCopies) {
-    copies.push_back(makeCopy(copy.dst, copy.src));
+  auto SameReg = [](const MachineReg &A, const MachineReg &B) {
+    return A.physical == B.physical && A.id == B.id && A.rc == B.rc &&
+           A.phys == B.phys;
+  };
+
+  pendingCopies.erase(
+      std::remove_if(pendingCopies.begin(), pendingCopies.end(),
+                     [&](const CopyPair &Copy) {
+                       return SameReg(Copy.dst, Copy.src);
+                     }),
+      pendingCopies.end());
+
+  while (!pendingCopies.empty()) {
+    auto Ready = pendingCopies.end();
+    for (auto It = pendingCopies.begin(); It != pendingCopies.end(); ++It) {
+      const bool DestinationStillNeeded =
+          std::any_of(pendingCopies.begin(), pendingCopies.end(),
+                      [&](const CopyPair &Other) {
+                        return SameReg(It->dst, Other.src);
+                      });
+      if (!DestinationStillNeeded) {
+        Ready = It;
+        break;
+      }
+    }
+
+    if (Ready != pendingCopies.end()) {
+      copies.push_back(makeCopy(Ready->dst, Ready->src));
+      pendingCopies.erase(Ready);
+      continue;
+    }
+
+    // A remaining cycle needs one saved old value. Replacing every use of the
+    // chosen source breaks the cycle without penalizing acyclic copy chains.
+    const MachineReg CycleSource = pendingCopies.front().src;
+    MachineReg Temp = mf.createVReg(CycleSource.rc);
+    copies.push_back(makeCopy(Temp, CycleSource));
+    for (CopyPair &Copy : pendingCopies) {
+      if (SameReg(Copy.src, CycleSource))
+        Copy.src = Temp;
+    }
   }
   return copies;
 }
@@ -647,7 +685,8 @@ void rebuildCFG(MachineFunction &mf) {
 void eliminatePhiNodes(MachineFunction &mf) {
   rebuildCFG(mf);
 
-  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size(); ++blockIndex) {
+  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
+       ++blockIndex) {
     bool hasPhi = false;
     for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
       if (instr.opcode == Opcode::PHI) {
@@ -681,12 +720,12 @@ void eliminatePhiNodes(MachineFunction &mf) {
     }
 
     MachineBasicBlock &phiBlock = mf.blocks[blockIndex];
-    phiBlock.instrs.erase(
-        std::remove_if(phiBlock.instrs.begin(), phiBlock.instrs.end(),
-                       [](const MachineInstr &instr) {
-                         return instr.opcode == Opcode::PHI;
-                       }),
-        phiBlock.instrs.end());
+    phiBlock.instrs.erase(std::remove_if(phiBlock.instrs.begin(),
+                                         phiBlock.instrs.end(),
+                                         [](const MachineInstr &instr) {
+                                           return instr.opcode == Opcode::PHI;
+                                         }),
+                          phiBlock.instrs.end());
     rebuildCFG(mf);
   }
 }
@@ -698,7 +737,8 @@ bool lowerSelectPseudo(MachineFunction &mf, bool branchlessOnly) {
 
   int selectId = 0;
   bool changed = false;
-  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size(); ++blockIndex) {
+  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
+       ++blockIndex) {
     MachineBasicBlock &block = mf.blocks[blockIndex];
     auto selectIt = std::find_if(block.instrs.begin(), block.instrs.end(),
                                  [](const MachineInstr &instr) {

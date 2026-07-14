@@ -191,6 +191,10 @@ MachinePassBuilder::buildPostRAOptPipeline(const BackendOptions &Options) {
   addOptionalPass(MPM, Options, "post-ra-cleanup-cfg", CleanupCFGPass());
   addOptionalPass(MPM, Options, "block-placement", BlockPlacementPass());
   MPM.addPass(RebuildCFGPass());
+  addOptionalPass(MPM, Options, "post-ra-loop-backedge-bypass",
+                  PostRALoopBackedgeBypassPass());
+  MPM.addPass(RebuildCFGPass());
+  addOptionalPass(MPM, Options, "post-ra-cleanup-cfg", CleanupCFGPass());
   // 最后做块内 list scheduling，不再改变 CFG，只重排单个基本块内部顺序。
   addOptionalPass(MPM, Options, "post-ra-list-schedule",
                   PostRAListSchedulePass());

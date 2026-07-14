@@ -19,6 +19,7 @@ bool runPreRAMachineDCE(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);
 bool runPostRAPeephole(MachineFunction &mf);
+bool runPostRALoopBackedgeBypass(MachineFunction &mf);
 bool runPostRAListSchedule(
     MachineFunction &mf, const MachineBlockFrequencyAnalysis::Result &frequencies);
 bool runBlockPlacement(
