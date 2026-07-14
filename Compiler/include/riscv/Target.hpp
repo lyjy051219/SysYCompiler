@@ -4,6 +4,7 @@
 #include <iosfwd>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace riscv {
 
@@ -16,6 +17,9 @@ enum class CodegenOptLevel {
 struct BackendOptions {
   bool emitMetrics = false;
   CodegenOptLevel optLevel = CodegenOptLevel::O1;
+  // 可选机器层 pass 禁用列表。名字由 MachinePassBuilder 统一定义，
+  // 例如 cleanup-cfg、post-ra-peephole；填 all 可禁用全部可选 pass。
+  std::vector<std::string> disabledMachinePasses;
 };
 
 class BackendError {

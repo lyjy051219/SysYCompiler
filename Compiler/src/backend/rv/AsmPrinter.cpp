@@ -377,6 +377,8 @@ AsmPrinter::AsmPrinter(std::ostream &out) : out_(out) {}
 
 void AsmPrinter::emitModule(const MachineModule &module) {
   out_ << "# myCompiler RV64GC backend\n";
+  out_ << "    .attribute arch, \"rv64gc\"\n";
+  out_ << "    .option rvc\n";
   for (const GlobalObject &global : module.globals) {
     emitGlobal(global);
   }
@@ -516,19 +518,62 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     return;
   case Opcode::ADDI:
   case Opcode::ADDIW:
+  case Opcode::ANDI:
+  case Opcode::ORI:
+  case Opcode::XORI:
+  case Opcode::SLLI:
+  case Opcode::SLLIW:
+  case Opcode::SRAI:
+  case Opcode::SRAIW:
+  case Opcode::SRLIW:
     if (instr.defs.empty() || instr.uses.size() < 2 ||
         instr.uses[1].kind != OperandKind::Imm) {
-      throw BackendError("malformed immediate add instruction");
+      throw BackendError("malformed immediate instruction");
     }
     {
-      int64_t offset = instr.uses[1].immValue;
-      auto [base, scratch] = memoryBaseReg(instr.uses[0], offset);
-      if (!fitsSigned12(offset)) {
-        throw BackendError("immediate add offset out of signed 12-bit range");
+      const char *mnemonic = "";
+      switch (instr.opcode) {
+      case Opcode::ADDI:
+        mnemonic = "addi";
+        break;
+      case Opcode::ADDIW:
+        mnemonic = "addiw";
+        break;
+      case Opcode::ANDI:
+        mnemonic = "andi";
+        break;
+      case Opcode::ORI:
+        mnemonic = "ori";
+        break;
+      case Opcode::XORI:
+        mnemonic = "xori";
+        break;
+      case Opcode::SLLI:
+        mnemonic = "slli";
+        break;
+      case Opcode::SLLIW:
+        mnemonic = "slliw";
+        break;
+      case Opcode::SRAI:
+        mnemonic = "srai";
+        break;
+      case Opcode::SRAIW:
+        mnemonic = "sraiw";
+        break;
+      case Opcode::SRLIW:
+        mnemonic = "srliw";
+        break;
+      default:
+        break;
       }
-      out_ << "    " << (instr.opcode == Opcode::ADDI ? "addi" : "addiw") << ' '
-           << operandReg(instr.defs.front()) << ", " << base << ", " << offset
-           << '\n';
+
+      int64_t imm = instr.uses[1].immValue;
+      auto [base, scratch] = memoryBaseReg(instr.uses[0], imm);
+      if (!fitsSigned12(imm)) {
+        throw BackendError("immediate operand out of signed 12-bit range");
+      }
+      out_ << "    " << mnemonic << ' ' << operandReg(instr.defs.front())
+           << ", " << base << ", " << imm << '\n';
       releaseScratchGpr(scratch);
     }
     return;
@@ -547,6 +592,7 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
   case Opcode::AND:
   case Opcode::OR:
   case Opcode::XOR:
+  case Opcode::SLL:
   case Opcode::SLLW:
   case Opcode::SRAW:
   case Opcode::SRLW:
@@ -609,6 +655,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
         break;
       case Opcode::XOR:
         mnemonic = "xor";
+        break;
+      case Opcode::SLL:
+        mnemonic = "sll";
         break;
       case Opcode::SLLW:
         mnemonic = "sllw";
@@ -789,6 +838,32 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     }
     out_ << "    beqz " << operandReg(instr.uses[0]) << ", "
          << instr.uses[1].blockLabel << '\n';
+    return;
+  case Opcode::BEQ:
+  case Opcode::BNE:
+  case Opcode::BLT:
+  case Opcode::BGE:
+    if (instr.uses.size() < 3 || instr.uses[2].kind != OperandKind::Block) {
+      throw BackendError("malformed conditional branch instruction");
+    }
+    switch (instr.opcode) {
+    case Opcode::BEQ:
+      out_ << "    beq ";
+      break;
+    case Opcode::BNE:
+      out_ << "    bne ";
+      break;
+    case Opcode::BLT:
+      out_ << "    blt ";
+      break;
+    case Opcode::BGE:
+      out_ << "    bge ";
+      break;
+    default:
+      break;
+    }
+    out_ << operandReg(instr.uses[0]) << ", " << operandReg(instr.uses[1])
+         << ", " << instr.uses[2].blockLabel << '\n';
     return;
   case Opcode::J:
     if (instr.uses.empty() || instr.uses.front().kind != OperandKind::Block) {

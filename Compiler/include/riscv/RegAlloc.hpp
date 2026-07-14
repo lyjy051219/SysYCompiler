@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MIR.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 namespace riscv {
 
@@ -15,6 +16,7 @@ struct RegAllocStats {
 };
 
 void allocateRegisters(MachineFunction &mf);
+void allocateRegisters(MachineFunction &mf, MachineFunctionAnalysisManager &am);
 void allocateRegisters(MachineFunction &mf, RegAllocStats *stats);
 
 } // namespace riscv

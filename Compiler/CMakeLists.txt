@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.13)
 project(compiler LANGUAGES CXX)
 
+# 必须在顶层启用，子目录注册的后端测试才能被根构建目录的 CTest 发现。
+enable_testing()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -95,6 +98,7 @@ elseif(BUILD_MIDDLE_END)
 
 else()
     message(STATUS "=== 构建完整编译器 ===")
+    set(CMAKE_CXX_CLANG_TIDY "") # 与其他分支一致，关闭代码检查以简化构建
 
     # 完整编译器构建
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/lib)

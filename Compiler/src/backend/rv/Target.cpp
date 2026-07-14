@@ -2,8 +2,9 @@
 
 #include "../../../include/riscv/AsmPrinter.hpp"
 #include "../../../include/riscv/ISel.hpp"
-#include "../../../include/riscv/MachinePassBuilder.hpp"
-#include "../../../include/riscv/MachinePassManager.hpp"
+#include "riscv/opt/CodeGenPrepare.hpp"
+#include "riscv/opt/MachinePassBuilder.hpp"
+#include "riscv/opt/MachinePassManager.hpp"
 
 #include <ostream>
 
@@ -11,6 +12,9 @@ namespace riscv {
 
 void emitAssembly(Module &module, std::ostream &out,
                   const BackendOptions &options) {
+  // R4：在指令选择前做 target-specific 的地址归纳准备，保留 IR SSA。
+  runCodeGenPrepare(module);
+
   // 指令选择：中端 IR 下降为带虚拟寄存器的 MIR
   IRLowering lowering(module);
   MachineModule machine = lowering.lowerModule();
@@ -24,7 +28,7 @@ void emitAssembly(Module &module, std::ostream &out,
 
   // 构建并运行代码生成流水线
   MachineModulePassManager MPM =
-      MPB.buildModulePipeline(options.optLevel, MFAM);
+      MPB.buildModulePipeline(options, MFAM);
   MPM.run(machine, MMAM);
 
   // 汇编打印

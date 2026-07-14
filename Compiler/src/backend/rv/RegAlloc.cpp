@@ -2,6 +2,7 @@
 
 #include "../../../include/riscv/Registers.hpp"
 #include "../../../include/riscv/Target.hpp"
+#include "riscv/opt/MachineAnalysis.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,7 +19,6 @@
 namespace riscv {
 namespace {
 
-using VRegSet = std::set<uint32_t>;
 using Node = uint32_t;
 
 constexpr Node kPhysicalNodeBase = 0x80000000U;
@@ -102,143 +102,35 @@ std::vector<uint32_t> virtualDefs(const MachineInstr &instr) {
   return result;
 }
 
-struct Liveness {
-  std::vector<VRegSet> uses;
-  std::vector<VRegSet> defs;
-  std::vector<VRegSet> liveIn;
-  std::vector<VRegSet> liveOut;
-};
-
-Liveness computeLiveness(const MachineFunction &mf) {
-  Liveness live;
-  const std::size_t blockCount = mf.blocks.size();
-  live.uses.resize(blockCount);
-  live.defs.resize(blockCount);
-  live.liveIn.resize(blockCount);
-  live.liveOut.resize(blockCount);
-
-  for (std::size_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
-    for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
-      for (uint32_t use : virtualUses(instr)) {
-        if (live.defs[blockIndex].count(use) == 0) {
-          live.uses[blockIndex].insert(use);
-        }
-      }
-      for (uint32_t def : virtualDefs(instr)) {
-        live.defs[blockIndex].insert(def);
-      }
-    }
+MachineLivenessAnalysis::Result
+getLiveness(MachineFunction &mf, MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    return am->getResult<MachineLivenessAnalysis>(mf);
   }
 
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (std::size_t reverse = 0; reverse < blockCount; ++reverse) {
-      const std::size_t blockIndex = blockCount - reverse - 1;
-      VRegSet newOut;
-      for (int succ : mf.blocks[blockIndex].succs) {
-        if (succ < 0 || succ >= static_cast<int>(blockCount)) {
-          throw BackendError(
-              "invalid CFG successor during register allocation");
-        }
-        const VRegSet &succIn = live.liveIn[static_cast<std::size_t>(succ)];
-        newOut.insert(succIn.begin(), succIn.end());
-      }
-
-      VRegSet newIn = live.uses[blockIndex];
-      for (uint32_t value : newOut) {
-        if (live.defs[blockIndex].count(value) == 0) {
-          newIn.insert(value);
-        }
-      }
-      if (newIn != live.liveIn[blockIndex] ||
-          newOut != live.liveOut[blockIndex]) {
-        live.liveIn[blockIndex] = std::move(newIn);
-        live.liveOut[blockIndex] = std::move(newOut);
-        changed = true;
-      }
-    }
-  }
-  return live;
+  MachineFunctionAnalysisManager localAM;
+  localAM.registerPass([] { return MachineCFGAnalysis(); });
+  localAM.registerPass([] { return MachineLivenessAnalysis(); });
+  return localAM.getResult<MachineLivenessAnalysis>(mf);
 }
 
-std::vector<int> computeLoopDepth(const MachineFunction &mf) {
-  const std::size_t count = mf.blocks.size();
-  std::vector<int> depth(count, 0);
-  if (count == 0) {
-    return depth;
+void invalidateAnalysesAfterRewrite(MachineFunction &mf,
+                                    MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    am->invalidate(mf, MachinePreservationStatus::none());
+  }
+}
+
+std::vector<int> getLoopDepth(MachineFunction &mf,
+                              MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    return am->getResult<MachineLoopAnalysis>(mf).depth;
   }
 
-  std::vector<std::set<int>> dominators(count);
-  std::set<int> all;
-  for (std::size_t i = 0; i < count; ++i) {
-    all.insert(static_cast<int>(i));
-  }
-  dominators[0].insert(0);
-  for (std::size_t i = 1; i < count; ++i) {
-    dominators[i] = all;
-  }
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (std::size_t i = 1; i < count; ++i) {
-      std::set<int> next;
-      bool firstPred = true;
-      for (int pred : mf.blocks[i].preds) {
-        if (pred < 0 || pred >= static_cast<int>(count)) {
-          throw BackendError(
-              "invalid CFG predecessor during register allocation");
-        }
-        if (firstPred) {
-          next = dominators[static_cast<std::size_t>(pred)];
-          firstPred = false;
-        } else {
-          std::set<int> intersection;
-          std::set_intersection(
-              next.begin(), next.end(),
-              dominators[static_cast<std::size_t>(pred)].begin(),
-              dominators[static_cast<std::size_t>(pred)].end(),
-              std::inserter(intersection, intersection.begin()));
-          next = std::move(intersection);
-        }
-      }
-      if (firstPred) {
-        next.clear();
-      }
-      next.insert(static_cast<int>(i));
-      if (next != dominators[i]) {
-        dominators[i] = std::move(next);
-        changed = true;
-      }
-    }
-  }
-
-  for (std::size_t from = 0; from < count; ++from) {
-    for (int succ : mf.blocks[from].succs) {
-      if (succ < 0 || succ >= static_cast<int>(count) ||
-          dominators[from].count(succ) == 0) {
-        continue;
-      }
-
-      // 回边源到支配头之间的反向可达块构成自然循环。
-      std::set<int> members{succ, static_cast<int>(from)};
-      std::vector<int> work{static_cast<int>(from)};
-      while (!work.empty()) {
-        int block = work.back();
-        work.pop_back();
-        for (int pred : mf.blocks[static_cast<std::size_t>(block)].preds) {
-          if (members.insert(pred).second && pred != succ) {
-            work.push_back(pred);
-          }
-        }
-      }
-      for (int block : members) {
-        ++depth[static_cast<std::size_t>(block)];
-      }
-    }
-  }
-  return depth;
+  MachineFunctionAnalysisManager localAM;
+  localAM.registerPass([] { return MachineCFGAnalysis(); });
+  localAM.registerPass([] { return MachineLoopAnalysis(); });
+  return localAM.getResult<MachineLoopAnalysis>(mf).depth;
 }
 
 struct ProgramInfo {
@@ -249,14 +141,13 @@ struct ProgramInfo {
 };
 
 ProgramInfo analyzeProgram(const MachineFunction &mf,
-                           const std::set<uint32_t> &generatedBySpill) {
+                           const std::set<uint32_t> &generatedBySpill,
+                           const std::vector<int> &loopDepth) {
   ProgramInfo info;
   info.classes = collectVRegs(mf);
   info.generatedBySpill = generatedBySpill;
   std::map<uint32_t, int> defCount;
   std::map<uint32_t, MachineInstr> candidates;
-  const std::vector<int> loopDepth = computeLoopDepth(mf);
-
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
     uint64_t blockHeat = 1;
@@ -394,7 +285,8 @@ bool isCopyForBank(const MachineInstr &instr, bool floatBank) {
 
 AllocationGraph buildAllocationGraph(const MachineFunction &mf,
                                      const ProgramInfo &info,
-                                     const Liveness &live, bool floatBank) {
+                                     const MachineLivenessAnalysis::Result &live,
+                                     bool floatBank) {
   AllocationGraph graph;
   graph.floatBank = floatBank;
   const RegClass bankClass = floatBank ? RegClass::FPR32 : RegClass::GPR64;
@@ -1209,7 +1101,8 @@ std::string allocationSignature(const MachineFunction &mf,
   return signature;
 }
 
-void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
+void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
+                           MachineFunctionAnalysisManager *am) {
   std::set<uint32_t> generatedBySpill;
   std::string previousSignature;
   int repeatedSignature = 0;
@@ -1218,11 +1111,12 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     if (stats != nullptr) {
       ++stats->rounds;
     }
-    ProgramInfo info = analyzeProgram(mf, generatedBySpill);
+    const std::vector<int> loopDepth = getLoopDepth(mf, am);
+    ProgramInfo info = analyzeProgram(mf, generatedBySpill, loopDepth);
     if (info.classes.empty()) {
       return;
     }
-    const Liveness live = computeLiveness(mf);
+    const MachineLivenessAnalysis::Result live = getLiveness(mf, am);
 
     ColoringResult gpr =
         IRCAllocator(buildAllocationGraph(mf, info, live, false), info).run();
@@ -1280,6 +1174,7 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
     previousSignature = signature;
 
     SpillRewriteResult rewrite = rewriteSpills(mf, info, spills, conflicts);
+    invalidateAnalysesAfterRewrite(mf, am);
     generatedBySpill.insert(rewrite.generated.begin(), rewrite.generated.end());
     if (stats != nullptr) {
       stats->spilledVRegs += spills.size();
@@ -1296,11 +1191,15 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats) {
 } // anonymous namespace
 
 void allocateRegisters(MachineFunction &mf) {
-  allocateRegistersImpl(mf, nullptr);
+  allocateRegistersImpl(mf, nullptr, nullptr);
+}
+
+void allocateRegisters(MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  allocateRegistersImpl(mf, nullptr, &am);
 }
 
 void allocateRegisters(MachineFunction &mf, RegAllocStats *stats) {
-  allocateRegistersImpl(mf, stats);
+  allocateRegistersImpl(mf, stats, nullptr);
 }
 
 } // namespace riscv

@@ -7,8 +7,10 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -122,9 +124,40 @@ struct Address {
   }
 };
 
+struct DivRemKey {
+  Value *lhs = nullptr;
+  int64_t divisor = 0;
+  BasicBlock *block = nullptr;
+
+  bool operator==(const DivRemKey &other) const {
+    return lhs == other.lhs && divisor == other.divisor &&
+           block == other.block;
+  }
+};
+
+struct DivRemKeyHash {
+  std::size_t operator()(const DivRemKey &key) const {
+    std::size_t hash = std::hash<Value *>{}(key.lhs);
+    hash ^= std::hash<int64_t>{}(key.divisor) + 0x9e3779b9 +
+            (hash << 6) + (hash >> 2);
+    hash ^= std::hash<BasicBlock *>{}(key.block) + 0x9e3779b9 +
+            (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
+
 struct LoweringState {
   std::unordered_map<Value *, Address> addresses;
   std::unordered_map<BasicBlock *, std::string> blockLabels;
+  std::unordered_map<DivRemKey, MachineReg, DivRemKeyHash> divRemQuotients;
+  BasicBlock *divRemBlock = nullptr;
+
+  void beginDivRemBlock(BasicBlock *block) {
+    if (divRemBlock != block) {
+      divRemQuotients.clear();
+      divRemBlock = block;
+    }
+  }
 };
 
 std::string sanitizeLabelPart(const std::string &name) {
@@ -162,7 +195,7 @@ Value *requiredUseValue(User &user, std::size_t index,
   return value;
 }
 
-bool intConstant(Value *value, int64_t &out) {
+bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
   if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
     out = intValue->getVal();
     return true;
@@ -181,7 +214,187 @@ bool intConstant(Value *value, int64_t &out) {
     out = 0;
     return true;
   }
+
+  // Some middle-end transformations materialize a constant as an otherwise
+  // ordinary integer instruction (for example, add i32 0, 65535).  Look
+  // through a small, acyclic expression tree so the instruction selector can
+  // still use immediate and constant-divisor lowering.  The original
+  // instruction is still lowered normally; this helper only observes it.
+  auto *binary = dynamic_cast<BinaryInst *>(value);
+  if (!binary || depth >= 4 || !value->getIRType() ||
+      value->getIRType()->getEnum() != IR_INT) {
+    return false;
+  }
+
+  auto &operands = binary->getUserList();
+  if (operands.size() != 2 || !operands[0] || !operands[1]) {
+    return false;
+  }
+
+  int64_t lhsValue = 0;
+  int64_t rhsValue = 0;
+  if (!intConstantImpl(operands[0]->getValue(), lhsValue, depth + 1) ||
+      !intConstantImpl(operands[1]->getValue(), rhsValue, depth + 1)) {
+    return false;
+  }
+
+  // Integer instructions in this backend operate on i32 values.  Normalize
+  // operands before folding so signed division/remainder and shifts follow
+  // the same width as the eventual machine instruction.
+  const int64_t lhs = static_cast<int32_t>(lhsValue);
+  const int64_t rhs = static_cast<int32_t>(rhsValue);
+  const uint32_t lhsBits = static_cast<uint32_t>(lhs);
+  const uint32_t rhsBits = static_cast<uint32_t>(rhs);
+
+  auto asI32 = [](uint32_t bits) -> int64_t {
+    return static_cast<int64_t>(static_cast<int32_t>(bits));
+  };
+
+  switch (binary->getOp()) {
+  case BinaryInst::ADD:
+    out = static_cast<int32_t>(lhs + rhs);
+    return true;
+  case BinaryInst::SUB:
+    out = static_cast<int32_t>(lhs - rhs);
+    return true;
+  case BinaryInst::MUL:
+    out = static_cast<int32_t>(lhs * rhs);
+    return true;
+  case BinaryInst::DIV:
+    if (rhs == 0 ||
+        (lhs == std::numeric_limits<int32_t>::min() && rhs == -1)) {
+      return false;
+    }
+    out = lhs / rhs;
+    return true;
+  case BinaryInst::UDIV:
+    if (rhsBits == 0) {
+      return false;
+    }
+    out = asI32(lhsBits / rhsBits);
+    return true;
+  case BinaryInst::MOD:
+    if (rhs == 0 ||
+        (lhs == std::numeric_limits<int32_t>::min() && rhs == -1)) {
+      return false;
+    }
+    out = lhs % rhs;
+    return true;
+  case BinaryInst::UREM:
+    if (rhsBits == 0) {
+      return false;
+    }
+    out = asI32(lhsBits % rhsBits);
+    return true;
+  case BinaryInst::AND:
+    out = asI32(lhsBits & rhsBits);
+    return true;
+  case BinaryInst::OR:
+    out = asI32(lhsBits | rhsBits);
+    return true;
+  case BinaryInst::XOR:
+    out = asI32(lhsBits ^ rhsBits);
+    return true;
+  case BinaryInst::SHL:
+    if (rhs < 0 || rhs >= 32) {
+      return false;
+    }
+    out = asI32(lhsBits << static_cast<unsigned>(rhs));
+    return true;
+  case BinaryInst::LSHR:
+    if (rhs < 0 || rhs >= 32) {
+      return false;
+    }
+    out = asI32(lhsBits >> static_cast<unsigned>(rhs));
+    return true;
+  case BinaryInst::ASHR:
+    if (rhs < 0 || rhs >= 32) {
+      return false;
+    }
+    out = static_cast<int32_t>(lhs) >> static_cast<unsigned>(rhs);
+    return true;
+  case BinaryInst::E:
+    out = lhs == rhs ? 1 : 0;
+    return true;
+  case BinaryInst::NE:
+    out = lhs != rhs ? 1 : 0;
+    return true;
+  case BinaryInst::GE:
+    out = lhs >= rhs ? 1 : 0;
+    return true;
+  case BinaryInst::L:
+    out = lhs < rhs ? 1 : 0;
+    return true;
+  case BinaryInst::LE:
+    out = lhs <= rhs ? 1 : 0;
+    return true;
+  case BinaryInst::G:
+    out = lhs > rhs ? 1 : 0;
+    return true;
+  }
+
   return false;
+}
+
+bool intConstant(Value *value, int64_t &out) {
+  return intConstantImpl(value, out, 0);
+}
+
+bool positivePowerOfTwo(int64_t value) {
+  return value > 0 && (value & (value - 1)) == 0;
+}
+
+int log2PowerOfTwo(int64_t value) {
+  int shift = 0;
+  while (value > 1) {
+    value >>= 1;
+    ++shift;
+  }
+  return shift;
+}
+
+struct SignedDivMagic {
+  int64_t multiplier = 0;
+  int shift = 0;
+  bool addDividend = false;
+};
+
+SignedDivMagic signedDivMagicForPositiveDivisor(int64_t divisor) {
+  const uint64_t ad = static_cast<uint64_t>(divisor);
+  const uint64_t two31 = 1ULL << 31;
+  const uint64_t anc = two31 - 1 - (two31 - 1) % ad;
+  int p = 31;
+  uint64_t q1 = two31 / anc;
+  uint64_t r1 = two31 - q1 * anc;
+  uint64_t q2 = two31 / ad;
+  uint64_t r2 = two31 - q2 * ad;
+
+  while (true) {
+    ++p;
+    q1 <<= 1;
+    r1 <<= 1;
+    if (r1 >= anc) {
+      ++q1;
+      r1 -= anc;
+    }
+    q2 <<= 1;
+    r2 <<= 1;
+    if (r2 >= ad) {
+      ++q2;
+      r2 -= ad;
+    }
+    const uint64_t delta = ad - r2;
+    if (q1 > delta || (q1 == delta && r1 != 0)) {
+      break;
+    }
+  }
+
+  const uint64_t magicBits = (q2 + 1) & 0xffffffffULL;
+  int64_t multiplier = static_cast<int64_t>(magicBits);
+  if (multiplier >= (1LL << 31)) {
+    multiplier -= (1LL << 32);
+  }
+  return SignedDivMagic{multiplier, p - 32, multiplier < 0};
 }
 
 void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
@@ -195,6 +408,12 @@ void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
     instr.uses.push_back(MachineOperand::reg(use));
   }
   mbb.instrs.push_back(std::move(instr));
+}
+
+void appendCopyInstr(MachineBasicBlock &mbb, MachineReg dst, MachineReg src) {
+  appendRegInstr(mbb, dst.rc == RegClass::FPR32 ? Opcode::F_COPY
+                                                : Opcode::COPY,
+                 dst, {src});
 }
 
 MachineReg materializeInt(MachineFunction &mf, MachineBasicBlock &mbb,
@@ -220,6 +439,377 @@ MachineReg materializeFloat(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg floatReg = mf.createVReg(RegClass::FPR32);
   appendRegInstr(mbb, Opcode::FMV_W_X, floatReg, {bitsReg});
   return floatReg;
+}
+
+MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
+                                RegClass rc);
+MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
+                    Value *value);
+void appendImmInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
+                    MachineOperand base, int64_t imm);
+
+MachineReg buildSignedPowerOfTwoAdjusted(MachineFunction &mf,
+                                         MachineBasicBlock &mbb,
+                                         MachineReg lhs, int64_t divisor) {
+  const int shift = log2PowerOfTwo(divisor);
+  MachineReg bias = mf.createVReg(RegClass::GPR32);
+  if (divisor == 2) {
+    appendImmInstr(mbb, Opcode::SRLIW, bias, MachineOperand::reg(lhs), 31);
+  } else {
+    MachineReg sign = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::SRAIW, sign, MachineOperand::reg(lhs), 31);
+    appendImmInstr(mbb, Opcode::SRLIW, bias, MachineOperand::reg(sign),
+                   32 - shift);
+  }
+
+  MachineReg adjusted = mf.createVReg(RegClass::GPR32);
+  appendRegInstr(mbb, Opcode::ADDW, adjusted, {lhs, bias});
+  return adjusted;
+}
+
+void lowerSignedDivByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
+                                MachineReg dst, MachineReg lhs,
+                                int64_t divisor) {
+  if (divisor == 1) {
+    appendCopyInstr(mbb, dst, lhs);
+    return;
+  }
+
+  MachineReg adjusted =
+      buildSignedPowerOfTwoAdjusted(mf, mbb, lhs, divisor);
+  appendImmInstr(mbb, Opcode::SRAIW, dst, MachineOperand::reg(adjusted),
+                 log2PowerOfTwo(divisor));
+}
+
+void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
+                                MachineReg dst, MachineReg lhs,
+                                int64_t divisor, MachineReg quotient) {
+  if (divisor == 1) {
+    appendCopyInstr(mbb, dst, MachineReg::preg(PhysReg::X0, RegClass::GPR32));
+    return;
+  }
+
+  MachineReg scaled = mf.createVReg(RegClass::GPR32);
+  appendImmInstr(mbb, Opcode::SLLIW, scaled, MachineOperand::reg(quotient),
+                 log2PowerOfTwo(divisor));
+  appendRegInstr(mbb, Opcode::SUBW, dst, {lhs, scaled});
+}
+
+void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
+                                MachineReg dst, MachineReg lhs,
+                                int64_t divisor) {
+  if (divisor == 1) {
+    appendCopyInstr(mbb, dst, MachineReg::preg(PhysReg::X0, RegClass::GPR32));
+    return;
+  }
+  if (fitsSigned12(-divisor)) {
+    MachineReg adjusted =
+        buildSignedPowerOfTwoAdjusted(mf, mbb, lhs, divisor);
+    MachineReg multiple = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::ANDI, multiple,
+                   MachineOperand::reg(adjusted), -divisor);
+    appendRegInstr(mbb, Opcode::SUBW, dst, {lhs, multiple});
+    return;
+  }
+
+  MachineReg quotient = mf.createVReg(RegClass::GPR32);
+  lowerSignedDivByPowerOfTwo(mf, mbb, quotient, lhs, divisor);
+  lowerSignedRemByPowerOfTwo(mf, mbb, dst, lhs, divisor, quotient);
+}
+
+bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
+                             const BinaryInst *remainder) {
+  if (!lhs || !block)
+    return false;
+  for (auto It = lhs->getUseList().begin(); It != lhs->getUseList().end(); ++It) {
+    Use *UseNode = *It;
+    auto *Bin = UseNode ? dynamic_cast<BinaryInst *>(UseNode->getUser()) : nullptr;
+    if (!Bin || Bin == remainder || Bin->getParent() != block ||
+        Bin->getOp() != BinaryInst::DIV || Bin->getUserList().size() != 2 ||
+        Bin->getUserList()[0]->getValue() != lhs) {
+      continue;
+    }
+    int64_t OtherDivisor = 0;
+    if (intConstant(Bin->getUserList()[1]->getValue(), OtherDivisor) &&
+        OtherDivisor == divisor) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void lowerSignedDivByPositiveConstant(MachineFunction &mf,
+                                      MachineBasicBlock &mbb, MachineReg dst,
+                                      MachineReg lhs, int64_t divisor) {
+  const SignedDivMagic magic = signedDivMagicForPositiveDivisor(divisor);
+  MachineReg magicReg = materializeInt(mf, mbb, magic.multiplier,
+                                       RegClass::GPR64);
+
+  MachineReg product = mf.createVReg(RegClass::GPR64);
+  appendRegInstr(mbb, Opcode::MUL, product, {lhs, magicReg});
+
+  MachineReg high = mf.createVReg(RegClass::GPR64);
+  appendImmInstr(mbb, Opcode::SRAI, high, MachineOperand::reg(product), 32);
+
+  MachineReg quotient = high;
+  if (magic.addDividend) {
+    quotient = mf.createVReg(RegClass::GPR32);
+    appendRegInstr(mbb, Opcode::ADDW, quotient, {high, lhs});
+  }
+
+  if (magic.shift > 0) {
+    MachineReg shifted = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::SRAIW, shifted, MachineOperand::reg(quotient),
+                   magic.shift);
+    quotient = shifted;
+  }
+
+  MachineReg sign = mf.createVReg(RegClass::GPR32);
+  appendImmInstr(mbb, Opcode::SRAIW, sign, MachineOperand::reg(lhs), 31);
+  appendRegInstr(mbb, Opcode::SUBW, dst, {quotient, sign});
+}
+
+void lowerSignedRemByPositiveConstant(MachineFunction &mf,
+                                      MachineBasicBlock &mbb, MachineReg dst,
+                                      MachineReg lhs, int64_t divisor,
+                                      MachineReg quotient) {
+  MachineReg divisorReg = materializeInt(mf, mbb, divisor, RegClass::GPR32);
+  MachineReg scaled = mf.createVReg(RegClass::GPR32);
+  appendRegInstr(mbb, Opcode::MULW, scaled, {quotient, divisorReg});
+  appendRegInstr(mbb, Opcode::SUBW, dst, {lhs, scaled});
+}
+
+void lowerSignedRemByPositiveConstant(MachineFunction &mf,
+                                      MachineBasicBlock &mbb, MachineReg dst,
+                                      MachineReg lhs, int64_t divisor) {
+  MachineReg quotient = mf.createVReg(RegClass::GPR32);
+  lowerSignedDivByPositiveConstant(mf, mbb, quotient, lhs, divisor);
+  lowerSignedRemByPositiveConstant(mf, mbb, dst, lhs, divisor, quotient);
+}
+
+bool findDivRemQuotient(LoweringState &state, Value *lhs, int64_t divisor,
+                        BasicBlock *block, MachineReg &quotient) {
+  auto found = state.divRemQuotients.find(DivRemKey{lhs, divisor, block});
+  if (found == state.divRemQuotients.end()) {
+    return false;
+  }
+  quotient = found->second;
+  return true;
+}
+
+void rememberDivRemQuotient(LoweringState &state, Value *lhs,
+                            int64_t divisor, BasicBlock *block,
+                            MachineReg quotient) {
+  state.divRemQuotients[DivRemKey{lhs, divisor, block}] = quotient;
+}
+
+bool lowerIntegerPowerOfTwoOp(MachineFunction &mf, MachineBasicBlock &mbb,
+                              LoweringState &state, BinaryInst &inst,
+                              Value *lhs, Value *rhs) {
+  int64_t rhsValue = 0;
+  if (!intConstant(rhs, rhsValue) || !positivePowerOfTwo(rhsValue)) {
+    return false;
+  }
+
+  MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
+  MachineReg left = valueReg(mf, mbb, lhs);
+  const int shift = log2PowerOfTwo(rhsValue);
+
+  switch (inst.getOp()) {
+  case BinaryInst::MUL:
+    if (rhsValue == 1) {
+      appendCopyInstr(mbb, dst, left);
+    } else {
+      appendImmInstr(mbb, Opcode::SLLIW, dst, MachineOperand::reg(left),
+                     shift);
+    }
+    return true;
+  case BinaryInst::DIV:
+    if (rhsValue > 1) {
+      MachineReg quotient;
+      if (findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+        appendCopyInstr(mbb, dst, quotient);
+      } else {
+        lowerSignedDivByPowerOfTwo(mf, mbb, dst, left, rhsValue);
+        rememberDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, dst);
+      }
+    } else {
+      lowerSignedDivByPowerOfTwo(mf, mbb, dst, left, rhsValue);
+    }
+    return true;
+  case BinaryInst::UDIV:
+    if (rhsValue == 1) {
+      appendCopyInstr(mbb, dst, left);
+    } else {
+      appendImmInstr(mbb, Opcode::SRLIW, dst, MachineOperand::reg(left),
+                     shift);
+    }
+    return true;
+  case BinaryInst::MOD:
+    if (rhsValue > 1) {
+      MachineReg quotient;
+      if (findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue, quotient);
+      } else if (hasMatchingSignedDivUse(lhs, rhsValue, mbb.irBlock, &inst)) {
+        quotient = mf.createVReg(RegClass::GPR32);
+        lowerSignedDivByPowerOfTwo(mf, mbb, quotient, left, rhsValue);
+        rememberDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient);
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue, quotient);
+      } else {
+        lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue);
+      }
+    } else {
+      lowerSignedRemByPowerOfTwo(mf, mbb, dst, left, rhsValue);
+    }
+    return true;
+  case BinaryInst::UREM:
+    if (rhsValue == 1) {
+      appendCopyInstr(mbb, dst, MachineReg::preg(PhysReg::X0, RegClass::GPR32));
+    } else {
+      if (fitsSigned12(rhsValue - 1)) {
+        appendImmInstr(mbb, Opcode::ANDI, dst, MachineOperand::reg(left),
+                       rhsValue - 1);
+      } else {
+        MachineReg mask =
+            materializeInt(mf, mbb, rhsValue - 1, RegClass::GPR32);
+        appendRegInstr(mbb, Opcode::AND, dst, {left, mask});
+      }
+    }
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool lowerIntegerPositiveConstantDivRem(MachineFunction &mf,
+                                        MachineBasicBlock &mbb,
+                                        LoweringState &state,
+                                        BinaryInst &inst, Value *lhs,
+                                        Value *rhs) {
+  int64_t rhsValue = 0;
+  if (!intConstant(rhs, rhsValue) || rhsValue <= 1 ||
+      positivePowerOfTwo(rhsValue)) {
+    return false;
+  }
+
+  MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
+  MachineReg left = valueReg(mf, mbb, lhs);
+  switch (inst.getOp()) {
+  case BinaryInst::DIV:
+    {
+      MachineReg quotient;
+      if (findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+        appendCopyInstr(mbb, dst, quotient);
+      } else {
+        lowerSignedDivByPositiveConstant(mf, mbb, dst, left, rhsValue);
+        rememberDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, dst);
+      }
+    }
+    return true;
+  case BinaryInst::MOD:
+    {
+      MachineReg quotient;
+      if (!findDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient)) {
+        quotient = mf.createVReg(RegClass::GPR32);
+        lowerSignedDivByPositiveConstant(mf, mbb, quotient, left, rhsValue);
+        rememberDivRemQuotient(state, lhs, rhsValue, mbb.irBlock, quotient);
+      }
+      lowerSignedRemByPositiveConstant(mf, mbb, dst, left, rhsValue,
+                                       quotient);
+    }
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool lowerIntegerImmediateOp(MachineFunction &mf, MachineBasicBlock &mbb,
+                             BinaryInst &inst, Value *lhs, Value *rhs) {
+  int64_t rhsValue = 0;
+  if (intConstant(rhs, rhsValue)) {
+    MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
+    MachineReg left = valueReg(mf, mbb, lhs);
+    switch (inst.getOp()) {
+    case BinaryInst::ADD:
+      if (fitsSigned12(rhsValue)) {
+        appendImmInstr(mbb, Opcode::ADDIW, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::SUB:
+      if (fitsSigned12(-rhsValue)) {
+        appendImmInstr(mbb, Opcode::ADDIW, dst, MachineOperand::reg(left),
+                       -rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::AND:
+      if (fitsSigned12(rhsValue)) {
+        appendImmInstr(mbb, Opcode::ANDI, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::OR:
+      if (fitsSigned12(rhsValue)) {
+        appendImmInstr(mbb, Opcode::ORI, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::XOR:
+      if (fitsSigned12(rhsValue)) {
+        appendImmInstr(mbb, Opcode::XORI, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::SHL:
+      if (rhsValue >= 0 && rhsValue < 32) {
+        appendImmInstr(mbb, Opcode::SLLIW, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::ASHR:
+      if (rhsValue >= 0 && rhsValue < 32) {
+        appendImmInstr(mbb, Opcode::SRAIW, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    case BinaryInst::LSHR:
+      if (rhsValue >= 0 && rhsValue < 32) {
+        appendImmInstr(mbb, Opcode::SRLIW, dst, MachineOperand::reg(left),
+                       rhsValue);
+        return true;
+      }
+      break;
+    default:
+      break;
+    }
+  }
+
+  int64_t lhsValue = 0;
+  if (intConstant(lhs, lhsValue) && fitsSigned12(lhsValue) &&
+      (inst.getOp() == BinaryInst::ADD || inst.getOp() == BinaryInst::AND ||
+       inst.getOp() == BinaryInst::OR || inst.getOp() == BinaryInst::XOR)) {
+    MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
+    MachineReg right = valueReg(mf, mbb, rhs);
+    Opcode opcode = Opcode::ADDIW;
+    if (inst.getOp() == BinaryInst::AND) {
+      opcode = Opcode::ANDI;
+    } else if (inst.getOp() == BinaryInst::OR) {
+      opcode = Opcode::ORI;
+    } else if (inst.getOp() == BinaryInst::XOR) {
+      opcode = Opcode::XORI;
+    }
+    appendImmInstr(mbb, opcode, dst, MachineOperand::reg(right), lhsValue);
+    return true;
+  }
+
+  return false;
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
@@ -263,12 +853,9 @@ MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
     return materializeFloat(mf, mbb, floatValue->getVal());
   }
   if (auto *instruction = dynamic_cast<Instruction *>(value)) {
-    if (isScalarResultType(instruction->getIRType())) {
+    if (!isVoidType(instruction->getIRType())) {
       return getOrCreateResultReg(
           mf, *instruction, regClassForType(instruction->getIRType()));
-    }
-    if (dynamic_cast<GetElementPtrInst *>(instruction)) {
-      return getOrCreateResultReg(mf, *instruction, RegClass::GPR64);
     }
   }
 
@@ -481,9 +1068,14 @@ MachineReg addScaledIndex(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg indexReg = valueReg(mf, mbb, index);
   MachineReg scaled = indexReg;
   if (scale != 1) {
-    MachineReg scaleReg = materializeInt(mf, mbb, scale, RegClass::GPR64);
     scaled = mf.createVReg(RegClass::GPR64);
-    appendRegInstr(mbb, Opcode::MUL, scaled, {indexReg, scaleReg});
+    if (positivePowerOfTwo(scale)) {
+      appendImmInstr(mbb, Opcode::SLLI, scaled, MachineOperand::reg(indexReg),
+                     log2PowerOfTwo(scale));
+    } else {
+      MachineReg scaleReg = materializeInt(mf, mbb, scale, RegClass::GPR64);
+      appendRegInstr(mbb, Opcode::MUL, scaled, {indexReg, scaleReg});
+    }
   }
 
   if (!currentOffset.isValid()) {
@@ -659,9 +1251,22 @@ bool isComparison(BinaryInst::Operation op) {
 void lowerIntCompare(MachineFunction &mf, MachineBasicBlock &mbb,
                      BinaryInst &inst, Value *lhs, Value *rhs) {
   MachineReg left = valueReg(mf, mbb, lhs);
-  MachineReg right = valueReg(mf, mbb, rhs);
   MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
   MachineReg tmp;
+
+  int64_t rhsValue = 0;
+  if ((inst.getOp() == BinaryInst::E || inst.getOp() == BinaryInst::NE) &&
+      intConstant(rhs, rhsValue) && fitsSigned12(rhsValue)) {
+    tmp = mf.createVReg(RegClass::GPR32);
+    appendImmInstr(mbb, Opcode::XORI, tmp, MachineOperand::reg(left),
+                   rhsValue);
+    appendRegInstr(mbb, inst.getOp() == BinaryInst::E ? Opcode::SEQZ
+                                                      : Opcode::SNEZ,
+                   dst, {tmp});
+    return;
+  }
+
+  MachineReg right = valueReg(mf, mbb, rhs);
 
   switch (inst.getOp()) {
   case BinaryInst::E:
@@ -733,10 +1338,11 @@ void lowerFloatCompare(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 void lowerBinary(MachineFunction &mf, MachineBasicBlock &mbb,
-                 BinaryInst &inst) {
+                 LoweringState &state, BinaryInst &inst) {
   Value *lhs = requiredUseValue(inst, 0, "binary instruction");
   Value *rhs = requiredUseValue(inst, 1, "binary instruction");
   const bool floatOperands = lhs && isFloatType(lhs->getIRType());
+  state.beginDivRemBlock(mbb.irBlock);
 
   if (isComparison(inst.getOp())) {
     if (floatOperands) {
@@ -744,6 +1350,20 @@ void lowerBinary(MachineFunction &mf, MachineBasicBlock &mbb,
     } else {
       lowerIntCompare(mf, mbb, inst, lhs, rhs);
     }
+    return;
+  }
+
+  if (!floatOperands && lowerIntegerImmediateOp(mf, mbb, inst, lhs, rhs)) {
+    return;
+  }
+
+  if (!floatOperands &&
+      lowerIntegerPowerOfTwoOp(mf, mbb, state, inst, lhs, rhs)) {
+    return;
+  }
+
+  if (!floatOperands &&
+      lowerIntegerPositiveConstantDivRem(mf, mbb, state, inst, lhs, rhs)) {
     return;
   }
 
@@ -978,6 +1598,220 @@ void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
   state.addresses[&inst] = Address::regBase(dst);
 }
 
+bool exactIntegerConstant(Value *value, int64_t &out) {
+  if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+    out = intValue->getVal();
+    return true;
+  }
+  if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+    out = boolValue->getVal() ? 1 : 0;
+    return true;
+  }
+  return false;
+}
+
+bool hasAllZeroBytes(Value *value, const std::shared_ptr<IRType> &type) {
+  if (!type) {
+    return false;
+  }
+  if (!value) {
+    return true;
+  }
+
+  if (auto *init = dynamic_cast<Initializer *>(value)) {
+    if (init->empty()) {
+      return true;
+    }
+    auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
+    if (!arrayType || arrayType->getElementCount() < 0 ||
+        init->size() > static_cast<std::size_t>(arrayType->getElementCount())) {
+      return false;
+    }
+    for (Value *element : *init) {
+      if (!hasAllZeroBytes(element, arrayType->getElementType())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (isPointerType(type)) {
+    return dynamic_cast<ConstPtr *>(value) != nullptr;
+  }
+  if (isBoolType(type)) {
+    if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+      return !boolValue->getVal();
+    }
+    if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+      return intValue->getVal() == 0;
+    }
+    return false;
+  }
+  if (type->getEnum() == IR_INT) {
+    if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
+      return intValue->getVal() == 0;
+    }
+    if (auto *boolValue = dynamic_cast<ConstBool *>(value)) {
+      return !boolValue->getVal();
+    }
+    return false;
+  }
+  if (isFloatType(type)) {
+    auto *floatValue = dynamic_cast<ConstFloat *>(value);
+    if (!floatValue) {
+      return false;
+    }
+    uint32_t bits = 0;
+    float raw = floatValue->getVal();
+    std::memcpy(&bits, &raw, sizeof(bits));
+    return bits == 0;
+  }
+  return false;
+}
+
+bool addScaledOffset(int64_t index, int64_t scale, int64_t &offset) {
+  if (scale <= 0 || index > std::numeric_limits<int64_t>::max() / scale ||
+      index < std::numeric_limits<int64_t>::min() / scale) {
+    return false;
+  }
+  const int64_t delta = index * scale;
+  if ((delta > 0 && offset > std::numeric_limits<int64_t>::max() - delta) ||
+      (delta < 0 && offset < std::numeric_limits<int64_t>::min() - delta)) {
+    return false;
+  }
+  offset += delta;
+  return true;
+}
+
+bool traceConstantPointer(Value *value, Variable *&base, int64_t &offset,
+                          unsigned depth = 0) {
+  if (!value || depth >= 16) {
+    return false;
+  }
+  if (auto *variable = dynamic_cast<Variable *>(value)) {
+    if (variable->vartag != Variable::Constant) {
+      return false;
+    }
+    base = variable;
+    offset = 0;
+    return true;
+  }
+  if (auto *bitCast = dynamic_cast<BitCastInst *>(value)) {
+    Value *source = useValue(*bitCast, 0);
+    if (!source || !isPointerType(source->getIRType()) ||
+        !isPointerType(bitCast->getIRType())) {
+      return false;
+    }
+    return traceConstantPointer(source, base, offset, depth + 1);
+  }
+
+  auto *gep = dynamic_cast<GetElementPtrInst *>(value);
+  if (!gep) {
+    return false;
+  }
+  Value *pointer = useValue(*gep, 0);
+  if (!traceConstantPointer(pointer, base, offset, depth + 1)) {
+    return false;
+  }
+  auto pointerType =
+      pointer ? std::dynamic_pointer_cast<POINTERType>(pointer->getIRType())
+              : nullptr;
+  if (!pointerType) {
+    return false;
+  }
+
+  auto currentType = pointerType->getPointerType();
+  auto &uses = gep->getUserList();
+  for (std::size_t i = 1; i < uses.size(); ++i) {
+    int64_t scale = 0;
+    currentType = advanceGepType(currentType, i == 1, scale);
+    int64_t index = 0;
+    if (scale <= 0 || !exactIntegerConstant(uses[i]->getValue(), index) ||
+        !addScaledOffset(index, scale, offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isAllZeroConstantSource(Value *src, int64_t size) {
+  Variable *base = nullptr;
+  int64_t offset = 0;
+  if (size < 0 || !traceConstantPointer(src, base, offset) || !base) {
+    return false;
+  }
+
+  auto pointerType = std::dynamic_pointer_cast<POINTERType>(base->getIRType());
+  if (!pointerType) {
+    return false;
+  }
+  auto objectType = pointerType->getPointerType();
+  const int64_t objectSize = typeSizeBytes(objectType);
+  if (objectSize < 0 || offset < 0 || offset > objectSize ||
+      size > objectSize - offset) {
+    return false;
+  }
+  return hasAllZeroBytes(base->getUsee(), objectType);
+}
+
+bool isNonVolatileMemcpy(CallInst &inst) {
+  int64_t isVolatile = 0;
+  return exactIntegerConstant(useValue(inst, 4), isVolatile) && isVolatile == 0;
+}
+
+bool prepareZeroMemcpyDestination(MachineFunction &mf, const Address &address,
+                                  int64_t size) {
+  if (address.kind != Address::Kind::FrameIndex || address.frameIndex < 0 ||
+      address.frameIndex >= static_cast<int>(mf.stackObjects.size())) {
+    return false;
+  }
+  StackObject &object = mf.stackObjects[address.frameIndex];
+  if (object.fixed || object.size < 0 || address.offset < 0 ||
+      address.offset > object.size || size < 0 ||
+      size > object.size - address.offset) {
+    return false;
+  }
+
+  // Frame layout has not run yet, so strengthening this object's requested
+  // alignment makes every subsequently selected natural-width store safe.
+  const int64_t requiredAlign = size >= 8 ? 8 : (size >= 4 ? 4 : 1);
+  const int64_t currentAlign = std::max<int64_t>(1, object.align);
+  if ((currentAlign <= requiredAlign && requiredAlign % currentAlign != 0) ||
+      (currentAlign > requiredAlign && currentAlign % requiredAlign != 0)) {
+    return false;
+  }
+  object.align = std::max(currentAlign, requiredAlign);
+  return true;
+}
+
+void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
+                            int64_t size) {
+  const MachineReg zero64 = MachineReg::preg(PhysReg::X0, RegClass::GPR64);
+  const MachineReg zero32 = MachineReg::preg(PhysReg::X0, RegClass::GPR32);
+
+  int64_t offset = 0;
+  while (offset < size) {
+    const int64_t remaining = size - offset;
+    const int64_t absoluteOffset = dstAddress.offset + offset;
+    Opcode opcode = Opcode::SB;
+    MachineReg zero = zero32;
+    int64_t width = 1;
+    if (remaining >= 8 && absoluteOffset % 8 == 0) {
+      opcode = Opcode::SD;
+      zero = zero64;
+      width = 8;
+    } else if (remaining >= 4 && absoluteOffset % 4 == 0) {
+      opcode = Opcode::SW;
+      width = 4;
+    }
+
+    Address storeAddress = dstAddress;
+    storeAddress.offset += offset;
+    appendStore(mbb, opcode, zero, storeAddress);
+    offset += width;
+  }
+}
+
 void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
                  LoweringState &state, CallInst &inst,
                  const std::string &name) {
@@ -993,6 +1827,13 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   Address dstAddress = addressForValue(mf, mbb, state, dst, name);
+  if (size <= kLoopMemcpyThreshold && isNonVolatileMemcpy(inst) &&
+      isAllZeroConstantSource(src, size) &&
+      prepareZeroMemcpyDestination(mf, dstAddress, size)) {
+    appendZeroMemcpyStores(mbb, dstAddress, size);
+    return;
+  }
+
   Address srcAddress = addressForValue(mf, mbb, state, src, name);
   if (size > kLoopMemcpyThreshold) {
     MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);
@@ -1037,6 +1878,7 @@ void lowerUnsupported(MachineFunction &mf, MachineBasicBlock &mbb,
 void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
                LoweringState &state, CallInst &inst) {
   Value *callee = requiredUseValue(inst, 0, "call instruction");
+
   std::string name = calleeName(callee);
   if (name == "llvm.memcpy.p0.p0.i32" ||
       name == "llvm.memcpy.p0i8.p0i8.i32") {
@@ -1256,7 +2098,7 @@ void lowerInstruction(MachineFunction &mf, MachineBasicBlock &mbb,
     return;
   }
   if (auto *binary = dynamic_cast<BinaryInst *>(&inst)) {
-    lowerBinary(mf, mbb, *binary);
+    lowerBinary(mf, mbb, state, *binary);
     return;
   }
   if (auto *alloca = dynamic_cast<AllocaInst *>(&inst)) {

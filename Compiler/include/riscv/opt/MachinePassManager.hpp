@@ -1,6 +1,6 @@
 #pragma once
 
-#include "MIR.hpp"
+#include "riscv/MIR.hpp"
 
 #include <cassert>
 #include <map>
