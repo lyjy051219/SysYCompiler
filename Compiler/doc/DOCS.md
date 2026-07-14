@@ -2930,11 +2930,92 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 将循环内部依赖于**循环不变量**的分支移动到循环外
 
-先运行LICM再运行LoopUnswitch
+先运行LoopSimplify，LCSSA，LICM再运行LoopUnswitch
 
+依赖AnalysisPass：DominatorTree，LoopInfo，SCEV，MemorySSA
 
+实现了如下两种UnSwitch的形式
 
+- Trivial Unswitch：目标分支的至少一个后继可以退出循环
+- Non-trivial Unswitch：两个分支的后继都留在循环内
 
+并且只做了Full Unswitch，即分支条件全是循环不变量
+
+- 算法流程：
+
+  1. 确认是loopsimplify，LCSSA形式
+
+  2. 优先执行Trivial Unswitch，其次执行Non-trivial Unswitch（并且每个函数中二者只能执行其一）
+
+  3. Full Trivial Unswitch：
+
+     检查：从 LoopInfo::Header 开始向下检查每个必经的基本块，检查当前块的 MemoryDef 以及副作用。如果存在除 MemoryPhi 以外的 MemoryDef，或者存在具有副作用的指令，则停止扫描。
+
+     获取当前块ParentBB的分支指令，必须是非常量条件分支
+
+     核心：检查整个条件是不是全都是循环不变量，然后明确true和false哪个分支的successor是退出循环的，哪个是继续循环的（这里不接受两个successor都退出循环或两个successor都继续循环），该分支属于当前循环本身，而不是位于某个内层子循环中。
+
+     检查离开分支的ExitBB中的PHI中的incoming value，这个incoming value必须也是循环不变量（不能在循环内被计算），否则不能被执行
+
+     然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader
+  
+     如果ExitBB只有当前分支块 ParentBB这一个前驱，那么出口直接复用，如果ExitBB还有其他前驱，那么进行切分，旧的ExitBB保留全部PHI，并新增跳到NewBB的Br无条件分支指令，NewBB保留原来旧ExitBB所有其他指令
+  
+     然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor（退出方向   -> ExitBB 或切分得到的 NewBB，继续方向   -> NewPreHeader）
+  
+     然后创建ParentBB的新分支指令Br无条件跳转到继续循环的那个块上
+  
+     对出口 PHI 进行修复：
+  
+     - 如果直接复用原来的 `ExitBB`，则将 PHI 中来自 `ParentBB` 的 incoming block 修改为来自 `OldPreHeader`，incoming value 保持不变。
+     - 如果对ExitBB进行了切分，则不能简单地把原 PHI 的 incoming block 修改为OldPreHeader。需要在切分得到的NewBB中创建新的合流 PHI，用来合并：
+       - 从 `OldPreHeader` 直接退出时使用的循环不变量值；
+       - 从原 `ExitBB` 正常退出时得到的原 PHI 结果。
+  
+     最后替换循环内所有使用循环不变量的Use为确定的True/False常量
+  
+     变换完成后重新获取当前ParentBB的 terminator：
+  
+     - 如果当前terminator已经变成无条件 branch，则根据其唯一successor更新下一个必经基本块，并继续扫描。
+     - 如果successor已经离开当前循环，或者该基本块已经被访问过，则停止扫描。
+  
+     ![image-20260714200129403](assets/image-20260714200129403.png)
+  
+  4. Full Non-trivial Unswitch：
+  
+     获取当前块ParentBB，以及对应的分支指令。要求整个分支条件都是循环不变量，并且该分支属于当前循环本身，而不是位于某个内层子循环中。
+  
+     根据目前的分支指令确定两个分支的successor，根据支配树，确定我们每个分支具体需要clone的支配子树（如果某些基本块被其中一个 successor 支配，并且只能通过该 successor 到达，那么这些基本块只属于对应的专门化路径。在克隆某个循环版本时，由另一个 successor 独占支配的基本块不需要复制；这些块在当前专门化版本中不可达。）
+  
+     然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader--**这一部分和刚才Trivial Unswitch一样**
+  
+     克隆循环：克隆当前循环所需要的全部基本块，并且为克隆循环新建一个 ClonedPreHeader。在clone过程中建立原值到clone值的映射，clone每条指令的时候必须重新映射其操作数，然后克隆循环 Header 中的 PHI,并根据其映射修改相关的incoming，克隆循环内其他 PHI 时，也必须同时映射 incoming value 和 incoming block，如果根据支配子树裁剪了部分基本块，那么必须删除由未克隆基本块产生的 PHI incoming，并在 PHI 只剩一个 incoming value 时进一步简化 PHI，对于循环出口和 LCSSA PHI，需要为克隆循环建立对应的退出值。原循环退出产生的值和克隆循环退出产生的值，最终需要在循环外合流
+  
+     然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor
+  
+     然后对原循环进行专门化，由于原循环负责 `Cond = false` 的版本，所以原循环中的 `ParentBB` 不再需要保留原条件分支，而是创建新的无条件 branch，删除原循环之中不需要保留的那条分支的CFG边，必须删除 `CloneSucc` 中所有来自 `ParentBB` 的 PHI incoming，
+  
+     然后对clone循环进行专门化，根据映射将克隆循环中的原条件 branch 替换为无条件 branch，同时删除克隆循环中指向另一个 successor 的 CFG 边，并删除对应 successor PHI 中来自 `ClonedParentBB` 的 incoming
+  
+     然后进行循环不变量的常量替换，并替换该循环内所有对该循环不变量的Use
+  
+     对于每个原循环 ExitBB：
+  
+     1. 保留原循环版本的退出 incoming。
+     2. 增加克隆循环版本对应的退出 incoming。
+     3. 如果原 ExitBB 不能直接同时承接两个循环版本，则切分或新建 ExitMergeBB。
+     4. 在 ExitMergeBB 中建立合流 PHI。
+     5. 所有循环外 Use 改为使用合流 PHI 的结果。
+     
+     ![image-20260714205026714](assets/image-20260714205026714.png)
+  
+     
+  
+     
+  
+     
+  
+     
 
 
 

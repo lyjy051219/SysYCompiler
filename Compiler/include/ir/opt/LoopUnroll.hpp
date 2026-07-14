@@ -233,9 +233,9 @@ private:
 
     static int nextUnrollSerial();
     static std::string makeUnrollBlockIdent(
-        Function *F, BasicBlock *BB, int Iter, int UnrollSerial);
+        Function *F, const BasicBlock *BB, int Iter, int UnrollSerial);
     static std::string makePeelBlockIdent(
-        Function *F, BasicBlock *BB, int Iter, int PeelSerial);
+        Function *F, const BasicBlock *BB, int Iter, int PeelSerial);
     static bool isSupportedCloneInstruction(Instruction *I);
     static Value *stripSimpleCast(Value *V);
     static std::optional<PeelPredicate> matchCompareWithIV(
@@ -269,9 +269,6 @@ private:
     static bool rebuildPhiFromIncomingChecked(
         PhiInst *Phi, const std::vector<PhiInst::IncomingEdge> &Incoming,
         Value **Replacement = nullptr);
-    static bool replaceOperandsUsingMap(
-        Instruction *I,
-        const std::unordered_map<Value *, Value *> &ValueMap);
     static bool replaceDataOperandsUsingMap(
         Instruction *I,
         const std::unordered_map<Value *, Value *> &ValueMap);

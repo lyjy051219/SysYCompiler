@@ -1,6 +1,7 @@
 #include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
+#include "lib/CFGClone.hpp"
 #include "lib/IRUtils.hpp"
 
 #include <algorithm>
@@ -507,6 +508,21 @@ void discardUncommittedPeelClones(PeeledBodyCore &Core) {
     Core.ValueMaps.clear();
 }
 
+void discardUncommittedUnrollClones(UnrolledBodyCore &Core) {
+    PeeledBodyCore Clones;
+    if (Core.IterBlocks.size() > 1) {
+        Clones.IterBlocks.assign(Core.IterBlocks.begin() + 1,
+                                 Core.IterBlocks.end());
+    }
+    discardUncommittedPeelClones(Clones);
+
+    Core.IterBlocks.clear();
+    Core.Headers.clear();
+    Core.Latches.clear();
+    Core.Exitings.clear();
+    Core.ValueMaps.clear();
+}
+
 } // namespace
 
 int LoopUnrollPass::nextUnrollSerial() {
@@ -515,7 +531,7 @@ int LoopUnrollPass::nextUnrollSerial() {
 }
 
 std::string LoopUnrollPass::makeUnrollBlockIdent(Function *F,
-                                 BasicBlock *BB,
+                                 const BasicBlock *BB,
                                  int Iter,
                                  int UnrollSerial) {
     std::string Base = BB ? BB->getIdent() : "bb";
@@ -529,7 +545,7 @@ std::string LoopUnrollPass::makeUnrollBlockIdent(Function *F,
 }
 
 std::string LoopUnrollPass::makePeelBlockIdent(Function *F,
-                               BasicBlock *BB,
+                               const BasicBlock *BB,
                                int Iter,
                                int PeelSerial) {
     std::string Base = BB ? BB->getIdent() : "bb";
@@ -842,22 +858,6 @@ bool LoopUnrollPass::rebuildPhiFromIncomingChecked(
     return true;
 }
 
-bool LoopUnrollPass::replaceOperandsUsingMap(Instruction *I,
-                             const std::unordered_map<Value *, Value *> &VMap) {
-    if (!I) return false;
-
-    bool Changed = false;
-    for (size_t OperandIndex = 0;
-         OperandIndex < I->getNumOperands(); ++OperandIndex) {
-        Use *U = I->getOperandUse(OperandIndex);
-        if (!U) continue;
-        auto It = VMap.find(U->getValue());
-        if (It == VMap.end()) continue;
-        Changed |= U->replaceUseeWith(It->second);
-    }
-    return Changed;
-}
-
 bool LoopUnrollPass::replaceDataOperandsUsingMap(
     Instruction *I,
     const std::unordered_map<Value *, Value *> &VMap) {
@@ -979,49 +979,31 @@ LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
     Core.Headers[0] = Shape->Header;
     Core.Latches[0] = Shape->Latch;
     Core.Exitings[0] = Shape->Exiting;
+    auto Fail = [&]() -> std::optional<UnrolledBodyCore> {
+        discardUncommittedUnrollClones(Core);
+        return std::nullopt;
+    };
 
     for (int Iter = 1; Iter < Count; ++Iter) {
-        auto &VMap = Core.ValueMaps[Iter];
-        std::unordered_map<BasicBlock *, BasicBlock *> BlockMap;
+        CloneBlockRegionOptions Options;
+        Options.MakeBlockIdent =
+            [F, Iter, UnrollSerial](const BasicBlock *BB, std::size_t) {
+                return makeUnrollBlockIdent(F, BB, Iter, UnrollSerial);
+            };
+        auto Cloned = cloneBasicBlockRegion(*F, LoopBlocks, {}, Options);
+        if (!Cloned) return Fail();
 
-        for (BasicBlock *BB : LoopBlocks) {
-            auto *NewBB = new BasicBlock();
-            NewBB->setIdent(makeUnrollBlockIdent(F, BB, Iter, UnrollSerial));
-            F->pushBlock(NewBB);
-            VMap[BB] = NewBB;
-            BlockMap[BB] = NewBB;
-            Core.IterBlocks[Iter].push_back(NewBB);
-        }
-
-        Core.Headers[Iter] = BlockMap[Shape->Header];
-        Core.Latches[Iter] = BlockMap[Shape->Latch];
-        Core.Exitings[Iter] = BlockMap[Shape->Exiting];
+        Core.Headers[Iter] = Cloned->getClonedBlock(Shape->Header);
+        Core.Latches[Iter] = Cloned->getClonedBlock(Shape->Latch);
+        Core.Exitings[Iter] = Cloned->getClonedBlock(Shape->Exiting);
+        Core.ValueMaps[Iter] = std::move(Cloned->VMap);
+        Core.IterBlocks[Iter] = std::move(Cloned->ClonedBlocks);
         if (!Core.Headers[Iter] || !Core.Latches[Iter] || !Core.Exitings[Iter]) {
-            return std::nullopt;
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
-
-            for (Instruction *I : *BB) {
-                Instruction *NewI = I->clone(VMap);
-                if (!NewI) return std::nullopt;
-                NewBB->push_back(NewI);
-                VMap[I] = NewI;
-            }
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return std::nullopt;
-            for (Instruction *I : *NewBB) {
-                replaceOperandsUsingMap(I, VMap);
-            }
+            return Fail();
         }
 
         if (!removeClonedHeaderPhis(Core, Iter)) {
-            return std::nullopt;
+            return Fail();
         }
     }
 
@@ -1059,44 +1041,22 @@ LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
     };
 
     for (int Iter = 0; Iter < PeelCount; ++Iter) {
-        auto &VMap = Core.ValueMaps[Iter];
-        std::unordered_map<BasicBlock *, BasicBlock *> BlockMap;
+        CloneBlockRegionOptions Options;
+        Options.MakeBlockIdent =
+            [F, Iter, PeelSerial](const BasicBlock *BB, std::size_t) {
+                return makePeelBlockIdent(F, BB, Iter, PeelSerial);
+            };
+        auto Cloned = cloneBasicBlockRegion(*F, LoopBlocks, {}, Options);
+        if (!Cloned) return Fail();
 
-        for (BasicBlock *BB : LoopBlocks) {
-            auto *NewBB = new BasicBlock();
-            NewBB->setIdent(makePeelBlockIdent(F, BB, Iter, PeelSerial));
-            F->pushBlock(NewBB);
-            VMap[BB] = NewBB;
-            BlockMap[BB] = NewBB;
-            Core.IterBlocks[Iter].push_back(NewBB);
-        }
-
-        Core.Headers[Iter] = BlockMap[Shape->Header];
-        Core.Latches[Iter] = BlockMap[Shape->Latch];
-        Core.Exitings[Iter] = BlockMap[Shape->Exiting];
+        Core.Headers[Iter] = Cloned->getClonedBlock(Shape->Header);
+        Core.Latches[Iter] = Cloned->getClonedBlock(Shape->Latch);
+        Core.Exitings[Iter] = Cloned->getClonedBlock(Shape->Exiting);
+        Core.ValueMaps[Iter] = std::move(Cloned->VMap);
+        Core.IterBlocks[Iter] = std::move(Cloned->ClonedBlocks);
         if (!Core.Headers[Iter] || !Core.Latches[Iter] ||
             !Core.Exitings[Iter]) {
             return Fail();
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return Fail();
-
-            for (Instruction *I : *BB) {
-                Instruction *NewI = I->clone(VMap);
-                if (!NewI) return Fail();
-                NewBB->push_back(NewI);
-                VMap[I] = NewI;
-            }
-        }
-
-        for (BasicBlock *BB : LoopBlocks) {
-            BasicBlock *NewBB = BlockMap[BB];
-            if (!NewBB) return Fail();
-            for (Instruction *I : *NewBB) {
-                replaceOperandsUsingMap(I, VMap);
-            }
         }
 
         if (!removePeeledHeaderPhis(Core, Iter)) {
@@ -1870,6 +1830,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         Core->Shape.Exiting && Core->Shape.Header &&
         Core->Shape.Exiting == Core->Shape.Header;
     if (!LatchExiting && !HeaderExiting) {
+        discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
 
@@ -1881,6 +1842,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     BasicBlock *Exit = Core->Shape.Exit;
     Function *F = Header ? Header->getParent() : nullptr;
     if (!Header || !PreHeader || !MainLast || !MainTailPred || !Exit || !F) {
+        discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
 
@@ -1892,6 +1854,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
             mapDataValueAtIteration(Backedge, MainCount - 1, *Core);
         if (!isDataValue(Initial) || !isDataValue(Backedge) ||
             !isDataValue(MainValue)) {
+            discardUncommittedUnrollClones(*Core);
             return LoopUnrollResult::Unmodified;
         }
         HeaderStates.push_back(
@@ -1903,6 +1866,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     std::unordered_map<PhiInst *, Value *> HeaderPhiReplacements;
     if (!rewriteOriginalHeaderPhisForPartial(*Core, MainCount - 1,
                                              &HeaderPhiReplacements)) {
+        discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
 
@@ -2825,7 +2789,11 @@ LoopUnrollResult LoopUnrollPass::executeFullUnroll(
     }
 
     auto Core = cloneUnrolledBodyCore(L, Decision.Count, SE);
-    if (!Core || !hasLatchExitShape(*Core)) {
+    if (!Core) {
+        return LoopUnrollResult::Unmodified;
+    }
+    if (!hasLatchExitShape(*Core)) {
+        discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
 
@@ -2876,6 +2844,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
         if (!LastExiting || !ClonedHeader ||
             !BasicBlock::redirectBranchTarget(LastExiting, ClonedHeader,
                                               Core->Headers.front())) {
+            discardUncommittedUnrollClones(*Core);
             return LoopUnrollResult::Unmodified;
         }
 
@@ -2896,6 +2865,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
             if (!Body ||
                 !BasicBlock::replaceCondBrWithUncond(
                     Core->Exitings[Iter], Body)) {
+                discardUncommittedUnrollClones(*Core);
                 return LoopUnrollResult::Unmodified;
             }
         }
@@ -2912,6 +2882,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
             return LoopUnrollResult::Unmodified;
         }
     } else {
+        discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
 

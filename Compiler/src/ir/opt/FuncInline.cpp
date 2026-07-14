@@ -3,6 +3,7 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "lib/CFGClone.hpp"
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
@@ -125,11 +126,8 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			continue;
 		}
 
-		std::unordered_map<Value*, Value*> VMap;
-		std::unordered_map<BasicBlock*, BasicBlock*> BBMap;
+		ValueToValueMap InitialMap;
 		std::vector<RetInst*> ClonedRets;
-		std::vector<std::pair<Instruction*, Instruction*>> ClonedInstPairs;
-		std::vector<std::pair<PhiInst*, PhiInst*>> ClonedPhiPairs;
 		std::vector<BasicBlock*> CalleeOrigBlocks;
 		for (auto* OldBB : *Callee) {
 			if (OldBB) CalleeOrigBlocks.push_back(OldBB);
@@ -138,105 +136,28 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		for (unsigned i = 0; i < Callee->getParamCount(); ++i) {
 			Value* Param = Callee->getParam(i);
 			Value* Arg = CI->getArg(i);
-			VMap[Param] = Arg;
+			if (!Param || !Arg) {
+				InitialMap.clear();
+				break;
+			}
+			InitialMap[Param] = Arg;
 		}
+		if (InitialMap.size() != Callee->getParamCount()) continue;
 
-		// 先克隆所有基本块，建立 oldBB -> newBB 映射。
-		for (auto* OldBB : CalleeOrigBlocks) {
-			if (!OldBB) continue;
-			auto* NewBB = new BasicBlock();
-			F.pushBlock(NewBB);
-			VMap[OldBB] = NewBB;
-			BBMap[OldBB] = NewBB;
-		}
+		CloneBlockRegionOptions CloneOptions;
+		CloneOptions.ClearTailCallFlags = true;
+		auto ClonedRegion = cloneBasicBlockRegion(
+			F, CalleeOrigBlocks, InitialMap, CloneOptions);
+		if (!ClonedRegion) continue;
 
-		// 再克隆指令并填充 oldInst -> newInst 映射。
-		for (auto* OldBB : CalleeOrigBlocks) {
-			if (!OldBB) continue;
-			auto* NewBB = BBMap[OldBB];
-			for (auto* OldI : *OldBB) {
-				if (!OldI) continue;
-				Instruction* NewI = OldI->clone(VMap);
-				if (!NewI) continue;
-
-				if (auto* NewCall = dynamic_cast<CallInst*>(NewI)) {
-					// clone 后直接清理 tail 标记，避免错误传播。
-					NewCall->setTailCall(false);
-				}
-
-				NewBB->push_back(NewI);
-				VMap[OldI] = NewI;
-				ClonedInstPairs.push_back({OldI, NewI});
-
-				if (auto* OldPhi = dynamic_cast<PhiInst*>(OldI)) {
-					auto* NewPhi = dynamic_cast<PhiInst*>(NewI);
-					if (NewPhi) ClonedPhiPairs.push_back({OldPhi, NewPhi});
-				}
-
-				if (auto* RI = dynamic_cast<RetInst*>(NewI)) {
-					ClonedRets.push_back(RI);
-				}
+		for (const auto& Pair : ClonedRegion->InstPairs) {
+			if (auto* RI = dynamic_cast<RetInst*>(Pair.second)) {
+				ClonedRets.push_back(RI);
 			}
 		}
 
-		// 全量二次修复所有 clone 指令操作数。
-		// 仅修 PHI/Br 不够：当 OldI 的某个操作数是“稍后才克隆”的值时，第一次 clone 会残留旧作用域引用。
-		for (auto& Pair : ClonedInstPairs) {
-			auto* OldI = Pair.first;
-			auto* NewI = Pair.second;
-			if (!OldI || !NewI) continue;
-
-			size_t N = std::min(OldI->getNumOperands(), NewI->getNumOperands());
-			for (size_t i = 0; i < N; ++i) {
-				Value* OldOp = OldI->getOperand(i);
-				auto It = VMap.find(OldOp);
-				if (It != VMap.end() && It->second) {
-					NewI->replaceOperand(i, It->second);
-				}
-			}
-		}
-
-		// 二次修复 clone 后 PHI 的 incoming，避免前向引用残留 old Callee 值。
-		for (auto& Pair : ClonedPhiPairs) {
-			auto* OldPhi = Pair.first;
-			auto* NewPhi = Pair.second;
-			if (!OldPhi || !NewPhi) continue;
-
-			for (unsigned i = 0; i < OldPhi->getNumIncomingValues(); ++i) {
-				Value* OldInV = OldPhi->getIncomingValue(i);
-				BasicBlock* OldInB = OldPhi->getIncomingBlock(i);
-
-				auto Vit = VMap.find(OldInV);
-				if (Vit != VMap.end()) {
-					NewPhi->setIncomingValue(i, Vit->second);
-				}
-
-				auto Bit = BBMap.find(OldInB);
-				if (Bit != BBMap.end()) {
-					NewPhi->setIncomingBlock(i, Bit->second);
-				}
-			}
-		}
-
-		// 显式修复 clone 图里的终结指令目标：只能跳到新 clone 的基本块。
-		for (auto* OldBB : CalleeOrigBlocks) {
-			if (!OldBB) continue;
-			auto* NewBB = BBMap[OldBB];
-			if (!NewBB) continue;
-
-			auto* TI = NewBB->back();
-			auto* BI = dynamic_cast<BrInst*>(TI);
-			if (!BI) continue;
-
-			for (unsigned i = 0; i < BI->getSuccessorCount(); ++i) {
-				BasicBlock *Dst = BI->getSuccessor(i);
-				auto It = BBMap.find(Dst);
-				if (It != BBMap.end() && It->second != Dst)
-					BasicBlock::redirectBranchTarget(NewBB, Dst, It->second);
-			}
-		}
-
-		BasicBlock* ClonedEntry = BBMap[Callee->front()];
+		BasicBlock* ClonedEntry =
+			ClonedRegion->getClonedBlock(Callee->front());
 		if (!ClonedEntry) continue;
 
 		// 将 clone 入口块里的 alloca 移到 Caller 入口块最前面。

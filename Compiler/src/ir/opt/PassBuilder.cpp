@@ -13,6 +13,7 @@
 #include "ir/opt/LCSSA.hpp"
 #include "ir/opt/LoopRotate.hpp"
 #include "ir/opt/LICM.hpp"
+#include "ir/opt/LoopUnswitch.hpp"
 #include "ir/opt/LoopDeletion.hpp"
 #include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/TailRecursionElimination.hpp"
@@ -248,6 +249,15 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(LCSSAPass());
     FPM.addPass(IndVarSimplifyPass());
     FPM.addPass(LICMPass());         // 循环不变量外提
+    // LICM makes full-unswitch conditions available at the preheader.
+    // Unswitch changes both CFG and LCSSA exit structure, so immediately
+    // remove specialized dead edges and restore the canonical loop form
+    // before idiom recognition, LSR and unrolling consume it.
+    FPM.addPass(LoopUnswitchPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 4));
+    FPM.addPass(LCSSAPass());
     // Convert the fully-proven constant-trip contiguous copy/fill subset to
     // memory intrinsics before unrolling duplicates the scalar operations.
     FPM.addPass(LoopIdiomRecognizePass());
