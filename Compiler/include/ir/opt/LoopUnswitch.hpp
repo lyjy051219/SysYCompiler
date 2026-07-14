@@ -2,7 +2,6 @@
 
 #include "ir/opt/NewPassManager.hpp"
 
-#include <cstddef>
 #include <unordered_map>
 
 class Function;
@@ -26,9 +25,7 @@ private:
 
     struct FunctionState {
         SelectedKind Kind = SelectedKind::None;
-        unsigned EntryKnownCount = 0;
         unsigned FullCloneCount = 0;
-        std::size_t CumulativeCloneWeight = 0;
     };
 
     std::unordered_map<Function *, FunctionState> States;

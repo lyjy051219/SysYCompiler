@@ -11,10 +11,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cstdint>
 #include <limits>
-#include <iostream>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -53,18 +51,11 @@ struct TrivialCandidate {
     bool ExitOnTrue = false;
 };
 
-enum class EntryProofKind {
-    Constant,
-    PredecessorChain,
-    DominatingEdge
-};
-
 struct EntryKnownCandidate {
     Loop *L = nullptr;
     Value *Condition = nullptr;
     std::vector<BasicBlock *> AllBlocks;
     bool KnownValue = false;
-    EntryProofKind Proof = EntryProofKind::PredecessorChain;
 };
 
 struct NonTrivialCandidate {
@@ -91,7 +82,6 @@ struct NonTrivialCandidate {
     unsigned ControlUses = 0;
     std::size_t CloneInstructions = 0;
     std::size_t CloneWeight = 0;
-    std::size_t FunctionWeight = 0;
     bool GeneratedByLoopTransform = false;
 };
 
@@ -518,11 +508,6 @@ unsigned countControlUses(Value *Condition, Loop &L) {
     return static_cast<unsigned>(Seen.size());
 }
 
-struct EntryProof {
-    bool Value = false;
-    EntryProofKind Kind = EntryProofKind::PredecessorChain;
-};
-
 Value *stripBooleanNot(Value *V, bool &Inverted) {
     Inverted = false;
     for (unsigned Depth = 0; V && Depth != 8; ++Depth) {
@@ -743,12 +728,12 @@ bool conditionIsStableAcrossGuardLoop(Value *Condition, BasicBlock *GuardBB,
                          *GuardLoop, DT);
 }
 
-std::optional<EntryProof> getEntryKnownValue(
+std::optional<bool> getEntryKnownValue(
     Value *Condition, BasicBlock *PreHeader, const LoopInfo &LI,
     const DominatorTree &DT) {
     if (!Condition || !PreHeader) return std::nullopt;
     if (auto Constant = evaluateConstantBoolean(Condition))
-        return EntryProof{*Constant, EntryProofKind::Constant};
+        return Constant;
 
     // First follow the actual dynamic entry path.  Unlike a bare block-
     // dominance test, a unique-predecessor chain cannot reuse a condition
@@ -773,8 +758,7 @@ std::optional<EntryProof> getEntryKnownValue(
             const bool GuardKnown = T == Current;
             if (auto Proven = proveConditionFromGuard(
                     Condition, Guard->getCondition(), GuardKnown)) {
-                return EntryProof{*Proven,
-                                  EntryProofKind::PredecessorChain};
+                return Proven;
             }
             Current = Pred;
             continue;
@@ -817,21 +801,11 @@ std::optional<EntryProof> getEntryKnownValue(
             }
             if (auto Proven = proveConditionFromGuard(
                     Condition, Guard->getCondition(), Arm == 0)) {
-                return EntryProof{*Proven,
-                                  EntryProofKind::DominatingEdge};
+                return Proven;
             }
         }
     }
     return std::nullopt;
-}
-
-const char *entryProofName(EntryProofKind Kind) {
-    switch (Kind) {
-    case EntryProofKind::Constant:         return "constant";
-    case EntryProofKind::PredecessorChain: return "pred-chain";
-    case EntryProofKind::DominatingEdge:   return "dom-edge";
-    }
-    return "unknown";
 }
 
 bool cloneClosureIsLegal(const NonTrivialCandidate &C) {
@@ -980,7 +954,7 @@ std::vector<EntryKnownCandidate> findEntryKnownCandidates(
             }
             if (Duplicate) continue;
             Result.push_back(EntryKnownCandidate{
-                L, Condition, AllBlocks, Proof->Value, Proof->Kind});
+                L, Condition, AllBlocks, *Proof});
         }
     }
     return Result;
@@ -1119,35 +1093,19 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
                 !chooseDirectionalClonePlan(C)) {
                 continue;
             }
-            auto TraceReject = [&](const char *Reason) {
-                if (!std::getenv("LYJY_TRACE_LOOP_UNSWITCH")) return;
-                std::cerr << "[LoopUnswitch] reject=full reason=" << Reason
-                          << " header=" << Shape.Header->getIdent()
-                          << " parent=" << BB->getIdent()
-                          << " original-value="
-                          << (C.OriginalValue ? 1 : 0)
-                          << " true-bb=" << C.TrueReachable.size()
-                          << " false-bb=" << C.FalseReachable.size()
-                          << " clone-bb=" << C.CloneReachable.size()
-                          << "\n";
-            };
             if (C.CloneReachable.size() > MaxNonTrivialCloneBlocks) {
-                TraceReject("block-cap");
                 continue;
             }
             if (!cloneClosureIsLegal(C)) {
-                TraceReject("clone-closure");
                 continue;
             }
             if (!validateVersionedExitPhis(C)) {
-                TraceReject("exit-phi");
                 continue;
             }
 
             C.CloneInstructions =
                 countInstructions(AllBlocks, &C.CloneReachable);
             if (C.CloneInstructions > MaxNonTrivialCloneInstructions) {
-                TraceReject("instruction-cap");
                 continue;
             }
             std::vector<BasicBlock *> CloneBlocks;
@@ -1155,7 +1113,6 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
                 if (CloneBB && C.CloneReachable.count(CloneBB))
                     CloneBlocks.push_back(CloneBB);
             if (hasAnyCall(CloneBlocks)) {
-                TraceReject("call-in-clone");
                 continue;
             }
 
@@ -1163,7 +1120,6 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
             C.CloneWeight = C.CloneInstructions +
                             3 * C.CloneReachable.size() +
                             4 * ExitPhiCost;
-            C.FunctionWeight = FunctionWeight;
             C.GeneratedByLoopTransform =
                 hasLoopTransformProvenance(AllBlocks);
             const std::size_t RelativeLimit =
@@ -1171,7 +1127,6 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
                     ? MaxGeneratedClonePercentOfFunction
                     : MaxClonePercentOfFunction;
             if (C.CloneWeight * 100 > FunctionWeight * RelativeLimit) {
-                TraceReject("relative-size");
                 continue;
             }
 
@@ -1206,23 +1161,7 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
             C.Cost = static_cast<std::int64_t>(C.CloneWeight) +
                      SmallBodyLayoutPenalty;
 
-            if (std::getenv("LYJY_TRACE_LOOP_UNSWITCH")) {
-                std::cerr << "[LoopUnswitch] evaluate=full header="
-                          << Shape.Header->getIdent()
-                          << " parent=" << BB->getIdent()
-                          << " depth=" << L->getDepth()
-                          << " scope=" << Scope
-                          << " trip=" << TripEstimate
-                          << " uses=" << C.ControlUses
-                          << " clone-weight=" << C.CloneWeight
-                          << " function-weight=" << FunctionWeight
-                          << " generated="
-                          << (C.GeneratedByLoopTransform ? 1 : 0)
-                          << " benefit=" << C.Benefit
-                          << " cost=" << C.Cost << "\n";
-            }
             if (C.Benefit < C.Cost + 4) {
-                TraceReject("profit");
                 continue;
             }
             Consider(std::move(C));
@@ -1672,9 +1611,6 @@ bool transformNonTrivial(Function &F, NonTrivialCandidate &C) {
 
 PassResult LoopUnswitchPass::run(Function &F,
                                  FunctionAnalysisPassManager &FAM) {
-    if (std::getenv("LYJY_DISABLE_LOOP_UNSWITCH"))
-        return PassResult::unchanged();
-
     FunctionState &State = States[&F];
 
     auto &DT = FAM.getResult<DominantAnalysis>(F);
@@ -1686,10 +1622,6 @@ PassResult LoopUnswitchPass::run(Function &F,
         if (auto Candidate = findTrivialCandidate(F, LI, DT, MSSA)) {
             if (transformTrivial(F, *Candidate)) {
                 State.Kind = SelectedKind::Trivial;
-                if (std::getenv("LYJY_TRACE_LOOP_UNSWITCH")) {
-                    std::cerr << "[LoopUnswitch] transform=trivial header="
-                              << Candidate->Shape.Header->getIdent() << "\n";
-                }
                 return PassResult::changed(PreservationStatus::none());
             }
         }
@@ -1704,23 +1636,13 @@ PassResult LoopUnswitchPass::run(Function &F,
     // one batch so the three outer fixed-point rounds are not consumed one at
     // a time, and keep their quota independent from Full Unswitch.
     bool EntryChanged = false;
-    unsigned EntryTransforms = 0;
     for (const EntryKnownCandidate &Candidate :
          findEntryKnownCandidates(LI, DT)) {
         if (!transformEntryKnown(Candidate)) continue;
         EntryChanged = true;
-        ++EntryTransforms;
-        if (std::getenv("LYJY_TRACE_LOOP_UNSWITCH")) {
-            std::cerr << "[LoopUnswitch] transform=entry-known proof="
-                      << entryProofName(Candidate.Proof)
-                      << " value=" << (Candidate.KnownValue ? 1 : 0)
-                      << " header=" << Candidate.L->getHeader()->getIdent()
-                      << " cond=" << Candidate.Condition->getIdent() << "\n";
-        }
     }
     if (EntryChanged) {
         State.Kind = SelectedKind::NonTrivial;
-        State.EntryKnownCount += EntryTransforms;
         return PassResult::changed(PreservationStatus::none());
     }
 
@@ -1732,25 +1654,10 @@ PassResult LoopUnswitchPass::run(Function &F,
     auto Candidate = findBestNonTrivialCandidate(F, LI, DT, SE);
     if (!Candidate) return PassResult::unchanged();
 
-    if (std::getenv("LYJY_TRACE_LOOP_UNSWITCH")) {
-        std::cerr << "[LoopUnswitch] candidate=full header="
-                  << Candidate->Shape.Header->getIdent()
-                  << " original-value="
-                  << (Candidate->OriginalValue ? 1 : 0)
-                  << " clone-bb=" << Candidate->CloneReachable.size()
-                  << " clone-inst=" << Candidate->CloneInstructions
-                  << " clone-weight=" << Candidate->CloneWeight
-                  << " function-weight=" << Candidate->FunctionWeight
-                  << " generated="
-                  << (Candidate->GeneratedByLoopTransform ? 1 : 0)
-                  << " benefit=" << Candidate->Benefit
-                  << " cost=" << Candidate->Cost << "\n";
-    }
     if (!transformNonTrivial(F, *Candidate))
         return PassResult::unchanged();
 
     State.Kind = SelectedKind::NonTrivial;
     ++State.FullCloneCount;
-    State.CumulativeCloneWeight += Candidate->CloneWeight;
     return PassResult::changed(PreservationStatus::none());
 }
