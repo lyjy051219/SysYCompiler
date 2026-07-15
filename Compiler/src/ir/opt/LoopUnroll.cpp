@@ -1,4 +1,5 @@
 #include "ir/opt/LoopUnroll.hpp"
+#include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/IRUtils.hpp"
@@ -359,6 +360,92 @@ bool LoopUnrollPass::proveInitialNotAboveBound(
     return InitialRange.max <= StartRange.min + 1;
 }
 
+// Keep the dynamic-bound profitability exception aligned with LICM's reusable
+// call policy, and narrow it further to calls which execute on every completed
+// outer iteration with loop-invariant arguments.
+bool LoopUnrollPass::isKnownReadonlyInvariantCall(
+    CallInst *CI, Loop *Outer, Loop *StableInner,
+    BasicBlock *OuterLatch, DominatorTree &DT, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
+    BasicBlock *CallBB = CI ? CI->getParent() : nullptr;
+    if (!CI || !Outer || !StableInner || !OuterLatch || !CallBB ||
+        CallBB == Outer->getHeader() || !Outer->contains(CallBB) ||
+        !DT.dominates(CallBB, OuterLatch) || CI->isTailCall() ||
+        !CI->getIRType() || CI->getIRType()->getEnum() == IR_VOID ||
+        !CI->hasUses()) {
+        return false;
+    }
+
+    Function *Callee = CI->getDirectCallee();
+    if (!Callee || !Callee->front()) return false;
+
+    // The outer-loop clone budget sees a call as one instruction.  Bound the
+    // hidden body as well, since the following inliner may duplicate this
+    // helper into both the peeled and residual paths.
+    constexpr std::size_t MaxReadonlyCalleeInstructions = 64;
+    std::size_t CalleeInstructions = 0;
+    for (BasicBlock *BB : *Callee) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I || ++CalleeInstructions > MaxReadonlyCalleeInstructions)
+                return false;
+        }
+    }
+
+    const SideEffectInfo &SEI =
+        FAM.getResult<SideEffectAnalysis>(*Callee);
+    if (SEI.hasBuiltin || !SEI.ModSet.empty()) return false;
+    for (const auto &Entry : SEI.ptrMap) {
+        if (Entry.second.untracked) return false;
+    }
+
+    ModRefInfo MRI = getFunctionModRefInfo(SEI);
+    if (MRI != ModRefInfo::NoModRef && MRI != ModRefInfo::Ref)
+        return false;
+
+    for (Value *Arg : CI->getArgs()) {
+        std::unordered_set<Value *> Active;
+        if (!isStructurallyLoopInvariant(Arg, Outer, Active))
+            return false;
+    }
+
+    // Predict LICM's residual-loop Mod/Ref check.  The stable inner loop is
+    // deliberately excluded: the proof paired with this query establishes
+    // that its original copy is zero-trip after peeling, and executePeeling
+    // exposes that fact before LICM runs.  Any write which remains elsewhere
+    // in the residual outer loop makes caching unprofitable and keeps the old
+    // constant-bound restriction.
+    std::vector<Value *> ReadPointers;
+    for (Value *ReadValue : SEI.RefSet) {
+        auto *Var = dynamic_cast<Variable *>(ReadValue);
+        if (!Var) continue;
+        if (Var->isGlobal()) {
+            ReadPointers.push_back(ReadValue);
+            continue;
+        }
+        if (!Var->isParam()) continue;
+
+        int ParamIndex = Callee->getParamIndex(ReadValue);
+        if (ParamIndex < 0) return false;
+        Value *Arg = CI->getArg(static_cast<unsigned>(ParamIndex));
+        if (!Arg || !Arg->isPointerValue()) return false;
+        ReadPointers.push_back(Arg);
+    }
+
+    for (Value *Ptr : ReadPointers) {
+        for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+            if (!BB) return false;
+            if (StableInner->contains(BB)) continue;
+            for (Instruction *I : *BB) {
+                if (!I || I == CI) continue;
+                if (isModSet(getInstModRefInfo(Ptr, I, AA, LI, FAM)))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Prove the one-shot nested-loop state pattern rather than merely matching
 // its syntax:
 //
@@ -379,7 +466,9 @@ bool LoopUnrollPass::proveInitialNotAboveBound(
 // based only on IR structure and applies independently of source/test names.
 std::optional<ProvenStablePeelState>
 LoopUnrollPass::findProvenStablePeelState(
-    Loop *Outer, SCEVResult &SE, RangeInfo &RI, DominatorTree &DT) {
+    Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+    RangeInfo &RI, DominatorTree &DT,
+    FunctionAnalysisPassManager &FAM) {
     if (!Outer || Outer->isInnermost() || !Outer->getHeader())
         return std::nullopt;
 
@@ -392,24 +481,37 @@ LoopUnrollPass::findProvenStablePeelState(
     Loop *StableInner = Outer->getSubLoops().front();
     if (!StableInner) return std::nullopt;
 
-    // A sibling's work may still be represented as a call at this stage and
-    // turn into another full loop after inlining.  Remember that shape here;
-    // once the stabilizing bound is known below, only grant the enlarged
-    // cloning budget when the bound is compile-time constant.  That retains
-    // the profitable fixed-size array case while avoiding speculative code
-    // duplication for an input-sized sibling computation.
-    bool ContainsCall = false;
-    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
-        if (!BB) return std::nullopt;
-        for (Instruction *I : *BB)
-            if (dynamic_cast<CallInst *>(I)) ContainsCall = true;
-    }
-
     BasicBlock *OuterPreHeader = nullptr;
     BasicBlock *OuterLatch = nullptr;
     if (!Outer->getLoopSimplifyForm(OuterPreHeader, OuterLatch) ||
         !OuterPreHeader || !OuterLatch) {
         return std::nullopt;
+    }
+
+    // A sibling's work may still be represented as a call at this pre-inline
+    // stage and turn into another full loop later.  Dynamic stable bounds are
+    // profitable when every such call is a must-execute, argument-invariant,
+    // known readonly call: peeling exposes the one-shot initialization and the
+    // following LICM phase can lazily cache the call in the residual loop.
+    // Unknown, writing, conditionally executed, or variant-argument calls keep
+    // the former constant-bound restriction.  This is a profitability gate;
+    // the peeling legality proof below is unchanged.
+    bool ContainsDisqualifyingCall = false;
+    std::size_t ReadonlyCallCount = 0;
+    constexpr std::size_t MaxReadonlyCallsForDynamicStablePeel = 4;
+    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB) {
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (!CI) continue;
+            ++ReadonlyCallCount;
+            if (ReadonlyCallCount > MaxReadonlyCallsForDynamicStablePeel ||
+                !isKnownReadonlyInvariantCall(
+                    CI, Outer, StableInner, OuterLatch, DT, AA, LI,
+                    FAM)) {
+                ContainsDisqualifyingCall = true;
+            }
+        }
     }
     for (PhiInst *StatePhi : Outer->getHeader()->collectPhiNodes()) {
         if (!StatePhi || !StatePhi->getIRType() ||
@@ -441,7 +543,8 @@ LoopUnrollPass::findProvenStablePeelState(
                     Bound, Outer, OuterPreHeader, DT)) {
                 continue;
             }
-            if (ContainsCall && !dynamic_cast<ConstInt *>(Bound))
+            if (ContainsDisqualifyingCall &&
+                !dynamic_cast<ConstInt *>(Bound))
                 continue;
 
             std::unordered_set<Value *> Active;
@@ -455,10 +558,17 @@ LoopUnrollPass::findProvenStablePeelState(
                 Initial, Bound, Outer, OuterPreHeader, SE, RI, DT,
                 InitialRange, BoundRange);
 
-            if (EntryOrderProven)
-                return ProvenStablePeelState{StatePhi, Bound, nullptr,
-                                             nullptr};
-            return ProvenStablePeelState{StatePhi, nullptr, Initial, Bound};
+            ProvenStablePeelState Result;
+            Result.Phi = StatePhi;
+            Result.InnerExitCmp = TCI->ExitCmp;
+            Result.InnerContinueOnTrue = TCI->ContinueOnTrue;
+            if (EntryOrderProven) {
+                Result.StableValue = Bound;
+            } else {
+                Result.Initial = Initial;
+                Result.Bound = Bound;
+            }
+            return Result;
         }
     }
     return std::nullopt;
@@ -2229,7 +2339,7 @@ PreservationStatus LoopUnrollPass::run(Function &F,
         auto &RI = FAM.getResult<RangeAnalysis>(F);
         const std::string HeaderIdent = Header->getIdent();
         LoopUnrollResult Result =
-            tryToUnrollLoop(F, L, LI, DT, SE, AA, RI);
+            tryToUnrollLoop(F, L, LI, DT, SE, AA, RI, FAM);
         if (Result == LoopUnrollResult::Unmodified) continue;
 
         AlreadyTransformed.insert(HeaderIdent);
@@ -2258,7 +2368,8 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
                                                  DominatorTree &DT,
                                                  SCEVResult &SE,
                                                  BasicAAResult &AA,
-                                                 RangeInfo &RI) {
+                                                 RangeInfo &RI,
+                                                 FunctionAnalysisPassManager &FAM) {
     (void)F;
 
     if (!L) {
@@ -2281,7 +2392,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Function &F,
     int BodyCost = estimateLoopBodyCost(L, LI);
     UnrollDecision Decision =
         computeUnrollDecision(
-            L, *TripInfo, BodyCost, Config, LI, SE, AA, RI, DT);
+            L, *TripInfo, BodyCost, Config, LI, SE, AA, RI, DT, FAM);
 
     if (!Decision.ShouldUnroll || Decision.Kind == UnrollKind::None) {
         return LoopUnrollResult::Unmodified;
@@ -2525,7 +2636,8 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     SCEVResult &SE,
     BasicAAResult &AA,
     RangeInfo &RI,
-    DominatorTree &DT) const {
+    DominatorTree &DT,
+    FunctionAnalysisPassManager &FAM) const {
     if (!L || !TCI.Valid || BodyCost <= 0) {
         return makeNoUnrollDecision();
     }
@@ -2561,7 +2673,8 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         auto IV = SE.getCanonicalInduction(L);
         int PeelCount =
             (IV && IV->Valid) ? detectPeelCount(L, *IV, Config) : 0;
-        auto StableState = findProvenStablePeelState(L, SE, RI, DT);
+        auto StableState = findProvenStablePeelState(
+            L, LI, SE, AA, RI, DT, FAM);
         // The fixed-point proof establishes everything after exactly the
         // first iteration.  Never let its enlarged clone budget justify a
         // second peeled copy.
@@ -2645,6 +2758,10 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                     Decision.StabilizedValue = StableState->StableValue;
                     Decision.StabilizedInitial = StableState->Initial;
                     Decision.StabilizedBound = StableState->Bound;
+                    Decision.StabilizedInnerExitCmp =
+                        StableState->InnerExitCmp;
+                    Decision.StabilizedInnerContinueOnTrue =
+                        StableState->InnerContinueOnTrue;
                 }
                 return Decision;
             }
@@ -3247,6 +3364,20 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
                 delete ResidualPhi;
             }
         }
+    }
+
+    // The stable-state proof established that this exact nested-loop header
+    // test takes the exit edge on every residual outer iteration.  Materialize
+    // the proven result now.  The peeled clone has its own cloned comparison,
+    // so the first iteration still executes the one-shot nested loop normally.
+    // CFG cleanup can then remove the unreachable residual body before LICM
+    // decides whether the readonly sibling call is reusable.
+    if (Decision.StabilizedInnerExitCmp &&
+        Decision.StabilizedInnerExitCmp->getParent()) {
+        const bool ExitCondition =
+            !Decision.StabilizedInnerContinueOnTrue;
+        Decision.StabilizedInnerExitCmp->replaceAllUsesWith(
+            ConstBool::newConstBool(ExitCondition));
     }
 
     // Any path entering the residual loop has completed a peeled iteration.

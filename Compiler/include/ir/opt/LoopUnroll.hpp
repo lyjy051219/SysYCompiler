@@ -89,6 +89,13 @@ struct UnrollDecision {
     // decision making itself must never mutate IR.
     Value *StabilizedInitial = nullptr;
     Value *StabilizedBound = nullptr;
+    // The stable-state proof also identifies the original nested-loop header
+    // test.  Every path reaching the residual outer loop has completed the
+    // peeled iteration, so this test is known to take its exit edge there.
+    // Keeping the exact comparison lets executePeeling expose that zero-trip
+    // fact directly instead of relying on later min/max algebra.
+    BinaryInst *StabilizedInnerExitCmp = nullptr;
+    bool StabilizedInnerContinueOnTrue = true;
 
 };
 
@@ -151,6 +158,8 @@ struct ProvenStablePeelState {
     Value *StableValue = nullptr;
     Value *Initial = nullptr;
     Value *Bound = nullptr;
+    BinaryInst *InnerExitCmp = nullptr;
+    bool InnerContinueOnTrue = true;
 };
 
 // PHI 重写统一采用“先收集并校验、再整体提交”的计划，避免留下半更新状态。
@@ -175,7 +184,8 @@ public:
                                      DominatorTree &DT,
                                      SCEVResult &SE,
                                      BasicAAResult &AA,
-                                     RangeInfo &RI);
+                                     RangeInfo &RI,
+                                     FunctionAnalysisPassManager &FAM);
 
     bool isCanonicalLoop(Loop *L) const;
     bool canCloneLoopBody(Loop *L, LoopInfo &LI) const;
@@ -198,7 +208,8 @@ public:
                                          SCEVResult &SE,
                                          BasicAAResult &AA,
                                          RangeInfo &RI,
-                                         DominatorTree &DT) const;
+                                         DominatorTree &DT,
+                                         FunctionAnalysisPassManager &FAM) const;
 
     LoopUnrollResult executeFullUnroll(Loop *L,
                                        const UnrollDecision &Decision,
@@ -265,6 +276,10 @@ private:
     static bool isTrivialForwardOf(
         Value *Candidate, Value *Source,
         std::unordered_set<Value *> &Active, int Depth = 0);
+    static bool isKnownReadonlyInvariantCall(
+        CallInst *CI, Loop *Outer, Loop *StableInner,
+        BasicBlock *OuterLatch, DominatorTree &DT, BasicAAResult &AA,
+        const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
     static std::pair<IntRange, IntRange> getFirstOuterEntryRanges(
         Value *Initial, Value *Bound, Loop *Outer,
         BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
@@ -274,7 +289,9 @@ private:
         BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
         DominatorTree &DT, IntRange &InitialRange, IntRange &BoundRange);
     static std::optional<ProvenStablePeelState> findProvenStablePeelState(
-        Loop *Outer, SCEVResult &SE, RangeInfo &RI, DominatorTree &DT);
+        Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+        RangeInfo &RI, DominatorTree &DT,
+        FunctionAnalysisPassManager &FAM);
     static void discardUncommittedPeelClones(PeeledBodyCore &Core);
     static void discardUncommittedUnrollClones(UnrolledBodyCore &Core);
     static UnrollConfig makePeelingOnlyConfig(UnrollConfig Config);
