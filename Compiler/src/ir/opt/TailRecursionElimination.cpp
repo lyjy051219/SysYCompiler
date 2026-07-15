@@ -22,7 +22,7 @@ Value *TailRecursionEliminationPass::resolveRetValueForPred(Value *V,
                                      std::vector<Instruction *> &ClonedInsts,
                                      std::unordered_set<Value *> &Visiting) {
     if (!V) return nullptr;
-    TraverseTools::ScopedActiveMark ActiveMark(Visiting, V);
+    ScopedActiveMark ActiveMark(Visiting, V);
     if (!ActiveMark.inserted()) return nullptr;
 
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
@@ -88,7 +88,7 @@ bool TailRecursionEliminationPass::isSelfCall(CallInst *CI, Function &F) {
 
 //  快速检查：函数是否包含自递归调用
 bool TailRecursionEliminationPass::hasSelfRecursion(Function &F) {
-    return !TraverseTools::forEachInstruction<CallInst>(
+    return !forEachInstruction<CallInst>(
         F, [&](CallInst *CI) { return !isSelfCall(CI, F); });
 }
 
@@ -118,7 +118,7 @@ bool TailRecursionEliminationPass::hasInterferingEarlierSelfCallInBlock(BasicBlo
                                                  FunctionAnalysisPassManager &FAM) {
     if (!BB || !StopCI) return false;
     bool Interferes = false;
-    TraverseTools::forEachInstruction<CallInst>(*BB, [&](CallInst *CI) {
+    forEachInstruction<CallInst>(*BB, [&](CallInst *CI) {
         if (CI == StopCI) return false;
         if (CI->getCallee() != &F) return true;
         if (!isReadonlyLikeCallInst(CI, FAM, F) || CI->hasUses()) {
@@ -185,7 +185,7 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
                 }
 
                 if (auto *inst = dynamic_cast<Instruction*>(curr)) {
-                    TraverseTools::forEachOperand(
+                    forEachOperand(
                         inst, [&](size_t, Use *, Value *Operand) {
                         if (Operand)
                             worklist.push_back(Operand);
@@ -317,7 +317,7 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         }
 
         // 操作数不能依赖 call 的返回值
-        if (!TraverseTools::forEachOperand(
+        if (!forEachOperand(
                 I, [CI](size_t, Use *, Value *Operand) {
                     return Operand != static_cast<Value *>(CI);
                 })) {
@@ -343,7 +343,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 
         // 创建新入口块
         BasicBlock *NewEntry = new BasicBlock();
-        F.push_front(NewEntry);
+        F.pushFront(NewEntry);
         NewEntry->genUnCondInst(OldEntry);
 
         // 将原入口块中所有 Alloca 搬到 NewEntry 的 Br 之前
@@ -353,7 +353,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
             auto brIt = NewEntry->begin();
             while (*brIt != brInst) ++brIt;
             for (AllocaInst *AI : allocas) {
-                AI->EraseFromParent();
+                AI->eraseFromParent();
                 brIt.insertBefore(AI);
             }
         }
@@ -364,7 +364,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         for (size_t i = 0; i < Params.size(); ++i) {
             Value *Param = Params[i].get();
             auto *Phi = new PhiInst(Param->getIRType());
-            OldEntry->push_front(Phi);
+            OldEntry->pushFront(Phi);
             Param->replaceAllUsesWith(Phi);
             Phi->addIncoming(Param, NewEntry);
             ArgPhis.push_back(Phi);
@@ -389,7 +389,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         if (!AccPhi) {
             // 首次: 创建累加器 PHI
             AccPhi = new PhiInst(AccInst->getIRType());
-            LoopHeader->push_front(AccPhi);
+            LoopHeader->pushFront(AccPhi);
 
             // 初始值: ADD→0, MUL→1
             Value *Identity = nullptr;
@@ -442,7 +442,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         auto callIt = BB->begin();
         while (*callIt != CI) ++callIt;
         for (Instruction *I : toMove) {
-            I->EraseFromParent();
+            I->eraseFromParent();
             callIt.insertBefore(I);
         }
     }
@@ -461,7 +461,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         if (RI->getOperand(0) == AccInst) {
             RI->replaceOperand(0, UndefValue::NewUndefValue(AccInst->getIRType()));
         }
-        AccInst->EraseFromParent();
+        AccInst->eraseFromParent();
         delete AccInst;
     }
 
@@ -512,11 +512,11 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                                           RetInst *ClonedRI,
                                           std::vector<Instruction *> &SupportInsts) {
             if (ClonedRI && ClonedRI->isInBlock(BB)) {
-                ClonedRI->EraseFromParent();
+                ClonedRI->eraseFromParent();
             }
             for (auto *I : SupportInsts) {
                 if (I && I->isInBlock(BB)) {
-                    I->EraseFromParent();
+                    I->eraseFromParent();
                 }
             }
             for (auto It = SupportInsts.rbegin(); It != SupportInsts.rend(); ++It) {
@@ -525,7 +525,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             delete ClonedRI;
         };
 
-        auto blockSnapshot = TraverseTools::snapshotPointers(F);
+        auto blockSnapshot = snapshotPointers(F);
 
         for (auto bb : blockSnapshot) {
             Instruction *term = bb->back();

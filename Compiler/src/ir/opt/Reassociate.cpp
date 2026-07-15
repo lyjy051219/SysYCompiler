@@ -76,7 +76,7 @@ bool ReassociateEngine::run() {
 		LocalChanged = false;
 		std::vector<BasicBlock *> Roots;
 		if (F.front()) Roots.push_back(F.front());
-		auto RPO = TraverseTools::buildRPO<BasicBlock>(Roots, F);
+		auto RPO = buildRPO<BasicBlock>(Roots, F);
 		for (BasicBlock *BB : RPO) {
 			if (!BB) continue;
 			auto Insts = collectInstructions(*BB);
@@ -114,13 +114,13 @@ void ReassociateEngine::initRankMap() {
 
 	std::vector<BasicBlock *> Roots;
 	if (F.front()) Roots.push_back(F.front());
-	auto RPO = TraverseTools::buildRPO<BasicBlock>(Roots, F);
+	auto RPO = buildRPO<BasicBlock>(Roots, F);
 	for (BasicBlock *BB : RPO) {
 		if (!BB) continue;
 		uint32_t Base = (++Rank) << 16;
 		BlockBase[BB] = Base;
 		uint32_t Seq = 0;
-		TraverseTools::forEachInstruction(*BB, [&](Instruction *I) {
+		forEachInstruction(*BB, [&](Instruction *I) {
 			StableOrder[I] = ++NextStableOrder;
 
 			bool ShouldSkip = false;

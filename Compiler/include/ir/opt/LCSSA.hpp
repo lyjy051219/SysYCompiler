@@ -31,7 +31,7 @@ private:
 
 	using ExitPhiMap = std::unordered_map<BasicBlock *, PhiInst *>;
 	using InstructionWorkList =
-		TraverseTools::UniqueWorkList<Instruction *>;
+		UniqueWorkList<Instruction *>;
 
 	static bool replaceUseWithValue(Use *U, Value *V);
     Value *getValueForBlock(BasicBlock *BB,

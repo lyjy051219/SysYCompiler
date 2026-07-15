@@ -602,7 +602,7 @@ bool LoopStrengthReductionPass::collectRemovableIndexChain(
 
     Out.insert(I);
     AllowedUsers.insert(I);
-    TraverseTools::forEachOperand(I, [&](size_t, Use *, Value *Operand) {
+    forEachOperand(I, [&](size_t, Use *, Value *Operand) {
         auto *OperandI = dynamic_cast<Instruction *>(Operand);
         if (OperandI && OperandI != I)
             collectRemovableIndexChain(OperandI, AllowedUsers, Out);
@@ -646,8 +646,8 @@ bool LoopStrengthReductionPass::coversDenseInnermostAddresses(
 
 void LoopStrengthReductionPass::cleanupDeadIndexChains(
     const std::vector<Instruction *> &Seeds) {
-    TraverseTools::UniqueWorkList<
-        Instruction *, TraverseTools::WorkListOrder::LIFO> WorkList;
+    UniqueWorkList<
+        Instruction *, WorkListOrder::LIFO> WorkList;
     for (Instruction *Seed : Seeds) {
         if (Seed) WorkList.push(Seed);
     }
@@ -657,7 +657,7 @@ void LoopStrengthReductionPass::cleanupDeadIndexChains(
         if (!isRemovableIndexInst(Current) || Current->hasUses()) continue;
 
         std::vector<Instruction *> Operands;
-        TraverseTools::forEachOperand(
+        forEachOperand(
             Current, [&](size_t, Use *, Value *Operand) {
                 auto *OperandI = dynamic_cast<Instruction *>(Operand);
                 if (OperandI && OperandI != Current)
@@ -770,7 +770,7 @@ PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
     PreHeader->insertBeforeTerminator(Result.Start);
 
     Result.Phi = new PhiInst(ResultTy);
-    Header->push_front(Result.Phi);
+    Header->pushFront(Result.Phi);
 
     std::vector<Value *> NextIndices;
     NextIndices.push_back(

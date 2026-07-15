@@ -115,7 +115,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         }
         bool AllSame = true;
         Value *First = Phi->getIncomingValue(0);
-        AllSame = TraverseTools::forEachPhiIncoming(
+        AllSame = forEachPhiIncoming(
             Phi, [First](unsigned I, Value *Incoming, BasicBlock *) {
                 return I == 0 || Incoming == First;
             });
@@ -138,7 +138,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     for (PhiInst *OldPhi : HeaderPhis) {
         Value *InitV = nullptr;
         Value *IterV = nullptr;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             OldPhi, [&](unsigned, Value *Incoming, BasicBlock *InB) {
                 if (InB == PreHeader) InitV = Incoming;
                 if (InB == Latch) IterV = Incoming;
@@ -155,13 +155,13 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     }
 
     for (auto It = NewBodyPhis.rbegin(); It != NewBodyPhis.rend(); ++It) {
-        Body->push_front(*It);
+        Body->pushFront(*It);
     }
 
     for (Instruction *OldI : HeaderNormalInsts) {
         Instruction *Cloned = cloneInstructionWithMap(OldI, HeaderToPreValue);
         if (!Cloned) return false;
-        PreHeader->push_back(Cloned);
+        PreHeader->pushBack(Cloned);
         HeaderToPreValue[OldI] = Cloned;
 
         bool UsedInLoopNonHeader = false;
@@ -179,7 +179,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
             auto *BodyPhi = new PhiInst(OldI->getIRType());
             BodyPhi->addIncoming(Cloned, PreHeader);
             BodyPhi->addIncoming(OldI, Header);
-            Body->push_front(BodyPhi);
+            Body->pushFront(BodyPhi);
             HeaderToBodyValue[OldI] = BodyPhi;
         }
     }
@@ -237,7 +237,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
                     LCPhi->setIdent(LCPhi->getIdent() + ".lcssa");
                     LCPhi->addIncoming(OldV, Header);
                     LCPhi->addIncoming(PreV, PreHeader);
-                    Exit->push_front(LCPhi);
+                    Exit->pushFront(LCPhi);
                     ExitLCSSA[OldV] = LCPhi;
                 }
                 U->replaceUseeWith(LCPhi);
@@ -250,7 +250,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         bool HasHeader = false;
         bool HasPreHeader = false;
         Value *HeaderIncoming = nullptr;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [&](unsigned, Value *Incoming, BasicBlock *InB) {
             if (InB == Header) {
                 HasHeader = true;
@@ -275,7 +275,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     auto HeaderPhisAfter = Header->collectPhiNodes();
     for (PhiInst *Phi : HeaderPhisAfter) {
         auto *NewPhi = new PhiInst(Phi->getIRType());
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [&](unsigned, Value *Incoming, BasicBlock *IncomingBlock) {
                 if (IncomingBlock != PreHeader)
                     NewPhi->addIncoming(Incoming, IncomingBlock);
@@ -327,7 +327,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         NewPreHeader->genUnCondInst(Body);
         BasicBlock::redirectBranchTarget(PreHeader, Body, NewPreHeader);
         for (PhiInst *Phi : Body->collectPhiNodes()) {
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [&](unsigned I, Value *, BasicBlock *IncomingBlock) {
                     if (IncomingBlock == OldPreHeader)
                         Phi->setIncomingBlock(I, NewPreHeader);
@@ -367,21 +367,21 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     std::vector<BasicBlock *> HeaderSuccs = Header->getSuccessors();
     while (Header->front() != nullptr) {
         Instruction *I = Header->front();
-        I->EraseFromParent();
-        Latch->push_back(I);
+        I->eraseFromParent();
+        Latch->pushBack(I);
     }
 
     for (BasicBlock *Succ : HeaderSuccs) {
         auto SuccPhis = Succ->collectPhiNodes();
         for (PhiInst *Phi : SuccPhis) {
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [&](unsigned I, Value *, BasicBlock *IncomingBlock) {
                     if (IncomingBlock == Header)
                         Phi->setIncomingBlock(I, Latch);
                 });
         }
     }
-    Header->EraseFromParent();
+    Header->eraseFromParent();
 
     // 步骤11：返回 true，事务顺利结束。
     return true;

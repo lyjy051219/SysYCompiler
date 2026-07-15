@@ -135,7 +135,7 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
     for (BasicBlock *BB : LoopBlocks)
         if (!BB) return false;
-    if (!TraverseTools::forEachInstructionInBlocks(
+    if (!forEachInstructionInBlocks(
             LoopBlocks, [&](Instruction *I) {
         if (auto *Br = dynamic_cast<BrInst *>(I)) {
             if (Br->isConditional()) {
@@ -235,7 +235,7 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
 
     std::vector<LoadInst *> Loads;
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
-    if (!TraverseTools::forEachInstructionInBlocks(
+    if (!forEachInstructionInBlocks(
             LoopBlocks, [&](Instruction *I) {
         if (auto *Store = dynamic_cast<StoreInst *>(I)) {
             if (Match.Store) return false;
@@ -465,7 +465,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         auto *Call = new CallInst(BuildInFunction::genBuildInFunction(
                                       BuildInFunction::getDefaultMemmoveName()),
                                   Args);
-        if (FastBlock) FastBlock->push_back(Call);
+        if (FastBlock) FastBlock->pushBack(Call);
         else if (!First.PreHeader->insertBeforeTerminator(Call)) {
             delete Call;
             goto PairFailure;
@@ -497,7 +497,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
 
 PairFailure:
     if (FastBlock) {
-        FastBlock->EraseFromParent();
+        FastBlock->eraseFromParent();
         delete FastBlock;
     }
     for (auto It = RuntimeValues.rbegin(); It != RuntimeValues.rend(); ++It)
@@ -532,7 +532,7 @@ bool LoopIdiomRecognizePass::transformLoop(
     StoreInst *Store = nullptr;
     std::vector<LoadInst *> Loads;
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
-    if (!TraverseTools::forEachInstructionInBlocks(
+    if (!forEachInstructionInBlocks(
             LoopBlocks, [&](Instruction *I) {
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             if (Store) return false;
@@ -771,12 +771,12 @@ bool LoopIdiomRecognizePass::transformLoop(
     }
     auto *Call = new CallInst(
         BuildInFunction::genBuildInFunction(IntrinsicName), Args);
-    bool InsertedCall = FastBlock ? (FastBlock->push_back(Call), true)
+    bool InsertedCall = FastBlock ? (FastBlock->pushBack(Call), true)
                                   : PreHeader->insertBeforeTerminator(Call);
     if (!InsertedCall) {
         delete Call;
         if (FastBlock) {
-            FastBlock->EraseFromParent();
+            FastBlock->eraseFromParent();
             delete FastBlock;
         }
         for (auto It = RuntimeValues.rbegin();

@@ -52,7 +52,7 @@ bool IndVarSimplifyPass::haveExactRecurrenceShape(
         return false;
 
     std::unordered_set<BasicBlock *> Seen;
-    if (!TraverseTools::forEachPhiIncoming(
+    if (!forEachPhiIncoming(
             A, [&](unsigned, Value *AV, BasicBlock *Pred) {
                 if (!Pred || !Seen.insert(Pred).second) return false;
                 Value *BV = B->getIncomingFromPred(Pred);

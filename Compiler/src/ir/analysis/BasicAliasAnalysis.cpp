@@ -83,11 +83,11 @@ bool BasicAAResult::hasUndefPointerOrigin(
         dynamic_cast<PhiInst *>(I) ||
         dynamic_cast<SelectInst *>(I);
     if (!TransparentPointerProducer) return false;
-    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return false;
 
     bool HasUndefOrigin = false;
-    TraverseTools::forEachOperand(
+    forEachOperand(
         I, [&](size_t, Use *, Value *Operand) {
             if (dynamic_cast<BasicBlock *>(Operand)) return true;
             if (!hasUndefPointerOrigin(Operand, Active, Depth + 1))
@@ -479,7 +479,7 @@ BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
 
     Value* Start = nullptr;
     Value* Update = nullptr;
-    if (!TraverseTools::forEachPhiIncoming(
+    if (!forEachPhiIncoming(
             Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
                 if (!V || !Pred) return false;
                 if (L->contains(Pred)) {
@@ -712,7 +712,7 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
             // block; matching by raw index can compare values from different
             // control-flow edges and manufacture NoAlias/MustAlias.
             std::unordered_map<BasicBlock *, Value *> OtherByPred;
-            if (!TraverseTools::forEachPhiIncoming(
+            if (!forEachPhiIncoming(
                     OtherPhi,
                     [&](unsigned, Value *Incoming, BasicBlock *Pred) {
                         return Pred &&
@@ -725,7 +725,7 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
             AliasInfo Acc = AliasInfo::MayAlias;
             bool First = true;
             bool InvalidIncoming = false;
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
                     if (!Pred || !SeenPreds.insert(Pred).second) {
                         InvalidIncoming = true;
@@ -769,7 +769,7 @@ AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
     if (!Select || !Other) return AliasInfo::MayAlias;
 
     auto Key = makeCanonicalPair(Select, Other);
-    TraverseTools::ScopedActiveMark ActiveMark(ActiveSelectQueries, Key);
+    ScopedActiveMark ActiveMark(ActiveSelectQueries, Key);
     if (!ActiveMark.inserted())
         return AliasInfo::MayAlias;
 
@@ -847,7 +847,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
     if (P1 == P2) return aliasImpl(P1, P2, LI, UseIndexRange);
 
     auto Key = makeCanonicalPair(P1, P2);
-    TraverseTools::ScopedActiveMark ActiveMark(Active, Key);
+    ScopedActiveMark ActiveMark(Active, Key);
     if (!ActiveMark.inserted()) return AliasInfo::MayAlias;
     auto Merge = [&](AliasInfo A, AliasInfo B) {
         return mergePhiAlias(A, B);
@@ -889,7 +889,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         Phi1->getNumIncomingValues() == Phi2->getNumIncomingValues() &&
         Phi1->getNumIncomingValues() != 0) {
         std::unordered_map<BasicBlock *, Value *> Incoming2;
-        if (!TraverseTools::forEachPhiIncoming(
+        if (!forEachPhiIncoming(
                 Phi2, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
                     return Pred && Incoming2.emplace(Pred, Incoming).second;
                 })) {
@@ -899,7 +899,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         AliasInfo Result = AliasInfo::MayAlias;
         std::unordered_set<BasicBlock *> Seen;
         bool InvalidIncoming = false;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi1, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
                 auto It = Incoming2.find(Pred);
                 if (!Pred || !Seen.insert(Pred).second ||
@@ -924,7 +924,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
             return AliasInfo::MayAlias;
         bool First = true;
         AliasInfo Result = AliasInfo::MayAlias;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [&](unsigned, Value *IncomingValue, BasicBlock *) {
                 MemoryLocation Incoming(
                     IncomingValue, PhiIsFirst ? L1.Size : L2.Size);

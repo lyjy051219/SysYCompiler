@@ -417,7 +417,7 @@ LoopInfo LoopInfoBuilder::build(Function &F, const DominatorTree &DT) {
     */
     LoopInfo LI;
 
-    if (F.Size() == 0 || DT.Root == nullptr)
+    if (F.size() == 0 || DT.Root == nullptr)
         return LI;
 
     //步骤1：后序遍历支配树，识别循环头，创建 Loop 对象

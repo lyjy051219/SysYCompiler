@@ -13,7 +13,7 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
 
     std::vector<BasicBlock*> ExitBlocks = L->getExitBlocks();
     std::set<BasicBlock *> ExitSet(ExitBlocks.begin(), ExitBlocks.end());
-	return TraverseTools::forEachInstructionInBlocks(
+	return forEachInstructionInBlocks(
 		L->getBlocks(), [&ExitSet, L](Instruction *Def) {
 			for (Use *U : Def->getUses()) {
 				auto *UserInst = dynamic_cast<Instruction *>(
@@ -102,7 +102,7 @@ Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
         return UndefValue::NewUndefValue(InstDef->getIRType());
     }
 
-    BB->push_front(BridgePhi);
+    BB->pushFront(BridgePhi);
     Changed = true;
 
     // 将新生成的桥接 PHI 加入队列，触发可能的链式反应
@@ -212,7 +212,7 @@ bool LCSSAPass::runLCSSA(Instruction *I,
             continue;
         }
 
-        ExitBB->push_front(LCPhi);
+        ExitBB->pushFront(LCPhi);
         MapValue[ExitBB] = LCPhi; // 将出口 PHI 存入缓存，作为递归的终点
         Changed = true;
 
@@ -259,7 +259,7 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
             ExitBlocks.begin(), ExitBlocks.end());
         std::vector<BasicBlock *> AncestorRoots(
             ExitBlocks.rbegin(), ExitBlocks.rend());
-        TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+        forEachReachablePreOrderCustomSucc<BasicBlock>(
             AncestorRoots,
             [L, &DT](BasicBlock *Curr) {
                 std::vector<BasicBlock *> Parent;
@@ -274,15 +274,15 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
                 // Exit blocks only seed the walk; the old algorithm inserted
                 // their in-loop IDom, never the exit roots themselves.
                 if (ExitRoots.count(Curr))
-                    return TraverseTools::TraversalControl::Continue;
+                    return TraversalControl::Continue;
                 ExitDominatingBlocks.insert(Curr);
                 if (Curr == L->getHeader())
-                    return TraverseTools::TraversalControl::SkipSuccessors;
-                return TraverseTools::TraversalControl::Continue;
+                    return TraversalControl::SkipSuccessors;
+                return TraversalControl::Continue;
             });
 
         //我们直接遍历这些支配ExitingBlock，并且在循环中的基本块的这些指令即可
-        TraverseTools::forEachInstructionInBlocks(
+        forEachInstructionInBlocks(
             ExitDominatingBlocks,
             [&LI, L, &WorkList](BasicBlock *BB, Instruction *Inst) {
                 if (LI.getLoopFor(BB) != L || !Inst->hasUses()) return;

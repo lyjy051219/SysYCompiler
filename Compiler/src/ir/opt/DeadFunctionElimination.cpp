@@ -75,10 +75,10 @@ PreservationStatus DeadFunctionEliminationPass::run(
 
 		F->collectReachableBlocks(ReachableBlocks);
 
-		TraverseTools::forEachInstruction(
+		forEachInstruction(
 			*F, [&](BasicBlock *BB, Instruction *I) {
 				if (!ReachableBlocks.count(BB)) return;
-				TraverseTools::forEachOperand(
+				forEachOperand(
 					I, [&](size_t, Use *, Value *Operand) {
 						auto *Target = dynamic_cast<Function *>(Operand);
 						if (!Target || !InModule.count(Target)) return;

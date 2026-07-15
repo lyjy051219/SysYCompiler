@@ -24,7 +24,7 @@ int SCEVExpander::estimateCostImpl(
     const SCEVExpr *E,
     std::unordered_set<const SCEVExpr *> &Active) const {
     if (!E || (Scope && E->mentionsLoop(Scope))) return -1;
-    TraverseTools::ScopedActiveMark ActiveMark(Active, E);
+    ScopedActiveMark ActiveMark(Active, E);
     if (!ActiveMark.inserted()) return -1;
 
     int Cost = 0;

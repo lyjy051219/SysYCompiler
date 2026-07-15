@@ -85,15 +85,15 @@ public:
       ElementType =
           std::dynamic_pointer_cast<POINTERType>(BaseType)->getPointerType();
     }
-    ElementType->to_string();
+    ElementType->toString();
     std::cout << ", ";
-    BaseType->to_string();
+    BaseType->toString();
     std::cout << ' ';
     Base->dumpIR();
     for (std::size_t I = 1; I < Ops.size(); ++I) {
       Value *Index = Ops[I]->getValue();
       std::cout << ", ";
-      Index->getIRType()->to_string();
+      Index->getIRType()->toString();
       std::cout << ' ';
       Index->dumpIR();
     }
@@ -980,7 +980,7 @@ bool insertBeforeFirstNonPhi(BasicBlock *BB, Instruction *Inst) {
     }
   }
   if (BB->empty()) {
-    BB->push_back(Inst);
+    BB->pushBack(Inst);
     return true;
   }
   auto It = BB->rbegin();
@@ -1370,13 +1370,13 @@ bool rewriteCandidate(const PrepareCandidate &Candidate) {
       Replacement = OffsetGEP;
     }
     MemberGEP->replaceAllUsesWith(Replacement);
-    if (!MemberGEP->getUseList().is_empty())
+    if (!MemberGEP->getUseList().isEmpty())
       return false;
     delete MemberGEP;
   }
 
   Orig->replaceAllUsesWith(PtrPhi);
-  if (!Orig->getUseList().is_empty())
+  if (!Orig->getUseList().isEmpty())
     return false;
   delete Orig;
   return true;
@@ -1399,7 +1399,7 @@ bool runCodeGenPrepare(Module &module) {
     if (!FuncPtr)
       continue;
     Function &F = *FuncPtr;
-    if (F.Size() == 0)
+    if (F.size() == 0)
       continue;
 
     const auto &DT = FAM.getResult<DominantAnalysis>(F);

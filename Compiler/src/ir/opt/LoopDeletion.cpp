@@ -123,7 +123,7 @@ Value *LoopDeletionPass::resolveZeroTripValue(
     // header instructions here.
     auto *Phi = dynamic_cast<PhiInst *>(I);
     if (!Phi || Phi->getParent() != L->getHeader()) return nullptr;
-    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return nullptr;
     Value *Incoming = Phi->getIncomingFromPred(PreHeader);
     return resolveZeroTripValue(Incoming, L, PreHeader, Active);
@@ -167,7 +167,7 @@ bool LoopDeletionPass::planDeadLoopPhiReplacements(
 
         Value *Keep = Phi->getIncomingValue(0);
         if (!Keep) return false;
-        if (!TraverseTools::forEachPhiIncoming(
+        if (!forEachPhiIncoming(
                 Phi, [Keep](unsigned I, Value *Incoming, BasicBlock *) {
                     return I == 0 || Incoming == Keep;
                 })) {

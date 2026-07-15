@@ -83,7 +83,7 @@ PreservationStatus GlobalInitializerFoldPass::run(
     Module &M, ModuleAnalysisPassManager &MAM) {
     (void)MAM;
     Function *Main = M.getMainFunction();
-    if (!Main || Main->Size() == 0 || isRecursiveMain(M, Main))
+    if (!Main || Main->size() == 0 || isRecursiveMain(M, Main))
         return PreservationStatus::all();
 
     BasicBlock *Entry = Main->front();

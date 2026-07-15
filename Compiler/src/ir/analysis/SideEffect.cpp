@@ -117,7 +117,7 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                     }
                 //如果是Phi指令：合并所有已计算的输入值的BaseAddressInfo
                 } else if (auto* Phi = dynamic_cast<PhiInst*>(I)) {
-                    TraverseTools::forEachPhiIncoming(
+                    forEachPhiIncoming(
                         Phi, [&](unsigned, Value *V, BasicBlock *) {
                         ensureInitialized(V, Map);
                         auto it = Map.find(V);
@@ -719,7 +719,7 @@ bool BasicBlockSideEffect(BasicBlock* BB,
 
             std::vector<BasicBlock *> Roots = BB->getSuccessors();
             bool FoundRef = false;
-            TraverseTools::forEachReachablePreOrder<BasicBlock>(
+            forEachReachablePreOrder<BasicBlock>(
                 Roots, [&SI, &AA, &LI, &FAM,
                         &FoundRef](BasicBlock *Cur) {
                     for (Instruction *J : *Cur) {
@@ -728,10 +728,10 @@ bool BasicBlockSideEffect(BasicBlock* BB,
                             MemoryLocation::get(SI), J, AA, LI, FAM);
                         if (isRefSet(MRI)) {
                             FoundRef = true;
-                            return TraverseTools::TraversalControl::Stop;
+                            return TraversalControl::Stop;
                         }
                     }
-                    return TraverseTools::TraversalControl::Continue;
+                    return TraversalControl::Continue;
                 });
             if (FoundRef) return true;
         }

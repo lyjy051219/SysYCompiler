@@ -89,13 +89,13 @@ bool PhiCongruenceMatcher::equivalentPhis(
     // unambiguously, so leave those uncommon forms alone.
     std::unordered_set<BasicBlock *> SeenA;
     std::unordered_set<BasicBlock *> SeenB;
-    bool Equal = TraverseTools::forEachPhiIncoming(
+    bool Equal = forEachPhiIncoming(
         A, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
         if (!Pred || !SeenA.insert(Pred).second) return false;
 
         Value *OtherIncoming = nullptr;
         unsigned Matches = 0;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             B, [&](unsigned, Value *Candidate, BasicBlock *CandidatePred) {
                 if (CandidatePred != Pred) return;
                 OtherIncoming = Candidate;
@@ -152,7 +152,7 @@ bool PhiCongruenceMatcher::equivalentImpl(
                 equivalentImpl(AL, BL, Depth + 1) &&
                 equivalentImpl(AR, BR, Depth + 1);
     } else if (IA->getNumOperands() == IB->getNumOperands()) {
-        Equal = TraverseTools::forEachOperand(
+        Equal = forEachOperand(
             IA, [&](size_t Index, Use *, Value *Operand) {
                 return equivalentImpl(
                     Operand, IB->getOperand(Index), Depth + 1);
@@ -259,7 +259,7 @@ void GVNPRESolver::rebuildRPOAndReachability() {
     if (!Entry) return;
 
     std::vector<BasicBlock *> Roots{Entry};
-    RPO = TraverseTools::buildRPOFromRoots<BasicBlock>(Roots);
+    RPO = buildRPOFromRoots<BasicBlock>(Roots);
     ReachableBlocks.insert(RPO.begin(), RPO.end());
 }
 
@@ -294,7 +294,7 @@ void GVNPRESolver::buildAvailOut() {
     std::vector<BasicBlock *> Roots;
     if (!isDeadBlock(Entry)) Roots.push_back(Entry);
     auto DomOrder =
-        TraverseTools::buildPreOrderFromRootsCustomSucc<BasicBlock>(
+        buildPreOrderFromRootsCustomSucc<BasicBlock>(
             Roots, [this](BasicBlock *BB) {
                 std::vector<BasicBlock *> Children;
                 if (!BB || isDeadBlock(BB)) return Children;
@@ -493,7 +493,7 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
     if (!I) return false;
 
     auto appendOperands = [&](Instruction *Inst, std::vector<int> &Args) {
-        TraverseTools::forEachOperand(
+        forEachOperand(
             Inst, [&](size_t, Use *, Value *Operand) {
             bool Fresh = false;
             Args.push_back(getOrAssignValueNum(Operand, Fresh));
@@ -643,7 +643,7 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
 bool GVNPRESolver::identicalCall(CallInst *A, CallInst *B) {
     if (!A || !B) return false;
     if (A->getNumOperands() != B->getNumOperands()) return false;
-    return TraverseTools::forEachOperand(
+    return forEachOperand(
         A, [&](size_t Index, Use *, Value *Operand) {
             Value *OtherOperand = B->getOperand(Index);
             return Operand && OtherOperand && Operand == OtherOperand;
@@ -655,8 +655,8 @@ void GVNPRESolver::markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc) 
 
     std::vector<BasicBlock *> Roots{DeadSucc};
     std::unordered_set<BasicBlock *> Candidate =
-        TraverseTools::collectReachableFromRoots<
-            BasicBlock, TraverseTools::WorkListOrder::FIFO>(Roots);
+        collectReachableFromRoots<
+            BasicBlock, WorkListOrder::FIFO>(Roots);
 
     std::vector<BasicBlock *> ToErase;
     bool Changed = true;
@@ -1068,7 +1068,7 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             if (VIt == ValueNum.end() || VIt->second != Num) continue;
 
             bool FoundIncoming = false;
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
                     if (Pred != ToPred) return true;
                     bool Fresh = false;
@@ -1178,7 +1178,7 @@ bool GVNPRESolver::runPRE() {
     // Snapshot entry-reachable CFG pre-order before PRE starts mutating IR.
     std::vector<BasicBlock *> Roots{F.front()};
     std::vector<BasicBlock *> DFSOrder =
-        TraverseTools::buildPreOrderFromRoots<BasicBlock>(Roots);
+        buildPreOrderFromRoots<BasicBlock>(Roots);
 
     for (BasicBlock *BB : DFSOrder) {
         if (!BB || BB == F.front() || isDeadBlock(BB)) continue;
@@ -1257,7 +1257,7 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
 
-            bool OperandOK = TraverseTools::forEachOperand(
+            bool OperandOK = forEachOperand(
                 I, [&](size_t Idx, Use *, Value *OrigV) {
                 if (!OrigV) return false;
 
@@ -1418,7 +1418,7 @@ bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
     }
 
     K.Operands.reserve(I->getNumOperands());
-    bool OperandsOK = TraverseTools::forEachOperand(
+    bool OperandsOK = forEachOperand(
         I, [&](size_t, Use *, Value *Operand) {
             if (!Operand || Value::isUndef(Operand)) return false;
             K.Operands.push_back(Operand);

@@ -17,7 +17,7 @@ bool Local2GlobalPass::isRecursiveFrom(
 
 	auto RootIt = CallGraph.find(F);
 	if (RootIt == CallGraph.end()) return false;
-	return TraverseTools::isReachableFromRootsCustomSucc<Function>(
+	return isReachableFromRootsCustomSucc<Function>(
 		RootIt->second, F,
 		[&CallGraph](Function *Current) -> std::vector<Function *> {
 			auto It = CallGraph.find(Current);

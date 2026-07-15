@@ -1169,7 +1169,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     if (phiTy && phiTy->getEnum() == IR_FLOAT) {
         FloatRange fresult = FloatRange::bottom();
         BasicBlock *phiBB = Phi->getParent();
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [this, phiBB, &fresult](unsigned, Value *inVal,
                                          BasicBlock *pred) {
             if (!FeasibleEdges.count({pred, phiBB})) return;
@@ -1203,7 +1203,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     KnownBits kbResult;
     bool firstKB = true;
     BasicBlock *phiBB = Phi->getParent();
-    TraverseTools::forEachPhiIncoming(
+    forEachPhiIncoming(
         Phi, [this, phiBB, &result, &kbResult, &firstKB](
                  unsigned, Value *inVal, BasicBlock *pred) {
         if (!FeasibleEdges.count({pred, phiBB})) return;

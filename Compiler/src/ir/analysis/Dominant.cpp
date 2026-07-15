@@ -317,7 +317,7 @@ DominatorTree SemiNCAInfo::calculate(Function* func) {
     Infos.emplace_back();
     numToNode.push_back(nullptr);
 
-    if (func->Size() == 0) return DT;
+    if (func->size() == 0) return DT;
     BasicBlock* entryBlock = func->front();
     //1.DFS遍历，初始化数据+计算DFS序
     runDFS(entryBlock);

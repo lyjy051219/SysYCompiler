@@ -19,25 +19,26 @@ class BinaryInst;
 class PhiInst;
 class BrInst;
 
-// CFG 边由源基本块和终结指令中的后继下标唯一标识，避免平行边退化成同一组块指针。
+// CFG 边由源基本块和终结指令中的后继下标唯一标识，从而区分目标相同的平行边。
 struct CFGEdge {
     BasicBlock *From = nullptr;
     unsigned SuccessorIndex = 0;
-    // 可选的目标校验；CFG 改写后不再匹配时，该瞬时句柄自动失效。
+    // 可选的目标校验；CFG 改写后不再匹配时，该瞬时句柄失效。
     BasicBlock *ExpectedSuccessor = nullptr;
 };
 
 // 重定向边时对旧后继 PHI 的处理策略。
 enum class CFGEdgePhiPolicy {
-    // 旧边彻底消失，删除旧后继中与该边对应的 incoming。
+    // 旧边彻底消失，删除旧后继中与该边对应的 PHI 入边项。
     RemoveOldIncoming,
-    // 新块继续无条件跳向旧后继，把对应 incoming 的前驱改为新块。
+    // 新块继续无条件跳向旧后继，把对应 PHI 入边项的前驱改为新块。
     PreserveIncomingThroughNewBlock,
 };
 
 using FunctionCallGraph =
     std::unordered_map<Function *, std::vector<Function *>>;
 
+// 所有 IR 指令的基类，同时维护操作数使用关系和所属基本块。
 class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     public:
     enum InstType{
@@ -57,40 +58,40 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     Instruction(): User(){};
     Instruction(std::shared_ptr<IRType> irtype,InstType instType):User(std::move(irtype)){this->instType = instType;}
     Instruction(std::shared_ptr<IRType> irtype): User(std::move(irtype)){};
+    // 按 LLVM IR 文本形式输出当前指令。
     virtual void dumpIR() = 0;
     static Function* getUserFunction(Use* U);
     Function* getParentFunction();
     static Function* getParentFunction(Instruction *I);
+    // 将指令插入到已挂接位置的前方或后方，位置无父块时失败。
     static bool insertBefore(Instruction *Pos, Instruction *NewI);
     static bool insertAfter(Instruction *Pos, Instruction *NewI);
     bool insertBefore(Instruction *NewI);
     bool insertAfter(Instruction *NewI);
     bool isInBlock(const BasicBlock *BB) const;
+    // 仅在两条指令属于同一基本块时比较线性顺序。
     bool comesBefore(const Instruction *Other) const;
     static bool comesBefore(const Instruction *A, const Instruction *B);
     Value *getUnaryOperand() const;
     static Value *getUnaryOperand(const Instruction *I);
+    // 对支持的常量类型转换直接折叠，操作数或转换不受支持时返回空指针。
     static Value *foldConstantCast(InstType CastType, Value *Operand);
 
+    // 按值映射复制指令；无法构造合法副本时返回空指针。
     virtual Instruction* clone(const std::unordered_map<Value*, Value*>&) { return nullptr; }
 
     protected:
-    //提供给所有子类 clone 函数复用的映射辅助函数
+    // 供各指令副本复用：映射内的值换成新值，区域外的值保持不变。
     static Value* remapVal(Value* v, const std::unordered_map<Value*, Value*>& vmap);
     static BasicBlock* remapBB(Value* v, const std::unordered_map<Value*, Value*>& vmap);
 };
 
-//二元操作指令
-/*映射到LLVM IR是
-add fadd sub fsub mul fmul sdiv fdiv srem frem（后面三个是取模）
-and or xor
-shl,lshr,ashr --这几条指令也没包括
-icmp fcmp这些指令
-*/
+// 二元指令统一表示算术、位运算和比较，再根据操作数类型选择整数或浮点操作码。
+// IR 结构：%r = add i32 %a, %b；%c = icmp slt i32 %a, %b。
 class BinaryInst : public Instruction{
     public:
     enum Operation{
-        //注意这里没区别float和int的区别
+        // 语义操作与标量类型解耦，具体 IR 操作码由操作数类型决定。
         ADD,SUB,MUL,DIV,UDIV,MOD,UREM,
         AND,OR,XOR,SHL,LSHR,ASHR,
         E,NE,GE,L,LE,G
@@ -106,7 +107,7 @@ class BinaryInst : public Instruction{
     static bool getOperands(const BinaryInst *BI, Value *&LHS, Value *&RHS);
     bool setOperands(Value *LHS, Value *RHS);
     static bool isCompareOp(Operation Op);
-    // 统一维护操作码的类型约束和指令类别映射，避免生成器重复判断。
+    // 统一维护操作码的类型约束和指令类别映射。
     static bool isIntegerOnlyOp(Operation Op);
     static Instruction::InstType getInstType(Operation Op, TypeSystem OperandType);
     static bool isAssociativeOp(Operation Op);
@@ -115,78 +116,74 @@ class BinaryInst : public Instruction{
     static Operation negatePredicate(Operation Op);
     static Operation reversePredicate(Operation Op);
     static BinaryInst *createBooleanNot(Value *Operand);
+    // 折叠两个常量操作数；启用位宽规整时按目标整数位宽处理溢出和移位。
     static Value *foldConstants(Operation Op, Value *LHS, Value *RHS,
                                 bool NormalizeIntegerWidth = false);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
 
-/*PhiInst,BinaryInst等待实现*/
-//类LLVM IR的内存结构，由BaseManager中Value/User/Use进行管理
-
-//Module:对应AST中CompUnit
-//由若干个Function和GlobalVar(全局变量)组成
+// 模块对应 AST 中的编译单元，统一拥有函数、全局变量和符号表。
 class Module final{
     private:
     std::vector<std::unique_ptr<Function>> functions;
     std::vector<std::unique_ptr<Variable>> globalvars;
     SymbolTable symbolTable;
-    std::set<std::string> declared_builtins;
+    std::set<std::string> declaredBuiltins;
     public:
     Module()=default;
-    //函数管理
-    //根据TypeSystem和ident创建新的Function（注册符号表，加入functions）
+    // 创建函数并同时完成符号注册和模块所有权接管。
     Function& newFunction(TypeSystem ts,std::string ident);
-    //注册符号表+push新Function
+    // 接管已创建函数的所有权并注册其符号。
     void pushFunction(Function* func);
     std::vector<std::unique_ptr<Function>>& getFunctions();
-    //从functions中删除指定的Function
+    // 从模块中删除指定函数及其所有内容。
     void deleteFunction(Function*ptr);
-    Function* getMainFunction(); //寻找main函数并返回
+    Function* getMainFunction();
     static Module* getActiveModule();
+    // 构建仅包含直接调用的函数调用图，重复调用保留重复边。
     FunctionCallGraph buildDirectCallGraph() const;
+    // 从入口函数出发，在给定调用图上收集可达函数。
     static std::unordered_set<Function *> collectReachableFunctions(
         Function *Entry, const FunctionCallGraph &CallGraph);
-    //全局变量管理
-    void pushGlobalVar(Variable* ptr); //只是将一个全局变量加入到Function
+    // 将全局变量加入模块并接管所有权。
+    void pushGlobalVar(Variable* ptr);
     std::vector<std::unique_ptr<Variable>>& getGlobalVar();
-    //符号表管理
     SymbolTable& getSymbolTable();
-    //调试信息打印
+    // 按全局变量、函数的顺序输出整个模块的 LLVM IR。
     void dumpIR();
-    //生成重名函数后缀的函数
+    // 生成当前模块中未被占用的函数名后缀。
     std::string genFuncNameNum(std::string ident);
     void registerBuiltin(std::string ident) {
-        declared_builtins.insert(ident);
+        declaredBuiltins.insert(ident);
     }
 };
 
-//初始化值类
-//作为InitvalList的映射类型，用来保存数组初始化的多个初始化值
+// 聚合初始值按数组层次保存子初始值，缺省元素由输出和生成阶段补零。
 class Initializer : public Value,public std::vector<Value*>{
     static bool isAllZero(Value *V);
 
     public:
     Initializer(std::shared_ptr<IRType> irtype);
     void dumpIR();
-    //根据初始化值生成GEP，Store指令，然后从BasicBlock中插入这些IR指令
-    void Var2Store(BasicBlock *bb, const std::string &name,std::vector<int> &gep_data);
+    // 递归找出动态元素，按索引路径生成 GEP 和 Store，并将常量模板中的对应元素置零。
+    void var2Store(BasicBlock *bb, const std::string &name,std::vector<int> &gepData);
 };
 
 class Variable : public User{
     public:
     enum VarTag{
-        GlobalVariable, //全局变量,常量数组和变量数组
-        Constant,       //常量
-        Param           //函数形参
+        GlobalVariable, // 全局变量
+        Constant,       // 全局常量
+        Param           // 函数形参
     };
 
     VarTag vartag;
-    //是不是全局变量/全局常量
+    // 判断该值是否以全局对象形式存储。
     virtual bool isGlobal() final;
-    //是不是函数形参
     virtual bool isParam() final;
     bool isScalarGlobal();
+    // 按多维索引查找常量初始值，省略的元素返回对应类型的零。
     Value *getConstantElement(const std::vector<int> &Path);
     static Value *getConstantElement(Variable *Source,
                                      const std::vector<int> &Path);
@@ -194,22 +191,21 @@ class Variable : public User{
     Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident);
     void dumpIR();
     Value* getUsee();
-    //virtual Value* clone(std::unordered_map<Value*,Value*> &)override;
 };
 
 class Function : public Value, public ChainList<Function,BasicBlock>{
     private:
-    //函数形参
+    // 保存 IR 形参值；函数入口块中的形参槽位由 pushParam 同步建立。
     std::vector<std::unique_ptr<Value>> params;
     public:
     int blockNum =0;
-    //指定返回类型和函数名称构造Function模块
+    // 按返回类型和名称创建函数，并自动建立入口基本块。
     Function(TypeSystem ts,std::string ident);
-    //同时向侵入式链表和vector中插入BasicBlock
+    // 将基本块加入函数的侵入式块链表。
     void pushBlock(BasicBlock*);
-    //在curr之前插入 -- 这个函数用于初始化创建
+    // 使新块无条件跳向 curr，再将新块加入函数。
     void insertBlock(BasicBlock* curr,BasicBlock* insert);
-    //参数管理
+    // 接管形参，并在需要时于入口块建立槽位和 Store。
     void pushParam(std::string ident,Variable* v);
     void pushParam(Variable* v);
     std::vector<std::unique_ptr<Value>>& getParams();
@@ -223,23 +219,23 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     bool hasReservedSignature() const;
     bool hasBlockIdent(const std::string &Name) const;
     std::string makeUniqueBlockIdent(const std::string &Base) const;
-    //virtual Function* clone(std::unordered_map<Value*,Value*>&)override{return this;}
-    //Inst插入
+    // 将栈分配指令插入函数入口块。
     void InsertAlloca(AllocaInst* ptr);
+    // 从入口块出发计算可达块，getReachableBlocks 按函数中的原有顺序返回结果。
     bool isReachable(BasicBlock* BB);
     void collectReachableBlocks(std::unordered_set<BasicBlock *> &Reachable);
     std::vector<BasicBlock *> getReachableBlocks();
+    // 清空函数内所有指令的操作数关系，供批量销毁或回滚前使用。
     void dropAllReferences();
-    //调试信息打印
+    // 输出函数签名、基本块及指令的 LLVM IR。
     void dumpIR();
 };
 
-//内置函数系统 -- 用来包含LLVM内置的函数
-//静态工厂函数，确保是单例
+// 内建函数代表 SysY 运行库和前端可生成的 LLVM 内建调用，同名对象由工厂复用。
 class BuildInFunction : public Value{
     BuildInFunction(std::shared_ptr<IRType>,std::string ident);
     public:
-    //virtual BuildInFunction* clone(std::unordered_map<Value*,Value*>&)override{return this;}
+    // 按名称返回已驻留的内建函数对象。
     static BuildInFunction* genBuildInFunction(std::string);
     static bool isSupportedName(const std::string &Name);
     static bool isKnownRuntimeName(const std::string &Name);
@@ -259,13 +255,15 @@ class BuildInFunction : public Value{
 
 class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, public ChainNode<Function,BasicBlock>{
     public:
-    //用于标记该basicblock在Function中的位置
+    // 标记基本块在所属函数中的创建序号。
     int num;
 
     virtual ~BasicBlock() = default;
     BasicBlock();
     void dumpIR();
+    // 后继按终结指令的操作数顺序返回，平行边保留重复项。
     std::vector<BasicBlock*> getSuccessors();
+    // 返回不重复的前驱基本块，不区分同一前驱产生的平行边。
     std::vector<BasicBlock*> getPredecessors();
     Instruction *getTerminator();
     BrInst* getBranchTerminator();
@@ -273,14 +271,18 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     static bool isUncondBr(BrInst *Br);
     int countEdgesToSucc(BasicBlock *To);
     bool hasMultipleDistinctSuccessors();
+    // 解析边句柄并校验预期目标，句柄已失效时返回空指针。
     static BasicBlock *getEdgeSuccessor(const CFGEdge &Edge);
     static bool isCriticalEdge(const CFGEdge &Edge);
+    // 精确重定向一条边，并按策略同步更新旧后继的 PHI 入边项。
     static bool redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
                              CFGEdgePhiPolicy PhiPolicy);
+    // 将条件分支折叠为选定的无条件边，并删除未选边对应的 PHI 入边项。
     static bool foldConditionalBranch(BasicBlock *BB,
                                       unsigned TakenSuccessorIndex);
+    // 在指定边中插入新块，同时保留原后继 PHI 中的值和边顺序。
     static BasicBlock *splitEdge(Function &F, const CFGEdge &Edge);
-    // 以下低层接口只改终结指令，不自动维护 PHI；调用方须在同一事务中处理 incoming。
+    // 以下低层接口只改终结指令，不自动维护 PHI；调用方须同步处理入边项。
     static bool redirectBranchTarget(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc);
     static bool replaceCondBrWithUncond(BasicBlock *BB, BasicBlock *Dst);
     bool replaceTerminator(Instruction *NewTerminator);
@@ -288,50 +290,37 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
                                   Instruction *NewTerminator);
     bool onlyPhiAndTerminator();
     static bool hasOnlyBlockLocalInstructionUsers(Instruction *I, BasicBlock *BB);
+    // 用未定义值替换仍被引用的非空类型指令，再删除整个基本块。
     void eraseBlockSafely();
     static void removeEdgeFromSuccPhis(BasicBlock *Succ, BasicBlock *From, int RemoveCount);
     static void replaceIncomingPredInSuccPhis(BasicBlock *Succ, BasicBlock *OldPred, BasicBlock *NewPred);
-    // 收集块开头连续的 PHI 指令
+    // 收集块开头连续的 PHI 指令。
     std::vector<PhiInst*> collectPhiNodes();
-    // 若本块只有唯一前驱，则折叠退化 PHI
+    // 若本块只有唯一前驱，则折叠仅有一个入边项的 PHI。
     bool simplifySinglePredPhis();
-    //关于指令生成
-    //终止指令
-    //ret <type> <value>,type就是后面Value的type，所以这里只需要传入Value即可
+    // 生成带返回值的终结指令：ret i32 %value。
     void genRetInst(Value* retVal);
-    //ret void
+    // 生成空返回终结指令：ret void。
     void genRetInst();
-    //br i1 <cond>, label <iftrue>, label <iffalse>
+    // 生成条件分支：br i1 %cond, label %ifTrue, label %ifFalse。
     void genCondInst(Value* cond,BasicBlock* isTrue,BasicBlock* isFalse);
-    //br label <dest>
+    // 生成无条件分支：br label %dest。
     void genUnCondInst(BasicBlock* block);
 
-    //内存操作指令
-    //Alloca %x = alloca i32 --栈分配 --alloca可以直接访问指令的属性，返回alloca是因为可以直接让后面的load和store进行调用
+    // 在函数入口块生成栈分配：%x = alloca i32。
     AllocaInst* genAllocaInst(std::shared_ptr<IRType> irtype,std::string ident);
-    //Load %val = load i32, ptr %ptr
+    // 生成内存读取：%val = load i32, i32* %ptr。
     Value* genLoadInst(Value* v);
-    //Store store i32 20, i32* %y_ptr
+    // 生成内存写入：store i32 20, i32* %ptr。
     void genStoreInst(Value* val,Value* ptr);
-    //Gep   %arrayidx = getelementptr i32, i32* %arr, i32 0
+    // 创建仅含基指针的 GEP，调用方添加索引后需更新结果类型。
     Value* genGepInst(Value* ptr);
-    //其他版本用的时候再写
- /*   //传入偏移量--单索引版本
-    Value* getGepInst(Value* ptr,Value* x);
-    //多索引版本
-    Value* getGepInst(Value* ptr,std::vector<Value*> x);*/
-
-    //二元运算指令
-    /*
-    add,fadd,sub,fsub,mul,fmul,sdiv,fdiv,srem,frem
-    and,or,xor,shl,lshr,ashr
-    icmp,fcmp
-     */
+    // 统一标量类型后生成二元指令：%r = add i32 %a, %b。
     Value* genBinaryInst(Value* A,BinaryInst::Operation op,Value* B);
-    //支持常量折叠的Binary生成版本
+    // 操作数全为常量时直接折叠，否则将指令插入给定基本块。
     static Value* genBinaryInst(BasicBlock*,Value*,BinaryInst::Operation,Value*);
 
-    //转换运算
+    // 生成标量转换、函数调用和选择指令。
     Value* genSITOFPInst(Value* x);
     Value* genFPTOSIInst(Value* x);
     Value* genCallInst(std::string ident,std::vector<Value*> params);
@@ -340,7 +329,7 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     Value* genSextInst(Value* x);
     Value* genBitCastInst(Value* v, std::shared_ptr<IRType> targetType);
     Value* genSelectInst(Value* cond, Value* isTrue, Value* isFalse);
-    //基本块管理
+    // 在同一函数中创建新基本块并维护指令插入位置。
     BasicBlock* genBlock();
     BasicBlock* genBlock(std::string ident);
     bool hasTerminator();
@@ -353,20 +342,9 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     // 在 Position 之后切分基本块，新块自动加入同一函数并接管后半段指令。
     BasicBlock *splitBlockAfter(Instruction *Position);
     void clear();
-
-    /*目前用不到
-    //Func相关指令
-    //select
-    Value* genSelectInst(Value* cond,Value* isTrue,Value* isFalse);
-    //phi   --目前先省略，用到的时候再来补
-    //具体函数类型的区分没写，等着以后去写
-    Value* genSextInst(Value* x);
-    Value* genTruncInst(Value* x);
-    Value* genBitCastInst(Value* x);*/
-    //BasicBlock* clone(std::unordered_map<Value*,Value*>&)override;
 };
 
-// CFGSnapshot 是只读快照；CFG 发生修改后，调用方必须重新构造快照。
+// CFG 只读快照同时保存边序列和去重前驱；CFG 改写后必须重新构造。
 class CFGSnapshot final {
     std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> SuccessorEdges;
     std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> PredecessorEdges;
@@ -374,6 +352,7 @@ class CFGSnapshot final {
 
 public:
     explicit CFGSnapshot(Function &F);
+    // 后继边和前驱边保留平行边，去重前驱每个源块仅保留一次。
     const std::vector<BasicBlock *> &successorEdges(BasicBlock *BB) const;
     const std::vector<BasicBlock *> &predecessorEdges(BasicBlock *BB) const;
     const std::vector<BasicBlock *> &distinctPredecessors(BasicBlock *BB) const;
@@ -382,28 +361,27 @@ public:
 
 
 
-//终止指令：Ret Br
-//Ret:返回指令：ret i32 %val/ret void
+// 返回指令结束当前函数执行。
+// IR 结构：ret i32 %val；ret void。
 class RetInst : public Instruction{
     public:
     RetInst();
     RetInst(std::shared_ptr<IRType> irtype);
     RetInst(Value* retVal);
-    //RetInst* clone(std::unordered_map<Value*, Value*>&)override;
     Value *getReturnValue() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-//跳转指令
+// 分支指令同时表示条件跳转和无条件跳转。
+// IR 结构：br i1 %cond, label %true, label %false；br label %dest。
 class BrInst : public Instruction{
     private:
-    bool isCond; //true为条件分支，false为无条件分支
-    //包括无条件跳转和有条件跳转
+    bool isCond; // 为真时有两个后继，为假时只有一个后继。
     public:
     BrInst(Value*,BasicBlock*,BasicBlock*);
     BrInst(BasicBlock* bb);
-    BrInst(std::shared_ptr<IRType> irtype,bool is_Cond);
+    BrInst(std::shared_ptr<IRType> irtype,bool isCond);
     void dumpIR() override;
     bool isConditional() const;
     Value *getCondition() const;
@@ -415,8 +393,8 @@ class BrInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-//MemoryInst：Alloca Store Load GEP
-//分配栈帧指令：%a = alloca i32
+// 栈分配指令在当前函数栈帧中创建对象。
+// IR 结构：%a = alloca i32。
 class AllocaInst : public Instruction{
     public:
     AllocaInst(std::shared_ptr<IRType> irtype);
@@ -430,7 +408,8 @@ class AllocaInst : public Instruction{
 
 };
 
-//写入内存指令: store i32 3,i32* %a
+// 内存写入指令的第一个操作数是值，第二个操作数是目标指针。
+// IR 结构：store i32 3, i32* %a。
 class StoreInst : public Instruction{
     public:
     StoreInst(Value* val,Value* ptr);
@@ -442,7 +421,8 @@ class StoreInst : public Instruction{
 
 };
 
-//内存读出指令: %x = load i32,i32* %a
+// 内存读取指令从指针操作数指向的对象中取值。
+// IR 结构：%x = load i32, i32* %a。
 class LoadInst : public Instruction{
     public:
     LoadInst(Value* v);
@@ -452,14 +432,15 @@ class LoadInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-//GEP:根据基地址与索引计算某元素地址，用于数组成员寻址
-//%p = getelementptr inbounds [10 x i32], [10 x i32]* %arr, i64 0, i64 3
+// 元素地址指令根据基指针和逐层索引计算子对象地址。
+// IR 结构：%p = getelementptr inbounds [10 x i32], [10 x i32]* %arr, i64 0, i64 3。
 class GetElementPtrInst : public Instruction{
     public:
     GetElementPtrInst(Value* v);
     GetElementPtrInst(Value* v,std::vector<Value*>& vv);
     GetElementPtrInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
+    // 按基指针和全部索引逐层剖析元素类型，重算 GEP 的结果指针类型。
     void updateType();
     Value *getBasePointer() const;
     size_t getNumIndices() const;
@@ -469,11 +450,15 @@ class GetElementPtrInst : public Instruction{
     bool getBaseAndIndices(Value *&Base, std::vector<Value *> &Indices) const;
     static bool getBaseAndIndices(const GetElementPtrInst *GEP, Value *&Base,
                                   std::vector<Value *> &Indices);
+    // 原子地重建基指针和索引操作数，并同步更新结果类型。
     bool reset(Value *Base, const std::vector<Value *> &Indices);
+    // 返回最后一个索引对应的字节步长，类型链无效时返回空值。
     std::optional<int64_t> getLastIndexStride();
+    // 仅合并内层首索引为零的 GEP 链，保留展平后的索引顺序。
     bool flattenZeroBasedChain(Value *&Base, std::vector<Value *> &Indices);
     static bool flattenZeroBasedChain(Value *V, Value *&Base,
                                       std::vector<Value *> &Indices);
+    // 按类型层次计算每个索引的字节步长及最终指向对象的步长。
     static bool getIndexStrides(Value *Base,
                                 const std::vector<Value *> &Indices,
                                 std::vector<int64_t> &Strides,
@@ -484,8 +469,8 @@ class GetElementPtrInst : public Instruction{
 
 
 
-//Call:函数调用指令：%r = call i32 @foo(i32 %a)
-//尾调用标记：tail call i32 @foo(i32 %a)
+// 函数调用指令把第一个操作数作为被调函数，其余操作数作为实参。
+// IR 结构：%r = call i32 @foo(i32 %a)；%r = tail call i32 @foo(i32 %a)。
 class CallInst : public Instruction{
     bool tailCall = false;
     public:
@@ -513,7 +498,7 @@ class CallInst : public Instruction{
 
 
 
-//float-> int: %i = fptosi float %f to i32
+// 浮点转有符号整数指令：%i = fptosi float %f to i32。
 class FPTOSIInst : public Instruction{
     public:
     FPTOSIInst(Value* v);
@@ -522,7 +507,7 @@ class FPTOSIInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-//int -> float : %f = sitofp i32 to float
+// 有符号整数转浮点指令：%f = sitofp i32 %i to float。
 class SITOFPInst : public Instruction{
     public:
     SITOFPInst(Value* v);
@@ -532,7 +517,7 @@ class SITOFPInst : public Instruction{
 };
 
 
-//零扩展:%x32 = zext i1 %b to i32
+// 零扩展指令：%x32 = zext i1 %b to i32。
 class ZextInst : public Instruction{
     public:
     ZextInst(Value* v);
@@ -541,7 +526,7 @@ class ZextInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 截断: i32 -> i1
+// 整数截断指令：%b = trunc i32 %x to i1。
 class TruncInst : public Instruction{
     public:
     TruncInst(Value* v);
@@ -550,7 +535,7 @@ class TruncInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 符号扩展: i1 -> i32
+// 符号扩展指令：%x32 = sext i1 %b to i32。
 class SextInst : public Instruction{
     public:
     SextInst(Value* v);
@@ -559,9 +544,8 @@ class SextInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-//函数操作指令
-//Select:三元选择指令:cond ? __ : __
-//%r = select i1 %c, i32 %a, i32 %b
+// 条件选择指令根据 i1 条件在两个同类型值之间选择。
+// IR 结构：%r = select i1 %c, i32 %a, i32 %b。
 class SelectInst : public Instruction{
     public:
     SelectInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::SELECT;}
@@ -573,7 +557,8 @@ class SelectInst : public Instruction{
     void dumpIR() override;
 };
 
-//phi指令:%x = phi i32 [ %v1, %bb1 ], [ %v2, %bb2 ]
+// PHI 指令按实际到达的前驱边选择一个输入值。
+// IR 结构：%x = phi i32 [ %v1, %bb1 ], [ %v2, %bb2 ]。
 class PhiInst : public Instruction{
     public:
     struct IncomingEdge {
@@ -581,23 +566,18 @@ class PhiInst : public Instruction{
         BasicBlock *Pred = nullptr;
     };
     PhiInst(std::shared_ptr<IRType> irtype);
-    //PhiInst* clone(std::unordered_map<Value*,Value*>&)override;
     void dumpIR() override;
-    // 添加一个 incoming value: (Value*, BasicBlock*)。若同一前驱存在平行边，
-    // 同前驱 incoming 的顺序必须与该前驱终结指令中的同目标边顺序一致。
+    // 添加一个“输入值、前驱块”对；平行边的顺序必须与前驱终结指令中的边顺序一致。
     void addIncoming(Value* val, BasicBlock* bb);
-    // 获取 incoming 的数量 (每个 incoming 占 userList 中2个位置: val, bb)
+    // 每个入边项占用两个操作数位置：输入值在前，前驱块在后。
     unsigned getNumIncomingValues() const;
-    // 获取第 i 个 incoming 的 Value
     Value* getIncomingValue(unsigned i) const;
-    // 获取第 i 个 incoming 的 BasicBlock
     BasicBlock* getIncomingBlock(unsigned i) const;
-    // 设置第 i 个 incoming 的 Value (用于重命名时更新)
     void setIncomingValue(unsigned i, Value* val);
     bool setIncomingBlock(unsigned i, BasicBlock *BB);
     unsigned countIncomingFromPred(BasicBlock *Pred) const;
     std::vector<IncomingEdge> collectIncomingEdges();
-    // 重建可能折叠并删除 Phi；成功后调用方不得继续使用旧 Phi 指针。
+    // 重建时零个或一个入边项会折叠并删除原 PHI，成功后原指针立即失效。
     static bool rebuildFromIncoming(PhiInst *Phi, const std::vector<IncomingEdge> &Incoming);
     static bool removeIncomingByPred(PhiInst *Phi, BasicBlock *Pred, int RemoveCount);
     static bool removeIncomingEdge(PhiInst *Phi, BasicBlock *Pred,
@@ -613,7 +593,8 @@ class PhiInst : public Instruction{
 
 
 
-//指针转换
+// 位转换指令仅改变值的静态类型，不改变其位模式。
+// IR 结构：%q = bitcast i32* %p to float*。
 class BitCastInst : public Instruction {
 public:
     BitCastInst(Value* v, std::shared_ptr<IRType> targetType);
@@ -622,12 +603,11 @@ public:
 };
 
 
- //常量系统
- class ConstantSystem : public Value{
+// 常量对象通过各子类工厂创建，并在实现允许时复用已有实例。
+class ConstantSystem : public Value{
     public:
     ConstantSystem()=delete;
     ConstantSystem(std::shared_ptr<IRType> irtype);
-    //virtual ConstantSystem* clone(std::unordered_map<Value*, Value*>&)override;
     virtual bool isConst(){return true;}
 };
 
@@ -650,7 +630,7 @@ class ConstBool : public ConstantSystem{
     ConstInt(int val, size_t size);
     public:
     int getVal() const;
-    //静态工厂方法
+    // 按整数值和存储字节数返回驻留常量。
      static ConstInt* newConstInt(int val = 0, size_t size = 4);
  };
 
@@ -677,6 +657,7 @@ class ConstBool : public ConstantSystem{
     static UndefValue* NewUndefValue(std::shared_ptr<IRType> it);
  };
 
+// 按模块、函数或基本块的现有线性顺序收集指定类型的可变指令指针。
 template <typename InstT = Instruction, typename IRUnitT>
 std::vector<InstT *> collectInstructions(IRUnitT &IRUnit) {
     static_assert(std::is_base_of_v<Instruction, InstT>,

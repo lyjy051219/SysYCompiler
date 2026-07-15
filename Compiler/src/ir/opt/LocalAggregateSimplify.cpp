@@ -219,7 +219,7 @@ LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     Value *V, std::unordered_set<Value *> &Visiting) {
     LocalAggregatePointerPath Result;
     if (!V) return Result;
-    TraverseTools::ScopedActiveMark VisitingMark(Visiting, V);
+    ScopedActiveMark VisitingMark(Visiting, V);
     if (!VisitingMark.inserted()) return Result;
 
     if (auto *AI = dynamic_cast<AllocaInst *>(V)) {

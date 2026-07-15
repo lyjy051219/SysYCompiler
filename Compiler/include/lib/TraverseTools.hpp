@@ -12,9 +12,7 @@
 #include <utility>
 #include <vector>
 
-//用于支持中端各种遍历对象和遍历方法的工具库
-
-namespace TraverseTools {
+// 提供中端所需的工作队列、作用域标记和通用图遍历算法。
 
 enum class TraversalControl {
 	Continue,
@@ -27,7 +25,7 @@ enum class WorkListOrder {
 	LIFO,
 };
 
-// 只对“当前仍在队列中的元素”去重；pop 后同一元素可以再次入队。
+// 只对当前仍在队列中的元素去重；元素出队后可以再次入队。
 // 这与 SCCP/Range 中允许重复调度的队列语义不同，不能用于替换它们。
 template <typename ValueT, WorkListOrder Order = WorkListOrder::FIFO,
 	      typename HashT = std::hash<ValueT>,
@@ -70,7 +68,7 @@ public:
 };
 
 // 递归证明只在“当前递归路径”上标记节点；所有提前返回都会自动撤销标记。
-// 它不是全局 visited 集，遇环时应返回什么仍由调用方决定。
+// 它不是全局已访问集合，遇环时的处理结果仍由调用方决定。
 template <typename SetT>
 class ScopedActiveMark {
 	SetT *ActiveSet;
@@ -97,7 +95,7 @@ public:
 template <typename SetT>
 ScopedActiveMark(SetT &, typename SetT::value_type) -> ScopedActiveMark<SetT>;
 
-// Visitor 返回 void 时完整遍历，返回可转换为 bool 的类型时 false 表示提前停止。
+// 回调返回 void 时完整遍历，返回可转换为 bool 的类型时 false 表示提前停止。
 template <typename VisitorT, typename... ArgT>
 bool invokeTraversalVisitor(VisitorT &Visitor, ArgT &&...Args) {
 	static_assert(std::is_invocable_v<VisitorT &, ArgT...>,
@@ -136,7 +134,7 @@ TraversalControl invokeTraversalControlVisitor(VisitorT &Visitor,
 	}
 }
 
-// 对 intrusive list 做结构性修改前使用。快照保持原顺序，也保留空指针。
+// 对侵入式链表做结构性修改前使用；快照保持原顺序，也保留空指针。
 template <typename RangeT>
 auto snapshotPointers(RangeT &Range) {
 	using PointerT = std::decay_t<decltype(*std::begin(Range))>;
@@ -147,8 +145,8 @@ auto snapshotPointers(RangeT &Range) {
 	return Result;
 }
 
-// 按 Module -> Function -> BasicBlock -> Instruction 的现有线性顺序访问。
-// Visitor 可接收 (InstT *) 或 (BasicBlock *, InstT *)。遍历期间可以替换操作数，
+// 按模块、函数、基本块、指令的现有线性顺序访问。
+// 回调可接收 (InstT *) 或 (BasicBlock *, InstT *)。遍历期间可以替换操作数，
 // 但不得插入、删除或移动正在遍历的指令；这类变更应先用 collectInstructions 快照。
 template <typename InstT = Instruction, typename IRUnitT, typename VisitorT>
 bool forEachInstruction(IRUnitT &IRUnit, VisitorT &&Visitor) {
@@ -201,7 +199,7 @@ bool forEachInstruction(IRUnitT &IRUnit, VisitorT &&Visitor) {
 	return true;
 }
 
-// 对调用方选定并排序的块集合做线性指令遍历；Loop 的 RPO、函数顺序、
+// 对调用方选定并排序的块集合做线性指令遍历；循环逆后序、函数顺序、
 // 含/不含子循环等语义由 BlockRange 明确决定，本接口不会替调用方改序或去重。
 template <typename InstT = Instruction, typename BlockRangeT, typename VisitorT>
 bool forEachInstructionInBlocks(const BlockRangeT &Blocks, VisitorT &&Visitor) {
@@ -212,8 +210,8 @@ bool forEachInstructionInBlocks(const BlockRangeT &Blocks, VisitorT &&Visitor) {
 	return true;
 }
 
-// 保持 operand 索引顺序。Visitor 接收 (Index, Use *, Value *)。
-// 遍历期间允许替换 usee，但不得增删 operand。
+// 保持操作数索引顺序；回调接收 (Index, Use *, Value *)。
+// 遍历期间允许替换被使用值，但不得增删操作数。
 template <typename VisitorT>
 bool forEachOperand(User *U, VisitorT &&Visitor) {
 	if (!U) return true;
@@ -227,8 +225,8 @@ bool forEachOperand(User *U, VisitorT &&Visitor) {
 	return true;
 }
 
-// 保持 PHI incoming 的顺序和重复前驱边。Visitor 接收
-// (Index, IncomingValue, IncomingBlock)。重建 PHI 时仍应先 collectIncomingEdges。
+// 保持 PHI 入边项的顺序和重复前驱边；回调接收
+// (Index, IncomingValue, IncomingBlock)。重建 PHI 时仍应先收集入边快照。
 template <typename VisitorT>
 bool forEachPhiIncoming(PhiInst *Phi, VisitorT &&Visitor) {
 	if (!Phi) return true;
@@ -243,7 +241,7 @@ bool forEachPhiIncoming(PhiInst *Phi, VisitorT &&Visitor) {
 }
 
 // 第一层：模板特化层
-// SuccessorProvider：提供不同遍历对象的“后继”定义
+// SuccessorProvider 为不同遍历对象提供“后继”定义。
 // 若后续新增遍历对象，只需补充对应特化
 template <typename NodeT>
 struct SuccessorProvider;
@@ -322,8 +320,8 @@ void appendPreOrderIterative(NodeT *Start,
 	}
 }
 
-// 弹栈时去重，等价于中端常用的显式 DFS preorder 写法。
-// Visitor 返回 SkipSuccessors 可剪枝，返回 Stop（或 bool false）可提前终止。
+// 弹栈时去重，等价于显式深度优先先序遍历。
+// 回调返回 SkipSuccessors 可剪枝，返回 Stop 或 false 可提前终止。
 template <typename NodeT, typename RootRangeT, typename SuccessorFn,
 	      typename VisitorT>
 bool forEachReachablePreOrderCustomSucc(
@@ -462,7 +460,9 @@ std::vector<NodeT *> reversePostOrder(std::vector<NodeT *> PostOrder) {
 
 
 
-// 第三层：接口层
+// 第三层：公共接口层。
+// 带 AllNodes 的接口会在根可达序列之后补入尚未访问的节点。
+// 名称带 FromRoots 的接口只处理根可达区域，RPO 接口返回后序的逆序结果。
 template <typename NodeT, typename RootRangeT, typename AllRangeT>
 std::vector<NodeT *> buildPostOrder(const RootRangeT &Roots, const AllRangeT &AllNodes) {
 	return buildPostOrderCustomSucc<NodeT>(
@@ -527,6 +527,4 @@ std::vector<NodeT *> buildRPO(const RootRangeT &Roots, const AllRangeT &AllNodes
 template <typename NodeT, typename RootRangeT>
 std::vector<NodeT *> buildRPOFromRoots(const RootRangeT &Roots) {
 	return reversePostOrder(buildPostOrderFromRoots<NodeT>(Roots));
-}
-
 }

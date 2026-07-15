@@ -1,22 +1,21 @@
 %header "include/yacc/Bison.hpp"
 %output "src/yacc/Bison.cpp"
-%define parse.trace
-//注意上面这两行是在项目根目录下运行指令，然后自动会将两个文件生成到对应的目录下
+// 生成文件路径相对于项目根目录。
 %language "c++"
-//使用yy::parser::make
+// 令牌由 yy::parser::make_* 构造函数创建。
 %define api.token.constructor
-//不用union存放语义值，用std::variant<...>
+// 语义值使用 std::variant 保存，避免手动管理联合体生命周期。
 %define api.value.type variant
 %require "3.2"
 
-//放在bison,hpp头文件里面的
+// 以下依赖写入生成的 Bison.hpp。
 %code requires{
   #include "../lib/AST.hpp"
-  #include<memory>
+  #include <memory>
   #include <iostream>
 }
 
-//放在bison.cpp里面的
+// 以下实现写入生成的 Bison.cpp。
 %code{
 extern yy::parser::symbol_type yylex();
 extern std::unique_ptr<CompUnit> ASTRoot;
@@ -29,7 +28,7 @@ namespace yy {
 }
 }
 
-//终结符
+// 终结符定义。
 %token <int> INTCONST
 %token <float> FLOATCONST
 %token <std::string> IDENT
@@ -69,7 +68,7 @@ namespace yy {
 %token END
 
 
-//非终结符
+// 非终结符及其语义值类型。
 %nterm <CompUnit*> CompUnit
 %nterm <Stmt*> Decl
 %nterm <ConstDecl*> ConstDecl
@@ -89,10 +88,10 @@ namespace yy {
 %nterm <BlockItemList*> BlockItemList
 %nterm <Stmt*> BlockItem
 %nterm <Stmt*> Stmt
-//这两个是关于数组维度列表的
+// 常量维度与运行时下标分别使用不同的列表产生式。
 %nterm <ArrayList*> ConstExpList
 %nterm <ArrayList*> ExpList
-//函数实参
+// 函数实参列表。
 %nterm <FuncRParamList*> FuncRParamList
 
 %nterm <LVal*> LVal
@@ -111,27 +110,27 @@ namespace yy {
 %%
 Start: CompUnit { ASTRoot = std::unique_ptr<CompUnit>($1); }
 
-//如果写成左递归的话就是push_back，然后就是使用vector进行保存数据
+// 编译单元使用左递归产生式，并按源码顺序在列表尾部追加节点。
 CompUnit
-  : CompUnit Decl{$$ = $1; $$->push_back((BaseAST*)$2);}
-  | CompUnit FuncDef{$$ = $1; $$->push_back((BaseAST*)$2);}
+  : CompUnit Decl{$$ = $1; $$->pushBack((BaseAST*)$2);}
+  | CompUnit FuncDef{$$ = $1; $$->pushBack((BaseAST*)$2);}
   | Decl{$$ = new CompUnit((BaseAST*)$1);}
   | FuncDef {$$ = new CompUnit((BaseAST*)$1);}
   ;
 
-//直接用ConstDecl/VarDecl替换Decl，将BaseAST*替换成Stmt*
+// 常量声明与变量声明统一转换为语句节点。
 Decl
   : ConstDecl { $$ = (Stmt*)$1; }
   | VarDecl { $$ = (Stmt*)$1; }
   ;
 
-//根据ConstDefList和Type创建ConDecl对象
+// 常量声明由基础类型和同类型定义列表组成。
 ConstDecl
   : CONST Type ConstDefList SEMICOLON{ $$ = new ConstDecl($2,$3); }
   ;
 
 ConstDefList
-  : ConstDefList COMMA ConstDef{ $$ = $1; $1->push_back($3); }
+  : ConstDefList COMMA ConstDef{ $$ = $1; $1->pushBack($3); }
   | ConstDef{ $$ = new ConstDefList($1); }
   ;
 
@@ -141,7 +140,7 @@ ConstDef
   ;
 
 ConstExpList
- : ConstExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET{ $$ = $1; $$->push_back($3); }
+ : ConstExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET{ $$ = $1; $$->pushBack($3); }
  | L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET { $$ = new ArrayList($2); }
  ;
 
@@ -153,7 +152,7 @@ ConstInitVal
 
 ConstInitValList
  : ConstInitVal{ $$ = new InitValList($1); }
- | ConstInitValList COMMA ConstInitVal{ $$ = $1; $$->push_back($3); }
+ | ConstInitValList COMMA ConstInitVal{ $$ = $1; $$->pushBack($3); }
  ;
 
 VarDecl
@@ -162,7 +161,7 @@ VarDecl
 
 VarDefList
  : VarDef{ $$ = new VarDefList($1); }
- | VarDefList COMMA VarDef{ $$ = $1; $$->push_back($3); }
+ | VarDefList COMMA VarDef{ $$ = $1; $$->pushBack($3); }
  ;
 
 VarDef
@@ -180,17 +179,17 @@ InitVal
 
 InitValList
  : InitVal { $$ = new InitValList($1); }
- | InitValList COMMA InitVal { $$ = $1; $$->push_back($3); }
+ | InitValList COMMA InitVal { $$ = $1; $$->pushBack($3); }
  ;
 
 FuncDef
  : Type IDENT L_SMALL_BRACKET R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2, nullptr, $5); }
  | Type IDENT L_SMALL_BRACKET FuncFParamList R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2, $4, $6); }
- ;
+  ;
 
 FuncFParamList
  : FuncFParam { $$ = new FuncParamList($1); }
- | FuncFParamList COMMA FuncFParam { $$ = $1; $$->push_back($3); }
+ | FuncFParamList COMMA FuncFParam { $$ = $1; $$->pushBack($3); }
  ;
 
 FuncFParam
@@ -207,14 +206,15 @@ Block
 
 BlockItemList
  : BlockItem { $$ = new BlockItemList($1); }
- | BlockItemList BlockItem { $$ = $1; $$->push_back($2); }
+ | BlockItemList BlockItem { $$ = $1; $$->pushBack($2); }
  ;
 
 BlockItem
  : Decl{ $$ = (Stmt*)$1; }
  | Stmt{ $$ = (Stmt*)$1; }
- ;
+  ;
 
+// 语句产生式覆盖赋值、分支、循环、跳转和返回。
 Stmt
  : LVal ASSIGN AddExp SEMICOLON{ $$ = new AssignStmt($1,$3); }
  | SEMICOLON { $$ = new ExpStmt(nullptr); }
@@ -227,7 +227,7 @@ Stmt
  | CONTINUE SEMICOLON { $$ = new ContinueStmt(); }
  | RETURN SEMICOLON { $$ = new ReturnStmt(); }
  | RETURN AddExp SEMICOLON { $$ = new ReturnStmt($2); }
- ;
+  ;
 
 
 LVal
@@ -237,7 +237,7 @@ LVal
 
 ExpList
  : L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET{ $$ = new ArrayList($2); }
- | ExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET{ $$ = $1; $$->push_back($3); }
+ | ExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET{ $$ = $1; $$->pushBack($3); }
  ;
 
 PrimaryExp
@@ -247,58 +247,58 @@ PrimaryExp
  | FLOATCONST{ $$ = (HasOperand*)(new ConValue<float>($1)); }
  | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1, yylineno));}
  | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = (HasOperand*)(new FuncCall($1, $3, yylineno));}
- ;
+  ;
 
 
-//只有一元表达式这里用到了push_front()
+// 一元运算符按从外到内的顺序插入表达式链表头部。
 UnaryExp
  : PrimaryExp{ $$ = new UnaryExp($1); }
- | ADD UnaryExp{ $$ = $2; $$->push_front(SY_ADD); }
- | SUB UnaryExp{ $$ = $2; $$->push_front(SY_SUB); }
- | NOT UnaryExp{ $$ = $2; $$->push_front(SY_NOT); }
- ;
+ | ADD UnaryExp{ $$ = $2; $$->pushFront(SY_ADD); }
+ | SUB UnaryExp{ $$ = $2; $$->pushFront(SY_SUB); }
+ | NOT UnaryExp{ $$ = $2; $$->pushFront(SY_NOT); }
+  ;
 
 
 FuncRParamList
  : AddExp { $$ = new FuncRParamList($1); }
- | FuncRParamList COMMA AddExp{ $$ = $1; $$->push_back($3); }
+ | FuncRParamList COMMA AddExp{ $$ = $1; $$->pushBack($3); }
  ;
 
 MulExp
  : UnaryExp { $$ = new MulExp($1); }
- | MulExp MUL UnaryExp { $$ = $1; $$->push_back(SY_MUL); $$->push_back($3); }
- | MulExp DIV UnaryExp { $$ = $1; $$->push_back(SY_DIV); $$->push_back($3); }
- | MulExp MOD UnaryExp { $$ = $1; $$->push_back(SY_MOD); $$->push_back($3); }
+ | MulExp MUL UnaryExp { $$ = $1; $$->pushBack(SY_MUL); $$->pushBack($3); }
+ | MulExp DIV UnaryExp { $$ = $1; $$->pushBack(SY_DIV); $$->pushBack($3); }
+ | MulExp MOD UnaryExp { $$ = $1; $$->pushBack(SY_MOD); $$->pushBack($3); }
  ;
 
 AddExp
  : MulExp{ $$ = new AddExp($1); }
- | AddExp ADD MulExp{ $$ = $1; $$->push_back(SY_ADD); $$->push_back($3); }
- | AddExp SUB MulExp{ $$ = $1; $$->push_back(SY_SUB); $$->push_back($3); }
+ | AddExp ADD MulExp{ $$ = $1; $$->pushBack(SY_ADD); $$->pushBack($3); }
+ | AddExp SUB MulExp{ $$ = $1; $$->pushBack(SY_SUB); $$->pushBack($3); }
  ;
 
 RelExp
  : AddExp {$$ = new RelExp($1);}
- | RelExp LESS AddExp{ $$ = $1; $$->push_back(SY_LESS); $$->push_back($3); }
- | RelExp GREAT AddExp{ $$ = $1; $$->push_back(SY_GREAT); $$->push_back($3); }
- | RelExp LESSEQ AddExp{ $$ = $1; $$->push_back(SY_LESSEQ); $$->push_back($3); }
- | RelExp GREATEQ AddExp{ $$ = $1; $$->push_back(SY_GREATEQ); $$->push_back($3); }
+ | RelExp LESS AddExp{ $$ = $1; $$->pushBack(SY_LESS); $$->pushBack($3); }
+ | RelExp GREAT AddExp{ $$ = $1; $$->pushBack(SY_GREAT); $$->pushBack($3); }
+ | RelExp LESSEQ AddExp{ $$ = $1; $$->pushBack(SY_LESSEQ); $$->pushBack($3); }
+ | RelExp GREATEQ AddExp{ $$ = $1; $$->pushBack(SY_GREATEQ); $$->pushBack($3); }
  ;
 
 EqExp
  : RelExp{ $$ = new EqExp($1); }
- | EqExp EQ RelExp{ $$ = $1; $$->push_back(SY_EQ); $$->push_back($3); }
- | EqExp NOTEQ RelExp{ $$ = $1; $$->push_back(SY_NOTEQ); $$->push_back($3); }
+ | EqExp EQ RelExp{ $$ = $1; $$->pushBack(SY_EQ); $$->pushBack($3); }
+ | EqExp NOTEQ RelExp{ $$ = $1; $$->pushBack(SY_NOTEQ); $$->pushBack($3); }
  ;
 
 LAndExp
  : EqExp { $$ = new LAndExp($1); }
- | LAndExp AND EqExp{ $$ = $1; $$->push_back(SY_AND); $$->push_back($3); }
+ | LAndExp AND EqExp{ $$ = $1; $$->pushBack(SY_AND); $$->pushBack($3); }
  ;
 
 LOrExp
  : LAndExp{ $$ = new LOrExp($1); }
- | LOrExp OR LAndExp{ $$ = $1; $$->push_back(SY_OR); $$->push_back($3); }
+ | LOrExp OR LAndExp{ $$ = $1; $$->pushBack(SY_OR); $$->pushBack($3); }
  ;
 
 

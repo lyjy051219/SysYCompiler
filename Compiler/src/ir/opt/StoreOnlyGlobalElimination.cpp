@@ -69,7 +69,7 @@ void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
         return;
     }
     if (auto *phi = dynamic_cast<PhiInst*>(ptr)) {
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             phi, [&](unsigned, Value *Incoming, BasicBlock *) {
                 collectReachableBases(Incoming, bases, visited,
                                       escape, depth + 1);
@@ -78,7 +78,7 @@ void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
         return;
     }
     if (auto *sel = dynamic_cast<SelectInst*>(ptr)) {
-        TraverseTools::forEachOperand(
+        forEachOperand(
             sel, [&](size_t I, Use *, Value *Operand) {
                 if (I == 0) return true;
                 collectReachableBases(Operand, bases, visited,
@@ -111,7 +111,7 @@ StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
         if (auto *gep = dynamic_cast<GetElementPtrInst*>(cur)) {
             if (gep->getNumOperands() == 0) { R.unresolved = true; return R; }
             // UL[1..] 是索引，累积（全常量才有意义）
-            TraverseTools::forEachOperand(
+            forEachOperand(
                 gep, [&](size_t I, Use *, Value *vi) {
                 if (I == 0) return;
                 if (auto *ci = dynamic_cast<ConstInt*>(vi)) {
@@ -183,7 +183,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         Function *F = funcPtr.get();
         if (!F) continue;
 
-        TraverseTools::forEachInstruction(*F, [&](Instruction *I) {
+        forEachInstruction(*F, [&](Instruction *I) {
                 // LoadInst → 读
                 if (auto *LI = dynamic_cast<LoadInst*>(I)) {
                     Value *ptr = LI->getPointerOperand();
@@ -378,7 +378,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             if (!F) continue;
             auto &AA = FAM.getResult<BasicAliasAnalysis>(*F);
             auto &LI = FAM.getResult<LoopAnalysis>(*F);
-            TraverseTools::forEachInstruction(*F, [&](Instruction *I) {
+            forEachInstruction(*F, [&](Instruction *I) {
                 if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
                     if (isModSet(getInstModRefInfo(G, SI2, AA, LI, FAM))) {
                         anyWrite = true;

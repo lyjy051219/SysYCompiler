@@ -10,8 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-// ASTVisitor 仍负责顶层、声明和语句的动态分派；表达式及其他会产生结果的
-// 子树由显式返回值的 lowering 接口处理。这样父子节点之间不再依赖共享栈。
+// 顶层节点通过 ASTVisitor 动态分派；产生值的子树由显式返回值接口递归生成 IR。
 class IRGenerator final : public ASTVisitor {
 private:
     struct LoopTargets {
@@ -45,8 +44,8 @@ private:
         Initializer* constantInitializer = nullptr;
     };
 
-    // value 是常量/已退化指针或对象地址；objectType 明确描述当前对象，
-    // isAddress 决定是否 load，避免再通过下标数量和指针层级猜测。
+    // value 可表示常量、退化后的指针或对象地址，objectType 描述源码对象类型。
+    // isAddress 指示读取右值时是否需要生成内存读取指令。
     struct LValueRef {
         Value* value = nullptr;
         std::shared_ptr<IRType> objectType;
@@ -54,10 +53,11 @@ private:
         bool isMutable = false;
     };
 
-    GenerationContext context_;
-    std::unordered_map<std::string, Function*> functions_;
-    std::unordered_map<Value*, Binding> bindings_;
+    GenerationContext context;
+    std::unordered_map<std::string, Function*> functions;
+    std::unordered_map<Value*, Binding> bindings;
 
+    // 将源码类型转换为 IR 类型，并判断表达式或初始化式能否在编译期求值。
     BasicBlock& currentBlock() const;
     TypeSystem lowerSourceType(Type type, bool allowVoid = false) const;
     std::shared_ptr<IRType> lowerScalarType(Type type) const;
@@ -71,6 +71,7 @@ private:
     bool hasConstantOperands(const BaseExp<OperandT>& node) const;
     bool isConstantInitializerSyntax(const InitVal& node) const;
 
+    // 根据声明所处位置、常量属性和数组形状生成对象及其初始化指令。
     template <typename DefinitionT>
     void lowerDefinition(DefinitionT& node, TypeSystem declaredType,
                          bool isConstant);
@@ -97,12 +98,14 @@ private:
                                       Initializer& initializer,
                                       std::vector<int>& indices);
 
+    // 解析符号绑定和下标，区分常量值、普通对象地址与数组形参地址。
     LValueRef lowerLValue(const LVal& node);
     Value* lowerRValue(const LVal& node);
     Value* decayArrayPointer(Value* pointer);
     Value* tryLowerConstantArrayElement(
         const Binding& binding, const std::vector<Value*>& indices);
 
+    // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
     Value* lowerPrimary(const HasOperand& node);
     Value* lowerExpression(const UnaryExp& node);
     Value* lowerExpression(const MulExp& node);
@@ -119,6 +122,7 @@ private:
     Value* emitBinary(Value* left, BinaryInst::Operation operation,
                       Value* right);
 
+    // 分别按用户函数签名和 SysY 运行库约定检查、转换调用实参。
     std::vector<Value*> lowerArguments(const FuncRParamList& node);
     Value* emitCall(const FuncCall& node, std::vector<Value*> arguments);
     bool coerceCallArguments(const std::string& callee,
@@ -129,6 +133,7 @@ private:
     Value* logicalNot(Value* value);
     Value* zeroValue(const std::shared_ptr<IRType>& type) const;
 
+    // 为逻辑与、逻辑或建立短路控制流；丢弃结果时汇合到新的继续块。
     void emitCondition(const LOrExp& node, BasicBlock* entry,
                        BasicBlock* isTrue, BasicBlock* isFalse);
     void emitCondition(const LAndExp& node, BasicBlock* entry,
@@ -168,7 +173,7 @@ public:
     void visit(ContinueStmt& node) override;
     void visit(ReturnStmt& node) override;
 
-    // 表达式兼容入口。IRGenerator 内部不会用这些 void Visitor 回传值。
+    // 这些入口仅兼容通用访问器；生成器内部通过显式返回值接口取得表达式结果。
     void visit(LVal& node) override;
     void visit(FuncCall& node) override;
     void visit(ArrayList& node) override;

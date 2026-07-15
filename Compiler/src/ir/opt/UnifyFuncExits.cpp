@@ -12,7 +12,7 @@
 PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassManager &) {
 	std::vector<std::pair<BasicBlock *, RetInst *>> retSites;
 
-	TraverseTools::forEachInstruction<RetInst>(
+	forEachInstruction<RetInst>(
 		F, [&](BasicBlock *BB, RetInst *RI) {
 			if (BB->back() == RI) retSites.emplace_back(BB, RI);
 		});
@@ -31,7 +31,7 @@ PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassMana
 		UnifiedExit->genRetInst();
 	} else {
 		retPhi = new PhiInst(F.getIRType());
-		UnifiedExit->push_back(retPhi);
+		UnifiedExit->pushBack(retPhi);
 		UnifiedExit->genRetInst(retPhi);
 	}
 

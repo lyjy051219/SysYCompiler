@@ -232,11 +232,11 @@ bool LICMPass::cacheLoopInvariantCall(
 	F.pushBlock(ComputeBB);
 	F.pushBlock(MergeBB);
 
-	CI->EraseFromParent();
-	ComputeBB->push_back(CI);
+	CI->eraseFromParent();
+	ComputeBB->pushBack(CI);
 	for (Instruction *I : Tail) {
-		I->EraseFromParent();
-		MergeBB->push_back(I);
+		I->eraseFromParent();
+		MergeBB->pushBack(I);
 	}
 
 	// The old terminator now belongs to MergeBB, hence all of its successor
@@ -270,9 +270,9 @@ bool LICMPass::cacheLoopInvariantCall(
 	CachedPhi->addIncoming(ValuePhi, BackedgePred);
 
 	ValuePhi->addIncoming(CachedPhi, BB);
-	MergeBB->push_front(ValuePhi);
-	Header->push_front(CachedPhi);
-	Header->push_front(FirstPhi);
+	MergeBB->pushFront(ValuePhi);
+	Header->pushFront(CachedPhi);
+	Header->pushFront(FirstPhi);
 
 	for (Use *U : OriginalUses)
 		if (U && U->getValue() == CI) U->replaceUseeWith(ValuePhi);
@@ -301,7 +301,7 @@ bool LICMPass::isInvariant(
 	const DominatorTree &DT,
 	const std::unordered_set<Instruction *> &InvariantSet) {
 	if (!I || !I->getParent()) return false;
-	return TraverseTools::forEachOperand(
+	return forEachOperand(
 		I, [&](size_t, Use *, Value *V) {
 		if (!V) return false;
 
@@ -636,7 +636,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						continue;
 					}
 
-					TraverseTools::forEachOperand(
+					forEachOperand(
 						Cloned, [&](size_t, Use *U, Value *OldOp) {
 						if (!OldOp) return;
 
@@ -663,7 +663,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 								delete Bridge;
 								Bridge = nullptr;
 							} else {
-								ExitBB->push_front(Bridge);
+								ExitBB->pushFront(Bridge);
 								ExitPhiCache[Key] = Bridge;
 							}
 						}
@@ -673,7 +673,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 					auto InsIt = ExitBB->begin();
 					while (InsIt != ExitBB->end() && dynamic_cast<PhiInst *>(*InsIt)) ++InsIt;
-					if (InsIt == ExitBB->end()) ExitBB->push_back(Cloned);
+					if (InsIt == ExitBB->end()) ExitBB->pushBack(Cloned);
 					else InsIt.insertBefore(Cloned);
 					ExitClone[ExitBB] = Cloned;
 				}
@@ -709,7 +709,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 				if (!RewriteOK) continue;
 
-				I->EraseFromParent();
+				I->eraseFromParent();
 				MemorySSAUsable = false;
 				delete I;
 				LocalChanged = true;
@@ -783,7 +783,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				while (TermIt != PreHeader->end() && *TermIt != PreHeader->back()) ++TermIt;
 				if (TermIt == PreHeader->end()) continue;
 
-				I->EraseFromParent();
+				I->eraseFromParent();
 				TermIt.insertBefore(I);
 				HoistInvariant.insert(I);
 				LocalChanged = true;

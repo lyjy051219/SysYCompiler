@@ -204,7 +204,7 @@ void SCCPSolver::visitPhiNode(PhiInst* Phi) {
     BasicBlock* PhiBB = Phi->getParent();
     LatticeValue Result = LatticeValue::getTop();
 
-    TraverseTools::forEachPhiIncoming(
+    forEachPhiIncoming(
         Phi, [&](unsigned, Value *InVal, BasicBlock *InBB) {
             // 只考虑可行边
             if (!isEdgeFeasible(InBB, PhiBB))
@@ -588,7 +588,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
                 }
                 for (PhiInst* phi : phis) {
                     bool needRebuild = false;
-                    TraverseTools::forEachPhiIncoming(
+                    forEachPhiIncoming(
                         phi, [&](unsigned, Value *, BasicBlock *IncomingBlock) {
                             if (IncomingBlock == DeadBB) {
                                 needRebuild = true;
@@ -599,7 +599,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
                     if (!needRebuild) continue;
 
                     PhiInst* newPhi = new PhiInst(phi->getIRType());
-                    TraverseTools::forEachPhiIncoming(
+                    forEachPhiIncoming(
                         phi, [&](unsigned, Value *IncomingValue,
                                  BasicBlock *IncomingBlock) {
                             if (IncomingBlock != DeadBB) {
@@ -641,7 +641,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
         changed = true;
     }
     for (BasicBlock* DeadBB : deadBlocks) {
-        DeadBB->EraseFromParent();
+        DeadBB->eraseFromParent();
     }
     if (!deadBlocks.empty()) {
         CfgChanged = true;
@@ -650,7 +650,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
     // 4. 对于可达块中条件为常量的分支，替换为无条件跳转
     for (auto bb : F) {
         if (!isBlockExecutable(bb)) continue;
-        if (bb->Size() == 0) continue;
+        if (bb->size() == 0) continue;
 
         Instruction* term = bb->back();
         BrInst* br = dynamic_cast<BrInst*>(term);

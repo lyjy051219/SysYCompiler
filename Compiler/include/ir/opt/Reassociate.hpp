@@ -42,8 +42,8 @@ private:
 	uint64_t NextStableOrder = 0;
 	std::unordered_map<BasicBlock *, uint32_t> BlockBase;
 	std::unordered_map<BasicBlock *, uint32_t> BlockSeq;
-	TraverseTools::UniqueWorkList<
-		Instruction *, TraverseTools::WorkListOrder::LIFO> Todo;
+	UniqueWorkList<
+		Instruction *, WorkListOrder::LIFO> Todo;
 
 	void initRankMap();
 	uint32_t getRank(Value *V) const;

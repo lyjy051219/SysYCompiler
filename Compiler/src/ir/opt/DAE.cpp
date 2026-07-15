@@ -123,7 +123,7 @@ bool DAEPass::isParamLive(
 		if (It->second == ParamLiveness::InProgress) return false;
 	}
 
-	TraverseTools::ScopedActiveMark VisitingMark(Visiting, Param);
+	ScopedActiveMark VisitingMark(Visiting, Param);
 	if (!VisitingMark.inserted()) {
 		Memo[Param] = ParamLiveness::Dead;
 		return false;

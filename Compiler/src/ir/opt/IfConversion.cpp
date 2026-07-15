@@ -283,8 +283,8 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 	delete M.PredBr;
 
 	for (Instruction *I : ToMove) {
-		I->EraseFromParent();
-		M.Pred->push_back(I);
+		I->eraseFromParent();
+		M.Pred->pushBack(I);
 	}
 
 	for (PhiInst *Phi : Phis) {
@@ -322,7 +322,7 @@ PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManage
 	while (true) {
 		bool Changed = false;
 
-		auto Blocks = TraverseTools::snapshotPointers(F);
+		auto Blocks = snapshotPointers(F);
 
 		for (BasicBlock *BB : Blocks) {
 			if (!BB) continue;

@@ -9,10 +9,8 @@
 
 static void rollbackClonedBlocks(
     std::vector<BasicBlock *> &Blocks) noexcept {
-    // First remove every use made by a clone while all cloned definitions and
-    // block labels are still alive.  This prevents Value::~Value() from
-    // recursively deleting another clone (or, for an external reference, an
-    // instruction in the source region) during rollback.
+    // 在克隆定义和块标签仍存活时先清空全部操作数，避免回滚析构递归删除
+    // 其他克隆对象或被临时引用的源区域指令。
     for (BasicBlock *BB : Blocks) {
         if (!BB) continue;
         for (Instruction *I : *BB) {
@@ -58,7 +56,7 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
         }
         if (!SourceFunction) SourceFunction = BB->getParent();
         if (BB->getParent() != SourceFunction) return std::nullopt;
-        InstructionCount += static_cast<std::size_t>(BB->Size());
+        InstructionCount += static_cast<std::size_t>(BB->size());
     }
     for (const auto &Entry : InitialMap) {
         if (!Entry.first || !Entry.second) return std::nullopt;
@@ -78,9 +76,8 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
     };
 
     try {
-        // Phase 1: construct the complete old-block -> new-block map.  This
-        // makes all internal branch and PHI block operands immediately
-        // remappable while leaving region exits untouched.
+        // 第一阶段建立完整的源块到新块映射，使区域内分支和 PHI 块操作数
+        // 都可重映射，同时保持指向区域外的出口不变。
         for (std::size_t Index = 0; Index < SourceBlocks.size(); ++Index) {
             BasicBlock *OldBB = SourceBlocks[Index];
             auto *NewBB = new BasicBlock();
@@ -93,9 +90,8 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
             }
         }
 
-        // Phase 2: clone instructions and complete old-instruction ->
-        // new-instruction mappings.  A clone may temporarily retain a forward
-        // reference to the source instruction; the final pass below fixes it.
+        // 第二阶段按块顺序克隆指令并补全指令映射；此时允许克隆指令暂时
+        // 保留指向源指令的前向引用，最后一阶段统一修正。
         for (std::size_t BlockIndex = 0;
              BlockIndex < SourceBlocks.size(); ++BlockIndex) {
             BasicBlock *OldBB = SourceBlocks[BlockIndex];
@@ -105,7 +101,7 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
                 Instruction *NewI = OldI->clone(Region.VMap);
                 if (!NewI) return Fail();
 
-                NewBB->push_back(NewI);
+                NewBB->pushBack(NewI);
                 Region.InstPairs.emplace_back(OldI, NewI);
                 Region.VMap[OldI] = NewI;
 
@@ -117,9 +113,7 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
             }
         }
 
-        // The source instruction is authoritative here.  Looking at NewI's
-        // current operand when remapping would miss forward references after
-        // another provisional mapping had already been applied by clone().
+        // 最终以源指令的操作数为准重新映射，避免临时映射覆盖后遗漏前向引用。
         for (const auto &Pair : Region.InstPairs) {
             Instruction *OldI = Pair.first;
             Instruction *NewI = Pair.second;

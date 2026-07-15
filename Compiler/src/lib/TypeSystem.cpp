@@ -1,6 +1,7 @@
 #include "TypeSystem.hpp"
 #include <iostream>
-//IRType
+
+// IR 类型通用查询与结构比较。
 int IRType::getScope(){ return 0; }
 bool IRType::isInt() const { return getEnum() == IR_INT; }
 bool IRType::isFloat() const { return getEnum() == IR_FLOAT; }
@@ -20,6 +21,7 @@ bool IRType::hasSameStorageType(const IRType &Other) const {
     return getEnum() == Other.getEnum() && getSize() == Other.getSize();
 }
 bool IRType::hasSameShape(const IRType &Other) const {
+    // 数组除总大小外还必须逐层匹配元素数量和子类型形状。
     if (getEnum() != Other.getEnum() || getSize() != Other.getSize())
         return false;
     if (!isArray()) return true;
@@ -37,6 +39,7 @@ std::shared_ptr<IRType> IRType::getPointeeType() const {
     return PtrTy ? PtrTy->getPointerType() : nullptr;
 }
 int IRType::countScalarElements(int Limit) const {
+    // 自叶向外累计标量数量，并用除法提前拦截上限溢出。
     if (Limit < 1) return -1;
     if (isScalar()) return 1;
     auto *ArrayTy = dynamic_cast<const ARRAYType *>(this);
@@ -50,6 +53,7 @@ int IRType::countScalarElements(int Limit) const {
 }
 bool IRType::flattenScalarPath(const std::vector<int> &Path,
                                int &FlatIndex) const {
+    // 每层索引乘以内层标量跨度，累加得到行主序线性位置。
     FlatIndex = 0;
     const IRType *Current = this;
     for (int Index : Path) {
@@ -67,6 +71,7 @@ bool IRType::flattenScalarPath(const std::vector<int> &Path,
 bool IRType::unflattenScalarPath(
     int FlatIndex, std::vector<int> &Path,
     std::shared_ptr<IRType> &ElementTy) const {
+    // 逐层用内层跨度做商和余数，恢复每一维索引及最终叶类型。
     Path.clear();
     ElementTy = nullptr;
     if (FlatIndex < 0) return false;
@@ -166,14 +171,14 @@ std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){
     return nullptr;
 }
 
-//Void
+// 空类型。
 std::shared_ptr<VOIDType> VOIDType::NewVoid(){
     static std::shared_ptr<VOIDType> single(new VOIDType());
     return single;
 }
-void VOIDType::to_string() const { std::cout << "void"; }
+void VOIDType::toString() const { std::cout << "void"; }
 
-//Int
+// 整数类型按字节数驻留，布尔类型使用独立的 i1 单例。
 std::shared_ptr<INTType> INTType::NewBool(){
     static std::shared_ptr<INTType> single(new INTType(1,true));
     return single;
@@ -184,25 +189,24 @@ std::shared_ptr<INTType> INTType::NewInt(size_t size) {
     if (it != cache.end()) {
         return it->second;
     }
-    // 使用 new 而不是 std::make_shared
+    // 构造函数不可公开访问，因此由类成员中的工厂直接创建实例。
     std::shared_ptr<INTType> ptr(new INTType(size, false));
     cache[size] = ptr;
     return ptr;
 }
-void INTType::to_string() const{
+void INTType::toString() const{
     if(isBool) std::cout << "i1";
-    else std::cout << "i" << (size * 8);  // 直接输出
+    else std::cout << "i" << (size * 8);
 }
 
-//Float
+// 浮点类型。
 std::shared_ptr<FLOATType> FLOATType::NewFloat(){
     static std::shared_ptr<FLOATType> single(new FLOATType());
     return single;
 }
-void FLOATType::to_string() const { std::cout << "float"; }
+void FLOATType::toString() const { std::cout << "float"; }
 
-//复合类型
-//Pointer
+// 指针类型按被指向类型作为键驻留，并递归输出基础类型。
 std::shared_ptr<POINTERType> POINTERType::NewPointer(std::shared_ptr<IRType> pointerType){
     static std::map<std::shared_ptr<IRType>,std::shared_ptr<POINTERType>> m;
     auto& ptr = m[pointerType];
@@ -211,9 +215,9 @@ std::shared_ptr<POINTERType> POINTERType::NewPointer(std::shared_ptr<IRType> poi
     }
     return ptr;
 }
-void POINTERType::to_string() const{
-    pointerType->to_string();  // 递归调用
-    std::cout << "*";  // 直接输出
+void POINTERType::toString() const{
+    pointerType->toString();
+    std::cout << "*";
 }
 std::shared_ptr<IRType> POINTERType::getBaseType() const{
         std::shared_ptr<IRType> baseType = pointerType;
@@ -229,7 +233,7 @@ std::shared_ptr<IRType> POINTERType::getBaseType() const{
 int POINTERType::getScope(){return scope;}
 
 
-//Array
+// 数组类型按元素类型和元素数量组成的结构键驻留。
 std::shared_ptr<ARRAYType> ARRAYType::NewArray(std::shared_ptr<IRType> elementType,int count){
     static std::map<std::pair<std::shared_ptr<IRType>, int>, std::shared_ptr<ARRAYType>> m;
     auto key = std::make_pair(elementType, count);
@@ -241,10 +245,10 @@ std::shared_ptr<ARRAYType> ARRAYType::NewArray(std::shared_ptr<IRType> elementTy
     }
 
 
-void ARRAYType::to_string() const{
+void ARRAYType::toString() const{
     std::cout << "[" << elementCount << " x ";
-    elementType->to_string();  // 递归调用
-    std::cout << "]";  // 直接输出
+    elementType->toString();
+    std::cout << "]";
 }
 std::shared_ptr<IRType> ARRAYType::getBaseType() const{
      if (auto arr = std::dynamic_pointer_cast<ARRAYType>(elementType))

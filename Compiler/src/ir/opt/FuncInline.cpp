@@ -20,7 +20,7 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	P.HasBody = (Callee->front() != nullptr);
 	if (!P.HasBody) return P;
 
-	TraverseTools::forEachInstruction(*Callee, [&](Instruction *I) {
+	forEachInstruction(*Callee, [&](Instruction *I) {
 		++P.TotalInstCount;
 
 		auto *CI = dynamic_cast<CallInst *>(I);
@@ -120,7 +120,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 
 		ValueToValueMap InitialMap;
 		std::vector<RetInst*> ClonedRets;
-		auto CalleeOrigBlocks = TraverseTools::snapshotPointers(*Callee);
+		auto CalleeOrigBlocks = snapshotPointers(*Callee);
 		CalleeOrigBlocks.erase(
 			std::remove(CalleeOrigBlocks.begin(), CalleeOrigBlocks.end(), nullptr),
 			CalleeOrigBlocks.end());
@@ -157,10 +157,10 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			auto MoveAllocas = collectInstructions<AllocaInst>(*ClonedEntry);
 
 			for (AllocaInst* AI : MoveAllocas) {
-				AI->EraseFromParent();
+				AI->eraseFromParent();
 				Instruction* EntryFirst = CallerEntry->front();
 				if (!EntryFirst) {
-					CallerEntry->push_back(AI);
+					CallerEntry->pushBack(AI);
 				} else {
 					auto It = CallerEntry->begin();
 					It.insertBefore(AI);
@@ -188,7 +188,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 				CI->replaceAllUsesWith(RetEdges[0].second);
 			} else {
 				auto* RetPhi = new PhiInst(CI->getIRType());
-				A2->push_front(RetPhi);
+				A2->pushFront(RetPhi);
 				for (auto& E : RetEdges) {
 					Value* InV = E.second ? E.second : UndefValue::NewUndefValue(CI->getIRType());
 					RetPhi->addIncoming(InV, E.first);

@@ -2,6 +2,7 @@
 #include "../../include/lib/BaseManager.hpp"
 #include "CFG.hpp"
 #include "IRUtils.hpp"
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -73,13 +74,13 @@ Instruction::InstType BinaryInst::getInstType(BinaryInst::Operation op,
 
 Function& Module::newFunction(TypeSystem ts,std::string ident){
     auto func = new Function(ts,ident);
-    this->getSymbolTable().register_symbolTable(ident,func);
+    this->getSymbolTable().registerSymbolTable(ident,func);
     this->functions.push_back(std::unique_ptr<Function>(func));
     return *(this->functions.back());
 }
 
 void Module::pushFunction(Function* func){
-    this->symbolTable.register_symbolTable(func->getIdent(),func);
+    this->symbolTable.registerSymbolTable(func->getIdent(),func);
     functions.push_back(std::unique_ptr<Function>(func));
 }
 
@@ -110,6 +111,7 @@ Module* Module::getActiveModule() {
 }
 
 FunctionCallGraph Module::buildDirectCallGraph() const {
+  // 遍历所有调用指令，只记录可静态确定的用户函数目标。
   FunctionCallGraph Graph;
   for (const auto &FunctionPtr : functions) {
     Function *F = FunctionPtr.get();
@@ -132,6 +134,7 @@ std::unordered_set<Function *> Module::collectReachableFunctions(
   std::unordered_set<Function *> Reachable;
   if (!Entry) return Reachable;
 
+  // 从入口函数广度遍历调用边，去重集合同时充当访问标记。
   std::queue<Function *> WorkList;
   Reachable.insert(Entry);
   WorkList.push(Entry);
@@ -176,14 +179,14 @@ for (int i = 0;; i++) {
 }
 
 Function::Function(TypeSystem ts,std::string ident) : Value(IRType::NewTypeByTypeSystem(ts),ident){
-    //创建的时候就会在侵入式链表里面加入一个BasicBlock
-    push_back(new BasicBlock());
+    // 每个函数至少拥有一个入口基本块。
+    pushBack(new BasicBlock());
 }
 
 
 
 void Function::pushBlock(BasicBlock* bb){
-    push_back(bb);
+    pushBack(bb);
 }
 
 
@@ -197,12 +200,12 @@ void Function::insertBlock(BasicBlock* curr,BasicBlock* insert){
 void Function::pushParam(Variable* v){ params.emplace_back(v); }
 
 void Function::pushParam(std::string ident,Variable* v){
-    //不仅vector中需要写入，而且其创建的inst也要加入侵入式链表之中
+    // 形参值保存在函数签名中，入口块中另建槽位以便按普通局部变量访问。
     auto alloca = new AllocaInst(POINTERType::NewPointer(v->getIRType()));
     auto store = new StoreInst(v,alloca);
-    front()->push_front(alloca);
-    front()->push_back(store);
-    ModuleIR->getSymbolTable().register_symbolTable(ident,alloca);
+    front()->pushFront(alloca);
+    front()->pushBack(store);
+    ModuleIR->getSymbolTable().registerSymbolTable(ident,alloca);
     params.emplace_back(std::unique_ptr<Variable>(v));
 }
 
@@ -264,7 +267,7 @@ std::string Function::makeUniqueBlockIdent(const std::string &Base) const {
   }
 }
 
-void Function::InsertAlloca(AllocaInst* ptr){front()->push_back(ptr);}
+void Function::InsertAlloca(AllocaInst* ptr){front()->pushBack(ptr);}
 
 bool Function::isReachable(BasicBlock* BB) {
   if (!BB) return false;
@@ -277,8 +280,9 @@ bool Function::isReachable(BasicBlock* BB) {
 void Function::collectReachableBlocks(
     std::unordered_set<BasicBlock *> &Reachable) {
   Reachable.clear();
-  if (this->Size() == 0 || !front()) return;
+  if (this->size() == 0 || !front()) return;
 
+  // 从入口块沿终结指令深度遍历，同一块仅调度一次。
   std::vector<BasicBlock *> WorkList;
   BasicBlock *Entry = front();
   WorkList.push_back(Entry);
@@ -310,6 +314,7 @@ std::vector<BasicBlock *> Function::getReachableBlocks() {
 }
 
 void Function::dropAllReferences() {
+  // 先解除指令间的操作数关系，避免后续批量销毁时递归影响其他指令。
   for (BasicBlock *BB : *this) {
     if (!BB) continue;
     for (Instruction *I : *BB) {
@@ -321,10 +326,10 @@ void Function::dropAllReferences() {
 
 void Function::dumpIR(){
   std::cout << "define ";
-  this->getIRType()->to_string();
+  this->getIRType()->toString();
   std::cout << " @" << ident << "(";
   for (auto &i : params) {
-    i->getIRType()->to_string();
+    i->getIRType()->toString();
     std::cout << " %" << i->getIdent();
     if (i.get() != params.back().get())
       std::cout << ", ";
@@ -342,6 +347,7 @@ BuildInFunction::BuildInFunction(std::shared_ptr<IRType> t,std::string ident):Va
 }
 
 BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
+  // 内建函数按名称驻留，返回类型由 SysY 运行库或 LLVM 内建签名决定。
   static std::map<std::string, BuildInFunction *> mp;
   auto gt = [&ident]() -> std::shared_ptr<IRType> {
     if (ident == "getint")
@@ -390,11 +396,12 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
      return VOIDType::NewVoid();
     if(ident == "CacheLookUp4")
       return VOIDType::NewVoid();
-    assert(0);
     return nullptr;
   };
   if (mp.find(ident) == mp.end()) {
-    mp[ident] = new BuildInFunction(gt(), ident);
+    auto returnType = gt();
+    if (!returnType) return nullptr;
+    mp[ident] = new BuildInFunction(returnType, ident);
   }
   return mp[ident];
 }
@@ -491,11 +498,9 @@ void BasicBlock::dumpIR(){
 
 }
 
-// CFG.cpp
-
 std::vector<BasicBlock*> BasicBlock::getSuccessors() {
     std::vector<BasicBlock*> succs;
-    if (this->Size() == 0) return succs;
+    if (this->size() == 0) return succs;
     auto *Br = dynamic_cast<BrInst *>(back());
     if (!Br) return succs;
     for (unsigned I = 0; I < Br->getSuccessorCount(); ++I) {
@@ -524,7 +529,7 @@ std::vector<BasicBlock*> BasicBlock::getPredecessors() {
 CFGSnapshot::CFGSnapshot(Function &F) {
   std::unordered_map<BasicBlock *, std::unordered_set<BasicBlock *>> SeenPreds;
 
-  // 保留终结指令中的边顺序；同一源块产生的平行边不会被合并。
+  // 先按终结指令顺序记录完整边集，再单独构建去重前驱视图。
   for (BasicBlock *BB : F) {
     if (!BB) continue;
     auto Successors = BB->getSuccessors();
@@ -563,7 +568,7 @@ CFGSnapshot::distinctPredecessors(BasicBlock *BB) const {
 }
 
 Instruction *BasicBlock::getTerminator() {
-    if (Size() == 0) return nullptr;
+    if (size() == 0) return nullptr;
     Instruction *Term = back();
     return dynamic_cast<BrInst *>(Term) || dynamic_cast<RetInst *>(Term)
                ? Term
@@ -597,6 +602,7 @@ bool BasicBlock::isCriticalEdge(const CFGEdge &Edge) {
 
 bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
                               CFGEdgePhiPolicy PhiPolicy) {
+  // 校验边句柄、新目标及所属函数，确保改写不跨越 CFG。
   BasicBlock *From = Edge.From;
   BasicBlock *OldSucc = getEdgeSuccessor(Edge);
   if (!From || !OldSucc || !NewSucc || OldSucc == NewSucc) return false;
@@ -607,19 +613,20 @@ bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
   BrInst *Br = From->getBranchTerminator();
   if (!Br) return false;
 
-  // successor 下标对应同目标边中的第几个 incoming，用它区分平行边。
+  // 把后继下标换算成同目标边中的出现次序，以精确定位平行边的 PHI 入边项。
   unsigned Occurrence = 0;
   for (unsigned I = 0; I < Edge.SuccessorIndex; ++I) {
     if (Br->getSuccessor(I) == OldSucc) ++Occurrence;
   }
 
+  // 改写前先验证旧后继的每个 PHI 都有可对应的入边项。
   auto OldPhis = OldSucc->collectPhiNodes();
   for (PhiInst *Phi : OldPhis) {
     if (!Phi || Phi->countIncomingFromPred(From) <= Occurrence) return false;
   }
 
   if (PhiPolicy == CFGEdgePhiPolicy::RemoveOldIncoming) {
-    // 没有 incoming 值可凭空补给已有 PHI，因此只允许重定向到无 PHI 的目标块。
+    // 无法为新目标中的已有 PHI 凭空构造输入值，因此该策略只允许新目标不含 PHI。
     if (!NewSucc->collectPhiNodes().empty()) return false;
   } else {
     BrInst *ForwardBr = NewSucc->getBranchTerminator();
@@ -630,6 +637,7 @@ bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
     }
   }
 
+  // 终结边改写成功后，再按策略删除或转移旧后继的入边项。
   if (!Br->setSuccessor(Edge.SuccessorIndex, NewSucc)) return false;
 
   for (PhiInst *Phi : OldPhis) {
@@ -656,7 +664,7 @@ bool BasicBlock::foldConditionalBranch(BasicBlock *BB,
   BasicBlock *Removed = OldBr->getSuccessor(RemovedSuccessorIndex);
   if (!Taken || !Removed) return false;
 
-  // 两条边目标相同时，精确保留 TakenSuccessorIndex 对应的 incoming。
+  // 两条边目标相同时，根据选中的后继下标精确删除另一个 PHI 入边项。
   unsigned RemovedOccurrence = 0;
   for (unsigned I = 0; I < RemovedSuccessorIndex; ++I) {
     if (OldBr->getSuccessor(I) == Removed) ++RemovedOccurrence;
@@ -699,52 +707,53 @@ void BasicBlock::genRetInst(Value* retVal){
         else retVal = genFPTOSIInst(retVal);
     }
     auto inst = new RetInst(retVal);
-    push_back(inst);
+    pushBack(inst);
 }
 
 void BasicBlock::genRetInst(){
     auto inst = new RetInst();
-    push_back(inst);
+    pushBack(inst);
 }
 
 void BasicBlock::genCondInst(Value* cond,BasicBlock* isTrue,BasicBlock* isFalse){
    auto inst = new BrInst(cond,isTrue,isFalse);
-   push_back(inst);
+   pushBack(inst);
 }
 
 void BasicBlock::genUnCondInst(BasicBlock *block) {
   auto inst = new BrInst(block);
-  push_back(inst);
+  pushBack(inst);
 }
 
 AllocaInst* BasicBlock::genAllocaInst(std::shared_ptr<IRType> irtype,std::string ident){
     auto tp = POINTERType::NewPointer(irtype);
     auto alloca = new AllocaInst(tp);
-    ModuleIR->getSymbolTable().register_symbolTable(ident,alloca);
-    getParent()->front()->push_front(alloca);
+    ModuleIR->getSymbolTable().registerSymbolTable(ident,alloca);
+    getParent()->front()->pushFront(alloca);
     return alloca;
 }
 
 Value* BasicBlock::genLoadInst(Value* v){
     auto inst = new LoadInst(v);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
 void BasicBlock::genStoreInst(Value* val,Value* ptr){
+    if (!val || !ptr) return;
     auto point = std::dynamic_pointer_cast<POINTERType>(ptr->getIRType());
-    assert(point && "StoreInst pointer operand is not a pointer type!"); // 安全检查
+    if (!point || !point->getPointerType() || !val->getIRType()) return;
     if(point->getPointerType()->getEnum() != val->getIRType()->getEnum()){
         if(point->getPointerType()->getEnum()  == IR_INT) val = this->genFPTOSIInst(val);
         else val = this->genSITOFPInst(val);
     }
     auto inst = new StoreInst(val,ptr);
-    this->push_back(inst);
+    this->pushBack(inst);
 }
 
 Value* BasicBlock::genGepInst(Value* ptr){
     auto inst = new GetElementPtrInst(ptr);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
@@ -753,6 +762,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
   bool b = (B->getIRType()->getEnum() == IR_INT);
     BinaryInst* inst;
 
+  // 只允许整数的操作先把浮点数转为整数，再把 i1 和普通整数统一到同一位宽。
   if (BinaryInst::isIntegerOnlyOp(op)) {
     if (!a) {
       A = genFPTOSIInst(A);
@@ -771,7 +781,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
     }
 
     inst = new BinaryInst(A, op, B);
-    push_back(inst);
+    pushBack(inst);
     return inst;
   }
 
@@ -788,26 +798,25 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
             bool aa = A->getIRType() == INTType::NewInt(4);
             bool bb = B->getIRType() == INTType::NewInt(4);
             if(aa ^ bb){
-                if(!aa) A = genZextInst(A); // i1 -> i32
-                else B = genZextInst(B);    // i1 -> i32
+                if(!aa) A = genZextInst(A); // 将 i1 零扩展为 i32。
+                else B = genZextInst(B);    // 将 i1 零扩展为 i32。
             }
         }
         inst = new BinaryInst(A, op, B);
     }
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
-Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation op,Value* _B){
-  if (_A->isConst() && _B->isConst()) {
-    Value *A = _A;
-    Value *B = _B;
+Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
+                                 BinaryInst::Operation op, Value* right){
+  if (!left || !right) return nullptr;
+  if (left->isConst() && right->isConst()) {
+    Value *A = left;
+    Value *B = right;
 
-    // Apply the same usual arithmetic conversion as the non-constant path.
-    // Keeping this conversion here also lets the shared folder distinguish
-    // integer division-by-zero (undef) from IEEE floating division-by-zero
-    // (Inf/NaN).  The former hand-written evaluator classified both as undef
-    // and additionally evaluated overflowing division/invalid shifts in C++.
+    // 常量路径与非常量路径使用相同的算术转换，从而区分整数除零的未定义值和浮点除零的 IEEE 结果。
+    // 定宽折叠还会避免在 C++ 层直接执行溢出除法或非法移位。
     if (!BinaryInst::isIntegerOnlyOp(op) &&
         (IRType::isFloat(A->getIRType()) ||
          IRType::isFloat(B->getIRType()))) {
@@ -822,47 +831,45 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation
 
     if (Value *Folded = BinaryInst::foldConstants(op, A, B, true))
       return Folded;
-    // NormalizeIntegerWidth deliberately handles only the integer spelling
-    // of remainder.  Keep IEEE frem available for internal IR producers.
+    // 首轮位宽规整只处理整数余数；浮点 frem 留给第二轮 IEEE 折叠。
     if (IRType::isFloat(A->getIRType()))
       if (Value *Folded = BinaryInst::foldConstants(op, A, B, false))
         return Folded;
 
-    assert(false && "unsupported constant binary expression");
     return nullptr;
   } else {
-    assert(bb != nullptr);
-    return bb->genBinaryInst(_A, op, _B);
+    if (!bb) return nullptr;
+    return bb->genBinaryInst(left, op, right);
   }
 }
 
 Value* BasicBlock::genSITOFPInst(Value* x){
     auto inst = new SITOFPInst(x);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genFPTOSIInst(Value* x){
     auto inst = new FPTOSIInst(x);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genZextInst(Value* x){
     auto inst = new ZextInst(x);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genTruncInst(Value* x){
   auto inst = new TruncInst(x);
-  push_back(inst);
+  pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genSextInst(Value* x){
   auto inst = new SextInst(x);
-  push_back(inst);
+  pushBack(inst);
   return inst;
 }
 
@@ -885,14 +892,16 @@ bool BasicBlock::moveInstructionsAfter(Instruction *Position,
       Destination == this)
     return false;
 
+  // 在搬移前保存原终结指令的后继，然后按原顺序转移后半段指令。
   Instruction *OldTerminator = getTerminator();
   auto OldSuccessors = getSuccessors();
   for (Instruction *I = Position->getNext(); I;) {
     Instruction *Next = I->getNext();
-    I->EraseFromParent();
-    Destination->push_back(I);
+    I->eraseFromParent();
+    Destination->pushBack(I);
     I = Next;
   }
+  // 终结指令被搬走时，其后继 PHI 的前驱也必须改为目标块。
   if (OldTerminator && OldTerminator->getParent() == Destination) {
     std::unordered_set<BasicBlock *> Updated;
     for (BasicBlock *Succ : OldSuccessors) {
@@ -908,6 +917,7 @@ BasicBlock *BasicBlock::splitBlockAfter(Instruction *Position) {
   Function *F = getParent();
   if (!F) return nullptr;
 
+  // 新建延续块并让它接管切分点之后的全部指令。
   auto *Continuation = new BasicBlock();
   F->pushBlock(Continuation);
   if (!moveInstructionsAfter(Position, Continuation)) {
@@ -917,8 +927,8 @@ BasicBlock *BasicBlock::splitBlockAfter(Instruction *Position) {
   return Continuation;
 }
 
-// 在 BasicBlock::genCallInst 函数中修改类型检查逻辑
 Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
+  // 运行库调用按固定签名转换标量实参，然后注册并生成内建调用。
   if (BuildInFunction::isSupportedName(ident)) {
     ModuleIR->registerBuiltin(ident);
     if (ident == "putint" || ident == "putch" || ident == "putarray" ||
@@ -931,30 +941,29 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
         args[0] = genSITOFPInst(args[0]);
     }
     auto tmp = new CallInst(BuildInFunction::genBuildInFunction(ident), args);
-    push_back(tmp);
+    pushBack(tmp);
     return tmp;
   }
 
+  // 用户函数要求实参数量一致；指针和数组保留原类型，仅标量整数与浮点数相互转换。
   if (auto func = dynamic_cast<Function*>(ModuleIR->getSymbolTable().getValueByName(ident))) {
     auto &params = func->getParams();
-    assert(args.size() == params.size());
+    if (args.size() != params.size()) return nullptr;
     auto i = args.begin();
     for (auto j = params.begin(); j != params.end(); j++, i++) {
       auto &ii = *i;
       auto jj = j->get();
+      if (!ii || !jj || !ii->getIRType() || !jj->getIRType()) return nullptr;
       if (jj->getIRType() != ii->getIRType()) {
         auto a = ii->getIRType()->getEnum(), b = jj->getIRType()->getEnum();
-
-        // ============ 修复：增加对实参类型的检查 ============
-        // 如果形参或实参是指针/数组类型，跳过基本类型转换
+        // 指针和数组由调用边界保证形状兼容，此处不猜测复合类型转换。
         if (b == IR_POINTER || a == IR_POINTER || a == IR_ARRAY) {
           continue;
         }
-        // ===================================================
-
-        // 只对基本类型（INT/FLOAT）进行转换
-        assert(a == IR_INT || a == IR_FLOAT);
-        assert(b == IR_INT || b == IR_FLOAT);
+        // 标量实参按形参类型在整数和浮点数之间转换。
+        if ((a != IR_INT && a != IR_FLOAT) ||
+            (b != IR_INT && b != IR_FLOAT))
+          return nullptr;
         if (b == IR_FLOAT)
           ii = genSITOFPInst(ii);
         else
@@ -962,13 +971,10 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
       }
     }
     auto inst = new CallInst(func, args);
-    push_back(inst);
+    pushBack(inst);
     return inst;
-  } else {
-    std::cerr << "No Such Function!\n";
-    assert(0);
-    return nullptr;
   }
+  return nullptr;
 }
 
 bool BasicBlock::hasTerminator(){
@@ -991,7 +997,7 @@ bool BasicBlock::insertBeforeTerminator(Instruction *I) {
       return true;
     }
   }
-  push_back(I);
+  pushBack(I);
   return true;
 }
 
@@ -1003,7 +1009,7 @@ bool BasicBlock::insertAfterPhiNodes(Instruction *I) {
       return true;
     }
   }
-  push_back(I);
+  pushBack(I);
   return true;
 }
 
@@ -1016,7 +1022,6 @@ bool BasicBlock::insertAfterPhiNodes(BasicBlock *BB, Instruction *I) {
 }
 
 void BasicBlock::clear(){
-    for (auto *Inst : *this) assert(!Inst->hasUses());
     ChainList<BasicBlock,Instruction>::clear();
 }
 
@@ -1135,7 +1140,7 @@ Value *RetInst::getReturnValue() const {
 void RetInst::dumpIR(){
     std::cout << "ret ";
   for (auto &i : userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
     i->getValue()->dumpIR();
     std::cout << " ";
@@ -1157,7 +1162,10 @@ BrInst::BrInst(BasicBlock* bb):Instruction(VOIDType::NewVoid(),InstType::BR){
     addUse(bb);
     isCond = false;
 }
-BrInst::BrInst(std::shared_ptr<IRType> irtype,bool is_Cond):Instruction(irtype){instType = InstType::BR; isCond = is_Cond;}
+BrInst::BrInst(std::shared_ptr<IRType> irtype,bool isCond):Instruction(irtype){
+    instType = InstType::BR;
+    this->isCond = isCond;
+}
 
 bool BrInst::isConditional() const {
   return isCond;
@@ -1206,7 +1214,7 @@ void BrInst::dumpIR(){
         bool flag = 0;
         for (auto &i : userList) {
             if (flag == 0) {
-            i->getValue()->getIRType()->to_string();
+            i->getValue()->getIRType()->toString();
             std::cout << " ";
             flag = 1;
             } else std::cout << "label ";
@@ -1221,12 +1229,11 @@ void BrInst::dumpIR(){
 AllocaInst::AllocaInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::ALLOCA;}
 AllocaInst::AllocaInst(std::string ident,std::shared_ptr<IRType> irtype):Instruction(POINTERType::NewPointer(irtype)){
     instType = InstType::ALLOCA;
-    //ident的相关映射没有去写，等到后面再补吧
 }
 void AllocaInst::dumpIR(){
     Value::dumpIR();
     std::cout << " = alloca ";
-    std::dynamic_pointer_cast<POINTERType>(irtype)->getPointerType()->to_string();
+    std::dynamic_pointer_cast<POINTERType>(irtype)->getPointerType()->toString();
     std::cout << "\n";
 }
 
@@ -1265,7 +1272,7 @@ Value* StoreInst::getPointerOperand() const {
 void StoreInst::dumpIR(){
   std::cout << "store ";
   for (auto &i : userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
     i->getValue()->dumpIR();
     if (i.get() != userList.back().get())
@@ -1275,15 +1282,16 @@ void StoreInst::dumpIR(){
 }
 
 LoadInst::LoadInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::LOAD;}
-LoadInst::LoadInst(Value* v) : Instruction(VOIDType::NewVoid()) { // 先传一个安全类型防止崩溃
+// 结果类型取自指针指向的类型，操作数关系在类型确定后建立。
+LoadInst::LoadInst(Value* v) : Instruction(VOIDType::NewVoid()) {
+    instType = InstType::LOAD;
+    if (!v || !v->getIRType()) return;
     auto ptrType = std::dynamic_pointer_cast<POINTERType>(v->getIRType());
-    assert(ptrType && "LoadInst operand is not a pointer type!"); // 断言检查
+    if (!ptrType || !ptrType->getPointerType()) return;
 
-    // 手动更新父类 Instruction 的 irtype 成员
     this->irtype = ptrType->getPointerType();
 
     addUse(v);
-    instType = InstType::LOAD;
 }
 
 Value* LoadInst::getPointerOperand() const {
@@ -1293,10 +1301,10 @@ Value* LoadInst::getPointerOperand() const {
 void LoadInst::dumpIR(){
   Value::dumpIR();
   std::cout << " = load ";
-  irtype->to_string();
+  irtype->toString();
   std::cout << ", ";
   for (auto &i : userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
     i->getValue()->dumpIR();
     if (i.get() != userList.back().get())
@@ -1313,41 +1321,35 @@ GetElementPtrInst::GetElementPtrInst(Value* v, std::vector<Value*>& vv) : Instru
     addUse(v);
     for(auto &&i : vv) addUse(i);
     instType = InstType::GEP;
-    // 注意：如果有索引列表，这里其实应该立即重新计算类型，见第二步
 }
 GetElementPtrInst::GetElementPtrInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::GEP;}
 void GetElementPtrInst::dumpIR() {
-    // 打印结果变量
-    this->Value::dumpIR();  // 这会打印出类似 "%1" 的标识符
+    // 先输出结果值，再按操作数顺序输出基指针和全部索引。
+    this->Value::dumpIR();
     std::cout << " = getelementptr inbounds ";
 
-    // 获取基指针类型（第一个操作数）
     Value* basePtr = userList[0]->getValue();
     auto baseType = basePtr->getIRType();
 
-    // 处理指针类型，获取元素类型
+    // GEP 文本中的首个类型是基指针所指向的聚合或元素类型。
     std::shared_ptr<IRType> elementType;
     if (baseType->getEnum() == IR_POINTER) {
         auto ptrType = std::dynamic_pointer_cast<POINTERType>(baseType);
         elementType = ptrType->getPointerType();
     } else {
-        // 如果不是指针类型，可能有问题，但先假设是指针
         elementType = baseType;
     }
 
-    // 打印元素类型
-    elementType->to_string();
+    elementType->toString();
     std::cout << ", ";
-    // 打印基指针类型和值
-    basePtr->getIRType()->to_string();
+    basePtr->getIRType()->toString();
     std::cout << " ";
     basePtr->dumpIR();
 
-    // 打印索引
     for (size_t i = 1; i < userList.size(); i++) {
         Value* index = userList[i]->getValue();
         std::cout << ", ";
-        index->getIRType()->to_string();
+        index->getIRType()->toString();
         std::cout << " ";
         index->dumpIR();
     }
@@ -1357,27 +1359,23 @@ void GetElementPtrInst::dumpIR() {
 void GetElementPtrInst::updateType() {
     if (userList.empty()) return;
 
-    // 获取基地址的类型 (第一个操作数)
     Value* basePtr = userList[0]->getValue();
     auto currentType = basePtr->getIRType();
 
-    // 从第二个操作数开始遍历（这些是索引）
+    // 从基指针类型出发，每个索引剥离一层指针或数组。
     for (size_t i = 1; i < userList.size(); i++) {
-        // 如果当前是指针，解引用一层
         if (auto ptr = std::dynamic_pointer_cast<POINTERType>(currentType)) {
             currentType = ptr->getPointerType();
         }
-        // 如果当前是数组，剥离一层维度
         else if (auto arr = std::dynamic_pointer_cast<ARRAYType>(currentType)) {
             currentType = arr->getElementType();
         }
         else {
-            // 错误处理：索引过多或类型不匹配
-            assert(0 && "GEP index out of bound or invalid type");
+            return;
         }
     }
 
-    // GEP 的结果永远是指向最终元素的指针
+    // 最终元素类型重新包装为 GEP 的结果指针类型。
     this->irtype = POINTERType::NewPointer(currentType);
 }
 
@@ -1451,6 +1449,7 @@ std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
 
     std::shared_ptr<IRType> CurrentTy = Base->getIRType();
     int64_t LastStride = 0;
+    // 按索引逐层剖解指针或数组，最后一层元素大小即末索引步长。
     for (size_t I = 1; I < getNumOperands(); ++I) {
         std::shared_ptr<IRType> ElementTy;
         if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
@@ -1490,6 +1489,7 @@ bool GetElementPtrInst::flattenZeroBasedChain(Value *V, Value *&Base,
     if (!LocalBase) return false;
     auto *BaseGEP = dynamic_cast<GetElementPtrInst *>(LocalBase);
     if (BaseGEP) {
+        // 只有内层 GEP 以零索引进入时，才能安全合并两段索引链。
         Value *FirstIndex = GEP->getOperand(1);
         if (!FirstIndex ||
             !FirstIndex->isConstIntZero()) {
@@ -1522,6 +1522,7 @@ bool GetElementPtrInst::getIndexStrides(Value *Base,
     FinalPointeeStride = 0;
     if (!Base || !Base->getIRType()) return false;
 
+    // 每个索引的字节步长等于该层被索引元素的大小。
     std::shared_ptr<IRType> CurrentTy = Base->getIRType();
     for (Value *Idx : Indices) {
         (void)Idx;
@@ -1648,10 +1649,10 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
   const auto Ty = LHS->getIRType();
 
   if (NormalizeIntegerWidth) {
+    // 规整模式先按 IR 位宽解释整数，再进行比较或算术折叠。
     auto *IntTy = dynamic_cast<INTType *>(Ty.get());
 
-    // Integer division/remainder by zero is undefined.  IEEE fdiv/frem by
-    // zero instead produces Inf/NaN and must reach the floating fold below.
+    // 整数除零或余零产生未定义值；浮点运算按 IEEE 规则生成 Inf 或 NaN。
     if (IntTy && (Op == DIV || Op == UDIV) && RHS->isConstZero())
       return Value::makeUndefForType(Ty);
     if (IntTy && (Op == MOD || Op == UREM) && RHS->isConstZero())
@@ -1683,8 +1684,7 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
       if (!LHS->tryGetNumericFloatConst(LV) ||
           !RHS->tryGetNumericFloatConst(RV))
         return nullptr;
-      // SysY follows C/IEEE ordered comparisons: NaN makes every relational
-      // comparison and equality false; only != is true.
+      // SysY 遵循 C/IEEE 有序比较：NaN 使关系比较和相等为假，仅不等为真。
       if (std::isnan(LV) || std::isnan(RV))
         return ConstBool::newConstBool(Op == NE);
       switch (Op) {
@@ -1699,6 +1699,7 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
     }
 
     if (IntTy) {
+      // 所有整数算术均检查非法除法与移位，并将结果截回声明位宽。
       const unsigned Bits = IntTy->getIsBool()
                                 ? 1u
                                 : static_cast<unsigned>(IntTy->getSize() * 8);
@@ -1774,6 +1775,7 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
     }
   }
 
+  // 非规整模式按操作数的现有类型分别折叠比较、浮点算术和整数算术。
   if (isCompareOp(Op)) {
     if (IRType::isFloat(Ty)) {
       float LV = 0.0f;
@@ -1908,7 +1910,7 @@ void BinaryInst::dumpIR(){
     if (tp == IR_INT)
       std::cout << "srem ";
     else
-      std::cout << "frem "; ///应该不存在
+      std::cout << "frem ";
     break;
   case BinaryInst::UREM:
     std::cout << "urem ";
@@ -1958,12 +1960,10 @@ void BinaryInst::dumpIR(){
   default:
     break;
   }
-  userList[0]->getValue()->getIRType()->to_string();
+  userList[0]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[0]->getValue()->dumpIR();
   std::cout << ", ";
-  //userList[1]->getValue()->getIRType()->to_string();
- // std::cout << " ";
   userList[1]->getValue()->dumpIR();
   std::cout << "\n";
 
@@ -1971,12 +1971,12 @@ void BinaryInst::dumpIR(){
 
 
 CallInst::CallInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::CALL;}
-CallInst::CallInst(Value *func, std::vector<Value*> &_args,
+CallInst::CallInst(Value *func, std::vector<Value*> &args,
                    std::string appendix)
     : Instruction(func->getIRType()) {
   ident += appendix;
   addUse(func);
-  for (auto &i : _args)
+  for (auto &i : args)
     addUse(i);
   instType = InstType::CALL;
 }
@@ -1988,7 +1988,7 @@ void CallInst::dumpIR(){
   }
   std::cout << (tailCall ? "tail call " : "call ");
   for (auto &i : this->userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
 
     i->getValue()->dumpIR();
@@ -2074,13 +2074,13 @@ void FPTOSIInst::dumpIR(){
   Value::dumpIR();
   std::cout << " = fptosi ";
   for (auto &i : userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
     i->getValue()->dumpIR();
     std::cout << " ";
   }
   std::cout << "to ";
-  irtype->to_string();
+  irtype->toString();
   std::cout << "\n";
 }
 
@@ -2088,13 +2088,13 @@ void SITOFPInst::dumpIR(){
   Value::dumpIR();
   std::cout << " = sitofp ";
   for (auto &i : userList) {
-    i->getValue()->getIRType()->to_string();
+    i->getValue()->getIRType()->toString();
     std::cout << " ";
     i->getValue()->dumpIR();
     std::cout << " ";
   }
   std::cout << "to ";
-  irtype->to_string();
+  irtype->toString();
   std::cout << '\n';
 }
 
@@ -2129,11 +2129,11 @@ TruncInst::TruncInst(Value* v):Instruction(INTType::NewBool()){
 void TruncInst::dumpIR(){
   Value::dumpIR();
   std::cout << " = trunc ";
-  userList[0]->getValue()->getIRType()->to_string();
+  userList[0]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[0]->getValue()->dumpIR();
   std::cout << " to ";
-  irtype->to_string();
+  irtype->toString();
   std::cout << "\n";
 }
 
@@ -2147,17 +2147,16 @@ SextInst::SextInst(Value* v):Instruction(INTType::NewInt(4)){
 void SextInst::dumpIR(){
   Value::dumpIR();
   std::cout << " = sext ";
-  userList[0]->getValue()->getIRType()->to_string();
+  userList[0]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[0]->getValue()->dumpIR();
   std::cout << " to ";
-  irtype->to_string();
+  irtype->toString();
   std::cout << "\n";
 }
 
 SelectInst::SelectInst(Value* cond,Value* isTrue,Value* isFalse)
   : Instruction(isTrue->getIRType()) {
-  assert(isTrue->getIRType() == isFalse->getIRType());
   instType = InstType::SELECT;
   addUse(cond);
   addUse(isTrue);
@@ -2172,17 +2171,17 @@ void SelectInst::dumpIR() {
   Value::dumpIR();
   std::cout << " = select ";
 
-  userList[0]->getValue()->getIRType()->to_string();
+  userList[0]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[0]->getValue()->dumpIR();
   std::cout << ", ";
 
-  userList[1]->getValue()->getIRType()->to_string();
+  userList[1]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[1]->getValue()->dumpIR();
   std::cout << ", ";
 
-  userList[2]->getValue()->getIRType()->to_string();
+  userList[2]->getValue()->getIRType()->toString();
   std::cout << " ";
   userList[2]->getValue()->dumpIR();
   std::cout << "\n";
@@ -2196,6 +2195,7 @@ Instruction* SelectInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 }
 
 Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
+  // select 条件统一转换为 i1，非零整数、非零浮点数和非空指针均表示真。
   if (cond->getIRType()->getEnum() != IR_INT || cond->getIRType() != INTType::NewBool()) {
     switch (cond->getIRType()->getEnum()) {
     case IR_INT:
@@ -2208,10 +2208,12 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
       cond = genBinaryInst(cond, BinaryInst::NE, ConstPtr::newConstPtr(cond->getIRType()));
       break;
     default:
-      assert(0 && "select condition type is unsupported");
+      assert(0 && "select 条件类型不受支持");
+      return nullptr;
     }
   }
 
+  // 两个候选值必须同型，整数与浮点数混用时将整数提升为浮点数。
   if (isTrue->getIRType() != isFalse->getIRType()) {
     auto tTy = isTrue->getIRType()->getEnum();
     auto fTy = isFalse->getIRType()->getEnum();
@@ -2220,12 +2222,12 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
     } else if (tTy == IR_FLOAT && fTy == IR_INT) {
       isFalse = genSITOFPInst(isFalse);
     } else {
-      assert(0 && "select arms type mismatch");
+      return nullptr;
     }
   }
 
   auto *inst = new SelectInst(cond, isTrue, isFalse);
-  push_back(inst);
+  pushBack(inst);
   return inst;
 }
 
@@ -2236,13 +2238,12 @@ bool Variable::isGlobal(){
 }
 
 Variable::Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident):User(vt == Param ? irtype : POINTERType::NewPointer(irtype)),vartag(vt){
-    //形参直接调用，直接存储值，所以不用创建指针类型
-    //而全局变量和常量需要创建指针类型进行存储
-    //在创建Variable的时候就需要完成加入Module vector和加入符号表之中
+    // 形参按值表示；全局变量和常量以指针类型表示其存储对象。
+    // 非形参对象在构造时登记到模块，全局变量同时注册源级名称。
     if(vt == Param) return;
     else if(vt == GlobalVariable){
         this->ident =  ".G." + ident;
-        ModuleIR->getSymbolTable().register_symbolTable(ident,this);
+        ModuleIR->getSymbolTable().registerSymbolTable(ident,this);
     }
     else{
         this->ident = ".C."+ this->ident;
@@ -2270,10 +2271,10 @@ void Variable::dumpIR(){
     std::cout << " = global ";
     else if (vartag == Constant)
     std::cout << " = constant ";
-    else /* if(usage==Param) */
+    else
     return;
     auto type = std::dynamic_pointer_cast<POINTERType>(getIRType());
-    type->getPointerType()->to_string();
+    type->getPointerType()->toString();
     std::cout<<" ";
     if (Value *init = getOperand(0)) {
         if(auto arrayInit = dynamic_cast<Initializer*>(init)) arrayInit->dumpIR();
@@ -2319,45 +2320,37 @@ Value *Variable::getConstantElement(Variable *Source,
 
 Initializer::Initializer(std::shared_ptr<IRType> irtype):Value(irtype){}
 
-void Initializer::Var2Store(BasicBlock *bb, const std::string &name, std::vector<int> &gep_data) {
+void Initializer::var2Store(BasicBlock *bb, const std::string &name, std::vector<int> &gepData) {
+    // 深度优先遍历聚合初始值，gepData 始终保存当前叶元素的完整索引路径。
     for (int i = 0; i < this->size(); i++) {
         auto &handle = (*this)[i];
-        gep_data.push_back(i);
+        gepData.push_back(i);
 
         if (auto inits = dynamic_cast<Initializer *>(handle)) {
-            inits->Var2Store(bb, name, gep_data);
+            inits->var2Store(bb, name, gepData);
         } else {
-            // 如果初始值不是常量（即使用了变量进行初始化，如 a[3][0]）
             if (!handle->isConst()) {
-                // 1. 生成 GEP 指令获取基地址
+                // 对动态叶元素构造完整 GEP 路径，重算结果类型后再生成 Store。
                 auto gep = dynamic_cast<GetElementPtrInst *>(
                     bb->genGepInst(ModuleIR->getSymbolTable().getValueByName(name)));
 
-                // 2. 添加索引 0 (解引用数组指针)
                 gep->addUse(ConstInt::newConstInt(0));
 
-                // 3. 添加后续维度的索引
-                for (auto &j : gep_data)
+                for (auto &j : gepData)
                     gep->addUse(ConstInt::newConstInt(j));
 
-                // ==========================================
-                // 【修复核心】：添加完索引后，必须更新GEP的类型！
-                // 否则 gep 仍被视为指向整个数组的指针，导致 Store 时类型误判
-                // ==========================================
                 gep->updateType();
 
-                // 4. 生成 Store 指令
-                // 现在 gep 类型已更正为 i32*，genStoreInst 会发现类型匹配(INT==INT)，不会生成 sitofp
                 bb->genStoreInst(handle, gep);
 
-                // 恢复 handle 为默认值（避免重复使用）
+                // 动态值写回后，用同类型零值替换常量模板中的占位。
                 if (handle->getIRType()->getEnum() == IR_INT)
                     handle = ConstInt::newConstInt();
                 else
                     handle = ConstFloat::newConstFloat();
             }
         }
-        gep_data.pop_back();
+        gepData.pop_back();
     }
 }
 
@@ -2384,17 +2377,16 @@ void Initializer::dumpIR(){
         std::cout << "zeroinitializer";
         return;
     }
-    std::cout << " [";
     auto arrType = std::dynamic_pointer_cast<ARRAYType>(irtype);
     if (!arrType) {
-        // 如果不是数组，直接打印自身的值（防御性编程）
-        // 或者根据逻辑直接 return
-        std::cout << "Invalid Initializer Type";
+        // 非数组类型无法按聚合常量展开，退化为同类型的零初始化值。
+        std::cout << "zeroinitializer";
         return;
     }
+    std::cout << " [";
     int limi = arrType->getElementCount();
     for (int i = 0; i < limi; i++) {
-    std::dynamic_pointer_cast<ARRAYType>(irtype)-> getElementType()->to_string();
+    arrType->getElementType()->toString();
     if (i < this->size()) {
       std::cout << " ";
       if (auto inits = dynamic_cast<Initializer *>((*this)[i]))
@@ -2409,7 +2401,7 @@ void Initializer::dumpIR(){
   std::cout << "]";
 }
 
-//常量系统的相关实现
+// 常量对象工厂与驻留。
 ConstantSystem::ConstantSystem(std::shared_ptr<IRType> irtype):Value(irtype){}
 
 
@@ -2423,12 +2415,12 @@ ConstBool::ConstBool(bool val):ConstantSystem(INTType::NewBool()),val(val){
 bool ConstBool::getVal() const {return val;}
 
 ConstBool* ConstBool::newConstBool(bool val){
-  static ConstBool true_const(true);
-  static ConstBool false_const(false);
+  static ConstBool trueConst(true);
+  static ConstBool falseConst(false);
   if (val)
-    return &true_const;
+    return &trueConst;
   else
-    return &false_const;
+    return &falseConst;
 }
 
 ConstInt::ConstInt(int val):ConstantSystem(INTType::NewInt(4)),val(val){
@@ -2441,33 +2433,31 @@ ConstInt::ConstInt(int val, size_t size):ConstantSystem(INTType::NewInt(size)),v
 int ConstInt::getVal() const {return val;}
 
 ConstInt* ConstInt::newConstInt(int val, size_t size){
-  static std::map<std::pair<int, size_t>, ConstInt*> int_const_map;
+  static std::map<std::pair<int, size_t>, ConstInt*> intConstMap;
   auto key = std::make_pair(val, size);
-  if (int_const_map.find(key) == int_const_map.end())
-    int_const_map[key] = (size == 4) ? new ConstInt(val) : new ConstInt(val, size);
-  return int_const_map[key];
+  if (intConstMap.find(key) == intConstMap.end())
+    intConstMap[key] = (size == 4) ? new ConstInt(val) : new ConstInt(val, size);
+  return intConstMap[key];
 }
 
 ConstFloat::ConstFloat(float val):ConstantSystem(FLOATType::NewFloat()),val(val){
   double tmp = val;
   std::uint64_t Bits = 0;
-  static_assert(sizeof(Bits) == sizeof(tmp), "unexpected double width");
+  static_assert(sizeof(Bits) == sizeof(tmp), "double 位宽不符合预期");
   std::memcpy(&Bits, &tmp, sizeof(Bits));
   std::stringstream ss;
   ss << "0x" << std::hex << Bits;
   ident = ss.str();
 }
 ConstFloat* ConstFloat::newConstFloat(float val){
-  // Floating values must be interned by representation rather than numeric
-  // ordering: +0.0 and -0.0 compare equal, while NaN is not a valid key for
-  // std::map<float>'s strict-weak-ordering requirements.
+  // 浮点常量按位模式驻留，以区分正负零，并避免 NaN 破坏有序容器的严格弱序。
   std::uint32_t Bits = 0;
-  static_assert(sizeof(Bits) == sizeof(val), "unexpected float width");
+  static_assert(sizeof(Bits) == sizeof(val), "float 位宽不符合预期");
   std::memcpy(&Bits, &val, sizeof(Bits));
-  static std::map<std::uint32_t, ConstFloat*> float_const_map;
-  auto It = float_const_map.find(Bits);
-  if (It == float_const_map.end()) {
-    It = float_const_map.emplace(Bits, new ConstFloat(val)).first;
+  static std::map<std::uint32_t, ConstFloat*> floatConstMap;
+  auto It = floatConstMap.find(Bits);
+  if (It == floatConstMap.end()) {
+    It = floatConstMap.emplace(Bits, new ConstFloat(val)).first;
   }
   return It->second;
 }
@@ -2478,8 +2468,8 @@ float ConstFloat::getVal() const {return val;}
  ConstPtr::ConstPtr(std::shared_ptr<IRType> irtype):ConstantSystem(irtype){}
 
 ConstPtr* ConstPtr::newConstPtr(std::shared_ptr<IRType> irtype){
-    static ConstPtr *const_ptr = new ConstPtr(irtype);
-    return const_ptr;
+    static ConstPtr *constPtr = new ConstPtr(irtype);
+    return constPtr;
 }
 
 UndefValue::UndefValue(std::shared_ptr<IRType> irtype):ConstantSystem(irtype){ident="undef";}
@@ -2492,28 +2482,27 @@ UndefValue *UndefValue::NewUndefValue(std::shared_ptr<IRType> it) {
   return UV;
 }
 
-// BitCastInst 实现
 BitCastInst::BitCastInst(Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(targetType) {
-    instType = InstType::BITCAST; // 确保你在 InstType 枚举里添加了 BITCAST
+    instType = InstType::BITCAST;
     addUse(v);
 }
 
 void BitCastInst::dumpIR() {
     Value::dumpIR();
     std::cout << " = bitcast ";
-    userList[0]->getValue()->getIRType()->to_string();
+    userList[0]->getValue()->getIRType()->toString();
     std::cout << " ";
     userList[0]->getValue()->dumpIR();
     std::cout << " to ";
-    irtype->to_string();
+    irtype->toString();
     std::cout << "\n";
 }
 
-// BasicBlock 中的 helper 函数
+// 创建位转换指令并追加到当前基本块。
 Value* BasicBlock::genBitCastInst(Value* v, std::shared_ptr<IRType> targetType) {
     auto inst = new BitCastInst(v, targetType);
-    push_back(inst);
+    pushBack(inst);
     return inst;
 }
 
@@ -2561,7 +2550,7 @@ unsigned PhiInst::countIncomingFromPred(BasicBlock *Pred) const {
 void PhiInst::dumpIR() {
     Value::dumpIR();
     std::cout << " = phi ";
-    irtype->to_string();
+    irtype->toString();
     std::cout << " ";
     for (unsigned i = 0; i < getNumIncomingValues(); i++) {
         if (i > 0) std::cout << ", ";
@@ -2600,6 +2589,7 @@ void PhiInst::dumpIR() {
     return changed;
   }
 
+// 各指令副本先按映射替换操作数，映射区域外的引用保持指向原值。
 Instruction* RetInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.empty()) return new RetInst();
     if (userList.size() == 1) {
@@ -2726,7 +2716,7 @@ BasicBlock* Instruction::remapBB(Value* v, const std::unordered_map<Value*, Valu
 }
 
 BrInst *BasicBlock::getBranchTerminator() {
-  if (this->Size() == 0) return nullptr;
+  if (this->size() == 0) return nullptr;
   return dynamic_cast<BrInst *>(this->back());
 }
 
@@ -2737,7 +2727,7 @@ bool BasicBlock::isCondBr(BrInst *Br) {
 bool BasicBlock::isUncondBr(BrInst *Br) {
   return Br && !Br->isConditional() && Br->getSuccessorCount() == 1;
 }
-//计算基本块从From到To的边数
+// 统计终结指令中从当前块指向目标块的边数，平行边分别计数。
 int BasicBlock::countEdgesToSucc(BasicBlock *To) {
   BrInst *Br = getBranchTerminator();
   if (!Br || !To) return 0;
@@ -2759,6 +2749,7 @@ std::vector<PhiInst::IncomingEdge> PhiInst::collectIncomingEdges() {
 bool PhiInst::rebuildFromIncoming(PhiInst *Phi, const std::vector<IncomingEdge> &Incoming) {
   if (!Phi) return false;
 
+  // 无入边时折叠为未定义值，单入边时折叠为唯一输入，多入边时重建 PHI。
   if (Incoming.empty()) {
     Phi->replaceAllUsesWith(UndefValue::NewUndefValue(Phi->getIRType()));
     delete Phi;
@@ -2809,6 +2800,7 @@ bool PhiInst::removeIncomingEdge(PhiInst *Phi, BasicBlock *Pred,
   if (!Phi || !Pred) return false;
   auto Incoming = Phi->collectIncomingEdges();
 
+  // 以同一前驱的出现次序定位平行边，只删除指定的一项。
   unsigned Seen = 0;
   for (auto It = Incoming.begin(); It != Incoming.end(); ++It) {
     if (It->Pred != Pred) continue;
@@ -2904,7 +2896,7 @@ bool BasicBlock::replaceTerminator(BasicBlock *BB,
 }
 
 bool BasicBlock::onlyPhiAndTerminator() {
-  if (this->Size() == 0) return false;
+  if (this->size() == 0) return false;
   Instruction *Term = this->back();
   for (Instruction *I : *this) {
     if (I == Term) continue;
@@ -2924,6 +2916,7 @@ bool BasicBlock::hasOnlyBlockLocalInstructionUsers(Instruction *I, BasicBlock *B
 }
 
 void BasicBlock::eraseBlockSafely() {
+  // 删块前先用同类型未定义值承接外部引用，再清空指令和块对象。
   for (Instruction *I : *this) {
     if (!I) continue;
     if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;

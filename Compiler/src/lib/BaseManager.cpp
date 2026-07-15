@@ -36,6 +36,7 @@ std::optional<std::size_t> Use::getOperandIndex() const {
 
 bool Use::replaceUseeWith(Value *ValueToUse) {
     if (!ValueToUse || usee == ValueToUse) return false;
+    // 先从旧值解链，再挂入新值，确保两侧计数和入口指针始终一致。
     removeFromUseList();
     usee = ValueToUse;
     ValueToUse->getUseList().addUseNode(this);
@@ -44,6 +45,7 @@ bool Use::replaceUseeWith(Value *ValueToUse) {
 
 void Use::removeFromUseList() {
     if (!usee || !prev) return;
+    // prev 指向当前节点的入口槽位，因此头节点和普通节点共享同一套 O(1) 解链逻辑。
     --usee->getUseList().size;
     *prev = next;
     if (next) next->prev = prev;
@@ -69,7 +71,7 @@ Use *UseList::getHead() const {
     return head;
 }
 
-bool UseList::is_empty() const {
+bool UseList::isEmpty() const {
     return head == nullptr;
 }
 
@@ -106,7 +108,7 @@ int Value::generateNum(const std::string &Name) {
 }
 
 Value::~Value() {
-    while (!useList.is_empty()) delete useList.getHead()->user;
+    while (!useList.isEmpty()) delete useList.getHead()->user;
 }
 
 Value::Value(std::shared_ptr<IRType> Type) : irtype(std::move(Type)) {
@@ -151,6 +153,7 @@ const UseList &Value::getUseList() const {
 
 void Value::replaceAllUsesWith(Value *ValueToUse) {
     if (!ValueToUse || ValueToUse == this) return;
+    // 先整体摘下旧使用链，避免逐项换绑时反复改写正在遍历的链头。
     useList.size = 0;
     Use *Head = useList.getHead();
     useList.getHead() = nullptr;
@@ -186,12 +189,12 @@ void User::addUse(Value *Operand) {
 }
 
 bool Value::isConstZero() const {
-    if (auto num_val = dynamic_cast<const ConstInt*>(this))
-        return num_val->getVal() == 0;
-    else if (auto num_val = dynamic_cast<const ConstFloat*>(this))
-        return num_val->getVal() == 0.0f;
-    else if (auto num_val = dynamic_cast<const ConstBool*>(this))
-        return num_val->getVal() == false;
+    if (auto numVal = dynamic_cast<const ConstInt*>(this))
+        return numVal->getVal() == 0;
+    else if (auto numVal = dynamic_cast<const ConstFloat*>(this))
+        return numVal->getVal() == 0.0f;
+    else if (auto numVal = dynamic_cast<const ConstBool*>(this))
+        return numVal->getVal() == false;
     else
         return false;
 }
@@ -271,6 +274,7 @@ bool Value::tryGetNumericFloatConst(float &Out) const {
 
 Value *Value::stripBooleanExtension(Value *V,
                                     BooleanExtensionKind &Kind) {
+    // 依次识别原始 i1、零扩展和符号扩展，供比较与布尔化逻辑恢复真实条件值。
     Kind = BooleanExtensionKind::None;
     if (!V) return nullptr;
     if (IRType::isBool(V->getIRType())) {
@@ -313,6 +317,7 @@ int Value::countUses() const {
 int Value::countInstructionUses(Instruction **SingleUser) const {
     if (SingleUser) *SingleUser = nullptr;
 
+    // 使用链还可能包含非指令 User，这里只统计真正的指令使用者。
     int Count = 0;
     Instruction *OnlyInstUser = nullptr;
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
@@ -333,6 +338,7 @@ int Value::countInstructionUses(Instruction **SingleUser) const {
 }
 
 std::vector<Use *> Value::getUses() const {
+    // 快照与原链解耦，调用方可在遍历快照期间执行批量替换。
     std::vector<Use *> Uses;
     Uses.reserve(static_cast<std::size_t>(useList.size));
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
@@ -365,7 +371,7 @@ std::vector<Instruction *> Value::getInstructionUsers() const {
 }
 
 bool Value::hasUses() const {
-    return !useList.is_empty();
+    return !useList.isEmpty();
 }
 
 bool Value::hasExactlyOneUse() const {
@@ -432,6 +438,7 @@ bool Value::tryGetFloatConst(const Value *V, float &Out) {
 }
 
 bool Value::areEqualConstants(const Value *A, const Value *B) {
+    // 先要求完整类型形状一致，再按常量种类比较；浮点值按位比较以区分正负零和 NaN 表示。
     if (A == B) return true;
     if (!A || !B || !A->getIRType() || !B->getIRType() ||
         !A->getIRType()->hasSameShape(*B->getIRType()))
@@ -466,6 +473,7 @@ bool Value::tryGetIntIndex(const Value *V, int &Out) {
 }
 
 Value *Value::stripPointerCastsAndGEP(Value *V) {
+    // 访问集合既防止异常自环，也允许连续剥离任意层 GEP 和位转换。
     std::unordered_set<Value *> Visited;
     while (V && Visited.insert(V).second) {
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {

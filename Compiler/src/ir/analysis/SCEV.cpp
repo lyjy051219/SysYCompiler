@@ -26,12 +26,12 @@ std::optional<int64_t> SCEVResult::getTrivialExactIntConstant(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V) || Depth > 32) return std::nullopt;
     if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal();
-    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return std::nullopt;
 
     std::optional<int64_t> Result;
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
-        if (!TraverseTools::forEachPhiIncoming(
+        if (!forEachPhiIncoming(
                 Phi, [&](unsigned, Value *Incoming, BasicBlock *) {
                     if (Incoming == V) return true;
                     auto C = getTrivialExactIntConstant(
@@ -509,7 +509,7 @@ const SCEVExpr *SCEVResult::createFromPhi(PhiInst *Phi) {
         return getSCEV(Phi->getIncomingValue(0));
 
     const SCEVExpr *Common = nullptr;
-    if (!TraverseTools::forEachPhiIncoming(
+    if (!forEachPhiIncoming(
             Phi, [&](unsigned, Value *In, BasicBlock *) {
                 if (!In || In == Phi) return true;
                 const SCEVExpr *Cur = getSCEV(In);
@@ -527,7 +527,7 @@ const SCEVExpr *SCEVResult::createFromPhi(PhiInst *Phi) {
 const SCEVExpr *SCEVResult::tryHeaderPhi(PhiInst *Phi, const Loop *L) {
     Value *Start = nullptr;
     Value *Update = nullptr;
-    if (!TraverseTools::forEachPhiIncoming(
+    if (!forEachPhiIncoming(
             Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
                 if (!V || !Pred) return false;
                 if (L->contains(Pred)) {
@@ -1087,7 +1087,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         if (Candidate && Candidate->getParent() == Info.Header) {
             bool UpdateIsBackedge = false;
             bool BadIncoming = false;
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Candidate,
                 [&](unsigned, Value *Incoming, BasicBlock *PredBB) {
                     if (!PredBB || !Incoming) {
@@ -1150,7 +1150,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         auto Ty = Info.IndVar->getIRType();
         std::optional<int64_t> ExactStart;
         Value *DirectUpdate = nullptr;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Info.IndVar,
             [&](unsigned, Value *Incoming, BasicBlock *PredBB) {
                 if (!PredBB || !Incoming) {
@@ -1354,7 +1354,7 @@ SCEVResult::getCanonicalInduction(const Loop *L) {
     PhiInst *Phi = TCInfo->IndVar;
     Value *StartValue = nullptr;
     Value *UpdateValue = nullptr;
-    if (!TraverseTools::forEachPhiIncoming(
+    if (!forEachPhiIncoming(
             Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
                 if (!V || !Pred) return false;
                 if (L->contains(Pred)) {

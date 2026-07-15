@@ -3,10 +3,8 @@
 #include <string>
 #include <vector>
 #include <list>
-#include <iostream>
 
-//本文件是用来创建AST的
-//使用解耦的办法，将IR生成的部分解耦交给Visitor来做
+// 定义 SysY 抽象语法树；IR 生成等后续阶段通过访问器与节点结构解耦。
 enum Type{
     SY_INT,
     SY_FLOAT,
@@ -32,7 +30,7 @@ enum Type{
     SY_ASSIGN
 };
 
-//前向声明，防止前面编译的用到后面编译的类从而报错
+// 前向声明用于解除节点之间的声明顺序依赖。
 class ConstDefList;
 class VarDefList;
 class ConstDef;
@@ -69,7 +67,7 @@ class LAndExp;
 class LOrExp;
 
 
-//visitor基类
+// 所有语法树访问器共用的动态分派接口。
 class ASTVisitor {
 public:
     virtual ~ASTVisitor() = default;
@@ -118,190 +116,179 @@ public:
 };
 
 
-//基础类：BaseAST，Stmt，HasOperand
-//所有AST节点的基类
+// 所有语法树节点的基类。
 class BaseAST{
 public:
     virtual ~BaseAST() = default;
     virtual void accept(ASTVisitor &visitor) = 0;
 };
-//语句基类
+// 所有声明与语句节点的共同基类。
 class Stmt : public BaseAST{
 public:
 };
-//有表达式基类
+// 所有可作为表达式操作数的节点共同基类。
 class HasOperand : public BaseAST{
 public:
 };
 
-//编译单元：由若干个Decl和FuncDef实现
-//由于我在bison中写的都是左递归，所以这里用vector+智能指针实现
+// 编译单元按源码顺序持有声明和函数定义，并独占各子节点的生命周期。
 class CompUnit : public BaseAST{
 private:
   std::vector<std::unique_ptr<BaseAST>> items;
 public:
   CompUnit(BaseAST * item){ items.push_back(std::unique_ptr<BaseAST>(item)); }
-  void push_back(BaseAST* item){ items.push_back(std::unique_ptr<BaseAST>(item)); }
+  void pushBack(BaseAST* item){ items.push_back(std::unique_ptr<BaseAST>(item)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-  //添加一个访问items的函数，用来访问并遍历私有成员
-  const std::vector<std::unique_ptr<BaseAST>>& get_items() const {return items;}
+  // 返回只读节点序列，供访问器按源码顺序遍历。
+  const std::vector<std::unique_ptr<BaseAST>>& getItems() const {return items;}
 };
 
-//声明和定义相关
-//常量声明
-//这里需要理解一下声明语句也是语句的一部分，所以直接继承Stmt
+// 常量声明也是块内语句，因此继承 Stmt。
 class ConstDecl : public Stmt{
-  //ConstDecl包括一个type和一个ConstDefList，这个ConstDefList用智能指针实现
   private:
     Type type;
-    std::unique_ptr<ConstDefList> def_list;
+    std::unique_ptr<ConstDefList> defList;
   public:
-    ConstDecl(Type t,ConstDefList* d): type(t), def_list(std::unique_ptr<ConstDefList>(d)) {}
+    ConstDecl(Type t,ConstDefList* d): type(t), defList(std::unique_ptr<ConstDefList>(d)) {}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    Type get_type() const {return type;}
-    const std::unique_ptr<ConstDefList>& get_ConstDefList() const{ return def_list; }
+    Type getType() const {return type;}
+    const std::unique_ptr<ConstDefList>& getConstDefList() const{ return defList; }
 };
-//变量声明
+// 变量声明持有同一基础类型下的全部变量定义。
 class VarDecl : public Stmt{
   private:
     Type type;
-    std::unique_ptr<VarDefList>def_list;
+    std::unique_ptr<VarDefList>defList;
   public:
-    VarDecl(Type t,VarDefList* d): type(t), def_list(std::unique_ptr<VarDefList>(d)) {}
+    VarDecl(Type t,VarDefList* d): type(t), defList(std::unique_ptr<VarDefList>(d)) {}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    Type get_type() const {return type;}
-    const std::unique_ptr<VarDefList>& get_VarDefList() const{ return def_list; }
+    Type getType() const {return type;}
+    const std::unique_ptr<VarDefList>& getVarDefList() const{ return defList; }
 
 };
-//常量定义列表
+// 常量定义列表保持文法归约得到的源码顺序。
 class ConstDefList : public Stmt{
 private:
   std::vector<std::unique_ptr<ConstDef>> cdl;
 public:
   ConstDefList(ConstDef* c){ cdl.push_back(std::unique_ptr<ConstDef>(c)); }
-  void push_back(ConstDef* c){ cdl.push_back(std::unique_ptr<ConstDef>(c)); }
+  void pushBack(ConstDef* c){ cdl.push_back(std::unique_ptr<ConstDef>(c)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-  const std::vector<std::unique_ptr<ConstDef>>& get_defs() const { return cdl; }
+  const std::vector<std::unique_ptr<ConstDef>>& getDefs() const { return cdl; }
 
 };
-//变量定义列表
+// 变量定义列表保持文法归约得到的源码顺序。
 class VarDefList : public Stmt{
   private:
     std::vector<std::unique_ptr<VarDef>> vdl;
   public:
   VarDefList(VarDef* v){ vdl.push_back(std::unique_ptr<VarDef>(v)); }
-  void push_back(VarDef* v){ vdl.push_back(std::unique_ptr<VarDef>(v)); }
+  void pushBack(VarDef* v){ vdl.push_back(std::unique_ptr<VarDef>(v)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-  const std::vector<std::unique_ptr<VarDef>>& get_defs() const { return vdl; }
+  const std::vector<std::unique_ptr<VarDef>>& getDefs() const { return vdl; }
 };
 
-//变量定义
+// 变量定义可选带数组维度和初始化值。
 class VarDef : public Stmt{
   private:
     std::string ident;
-    std::unique_ptr<ArrayList> exp_list;
-    std::unique_ptr<InitVal> init_val;
+    std::unique_ptr<ArrayList> expList;
+    std::unique_ptr<InitVal> initVal;
   public:
-    VarDef(const std::string& id): ident(id), exp_list(nullptr), init_val(nullptr) {}
-   /* VarDef(const std::string& id, InitVal* iv): ident(id), exp_list(nullptr), init_val(iv) {}
-    VarDef(const std::string& id, ArrayList* el): ident(id), exp_list(el), init_val(nullptr) {}*/
-    VarDef(const std::string& id, ArrayList* el, InitVal* iv): ident(id), exp_list(std::unique_ptr<ArrayList>(el)), init_val(std::unique_ptr<InitVal>(iv)) {}
+    VarDef(const std::string& id): ident(id), expList(nullptr), initVal(nullptr) {}
+    VarDef(const std::string& id, ArrayList* el, InitVal* iv): ident(id), expList(std::unique_ptr<ArrayList>(el)), initVal(std::unique_ptr<InitVal>(iv)) {}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    std::string get_ident()const { return ident; }
-    bool has_array() const { return exp_list != nullptr; }
-    ArrayList* get_array() const { return exp_list.get(); }
-    bool has_initval() const { return init_val != nullptr; }
-    InitVal* get_initval() const { return init_val.get(); }
+    std::string getIdent()const { return ident; }
+    bool hasArray() const { return expList != nullptr; }
+    ArrayList* getArray() const { return expList.get(); }
+    bool hasInitVal() const { return initVal != nullptr; }
+    InitVal* getInitVal() const { return initVal.get(); }
 };
-//常量定义
+// 常量定义必须由语义阶段校验其初始化式为常量表达式。
 class ConstDef : public Stmt{
 private:
     std::string ident;
-    std::unique_ptr<ArrayList> exp_list;
-    std::unique_ptr<InitVal> init_val;
+    std::unique_ptr<ArrayList> expList;
+    std::unique_ptr<InitVal> initVal;
 public:
-   // ConstDef(const std::string& id, InitVal* iv): ident(id), exp_list(nullptr), init_val(std::unique_ptr<InitVal>(iv)){}
-    ConstDef(const std::string& id, ArrayList* el, InitVal* iv): ident(id), exp_list(std::unique_ptr<ArrayList>(el)), init_val(std::unique_ptr<InitVal>(iv)){}
+    ConstDef(const std::string& id, ArrayList* el, InitVal* iv): ident(id), expList(std::unique_ptr<ArrayList>(el)), initVal(std::unique_ptr<InitVal>(iv)){}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    std::string get_ident()const { return ident; }
-    bool has_array() const { return exp_list != nullptr; }
-    ArrayList* get_array() const { return exp_list.get(); }
-    bool has_initval() const { return init_val != nullptr; }
-    InitVal* get_initval() const { return init_val.get(); }
+    std::string getIdent()const { return ident; }
+    bool hasArray() const { return expList != nullptr; }
+    ArrayList* getArray() const { return expList.get(); }
+    bool hasInitVal() const { return initVal != nullptr; }
+    InitVal* getInitVal() const { return initVal.get(); }
 };
 
-//函数相关
-//函数定义
+// 函数定义独占形参列表和函数体；无形参时 params 为空。
 class FuncDef : public BaseAST{
   private:
   Type type;
   std::string ident;
-  std::unique_ptr<FuncParamList> params; //函数形参列表
-  std::unique_ptr<Block> funcBody; //函数体
+  std::unique_ptr<FuncParamList> params;
+  std::unique_ptr<Block> funcBody;
   public:
-  //FuncDef(Type t,std::string id,Block* b):type(t),ident(id),params(nullptr),funcBody(b){}
   FuncDef(Type t,std::string id,FuncParamList* p,Block* b):type(t),ident(id),params(std::unique_ptr<FuncParamList>(p)),funcBody(std::unique_ptr<Block>(b)){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-   Type get_type() const { return type; }
-   const std::string& get_ident() const { return ident; }
-   const std::unique_ptr<FuncParamList>& get_params() const { return params; }
-   const std::unique_ptr<Block>& get_funcBody() const { return funcBody; }
+   Type getType() const { return type; }
+   const std::string& getIdent() const { return ident; }
+   const std::unique_ptr<FuncParamList>& getParams() const { return params; }
+   const std::unique_ptr<Block>& getFuncBody() const { return funcBody; }
 };
-//函数形参
+// 函数形参记录首个空维度和后续显式维度，供数组形参类型降级使用。
 class FuncParam : public BaseAST{
 private:
   Type type;
   std::string ident;
-  bool has_empty_brackets_;  // 是否有空方括号 []
-  std::unique_ptr<ArrayList> dimension_list;  // 更清晰的命名
+  bool hasEmptyBracketsFlag;
+  std::unique_ptr<ArrayList> dimensionList;
 public:
- // 规则1：普通参数 Type IDENT
+  // 普通标量形参：Type IDENT。
   FuncParam(Type t, std::string id):
-      type(t), ident(id), has_empty_brackets_(false), dimension_list(nullptr) {}
+      type(t), ident(id), hasEmptyBracketsFlag(false), dimensionList(nullptr) {}
 
-  // 规则2：空方括号参数 Type IDENT []
-  FuncParam(Type t, std::string id, bool has_empty_brackets):
-      type(t), ident(id), has_empty_brackets_(has_empty_brackets), dimension_list(nullptr) {}
+  // 省略首维的数组形参：Type IDENT []。
+  FuncParam(Type t, std::string id, bool hasEmptyBrackets):
+      type(t), ident(id), hasEmptyBracketsFlag(hasEmptyBrackets), dimensionList(nullptr) {}
 
-  // 规则3和规则4：带维度参数
-  FuncParam(Type t, std::string id, bool has_empty_brackets, ArrayList* dim_list):
-      type(t), ident(id), has_empty_brackets_(has_empty_brackets),
-      dimension_list(std::unique_ptr<ArrayList>(dim_list)) {}
+  // 带后续维度的数组形参：Type IDENT [][Exp]...。
+  FuncParam(Type t, std::string id, bool hasEmptyBrackets, ArrayList* dimList):
+      type(t), ident(id), hasEmptyBracketsFlag(hasEmptyBrackets),
+      dimensionList(std::unique_ptr<ArrayList>(dimList)) {}
 
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  Type get_type() const { return type; }
-  const std::string& get_ident() const { return ident; }
-  bool has_empty_brackets() const { return has_empty_brackets_; }  // 是否有 []
-  bool has_dimension() const { return dimension_list != nullptr; }  // 是否有具体维度
-  const std::unique_ptr<ArrayList>& get_exp_list() const { return dimension_list; }
+  Type getType() const { return type; }
+  const std::string& getIdent() const { return ident; }
+  bool hasEmptyBrackets() const { return hasEmptyBracketsFlag; }
+  bool hasDimension() const { return dimensionList != nullptr; }
+  const std::unique_ptr<ArrayList>& getExpList() const { return dimensionList; }
 };
-//函数形参列表，函数定义使用的
+// 函数定义使用的形参列表。
 class FuncParamList : public BaseAST{
   private:
   std::vector<std::unique_ptr<FuncParam>> fpl;
   public:
   FuncParamList(FuncParam* f){ fpl.push_back(std::unique_ptr<FuncParam>(f)); }
-  void push_back(FuncParam* f){ fpl.push_back(std::unique_ptr<FuncParam>(f)); }
+  void pushBack(FuncParam* f){ fpl.push_back(std::unique_ptr<FuncParam>(f)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::vector<std::unique_ptr<FuncParam>>& get_params() const { return fpl; }
+  const std::vector<std::unique_ptr<FuncParam>>& getParams() const { return fpl; }
 };
 
-//初始化相关--包括常量初始化和变量初始化
-//初始化列表
+// 聚合初始化列表，可同时表示常量初始化和变量初始化。
 class InitValList : public BaseAST{
   private:
   std::vector<std::unique_ptr<InitVal>> ivl;
   public:
   InitValList(InitVal* iv){ ivl.push_back(std::unique_ptr<InitVal>(iv)); }
-  void push_back(InitVal* iv){ ivl.push_back(std::unique_ptr<InitVal>(iv)); }
+  void pushBack(InitVal* iv){ ivl.push_back(std::unique_ptr<InitVal>(iv)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::vector<std::unique_ptr<InitVal>>& get_initVals() const { return ivl; }
+  const std::vector<std::unique_ptr<InitVal>>& getInitVals() const { return ivl; }
 };
-//初始化值
+// 初始化值为空、标量表达式或聚合初始化列表之一。
 class InitVal : public BaseAST{
   private:
   std::unique_ptr<BaseAST> val;
@@ -310,12 +297,11 @@ class InitVal : public BaseAST{
   InitVal(BaseAST* iv): val(std::unique_ptr<BaseAST>(iv)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<BaseAST>& get_value() const { return val; }
+  const std::unique_ptr<BaseAST>& getValue() const { return val; }
 };
 
 
-//下面是语句的相关子类
-//语句块--即代码块
+// 代码块可为空；非空时独占块项列表。
 class Block : public Stmt{
   private:
   std::unique_ptr<BlockItemList> items;
@@ -323,20 +309,20 @@ class Block : public Stmt{
   Block(BlockItemList* it): items(std::unique_ptr<BlockItemList>(it)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<BlockItemList>& get_items() const { return items; }
+  const std::unique_ptr<BlockItemList>& getItems() const { return items; }
 };
-//语句块列表：语句块内部的声明和语句列表
+// 块项列表按源码顺序混合保存声明与语句。
 class BlockItemList : public Stmt{
   private:
   std::vector<std::unique_ptr<Stmt>> st;
   public:
   BlockItemList(Stmt* s){ st.push_back(std::unique_ptr<Stmt>(s)); }
-  void push_back(Stmt* s){ st.push_back(std::unique_ptr<Stmt>(s)); }
+  void pushBack(Stmt* s){ st.push_back(std::unique_ptr<Stmt>(s)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::vector<std::unique_ptr<Stmt>>& get_stmts() const { return st; }
+  const std::vector<std::unique_ptr<Stmt>>& getStmts() const { return st; }
 };
-//赋值语句
+// 赋值语句保存目标左值与右侧表达式。
 class AssignStmt : public Stmt{
   private:
   std::unique_ptr<LVal> lv;
@@ -345,10 +331,10 @@ class AssignStmt : public Stmt{
   AssignStmt(LVal* lv,AddExp* ae): lv(std::unique_ptr<LVal>(lv)), ae(std::unique_ptr<AddExp>(ae)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<LVal>& get_lval() const { return lv; }
-  const std::unique_ptr<AddExp>& get_exp() const { return ae; }
+  const std::unique_ptr<LVal>& getLVal() const { return lv; }
+  const std::unique_ptr<AddExp>& getExp() const { return ae; }
 };
-//表达式语句
+// 表达式语句允许空表达式。
 class ExpStmt : public Stmt{
   private:
   std::unique_ptr<AddExp> ae;
@@ -356,62 +342,62 @@ class ExpStmt : public Stmt{
   ExpStmt(AddExp* ae): ae(std::unique_ptr<AddExp>(ae)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<AddExp>& get_exp() const { return ae; }
+  const std::unique_ptr<AddExp>& getExp() const { return ae; }
 };
-//if语句
+// 条件语句可选带否分支。
 class IfStmt : public Stmt{
   private:
   std::unique_ptr<LOrExp> condition;
-  std::unique_ptr<Stmt> if_st,else_st;
+  std::unique_ptr<Stmt> ifStmt,elseStmt;
   public:
-  IfStmt(LOrExp* condition,Stmt* if_st):condition(std::unique_ptr<LOrExp>(condition)),if_st(std::unique_ptr<Stmt>(if_st)),else_st(nullptr){}
-  IfStmt(LOrExp* condition,Stmt* if_st,Stmt* else_st):condition(std::unique_ptr<LOrExp>(condition)),if_st(std::unique_ptr<Stmt>(if_st)),else_st(std::unique_ptr<Stmt>(else_st)){}
+  IfStmt(LOrExp* condition,Stmt* ifStmt):condition(std::unique_ptr<LOrExp>(condition)),ifStmt(std::unique_ptr<Stmt>(ifStmt)),elseStmt(nullptr){}
+  IfStmt(LOrExp* condition,Stmt* ifStmt,Stmt* elseStmt):condition(std::unique_ptr<LOrExp>(condition)),ifStmt(std::unique_ptr<Stmt>(ifStmt)),elseStmt(std::unique_ptr<Stmt>(elseStmt)){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<LOrExp>& get_condition() const { return condition; }
-  const std::unique_ptr<Stmt>& get_if_stmt() const { return if_st; }
-  bool has_else() const { return else_st != nullptr; }
-  const std::unique_ptr<Stmt>& get_else_stmt() const { return else_st; }
+  const std::unique_ptr<LOrExp>& getCondition() const { return condition; }
+  const std::unique_ptr<Stmt>& getIfStmt() const { return ifStmt; }
+  bool hasElse() const { return elseStmt != nullptr; }
+  const std::unique_ptr<Stmt>& getElseStmt() const { return elseStmt; }
 };
-//while语句
+// 循环语句保存条件和循环体。
 class WhileStmt : public Stmt{
   private:
   std::unique_ptr<LOrExp> condition;
-  std::unique_ptr<Stmt> while_st;
+  std::unique_ptr<Stmt> whileStmt;
   public:
-  WhileStmt(LOrExp* condition,Stmt* while_st):condition(std::unique_ptr<LOrExp>(condition)),while_st(std::unique_ptr<Stmt> (while_st)){}
+  WhileStmt(LOrExp* condition,Stmt* whileStmt):condition(std::unique_ptr<LOrExp>(condition)),whileStmt(std::unique_ptr<Stmt> (whileStmt)){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::unique_ptr<LOrExp>& get_condition() const { return condition; }
-  const std::unique_ptr<Stmt>& get_while_stmt() const { return while_st; }
+  const std::unique_ptr<LOrExp>& getCondition() const { return condition; }
+  const std::unique_ptr<Stmt>& getWhileStmt() const { return whileStmt; }
 };
-//break语句
+// 退出当前循环的语句节点。
 class BreakStmt : public Stmt{
   public:
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
 };
-//continue语句
+// 继续当前循环下一次迭代的语句节点。
 class ContinueStmt : public Stmt{
   public:
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-};//--这里注意，在现在编写的这个阶段，break和continue两个好像没什么区别
-//return语句
+};
+// 返回语句可选带返回值表达式。
 class ReturnStmt : public Stmt{
   private:
-  std::unique_ptr<AddExp> ret_val;
+  std::unique_ptr<AddExp> retVal;
   public:
-  ReturnStmt(): ret_val(nullptr) {}
-  ReturnStmt(AddExp* ae): ret_val(std::unique_ptr<AddExp>(ae)) {}
+  ReturnStmt(): retVal(nullptr) {}
+  ReturnStmt(AddExp* ae): retVal(std::unique_ptr<AddExp>(ae)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  bool has_return_value() const { return ret_val != nullptr; }
-  const std::unique_ptr<AddExp>& get_return_value() const { return ret_val; }
+  bool hasReturnValue() const { return retVal != nullptr; }
+  const std::unique_ptr<AddExp>& getReturnValue() const { return retVal; }
 
 };
 
 
-//左值表达式：变量，数组元素等可以出现在=左边的表达式
+// 左值表达式表示变量或数组元素，可出现在赋值号左侧。
 class LVal : public HasOperand{
   private:
   std::string ident;
@@ -421,36 +407,33 @@ class LVal : public HasOperand{
   LVal(std::string id,ArrayList* e):ident(id),arr(std::unique_ptr<ArrayList>(e)){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::string& get_ident() const { return ident; }
-  bool has_array() const { return arr != nullptr; }
-  const std::unique_ptr<ArrayList>& get_array() const { return arr; }
+  const std::string& getIdent() const { return ident; }
+  bool hasArray() const { return arr != nullptr; }
+  const std::unique_ptr<ArrayList>& getArray() const { return arr; }
 };
 
 
 
-//下面是有操作数的表达式的相关子类
-//基础表达式模板
+// 同一优先级的表达式链；始终满足操作数数量比操作符数量多一。
 template <typename T>
 class BaseExp : public HasOperand{
   protected:
-  //因为只有一元表达式涉及了右递归，所以这里我统一用链表进行实现
-  std::list<Type> op;  //操作符序列
-  std::list<std::unique_ptr<T>> operand;  //操作数序列
+  std::list<Type> op;
+  std::list<std::unique_ptr<T>> operand;
   public:
   BaseExp(T* data){ operand.push_back(std::unique_ptr<T>(data));}
-  //接受第一个操作数，然后进行创建对象
-  void push_back(Type t){ op.push_back(t); }
-  void push_back(T* data){ operand.push_back(std::unique_ptr<T>(data)); }
-  void push_front(Type t){ op.push_front(t); }
-  void push_front(T* data){ operand.push_front(std::unique_ptr<T>(data)); }
+  // 尾插用于左递归表达式；头插用于按文法顺序保存一元操作符。
+  void pushBack(Type t){ op.push_back(t); }
+  void pushBack(T* data){ operand.push_back(std::unique_ptr<T>(data)); }
+  void pushFront(Type t){ op.push_front(t); }
+  void pushFront(T* data){ operand.push_front(std::unique_ptr<T>(data)); }
   const std::list<Type>& getOps() const { return op;}
   const std::list<std::unique_ptr<T>>& getOperands() const {return operand;}
 
-  size_t get_operand_count() const { return operand.size(); }
-  size_t get_op_count() const { return op.size(); }
+  size_t getOperandCount() const { return operand.size(); }
+  size_t getOpCount() const { return op.size(); }
 };
-// 具体表达式类型
-//UnaryExp → MulExp → AddExp → RelExp → EqExp → LAndExp → LOrExp
+// 表达式层级从高到低依次为一元、乘除、加减、关系、相等、逻辑与、逻辑或。
 class UnaryExp : public BaseExp<HasOperand> {
 public:
     using BaseExp<HasOperand>::BaseExp;
@@ -493,7 +476,7 @@ public:
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 };
 
-//函数调用的表达式
+// 函数调用记录被调函数、可选实参列表和源码行号。
 class FuncCall : public HasOperand{
   private:
   std::string ident;
@@ -504,37 +487,35 @@ class FuncCall : public HasOperand{
   FuncCall(std::string id, int line) : ident(id), fp(nullptr), lineno(line) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::string& get_ident() const { return ident; }
-  bool has_params() const { return fp != nullptr; }
-  const std::unique_ptr<FuncRParamList>& get_params() const { return fp; }
-  int get_lineno() const { return lineno; }
+  const std::string& getIdent() const { return ident; }
+  bool hasParams() const { return fp != nullptr; }
+  const std::unique_ptr<FuncRParamList>& getParams() const { return fp; }
+  int getLineNo() const { return lineno; }
 };
-//表达式列表
-//这里对应Bison中的ExpList--即数组维度列表
+// 数组维度或索引表达式列表，对应语法规则中的 ExpList。
 class ArrayList : public BaseAST{
   private:
   std::vector<std::unique_ptr<AddExp>> al;
   public:
   ArrayList(AddExp* ae){ al.push_back(std::unique_ptr<AddExp>(ae)); }
-  void push_back(AddExp* ae){ al.push_back(std::unique_ptr<AddExp>(ae)); }
+  void pushBack(AddExp* ae){ al.push_back(std::unique_ptr<AddExp>(ae)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-  const std::vector<std::unique_ptr<AddExp>>& get_expressions() const { return al; }
+  const std::vector<std::unique_ptr<AddExp>>& getExpressions() const { return al; }
 };
-//函数调用时的实参列表
+// 函数调用的实参列表。
 class FuncRParamList : public BaseAST{
   private:
   std::vector<std::unique_ptr<AddExp>> fp;
   public:
   FuncRParamList(AddExp* ae){ fp.push_back(std::unique_ptr<AddExp>(ae)); }
-  void push_back(AddExp* ae){ fp.push_back(std::unique_ptr<AddExp>(ae)); }
+  void pushBack(AddExp* ae){ fp.push_back(std::unique_ptr<AddExp>(ae)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::vector<std::unique_ptr<AddExp>>& get_params() const { return fp; }
+  const std::vector<std::unique_ptr<AddExp>>& getParams() const { return fp; }
 };
 
 
-//字面量常量
-//Number->INTCONST|FLOAT_CONST
+// 整数或浮点数字面量，对应 Number 文法节点。
 template<typename T>
 class ConValue : public HasOperand{
   private:
@@ -543,5 +524,5 @@ class ConValue : public HasOperand{
   ConValue(T t):t(t){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  T get_value() const { return t; }
+  T getValue() const { return t; }
 };

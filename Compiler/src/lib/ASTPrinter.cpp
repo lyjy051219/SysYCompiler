@@ -29,30 +29,30 @@ void ASTPrinter::visit(CompUnit &node){
     std::cout << "======================================" << std::endl;
     std::cout << "                AST调试                " << std::endl;
     std::cout << "======================================" << std::endl;
-    for(auto &n : node.get_items()){
+    for(auto &n : node.getItems()){
         n->accept(*this);
     }
 }
 
 void ASTPrinter::visit(ConstDecl &node) {
-    std::cout << "const "<< typeToString(node.get_type()) << " ";
-    if (node.get_ConstDefList()) {
-        node.get_ConstDefList()->accept(*this);
+    std::cout << "const "<< typeToString(node.getType()) << " ";
+    if (node.getConstDefList()) {
+        node.getConstDefList()->accept(*this);
     }
     std::cout << ";" << std::endl;
 }
 
 void ASTPrinter::visit(VarDecl &node) {
-    std::cout << typeToString(node.get_type()) << " ";
-    if (node.get_VarDefList()) {
-        node.get_VarDefList()->accept(*this);
+    std::cout << typeToString(node.getType()) << " ";
+    if (node.getVarDefList()) {
+        node.getVarDefList()->accept(*this);
     }
     std::cout << ";" << std::endl;
 }
 
 void ASTPrinter::visit(ConstDefList &node) {
     bool first = true;
-    for (const auto& def : node.get_defs()) {
+    for (const auto& def : node.getDefs()) {
         if (!first) {
             std::cout << ", ";
         }
@@ -63,7 +63,7 @@ void ASTPrinter::visit(ConstDefList &node) {
 
 void ASTPrinter::visit(VarDefList &node) {
     bool first = true;
-    for (const auto& def : node.get_defs()) {
+    for (const auto& def : node.getDefs()) {
         if (!first) {
             std::cout << ", ";
         }
@@ -73,56 +73,56 @@ void ASTPrinter::visit(VarDefList &node) {
 }
 
 void ASTPrinter::visit(ConstDef &node) {
-    std::cout << node.get_ident();
+    std::cout << node.getIdent();
 
-    if (node.has_array() && node.get_array()) {
-        node.get_array()->accept(*this);
+    if (node.hasArray() && node.getArray()) {
+        node.getArray()->accept(*this);
     }
 
-    if (node.has_initval() && node.get_initval()) {
+    if (node.hasInitVal() && node.getInitVal()) {
         std::cout << " = ";
-        node.get_initval()->accept(*this);
+        node.getInitVal()->accept(*this);
     }
 }
 
 void ASTPrinter::visit(VarDef &node) {
-    std::cout << node.get_ident();
+    std::cout << node.getIdent();
 
-    if (node.has_array() && node.get_array()) {
-        node.get_array()->accept(*this);
+    if (node.hasArray() && node.getArray()) {
+        node.getArray()->accept(*this);
     }
 
-    if (node.has_initval() && node.get_initval()) {
+    if (node.hasInitVal() && node.getInitVal()) {
         std::cout << " = ";
-        node.get_initval()->accept(*this);
+        node.getInitVal()->accept(*this);
     }
 }
 
-// 函数相关visit实现
+// 输出函数签名、形参和函数体。
 void ASTPrinter::visit(FuncDef &node) {
-    std::cout << typeToString(node.get_type()) << " " << node.get_ident();
+    std::cout << typeToString(node.getType()) << " " << node.getIdent();
     std::cout << "(";
-    if (node.get_params()) {
-        node.get_params()->accept(*this);
+    if (node.getParams()) {
+        node.getParams()->accept(*this);
     }
     std::cout << ")" << std::endl;
 
-    if (node.get_funcBody()) {
-        node.get_funcBody()->accept(*this);
+    if (node.getFuncBody()) {
+        node.getFuncBody()->accept(*this);
     }
     std::cout << std::endl;
 }
 void ASTPrinter::visit(FuncParam &node) {
-    std::cout << typeToString(node.get_type()) << " " << node.get_ident();
+    std::cout << typeToString(node.getType()) << " " << node.getIdent();
 
-    if (node.has_empty_brackets() || node.has_dimension()) {
-        if (node.has_dimension()) {
-            // 有具体维度
+    if (node.hasEmptyBrackets() || node.hasDimension()) {
+        if (node.hasDimension()) {
+            // 依次输出数组形参的显式维度。
             std::cout << "[";
-            node.get_exp_list()->accept(*this);
+            node.getExpList()->accept(*this);
             std::cout << "]";
         } else {
-            // 无维度（函数参数常见情况）
+            // 仅保留数组形参省略的首维。
             std::cout << "[]";
         }
     }
@@ -130,7 +130,7 @@ void ASTPrinter::visit(FuncParam &node) {
 
 void ASTPrinter::visit(FuncParamList &node) {
     bool first = true;
-    for (const auto& param : node.get_params()) {
+    for (const auto& param : node.getParams()) {
         if (!first) {
             std::cout << ", ";
         }
@@ -139,11 +139,11 @@ void ASTPrinter::visit(FuncParamList &node) {
     }
 }
 
-// 初始化相关visit实现
+// 使用花括号递归输出聚合初始化值。
 void ASTPrinter::visit(InitValList &node) {
     std::cout << "{";
     bool first = true;
-    for (const auto& initVal : node.get_initVals()) {
+    for (const auto& initVal : node.getInitVals()) {
         if (!first) {
             std::cout << ", ";
         }
@@ -154,134 +154,132 @@ void ASTPrinter::visit(InitValList &node) {
 }
 
 void ASTPrinter::visit(InitVal &node) {
-    if (node.get_value()) {
-        node.get_value()->accept(*this);
+    if (node.getValue()) {
+        node.getValue()->accept(*this);
     } else {
         std::cout << "{}";
     }
 }
 
-// 语句相关visit实现
+// 按语句结构恢复类源码文本。
 void ASTPrinter::visit(Block &node) {
     std::cout << "{" << std::endl;
-    if (node.get_items()) {
-        node.get_items()->accept(*this);
+    if (node.getItems()) {
+        node.getItems()->accept(*this);
     }
     std::cout << "}" << std::endl;
 }
 
 void ASTPrinter::visit(BlockItemList &node) {
-    for (const auto& stmt : node.get_stmts()) {
+    for (const auto& stmt : node.getStmts()) {
         stmt->accept(*this);
     }
 }
 
 void ASTPrinter::visit(AssignStmt &node) {
-    if (node.get_lval()) {
-        node.get_lval()->accept(*this);
+    if (node.getLVal()) {
+        node.getLVal()->accept(*this);
     }
     std::cout << " = ";
-    if (node.get_exp()) {
-        node.get_exp()->accept(*this);
+    if (node.getExp()) {
+        node.getExp()->accept(*this);
     }
     std::cout << ";" << std::endl;
 }
 
 void ASTPrinter::visit(ExpStmt &node) {
-    if (node.get_exp()) {
-        node.get_exp()->accept(*this);
+    if (node.getExp()) {
+        node.getExp()->accept(*this);
     }
     std::cout << ";" << std::endl;
 }
 
 void ASTPrinter::visit(IfStmt &node) {
     std::cout << "if (";
-    if (node.get_condition()) {
-        node.get_condition()->accept(*this);
+    if (node.getCondition()) {
+        node.getCondition()->accept(*this);
     }
     std::cout << ") ";
 
-    // 处理then分支
-    if (node.get_if_stmt()) {
-        bool thenIsBlock = dynamic_cast<Block*>(node.get_if_stmt().get());
+    // 非块形式的真分支补充花括号，避免输出结构产生歧义。
+    if (node.getIfStmt()) {
+        bool thenIsBlock = dynamic_cast<Block*>(node.getIfStmt().get());
         if (!thenIsBlock) {
             std::cout << "{" << std::endl << "  ";
-            node.get_if_stmt()->accept(*this);
+            node.getIfStmt()->accept(*this);
             std::cout << std::endl << "}";
         } else {
-            node.get_if_stmt()->accept(*this);
+            node.getIfStmt()->accept(*this);
         }
     }
 
-    // 处理else分支
-    if (node.has_else()) {
+    // 否分支中的嵌套条件直接组成 else-if 链。
+    if (node.hasElse()) {
         std::cout << " else ";
 
-        // 检查else分支是否是另一个IfStmt（即else if）
-        auto elseIf = dynamic_cast<IfStmt*>(node.get_else_stmt().get());
+        auto elseIf = dynamic_cast<IfStmt*>(node.getElseStmt().get());
         if (elseIf) {
-            // 直接打印else if，不添加大括号
             elseIf->accept(*this);
         } else {
-            bool elseIsBlock = dynamic_cast<Block*>(node.get_else_stmt().get());
+            bool elseIsBlock = dynamic_cast<Block*>(node.getElseStmt().get());
             if (!elseIsBlock) {
                 std::cout << "{" << std::endl << "  ";
-                node.get_else_stmt()->accept(*this);
+                node.getElseStmt()->accept(*this);
                 std::cout << std::endl << "}";
             } else {
-                node.get_else_stmt()->accept(*this);
+                node.getElseStmt()->accept(*this);
             }
         }
     }
 }
 void ASTPrinter::visit(WhileStmt &node) {
     std::cout << "while (";
-    if (node.get_condition()) {
-        node.get_condition()->accept(*this);
+    if (node.getCondition()) {
+        node.getCondition()->accept(*this);
     }
     std::cout << ") ";
 
-    if (node.get_while_stmt()) {
-        bool whileIsBlock = dynamic_cast<Block*>(node.get_while_stmt().get());
+    if (node.getWhileStmt()) {
+        bool whileIsBlock = dynamic_cast<Block*>(node.getWhileStmt().get());
         if (!whileIsBlock) {
             std::cout << "{" << std::endl << "  ";
-            node.get_while_stmt()->accept(*this);
+            node.getWhileStmt()->accept(*this);
             std::cout << std::endl << "}";
         } else {
-            node.get_while_stmt()->accept(*this);
+            node.getWhileStmt()->accept(*this);
         }
     }
 }
 
-void ASTPrinter::visit(BreakStmt &/*node*/) {
+void ASTPrinter::visit(BreakStmt &) {
     std::cout << "break;" << std::endl;
 }
 
-void ASTPrinter::visit(ContinueStmt &/*node*/) {
+void ASTPrinter::visit(ContinueStmt &) {
     std::cout << "continue;" << std::endl;
 }
 
 void ASTPrinter::visit(ReturnStmt &node) {
     std::cout << "return";
-    if (node.has_return_value() && node.get_return_value()) {
+    if (node.hasReturnValue() && node.getReturnValue()) {
         std::cout << " ";
-        node.get_return_value()->accept(*this);
+        node.getReturnValue()->accept(*this);
     }
     std::cout << ";" << std::endl;
 }
 
-// 表达式相关visit实现
+// 输出左值、调用、数组索引和实参列表。
 void ASTPrinter::visit(LVal &node) {
-    std::cout << node.get_ident();
-    if (node.has_array() && node.get_array()) {
-        node.get_array()->accept(*this);
+    std::cout << node.getIdent();
+    if (node.hasArray() && node.getArray()) {
+        node.getArray()->accept(*this);
     }
 }
 
 void ASTPrinter::visit(FuncCall &node) {
-    std::cout << node.get_ident() << "(";
-    if (node.has_params() && node.get_params()) {
-        node.get_params()->accept(*this);
+    std::cout << node.getIdent() << "(";
+    if (node.hasParams() && node.getParams()) {
+        node.getParams()->accept(*this);
     }
     std::cout << ")";
 }
@@ -289,7 +287,7 @@ void ASTPrinter::visit(FuncCall &node) {
 void ASTPrinter::visit(ArrayList &node) {
     std::cout << "[";
     bool first = true;
-    for (const auto& exp : node.get_expressions()) {
+    for (const auto& exp : node.getExpressions()) {
         if (!first) {
             std::cout << "][";
         }
@@ -301,7 +299,7 @@ void ASTPrinter::visit(ArrayList &node) {
 
 void ASTPrinter::visit(FuncRParamList &node) {
     bool first = true;
-    for (const auto& param : node.get_params()) {
+    for (const auto& param : node.getParams()) {
         if (!first) {
             std::cout << ", ";
         }
@@ -310,12 +308,12 @@ void ASTPrinter::visit(FuncRParamList &node) {
     }
 }
 
-// 表达式visit实现 - 不使用模板函数
+// 一元表达式按保存顺序输出操作符；嵌套一元操作需要括号保护结合关系。
 void ASTPrinter::visit(UnaryExp &node) {
     const auto& ops = node.getOps();
     const auto& operands = node.getOperands();
 
-    // 如果没有操作符，直接打印操作数
+    // 无操作符时直接向下输出唯一操作数。
     if (ops.empty()) {
         if (!operands.empty()) {
             operands.front()->accept(*this);
@@ -323,16 +321,14 @@ void ASTPrinter::visit(UnaryExp &node) {
         return;
     }
 
-    // 打印所有操作符
+    // 一元操作符已经按从外到内的顺序保存。
     for (const auto& op : ops) {
         std::cout << typeToString(op);
     }
 
-    // 打印操作数
     if (!operands.empty()) {
-        // 检查操作数是否也是一元表达式
         if (auto nestedUnary = dynamic_cast<UnaryExp*>((*operands.begin()).get())) {
-            // 如果嵌套的一元表达式也有操作符，需要括号
+            // 嵌套的一元操作链用括号明确结合关系。
             if (!nestedUnary->getOps().empty()) {
                 std::cout << "(";
                 (*operands.begin())->accept(*this);
@@ -341,7 +337,6 @@ void ASTPrinter::visit(UnaryExp &node) {
                 (*operands.begin())->accept(*this);
             }
         } else {
-            // 其他类型的操作数直接打印
             (*operands.begin())->accept(*this);
         }
     }
@@ -352,23 +347,21 @@ void ASTPrinter::visit(MulExp &node) {
     const auto& ops = node.getOps();
 
     if (ops.empty()) {
-        // 没有操作符，直接打印操作数
+        // 无同级操作符时不额外添加括号。
         if (!operands.empty()) {
             operands.front()->accept(*this);
         }
     } else {
-        // 有操作符，添加括号确保优先级
+        // 同级操作链整体加括号，保持原语法树优先级。
         std::cout << "(";
         auto opIt = ops.begin();
         auto operandIt = operands.begin();
 
-        // 打印第一个操作数
         if (operandIt != operands.end()) {
             (*operandIt)->accept(*this);
             ++operandIt;
         }
 
-        // 依次打印操作符和操作数
         while (opIt != ops.end() && operandIt != operands.end()) {
             std::cout << " " << typeToString(*opIt) << " ";
             (*operandIt)->accept(*this);
@@ -384,23 +377,21 @@ void ASTPrinter::visit(AddExp &node) {
     const auto& ops = node.getOps();
 
     if (ops.empty()) {
-        // 没有操作符，直接打印操作数
+        // 无同级操作符时不额外添加括号。
         if (!operands.empty()) {
             operands.front()->accept(*this);
         }
     } else {
-        // 有操作符，添加括号确保优先级
+        // 同级操作链整体加括号，保持原语法树优先级。
         std::cout << "(";
         auto opIt = ops.begin();
         auto operandIt = operands.begin();
 
-        // 打印第一个操作数
         if (operandIt != operands.end()) {
             (*operandIt)->accept(*this);
             ++operandIt;
         }
 
-        // 依次打印操作符和操作数
         while (opIt != ops.end() && operandIt != operands.end()) {
             std::cout << " " << typeToString(*opIt) << " ";
             (*operandIt)->accept(*this);
@@ -411,7 +402,7 @@ void ASTPrinter::visit(AddExp &node) {
     }
 }
 
-// 对其他表达式类型也做同样的修改：RelExp, EqExp, LAndExp, LOrExp
+// 关系、相等和逻辑表达式沿用相同的操作链输出规则。
 void ASTPrinter::visit(RelExp &node) {
     const auto& operands = node.getOperands();
     const auto& ops = node.getOps();
@@ -524,11 +515,11 @@ void ASTPrinter::visit(LOrExp &node) {
     }
 }
 
-// 常量visit实现
+// 字面量按解析后的数值直接输出。
 void ASTPrinter::visit(ConValue<int> &node) {
-    std::cout << node.get_value();
+    std::cout << node.getValue();
 }
 
 void ASTPrinter::visit(ConValue<float> &node) {
-    std::cout << node.get_value();
+    std::cout << node.getValue();
 }

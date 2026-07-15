@@ -252,8 +252,8 @@ bool DCEPass::isDeletableInstruction(
 PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	bool Changed = false;
 
-	TraverseTools::UniqueWorkList<
-		Instruction *, TraverseTools::WorkListOrder::FIFO> WorkQ;
+	UniqueWorkList<
+		Instruction *, WorkListOrder::FIFO> WorkQ;
 	std::unordered_set<Instruction*> Erased;
 
 	auto enqueue = [&](Instruction* I) {
@@ -273,7 +273,7 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		// clearOperands 直接销毁 Use，同时更准确地更新上游 use count。
 		std::vector<Instruction *> OperandDefs;
 		OperandDefs.reserve(I->getNumOperands());
-		TraverseTools::forEachOperand(
+		forEachOperand(
 			I, [&](size_t, Use *U, Value *Op) {
 				if (!U || !Op || Op == I) return; // 自引用直接跳过
 				if (auto *DefI = dynamic_cast<Instruction *>(Op))

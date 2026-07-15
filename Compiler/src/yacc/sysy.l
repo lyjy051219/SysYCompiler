@@ -2,8 +2,8 @@
 %option yylineno
 
 %{
-#include <iostream>
 #include "Bison.hpp"
+// Flex 生成的扫描器向 Bison 返回强类型令牌。
 #define YY_DECL yy::parser::symbol_type yylex(void)
 %}
 
@@ -74,8 +74,7 @@ Float {DEC_FLOAT}|{HEX_FLOAT}
 
 
 <<EOF>>          {
-   //有用的时候再开 std::cout << "EOF reached, returning 0" << std::endl;
-    return 0;  // 返回0表示真正的文件结束
+    return 0;
 }
 
 "//".*              {}

@@ -105,7 +105,7 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
     BlockSet Forward;
     std::vector<BasicBlock *> ForwardRoots{C.Shape.Header};
     bool ForwardComplete =
-        TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+        forEachReachablePreOrderCustomSucc<BasicBlock>(
             ForwardRoots,
             [](BasicBlock *BB) {
                 auto Successors = BB ? BB->getSuccessors()
@@ -115,18 +115,18 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
             },
             [&C, &Forward](BasicBlock *BB) {
                 if (!BB || !C.L->contains(BB))
-                    return TraverseTools::TraversalControl::SkipSuccessors;
+                    return TraversalControl::SkipSuccessors;
                 Forward.insert(BB);
                 if (BB == C.Parent)
-                    return TraverseTools::TraversalControl::SkipSuccessors;
+                    return TraversalControl::SkipSuccessors;
 
                 for (BasicBlock *Succ : BB->getSuccessors()) {
                     if (!Succ || !C.L->contains(Succ) ||
                         Succ == C.Shape.Header) {
-                        return TraverseTools::TraversalControl::Stop;
+                        return TraversalControl::Stop;
                     }
                 }
-                return TraverseTools::TraversalControl::Continue;
+                return TraversalControl::Continue;
             });
     if (!ForwardComplete || !Forward.count(C.Parent)) return false;
 
@@ -135,7 +135,7 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
     // the original branch was never executed.
     BlockSet CanReachParent;
     std::vector<BasicBlock *> ReverseRoots{C.Parent};
-    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+    forEachReachablePreOrderCustomSucc<BasicBlock>(
         ReverseRoots,
         [&C](BasicBlock *BB) {
             std::vector<BasicBlock *> Predecessors;
@@ -149,11 +149,11 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
         },
         [&C, &CanReachParent](BasicBlock *BB) {
             if (!BB || !C.L->contains(BB))
-                return TraverseTools::TraversalControl::SkipSuccessors;
+                return TraversalControl::SkipSuccessors;
             CanReachParent.insert(BB);
             if (BB == C.Shape.Header)
-                return TraverseTools::TraversalControl::SkipSuccessors;
-            return TraverseTools::TraversalControl::Continue;
+                return TraversalControl::SkipSuccessors;
+            return TraversalControl::Continue;
         });
 
     for (BasicBlock *BB : Forward) {
@@ -185,7 +185,7 @@ bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
         Value *DirectValue = nullptr;
         unsigned DirectCount = 0;
         unsigned RemainingCount = 0;
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [&C, &DirectValue, &DirectCount, &RemainingCount](
                      unsigned, Value *Incoming, BasicBlock *Pred) {
             if (Pred == C.Parent) {
@@ -205,7 +205,7 @@ bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
         // Exit PHIs produced by LCSSA do not depend on each other.  Reject an
         // unusual cyclic/cross-PHI form instead of creating a definition in
         // the new merge block that is used by its predecessor.
-        if (!TraverseTools::forEachPhiIncoming(
+        if (!forEachPhiIncoming(
                 Phi, [&C](unsigned, Value *Incoming, BasicBlock *) {
                     auto *InI = dynamic_cast<Instruction *>(Incoming);
                     return !InI || InI->getParent() != C.Exit;
@@ -286,7 +286,7 @@ void LoopUnswitchPass::setHeaderPredecessor(BasicBlock *Header, BasicBlock *OldP
                           BasicBlock *NewPreHeader) {
     if (!Header || !OldPreHeader || !NewPreHeader) return;
     for (PhiInst *Phi : Header->collectPhiNodes()) {
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             Phi, [Phi, OldPreHeader, NewPreHeader](
                      unsigned Index, Value *, BasicBlock *Pred) {
                 if (Pred == OldPreHeader)
@@ -322,7 +322,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
 
     if (ReuseExit) {
         for (PhiInst *Phi : C.Exit->collectPhiNodes()) {
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [Phi, &C, OldPreHeader](
                          unsigned Index, Value *, BasicBlock *Pred) {
                     if (Pred == C.Parent)
@@ -346,8 +346,8 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
             if (!dynamic_cast<PhiInst *>(I)) NonPhis.push_back(I);
         }
         for (Instruction *I : NonPhis) {
-            I->EraseFromParent();
-            ExitMerge->push_back(I);
+            I->eraseFromParent();
+            ExitMerge->pushBack(I);
         }
 
         std::vector<PhiInst *> OldPhis = C.Exit->collectPhiNodes();
@@ -382,9 +382,9 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
             delete OldPhi;
         }
         for (auto It = NormalPhis.rbegin(); It != NormalPhis.rend(); ++It)
-            C.Exit->push_front(*It);
+            C.Exit->pushFront(*It);
         for (auto It = MergePhis.rbegin(); It != MergePhis.rend(); ++It)
-            ExitMerge->push_front(*It);
+            ExitMerge->pushFront(*It);
         C.Exit->genUnCondInst(ExitMerge);
 
         BlockSet SeenSuccessors;
@@ -405,9 +405,9 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
     const unsigned ContinueOperand = C.ExitOnTrue ? 2U : 1U;
     C.Branch->replaceOperand(ExitOperand, ExitDestination);
     C.Branch->replaceOperand(ContinueOperand, NewPreHeader);
-    C.Branch->EraseFromParent();
+    C.Branch->eraseFromParent();
     delete OldPreBr;
-    OldPreHeader->push_back(C.Branch);
+    OldPreHeader->pushBack(C.Branch);
     C.Parent->genUnCondInst(C.Continue);
 
     BlockSet OriginalLoopBlocks;
@@ -427,7 +427,7 @@ LoopUnswitchPass::collectSpecializedReachable(Loop &L, BasicBlock *Parent,
     if (!L.contains(Header)) return Reachable;
 
     std::vector<BasicBlock *> Roots{Header};
-    return TraverseTools::collectReachableFromRootsCustomSucc<BasicBlock>(
+    return collectReachableFromRootsCustomSucc<BasicBlock>(
         Roots, [&L, Parent, ChosenSuccessor](BasicBlock *BB) {
             std::vector<BasicBlock *> Successors;
             if (!BB || !L.contains(BB)) return Successors;
@@ -457,7 +457,7 @@ std::size_t LoopUnswitchPass::countInstructions(const std::vector<BasicBlock *> 
     std::size_t Count = 0;
     for (BasicBlock *BB : Blocks) {
         if (!BB || (Filter && !Filter->count(BB))) continue;
-        Count += static_cast<std::size_t>(BB->Size());
+        Count += static_cast<std::size_t>(BB->size());
     }
     return Count;
 }
@@ -779,7 +779,7 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
         for (Instruction *I : *BB) {
             if (!I) return false;
             if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-                const bool Legal = TraverseTools::forEachPhiIncoming(
+                const bool Legal = forEachPhiIncoming(
                     Phi, [&C, BB](unsigned, Value *Incoming,
                                   BasicBlock *Pred) {
                     bool Active = false;
@@ -802,7 +802,7 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
                 continue;
             }
 
-            const bool Legal = TraverseTools::forEachOperand(
+            const bool Legal = forEachOperand(
                 I, [&C, BB, I](size_t, Use *, Value *Operand) {
                 if (auto *Target = dynamic_cast<BasicBlock *>(Operand)) {
                     if (C.L->contains(Target) &&
@@ -863,7 +863,7 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
 
         for (PhiInst *Phi : Exit->collectPhiNodes()) {
             if (!Phi) return false;
-            if (!TraverseTools::forEachPhiIncoming(
+            if (!forEachPhiIncoming(
                     Phi, [Exit](unsigned, Value *Incoming, BasicBlock *) {
                         auto *InI = dynamic_cast<Instruction *>(Incoming);
                         return !InI || InI->getParent() != Exit;
@@ -873,7 +873,7 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
             for (BasicBlock *Pred : C.TrueReachable) {
                 if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
                 unsigned Hits = 0;
-                TraverseTools::forEachPhiIncoming(
+                forEachPhiIncoming(
                     Phi, [Pred, &Hits](unsigned, Value *,
                                        BasicBlock *IncomingPred) {
                         Hits += IncomingPred == Pred;
@@ -883,7 +883,7 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
             for (BasicBlock *Pred : C.FalseReachable) {
                 if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
                 unsigned Hits = 0;
-                TraverseTools::forEachPhiIncoming(
+                forEachPhiIncoming(
                     Phi, [Pred, &Hits](unsigned, Value *,
                                        BasicBlock *IncomingPred) {
                         Hits += IncomingPred == Pred;
@@ -1165,7 +1165,7 @@ bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
         PhiPrunePlan P;
         P.Original = OldPhi;
         P.Cloned = NewPhi;
-        const bool Planned = TraverseTools::forEachPhiIncoming(
+        const bool Planned = forEachPhiIncoming(
             OldPhi, [&Region, &C, ClonedPreHeader, OldBB, &P](
                         unsigned, Value *OldValue, BasicBlock *OldPred) {
             BasicBlock *NewPred = nullptr;
@@ -1282,7 +1282,7 @@ PhiInst *LoopUnswitchPass::buildExitProxyValue(
     auto *Phi = new PhiInst(Ty);
     Phi->setIdent(Name);
     for (const auto &In : Incoming) Phi->addIncoming(In.V, In.Pred);
-    Proxy->push_front(Phi);
+    Proxy->pushFront(Phi);
     return Phi;
 }
 

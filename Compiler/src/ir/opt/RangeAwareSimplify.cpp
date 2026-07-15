@@ -83,7 +83,7 @@ IntRange RangeAwareSimplifyPass::queryIntExprImpl(
     if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return base;
     if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return base;
 
-    TraverseTools::ScopedActiveMark VisitingMark(visiting, V);
+    ScopedActiveMark VisitingMark(visiting, V);
     IntRange l = queryIntExprImpl(lhs, BB, RI, DT, depth - 1, visiting);
     IntRange r = queryIntExprImpl(rhs, BB, RI, DT, depth - 1, visiting);
 

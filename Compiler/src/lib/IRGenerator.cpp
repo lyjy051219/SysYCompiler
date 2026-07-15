@@ -10,54 +10,54 @@ extern std::unique_ptr<Module> ModuleIR;
 
 class IRGeneratorSymbolScope final {
 public:
-    explicit IRGeneratorSymbolScope(SymbolTable& symbols) : symbols_(symbols) {
-        symbols_.enter_scope();
+    explicit IRGeneratorSymbolScope(SymbolTable& symbols) : symbols(symbols) {
+        symbols.enterScope();
     }
 
-    ~IRGeneratorSymbolScope() { symbols_.exit_scope(); }
+    ~IRGeneratorSymbolScope() { symbols.exitScope(); }
 
     IRGeneratorSymbolScope(const IRGeneratorSymbolScope&) = delete;
     IRGeneratorSymbolScope& operator=(const IRGeneratorSymbolScope&) = delete;
 
 private:
-    SymbolTable& symbols_;
+    SymbolTable& symbols;
 };
 
 template <typename T>
 class IRGeneratorScopedRestore final {
 public:
-    IRGeneratorScopedRestore(T& slot, T value) : slot_(slot), oldValue_(slot) {
-        slot_ = std::move(value);
+    IRGeneratorScopedRestore(T& slot, T value) : slot(slot), oldValue(slot) {
+        slot = std::move(value);
     }
 
-    ~IRGeneratorScopedRestore() { slot_ = std::move(oldValue_); }
+    ~IRGeneratorScopedRestore() { slot = std::move(oldValue); }
 
     IRGeneratorScopedRestore(const IRGeneratorScopedRestore&) = delete;
     IRGeneratorScopedRestore& operator=(const IRGeneratorScopedRestore&) = delete;
 
 private:
-    T& slot_;
-    T oldValue_;
+    T& slot;
+    T oldValue;
 };
 
 template <typename T>
 class IRGeneratorScopedPush final {
 public:
-    IRGeneratorScopedPush(std::vector<T>& values, T value) : values_(values) {
-        values_.push_back(std::move(value));
+    IRGeneratorScopedPush(std::vector<T>& values, T value) : values(values) {
+        values.push_back(std::move(value));
     }
 
-    ~IRGeneratorScopedPush() { values_.pop_back(); }
+    ~IRGeneratorScopedPush() { values.pop_back(); }
 
     IRGeneratorScopedPush(const IRGeneratorScopedPush&) = delete;
     IRGeneratorScopedPush& operator=(const IRGeneratorScopedPush&) = delete;
 
 private:
-    std::vector<T>& values_;
+    std::vector<T>& values;
 };
 
 BasicBlock& IRGenerator::currentBlock() const {
-    return *context_.block;
+    return *context.block;
 }
 
 TypeSystem IRGenerator::lowerSourceType(Type type, bool allowVoid) const {
@@ -92,16 +92,16 @@ bool IRGenerator::isConstantPrimary(const HasOperand& node) const {
         return false;
 
     Value* symbol =
-        ModuleIR->getSymbolTable().getValueByName(lvalue->get_ident());
-    const auto bindingEntry = bindings_.find(symbol);
-    if (bindingEntry == bindings_.end())
+        ModuleIR->getSymbolTable().getValueByName(lvalue->getIdent());
+    const auto bindingEntry = bindings.find(symbol);
+    if (bindingEntry == bindings.end())
         return false;
     const Binding& binding = bindingEntry->second;
 
     if (binding.kind == BindingKind::ConstantValue)
-        return !lvalue->has_array();
+        return !lvalue->hasArray();
     if (binding.isMutable || binding.constantInitializer == nullptr ||
-        binding.objectType == nullptr || !lvalue->has_array()) {
+        binding.objectType == nullptr || !lvalue->hasArray()) {
         return false;
     }
 
@@ -111,7 +111,7 @@ bool IRGenerator::isConstantPrimary(const HasOperand& node) const {
         ++rank;
         type = std::dynamic_pointer_cast<ARRAYType>(type)->getElementType();
     }
-    const auto& indices = lvalue->get_array()->get_expressions();
+    const auto& indices = lvalue->getArray()->getExpressions();
     if (indices.size() != rank)
         return false;
     for (const auto& index : indices) {
@@ -122,7 +122,7 @@ bool IRGenerator::isConstantPrimary(const HasOperand& node) const {
 }
 
 bool IRGenerator::isConstantExpression(const UnaryExp& node) const {
-    return node.get_operand_count() == 1 &&
+    return node.getOperandCount() == 1 &&
            isConstantPrimary(*node.getOperands().front());
 }
 
@@ -156,16 +156,16 @@ bool IRGenerator::isConstantExpression(const EqExp& node) const {
 }
 
 bool IRGenerator::isConstantInitializerSyntax(const InitVal& node) const {
-    if (auto expression = dynamic_cast<const AddExp*>(node.get_value().get()))
+    if (auto expression = dynamic_cast<const AddExp*>(node.getValue().get()))
         return isConstantExpression(*expression);
-    if (auto list = dynamic_cast<const InitValList*>(node.get_value().get())) {
-        for (const auto& initializer : list->get_initVals()) {
+    if (auto list = dynamic_cast<const InitValList*>(node.getValue().get())) {
+        for (const auto& initializer : list->getInitVals()) {
             if (!isConstantInitializerSyntax(*initializer))
                 return false;
         }
         return true;
     }
-    return node.get_value() == nullptr;
+    return node.getValue() == nullptr;
 }
 
 Value* IRGenerator::zeroValue(const std::shared_ptr<IRType>& type) const {
@@ -191,6 +191,7 @@ Value* IRGenerator::zeroValue(const std::shared_ptr<IRType>& type) const {
 
 Value* IRGenerator::coerce(Value* value,
                            const std::shared_ptr<IRType>& targetType) {
+    // 常量直接重建为目标类型，运行期标量则在当前基本块插入相应转换指令。
     if (value == nullptr || targetType == nullptr)
         return nullptr;
     const auto sourceType = value->getIRType();
@@ -219,14 +220,14 @@ Value* IRGenerator::coerce(Value* value,
                                          targetType->getSize());
 
         if (sourceType->getEnum() == IR_FLOAT) {
-            if (context_.block == nullptr)
+            if (context.block == nullptr)
                 return nullptr;
             return currentBlock().genFPTOSIInst(value);
         }
         if (sourceType->getEnum() == IR_INT) {
             const auto sourceInteger = std::dynamic_pointer_cast<INTType>(sourceType);
             if (sourceInteger && sourceInteger->getIsBool()) {
-                if (context_.block == nullptr)
+                if (context.block == nullptr)
                     return nullptr;
                 return currentBlock().genZextInst(value);
             }
@@ -244,7 +245,7 @@ Value* IRGenerator::coerce(Value* value,
 
         if (sourceType->getEnum() == IR_INT) {
             const auto sourceInteger = std::dynamic_pointer_cast<INTType>(sourceType);
-            if (context_.block == nullptr)
+            if (context.block == nullptr)
                 return nullptr;
             if (sourceInteger && sourceInteger->getIsBool())
                 value = currentBlock().genZextInst(value);
@@ -254,8 +255,7 @@ Value* IRGenerator::coerce(Value* value,
             return value;
     }
 
-    // Pointer/aggregate conversions are deliberately not guessed here. Their
-    // compatibility belongs to the call/lvalue boundary and, later, vector ABI.
+    // 指针与聚合类型不在此猜测结构转换，兼容性由调用边界和左值解析负责校验。
     if (targetType->getEnum() == IR_POINTER &&
         sourceType->getEnum() == IR_POINTER) {
         return value;
@@ -328,6 +328,7 @@ BinaryInst::Operation IRGenerator::lowerBinaryOperator(Type type) const {
 Value* IRGenerator::emitBinary(Value* left,
                                BinaryInst::Operation operation,
                                Value* right) {
+    // 先执行 SysY 常用算术转换，再交给基本块统一完成常量折叠或指令生成。
     if (left == nullptr || right == nullptr)
         return nullptr;
     const auto leftType = left->getIRType();
@@ -357,11 +358,11 @@ Value* IRGenerator::emitBinary(Value* left,
 
     if (left == nullptr || right == nullptr)
         return nullptr;
-    if ((!left->isConst() || !right->isConst()) && context_.block == nullptr)
+    if ((!left->isConst() || !right->isConst()) && context.block == nullptr)
         return nullptr;
 
     Value* result = BasicBlock::genBinaryInst(
-        context_.block, left, operation, right);
+        context.block, left, operation, right);
     return result;
 }
 
@@ -398,13 +399,13 @@ Value* IRGenerator::lowerPrimary(const HasOperand& node) {
 }
 
 Value* IRGenerator::lowerExpression(const UnaryExp& node) {
-    if (node.get_operand_count() != 1)
+    if (node.getOperandCount() != 1)
         return nullptr;
     Value* result = lowerPrimary(*node.getOperands().front());
     if (result == nullptr)
         return nullptr;
 
-    // Bison 将外层一元操作 push_front；逆序应用即可按由内到外求值。
+    // 语法分析器把外层一元操作头插保存，因此逆序应用即可按由内到外求值。
     for (auto operation = node.getOps().rbegin();
          operation != node.getOps().rend(); ++operation) {
         switch (*operation) {
@@ -446,24 +447,25 @@ Value* IRGenerator::lowerExpression(const EqExp& node) {
 }
 
 Value* IRGenerator::lowerExpression(const ConValue<int>& node) {
-    return ConstInt::newConstInt(node.get_value());
+    return ConstInt::newConstInt(node.getValue());
 }
 
 Value* IRGenerator::lowerExpression(const ConValue<float>& node) {
-    return ConstFloat::newConstFloat(node.get_value());
+    return ConstFloat::newConstFloat(node.getValue());
 }
 
 std::vector<Value*> IRGenerator::lowerArguments(const FuncRParamList& node) {
     std::vector<Value*> arguments;
-    arguments.reserve(node.get_params().size());
-    for (const auto& argument : node.get_params())
+    arguments.reserve(node.getParams().size());
+    for (const auto& argument : node.getParams())
         arguments.push_back(lowerExpression(*argument));
     return arguments;
 }
 
 bool IRGenerator::coerceCallArguments(const std::string& callee,
                                       std::vector<Value*>& arguments) {
-    if (auto function = functions_.find(callee); function != functions_.end()) {
+    // 用户函数严格匹配形参数量与剩余数组形状，标量实参允许常用算术转换。
+    if (auto function = functions.find(callee); function != functions.end()) {
         const auto& parameters = function->second->getParams();
         if (arguments.size() != parameters.size())
             return false;
@@ -500,6 +502,7 @@ bool IRGenerator::coerceCallArguments(const std::string& callee,
         return true;
     }
 
+    // 运行库没有 Function 参数对象，按每个固定接口的 ABI 单独验证。
     auto requireArity = [&](std::size_t count) {
         return arguments.size() == count;
     };
@@ -603,37 +606,37 @@ bool IRGenerator::coerceCallArguments(const std::string& callee,
 
 Value* IRGenerator::emitCall(const FuncCall& node,
                              std::vector<Value*> arguments) {
-    if (node.get_ident() == "starttime" || node.get_ident() == "stoptime")
-        arguments.push_back(ConstInt::newConstInt(node.get_lineno()));
+    if (node.getIdent() == "starttime" || node.getIdent() == "stoptime")
+        arguments.push_back(ConstInt::newConstInt(node.getLineNo()));
 
-    if (!coerceCallArguments(node.get_ident(), arguments))
+    if (!coerceCallArguments(node.getIdent(), arguments))
         return UndefValue::NewUndefValue(INTType::NewInt(4));
 
     Value* callee = nullptr;
-    if (BuildInFunction::isSupportedName(node.get_ident())) {
-        ModuleIR->registerBuiltin(node.get_ident());
-        callee = BuildInFunction::genBuildInFunction(node.get_ident());
+    if (BuildInFunction::isSupportedName(node.getIdent())) {
+        ModuleIR->registerBuiltin(node.getIdent());
+        callee = BuildInFunction::genBuildInFunction(node.getIdent());
     } else {
         // SysY 允许变量与函数同名；调用语法因此使用独立的函数绑定表，
         // 不受当前变量作用域中的同名对象影响。
-        const auto function = functions_.find(node.get_ident());
-        if (function == functions_.end()) {
+        const auto function = functions.find(node.getIdent());
+        if (function == functions.end()) {
             return UndefValue::NewUndefValue(INTType::NewInt(4));
         }
         callee = function->second;
     }
 
-    if (context_.block == nullptr)
+    if (context.block == nullptr)
         return UndefValue::NewUndefValue(callee->getIRType());
     auto* instruction = new CallInst(callee, arguments);
-    currentBlock().push_back(instruction);
+    currentBlock().pushBack(instruction);
     return instruction;
 }
 
 Value* IRGenerator::lowerExpression(const FuncCall& node) {
     std::vector<Value*> arguments;
-    if (node.has_params())
-        arguments = lowerArguments(*node.get_params());
+    if (node.hasParams())
+        arguments = lowerArguments(*node.getParams());
     return emitCall(node, std::move(arguments));
 }
 
@@ -641,8 +644,8 @@ std::shared_ptr<IRType> IRGenerator::lowerArrayType(
     const ArrayList& dimensions, std::shared_ptr<IRType> elementType) {
     if (elementType == nullptr)
         return nullptr;
-    for (auto dimension = dimensions.get_expressions().rbegin();
-         dimension != dimensions.get_expressions().rend(); ++dimension) {
+    for (auto dimension = dimensions.getExpressions().rbegin();
+         dimension != dimensions.getExpressions().rend(); ++dimension) {
         if (!isConstantExpression(**dimension))
             return elementType;
         Value* dimensionValue = lowerExpression(**dimension);
@@ -660,15 +663,15 @@ std::shared_ptr<IRType> IRGenerator::lowerArrayType(
 }
 
 void IRGenerator::lowerParameter(FuncParam& node) {
-    if (context_.function == nullptr)
+    if (context.function == nullptr)
         return;
-    std::shared_ptr<IRType> parameterType = lowerScalarType(node.get_type());
+    std::shared_ptr<IRType> parameterType = lowerScalarType(node.getType());
     if (parameterType == nullptr)
         return;
 
-    if (node.has_dimension()) {
-        parameterType = lowerArrayType(*node.get_exp_list(), parameterType);
-        if (node.has_empty_brackets()) {
+    if (node.hasDimension()) {
+        parameterType = lowerArrayType(*node.getExpList(), parameterType);
+        if (node.hasEmptyBrackets()) {
             parameterType = POINTERType::NewPointer(parameterType);
         } else {
             auto arrayType = std::dynamic_pointer_cast<ARRAYType>(parameterType);
@@ -677,16 +680,16 @@ void IRGenerator::lowerParameter(FuncParam& node) {
             // `T a[N][M]` 作为形参时第一维退化，等价于 `T a[][M]`。
             parameterType = POINTERType::NewPointer(arrayType->getElementType());
         }
-    } else if (node.has_empty_brackets()) {
+    } else if (node.hasEmptyBrackets()) {
         parameterType = POINTERType::NewPointer(parameterType);
     }
 
-    context_.function->pushParam(
-        node.get_ident(),
-        new Variable(Variable::Param, parameterType, node.get_ident()));
+    context.function->pushParam(
+        node.getIdent(),
+        new Variable(Variable::Param, parameterType, node.getIdent()));
 
     Value* storage =
-        ModuleIR->getSymbolTable().getValueByName(node.get_ident());
+        ModuleIR->getSymbolTable().getValueByName(node.getIdent());
     if (storage == nullptr)
         return;
     if (parameterType->getEnum() == IR_POINTER) {
@@ -694,14 +697,14 @@ void IRGenerator::lowerParameter(FuncParam& node) {
             std::dynamic_pointer_cast<POINTERType>(parameterType);
         if (pointerType == nullptr)
             return;
-        bindings_[storage] = Binding{
+        bindings[storage] = Binding{
             BindingKind::ArrayParameter,
             pointerType->getPointerType(),
             true,
             nullptr,
         };
     } else {
-        bindings_[storage] = Binding{
+        bindings[storage] = Binding{
             BindingKind::ObjectAddress,
             parameterType,
             true,
@@ -736,7 +739,7 @@ Value* IRGenerator::lowerInitializer(
     InitializerRole role) {
     if (expectedType == nullptr)
         return nullptr;
-    if (auto expression = dynamic_cast<const AddExp*>(node.get_value().get())) {
+    if (auto expression = dynamic_cast<const AddExp*>(node.getValue().get())) {
         if (role == InitializerRole::CompleteObject &&
             expectedType->getEnum() == IR_ARRAY) {
             return new Initializer(expectedType);
@@ -755,7 +758,7 @@ Value* IRGenerator::lowerInitializer(
         }
         return coerce(value, targetType);
     }
-    if (auto list = dynamic_cast<const InitValList*>(node.get_value().get()))
+    if (auto list = dynamic_cast<const InitValList*>(node.getValue().get()))
         return lowerInitializerList(*list, expectedType);
     if (expectedType->getEnum() == IR_ARRAY)
         return new Initializer(expectedType);
@@ -771,8 +774,8 @@ Initializer* IRGenerator::lowerInitializerList(
     auto* result = new Initializer(expectedType);
     std::size_t initializedLeaves = 0;
 
-    // child type -> enclosing array type。类型工厂会驻留复合类型，因此该映射
-    // 可以直接描述当前数组的形状，而不依赖任何生成器全局状态。
+    // 建立“子类型到外层数组类型”的映射，用于把连续叶元素逐层回卷成聚合值。
+    // 类型工厂会驻留复合类型，因此可直接用共享指针标识数组形状。
     std::map<std::shared_ptr<IRType>, std::shared_ptr<ARRAYType>> parentType;
     for (auto current = arrayType; current != nullptr;
          current = std::dynamic_pointer_cast<ARRAYType>(
@@ -780,6 +783,7 @@ Initializer* IRGenerator::lowerInitializerList(
         parentType[current->getElementType()] = current;
     }
 
+    // 根据已经消费的叶元素数，选择当前位置允许开始的最大对齐子聚合类型。
     auto largestAlignedType = [&](std::shared_ptr<IRType> type) {
         std::size_t leafCount = initializerLeafCount(type);
         while (leafCount != 0 && initializedLeaves % leafCount != 0) {
@@ -796,7 +800,8 @@ Initializer* IRGenerator::lowerInitializerList(
     const std::size_t aggregateLeafCount =
         initializerLeafCount(expectedType);
 
-    for (const auto& initializer : node.get_initVals()) {
+    for (const auto& initializer : node.getInitVals()) {
+        // 每个显式初始化项先生成叶值或子聚合，再在元素数满足时向外回卷。
         const auto expectedElementType = largestAlignedType(elementType);
         if (expectedElementType == nullptr)
             break;
@@ -856,7 +861,8 @@ Initializer* IRGenerator::lowerInitializerList(
 
 void IRGenerator::emitDynamicInitializerStores(
     Value* destination, Initializer& initializer, std::vector<int>& indices) {
-    if (destination == nullptr || context_.block == nullptr)
+    // 深度优先遍历聚合值，仅为非常量叶元素生成 GEP 和写内存指令。
+    if (destination == nullptr || context.block == nullptr)
         return;
     for (std::size_t index = 0; index < initializer.size(); ++index) {
         Value*& element = initializer[index];
@@ -886,8 +892,9 @@ void IRGenerator::emitDynamicInitializerStores(
 void IRGenerator::emitLocalArrayInitialization(
     AllocaInst* destination, const std::shared_ptr<IRType>& arrayType,
     Value* initializer) {
+    // 先用常量模板整体初始化，再用逐元素写入覆盖运行期才能求值的叶节点。
     if (destination == nullptr || arrayType == nullptr || initializer == nullptr ||
-        context_.block == nullptr) {
+        context.block == nullptr) {
         return;
     }
     auto* aggregate = dynamic_cast<Initializer*>(initializer);
@@ -905,8 +912,7 @@ void IRGenerator::emitLocalArrayInitialization(
     };
     currentBlock().genCallInst("llvm.memcpy.p0.p0.i32", arguments);
 
-    // 动态元素不属于常量模板：把模板中的对应位置改成零，并针对实际
-    // destination 直接生成 store，不再按变量名回查符号表。
+    // 动态元素在常量模板中以零占位，并直接针对目标地址生成写内存指令。
     std::vector<int> indices;
     emitDynamicInitializerStores(destination, *aggregate, indices);
 }
@@ -914,31 +920,32 @@ void IRGenerator::emitLocalArrayInitialization(
 template <typename DefinitionT>
 void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
                                   bool isConstant) {
-    const std::string name = node.get_ident();
+    // 先确定标量或数组对象类型，再按局部/全局与常量/变量四种组合创建存储。
+    const std::string name = node.getIdent();
     const auto scalarType = IRType::NewTypeByTypeSystem(declaredType);
     if (scalarType == nullptr)
         return;
 
     std::shared_ptr<IRType> objectType = scalarType;
-    if (node.has_array())
-        objectType = lowerArrayType(*node.get_array(), scalarType);
+    if (node.hasArray())
+        objectType = lowerArrayType(*node.getArray(), scalarType);
     if (objectType == nullptr)
         return;
 
-    bool hasInitializer = node.has_initval();
-    if (hasInitializer && (isConstant || !context_.inFunction()) &&
-        !isConstantInitializerSyntax(*node.get_initval())) {
+    bool hasInitializer = node.hasInitVal();
+    if (hasInitializer && (isConstant || !context.inFunction()) &&
+        !isConstantInitializerSyntax(*node.getInitVal())) {
         hasInitializer = false;
     }
 
     if (objectType->getEnum() == IR_ARRAY) {
-        if (context_.inFunction()) {
-            if (context_.block == nullptr)
+        if (context.inFunction()) {
+            if (context.block == nullptr)
                 return;
             auto* storage = currentBlock().genAllocaInst(objectType, name);
             if (storage == nullptr)
                 return;
-            bindings_[storage] = Binding{
+            bindings[storage] = Binding{
                 BindingKind::ObjectAddress,
                 objectType,
                 !isConstant,
@@ -946,14 +953,14 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             };
             if (hasInitializer) {
                 Value* initializer = lowerInitializer(
-                    *node.get_initval(), objectType);
+                    *node.getInitVal(), objectType);
                 if (initializer == nullptr)
                     return;
                 if (isConstant) {
                     auto* aggregate = dynamic_cast<Initializer*>(initializer);
                     if (aggregate == nullptr)
                         return;
-                    bindings_[storage].constantInitializer = aggregate;
+                    bindings[storage].constantInitializer = aggregate;
                 }
                 emitLocalArrayInitialization(storage, objectType, initializer);
             }
@@ -964,9 +971,9 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             auto* global = new Variable(storageKind, objectType, name);
             if (isConstant) {
                 global->setIdent(".C." + name);
-                ModuleIR->getSymbolTable().register_symbolTable(name, global);
+                ModuleIR->getSymbolTable().registerSymbolTable(name, global);
             }
-            bindings_[global] = Binding{
+            bindings[global] = Binding{
                 BindingKind::ObjectAddress,
                 objectType,
                 !isConstant,
@@ -974,7 +981,7 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             };
             if (hasInitializer) {
                 Value* initializer = lowerInitializer(
-                    *node.get_initval(), objectType);
+                    *node.getInitVal(), objectType);
                 if (initializer == nullptr)
                     return;
                 global->addUse(initializer);
@@ -982,7 +989,7 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
                     auto* aggregate = dynamic_cast<Initializer*>(initializer);
                     if (aggregate == nullptr)
                         return;
-                    bindings_[global].constantInitializer = aggregate;
+                    bindings[global].constantInitializer = aggregate;
                 }
             }
         }
@@ -991,43 +998,43 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
 
     if (isConstant) {
         Value* initializer = hasInitializer
-                                 ? lowerInitializer(*node.get_initval(), objectType)
+                                 ? lowerInitializer(*node.getInitVal(), objectType)
                                  : zeroValue(objectType);
         initializer = coerce(initializer, objectType);
         if (initializer == nullptr)
             return;
-        bindings_[initializer] = Binding{
+        bindings[initializer] = Binding{
             BindingKind::ConstantValue,
             objectType,
             false,
             nullptr,
         };
 
-        if (context_.inFunction()) {
-            ModuleIR->getSymbolTable().register_symbolTable(name, initializer);
+        if (context.inFunction()) {
+            ModuleIR->getSymbolTable().registerSymbolTable(name, initializer);
         } else {
             auto* global = new Variable(Variable::Constant, objectType, name);
             global->setIdent(".C." + name);
-            bindings_[global] = Binding{
+            bindings[global] = Binding{
                 BindingKind::ObjectAddress,
                 objectType,
                 false,
                 nullptr,
             };
             global->addUse(initializer);
-            // 标量常量按值绑定，后续表达式无需再经 load。
-            ModuleIR->getSymbolTable().register_symbolTable(name, initializer);
+            // 标量常量按值绑定，后续表达式无需生成内存读取指令。
+            ModuleIR->getSymbolTable().registerSymbolTable(name, initializer);
         }
         return;
     }
 
-    if (context_.inFunction()) {
-        if (context_.block == nullptr)
+    if (context.inFunction()) {
+        if (context.block == nullptr)
             return;
         auto* storage = currentBlock().genAllocaInst(objectType, name);
         if (storage == nullptr)
             return;
-        bindings_[storage] = Binding{
+        bindings[storage] = Binding{
             BindingKind::ObjectAddress,
             objectType,
             true,
@@ -1035,14 +1042,14 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
         };
         if (hasInitializer) {
             Value* initializer = lowerInitializer(
-                *node.get_initval(), objectType);
+                *node.getInitVal(), objectType);
             Value* converted = coerce(initializer, objectType);
             if (converted != nullptr)
                 currentBlock().genStoreInst(converted, storage);
         }
     } else {
         auto* global = new Variable(Variable::GlobalVariable, objectType, name);
-        bindings_[global] = Binding{
+        bindings[global] = Binding{
             BindingKind::ObjectAddress,
             objectType,
             true,
@@ -1050,7 +1057,7 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
         };
         if (hasInitializer) {
             Value* initializer = lowerInitializer(
-                *node.get_initval(), objectType);
+                *node.getInitVal(), objectType);
             Value* converted = coerce(initializer, objectType);
             if (converted != nullptr)
                 global->addUse(converted);
@@ -1103,22 +1110,23 @@ Value* IRGenerator::tryLowerConstantArrayElement(
 }
 
 IRGenerator::LValueRef IRGenerator::lowerLValue(const LVal& node) {
+    // 第一阶段解析符号和所有下标，随后按绑定种类决定返回值还是构造元素地址。
     Value* symbol =
-        ModuleIR->getSymbolTable().getValueByName(node.get_ident());
+        ModuleIR->getSymbolTable().getValueByName(node.getIdent());
     if (symbol == nullptr)
         return {};
 
-    const auto bindingEntry = bindings_.find(symbol);
-    if (bindingEntry == bindings_.end())
+    const auto bindingEntry = bindings.find(symbol);
+    if (bindingEntry == bindings.end())
         return {};
     const Binding& binding = bindingEntry->second;
     if (binding.objectType == nullptr)
         return {};
 
     std::vector<Value*> indices;
-    if (node.has_array()) {
-        indices.reserve(node.get_array()->get_expressions().size());
-        for (const auto& expression : node.get_array()->get_expressions()) {
+    if (node.hasArray()) {
+        indices.reserve(node.getArray()->getExpressions().size());
+        for (const auto& expression : node.getArray()->getExpressions()) {
             Value* index = lowerExpression(*expression);
             if (index == nullptr || index->getIRType() == nullptr ||
                 index->getIRType()->getEnum() != IR_INT) {
@@ -1140,10 +1148,9 @@ IRGenerator::LValueRef IRGenerator::lowerLValue(const LVal& node) {
     if (Value* constant = tryLowerConstantArrayElement(binding, indices))
         return LValueRef{constant, constant->getIRType(), false, false};
 
-    // 数组形参被 Function::pushParam 保存为 pointer-to-pointer alloca。
-    // 先 load 出源语言中的数组指针；无下标时它本身就是退化后的值。
+    // 数组形参保存为“指针的栈槽”，先读取源码层数组指针，再按下标构造元素地址。
     if (binding.kind == BindingKind::ArrayParameter) {
-        if (context_.block == nullptr)
+        if (context.block == nullptr)
             return {};
         Value* parameterPointer = currentBlock().genLoadInst(symbol);
         if (parameterPointer == nullptr)
@@ -1186,7 +1193,7 @@ IRGenerator::LValueRef IRGenerator::lowerLValue(const LVal& node) {
                 binding.isMutable,
             };
 
-        if (context_.block == nullptr)
+        if (context.block == nullptr)
             return {};
         auto* address = dynamic_cast<GetElementPtrInst*>(
             currentBlock().genGepInst(symbol));
@@ -1220,7 +1227,7 @@ IRGenerator::LValueRef IRGenerator::lowerLValue(const LVal& node) {
 
 Value* IRGenerator::decayArrayPointer(Value* pointer) {
     if (pointer == nullptr || pointer->getIRType() == nullptr ||
-        context_.block == nullptr) {
+        context.block == nullptr) {
         return nullptr;
     }
     auto pointerType = std::dynamic_pointer_cast<POINTERType>(pointer->getIRType());
@@ -1248,13 +1255,14 @@ Value* IRGenerator::lowerRValue(const LVal& node) {
         return reference.value;
     if (reference.objectType->getEnum() == IR_ARRAY)
         return decayArrayPointer(reference.value);
-    if (context_.block == nullptr)
+    if (context.block == nullptr)
         return nullptr;
     return currentBlock().genLoadInst(reference.value);
 }
 
 void IRGenerator::emitCondition(const LAndExp& node, BasicBlock* entry,
                                 BasicBlock* isTrue, BasicBlock* isFalse) {
+    // 逻辑与仅在当前项为真时进入下一项，任一项为假都直接跳到假分支。
     if (entry == nullptr || isTrue == nullptr || isFalse == nullptr)
         return;
     const auto& operands = node.getOperands();
@@ -1265,7 +1273,7 @@ void IRGenerator::emitCondition(const LAndExp& node, BasicBlock* entry,
 
     BasicBlock* block = entry;
     for (auto operand = operands.begin(); operand != operands.end(); ++operand) {
-        context_.block = block;
+        context.block = block;
         Value* condition = toCondition(lowerExpression(**operand));
         if (condition == nullptr) {
             block->genUnCondInst(isFalse);
@@ -1285,6 +1293,7 @@ void IRGenerator::emitCondition(const LAndExp& node, BasicBlock* entry,
 
 void IRGenerator::emitCondition(const LOrExp& node, BasicBlock* entry,
                                 BasicBlock* isTrue, BasicBlock* isFalse) {
+    // 逻辑或任一项为真即跳到真分支，只有当前项为假才继续计算下一项。
     if (entry == nullptr || isTrue == nullptr || isFalse == nullptr)
         return;
     const auto& operands = node.getOperands();
@@ -1295,7 +1304,7 @@ void IRGenerator::emitCondition(const LOrExp& node, BasicBlock* entry,
 
     BasicBlock* block = entry;
     for (auto operand = operands.begin(); operand != operands.end(); ++operand) {
-        context_.block = block;
+        context.block = block;
         if (std::next(operand) == operands.end()) {
             emitCondition(**operand, block, isTrue, isFalse);
         } else {
@@ -1310,7 +1319,7 @@ void IRGenerator::emitCondition(const LOrExp& node, BasicBlock* entry,
 
 template <typename ConditionT>
 void IRGenerator::emitDiscardedCondition(const ConditionT& node) {
-    BasicBlock* entry = context_.block;
+    BasicBlock* entry = context.block;
     if (entry == nullptr || entry->hasTerminator())
         return;
 
@@ -1321,33 +1330,33 @@ void IRGenerator::emitDiscardedCondition(const ConditionT& node) {
         return;
     emitCondition(node, entry, isTrue, isFalse);
 
-    context_.block = isTrue;
+    context.block = isTrue;
     currentBlock().genUnCondInst(continuation);
-    context_.block = isFalse;
+    context.block = isFalse;
     currentBlock().genUnCondInst(continuation);
-    context_.block = continuation;
+    context.block = continuation;
 }
 
 void IRGenerator::visit(CompUnit& node) {
-    if (context_.inFunction() || context_.block != nullptr)
+    if (context.inFunction() || context.block != nullptr)
         return;
-    for (const auto& item : node.get_items())
+    for (const auto& item : node.getItems())
         item->accept(*this);
 }
 
 void IRGenerator::visit(ConstDecl& node) {
-    const TypeSystem declaredType = lowerSourceType(node.get_type());
-    if (node.get_ConstDefList() == nullptr)
+    const TypeSystem declaredType = lowerSourceType(node.getType());
+    if (node.getConstDefList() == nullptr)
         return;
-    for (const auto& definition : node.get_ConstDefList()->get_defs())
+    for (const auto& definition : node.getConstDefList()->getDefs())
         lowerDefinition(*definition, declaredType, true);
 }
 
 void IRGenerator::visit(VarDecl& node) {
-    const TypeSystem declaredType = lowerSourceType(node.get_type());
-    if (node.get_VarDefList() == nullptr)
+    const TypeSystem declaredType = lowerSourceType(node.getType());
+    if (node.getVarDefList() == nullptr)
         return;
-    for (const auto& definition : node.get_VarDefList()->get_defs())
+    for (const auto& definition : node.getVarDefList()->getDefs())
         lowerDefinition(*definition, declaredType, false);
 }
 
@@ -1368,33 +1377,34 @@ void IRGenerator::visit(VarDef& node) {
 }
 
 void IRGenerator::visit(FuncDef& node) {
-    if (context_.inFunction() ||
-        functions_.find(node.get_ident()) != functions_.end()) {
+    // 建立函数和入口块后进入独立符号作用域，最后为未终结路径补默认返回。
+    if (context.inFunction() ||
+        functions.find(node.getIdent()) != functions.end()) {
         return;
     }
-    const TypeSystem returnType = lowerSourceType(node.get_type(), true);
+    const TypeSystem returnType = lowerSourceType(node.getType(), true);
     if (returnType == IR_UNDEF)
         return;
-    Function& function = ModuleIR->newFunction(returnType, node.get_ident());
-    functions_.emplace(node.get_ident(), &function);
+    Function& function = ModuleIR->newFunction(returnType, node.getIdent());
+    functions.emplace(node.getIdent(), &function);
     if (function.front() == nullptr)
         return;
 
-    IRGeneratorScopedRestore<Function*> activeFunction(context_.function,
+    IRGeneratorScopedRestore<Function*> activeFunction(context.function,
                                                        &function);
-    IRGeneratorScopedRestore<BasicBlock*> insertionBlock(context_.block,
+    IRGeneratorScopedRestore<BasicBlock*> insertionBlock(context.block,
                                                          function.front());
     IRGeneratorSymbolScope functionScope(ModuleIR->getSymbolTable());
 
-    if (node.get_params() != nullptr) {
-        for (const auto& parameter : node.get_params()->get_params())
+    if (node.getParams() != nullptr) {
+        for (const auto& parameter : node.getParams()->getParams())
             lowerParameter(*parameter);
     }
 
-    if (node.get_funcBody() != nullptr)
-        node.get_funcBody()->accept(*this);
+    if (node.getFuncBody() != nullptr)
+        node.getFuncBody()->accept(*this);
 
-    if (context_.block != nullptr && !currentBlock().hasTerminator()) {
+    if (context.block != nullptr && !currentBlock().hasTerminator()) {
         if (function.getIRType()->getEnum() == IR_VOID) {
             currentBlock().genRetInst();
         } else if (function.getIdent() == "main") {
@@ -1411,9 +1421,9 @@ void IRGenerator::visit(FuncParam& node) {
 }
 
 void IRGenerator::visit(FuncParamList& node) {
-    if (context_.function == nullptr)
+    if (context.function == nullptr)
         return;
-    for (const auto& parameter : node.get_params())
+    for (const auto& parameter : node.getParams())
         lowerParameter(*parameter);
 }
 
@@ -1427,14 +1437,14 @@ void IRGenerator::visit(InitVal& node) {
 
 void IRGenerator::visit(Block& node) {
     IRGeneratorSymbolScope scope(ModuleIR->getSymbolTable());
-    if (node.get_items() != nullptr)
-        node.get_items()->accept(*this);
+    if (node.getItems() != nullptr)
+        node.getItems()->accept(*this);
 }
 
 void IRGenerator::visit(BlockItemList& node) {
-    if (context_.block == nullptr)
+    if (context.block == nullptr)
         return;
-    for (const auto& statement : node.get_stmts()) {
+    for (const auto& statement : node.getStmts()) {
         if (currentBlock().hasTerminator())
             return;
         statement->accept(*this);
@@ -1442,12 +1452,12 @@ void IRGenerator::visit(BlockItemList& node) {
 }
 
 void IRGenerator::visit(AssignStmt& node) {
-    if (context_.block == nullptr || node.get_exp() == nullptr ||
-        node.get_lval() == nullptr) {
+    if (context.block == nullptr || node.getExp() == nullptr ||
+        node.getLVal() == nullptr) {
         return;
     }
-    Value* right = lowerExpression(*node.get_exp());
-    LValueRef left = lowerLValue(*node.get_lval());
+    Value* right = lowerExpression(*node.getExp());
+    LValueRef left = lowerLValue(*node.getLVal());
     if (right == nullptr || left.value == nullptr || left.objectType == nullptr ||
         !left.isAddress || !left.isMutable ||
         left.objectType->getEnum() == IR_ARRAY) {
@@ -1459,14 +1469,15 @@ void IRGenerator::visit(AssignStmt& node) {
 }
 
 void IRGenerator::visit(ExpStmt& node) {
-    if (node.get_exp() != nullptr)
-        (void)lowerExpression(*node.get_exp());
+    if (node.getExp() != nullptr)
+        (void)lowerExpression(*node.getExp());
 }
 
 void IRGenerator::visit(IfStmt& node) {
-    BasicBlock* conditionBlock = context_.block;
-    if (conditionBlock == nullptr || node.get_condition() == nullptr ||
-        node.get_if_stmt() == nullptr) {
+    // 条件先分流到真/假块，两个未终结分支再按需创建并连接同一继续块。
+    BasicBlock* conditionBlock = context.block;
+    if (conditionBlock == nullptr || node.getCondition() == nullptr ||
+        node.getIfStmt() == nullptr) {
         return;
     }
     BasicBlock* trueBlock = conditionBlock->genBlock();
@@ -1475,22 +1486,22 @@ void IRGenerator::visit(IfStmt& node) {
     BasicBlock* falseBlock = nullptr;
     BasicBlock* continuation = nullptr;
 
-    if (node.has_else()) {
+    if (node.hasElse()) {
         falseBlock = conditionBlock->genBlock();
         if (falseBlock == nullptr)
             return;
-        emitCondition(*node.get_condition(), conditionBlock, trueBlock,
+        emitCondition(*node.getCondition(), conditionBlock, trueBlock,
                       falseBlock);
     } else {
         continuation = conditionBlock->genBlock();
         if (continuation == nullptr)
             return;
-        emitCondition(*node.get_condition(), conditionBlock, trueBlock,
+        emitCondition(*node.getCondition(), conditionBlock, trueBlock,
                       continuation);
     }
 
-    context_.block = trueBlock;
-    node.get_if_stmt()->accept(*this);
+    context.block = trueBlock;
+    node.getIfStmt()->accept(*this);
     if (!currentBlock().hasTerminator()) {
         if (continuation == nullptr)
             continuation = currentBlock().genBlock();
@@ -1499,9 +1510,9 @@ void IRGenerator::visit(IfStmt& node) {
     }
 
     if (falseBlock != nullptr) {
-        context_.block = falseBlock;
-        if (node.get_else_stmt() != nullptr)
-            node.get_else_stmt()->accept(*this);
+        context.block = falseBlock;
+        if (node.getElseStmt() != nullptr)
+            node.getElseStmt()->accept(*this);
         if (!currentBlock().hasTerminator()) {
             if (continuation == nullptr)
                 continuation = currentBlock().genBlock();
@@ -1511,13 +1522,14 @@ void IRGenerator::visit(IfStmt& node) {
     }
 
     if (continuation != nullptr)
-        context_.block = continuation;
+        context.block = continuation;
 }
 
 void IRGenerator::visit(WhileStmt& node) {
-    BasicBlock* predecessor = context_.block;
-    if (predecessor == nullptr || node.get_condition() == nullptr ||
-        node.get_while_stmt() == nullptr) {
+    // 循环由前驱、条件、循环体和继续块组成，循环目标栈为 break/continue 提供落点。
+    BasicBlock* predecessor = context.block;
+    if (predecessor == nullptr || node.getCondition() == nullptr ||
+        node.getWhileStmt() == nullptr) {
         return;
     }
     BasicBlock* conditionBlock = predecessor->genBlock("wc");
@@ -1529,44 +1541,44 @@ void IRGenerator::visit(WhileStmt& node) {
     }
 
     predecessor->genUnCondInst(conditionBlock);
-    emitCondition(*node.get_condition(), conditionBlock, bodyBlock,
+    emitCondition(*node.getCondition(), conditionBlock, bodyBlock,
                   continuation);
 
     IRGeneratorScopedPush<LoopTargets> loop(
-        context_.loops, LoopTargets{conditionBlock, continuation});
-    context_.block = bodyBlock;
-    node.get_while_stmt()->accept(*this);
+        context.loops, LoopTargets{conditionBlock, continuation});
+    context.block = bodyBlock;
+    node.getWhileStmt()->accept(*this);
     if (!currentBlock().hasTerminator())
         currentBlock().genUnCondInst(conditionBlock);
 
-    context_.block = continuation;
+    context.block = continuation;
 }
 
 void IRGenerator::visit(BreakStmt& node) {
     (void)node;
-    if (context_.block == nullptr || context_.loops.empty())
+    if (context.block == nullptr || context.loops.empty())
         return;
-    BasicBlock* target = context_.loops.back().breakTarget;
+    BasicBlock* target = context.loops.back().breakTarget;
     if (target != nullptr)
         currentBlock().genUnCondInst(target);
 }
 
 void IRGenerator::visit(ContinueStmt& node) {
     (void)node;
-    if (context_.block == nullptr || context_.loops.empty())
+    if (context.block == nullptr || context.loops.empty())
         return;
-    BasicBlock* target = context_.loops.back().continueTarget;
+    BasicBlock* target = context.loops.back().continueTarget;
     if (target != nullptr)
         currentBlock().genUnCondInst(target);
 }
 
 void IRGenerator::visit(ReturnStmt& node) {
-    if (context_.function == nullptr || context_.block == nullptr)
+    if (context.function == nullptr || context.block == nullptr)
         return;
-    const auto returnType = context_.function->getIRType();
+    const auto returnType = context.function->getIRType();
     if (returnType == nullptr)
         return;
-    if (!node.has_return_value()) {
+    if (!node.hasReturnValue()) {
         if (returnType->getEnum() == IR_VOID)
             currentBlock().genRetInst();
         else
@@ -1574,7 +1586,7 @@ void IRGenerator::visit(ReturnStmt& node) {
         return;
     }
 
-    Value* value = lowerExpression(*node.get_return_value());
+    Value* value = lowerExpression(*node.getReturnValue());
     if (returnType->getEnum() == IR_VOID) {
         currentBlock().genRetInst();
         return;
@@ -1585,12 +1597,12 @@ void IRGenerator::visit(ReturnStmt& node) {
     currentBlock().genRetInst(converted);
 }
 
-// 这些入口仅满足通用 ASTVisitor 接口；内部 lowering 始终直接取得返回值。
+// 这些入口仅满足通用访问器接口；内部生成流程始终通过显式返回值取得结果。
 void IRGenerator::visit(LVal& node) { (void)lowerRValue(node); }
 void IRGenerator::visit(FuncCall& node) { (void)lowerExpression(node); }
 
 void IRGenerator::visit(ArrayList& node) {
-    for (const auto& expression : node.get_expressions())
+    for (const auto& expression : node.getExpressions())
         (void)lowerExpression(*expression);
 }
 

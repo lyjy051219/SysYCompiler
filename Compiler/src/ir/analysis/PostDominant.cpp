@@ -127,7 +127,7 @@ std::vector<BasicBlock*> PostSemiNCAInfo::findExitBlocks(
     std::vector<BasicBlock*> exits;
     for (BasicBlock* BB : *func) {
         if (!reachable.count(BB)) continue;
-        if (BB->Size() == 0) continue;  // 跳过空块
+        if (BB->size() == 0) continue;  // 跳过空块
         auto succs = BB->getSuccessors();
         if (succs.empty()) {
             exits.push_back(BB);
@@ -275,7 +275,7 @@ PostDominatorTree PostSemiNCAInfo::calculate(Function* func) {
     Infos.emplace_back();
     numToNode.push_back(nullptr);
 
-    if (func->Size() == 0) return PDT;
+    if (func->size() == 0) return PDT;
 
     // 1. 收集 entry 可达块
     std::unordered_set<BasicBlock*> reachable;

@@ -27,7 +27,7 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
         std::vector<std::pair<Value *, BasicBlock *>> moved;
         std::vector<std::pair<Value *, BasicBlock *>> kept;
         //遍历当前Phi节点的所有输入边，收集来自Preds的边到moved里，其他边到kept里
-        TraverseTools::forEachPhiIncoming(
+        forEachPhiIncoming(
             phi, [&](unsigned, Value *inValue, BasicBlock *inBlock) {
             //判断每个输入边的来源块是否在Preds中，如果在就放到moved里，否则放到kept里
             if (Preds.count(inBlock)) {
@@ -50,7 +50,7 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
                 mergePhi->addIncoming(kv.first, kv.second);
             }
             // 【致命Bug已修复】：必须使用 push_front 保证 PHI 节点在基本块的最顶端！
-            MergeBlock->push_front(mergePhi);
+            MergeBlock->pushFront(mergePhi);
             mergedValue = mergePhi;
         }
 
@@ -218,7 +218,7 @@ bool LoopSimplifyPass::simplifyHeaderPhis(Loop &L) {
             continue;
         }
 
-        bool allSelf = TraverseTools::forEachPhiIncoming(
+        bool allSelf = forEachPhiIncoming(
             phi, [phi](unsigned, Value *Incoming, BasicBlock *) {
                 return Incoming == phi;
             });

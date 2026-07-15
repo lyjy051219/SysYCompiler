@@ -106,14 +106,14 @@ bool ConstantHoistPass::isLiteralSensitiveUse(
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
     Function &F, const LoopInfo &LI) {
     ConstantHoistCollectResult R;
-    TraverseTools::forEachInstruction(
+    forEachInstruction(
         F, [&](BasicBlock *BB, Instruction *I) {
         unsigned depth = 0;
         if (Loop *L = LI.getLoopFor(BB)) depth = L->getDepth();
         // PHI 的 incoming 定义点必须在 incoming block 末尾，我们的物化
         // 指令插在非-PHI 位置无法满足这个规约
         if (dynamic_cast<PhiInst *>(I)) return;
-        TraverseTools::forEachOperand(
+        forEachOperand(
             I, [&](size_t OperandIndex, Use *u, Value *v) {
                 if (!u) return;
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
@@ -212,7 +212,7 @@ bool ConstantHoistPass::materializeGroup(
             for (ConstantHoistUseSite *us : useList) userSet.insert(us->inst);
 
             Instruction *earliest = nullptr;
-            TraverseTools::forEachInstruction(*B, [&](Instruction *I) {
+            forEachInstruction(*B, [&](Instruction *I) {
                 if (!userSet.count(I)) return true;
                 earliest = I;
                 return false;
@@ -233,7 +233,7 @@ bool ConstantHoistPass::materializeGroup(
 
 PreservationStatus ConstantHoistPass::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) {
-    if (F.Size() == 0) return PreservationStatus::all();
+    if (F.size() == 0) return PreservationStatus::all();
     BasicBlock *entry = F.front();
     if (!entry) return PreservationStatus::all();
 

@@ -36,7 +36,7 @@ PreservationStatus Select2BranchPass::run(Function &F, FunctionAnalysisPassManag
 
 		// 在 MergeBB 顶部插入 PHI，替换原 select 的所有 uses。
 		auto *Phi = new PhiInst(TrueVal->getIRType());
-		MergeBB->push_front(Phi);
+		MergeBB->pushFront(Phi);
 		Phi->addIncoming(TrueVal, TrueBB);
 		Phi->addIncoming(FalseVal, CurBB);
 

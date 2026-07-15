@@ -1,6 +1,5 @@
 #pragma once
 #include <algorithm>
-#include <cassert>
 #include <list>
 #include <memory>
 #include <vector>
@@ -20,109 +19,92 @@ class ChainNode {
     friend class ChainList<OwnerTy, ItemTy>;
 
 private:
-    ItemTy* prev_ = nullptr;
-    ItemTy* next_ = nullptr;
-    OwnerTy* owner_ = nullptr;
+    ItemTy* prev = nullptr;
+    ItemTy* next = nullptr;
+    OwnerTy* owner = nullptr;
 
 public:
-    ChainNode() : prev_(nullptr), next_(nullptr) {}
+    ChainNode() : prev(nullptr), next(nullptr) {}
 
-    // 非虚析构函数：编译器和调用者都知道具体类型
-    // 注意：此类设计为被继承，不独立使用
+    // 节点析构时自动解除其与所属链表的链接。
     ~ChainNode() {
-        if (!owner_) return;
-        EraseFromParent();
+        if (!owner) return;
+        eraseFromParent();
     }
 
-    // 禁止拷贝和移动（节点绑定到特定链表）
+    // 节点与特定链表绑定，因此禁止拷贝和移动。
     ChainNode(const ChainNode&) = delete;
     ChainNode(ChainNode&&) = delete;
     ChainNode& operator=(const ChainNode&) = delete;
     ChainNode& operator=(ChainNode&&) = delete;
 
-    // ====================================================================
-    // 内部接口（仅 ChainList 可用）
-    // ====================================================================
-    void SetParent_(OwnerTy* owner) {
-        this->owner_ = owner;
+    // 更新节点所属的链表。
+    void setParent(OwnerTy* owner) {
+        this->owner = owner;
     }
 
-    // 从父列表中移除此节点 (O(1) 直接指针操作)
-    // 此方法是最关键的性能优化点：
-    //   - 不遍历列表
-    //   - 只修改邻近指针
-    //   - 统一更新计数
-    void EraseFromParent_() {
-        assert(owner_ != nullptr && "Cannot erase a node without owner");
+    // 以常数时间解除节点与所属链表的链接。
+    void eraseFromParentImpl() {
+        if (!owner) return;
 
-        auto* current_owner = this->owner_;
+        auto* currentOwner = this->owner;
 
-        if (prev_) {
-            prev_->next_ = next_;
+        if (prev) {
+            prev->next = next;
         } else {
-            current_owner->first_ = next_;
+            currentOwner->first = next;
         }
 
-        if (next_) {
-            next_->prev_ = prev_;
+        if (next) {
+            next->prev = prev;
         } else {
-            current_owner->last_ = prev_;
+            currentOwner->last = prev;
         }
 
-        current_owner->count_--;
-        owner_ = nullptr;
-        prev_ = nullptr;
-        next_ = nullptr;
+        currentOwner->count--;
+        owner = nullptr;
+        prev = nullptr;
+        next = nullptr;
     }
 
-    // ====================================================================
-    // 公共接口
-    // ====================================================================
-
-    // 从父列表中移除此节点 (O(1))
-    // 这是向后兼容的公共接口，由 ChainList 的友元访问
-    void EraseFromParent() {
-        EraseFromParent_();
+    // 从所属链表移除此节点。
+    void eraseFromParent() {
+        eraseFromParentImpl();
     }
 
-    // 用 new_node 替换此节点在链表中的位置 (O(1))
-    // 此操作将 new_node 在链表中替换 this，this 会被断开所有链接
-    void replaceWith(ItemTy* new_node) {
-        if (!new_node) return;
+    // 用新节点替换当前位置，并解除当前节点的链接。
+    void replaceWith(ItemTy* newNode) {
+        if (!newNode || !owner) return;
 
-        new_node->owner_ = this->owner_;
-        new_node->prev_ = this->prev_;
-        new_node->next_ = this->next_;
+        newNode->owner = this->owner;
+        newNode->prev = this->prev;
+        newNode->next = this->next;
 
-        if (!prev_) {
-            owner_->first_ = new_node;
+        if (!prev) {
+            owner->first = newNode;
         } else {
-            prev_->next_ = new_node;
+            prev->next = newNode;
         }
 
-        if (!next_) {
-            owner_->last_ = new_node;
+        if (!next) {
+            owner->last = newNode;
         } else {
-            next_->prev_ = new_node;
+            next->prev = newNode;
         }
 
-        this->prev_ = nullptr;
-        this->next_ = nullptr;
-        this->owner_ = nullptr;
+        this->prev = nullptr;
+        this->next = nullptr;
+        this->owner = nullptr;
     }
 
-    // ====================================================================
-    // 公共接口
-    // ====================================================================
-
-    // 获取所属的链表所有者 (O(1))
+    // 返回节点所属的链表。
     OwnerTy* getParent() const {
-        return owner_;
+        return owner;
     }
 
-    // 链表导航 (O(1))
-    ItemTy* getNext() const { return next_; }
-    ItemTy* getPrev() const { return prev_; }
+    // 返回相邻节点。
+    ItemTy* getNext() const { return next; }
+    ItemTy* getPrev() const { return prev; }
 };
 
 
@@ -131,19 +113,19 @@ class ChainList {
     friend class ChainNode<ListOwner, ListItem>;
 
 public:
-    ListItem* first_ = nullptr;
-    ListItem* last_ = nullptr;
-    int count_ = 0;
+    ListItem* first = nullptr;
+    ListItem* last = nullptr;
+    int count = 0;
 
     ChainList() = default;
 
-    // 禁止拷贝和移动（列表包含指向外部的指针）
+    // 链表直接持有节点链接，因此禁止拷贝和移动。
     ChainList(const ChainList&) = delete;
     ChainList(ChainList&&) = delete;
     ChainList& operator=(const ChainList&) = delete;
     ChainList& operator=(ChainList&&) = delete;
 
-    // 非虚析构函数
+    // 析构时释放链表中的全部节点。
     ~ChainList() {
         clear();
     }
@@ -156,15 +138,15 @@ public:
         using pointer = ListItem**;
         using reference = ListItem*&;
 
-        ListItem* pos_;
+        ListItem* pos;
 
     public:
-        Iterator() : pos_(nullptr) {}
-        explicit Iterator(ListItem* ptr) : pos_(ptr) {}
+        Iterator() : pos(nullptr) {}
+        explicit Iterator(ListItem* ptr) : pos(ptr) {}
 
-        // 前进 (O(1))
+        // 移动到后继节点。
         Iterator& operator++() {
-            if (pos_) pos_ = pos_->next_;
+            if (pos) pos = pos->next;
             return *this;
         }
 
@@ -174,9 +156,9 @@ public:
             return tmp;
         }
 
-        // 后退 (O(1))
+        // 移动到前驱节点。
         Iterator& operator--() {
-            if (pos_) pos_ = pos_->prev_;
+            if (pos) pos = pos->prev;
             return *this;
         }
 
@@ -186,224 +168,217 @@ public:
             return tmp;
         }
 
-        // 解引用
-        value_type operator*() const { return pos_; }
-        bool operator==(const Iterator& rhs) const { return pos_ == rhs.pos_; }
-        bool operator!=(const Iterator& rhs) const { return pos_ != rhs.pos_; }
+        value_type operator*() const { return pos; }
+        bool operator==(const Iterator& rhs) const { return pos == rhs.pos; }
+        bool operator!=(const Iterator& rhs) const { return pos != rhs.pos; }
 
-        // 在当前位置之前插入 (O(1))
-        // 失败条件：pos_ 为空或无 owner
-        Iterator insertBefore(ListItem* new_node) {
-            assert(pos_ && pos_->owner_ && new_node);
-            ListOwner* owner = pos_->owner_;
+        // 在当前位置之前插入节点，参数无效时返回空迭代器。
+        Iterator insertBefore(ListItem* newNode) {
+            if (!pos || !pos->owner || !newNode) return Iterator(nullptr);
+            ListOwner* owner = pos->owner;
 
-            if (pos_ == owner->first_) {
-                owner->push_front(new_node);
+            if (pos == owner->first) {
+                owner->pushFront(newNode);
             } else {
-                new_node->SetParent_(owner);
-                auto* prev_item = pos_->prev_;
+                newNode->setParent(owner);
+                auto* prevItem = pos->prev;
 
-                new_node->prev_ = prev_item;
-                new_node->next_ = pos_;
+                newNode->prev = prevItem;
+                newNode->next = pos;
 
-                prev_item->next_ = new_node;
-                pos_->prev_ = new_node;
+                prevItem->next = newNode;
+                pos->prev = newNode;
 
-                owner->count_++;
+                owner->count++;
             }
-            return Iterator(new_node);
+            return Iterator(newNode);
         }
 
-        // 在当前位置之后插入 (O(1))
-        // 失败条件：pos_ 为空或无 owner
-        Iterator insertAfter(ListItem* new_node) {
-            assert(pos_ && pos_->owner_ && new_node);
-            ListOwner* owner = pos_->owner_;
+        // 在当前位置之后插入节点，参数无效时返回空迭代器。
+        Iterator insertAfter(ListItem* newNode) {
+            if (!pos || !pos->owner || !newNode) return Iterator(nullptr);
+            ListOwner* owner = pos->owner;
 
-            if (pos_ == owner->last_) {
-                owner->push_back(new_node);
+            if (pos == owner->last) {
+                owner->pushBack(newNode);
             } else {
-                new_node->SetParent_(owner);
-                auto* next_item = pos_->next_;
+                newNode->setParent(owner);
+                auto* nextItem = pos->next;
 
-                new_node->next_ = next_item;
-                new_node->prev_ = pos_;
+                newNode->next = nextItem;
+                newNode->prev = pos;
 
-                pos_->next_ = new_node;
-                next_item->prev_ = new_node;
+                pos->next = newNode;
+                nextItem->prev = newNode;
 
-                owner->count_++;
+                owner->count++;
             }
-            return Iterator(new_node);
+            return Iterator(newNode);
         }
     };
 
-    // 标准迭代器接口 (O(1) 获取)
-    Iterator begin() { return Iterator(first_); }
-    Iterator begin() const { return Iterator(first_); }
+    // 返回正向或反向遍历的边界迭代器。
+    Iterator begin() { return Iterator(first); }
+    Iterator begin() const { return Iterator(first); }
     Iterator end() { return Iterator(nullptr); }
     Iterator end() const { return Iterator(nullptr); }
-    Iterator rbegin() { return Iterator(last_); }
-    Iterator rbegin() const { return Iterator(last_); }
+    Iterator rbegin() { return Iterator(last); }
+    Iterator rbegin() const { return Iterator(last); }
     Iterator rend() { return Iterator(nullptr); }
     Iterator rend() const { return Iterator(nullptr); }
 
-    // 从某处连接一条已存在的链 (O(n) where n = 链的长度)
-    // 警告：这个操作有线性遍历成本，应该尽量避免使用
-    void connectSequence(ListItem* start_node, ListItem* end_node) {
-        if (first_ || last_) {
-            assert(false && "List is not empty, cannot connect");
-        }
+    // 将现有节点链连接到空列表，并更新各节点的所属关系。
+    void connectSequence(ListItem* startNode, ListItem* endNode) {
+        if (first || last) return;
 
-        first_ = start_node;
-        last_ = end_node;
-        count_ = 0;
+        first = startNode;
+        last = endNode;
+        count = 0;
 
-        ListItem* walker = first_;
+        ListItem* walker = first;
         while (walker != nullptr) {
-            walker->SetParent_(static_cast<ListOwner*>(this));
-            count_++;
-            walker = walker->next_;
+            walker->setParent(static_cast<ListOwner*>(this));
+            count++;
+            walker = walker->next;
         }
     }
 
-    std::pair<ListItem*, ListItem*> extract(ListItem* start_node, ListItem* end_node) {
-        assert(start_node && end_node);
-        auto* self_ptr = static_cast<ListOwner*>(this);
-        assert(start_node->owner_ == self_ptr && end_node->owner_ == self_ptr);
-
-        ListItem* pre_start = start_node->prev_;
-        ListItem* post_end = end_node->next_;
-
-        // ====================================================================
-        // 关键优化：只遍历被切走的部分，O(k) where k = removed nodes
-        // ====================================================================
-        int removed_count = 0;
-        for (ListItem* walker = start_node; walker != nullptr; walker = walker->next_) {
-            removed_count++;
-            if (walker == end_node) break;  // 关键：及时停止，不继续遍历
+    // 提取闭区间节点链，参数无效时返回一对空指针。
+    std::pair<ListItem*, ListItem*> extract(ListItem* startNode, ListItem* endNode) {
+        auto* selfPtr = static_cast<ListOwner*>(this);
+        if (!startNode || !endNode || startNode->owner != selfPtr ||
+            endNode->owner != selfPtr) {
+            return {nullptr, nullptr};
         }
 
-        // 修复链表指针（不需要遍历）
-        if (start_node == first_) {
-            first_ = post_end;
-        } else if (pre_start) {
-            pre_start->next_ = post_end;
+        // 确认结束节点可达并统计待提取的节点数。
+        int removedCount = 0;
+        bool reachesEnd = false;
+        for (ListItem* walker = startNode; walker != nullptr; walker = walker->next) {
+            removedCount++;
+            if (walker == endNode) {
+                reachesEnd = true;
+                break;
+            }
+        }
+        if (!reachesEnd) return {nullptr, nullptr};
+
+        ListItem* preStart = startNode->prev;
+        ListItem* postEnd = endNode->next;
+
+        // 连接提取区间两侧的节点。
+        if (startNode == first) {
+            first = postEnd;
+        } else if (preStart) {
+            preStart->next = postEnd;
         }
 
-        if (end_node == last_) {
-            last_ = pre_start;
-        } else if (post_end) {
-            post_end->prev_ = pre_start;
+        if (endNode == last) {
+            last = preStart;
+        } else if (postEnd) {
+            postEnd->prev = preStart;
         }
 
-        // 清理被切走部分的边界指针
-        start_node->prev_ = nullptr;
-        end_node->next_ = nullptr;
+        // 清除提取链的外部链接并更新节点数。
+        startNode->prev = nullptr;
+        endNode->next = nullptr;
+        count -= removedCount;
 
-        // 更新计数器（O(1) 数学运算，零遍历！）
-        // 这是性能优化的核心，避免了原来的 O(N) 重遍历
-        count_ -= removed_count;
-
-        return {start_node, end_node};
+        return {startNode, endNode};
     }
 
-    // split: extract 的语义别名，含义更清晰
-    // 完全等价，但名称暗示"分割"而非"提取"
-    std::pair<ListItem*, ListItem*> split(ListItem* start_node, ListItem* end_node) {
-        return extract(start_node, end_node);
+    // 按照 extract 的语义分割节点链。
+    std::pair<ListItem*, ListItem*> split(ListItem* startNode, ListItem* endNode) {
+        return extract(startNode, endNode);
     }
 
-    // 标准容器接口
+    // 以常数时间返回节点数。
+    int size() const { return count; }
 
-    // 获取当前大小 (O(1) - 常数时间)
-    // 不需要遍历，维护的 count_ 保证 O(1) 性能
-    int Size() const { return count_; }
+    bool empty() const { return count == 0; }
 
-    // 检查是否为空 (O(1))
-    bool empty() const { return count_ == 0; }
+    // 在链表尾部添加节点。
+    void pushBack(ListItem* newNode) {
+        newNode->setParent(static_cast<ListOwner*>(this));
 
-    // 向后添加 (O(1))
-    void push_back(ListItem* new_node) {
-        new_node->SetParent_(static_cast<ListOwner*>(this));
-
-        if (!first_) {
-            first_ = new_node;
-            last_ = new_node;
+        if (!first) {
+            first = newNode;
+            last = newNode;
         } else {
-            last_->next_ = new_node;
-            new_node->prev_ = last_;
-            last_ = new_node;
+            last->next = newNode;
+            newNode->prev = last;
+            last = newNode;
         }
-        count_++;
+        count++;
     }
 
-    // 向前添加 (O(1))
-    void push_front(ListItem* new_node) {
-        new_node->SetParent_(static_cast<ListOwner*>(this));
+    // 在链表头部添加节点。
+    void pushFront(ListItem* newNode) {
+        newNode->setParent(static_cast<ListOwner*>(this));
 
-        if (!first_) {
-            first_ = new_node;
-            last_ = new_node;
+        if (!first) {
+            first = newNode;
+            last = newNode;
         } else {
-            first_->prev_ = new_node;
-            new_node->next_ = first_;
-            first_ = new_node;
+            first->prev = newNode;
+            newNode->next = first;
+            first = newNode;
         }
-        count_++;
+        count++;
     }
 
-    // 重新排列一组项 (O(m) where m = items.size())
+    // 按照给定顺序重新连接起止位置之间的节点。
     void rearrangeItems(ListItem* start, ListItem* end, std::list<ListItem*>& items) {
-        assert(!items.empty());
-
-        auto* link_prev = start->prev_;
-        auto* link_next = end;
-
-        if (!link_prev) {
-            first_ = items.front();
+        auto* selfPtr = static_cast<ListOwner*>(this);
+        // end 为空表示重排区间一直延伸到链表末尾。
+        if (!start || items.empty() || start->owner != selfPtr ||
+            (end && end->owner != selfPtr)) {
+            return;
         }
 
-        // 验证所有条目都属于此列表
+        // 修改链接前验证所有节点均属于当前链表。
         for (auto* item : items) {
-            if (item->getParent() != static_cast<ListOwner*>(this)) {
-                assert(false && "Item parent mismatch");
-            }
+            if (!item || item->getParent() != selfPtr) return;
         }
 
-        // 重新链接项目序列
-        ListItem* prev_slot = link_prev;
+        auto* linkPrev = start->prev;
+        auto* linkNext = end;
+
+        if (!linkPrev) {
+            first = items.front();
+        }
+
+        // 按照输入顺序连接节点。
+        ListItem* prevSlot = linkPrev;
         for (auto* item : items) {
-            item->prev_ = prev_slot;
-            if (prev_slot) {
-                prev_slot->next_ = item;
+            item->prev = prevSlot;
+            if (prevSlot) {
+                prevSlot->next = item;
             }
-            prev_slot = item;
+            prevSlot = item;
         }
 
-        // 连接序列尾部
-        ListItem* last_item = items.back();
-        last_item->next_ = link_next;
+        ListItem* lastItem = items.back();
+        lastItem->next = linkNext;
 
-        if (link_next) {
-            link_next->prev_ = last_item;
+        if (linkNext) {
+            linkNext->prev = lastItem;
         }
     }
 
-    // 清空链表，删除所有节点 (O(n))
+    // 删除链表中的全部节点。
     void clear() {
-        while (first_) {
-            ListItem* temp = first_;
-            first_ = first_->next_;
+        while (first) {
+            ListItem* temp = first;
+            first = first->next;
             if (temp) delete temp;
         }
-        last_ = nullptr;
-        count_ = 0;
+        last = nullptr;
+        count = 0;
     }
 
-    // 获取首尾节点 (O(1))
-    ListItem* front() { return first_; }
-    const ListItem* front() const { return first_; }
-    ListItem* back() { return last_; }
-    const ListItem* back() const { return last_; }
+    ListItem* front() { return first; }
+    const ListItem* front() const { return first; }
+    ListItem* back() { return last; }
+    const ListItem* back() const { return last; }
 };

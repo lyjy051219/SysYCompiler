@@ -7,7 +7,7 @@
 #include "TypeSystem.hpp"
 
 
-//Value,User,Use
+// IR 值、使用者和使用关系的基础设施。
 class IRType;
 class VOIDType;
 class ConstInt;
@@ -35,47 +35,37 @@ class ZextInst;
 class Variable;
 class PhiInst;
 
-/*Use类解读，Use是链表的节点
-每个Use链表中节点的共同点是他们都指向同一个usee
-设计特点，禁止被移动和拷贝，禁止被继承*/
-
+// Use 同时记录使用者和被使用值，并作为被使用值的使用链节点。
+// 节点地址参与链表连接，因此禁止复制、移动和继承。
 class Use final{
     friend class UseList;
     friend class Value;
 
 private:
-    //指向这条Use关系的使用者user
+    // 持有该操作数的使用者。
     User* user = nullptr;
-    //指向这条Use关系的被使用者usee
+    // 当前操作数引用的值。
     Value* usee = nullptr;
-    //指向下一个关联相同usee的Use关系
+    // 指向同一值的下一条使用关系。
     Use* next = nullptr;
-    //指向本个/上一个关联相同usee的Use关系的next指针的地址
+    // 指向当前节点入口槽位，借助二级指针统一处理头节点和普通节点解链。
     Use** prev = nullptr;
-    // 从当前 Value 的 use-list 解链；重复调用安全。
+    // 从当前值的使用链解链；重复调用不会产生副作用。
     void removeFromUseList();
-    /*解析prev：
-    prev:指向的是前一个Use对象的next的指针的地址
-    *prev指向的是前一个Use对象的next地址/也可以理解成是当前Use对象的地址
-    next指向的就是下一个对象的的地址
-    好处：无需特别判断头结点的情况
-    */
 public:
-    //禁止直接构造
+    // Use 必须由具体使用者和值共同构造。
     Use()=delete;
-    //禁止拷贝和移动
     Use(const Use& u) = delete;
     Use(Use&& u) = delete;
     Use& operator=(const Use& u) = delete;
     Use& operator=(Use&& u) = delete;
-    //构造方式：需要传入Value和User
-    //通过Value访问UseList利用其addUseNode函数进行插入该结点
+    // 构造时自动挂入被使用值的使用链。
     Use(User* er ,Value* ee);
     ~Use();
     User* getUser() const;
     Value* getValue() const;
     std::optional<std::size_t> getOperandIndex() const;
-    //替换当前 Use 关系中的目标 Value (被使用者)
+    // 将当前操作数换绑到新值，并同步维护新旧两条使用链。
     bool replaceUseeWith(Value* V);
 };
 
@@ -89,21 +79,21 @@ class UseList final{
    Use* getHead() const;
    void addUseNode(Use* newNode);
    public:
-   // 保留既有字段以兼容只读的后端调用；中端统一通过 Value 接口访问。
+   // 缓存节点数量；外部查询优先使用 Value 提供的接口。
    int size = 0;
    UseList()= default;
-   //禁止拷贝和移动
+   // 链表节点拥有稳定地址，因此容器禁止复制和移动。
    UseList(const UseList&) = delete;
    UseList(UseList&&) = delete;
    UseList& operator=(const UseList& u) = delete;
    UseList& operator=(UseList&& u) = delete;
-   bool is_empty() const;
+   bool isEmpty() const;
 
-   //实现迭代器--只能正向进行遍历
+   // 使用链只提供正向迭代。
     class iterator{
         Use *ptr;
         public:
-        explicit iterator(Use *_ptr);
+        explicit iterator(Use *ptr);
         iterator& operator++();
         Use* operator*() const;
         bool operator==(const iterator& other) const;
@@ -111,19 +101,15 @@ class UseList final{
     };
     iterator begin() const;
     iterator end() const;
-    /*使用示例：
-    for(UserList::iterator it = list.begin(); it != list.end(); ++it) {
-    Use* currentUse = *it;
-    }*/
 };
 
 class Value{
    private:
-   UseList useList;     //存储所有的user
-   static int generateNum(const std::string& s); //编号每次创建类的时候自动生成
+   UseList useList;     // 保存所有以当前值为操作数的使用关系。
+   static int generateNum(const std::string& s); // 为同名前缀生成递增编号。
    protected:
-    std::shared_ptr<IRType> irtype;  //类型系统
-   std::string ident;   //名称
+    std::shared_ptr<IRType> irtype;
+   std::string ident;
    int num;
    public:
    enum class BooleanExtensionKind {
@@ -133,10 +119,10 @@ class Value{
        SignExt,
    };
 
-   //调用Use的析构函数进行彻底删除
+   // 析构值时删除仍引用它的使用者，保证使用链不悬空。
    virtual ~Value();
    Value() = delete;
-   //只能通过这两种方式构造对象，其他方式构建对象不行
+   // 所有值必须携带 IR 类型，可选携带显式标识符。
    Value(std::shared_ptr<IRType> irtype);
    Value(std::shared_ptr<IRType> irtype,std::string ident);
    virtual bool isConst();
@@ -161,7 +147,7 @@ class Value{
    int integerBitWidth(int DefaultBits = 32) const;
    int countUses() const;
    int countInstructionUses(Instruction **SingleUser = nullptr) const;
-   // 返回可跨 RAUW/换边使用的 Use 指针快照；删除其所属 User 会使对应指针失效。
+   // 返回可跨批量替换和 CFG 换边使用的 Use 指针快照；删除所属 User 后指针失效。
    std::vector<Use *> getUses() const;
    Use *getSingleUse() const;
    std::vector<Instruction *> getInstructionUsers() const;
@@ -183,8 +169,10 @@ class Value{
    static bool tryGetFloatConst(const Value *V, float &Out);
    static bool areEqualConstants(const Value *A, const Value *B);
    static bool tryGetIntIndex(const Value *V, int &Out);
+   // 识别布尔值及其零扩展或符号扩展形式，并返回扩展前的值。
    static Value *stripBooleanExtension(Value *V,
                                        BooleanExtensionKind &Kind);
+   // 反复剥离指针转换和 GEP；遇到环时停止并返回当前值。
    static Value *stripPointerCastsAndGEP(Value *V);
    static bool isLocalStackPointer(Value *V);
    static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty);
@@ -194,11 +182,11 @@ class Value{
    static Value *makeIntegerForType(int32_t Val,
                                     const std::shared_ptr<IRType> &Ty);
    static Value *makeIntegerLike(const Value *Model, int32_t Val);
+   // 将所有现有 Use 换绑到目标值，保持每个 User 的操作数位置不变。
    void replaceAllUsesWith(Value* Val);
+   // 输出当前值在 LLVM IR 中的引用形式。
    void dumpIR();
-   //如果一个Value一定需要copy，就需要用到clone,不允许使用构造函数copyValue
-   //virtual Value* clone(std::unordered_map<Value*,Value*>&) = 0;
-   //类型转换函数：将Value安全转换成其派生类
+   // 运行期检查并转换为指定派生类型，类型不匹配时返回空指针。
    template<typename T>
 
     T* as(){return dynamic_cast<T*>(this);}
@@ -207,11 +195,10 @@ class Value{
 };
 
 
-//User实质上就是Instruction，只不过我们将在User层面的东西拿出来进行整合
+// User 是持有操作数 Use 的 Value 基类，供指令和变量等节点复用。
 class User : public Value{
    protected:
-   //每一个User对象持有一个vector，这个vector中的元素是每一个以该User为User的Use对象
-   //通过userList[i]->Use对象->usee就可以遍历到所有该User使用的usee
+   // 下标即操作数位置，每个元素负责维护对应值的反向使用链。
    std::vector<std::unique_ptr<Use>> userList;
 
    public:
@@ -225,12 +212,11 @@ class User : public Value{
     Use *getOperandUse(size_t Index) const;
     bool replaceOperand(size_t Index, Value *V);
     bool eraseOperand(size_t Index);
+    // 删除全部操作数，同时让各 Use 从被使用值的使用链解链。
     void clearOperands();
-    //获得在UserList中的索引
+    // 返回给定 Use 的操作数下标，不属于当前 User 时返回 -1。
     int getUserIndex(const Use* u) const;
 
-
-   //这个是往UserList里面加结点的函数,同时调用了Use的构造函数，在UseList里面也创建了相应的结点
+   // 追加操作数，并在目标值的使用链中注册对应 Use。
    void addUse(Value* v);
-   //virtual Value* clone(std::unordered_map<Value*,Value*>&)override;
 };

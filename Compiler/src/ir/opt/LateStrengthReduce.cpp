@@ -52,7 +52,7 @@ bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
     if (V->tryGetIntConst(C)) return C >= 0;
 
     if (Depth <= 0) return false;
-    TraverseTools::ScopedActiveMark VisitingMark(Visiting, V);
+    ScopedActiveMark VisitingMark(Visiting, V);
     if (!VisitingMark.inserted()) return false;
 
     if (dynamic_cast<ZextInst *>(V)) {

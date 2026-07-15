@@ -308,7 +308,7 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     }
 
     // 环检测：当前递归栈上的块
-    TraverseTools::ScopedActiveMark ActiveMark(onStack, BB);
+    ScopedActiveMark ActiveMark(onStack, BB);
     if (!ActiveMark.inserted()) return LoadElimQueryResult::unknown();
 
     // 缓存命中
@@ -456,7 +456,7 @@ bool LoadEliminationPass::processLoad(
     for (auto &[pred, val] : predValues) {
         phi->addIncoming(val, pred);
     }
-    BB->push_front(phi);
+    BB->pushFront(phi);
     loadInst->replaceAllUsesWith(phi);
     delete loadInst;
     return true;
@@ -476,7 +476,7 @@ bool LoadEliminationPass::processFunction(
     std::vector<DominatorNode *> Roots;
     if (DT.Root) Roots.push_back(DT.Root);
     auto DomOrder =
-        TraverseTools::buildPreOrderFromRootsCustomSucc<DominatorNode>(
+        buildPreOrderFromRootsCustomSucc<DominatorNode>(
             Roots, [&DT](DominatorNode *Node) {
                 if (!Node || !Node->Block)
                     return std::vector<DominatorNode *>{};
@@ -565,7 +565,7 @@ PreservationStatus LoadEliminationPass::run(Function &F,
         auto *AsLoad = dynamic_cast<LoadInst *>(V);
         auto It = AsLoad ? Planned.find(AsLoad) : Planned.end();
         if (It == Planned.end()) return V;
-        TraverseTools::ScopedActiveMark ActiveMark(Active, AsLoad);
+        ScopedActiveMark ActiveMark(Active, AsLoad);
         if (!ActiveMark.inserted()) return nullptr;
         return ResolveReplacement(It->second, Active);
     };

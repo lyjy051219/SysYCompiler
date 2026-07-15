@@ -74,7 +74,7 @@ InstSimplifier::InstSimplifier(
 bool InstSimplifier::run(Function &F) {
 	bool Changed = false;
 
-	TraverseTools::UniqueWorkList<Instruction *> Q;
+	UniqueWorkList<Instruction *> Q;
 	std::unordered_set<Instruction *> Erased;
 
 	auto enqueue = [&](Instruction *I) {
@@ -1177,7 +1177,7 @@ Value *InstSimplifier::simplifyPhi(PhiInst *Phi) {
 	Value *Common = nullptr;
 	bool HasUndef = false;
 
-	bool Compatible = TraverseTools::forEachPhiIncoming(
+	bool Compatible = forEachPhiIncoming(
 		Phi, [&](unsigned, Value *InV, BasicBlock *) {
 			if (!InV || InV == Phi) return true;
 			if (Value::isUndef(InV)) {

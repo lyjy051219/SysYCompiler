@@ -237,7 +237,7 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
     ADCEContext ctx;
 
     // 2. Initialize: 收集 root-live
-    TraverseTools::forEachInstruction(F, [&](Instruction *I) {
+    forEachInstruction(F, [&](Instruction *I) {
         if (isRootLive(I, PDT)) markLive(I, ctx);
     });
 
@@ -247,7 +247,7 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
         ctx.Worklist.pop_front();
 
         // 3a. 数据依赖: 保活所有 Instruction 型操作数
-        TraverseTools::forEachOperand(I, [&](size_t, Use *, Value *V) {
+        forEachOperand(I, [&](size_t, Use *, Value *V) {
             if (auto *OpI = dynamic_cast<Instruction *>(V)) {
                 markLive(OpI, ctx);
             }
@@ -259,7 +259,7 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
         // 3c. 控制依赖: PhiInst 的每个 incoming block
         if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-            TraverseTools::forEachPhiIncoming(
+            forEachPhiIncoming(
                 Phi, [&](unsigned, Value *, BasicBlock *IncomingBlock) {
                     markControlDependences(IncomingBlock, PDT, ctx);
                 });

@@ -22,7 +22,7 @@ Value *LatePhiCleanupPass::safeReplacement(PhiInst *Phi, const DominatorTree &DT
 	bool SawUndef = false;
 	std::unordered_set<BasicBlock *> Preds;
 
-	bool Compatible = TraverseTools::forEachPhiIncoming(
+	bool Compatible = forEachPhiIncoming(
 		Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
 			if (Pred) Preds.insert(Pred);
 			if (!V || V == Phi) return true;

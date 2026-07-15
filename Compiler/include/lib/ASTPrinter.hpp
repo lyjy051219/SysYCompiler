@@ -1,6 +1,7 @@
 #pragma once
 #include "AST.hpp"
 
+// 将语法树输出为便于人工检查的类 SysY 源码文本。
 class ASTPrinter : public ASTVisitor {
 public:
     // 编译单元

@@ -172,7 +172,7 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
             if (!FirstGEP) continue;
 
             // 不折叠自引用（循环回边的 GEP）
-            bool selfRef = !TraverseTools::forEachPhiIncoming(
+            bool selfRef = !forEachPhiIncoming(
                 Phi, [Phi](unsigned, Value *Incoming, BasicBlock *) {
                     return Incoming != Phi;
                 });
@@ -183,7 +183,7 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
             bool valid = true;
             int diffIdx = -1;
 
-            valid = TraverseTools::forEachPhiIncoming(
+            valid = forEachPhiIncoming(
                 Phi, [&](unsigned I, Value *Incoming, BasicBlock *) {
                 if (I == 0) return true;
                 auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Incoming);
@@ -229,14 +229,14 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                 if (!diffVal->getIRType()) continue;
 
                 PhiInst *newPhi = new PhiInst(diffVal->getIRType());
-                TraverseTools::forEachPhiIncoming(
+                forEachPhiIncoming(
                     Phi, [&](unsigned, Value *Incoming,
                              BasicBlock *IncomingBlock) {
                     auto *G = dynamic_cast<GetElementPtrInst *>(Incoming);
                     newPhi->addIncoming(G->getIndex(static_cast<size_t>(diffIdx)),
                                         IncomingBlock);
                 });
-                BB->push_front(newPhi);
+                BB->pushFront(newPhi);
 
                 std::vector<Value *> newIndices;
                 for (size_t j = 0; j < FirstGEP->getNumIndices(); j++) {
@@ -278,7 +278,7 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
             if (GEP->getNumIndices() < 2) continue;
 
             size_t hash = 0;
-            TraverseTools::forEachOperand(
+            forEachOperand(
                 GEP, [&](size_t I, Use *, Value *Operand) {
                     if (I + 1 < GEP->getNumOperands())
                         hash = hash * 131 + std::hash<Value *>{}(Operand);
@@ -291,7 +291,7 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
                     auto &grp = groups[gIdx];
                     auto *first = grp.Geps[0];
                     if (first->getNumOperands() != GEP->getNumOperands()) continue;
-                    bool match = TraverseTools::forEachOperand(
+                    bool match = forEachOperand(
                         GEP, [&](size_t I, Use *, Value *Operand) {
                             return I + 1 >= GEP->getNumOperands() ||
                                    Operand == first->getOperand(I);

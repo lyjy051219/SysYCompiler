@@ -413,7 +413,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 
         for (BasicBlock* Y : phiBlocks) {
             PhiInst* phi = new PhiInst(allocType);
-            Y->push_front(phi);
+            Y->pushFront(phi);
             PhiNodes[Y][i] = phi;
         }
     }
@@ -615,7 +615,7 @@ void PromotePass::computeLiveInBlocks(
     // remains a barrier, matching the original two-phase seed/BFS behavior.
     std::set<BasicBlock *> SeedBlocks(
         UseBlocksToPropagate.begin(), UseBlocksToPropagate.end());
-    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+    forEachReachablePreOrderCustomSucc<BasicBlock>(
         UseBlocksToPropagate,
         [&PredMap](BasicBlock *BB) {
             auto It = PredMap.find(BB);
@@ -625,19 +625,19 @@ void PromotePass::computeLiveInBlocks(
         [&DefBlocks, &LiveInBlocks,
          &SeedBlocks](BasicBlock *BB) {
             if (LiveInBlocks.count(BB))
-                return TraverseTools::TraversalControl::SkipSuccessors;
+                return TraversalControl::SkipSuccessors;
             if (!SeedBlocks.count(BB) && DefBlocks.count(BB))
-                return TraverseTools::TraversalControl::SkipSuccessors;
+                return TraversalControl::SkipSuccessors;
 
             LiveInBlocks.insert(BB);
-            return TraverseTools::TraversalControl::Continue;
+            return TraversalControl::Continue;
         });
 }
 
 bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
     Value* singleVal = nullptr;
 
-    bool AllSame = TraverseTools::forEachPhiIncoming(
+    bool AllSame = forEachPhiIncoming(
         Phi, [&singleVal, Phi](unsigned, Value *V, BasicBlock *) {
             // 只跳过 phi 自引用（循环回边），不跳过 undef
             if (V == Phi) return true;

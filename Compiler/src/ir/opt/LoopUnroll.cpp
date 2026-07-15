@@ -48,10 +48,10 @@ bool LoopUnrollPass::isStructurallyLoopInvariant(
                         I->instType == Instruction::SEXT ||
                         I->instType == Instruction::BITCAST;
     if (!PureProducer) return false;
-    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return false;
 
-    const bool OperandsInvariant = TraverseTools::forEachOperand(
+    const bool OperandsInvariant = forEachOperand(
         I, [L, &Active](size_t, Use *, Value *Operand) {
             if (dynamic_cast<BasicBlock *>(Operand)) return true;
             return isStructurallyLoopInvariant(Operand, L, Active);
@@ -86,7 +86,7 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
     }
     std::reverse(NestedRoots.begin(), NestedRoots.end());
     std::unordered_set<BasicBlock *> NestedControlledBlocks =
-        TraverseTools::collectReachableFromRootsCustomSucc<BasicBlock>(
+        collectReachableFromRootsCustomSucc<BasicBlock>(
             NestedRoots, [L, OuterLatch](BasicBlock *BB) {
                 std::vector<BasicBlock *> Successors;
                 if (!BB || !L->contains(BB)) return Successors;
@@ -245,9 +245,9 @@ bool LoopUnrollPass::containsUndef(
     if (Depth > 32) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return false;
-    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return true;
-    const bool NoOperandContainsUndef = TraverseTools::forEachOperand(
+    const bool NoOperandContainsUndef = forEachOperand(
         I, [&Active, Depth](size_t, Use *, Value *Operand) {
             if (dynamic_cast<BasicBlock *>(Operand)) return true;
             return !containsUndef(Operand, Active, Depth + 1);
@@ -262,13 +262,13 @@ bool LoopUnrollPass::isTrivialForwardOf(
     if (!Candidate || !Source || Depth > 16) {
         return false;
     }
-    TraverseTools::ScopedActiveMark ActiveMark(Active, Candidate);
+    ScopedActiveMark ActiveMark(Active, Candidate);
     if (!ActiveMark.inserted()) return false;
 
     bool Result = false;
     if (auto *Phi = dynamic_cast<PhiInst *>(Candidate)) {
         Result = Phi->getNumIncomingValues() != 0 &&
-                 TraverseTools::forEachPhiIncoming(
+                 forEachPhiIncoming(
                      Phi, [Source, &Active, Depth](unsigned, Value *Incoming,
                                                    BasicBlock *) {
                          return isTrivialForwardOf(
@@ -849,7 +849,7 @@ bool LoopUnrollPass::replaceDataOperandsUsingMap(
     const std::unordered_map<Value *, Value *> &VMap) {
     if (!I) return false;
 
-    TraverseTools::forEachOperand(
+    forEachOperand(
         I, [&VMap](size_t, Use *U, Value *Old) {
         if (!U) return;
         if (isBlockValue(Old)) return;
@@ -1349,7 +1349,7 @@ std::vector<BasicBlock *> LoopUnrollPass::collectExitRegionBlocksFrom(
     if (!Exit) return Region;
 
     std::vector<BasicBlock *> Roots{Exit};
-    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+    forEachReachablePreOrderCustomSucc<BasicBlock>(
         Roots,
         [&StopBlocks](BasicBlock *BB) {
             std::vector<BasicBlock *> Successors;
@@ -1366,14 +1366,14 @@ std::vector<BasicBlock *> LoopUnrollPass::collectExitRegionBlocksFrom(
         [&Region, Exit, &StopBlocks,
          StopAtConditionalBranch](BasicBlock *BB) {
             if (BB != Exit && StopBlocks.count(BB))
-                return TraverseTools::TraversalControl::SkipSuccessors;
+                return TraversalControl::SkipSuccessors;
 
             Region.push_back(BB);
             if (StopAtConditionalBranch &&
                 BasicBlock::isCondBr(BB->getBranchTerminator())) {
-                return TraverseTools::TraversalControl::SkipSuccessors;
+                return TraversalControl::SkipSuccessors;
             }
-            return TraverseTools::TraversalControl::Continue;
+            return TraversalControl::Continue;
         });
 
     return Region;
@@ -1391,7 +1391,7 @@ std::vector<ExitRegionDataUse> LoopUnrollPass::collectExitRegionDataUsesFrom(
         if (!BB) continue;
         for (Instruction *I : *BB) {
             if (!I || dynamic_cast<PhiInst *>(I)) continue;
-            TraverseTools::forEachOperand(
+            forEachOperand(
                 I, [Exit, Exiting, &Uses](size_t, Use *U, Value *Old) {
                 if (!U) return;
                 if (!isDataValue(Old)) return;
@@ -1890,7 +1890,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
                     delete Merge;
                     return LoopUnrollResult::Unmodified;
                 }
-                TailEntry->push_back(Merge);
+                TailEntry->pushBack(Merge);
                 TailState = Merge;
             }
             if (!isDataValue(State.MainValue) || !isDataValue(TailState)) {
@@ -1924,7 +1924,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         return LoopUnrollResult::Unmodified;
     }
     GroupPhi->addIncoming(Zero, PreHeader);
-    Header->push_front(GroupPhi);
+    Header->pushFront(GroupPhi);
 
     auto *NextGroup = new BinaryInst(GroupPhi, BinaryInst::ADD, One);
     BasicBlock::insertBeforeTerminator(MainLast, NextGroup);
@@ -2052,7 +2052,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
                 delete NoTailValue;
                 return LoopUnrollResult::Unmodified;
             }
-            TailEntry->push_back(NoTailValue);
+            TailEntry->pushBack(NoTailValue);
             Incoming.push_back({NoTailValue, TailEntry});
 
             for (int Tail = 0; Tail < TailCopies; ++Tail) {
@@ -2115,8 +2115,8 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         }
         auto *HasRemainder =
             new BinaryInst(RemainderValue, BinaryInst::NE, ZeroRemainder);
-        TailEntry->push_back(HasRemainder);
-        TailEntry->push_back(
+        TailEntry->pushBack(HasRemainder);
+        TailEntry->pushBack(
             new BrInst(HasRemainder, Core->Headers[MainCount], Exit));
 
         Value *ZeroGroups =
@@ -2133,7 +2133,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
             return LoopUnrollResult::Unmodified;
         }
     } else {
-        TailEntry->push_back(new BrInst(Core->Headers[MainCount]));
+        TailEntry->pushBack(new BrInst(Core->Headers[MainCount]));
         if (HeaderExiting) {
             std::unordered_map<Value *, Value *> TailInputValues;
             if (!buildHeaderTailInputValueMap(HeaderStates, PreHeader,
@@ -2495,7 +2495,7 @@ int LoopUnrollPass::detectPeelCount(Loop *L,
     int BestPeelCount = 0;
     for (BasicBlock *BB : L->getBlocks()) {
         if (!BB) continue;
-        if (BB->Size() == 0) continue;
+        if (BB->size() == 0) continue;
         auto *Br = dynamic_cast<BrInst *>(BB->back());
         if (!isInternalConditionalBranch(L, Br)) {
             continue;
@@ -3258,7 +3258,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     for (StoreInst *SI : RedundantResidualStores) {
         if (!SI || !SI->getParent() || !L->contains(SI->getParent()))
             continue;
-        SI->EraseFromParent();
+        SI->eraseFromParent();
         delete SI;
     }
 
