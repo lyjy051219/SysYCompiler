@@ -2,7 +2,9 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <vector>
 #include <cmath>
@@ -81,10 +83,9 @@ IntRange RangeAwareSimplifyPass::queryIntExprImpl(
     if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return base;
     if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return base;
 
-    visiting.insert(V);
+    TraverseTools::ScopedActiveMark VisitingMark(visiting, V);
     IntRange l = queryIntExprImpl(lhs, BB, RI, DT, depth - 1, visiting);
     IntRange r = queryIntExprImpl(rhs, BB, RI, DT, depth - 1, visiting);
-    visiting.erase(V);
 
     IntRange expr;
     switch (BI->getOp()) {
@@ -152,14 +153,10 @@ bool RangeAwareSimplifyPass::strengthReduce(
     bool changed = false;
 
     std::vector<BinaryInst *> candidates;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *BI = dynamic_cast<BinaryInst *>(I);
-            if (!BI) continue;
-            auto op = BI->getOp();
-            if (op == BinaryInst::DIV || op == BinaryInst::MOD)
-                candidates.push_back(BI);
-        }
+    for (BinaryInst *BI : collectInstructions<BinaryInst>(F)) {
+        auto op = BI->getOp();
+        if (op == BinaryInst::DIV || op == BinaryInst::MOD)
+            candidates.push_back(BI);
     }
 
     for (BinaryInst *BI : candidates) {
@@ -224,50 +221,48 @@ bool RangeAwareSimplifyPass::foldConstants(
     std::vector<Instruction *> intToFold;
     std::vector<Instruction *> floatToFold;
 
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (!I->getIRType()) continue;
-            // 跳过有副作用/内存副作用的指令（整数和浮点通用）：
-            //   CallInst：delete 会丢掉副作用（典型：通过指针实参写数组）
-            //   LoadInst：range 相等不等于值相等，且删除会丢掉依赖
-            //   StoreInst：无返回值，保险加上
-            // 只 fold 纯计算的结果（PHI / BinaryInst / Select / cast 等）
-            if (dynamic_cast<CallInst *>(I)) continue;
-            if (dynamic_cast<LoadInst *>(I)) continue;
-            if (dynamic_cast<StoreInst *>(I)) continue;
-            // A loop PHI may temporarily look like its initial singleton while
-            // feasible backedges are still converging.  Do not delete PHIs
-            // from a range result alone; SCCP/SCEV can fold them when every
-            // incoming edge is explicitly proven.
-            if (dynamic_cast<PhiInst *>(I)) continue;
+    for (Instruction *I : collectInstructions(F)) {
+        if (!I->getIRType()) continue;
+        // 跳过有副作用/内存副作用的指令（整数和浮点通用）：
+        //   CallInst：delete 会丢掉副作用（典型：通过指针实参写数组）
+        //   LoadInst：range 相等不等于值相等，且删除会丢掉依赖
+        //   StoreInst：无返回值，保险加上
+        // 只 fold 纯计算的结果（PHI / BinaryInst / Select / cast 等）
+        if (dynamic_cast<CallInst *>(I)) continue;
+        if (dynamic_cast<LoadInst *>(I)) continue;
+        if (dynamic_cast<StoreInst *>(I)) continue;
+        // A loop PHI may temporarily look like its initial singleton while
+        // feasible backedges are still converging.  Do not delete PHIs
+        // from a range result alone; SCCP/SCEV can fold them when every
+        // incoming edge is explicitly proven.
+        if (dynamic_cast<PhiInst *>(I)) continue;
 
-            BasicBlock *block = I->getParent();
-            if (!block) continue;
+        BasicBlock *block = I->getParent();
+        if (!block) continue;
 
-            auto ty = I->getIRType()->getEnum();
-            if (ty == IR_INT) {
-                if (dynamic_cast<ConstInt *>(I)) continue;
-                IntRange range = RI.query(I, block, DT);
-                // 先看 IntRange 是不是单值；再退一步看 KB 是不是 32 位全锁定
-                //   ConstantRange 和 KnownBits 是独立 lattice，能判的集合不完全重叠
-                bool singleInt = range.isSingleValue();
-                if (!singleInt) {
-                    KnownBits kb = RI.queryBits(I, block, DT);
-                    if (kb.isFullyKnown()) {
-                        intToFold.push_back(I);
-                        continue;
-                    }
-                }
-                if (singleInt) {
+        auto ty = I->getIRType()->getEnum();
+        if (ty == IR_INT) {
+            if (dynamic_cast<ConstInt *>(I)) continue;
+            IntRange range = RI.query(I, block, DT);
+            // 先看 IntRange 是不是单值；再退一步看 KB 是不是 32 位全锁定
+            //   ConstantRange 和 KnownBits 是独立 lattice，能判的集合不完全重叠
+            bool singleInt = range.isSingleValue();
+            if (!singleInt) {
+                KnownBits kb = RI.queryBits(I, block, DT);
+                if (kb.isFullyKnown()) {
                     intToFold.push_back(I);
+                    continue;
                 }
-            } else if (ty == IR_FLOAT) {
-                if (dynamic_cast<ConstFloat *>(I)) continue;
-                FloatRange range = RI.queryFloat(I, block, DT);
-                // isSingleValue 已经排除了 ±inf（不是合法的 float 常量）
-                if (range.isSingleValue()) {
-                    floatToFold.push_back(I);
-                }
+            }
+            if (singleInt) {
+                intToFold.push_back(I);
+            }
+        } else if (ty == IR_FLOAT) {
+            if (dynamic_cast<ConstFloat *>(I)) continue;
+            FloatRange range = RI.queryFloat(I, block, DT);
+            // isSingleValue 已经排除了 ±inf（不是合法的 float 常量）
+            if (range.isSingleValue()) {
+                floatToFold.push_back(I);
             }
         }
     }
@@ -324,16 +319,12 @@ bool RangeAwareSimplifyPass::foldComparisons(
     bool changed = false;
 
     std::vector<BinaryInst *> cmps;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *BI = dynamic_cast<BinaryInst *>(I);
-            if (!BI) continue;
-            auto op = BI->getOp();
-            if (op == BinaryInst::L || op == BinaryInst::LE ||
-                op == BinaryInst::G || op == BinaryInst::GE ||
-                op == BinaryInst::E || op == BinaryInst::NE)
-                cmps.push_back(BI);
-        }
+    for (BinaryInst *BI : collectInstructions<BinaryInst>(F)) {
+        auto op = BI->getOp();
+        if (op == BinaryInst::L || op == BinaryInst::LE ||
+            op == BinaryInst::G || op == BinaryInst::GE ||
+            op == BinaryInst::E || op == BinaryInst::NE)
+            cmps.push_back(BI);
     }
 
     for (BinaryInst *cmp : cmps) {
@@ -538,12 +529,8 @@ bool RangeAwareSimplifyPass::foldIcmpOfSelect(
     bool changed = false;
 
     std::vector<BinaryInst *> cmps;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *BI = dynamic_cast<BinaryInst *>(I);
-            if (BI && isIntCmpOp(BI->getOp())) cmps.push_back(BI);
-        }
-    }
+    for (BinaryInst *BI : collectInstructions<BinaryInst>(F))
+        if (isIntCmpOp(BI->getOp())) cmps.push_back(BI);
 
     for (BinaryInst *cmp : cmps) {
         Value *lhs = nullptr;
@@ -603,13 +590,7 @@ bool RangeAwareSimplifyPass::foldSelectByConditionRange(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     bool changed = false;
 
-    std::vector<SelectInst *> candidates;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (auto *SI = dynamic_cast<SelectInst *>(I))
-                candidates.push_back(SI);
-        }
-    }
+    auto candidates = collectInstructions<SelectInst>(F);
 
     for (SelectInst *SI : candidates) {
         Value *cond = SI->getCondition();
@@ -647,14 +628,9 @@ bool RangeAwareSimplifyPass::foldAbsViaSelect(
     bool changed = false;
 
     std::vector<SelectInst *> candidates;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (auto *SI = dynamic_cast<SelectInst *>(I)) {
-                if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
-                    candidates.push_back(SI);
-            }
-        }
-    }
+    for (SelectInst *SI : collectInstructions<SelectInst>(F))
+        if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
+            candidates.push_back(SI);
 
     auto matchNeg = [](Value *v) -> Value * {
         auto *BI = dynamic_cast<BinaryInst *>(v);
@@ -734,14 +710,9 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
     bool changed = false;
 
     std::vector<SelectInst *> candidates;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (auto *SI = dynamic_cast<SelectInst *>(I)) {
-                if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
-                    candidates.push_back(SI);
-            }
-        }
-    }
+    for (SelectInst *SI : collectInstructions<SelectInst>(F))
+        if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
+            candidates.push_back(SI);
 
     for (SelectInst *SI : candidates) {
         auto *cmp = dynamic_cast<BinaryInst *>(SI->getCondition());
@@ -816,13 +787,8 @@ bool RangeAwareSimplifyPass::convertSignedToUnsigned(
     bool changed = false;
 
     std::vector<BinaryInst *> srems;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *BI = dynamic_cast<BinaryInst *>(I);
-            if (!BI || BI->getOp() != BinaryInst::MOD) continue;
-            srems.push_back(BI);
-        }
-    }
+    for (BinaryInst *BI : collectInstructions<BinaryInst>(F))
+        if (BI->getOp() == BinaryInst::MOD) srems.push_back(BI);
 
     for (BinaryInst *srem : srems) {
         Value *lhs = nullptr;

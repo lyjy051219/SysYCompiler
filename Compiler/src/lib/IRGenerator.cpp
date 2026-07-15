@@ -627,7 +627,7 @@ Value* IRGenerator::emitCall(const FuncCall& node,
         return UndefValue::NewUndefValue(callee->getIRType());
     auto* instruction = new CallInst(callee, arguments);
     currentBlock().push_back(instruction);
-    return instruction->getOprand();
+    return instruction;
 }
 
 Value* IRGenerator::lowerExpression(const FuncCall& node) {

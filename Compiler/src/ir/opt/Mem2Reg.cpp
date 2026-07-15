@@ -5,6 +5,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/Tool.hpp"
+#include "lib/TraverseTools.hpp"
 #include <queue>
 #include <set>
 #include <stack>
@@ -306,12 +307,8 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     BlockInfo blockInfo;
     bool roundChanged = false;
 
-    for(auto inst : *EntryBB){
-        if (dynamic_cast<RetInst*>(inst)) continue;
-        if(AllocaInst * AI = dynamic_cast<AllocaInst*>(inst)){
-            if(isAllocaPromotable(AI)) Allocas.push_back(AI);
-        }
-    }
+    for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB))
+        if (isAllocaPromotable(AI)) Allocas.push_back(AI);
 
     if(Allocas.empty()) {
         // Earlier rounds may already have promoted or deleted allocas.  Do
@@ -613,48 +610,44 @@ void PromotePass::computeLiveInBlocks(
         }
     }
 
-        // 第二步：反向 BFS 使用 PredMap
-    std::queue<BasicBlock*> worklist;
+    // Seed blocks are live-in and propagate through predecessors even when
+    // they also define the alloca.  A DefBlock reached later through an edge
+    // remains a barrier, matching the original two-phase seed/BFS behavior.
+    std::set<BasicBlock *> SeedBlocks(
+        UseBlocksToPropagate.begin(), UseBlocksToPropagate.end());
+    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+        UseBlocksToPropagate,
+        [&PredMap](BasicBlock *BB) {
+            auto It = PredMap.find(BB);
+            return It == PredMap.end() ? std::vector<BasicBlock *>{}
+                                       : It->second;
+        },
+        [&DefBlocks, &LiveInBlocks,
+         &SeedBlocks](BasicBlock *BB) {
+            if (LiveInBlocks.count(BB))
+                return TraverseTools::TraversalControl::SkipSuccessors;
+            if (!SeedBlocks.count(BB) && DefBlocks.count(BB))
+                return TraverseTools::TraversalControl::SkipSuccessors;
 
-    for (BasicBlock* BB : UseBlocksToPropagate) {
-        if (LiveInBlocks.insert(BB).second) {
-            auto it = PredMap.find(BB);
-            if (it != PredMap.end())
-                for (BasicBlock* Pred : it->second)
-                    worklist.push(Pred);
-        }
-    }
-
-    while (!worklist.empty()) {
-        BasicBlock* BB = worklist.front();
-        worklist.pop();
-
-        if (LiveInBlocks.count(BB)) continue;
-        if (DefBlocks.count(BB)) continue;
-
-        LiveInBlocks.insert(BB);
-        auto it = PredMap.find(BB);
-        if (it != PredMap.end())
-            for (BasicBlock* Pred : it->second)
-                worklist.push(Pred);
-    }
+            LiveInBlocks.insert(BB);
+            return TraverseTools::TraversalControl::Continue;
+        });
 }
 
 bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
     Value* singleVal = nullptr;
 
-    for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-        Value* V = Phi->getIncomingValue(i);
-
-        // 只跳过 phi 自引用（循环回边），不跳过 undef
-        if (V == Phi) continue;
-
-        if (singleVal == nullptr) {
-            singleVal = V;
-        } else if (singleVal != V) {
-            return false;
-        }
-    }
+    bool AllSame = TraverseTools::forEachPhiIncoming(
+        Phi, [&singleVal, Phi](unsigned, Value *V, BasicBlock *) {
+            // 只跳过 phi 自引用（循环回边），不跳过 undef
+            if (V == Phi) return true;
+            if (singleVal == nullptr) {
+                singleVal = V;
+                return true;
+            }
+            return singleVal == V;
+        });
+    if (!AllSame) return false;
 
     if (singleVal == nullptr) {
         // 所有 incoming 都是自引用（不应发生），替换为 undef

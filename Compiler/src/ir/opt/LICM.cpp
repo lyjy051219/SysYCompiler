@@ -4,6 +4,8 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
+#include "lib/CFG.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -205,7 +207,7 @@ bool LICMPass::cacheLoopInvariantCall(
 	// A well-formed basic block must retain a terminator in the continuation.
 	std::vector<Instruction *> Tail;
 	bool SeenCall = false;
-	for (Instruction *I : *BB) {
+	for (Instruction *I : collectInstructions(*BB)) {
 		if (I == CI) {
 			SeenCall = true;
 			continue;
@@ -299,9 +301,8 @@ bool LICMPass::isInvariant(
 	const DominatorTree &DT,
 	const std::unordered_set<Instruction *> &InvariantSet) {
 	if (!I || !I->getParent()) return false;
-	for (size_t OperandIndex = 0;
-		 OperandIndex < I->getNumOperands(); ++OperandIndex) {
-		Value *V = I->getOperand(OperandIndex);
+	return TraverseTools::forEachOperand(
+		I, [&](size_t, Use *, Value *V) {
 		if (!V) return false;
 
 		if (dynamic_cast<ConstantSystem *>(V) ||
@@ -309,17 +310,17 @@ bool LICMPass::isInvariant(
 			dynamic_cast<BuildInFunction *>(V) ||
 			dynamic_cast<BasicBlock *>(V) ||
 			dynamic_cast<Variable *>(V)) {
-			continue;
+			return true;
 		}
 
 		auto *DefI = dynamic_cast<Instruction *>(V);
 		if (!DefI || !DefI->getParent()) return false;
-		if (!L.contains(DefI->getParent())) continue;
+		if (!L.contains(DefI->getParent())) return true;
 
 		if (InvariantSet.count(DefI) == 0) return false;
 		if (!DT.dominates(DefI->getParent(), I->getParent())) return false;
-	}
-	return true;
+		return true;
+	});
 }
 
 // 3) 指令能否安全移动（基于别名/副作用 + 指令类别规则）
@@ -579,7 +580,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			std::vector<Instruction *> Insts;
 			for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
 				if (!BB) continue;
-				for (auto *II : *BB) Insts.push_back(II);
+				auto BlockInsts = collectInstructions(*BB);
+				Insts.insert(Insts.end(), BlockInsts.begin(), BlockInsts.end());
 			}
 			return Insts;
 		};
@@ -593,8 +595,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			BasicBlock *BB = *BIt;
 			if (!BB) continue;
 
-			std::vector<Instruction *> Insts;
-			for (auto *I : *BB) Insts.push_back(I);
+			auto Insts = collectInstructions(*BB);
 
 			for (auto IIt = Insts.rbegin(); IIt != Insts.rend(); ++IIt) {
 				Instruction *I = *IIt;
@@ -635,14 +636,13 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						continue;
 					}
 
-					for (size_t OperandIndex = 0;
-						 OperandIndex < Cloned->getNumOperands(); ++OperandIndex) {
-						Use *U = Cloned->getOperandUse(OperandIndex);
-						Value *OldOp = Cloned->getOperand(OperandIndex);
-						if (!OldOp) continue;
+					TraverseTools::forEachOperand(
+						Cloned, [&](size_t, Use *U, Value *OldOp) {
+						if (!OldOp) return;
 
 						auto *DefOpI = dynamic_cast<Instruction *>(OldOp);
-						if (!DefOpI || !DefOpI->getParent() || !L->contains(DefOpI->getParent())) continue;
+						if (!DefOpI || !DefOpI->getParent() ||
+							!L->contains(DefOpI->getParent())) return;
 
 						ExitValueKey Key{ExitBB, OldOp};
 						PhiInst *Bridge = nullptr;
@@ -669,7 +669,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						}
 
 						if (Bridge) U->replaceUseeWith(Bridge);
-					}
+					});
 
 					auto InsIt = ExitBB->begin();
 					while (InsIt != ExitBB->end() && dynamic_cast<PhiInst *>(*InsIt)) ++InsIt;
@@ -721,8 +721,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		auto HoistBlocksRPO = L->getBlocksInRPO();
 		for (BasicBlock *BB : HoistBlocksRPO) {
 			if (!BB) continue;
-			std::vector<Instruction *> Insts;
-			for (auto *I : *BB) Insts.push_back(I);
+			auto Insts = collectInstructions(*BB);
 
 			for (Instruction *I : Insts) {
 				if (!I || I->getParent() != BB) continue;

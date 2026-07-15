@@ -10,7 +10,7 @@ PreservationStatus Select2BranchPass::run(Function &F, FunctionAnalysisPassManag
 
 	bool Changed = false;
 
-	auto Selects = F.collectInstructions<SelectInst>();
+	auto Selects = collectInstructions<SelectInst>(F);
 
 	for (SelectInst *SI : Selects) {
 		if (!SI) continue;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
-#include "lib/CFGClone.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cstdint>
 #include <memory>

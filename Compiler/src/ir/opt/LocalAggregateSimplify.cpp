@@ -1,6 +1,8 @@
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
+#include "lib/CFG.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -123,85 +125,83 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
     std::unordered_map<Variable *, bool> ReadOnlyCache;
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
 
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *Load = dynamic_cast<LoadInst *>(I);
-            if (!Load) continue;
-            Value *Pointer = Load->getPointerOperand();
+    for (LoadInst *Load : collectInstructions<LoadInst>(F)) {
+        BasicBlock *BB = Load->getParent();
+        if (!BB) continue;
+        Value *Pointer = Load->getPointerOperand();
 
-            Variable *Root = nullptr;
-            std::vector<int> Path;
-            std::shared_ptr<IRType> ElementTy;
-            if (traceConstantGlobalPointer(Pointer, Root, Path, ElementTy)) {
-                auto CacheIt = ReadOnlyCache.find(Root);
-                bool ReadOnly = CacheIt != ReadOnlyCache.end()
-                                    ? CacheIt->second
-                                    : (ReadOnlyCache[Root] =
-                                           isWholeProgramReadOnlyVariable(Root));
-                if (!ReadOnly) continue;
-                Value *Constant = Root->getConstantElement(Path);
-                if (Constant && Value::hasSameStorageType(Load, Constant))
-                    Replacements.push_back({Load, Constant});
-                continue;
-            }
-
-            // Recognize a compact immutable power-of-two table.  A proven
-            // in-range dynamic lookup is exactly `1 << index`, which removes
-            // both the address calculation and the memory dependence without
-            // building an expensive select chain.  This is shape-driven, not
-            // tied to a source-level variable name such as SHIFT_TABLE.
-            auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
-            auto *CandidateRoot = GEP && GEP->getBasePointer()
-                                      ? dynamic_cast<Variable *>(
-                                            GEP->getBasePointer())
-                                      : nullptr;
-            if (!GEP || !CandidateRoot || GEP->getNumIndices() != 2)
-                continue;
-            int Zero = 0;
-            if (!Value::tryGetIntIndex(GEP->getIndex(0), Zero) || Zero != 0)
-                continue;
-            Value *Index = GEP->getIndex(1);
-            if (!Index || dynamic_cast<ConstInt *>(Index)) continue;
-
-            auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(
-                CandidateRoot->getPointeeType());
-            int Count = ArrayTy ? ArrayTy->getElementCount() : 0;
-            if (!ArrayTy || Count <= 0 || Count > 31 ||
-                !IRType::isScalar(ArrayTy->getElementType()))
-                continue;
-            auto CacheIt = ReadOnlyCache.find(CandidateRoot);
+        Variable *Root = nullptr;
+        std::vector<int> Path;
+        std::shared_ptr<IRType> ElementTy;
+        if (traceConstantGlobalPointer(Pointer, Root, Path, ElementTy)) {
+            auto CacheIt = ReadOnlyCache.find(Root);
             bool ReadOnly = CacheIt != ReadOnlyCache.end()
                                 ? CacheIt->second
-                                : (ReadOnlyCache[CandidateRoot] =
-                                       isWholeProgramReadOnlyVariable(
-                                           CandidateRoot));
+                                : (ReadOnlyCache[Root] =
+                                       isWholeProgramReadOnlyVariable(Root));
             if (!ReadOnly) continue;
-
-            bool IsPowerTable = true;
-            for (int N = 0; N < Count; ++N) {
-                auto *C = dynamic_cast<ConstInt *>(
-                    CandidateRoot->getConstantElement({N}));
-                if (!C || static_cast<uint32_t>(C->getVal()) !=
-                              (uint32_t{1} << N)) {
-                    IsPowerTable = false;
-                    break;
-                }
-            }
-            if (!IsPowerTable) continue;
-
-            IntRange IndexRange = RI.query(Index, BB, DT);
-            if (IndexRange.isBottom() || IndexRange.min < 0 ||
-                IndexRange.max >= Count)
-                continue;
-            Value *One = Value::makeIntegerLike(Index, 1);
-            if (!One || !Value::hasSameStorageType(Load, One)) continue;
-            auto *Shift = new BinaryInst(One, BinaryInst::SHL, Index);
-            if (!Load->insertBefore(Shift)) {
-                delete Shift;
-                continue;
-            }
-            Replacements.push_back({Load, Shift});
+            Value *Constant = Root->getConstantElement(Path);
+            if (Constant && Value::hasSameStorageType(Load, Constant))
+                Replacements.push_back({Load, Constant});
+            continue;
         }
+
+        // Recognize a compact immutable power-of-two table.  A proven
+        // in-range dynamic lookup is exactly `1 << index`, which removes
+        // both the address calculation and the memory dependence without
+        // building an expensive select chain.  This is shape-driven, not
+        // tied to a source-level variable name such as SHIFT_TABLE.
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
+        auto *CandidateRoot = GEP && GEP->getBasePointer()
+                                  ? dynamic_cast<Variable *>(
+                                        GEP->getBasePointer())
+                                  : nullptr;
+        if (!GEP || !CandidateRoot || GEP->getNumIndices() != 2)
+            continue;
+        int Zero = 0;
+        if (!Value::tryGetIntIndex(GEP->getIndex(0), Zero) || Zero != 0)
+            continue;
+        Value *Index = GEP->getIndex(1);
+        if (!Index || dynamic_cast<ConstInt *>(Index)) continue;
+
+        auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(
+            CandidateRoot->getPointeeType());
+        int Count = ArrayTy ? ArrayTy->getElementCount() : 0;
+        if (!ArrayTy || Count <= 0 || Count > 31 ||
+            !IRType::isScalar(ArrayTy->getElementType()))
+            continue;
+        auto CacheIt = ReadOnlyCache.find(CandidateRoot);
+        bool ReadOnly = CacheIt != ReadOnlyCache.end()
+                            ? CacheIt->second
+                            : (ReadOnlyCache[CandidateRoot] =
+                                   isWholeProgramReadOnlyVariable(
+                                       CandidateRoot));
+        if (!ReadOnly) continue;
+
+        bool IsPowerTable = true;
+        for (int N = 0; N < Count; ++N) {
+            auto *C = dynamic_cast<ConstInt *>(
+                CandidateRoot->getConstantElement({N}));
+            if (!C || static_cast<uint32_t>(C->getVal()) !=
+                          (uint32_t{1} << N)) {
+                IsPowerTable = false;
+                break;
+            }
+        }
+        if (!IsPowerTable) continue;
+
+        IntRange IndexRange = RI.query(Index, BB, DT);
+        if (IndexRange.isBottom() || IndexRange.min < 0 ||
+            IndexRange.max >= Count)
+            continue;
+        Value *One = Value::makeIntegerLike(Index, 1);
+        if (!One || !Value::hasSameStorageType(Load, One)) continue;
+        auto *Shift = new BinaryInst(One, BinaryInst::SHL, Index);
+        if (!Load->insertBefore(Shift)) {
+            delete Shift;
+            continue;
+        }
+        Replacements.push_back({Load, Shift});
     }
 
     for (auto &Replacement : Replacements) {
@@ -218,43 +218,33 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
 LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     Value *V, std::unordered_set<Value *> &Visiting) {
     LocalAggregatePointerPath Result;
-    if (!V || !Visiting.insert(V).second) return Result;
+    if (!V) return Result;
+    TraverseTools::ScopedActiveMark VisitingMark(Visiting, V);
+    if (!VisitingMark.inserted()) return Result;
 
     if (auto *AI = dynamic_cast<AllocaInst *>(V)) {
         Result.Root = AI;
-        Visiting.erase(V);
         return Result;
     }
 
     if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
         if (Value *Operand = BC->getUnaryOperand())
             Result = tracePointer(Operand, Visiting);
-        Visiting.erase(V);
         return Result;
     }
 
     auto *GEP = dynamic_cast<GetElementPtrInst *>(V);
-    if (!GEP) {
-        Visiting.erase(V);
-        return Result;
-    }
+    if (!GEP) return Result;
 
-    if (GEP->getNumIndices() < 1 || !GEP->getBasePointer()) {
-        Visiting.erase(V);
-        return Result;
-    }
+    if (GEP->getNumIndices() < 1 || !GEP->getBasePointer()) return Result;
 
     Result = tracePointer(GEP->getBasePointer(), Visiting);
-    if (!Result.Root) {
-        Visiting.erase(V);
-        return Result;
-    }
+    if (!Result.Root) return Result;
 
     int FirstIndex = 0;
     if (!Value::tryGetIntIndex(GEP->getIndex(0), FirstIndex) ||
         FirstIndex != 0) {
         Result.IsConstant = false;
-        Visiting.erase(V);
         return Result;
     }
 
@@ -267,7 +257,6 @@ LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
         Result.Indices.push_back(Index);
     }
 
-    Visiting.erase(V);
     return Result;
 }
 
@@ -477,9 +466,7 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     std::map<std::vector<int>, Value *> Overwrites;
     std::vector<LoadInst *> DeadLoads;
 
-    std::vector<Instruction *> Instructions;
-    for (auto It = BB->begin(); It != BB->end(); ++It)
-        Instructions.push_back(*It);
+    auto Instructions = collectInstructions(*BB);
 
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
@@ -1080,14 +1067,8 @@ bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
 std::vector<AllocaInst *>
 LocalAggregateSimplifyPass::collectArrayAllocas(Function &F) {
     std::vector<AllocaInst *> Aggregates;
-    for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt) {
-        BasicBlock *BB = *BBIt;
-        for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
-            if (auto *AI = dynamic_cast<AllocaInst *>(*IIt);
-                AllocaInst::isArrayAllocation(AI))
-                Aggregates.push_back(AI);
-        }
-    }
+    for (AllocaInst *AI : collectInstructions<AllocaInst>(F))
+        if (AllocaInst::isArrayAllocation(AI)) Aggregates.push_back(AI);
     return Aggregates;
 }
 

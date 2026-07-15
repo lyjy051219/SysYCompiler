@@ -4,6 +4,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <cmath>
 
@@ -203,18 +204,17 @@ void SCCPSolver::visitPhiNode(PhiInst* Phi) {
     BasicBlock* PhiBB = Phi->getParent();
     LatticeValue Result = LatticeValue::getTop();
 
-    for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-        BasicBlock* InBB = Phi->getIncomingBlock(i);
-        // 只考虑可行边
-        if (!isEdgeFeasible(InBB, PhiBB))
-            continue;
+    TraverseTools::forEachPhiIncoming(
+        Phi, [&](unsigned, Value *InVal, BasicBlock *InBB) {
+            // 只考虑可行边
+            if (!isEdgeFeasible(InBB, PhiBB))
+                return true;
 
-        Value* InVal = Phi->getIncomingValue(i);
-        LatticeValue InLV = getValueState(InVal);
+            LatticeValue InLV = getValueState(InVal);
 
-        Result.mergeIn(InLV);
-        if (Result.isBottom()) break; // 已经是 Bottom，无需继续
-    }
+            Result.mergeIn(InLV);
+            return !Result.isBottom(); // 已经是 Bottom，无需继续
+        });
 
     mergeInValue(Phi, Result);
 }
@@ -588,21 +588,24 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
                 }
                 for (PhiInst* phi : phis) {
                     bool needRebuild = false;
-                    for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-                        if (phi->getIncomingBlock(i) == DeadBB) {
-                            needRebuild = true;
-                            break;
-                        }
-                    }
+                    TraverseTools::forEachPhiIncoming(
+                        phi, [&](unsigned, Value *, BasicBlock *IncomingBlock) {
+                            if (IncomingBlock == DeadBB) {
+                                needRebuild = true;
+                                return false;
+                            }
+                            return true;
+                        });
                     if (!needRebuild) continue;
 
                     PhiInst* newPhi = new PhiInst(phi->getIRType());
-                    for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-                        if (phi->getIncomingBlock(i) != DeadBB) {
-                            newPhi->addIncoming(phi->getIncomingValue(i),
-                                                phi->getIncomingBlock(i));
-                        }
-                    }
+                    TraverseTools::forEachPhiIncoming(
+                        phi, [&](unsigned, Value *IncomingValue,
+                                 BasicBlock *IncomingBlock) {
+                            if (IncomingBlock != DeadBB) {
+                                newPhi->addIncoming(IncomingValue, IncomingBlock);
+                            }
+                        });
 
                     if (newPhi->getNumIncomingValues() == 0) {
                         phi->replaceAllUsesWith(

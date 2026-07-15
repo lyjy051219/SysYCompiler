@@ -1,5 +1,6 @@
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -25,19 +26,21 @@ std::optional<int64_t> SCEVResult::getTrivialExactIntConstant(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V) || Depth > 32) return std::nullopt;
     if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal();
-    if (!Active.insert(V).second) return std::nullopt;
+    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return std::nullopt;
 
     std::optional<int64_t> Result;
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-            Value *Incoming = Phi->getIncomingValue(I);
-            if (Incoming == V) continue;
-            auto C = getTrivialExactIntConstant(Incoming, Active, Depth + 1);
-            if (!C || (Result && *Result != *C)) {
-                Active.erase(V);
-                return std::nullopt;
-            }
-            Result = *C;
+        if (!TraverseTools::forEachPhiIncoming(
+                Phi, [&](unsigned, Value *Incoming, BasicBlock *) {
+                    if (Incoming == V) return true;
+                    auto C = getTrivialExactIntConstant(
+                        Incoming, Active, Depth + 1);
+                    if (!C || (Result && *Result != *C)) return false;
+                    Result = *C;
+                    return true;
+                })) {
+            return std::nullopt;
         }
     } else if (auto *Sel = dynamic_cast<SelectInst *>(V)) {
         if (Sel->getNumOperands() >= 3) {
@@ -48,7 +51,6 @@ std::optional<int64_t> SCEVResult::getTrivialExactIntConstant(
             if (T && F && *T == *F) Result = *T;
         }
     }
-    Active.erase(V);
     return Result;
 }
 
@@ -507,15 +509,17 @@ const SCEVExpr *SCEVResult::createFromPhi(PhiInst *Phi) {
         return getSCEV(Phi->getIncomingValue(0));
 
     const SCEVExpr *Common = nullptr;
-    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-        Value *In = Phi->getIncomingValue(I);
-        if (!In || In == Phi) continue;
-        const SCEVExpr *Cur = getSCEV(In);
-        if (!Common) {
-            Common = Cur;
-            continue;
-        }
-        if (!sameExpr(Common, Cur)) return makeUnknown(Phi);
+    if (!TraverseTools::forEachPhiIncoming(
+            Phi, [&](unsigned, Value *In, BasicBlock *) {
+                if (!In || In == Phi) return true;
+                const SCEVExpr *Cur = getSCEV(In);
+                if (!Common) {
+                    Common = Cur;
+                    return true;
+                }
+                return sameExpr(Common, Cur);
+            })) {
+        return makeUnknown(Phi);
     }
     return Common ? Common : makeUnknown(Phi);
 }
@@ -523,17 +527,19 @@ const SCEVExpr *SCEVResult::createFromPhi(PhiInst *Phi) {
 const SCEVExpr *SCEVResult::tryHeaderPhi(PhiInst *Phi, const Loop *L) {
     Value *Start = nullptr;
     Value *Update = nullptr;
-    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-        Value *V = Phi->getIncomingValue(I);
-        BasicBlock *Pred = Phi->getIncomingBlock(I);
-        if (!V || !Pred) return nullptr;
-        if (L->contains(Pred)) {
-            if (Update && Update != V) return nullptr;
-            Update = V;
-        } else {
-            if (Start && Start != V) return nullptr;
-            Start = V;
-        }
+    if (!TraverseTools::forEachPhiIncoming(
+            Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
+                if (!V || !Pred) return false;
+                if (L->contains(Pred)) {
+                    if (Update && Update != V) return false;
+                    Update = V;
+                } else {
+                    if (Start && Start != V) return false;
+                    Start = V;
+                }
+                return true;
+            })) {
+        return nullptr;
     }
     if (!Start || !Update) return nullptr;
 
@@ -1081,22 +1087,23 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         if (Candidate && Candidate->getParent() == Info.Header) {
             bool UpdateIsBackedge = false;
             bool BadIncoming = false;
-            for (unsigned I = 0; I < Candidate->getNumIncomingValues(); ++I) {
-                BasicBlock *PredBB = Candidate->getIncomingBlock(I);
-                Value *Incoming = Candidate->getIncomingValue(I);
-                if (!PredBB || !Incoming) {
-                    BadIncoming = true;
-                    break;
-                }
-                if (L->contains(PredBB)) {
-                    if (UpdateIsBackedge || Incoming != Update ||
-                        (Info.Latch && PredBB != Info.Latch)) {
+            TraverseTools::forEachPhiIncoming(
+                Candidate,
+                [&](unsigned, Value *Incoming, BasicBlock *PredBB) {
+                    if (!PredBB || !Incoming) {
                         BadIncoming = true;
-                        break;
+                        return false;
                     }
-                    UpdateIsBackedge = true;
-                }
-            }
+                    if (L->contains(PredBB)) {
+                        if (UpdateIsBackedge || Incoming != Update ||
+                            (Info.Latch && PredBB != Info.Latch)) {
+                            BadIncoming = true;
+                            return false;
+                        }
+                        UpdateIsBackedge = true;
+                    }
+                    return true;
+                });
             auto CandidateAffine = getAffine(Candidate);
             if (!BadIncoming && UpdateIsBackedge && CandidateAffine &&
                 CandidateAffine->RecLoop == L &&
@@ -1143,30 +1150,31 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         auto Ty = Info.IndVar->getIRType();
         std::optional<int64_t> ExactStart;
         Value *DirectUpdate = nullptr;
-        for (unsigned I = 0; I < Info.IndVar->getNumIncomingValues(); ++I) {
-            BasicBlock *PredBB = Info.IndVar->getIncomingBlock(I);
-            Value *Incoming = Info.IndVar->getIncomingValue(I);
-            if (!PredBB || !Incoming) {
-                ExactStart.reset();
-                DirectUpdate = nullptr;
-                break;
-            }
-            if (L->contains(PredBB)) {
-                if (DirectUpdate && DirectUpdate != Incoming) {
-                    DirectUpdate = nullptr;
-                    break;
-                }
-                DirectUpdate = Incoming;
-            } else {
-                std::unordered_set<Value *> Active;
-                auto C = getTrivialExactIntConstant(Incoming, Active);
-                if (!C || (ExactStart && *ExactStart != *C)) {
+        TraverseTools::forEachPhiIncoming(
+            Info.IndVar,
+            [&](unsigned, Value *Incoming, BasicBlock *PredBB) {
+                if (!PredBB || !Incoming) {
                     ExactStart.reset();
-                    break;
+                    DirectUpdate = nullptr;
+                    return false;
                 }
-                ExactStart = *C;
-            }
-        }
+                if (L->contains(PredBB)) {
+                    if (DirectUpdate && DirectUpdate != Incoming) {
+                        DirectUpdate = nullptr;
+                        return false;
+                    }
+                    DirectUpdate = Incoming;
+                } else {
+                    std::unordered_set<Value *> Active;
+                    auto C = getTrivialExactIntConstant(Incoming, Active);
+                    if (!C || (ExactStart && *ExactStart != *C)) {
+                        ExactStart.reset();
+                        return false;
+                    }
+                    ExactStart = *C;
+                }
+                return true;
+            });
 
         // Confirm that the backedge is exactly `phi +/- ConstInt`; otherwise
         // a mathematically folded invariant step could already have wrapped in
@@ -1346,17 +1354,19 @@ SCEVResult::getCanonicalInduction(const Loop *L) {
     PhiInst *Phi = TCInfo->IndVar;
     Value *StartValue = nullptr;
     Value *UpdateValue = nullptr;
-    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-        Value *V = Phi->getIncomingValue(I);
-        BasicBlock *Pred = Phi->getIncomingBlock(I);
-        if (!V || !Pred) return std::nullopt;
-        if (L->contains(Pred)) {
-            if (UpdateValue && UpdateValue != V) return std::nullopt;
-            UpdateValue = V;
-        } else {
-            if (StartValue && StartValue != V) return std::nullopt;
-            StartValue = V;
-        }
+    if (!TraverseTools::forEachPhiIncoming(
+            Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
+                if (!V || !Pred) return false;
+                if (L->contains(Pred)) {
+                    if (UpdateValue && UpdateValue != V) return false;
+                    UpdateValue = V;
+                } else {
+                    if (StartValue && StartValue != V) return false;
+                    StartValue = V;
+                }
+                return true;
+            })) {
+        return std::nullopt;
     }
 
     if (!StartValue || !UpdateValue) return std::nullopt;

@@ -1,5 +1,6 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/TraverseTools.hpp"
 #include <cstdlib>
 #include <queue>
 
@@ -116,9 +117,8 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                     }
                 //如果是Phi指令：合并所有已计算的输入值的BaseAddressInfo
                 } else if (auto* Phi = dynamic_cast<PhiInst*>(I)) {
-                    unsigned N = Phi->getNumIncomingValues();
-                    for (unsigned j = 0; j < N; ++j) {
-                        Value* V = Phi->getIncomingValue(j);
+                    TraverseTools::forEachPhiIncoming(
+                        Phi, [&](unsigned, Value *V, BasicBlock *) {
                         ensureInitialized(V, Map);
                         auto it = Map.find(V);
                         if (it != Map.end()) {
@@ -128,7 +128,7 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                         }
                         // V 不在 Map 中：视为 bottom（尚未计算），跳过
                         // 不能设 untracked=true，否则会在 merge 中永久污染
-                    }
+                    });
                     // PHI 使用替换而非合并：允许 untracked 状态在后续迭代中被纠正
                     // （处理顺序导致的虚假 untracked=true 可以在 incoming 值计算后被清除）
                     {
@@ -717,32 +717,23 @@ bool BasicBlockSideEffect(BasicBlock* BB,
                 }
             }
 
-            std::queue<BasicBlock*> Q;
-            std::unordered_set<BasicBlock*> Visited;
-            for (BasicBlock* Succ : BB->getSuccessors()) {
-                if (Succ && Visited.insert(Succ).second) {
-                    Q.push(Succ);
-                }
-            }
-
-            while (!Q.empty()) {
-                BasicBlock* Cur = Q.front();
-                Q.pop();
-                for (auto II = Cur->begin(); II != Cur->end(); ++II) {
-                    Instruction* J = *II;
-                    if (!J) continue;
-                    ModRefInfo MRI = getInstModRefInfo(
-                        MemoryLocation::get(SI), J, AA, LI, FAM);
-                    if (isRefSet(MRI)) {
-                        return true;
+            std::vector<BasicBlock *> Roots = BB->getSuccessors();
+            bool FoundRef = false;
+            TraverseTools::forEachReachablePreOrder<BasicBlock>(
+                Roots, [&SI, &AA, &LI, &FAM,
+                        &FoundRef](BasicBlock *Cur) {
+                    for (Instruction *J : *Cur) {
+                        if (!J) continue;
+                        ModRefInfo MRI = getInstModRefInfo(
+                            MemoryLocation::get(SI), J, AA, LI, FAM);
+                        if (isRefSet(MRI)) {
+                            FoundRef = true;
+                            return TraverseTools::TraversalControl::Stop;
+                        }
                     }
-                }
-                for (BasicBlock* Succ : Cur->getSuccessors()) {
-                    if (Succ && Visited.insert(Succ).second) {
-                        Q.push(Succ);
-                    }
-                }
-            }
+                    return TraverseTools::TraversalControl::Continue;
+                });
+            if (FoundRef) return true;
         }
     }
 

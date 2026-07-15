@@ -58,7 +58,6 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     Instruction(std::shared_ptr<IRType> irtype,InstType instType):User(std::move(irtype)){this->instType = instType;}
     Instruction(std::shared_ptr<IRType> irtype): User(std::move(irtype)){};
     virtual void dumpIR() = 0;
-    virtual Value* getOprand();
     static Function* getUserFunction(Use* U);
     Function* getParentFunction();
     static Function* getParentFunction(Instruction *I);
@@ -141,9 +140,6 @@ class Module final{
     //注册符号表+push新Function
     void pushFunction(Function* func);
     std::vector<std::unique_ptr<Function>>& getFunctions();
-    std::vector<Instruction *> getInstructions();
-    template <typename InstT = Instruction>
-    std::vector<InstT *> collectInstructions();
     //从functions中删除指定的Function
     void deleteFunction(Function*ptr);
     Function* getMainFunction(); //寻找main函数并返回
@@ -233,13 +229,9 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     bool isReachable(BasicBlock* BB);
     void collectReachableBlocks(std::unordered_set<BasicBlock *> &Reachable);
     std::vector<BasicBlock *> getReachableBlocks();
-    std::vector<Instruction *> getInstructions();
-    template <typename InstT = Instruction>
-    std::vector<InstT *> collectInstructions();
     void dropAllReferences();
     //调试信息打印
     void dumpIR();
-    std::string getIdent() const { return ident;}
 };
 
 //内置函数系统 -- 用来包含LLVM内置的函数
@@ -263,7 +255,6 @@ class BuildInFunction : public Value{
     static const char *getDefaultMemcpyName();
     static const char *getDefaultMemmoveName();
     static const char *getDefaultMemsetName();
-    std::string getIdent() const { return ident;}
 };
 
 class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, public ChainNode<Function,BasicBlock>{
@@ -302,9 +293,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     static void replaceIncomingPredInSuccPhis(BasicBlock *Succ, BasicBlock *OldPred, BasicBlock *NewPred);
     // 收集块开头连续的 PHI 指令
     std::vector<PhiInst*> collectPhiNodes();
-    std::vector<Instruction *> getInstructions();
-    template <typename InstT = Instruction>
-    std::vector<InstT *> collectInstructions();
     // 若本块只有唯一前驱，则折叠退化 PHI
     bool simplifySinglePredPhis();
     //关于指令生成
@@ -402,7 +390,6 @@ class RetInst : public Instruction{
     RetInst(std::shared_ptr<IRType> irtype);
     RetInst(Value* retVal);
     //RetInst* clone(std::unordered_map<Value*, Value*>&)override;
-    Value* getOprand()final;
     Value *getReturnValue() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -417,7 +404,6 @@ class BrInst : public Instruction{
     BrInst(Value*,BasicBlock*,BasicBlock*);
     BrInst(BasicBlock* bb);
     BrInst(std::shared_ptr<IRType> irtype,bool is_Cond);
-    Value* getOprand()final;
     void dumpIR() override;
     bool isConditional() const;
     Value *getCondition() const;
@@ -449,7 +435,6 @@ class StoreInst : public Instruction{
     public:
     StoreInst(Value* val,Value* ptr);
     StoreInst(std::shared_ptr<IRType> irtype);
-    Value* getOprand()final;
     Value* getValueOperand() const;
     Value* getPointerOperand() const;
     void dumpIR() override;
@@ -692,53 +677,24 @@ class ConstBool : public ConstantSystem{
     static UndefValue* NewUndefValue(std::shared_ptr<IRType> it);
  };
 
-// 模板必须放在头文件中；统一的类型过滤接口可替代 Pass 内重复的双层遍历。
-template <typename InstT>
-std::vector<InstT *> BasicBlock::collectInstructions() {
+template <typename InstT = Instruction, typename IRUnitT>
+std::vector<InstT *> collectInstructions(IRUnitT &IRUnit) {
     static_assert(std::is_base_of_v<Instruction, InstT>,
                   "InstT 必须派生自 Instruction");
-    std::vector<InstT *> Result;
-    for (Instruction *I : *this) {
-        if (!I) continue;
-        if constexpr (std::is_same_v<InstT, Instruction>) {
-            Result.push_back(I);
-        } else if (auto *Typed = dynamic_cast<InstT *>(I)) {
-            Result.push_back(Typed);
-        }
-    }
-    return Result;
-}
+    using UnitT = std::remove_cv_t<std::remove_reference_t<IRUnitT>>;
+    static_assert(std::is_same_v<UnitT, BasicBlock> ||
+                      std::is_same_v<UnitT, Function> ||
+                      std::is_same_v<UnitT, Module>,
+                  "IRUnitT 必须是 BasicBlock、Function 或 Module");
+    static_assert(!std::is_const_v<std::remove_reference_t<IRUnitT>>,
+                  "collectInstructions 当前仅返回可变 Instruction 指针");
 
-template <typename InstT>
-std::vector<InstT *> Function::collectInstructions() {
-    static_assert(std::is_base_of_v<Instruction, InstT>,
-                  "InstT 必须派生自 Instruction");
     std::vector<InstT *> Result;
-    for (BasicBlock *BB : *this) {
-        if (!BB) continue;
-        for (Instruction *I : *BB) {
-            if (!I) continue;
-            if constexpr (std::is_same_v<InstT, Instruction>) {
-                Result.push_back(I);
-            } else if (auto *Typed = dynamic_cast<InstT *>(I)) {
-                Result.push_back(Typed);
-            }
-        }
-    }
-    return Result;
-}
-
-template <typename InstT>
-std::vector<InstT *> Module::collectInstructions() {
-    static_assert(std::is_base_of_v<Instruction, InstT>,
-                  "InstT 必须派生自 Instruction");
-    std::vector<InstT *> Result;
-    for (const auto &FunctionPtr : getFunctions()) {
-        Function *F = FunctionPtr.get();
-        if (!F) continue;
-        for (BasicBlock *BB : *F) {
-            if (!BB) continue;
-            for (Instruction *I : *BB) {
+    auto AppendInstructions = [&Result](auto &Self, auto &Current) -> void {
+        using CurrentT =
+            std::remove_cv_t<std::remove_reference_t<decltype(Current)>>;
+        if constexpr (std::is_same_v<CurrentT, BasicBlock>) {
+            for (Instruction *I : Current) {
                 if (!I) continue;
                 if constexpr (std::is_same_v<InstT, Instruction>) {
                     Result.push_back(I);
@@ -746,7 +702,17 @@ std::vector<InstT *> Module::collectInstructions() {
                     Result.push_back(Typed);
                 }
             }
+        } else if constexpr (std::is_same_v<CurrentT, Function>) {
+            for (BasicBlock *BB : Current) {
+                if (BB) Self(Self, *BB);
+            }
+        } else {
+            for (const auto &FunctionPtr : Current.getFunctions()) {
+                if (Function *F = FunctionPtr.get()) Self(Self, *F);
+            }
         }
-    }
+    };
+
+    AppendInstructions(AppendInstructions, IRUnit);
     return Result;
 }

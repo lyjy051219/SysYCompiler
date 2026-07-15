@@ -4,26 +4,12 @@
 #include "ir/analysis/SCEV.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-std::vector<BasicBlock *> LoopDeletionPass::collectLoopBlocks(
-    Loop *L, Function *F) {
-    std::vector<BasicBlock *> Result;
-    if (!L || !F) return Result;
-    std::unordered_set<BasicBlock *> InLoop;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops())
-        if (BB && BB->getParent() == F) InLoop.insert(BB);
-
-    // Function order makes deletion deterministic and avoids dereferencing
-    // loop-analysis nodes after their blocks have been destroyed.
-    for (BasicBlock *BB : *F)
-        if (InLoop.count(BB)) Result.push_back(BB);
-    return Result;
-}
 
 bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     if (!I) return false;
@@ -137,11 +123,10 @@ Value *LoopDeletionPass::resolveZeroTripValue(
     // header instructions here.
     auto *Phi = dynamic_cast<PhiInst *>(I);
     if (!Phi || Phi->getParent() != L->getHeader()) return nullptr;
-    if (!Active.insert(V).second) return nullptr;
+    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return nullptr;
     Value *Incoming = Phi->getIncomingFromPred(PreHeader);
-    Value *Resolved = resolveZeroTripValue(Incoming, L, PreHeader, Active);
-    Active.erase(V);
-    return Resolved;
+    return resolveZeroTripValue(Incoming, L, PreHeader, Active);
 }
 
 bool LoopDeletionPass::planZeroTripPhiReplacements(
@@ -182,8 +167,12 @@ bool LoopDeletionPass::planDeadLoopPhiReplacements(
 
         Value *Keep = Phi->getIncomingValue(0);
         if (!Keep) return false;
-        for (unsigned I = 1; I < N; ++I)
-            if (Phi->getIncomingValue(I) != Keep) return false;
+        if (!TraverseTools::forEachPhiIncoming(
+                Phi, [Keep](unsigned I, Value *Incoming, BasicBlock *) {
+                    return I == 0 || Incoming == Keep;
+                })) {
+            return false;
+        }
 
         auto *Def = dynamic_cast<Instruction *>(Keep);
         if (Def && Def->getParent() && L->contains(Def->getParent()))
@@ -302,7 +291,7 @@ PreservationStatus LoopDeletionPass::run(
             continue;
         }
 
-        std::vector<BasicBlock *> Blocks = collectLoopBlocks(L, &F);
+        std::vector<BasicBlock *> Blocks = L->getBlocksInFunctionOrder();
         if (Blocks.empty()) continue;
 
         PhiReplacementMap PhiPlan;

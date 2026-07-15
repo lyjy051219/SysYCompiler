@@ -9,6 +9,7 @@
 #include "ir/analysis/SCEVExpander.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -601,13 +602,11 @@ bool LoopStrengthReductionPass::collectRemovableIndexChain(
 
     Out.insert(I);
     AllowedUsers.insert(I);
-    for (size_t OperandIndex = 0;
-         OperandIndex < I->getNumOperands(); ++OperandIndex) {
-        auto *OperandI = dynamic_cast<Instruction *>(
-            I->getOperand(OperandIndex));
+    TraverseTools::forEachOperand(I, [&](size_t, Use *, Value *Operand) {
+        auto *OperandI = dynamic_cast<Instruction *>(Operand);
         if (OperandI && OperandI != I)
             collectRemovableIndexChain(OperandI, AllowedUsers, Out);
-    }
+    });
     return true;
 }
 
@@ -647,31 +646,29 @@ bool LoopStrengthReductionPass::coversDenseInnermostAddresses(
 
 void LoopStrengthReductionPass::cleanupDeadIndexChains(
     const std::vector<Instruction *> &Seeds) {
-    std::vector<Instruction *> WorkList;
-    std::unordered_set<Instruction *> Queued;
+    TraverseTools::UniqueWorkList<
+        Instruction *, TraverseTools::WorkListOrder::LIFO> WorkList;
     for (Instruction *Seed : Seeds) {
-        if (Seed && Queued.insert(Seed).second) WorkList.push_back(Seed);
+        if (Seed) WorkList.push(Seed);
     }
 
     while (!WorkList.empty()) {
-        Instruction *Current = WorkList.back();
-        WorkList.pop_back();
-        Queued.erase(Current);
+        Instruction *Current = WorkList.pop();
         if (!isRemovableIndexInst(Current) || Current->hasUses()) continue;
 
         std::vector<Instruction *> Operands;
-        for (size_t OperandIndex = 0;
-             OperandIndex < Current->getNumOperands(); ++OperandIndex) {
-            auto *OperandI = dynamic_cast<Instruction *>(
-                Current->getOperand(OperandIndex));
-            if (OperandI && OperandI != Current) Operands.push_back(OperandI);
-        }
+        TraverseTools::forEachOperand(
+            Current, [&](size_t, Use *, Value *Operand) {
+                auto *OperandI = dynamic_cast<Instruction *>(Operand);
+                if (OperandI && OperandI != Current)
+                    Operands.push_back(OperandI);
+            });
 
         delete Current;
         for (Instruction *OperandI : Operands) {
             if (OperandI && isRemovableIndexInst(OperandI) &&
-                !OperandI->hasUses() && Queued.insert(OperandI).second) {
-                WorkList.push_back(OperandI);
+                !OperandI->hasUses()) {
+                WorkList.push(OperandI);
             }
         }
     }

@@ -1,8 +1,8 @@
 #include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
-#include "lib/CFGClone.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -47,18 +47,16 @@ bool LoopUnrollPass::isStructurallyLoopInvariant(
                         I->instType == Instruction::ZEXT ||
                         I->instType == Instruction::SEXT ||
                         I->instType == Instruction::BITCAST;
-    if (!PureProducer || !Active.insert(V).second) return false;
+    if (!PureProducer) return false;
+    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return false;
 
-    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
-        Value *Operand = I->getOperand(Op);
-        if (dynamic_cast<BasicBlock *>(Operand)) continue;
-        if (!isStructurallyLoopInvariant(Operand, L, Active)) {
-            Active.erase(V);
-            return false;
-        }
-    }
-    Active.erase(V);
-    return true;
+    const bool OperandsInvariant = TraverseTools::forEachOperand(
+        I, [L, &Active](size_t, Use *, Value *Operand) {
+            if (dynamic_cast<BasicBlock *>(Operand)) return true;
+            return isStructurallyLoopInvariant(Operand, L, Active);
+        });
+    return OperandsInvariant;
 }
 
 std::vector<StoreInst *>
@@ -81,21 +79,25 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
     // such downstream blocks once, without crossing the canonical outer
     // backedge.  Stores before a nested loop (the profitable common case)
     // remain eligible because the nested loop cannot reach backwards to them.
-    std::unordered_set<BasicBlock *> NestedControlledBlocks;
-    std::vector<BasicBlock *> NestedWorklist;
+    std::vector<BasicBlock *> NestedRoots;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        if (BB && LI.getLoopFor(BB) != L) NestedWorklist.push_back(BB);
+        if (BB && L->contains(BB) && LI.getLoopFor(BB) != L)
+            NestedRoots.push_back(BB);
     }
-    while (!NestedWorklist.empty()) {
-        BasicBlock *BB = NestedWorklist.back();
-        NestedWorklist.pop_back();
-        if (!BB || !NestedControlledBlocks.insert(BB).second) continue;
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (!Succ || !L->contains(Succ)) continue;
-            if (BB == OuterLatch && Succ == L->getHeader()) continue;
-            NestedWorklist.push_back(Succ);
-        }
-    }
+    std::reverse(NestedRoots.begin(), NestedRoots.end());
+    std::unordered_set<BasicBlock *> NestedControlledBlocks =
+        TraverseTools::collectReachableFromRootsCustomSucc<BasicBlock>(
+            NestedRoots, [L, OuterLatch](BasicBlock *BB) {
+                std::vector<BasicBlock *> Successors;
+                if (!BB || !L->contains(BB)) return Successors;
+                for (BasicBlock *Succ : BB->getSuccessors()) {
+                    if (!Succ || !L->contains(Succ)) continue;
+                    if (BB == OuterLatch && Succ == L->getHeader()) continue;
+                    Successors.push_back(Succ);
+                }
+                std::reverse(Successors.begin(), Successors.end());
+                return Successors;
+            });
 
     // Every direct-loop control decision (apart from the loop exit itself)
     // must repeat across iterations.  Then a conditional store either runs
@@ -243,41 +245,41 @@ bool LoopUnrollPass::containsUndef(
     if (Depth > 32) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return false;
-    if (!Active.insert(V).second) return true;
-    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
-        Value *Operand = I->getOperand(Op);
-        if (dynamic_cast<BasicBlock *>(Operand)) continue;
-        if (containsUndef(Operand, Active, Depth + 1)) {
-            Active.erase(V);
-            return true;
-        }
-    }
-    Active.erase(V);
-    return false;
+    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return true;
+    const bool NoOperandContainsUndef = TraverseTools::forEachOperand(
+        I, [&Active, Depth](size_t, Use *, Value *Operand) {
+            if (dynamic_cast<BasicBlock *>(Operand)) return true;
+            return !containsUndef(Operand, Active, Depth + 1);
+        });
+    return !NoOperandContainsUndef;
 }
 
 bool LoopUnrollPass::isTrivialForwardOf(
     Value *Candidate, Value *Source,
     std::unordered_set<Value *> &Active, int Depth) {
     if (Candidate == Source) return true;
-    if (!Candidate || !Source || Depth > 16 ||
-        !Active.insert(Candidate).second) {
+    if (!Candidate || !Source || Depth > 16) {
         return false;
     }
+    TraverseTools::ScopedActiveMark ActiveMark(Active, Candidate);
+    if (!ActiveMark.inserted()) return false;
 
     bool Result = false;
     if (auto *Phi = dynamic_cast<PhiInst *>(Candidate)) {
-        Result = Phi->getNumIncomingValues() != 0;
-        for (unsigned I = 0; Result && I < Phi->getNumIncomingValues(); ++I)
-            Result = isTrivialForwardOf(
-                Phi->getIncomingValue(I), Source, Active, Depth + 1);
+        Result = Phi->getNumIncomingValues() != 0 &&
+                 TraverseTools::forEachPhiIncoming(
+                     Phi, [Source, &Active, Depth](unsigned, Value *Incoming,
+                                                   BasicBlock *) {
+                         return isTrivialForwardOf(
+                             Incoming, Source, Active, Depth + 1);
+                     });
     } else if (auto *Sel = dynamic_cast<SelectInst *>(Candidate)) {
         Result = isTrivialForwardOf(
                      Sel->getTrueValue(), Source, Active, Depth + 1) &&
                  isTrivialForwardOf(
                      Sel->getFalseValue(), Source, Active, Depth + 1);
     }
-    Active.erase(Candidate);
     return Result;
 }
 
@@ -847,17 +849,15 @@ bool LoopUnrollPass::replaceDataOperandsUsingMap(
     const std::unordered_map<Value *, Value *> &VMap) {
     if (!I) return false;
 
-    for (size_t OperandIndex = 0;
-         OperandIndex < I->getNumOperands(); ++OperandIndex) {
-        Use *U = I->getOperandUse(OperandIndex);
-        if (!U) continue;
-        Value *Old = U->getValue();
-        if (isBlockValue(Old)) continue;
+    TraverseTools::forEachOperand(
+        I, [&VMap](size_t, Use *U, Value *Old) {
+        if (!U) return;
+        if (isBlockValue(Old)) return;
         auto It = VMap.find(Old);
-        if (It == VMap.end()) continue;
-        if (!isValueCompatibleWithType(It->second, Old->getIRType())) continue;
+        if (It == VMap.end()) return;
+        if (!isValueCompatibleWithType(It->second, Old->getIRType())) return;
         U->replaceUseeWith(It->second);
-    }
+        });
     return true;
 }
 
@@ -1348,30 +1348,33 @@ std::vector<BasicBlock *> LoopUnrollPass::collectExitRegionBlocksFrom(
     std::vector<BasicBlock *> Region;
     if (!Exit) return Region;
 
-    std::unordered_set<BasicBlock *> Seen;
-    std::vector<BasicBlock *> Stack;
-    Stack.push_back(Exit);
+    std::vector<BasicBlock *> Roots{Exit};
+    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+        Roots,
+        [&StopBlocks](BasicBlock *BB) {
+            std::vector<BasicBlock *> Successors;
+            if (!BB) return Successors;
+            for (BasicBlock *Succ : BB->getSuccessors()) {
+                if (!Succ || StopBlocks.count(Succ)) continue;
+                Successors.push_back(Succ);
+            }
+            // The old explicit stack pushed successors in their natural order,
+            // so LIFO visited the last successor first.
+            std::reverse(Successors.begin(), Successors.end());
+            return Successors;
+        },
+        [&Region, Exit, &StopBlocks,
+         StopAtConditionalBranch](BasicBlock *BB) {
+            if (BB != Exit && StopBlocks.count(BB))
+                return TraverseTools::TraversalControl::SkipSuccessors;
 
-    while (!Stack.empty()) {
-        BasicBlock *BB = Stack.back();
-        Stack.pop_back();
-        if (!BB || Seen.count(BB)) continue;
-        if (BB != Exit && StopBlocks.count(BB)) continue;
-
-        Seen.insert(BB);
-        Region.push_back(BB);
-
-        if (StopAtConditionalBranch &&
-            BasicBlock::isCondBr(BB->getBranchTerminator())) {
-            continue;
-        }
-
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (!Succ || Seen.count(Succ)) continue;
-            if (StopBlocks.count(Succ)) continue;
-            Stack.push_back(Succ);
-        }
-    }
+            Region.push_back(BB);
+            if (StopAtConditionalBranch &&
+                BasicBlock::isCondBr(BB->getBranchTerminator())) {
+                return TraverseTools::TraversalControl::SkipSuccessors;
+            }
+            return TraverseTools::TraversalControl::Continue;
+        });
 
     return Region;
 }
@@ -1388,12 +1391,10 @@ std::vector<ExitRegionDataUse> LoopUnrollPass::collectExitRegionDataUsesFrom(
         if (!BB) continue;
         for (Instruction *I : *BB) {
             if (!I || dynamic_cast<PhiInst *>(I)) continue;
-            for (size_t OperandIndex = 0;
-                 OperandIndex < I->getNumOperands(); ++OperandIndex) {
-                Use *U = I->getOperandUse(OperandIndex);
-                if (!U) continue;
-                Value *Old = U->getValue();
-                if (!isDataValue(Old)) continue;
+            TraverseTools::forEachOperand(
+                I, [Exit, Exiting, &Uses](size_t, Use *U, Value *Old) {
+                if (!U) return;
+                if (!isDataValue(Old)) return;
                 Value *Lookup = Old;
                 if (auto *Phi = dynamic_cast<PhiInst *>(Old)) {
                     if (Phi->getParent() == Exit && Exiting) {
@@ -1403,7 +1404,7 @@ std::vector<ExitRegionDataUse> LoopUnrollPass::collectExitRegionDataUsesFrom(
                     }
                 }
                 Uses.push_back({U, Old, Lookup, Old->getIRType()});
-            }
+                });
         }
     }
 

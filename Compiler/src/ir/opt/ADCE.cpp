@@ -5,6 +5,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <vector>
 
@@ -236,13 +237,9 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
     ADCEContext ctx;
 
     // 2. Initialize: 收集 root-live
-    for (auto bb : F) {
-        for (auto inst : *bb) {
-            if (isRootLive(inst, PDT)) {
-                markLive(inst, ctx);
-            }
-        }
-    }
+    TraverseTools::forEachInstruction(F, [&](Instruction *I) {
+        if (isRootLive(I, PDT)) markLive(I, ctx);
+    });
 
     // 3. Mark: worklist 驱动的反向传播 + 控制依赖补活
     while (!ctx.Worklist.empty()) {
@@ -250,13 +247,11 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
         ctx.Worklist.pop_front();
 
         // 3a. 数据依赖: 保活所有 Instruction 型操作数
-        for (size_t OperandIndex = 0;
-             OperandIndex < I->getNumOperands(); ++OperandIndex) {
-            Value *V = I->getOperand(OperandIndex);
+        TraverseTools::forEachOperand(I, [&](size_t, Use *, Value *V) {
             if (auto *OpI = dynamic_cast<Instruction *>(V)) {
                 markLive(OpI, ctx);
             }
-        }
+        });
 
         // 3b. 控制依赖: I 所在块
         BasicBlock *BB = I->getParent();
@@ -264,9 +259,10 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
         // 3c. 控制依赖: PhiInst 的每个 incoming block
         if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-            for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-                markControlDependences(Phi->getIncomingBlock(i), PDT, ctx);
-            }
+            TraverseTools::forEachPhiIncoming(
+                Phi, [&](unsigned, Value *, BasicBlock *IncomingBlock) {
+                    markControlDependences(IncomingBlock, PDT, ctx);
+                });
         }
     }
 

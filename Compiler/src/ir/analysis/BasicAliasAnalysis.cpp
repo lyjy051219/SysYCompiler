@@ -1,5 +1,6 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -82,18 +83,19 @@ bool BasicAAResult::hasUndefPointerOrigin(
         dynamic_cast<PhiInst *>(I) ||
         dynamic_cast<SelectInst *>(I);
     if (!TransparentPointerProducer) return false;
-    if (!Active.insert(V).second) return false;
+    TraverseTools::ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return false;
 
-    for (size_t Op = 0; Op < I->getNumOperands(); ++Op) {
-        Value *Operand = I->getOperand(Op);
-        if (dynamic_cast<BasicBlock *>(Operand)) continue;
-        if (hasUndefPointerOrigin(Operand, Active, Depth + 1)) {
-            Active.erase(V);
-            return true;
-        }
-    }
-    Active.erase(V);
-    return false;
+    bool HasUndefOrigin = false;
+    TraverseTools::forEachOperand(
+        I, [&](size_t, Use *, Value *Operand) {
+            if (dynamic_cast<BasicBlock *>(Operand)) return true;
+            if (!hasUndefPointerOrigin(Operand, Active, Depth + 1))
+                return true;
+            HasUndefOrigin = true;
+            return false;
+        });
+    return HasUndefOrigin;
 }
 
 MemoryLocation MemoryLocation::get(const LoadInst *Load) {
@@ -477,23 +479,19 @@ BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
 
     Value* Start = nullptr;
     Value* Update = nullptr;
-    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-        Value* V = Phi->getIncomingValue(I);
-        BasicBlock* Pred = Phi->getIncomingBlock(I);
-        if (!V || !Pred) {
-            return std::nullopt;
-        }
-        if (L->contains(Pred)) {
-            if (Update && Update != V) {
-                return std::nullopt;
-            }
-            Update = V;
-        } else {
-            if (Start && Start != V) {
-                return std::nullopt;
-            }
-            Start = V;
-        }
+    if (!TraverseTools::forEachPhiIncoming(
+            Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
+                if (!V || !Pred) return false;
+                if (L->contains(Pred)) {
+                    if (Update && Update != V) return false;
+                    Update = V;
+                } else {
+                    if (Start && Start != V) return false;
+                    Start = V;
+                }
+                return true;
+            })) {
+        return std::nullopt;
     }
 
     auto Step = getAdditiveOffsetFrom(Update, Phi);
@@ -714,37 +712,42 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
             // block; matching by raw index can compare values from different
             // control-flow edges and manufacture NoAlias/MustAlias.
             std::unordered_map<BasicBlock *, Value *> OtherByPred;
-            for (unsigned i = 0; i < M; ++i) {
-                BasicBlock *Pred = OtherPhi->getIncomingBlock(i);
-                if (!Pred || !OtherByPred.emplace(
-                                 Pred, OtherPhi->getIncomingValue(i)).second)
-                    return AliasInfo::MayAlias;
+            if (!TraverseTools::forEachPhiIncoming(
+                    OtherPhi,
+                    [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                        return Pred &&
+                               OtherByPred.emplace(Pred, Incoming).second;
+                    })) {
+                return AliasInfo::MayAlias;
             }
 
             std::unordered_set<BasicBlock *> SeenPreds;
             AliasInfo Acc = AliasInfo::MayAlias;
             bool First = true;
-            for (unsigned i = 0; i < N; ++i) {
-                BasicBlock *Pred = Phi->getIncomingBlock(i);
-                if (!Pred || !SeenPreds.insert(Pred).second)
-                    return AliasInfo::MayAlias;
-                auto OtherIt = OtherByPred.find(Pred);
-                if (OtherIt == OtherByPred.end())
-                    return AliasInfo::MayAlias;
+            bool InvalidIncoming = false;
+            TraverseTools::forEachPhiIncoming(
+                Phi, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                    if (!Pred || !SeenPreds.insert(Pred).second) {
+                        InvalidIncoming = true;
+                        return false;
+                    }
+                    auto OtherIt = OtherByPred.find(Pred);
+                    if (OtherIt == OtherByPred.end()) {
+                        InvalidIncoming = true;
+                        return false;
+                    }
 
-                AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i),
-                                          OtherIt->second, LI,
-                                          UseIndexRange);
-                if (First) {
-                    Acc = Cur;
-                    First = false;
-                    continue;
-                }
-                Acc = mergePhiAlias(Acc, Cur);
-                if (Acc == AliasInfo::MayAlias) {
-                    break;
-                }
-            }
+                    AliasInfo Cur = aliasImpl(Incoming, OtherIt->second, LI,
+                                              UseIndexRange);
+                    if (First) {
+                        Acc = Cur;
+                        First = false;
+                        return true;
+                    }
+                    Acc = mergePhiAlias(Acc, Cur);
+                    return Acc != AliasInfo::MayAlias;
+                });
+            if (InvalidIncoming) return AliasInfo::MayAlias;
             return Acc;
         }
     }
@@ -766,18 +769,14 @@ AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
     if (!Select || !Other) return AliasInfo::MayAlias;
 
     auto Key = makeCanonicalPair(Select, Other);
-    if (!ActiveSelectQueries.insert(Key).second)
+    TraverseTools::ScopedActiveMark ActiveMark(ActiveSelectQueries, Key);
+    if (!ActiveMark.inserted())
         return AliasInfo::MayAlias;
-
-    auto Finish = [&](AliasInfo Result) {
-        ActiveSelectQueries.erase(Key);
-        return Result;
-    };
 
     Value *TrueValue = Select->getOperand(1);
     Value *FalseValue = Select->getOperand(2);
     if (!TrueValue || !FalseValue)
-        return Finish(AliasInfo::MayAlias);
+        return AliasInfo::MayAlias;
 
     // Correlated selects with the same condition choose corresponding arms in
     // every execution.  Pairing all four combinations would lose useful
@@ -790,13 +789,13 @@ AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
             AliasInfo OnFalse = aliasImpl(FalseValue,
                                           OtherSelect->getOperand(2), LI,
                                           UseIndexRange);
-            return Finish(mergePhiAlias(OnTrue, OnFalse));
+            return mergePhiAlias(OnTrue, OnFalse);
         }
     }
 
     AliasInfo OnTrue = aliasImpl(TrueValue, Other, LI, UseIndexRange);
     AliasInfo OnFalse = aliasImpl(FalseValue, Other, LI, UseIndexRange);
-    return Finish(mergePhiAlias(OnTrue, OnFalse));
+    return mergePhiAlias(OnTrue, OnFalse);
 }
 
 AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
@@ -848,11 +847,8 @@ AliasInfo BasicAAResult::aliasLocationImpl(
     if (P1 == P2) return aliasImpl(P1, P2, LI, UseIndexRange);
 
     auto Key = makeCanonicalPair(P1, P2);
-    if (!Active.insert(Key).second) return AliasInfo::MayAlias;
-    auto Finish = [&](AliasInfo Result) {
-        Active.erase(Key);
-        return Result;
-    };
+    TraverseTools::ScopedActiveMark ActiveMark(Active, Key);
+    if (!ActiveMark.inserted()) return AliasInfo::MayAlias;
     auto Merge = [&](AliasInfo A, AliasInfo B) {
         return mergePhiAlias(A, B);
     };
@@ -866,7 +862,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         AliasInfo OnFalse = aliasLocationImpl(
             {S1->getOperand(2), L1.Size}, {S2->getOperand(2), L2.Size},
             LI, UseIndexRange, Depth + 1, Active);
-        return Finish(Merge(OnTrue, OnFalse));
+        return Merge(OnTrue, OnFalse);
     }
     if (S1) {
         AliasInfo OnTrue = aliasLocationImpl(
@@ -875,7 +871,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         AliasInfo OnFalse = aliasLocationImpl(
             {S1->getOperand(2), L1.Size}, L2, LI, UseIndexRange,
             Depth + 1, Active);
-        return Finish(Merge(OnTrue, OnFalse));
+        return Merge(OnTrue, OnFalse);
     }
     if (S2) {
         AliasInfo OnTrue = aliasLocationImpl(
@@ -884,7 +880,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         AliasInfo OnFalse = aliasLocationImpl(
             L1, {S2->getOperand(2), L2.Size}, LI, UseIndexRange,
             Depth + 1, Active);
-        return Finish(Merge(OnTrue, OnFalse));
+        return Merge(OnTrue, OnFalse);
     }
 
     auto *Phi1 = dynamic_cast<PhiInst *>(P1);
@@ -893,28 +889,33 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         Phi1->getNumIncomingValues() == Phi2->getNumIncomingValues() &&
         Phi1->getNumIncomingValues() != 0) {
         std::unordered_map<BasicBlock *, Value *> Incoming2;
-        for (unsigned I = 0; I < Phi2->getNumIncomingValues(); ++I) {
-            BasicBlock *Pred = Phi2->getIncomingBlock(I);
-            if (!Pred || !Incoming2.emplace(
-                             Pred, Phi2->getIncomingValue(I)).second)
-                return Finish(AliasInfo::MayAlias);
+        if (!TraverseTools::forEachPhiIncoming(
+                Phi2, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                    return Pred && Incoming2.emplace(Pred, Incoming).second;
+                })) {
+            return AliasInfo::MayAlias;
         }
         bool First = true;
         AliasInfo Result = AliasInfo::MayAlias;
         std::unordered_set<BasicBlock *> Seen;
-        for (unsigned I = 0; I < Phi1->getNumIncomingValues(); ++I) {
-            BasicBlock *Pred = Phi1->getIncomingBlock(I);
-            auto It = Incoming2.find(Pred);
-            if (!Pred || !Seen.insert(Pred).second || It == Incoming2.end())
-                return Finish(AliasInfo::MayAlias);
-            AliasInfo Current = aliasLocationImpl(
-                {Phi1->getIncomingValue(I), L1.Size}, {It->second, L2.Size},
-                LI, UseIndexRange, Depth + 1, Active);
-            Result = First ? Current : Merge(Result, Current);
-            First = false;
-            if (Result == AliasInfo::MayAlias) break;
-        }
-        return Finish(Result);
+        bool InvalidIncoming = false;
+        TraverseTools::forEachPhiIncoming(
+            Phi1, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                auto It = Incoming2.find(Pred);
+                if (!Pred || !Seen.insert(Pred).second ||
+                    It == Incoming2.end()) {
+                    InvalidIncoming = true;
+                    return false;
+                }
+                AliasInfo Current = aliasLocationImpl(
+                    {Incoming, L1.Size}, {It->second, L2.Size}, LI,
+                    UseIndexRange, Depth + 1, Active);
+                Result = First ? Current : Merge(Result, Current);
+                First = false;
+                return Result != AliasInfo::MayAlias;
+            });
+        if (InvalidIncoming) return AliasInfo::MayAlias;
+        return Result;
     }
 
     auto ExpandPhi = [&](PhiInst *Phi, const MemoryLocation &Other,
@@ -923,22 +924,23 @@ AliasInfo BasicAAResult::aliasLocationImpl(
             return AliasInfo::MayAlias;
         bool First = true;
         AliasInfo Result = AliasInfo::MayAlias;
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-            MemoryLocation Incoming(Phi->getIncomingValue(I),
-                                    PhiIsFirst ? L1.Size : L2.Size);
-            AliasInfo Current = PhiIsFirst
-                ? aliasLocationImpl(Incoming, Other, LI, UseIndexRange,
-                                    Depth + 1, Active)
-                : aliasLocationImpl(Other, Incoming, LI, UseIndexRange,
-                                    Depth + 1, Active);
-            Result = First ? Current : Merge(Result, Current);
-            First = false;
-            if (Result == AliasInfo::MayAlias) break;
-        }
+        TraverseTools::forEachPhiIncoming(
+            Phi, [&](unsigned, Value *IncomingValue, BasicBlock *) {
+                MemoryLocation Incoming(
+                    IncomingValue, PhiIsFirst ? L1.Size : L2.Size);
+                AliasInfo Current = PhiIsFirst
+                    ? aliasLocationImpl(Incoming, Other, LI, UseIndexRange,
+                                        Depth + 1, Active)
+                    : aliasLocationImpl(Other, Incoming, LI, UseIndexRange,
+                                        Depth + 1, Active);
+                Result = First ? Current : Merge(Result, Current);
+                First = false;
+                return Result != AliasInfo::MayAlias;
+            });
         return Result;
     };
-    if (Phi1) return Finish(ExpandPhi(Phi1, L2, true));
-    if (Phi2) return Finish(ExpandPhi(Phi2, L1, false));
+    if (Phi1) return ExpandPhi(Phi1, L2, true);
+    if (Phi2) return ExpandPhi(Phi2, L1, false);
 
     AliasInfo Result = aliasImpl(P1, P2, LI, UseIndexRange);
     if (L1.Size && L2.Size) {
@@ -954,7 +956,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
                               L1.Size, L2.Size);
         }
     }
-    return Finish(Result);
+    return Result;
 }
 
 AliasInfo BasicAAResult::alias(const MemoryLocation &L1,

@@ -7,7 +7,7 @@
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/CFG.hpp"
-#include "lib/CFGClone.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -103,39 +103,58 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
     // back to Header would make an instruction in the region execute before
     // the candidate in an earlier iteration and invalidate prefix motion.
     BlockSet Forward;
-    std::vector<BasicBlock *> Worklist{C.Shape.Header};
-    while (!Worklist.empty()) {
-        BasicBlock *BB = Worklist.back();
-        Worklist.pop_back();
-        if (!BB || !C.L->contains(BB) || !Forward.insert(BB).second)
-            continue;
-        if (BB == C.Parent) continue;
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (!Succ || !C.L->contains(Succ) || Succ == C.Shape.Header)
-                return false;
-            Worklist.push_back(Succ);
-        }
-    }
-    if (!Forward.count(C.Parent)) return false;
+    std::vector<BasicBlock *> ForwardRoots{C.Shape.Header};
+    bool ForwardComplete =
+        TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+            ForwardRoots,
+            [](BasicBlock *BB) {
+                auto Successors = BB ? BB->getSuccessors()
+                                     : std::vector<BasicBlock *>{};
+                std::reverse(Successors.begin(), Successors.end());
+                return Successors;
+            },
+            [&C, &Forward](BasicBlock *BB) {
+                if (!BB || !C.L->contains(BB))
+                    return TraverseTools::TraversalControl::SkipSuccessors;
+                Forward.insert(BB);
+                if (BB == C.Parent)
+                    return TraverseTools::TraversalControl::SkipSuccessors;
+
+                for (BasicBlock *Succ : BB->getSuccessors()) {
+                    if (!Succ || !C.L->contains(Succ) ||
+                        Succ == C.Shape.Header) {
+                        return TraverseTools::TraversalControl::Stop;
+                    }
+                }
+                return TraverseTools::TraversalControl::Continue;
+            });
+    if (!ForwardComplete || !Forward.count(C.Parent)) return false;
 
     // Every block reachable before Parent must still be able to reach Parent
     // without taking the loop backedge.  This excludes a side path on which
     // the original branch was never executed.
     BlockSet CanReachParent;
-    Worklist = {C.Parent};
-    while (!Worklist.empty()) {
-        BasicBlock *BB = Worklist.back();
-        Worklist.pop_back();
-        if (!BB || !C.L->contains(BB) ||
-            !CanReachParent.insert(BB).second) {
-            continue;
-        }
-        for (BasicBlock *Pred : BB->getPredecessors()) {
-            if (!Pred || !C.L->contains(Pred)) continue;
-            if (BB == C.Shape.Header) continue;
-            Worklist.push_back(Pred);
-        }
-    }
+    std::vector<BasicBlock *> ReverseRoots{C.Parent};
+    TraverseTools::forEachReachablePreOrderCustomSucc<BasicBlock>(
+        ReverseRoots,
+        [&C](BasicBlock *BB) {
+            std::vector<BasicBlock *> Predecessors;
+            if (!BB || BB == C.Shape.Header) return Predecessors;
+            for (BasicBlock *Pred : BB->getPredecessors()) {
+                if (Pred && C.L->contains(Pred))
+                    Predecessors.push_back(Pred);
+            }
+            std::reverse(Predecessors.begin(), Predecessors.end());
+            return Predecessors;
+        },
+        [&C, &CanReachParent](BasicBlock *BB) {
+            if (!BB || !C.L->contains(BB))
+                return TraverseTools::TraversalControl::SkipSuccessors;
+            CanReachParent.insert(BB);
+            if (BB == C.Shape.Header)
+                return TraverseTools::TraversalControl::SkipSuccessors;
+            return TraverseTools::TraversalControl::Continue;
+        });
 
     for (BasicBlock *BB : Forward) {
         if (!CanReachParent.count(BB) || !isDirectLoopBlock(LI, C.L, BB))
@@ -166,14 +185,16 @@ bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
         Value *DirectValue = nullptr;
         unsigned DirectCount = 0;
         unsigned RemainingCount = 0;
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-            if (Phi->getIncomingBlock(I) == C.Parent) {
-                DirectValue = Phi->getIncomingValue(I);
+        TraverseTools::forEachPhiIncoming(
+            Phi, [&C, &DirectValue, &DirectCount, &RemainingCount](
+                     unsigned, Value *Incoming, BasicBlock *Pred) {
+            if (Pred == C.Parent) {
+                DirectValue = Incoming;
                 ++DirectCount;
             } else {
                 ++RemainingCount;
             }
-        }
+            });
         if (DirectCount != 1 ||
             !isAvailableAt(DirectValue, C.Shape.PreHeader->getTerminator(),
                            *C.L, DT)) {
@@ -184,9 +205,12 @@ bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
         // Exit PHIs produced by LCSSA do not depend on each other.  Reject an
         // unusual cyclic/cross-PHI form instead of creating a definition in
         // the new merge block that is used by its predecessor.
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-            auto *InI = dynamic_cast<Instruction *>(Phi->getIncomingValue(I));
-            if (InI && InI->getParent() == C.Exit) return false;
+        if (!TraverseTools::forEachPhiIncoming(
+                Phi, [&C](unsigned, Value *Incoming, BasicBlock *) {
+                    auto *InI = dynamic_cast<Instruction *>(Incoming);
+                    return !InI || InI->getParent() != C.Exit;
+                })) {
+            return false;
         }
     }
     return true;
@@ -262,10 +286,12 @@ void LoopUnswitchPass::setHeaderPredecessor(BasicBlock *Header, BasicBlock *OldP
                           BasicBlock *NewPreHeader) {
     if (!Header || !OldPreHeader || !NewPreHeader) return;
     for (PhiInst *Phi : Header->collectPhiNodes()) {
-        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-            if (Phi->getIncomingBlock(I) == OldPreHeader)
-                Phi->setIncomingBlock(I, NewPreHeader);
-        }
+        TraverseTools::forEachPhiIncoming(
+            Phi, [Phi, OldPreHeader, NewPreHeader](
+                     unsigned Index, Value *, BasicBlock *Pred) {
+                if (Pred == OldPreHeader)
+                    Phi->setIncomingBlock(Index, NewPreHeader);
+            });
     }
 }
 
@@ -296,10 +322,12 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
 
     if (ReuseExit) {
         for (PhiInst *Phi : C.Exit->collectPhiNodes()) {
-            for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-                if (Phi->getIncomingBlock(I) == C.Parent)
-                    Phi->setIncomingBlock(I, OldPreHeader);
-            }
+            TraverseTools::forEachPhiIncoming(
+                Phi, [Phi, &C, OldPreHeader](
+                         unsigned Index, Value *, BasicBlock *Pred) {
+                    if (Pred == C.Parent)
+                        Phi->setIncomingBlock(Index, OldPreHeader);
+                });
         }
     } else {
         auto *ExitMerge = new BasicBlock();
@@ -396,23 +424,24 @@ LoopUnswitchPass::collectSpecializedReachable(Loop &L, BasicBlock *Parent,
     BlockSet Reachable;
     BasicBlock *Header = L.getHeader();
     if (!Header || !Parent || !ChosenSuccessor) return Reachable;
+    if (!L.contains(Header)) return Reachable;
 
-    std::vector<BasicBlock *> Worklist{Header};
-    while (!Worklist.empty()) {
-        BasicBlock *BB = Worklist.back();
-        Worklist.pop_back();
-        if (!BB || !L.contains(BB) || !Reachable.insert(BB).second)
-            continue;
-        if (BB == Parent) {
-            if (L.contains(ChosenSuccessor))
-                Worklist.push_back(ChosenSuccessor);
-            continue;
-        }
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (Succ && L.contains(Succ)) Worklist.push_back(Succ);
-        }
-    }
-    return Reachable;
+    std::vector<BasicBlock *> Roots{Header};
+    return TraverseTools::collectReachableFromRootsCustomSucc<BasicBlock>(
+        Roots, [&L, Parent, ChosenSuccessor](BasicBlock *BB) {
+            std::vector<BasicBlock *> Successors;
+            if (!BB || !L.contains(BB)) return Successors;
+            if (BB == Parent) {
+                if (L.contains(ChosenSuccessor))
+                    Successors.push_back(ChosenSuccessor);
+                return Successors;
+            }
+            for (BasicBlock *Succ : BB->getSuccessors()) {
+                if (Succ && L.contains(Succ)) Successors.push_back(Succ);
+            }
+            std::reverse(Successors.begin(), Successors.end());
+            return Successors;
+        });
 }
 
 bool LoopUnswitchPass::isActiveSpecializedEdge(BasicBlock *Pred, BasicBlock *Succ,
@@ -750,9 +779,9 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
         for (Instruction *I : *BB) {
             if (!I) return false;
             if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-                for (unsigned Index = 0;
-                     Index < Phi->getNumIncomingValues(); ++Index) {
-                    BasicBlock *Pred = Phi->getIncomingBlock(Index);
+                const bool Legal = TraverseTools::forEachPhiIncoming(
+                    Phi, [&C, BB](unsigned, Value *Incoming,
+                                  BasicBlock *Pred) {
                     bool Active = false;
                     if (BB == C.Shape.Header && Pred == C.Shape.PreHeader) {
                         Active = true;
@@ -760,20 +789,21 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
                         Active = isActiveSpecializedEdge(
                             Pred, BB, C.Parent, C.CloneSucc);
                     }
-                    if (!Active) continue;
-                    auto *Def = dynamic_cast<Instruction *>(
-                        Phi->getIncomingValue(Index));
+                    if (!Active) return true;
+                    auto *Def = dynamic_cast<Instruction *>(Incoming);
                     if (Def && Def->getParent() &&
                         C.L->contains(Def->getParent()) &&
                         !C.CloneReachable.count(Def->getParent())) {
                         return false;
                     }
-                }
+                    return true;
+                    });
+                if (!Legal) return false;
                 continue;
             }
 
-            for (std::size_t Op = 0; Op < I->getNumOperands(); ++Op) {
-                Value *Operand = I->getOperand(Op);
+            const bool Legal = TraverseTools::forEachOperand(
+                I, [&C, BB, I](size_t, Use *, Value *Operand) {
                 if (auto *Target = dynamic_cast<BasicBlock *>(Operand)) {
                     if (C.L->contains(Target) &&
                         !C.CloneReachable.count(Target)) {
@@ -783,7 +813,7 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
                             return false;
                         }
                     }
-                    continue;
+                    return true;
                 }
                 auto *Def = dynamic_cast<Instruction *>(Operand);
                 if (Def && Def->getParent() &&
@@ -791,7 +821,9 @@ bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
                     !C.CloneReachable.count(Def->getParent())) {
                     return false;
                 }
-            }
+                return true;
+                });
+            if (!Legal) return false;
         }
     }
     return true;
@@ -831,23 +863,31 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
 
         for (PhiInst *Phi : Exit->collectPhiNodes()) {
             if (!Phi) return false;
-            for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-                auto *InI = dynamic_cast<Instruction *>(
-                    Phi->getIncomingValue(I));
-                if (InI && InI->getParent() == Exit) return false;
+            if (!TraverseTools::forEachPhiIncoming(
+                    Phi, [Exit](unsigned, Value *Incoming, BasicBlock *) {
+                        auto *InI = dynamic_cast<Instruction *>(Incoming);
+                        return !InI || InI->getParent() != Exit;
+                    })) {
+                return false;
             }
             for (BasicBlock *Pred : C.TrueReachable) {
                 if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
                 unsigned Hits = 0;
-                for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I)
-                    Hits += Phi->getIncomingBlock(I) == Pred;
+                TraverseTools::forEachPhiIncoming(
+                    Phi, [Pred, &Hits](unsigned, Value *,
+                                       BasicBlock *IncomingPred) {
+                        Hits += IncomingPred == Pred;
+                    });
                 if (Hits != 1) return false;
             }
             for (BasicBlock *Pred : C.FalseReachable) {
                 if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
                 unsigned Hits = 0;
-                for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I)
-                    Hits += Phi->getIncomingBlock(I) == Pred;
+                TraverseTools::forEachPhiIncoming(
+                    Phi, [Pred, &Hits](unsigned, Value *,
+                                       BasicBlock *IncomingPred) {
+                        Hits += IncomingPred == Pred;
+                    });
                 if (Hits != 1) return false;
             }
         }
@@ -1125,8 +1165,9 @@ bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
         PhiPrunePlan P;
         P.Original = OldPhi;
         P.Cloned = NewPhi;
-        for (unsigned I = 0; I < OldPhi->getNumIncomingValues(); ++I) {
-            BasicBlock *OldPred = OldPhi->getIncomingBlock(I);
+        const bool Planned = TraverseTools::forEachPhiIncoming(
+            OldPhi, [&Region, &C, ClonedPreHeader, OldBB, &P](
+                        unsigned, Value *OldValue, BasicBlock *OldPred) {
             BasicBlock *NewPred = nullptr;
             bool Active = false;
             if (OldBB == C.Shape.Header &&
@@ -1139,12 +1180,13 @@ bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
                 Active = true;
                 NewPred = Region.getClonedBlock(OldPred);
             }
-            if (!Active) continue;
-            Value *NewValue = mapValue(OldPhi->getIncomingValue(I),
-                                       Region.VMap);
+            if (!Active) return true;
+            Value *NewValue = mapValue(OldValue, Region.VMap);
             if (!NewPred || !NewValue) return false;
             P.Incoming.push_back({NewValue, NewPred});
-        }
+            return true;
+            });
+        if (!Planned) return false;
         Plans.push_back(std::move(P));
     }
 

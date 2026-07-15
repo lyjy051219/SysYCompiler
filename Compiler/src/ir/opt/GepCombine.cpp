@@ -1,6 +1,7 @@
 #include "ir/opt/GepOpt.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <vector>
 #include <unordered_map>
@@ -60,7 +61,7 @@
 bool GepCombinePass::combineChainedGEPs(Function &F) {
     bool changed = false;
 
-    auto geps = F.collectInstructions<GetElementPtrInst>();
+    auto geps = collectInstructions<GetElementPtrInst>(F);
 
     // 延迟删除集合，避免遍历中 delete 导致悬空指针
     std::unordered_set<GetElementPtrInst *> deleted;
@@ -158,12 +159,7 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
     bool changed = false;
 
     for (BasicBlock *BB : F) {
-        std::vector<PhiInst *> phis;
-        for (Instruction *I : *BB) {
-            auto *Phi = dynamic_cast<PhiInst *>(I);
-            if (!Phi) break;
-            phis.push_back(Phi);
-        }
+        auto phis = BB->collectPhiNodes();
 
         for (PhiInst *Phi : phis) {
             if (Phi->getNumIncomingValues() < 2) continue;
@@ -176,10 +172,10 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
             if (!FirstGEP) continue;
 
             // 不折叠自引用（循环回边的 GEP）
-            bool selfRef = false;
-            for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-                if (Phi->getIncomingValue(i) == Phi) { selfRef = true; break; }
-            }
+            bool selfRef = !TraverseTools::forEachPhiIncoming(
+                Phi, [Phi](unsigned, Value *Incoming, BasicBlock *) {
+                    return Incoming != Phi;
+                });
             if (selfRef) continue;
 
             if (FirstGEP->getNumIndices() < 1) continue;
@@ -187,17 +183,18 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
             bool valid = true;
             int diffIdx = -1;
 
-            for (unsigned i = 1; i < Phi->getNumIncomingValues(); i++) {
-                auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
-                if (!OtherGEP) { valid = false; break; }
+            valid = TraverseTools::forEachPhiIncoming(
+                Phi, [&](unsigned I, Value *Incoming, BasicBlock *) {
+                if (I == 0) return true;
+                auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Incoming);
+                if (!OtherGEP) return false;
 
                 if (OtherGEP->getNumIndices() != FirstGEP->getNumIndices()) {
-                    valid = false;
-                    break;
+                    return false;
                 }
 
                 if (OtherGEP->getBasePointer() != FirstGEP->getBasePointer()) {
-                    valid = false; break;
+                    return false;
                 }
 
                 for (size_t j = 0; j < FirstGEP->getNumIndices(); j++) {
@@ -205,13 +202,12 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                         if (diffIdx == -1) {
                             diffIdx = (int)j;
                         } else if (diffIdx != (int)j) {
-                            valid = false;
-                            break;
+                            return false;
                         }
                     }
                 }
-                if (!valid) break;
-            }
+                return true;
+            });
 
             if (!valid) continue;
 
@@ -233,11 +229,13 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                 if (!diffVal->getIRType()) continue;
 
                 PhiInst *newPhi = new PhiInst(diffVal->getIRType());
-                for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-                    auto *G = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
+                TraverseTools::forEachPhiIncoming(
+                    Phi, [&](unsigned, Value *Incoming,
+                             BasicBlock *IncomingBlock) {
+                    auto *G = dynamic_cast<GetElementPtrInst *>(Incoming);
                     newPhi->addIncoming(G->getIndex(static_cast<size_t>(diffIdx)),
-                                        Phi->getIncomingBlock(i));
-                }
+                                        IncomingBlock);
+                });
                 BB->push_front(newPhi);
 
                 std::vector<Value *> newIndices;
@@ -280,8 +278,11 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
             if (GEP->getNumIndices() < 2) continue;
 
             size_t hash = 0;
-            for (size_t i = 0; i + 1 < GEP->getNumOperands(); i++)
-                hash = hash * 131 + std::hash<Value *>{}(GEP->getOperand(i));
+            TraverseTools::forEachOperand(
+                GEP, [&](size_t I, Use *, Value *Operand) {
+                    if (I + 1 < GEP->getNumOperands())
+                        hash = hash * 131 + std::hash<Value *>{}(Operand);
+                });
             hash = hash * 131 + GEP->getNumOperands();
 
             bool inserted = false;
@@ -290,12 +291,11 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
                     auto &grp = groups[gIdx];
                     auto *first = grp.Geps[0];
                     if (first->getNumOperands() != GEP->getNumOperands()) continue;
-                    bool match = true;
-                    for (size_t i = 0; i + 1 < GEP->getNumOperands(); i++) {
-                        if (GEP->getOperand(i) != first->getOperand(i)) {
-                            match = false; break;
-                        }
-                    }
+                    bool match = TraverseTools::forEachOperand(
+                        GEP, [&](size_t I, Use *, Value *Operand) {
+                            return I + 1 >= GEP->getNumOperands() ||
+                                   Operand == first->getOperand(I);
+                        });
                     if (match) {
                         grp.Geps.push_back(GEP);
                         inserted = true;

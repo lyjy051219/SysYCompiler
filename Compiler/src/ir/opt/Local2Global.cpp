@@ -1,10 +1,10 @@
 #include "ir/opt/Local2Global.hpp"
 
 #include "lib/CFG.hpp"
+#include "lib/TraverseTools.hpp"
 #include "lib/TypeSystem.hpp"
 
 #include <memory>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -15,27 +15,15 @@ bool Local2GlobalPass::isRecursiveFrom(
 	Function *F, const FunctionCallGraph &CallGraph) {
 	if (!F) return false;
 
-	std::vector<Function *> WorkList;
-	std::unordered_set<Function *> Visited;
 	auto RootIt = CallGraph.find(F);
 	if (RootIt == CallGraph.end()) return false;
-	for (Function *Callee : RootIt->second) {
-		if (Callee) WorkList.push_back(Callee);
-	}
-
-	while (!WorkList.empty()) {
-		Function *Current = WorkList.back();
-		WorkList.pop_back();
-		if (Current == F) return true;
-		if (!Current || !Visited.insert(Current).second) continue;
-
-		auto It = CallGraph.find(Current);
-		if (It == CallGraph.end()) continue;
-		for (Function *Callee : It->second) {
-			if (Callee) WorkList.push_back(Callee);
-		}
-	}
-	return false;
+	return TraverseTools::isReachableFromRootsCustomSucc<Function>(
+		RootIt->second, F,
+		[&CallGraph](Function *Current) -> std::vector<Function *> {
+			auto It = CallGraph.find(Current);
+			return It == CallGraph.end() ? std::vector<Function *>{}
+			                            : It->second;
+		});
 }
 
 PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
@@ -59,10 +47,7 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
 
-	for (auto IIt = EntryBB->begin(); IIt != EntryBB->end(); ++IIt) {
-		auto *AI = dynamic_cast<AllocaInst *>(*IIt);
-		if (!AI) continue;
-
+	for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
 		auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
 		if (!PtrTy) continue;
 

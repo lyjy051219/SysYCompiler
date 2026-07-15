@@ -4,6 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -26,17 +27,15 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
         std::vector<std::pair<Value *, BasicBlock *>> moved;
         std::vector<std::pair<Value *, BasicBlock *>> kept;
         //遍历当前Phi节点的所有输入边，收集来自Preds的边到moved里，其他边到kept里
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
-            //取出当前边的输入值 inValue 和来源块 inBlock
-            Value *inValue = phi->getIncomingValue(i);
-            BasicBlock *inBlock = phi->getIncomingBlock(i);
+        TraverseTools::forEachPhiIncoming(
+            phi, [&](unsigned, Value *inValue, BasicBlock *inBlock) {
             //判断每个输入边的来源块是否在Preds中，如果在就放到moved里，否则放到kept里
             if (Preds.count(inBlock)) {
                 moved.push_back({inValue, inBlock});
             } else {
                 kept.push_back({inValue, inBlock});
             }
-        }
+        });
 
         if (moved.empty()) continue;
 
@@ -219,13 +218,10 @@ bool LoopSimplifyPass::simplifyHeaderPhis(Loop &L) {
             continue;
         }
 
-        bool allSelf = true;
-        for (unsigned i = 0; i < n; ++i) {
-            if (phi->getIncomingValue(i) != phi) {
-                allSelf = false;
-                break;
-            }
-        }
+        bool allSelf = TraverseTools::forEachPhiIncoming(
+            phi, [phi](unsigned, Value *Incoming, BasicBlock *) {
+                return Incoming == phi;
+            });
         // 情况 3：退化 PHI —— 所有输入边都来自于 PHI 自己（自循环Phi）
         if (allSelf) {
             phi->replaceAllUsesWith(UndefValue::NewUndefValue(phi->getIRType()));

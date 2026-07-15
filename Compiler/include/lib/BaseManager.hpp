@@ -97,7 +97,6 @@ class UseList final{
    UseList(UseList&&) = delete;
    UseList& operator=(const UseList& u) = delete;
    UseList& operator=(UseList&& u) = delete;
-   int getSize() const;
    bool is_empty() const;
 
    //实现迭代器--只能正向进行遍历
@@ -110,8 +109,6 @@ class UseList final{
         bool operator==(const iterator& other) const;
         bool operator!=(const iterator& other) const;
     };
-    iterator begin();
-    iterator end();
     iterator begin() const;
     iterator end() const;
     /*使用示例：
@@ -144,7 +141,6 @@ class Value{
    Value(std::shared_ptr<IRType> irtype,std::string ident);
    virtual bool isConst();
    virtual bool isGlobal();
-   std::shared_ptr<IRType> getIRType();
    std::shared_ptr<IRType> getIRType() const;
    void setIRType(std::shared_ptr<IRType> Type);
    void setIdent(std::string Ident);
@@ -223,14 +219,10 @@ class User : public Value{
    User();
    User(std::shared_ptr<IRType> irtype);
 
-    std::vector<std::unique_ptr<Use>>& getUserList();
     const std::vector<std::unique_ptr<Use>>& getUserList() const;
     size_t getNumOperands() const;
     Value *getOperand(size_t Index) const;
-    // 返回操作数快照，避免各 Pass 直接依赖 userList 的存储细节。
-    std::vector<Value *> getOperands() const;
     Use *getOperandUse(size_t Index) const;
-    bool getOperand(size_t Index, Value *&Out) const;
     bool replaceOperand(size_t Index, Value *V);
     bool eraseOperand(size_t Index);
     void clearOperands();

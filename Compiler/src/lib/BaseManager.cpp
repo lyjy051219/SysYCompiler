@@ -73,10 +73,6 @@ bool UseList::is_empty() const {
     return head == nullptr;
 }
 
-int UseList::getSize() const {
-    return size;
-}
-
 UseList::iterator::iterator(Use *Ptr) : ptr(Ptr) {}
 
 UseList::iterator &UseList::iterator::operator++() {
@@ -94,14 +90,6 @@ bool UseList::iterator::operator==(const iterator &Other) const {
 
 bool UseList::iterator::operator!=(const iterator &Other) const {
     return !(*this == Other);
-}
-
-UseList::iterator UseList::begin() {
-    return iterator(head);
-}
-
-UseList::iterator UseList::end() {
-    return iterator(nullptr);
 }
 
 UseList::iterator UseList::begin() const {
@@ -135,10 +123,6 @@ bool Value::isConst() {
 
 bool Value::isGlobal() {
     return false;
-}
-
-std::shared_ptr<IRType> Value::getIRType() {
-    return irtype;
 }
 
 std::shared_ptr<IRType> Value::getIRType() const {
@@ -185,10 +169,6 @@ User::~User() = default;
 User::User() : Value(VOIDType::NewVoid()) {}
 
 User::User(std::shared_ptr<IRType> Type) : Value(std::move(Type)) {}
-
-std::vector<std::unique_ptr<Use>> &User::getUserList() {
-    return userList;
-}
 
 const std::vector<std::unique_ptr<Use>> &User::getUserList() const {
     return userList;
@@ -327,7 +307,7 @@ int Value::integerBitWidth(int DefaultBits) const {
 }
 
 int Value::countUses() const {
-    return useList.getSize();
+    return useList.size;
 }
 
 int Value::countInstructionUses(Instruction **SingleUser) const {
@@ -354,7 +334,7 @@ int Value::countInstructionUses(Instruction **SingleUser) const {
 
 std::vector<Use *> Value::getUses() const {
     std::vector<Use *> Uses;
-    Uses.reserve(static_cast<std::size_t>(useList.getSize()));
+    Uses.reserve(static_cast<std::size_t>(useList.size));
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
         Use *U = *It;
         if (U && U->getValue() == this) Uses.push_back(U);
@@ -556,22 +536,9 @@ Value *User::getOperand(size_t Index) const {
     return userList[Index]->getValue();
 }
 
-std::vector<Value *> User::getOperands() const {
-    std::vector<Value *> Operands;
-    Operands.reserve(userList.size());
-    for (const auto &OperandUse : userList)
-        Operands.push_back(OperandUse ? OperandUse->getValue() : nullptr);
-    return Operands;
-}
-
 Use *User::getOperandUse(size_t Index) const {
     if (Index >= userList.size() || !userList[Index]) return nullptr;
     return userList[Index].get();
-}
-
-bool User::getOperand(size_t Index, Value *&Out) const {
-    Out = getOperand(Index);
-    return Out != nullptr;
 }
 
 bool User::replaceOperand(size_t Index, Value *V) {

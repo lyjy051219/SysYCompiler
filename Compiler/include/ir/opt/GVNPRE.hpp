@@ -9,7 +9,6 @@
 #include "lib/CFG.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -187,9 +186,6 @@ private:
 	void seedDeadBlocksToLeaderTable();
 	bool runPRE();
 
-	// Domtree DFS helper: visits BB and all domtree children top-down
-	void domTreeDFS(BasicBlock *BB,
-	                std::function<void(BasicBlock *)> Visit);
 };
 
 // GVN + PRE 组合优化

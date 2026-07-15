@@ -5,6 +5,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_set>
 #include <vector>
@@ -21,21 +22,21 @@ Value *LatePhiCleanupPass::safeReplacement(PhiInst *Phi, const DominatorTree &DT
 	bool SawUndef = false;
 	std::unordered_set<BasicBlock *> Preds;
 
-	for (unsigned i = 0; i < N; ++i) {
-		BasicBlock *Pred = Phi->getIncomingBlock(i);
-		Value *V = Phi->getIncomingValue(i);
-		if (Pred) Preds.insert(Pred);
-		if (!V || V == Phi) continue;
-		if (V->isUndef()) {
-			SawUndef = true;
-			continue;
-		}
-		if (!Common) {
-			Common = V;
-			continue;
-		}
-		if (Common != V) return nullptr;
-	}
+	bool Compatible = TraverseTools::forEachPhiIncoming(
+		Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
+			if (Pred) Preds.insert(Pred);
+			if (!V || V == Phi) return true;
+			if (V->isUndef()) {
+				SawUndef = true;
+				return true;
+			}
+			if (!Common) {
+				Common = V;
+				return true;
+			}
+			return Common == V;
+		});
+	if (!Compatible) return nullptr;
 
 	if (!Common) return nullptr;
 

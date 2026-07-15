@@ -6,10 +6,10 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <cmath>
 #include <cstdint>
-#include <queue>
 #include <unordered_set>
 #include <vector>
 
@@ -74,24 +74,21 @@ InstSimplifier::InstSimplifier(
 bool InstSimplifier::run(Function &F) {
 	bool Changed = false;
 
-	std::queue<Instruction *> Q;
-	std::unordered_set<Instruction *> InQ;
+	TraverseTools::UniqueWorkList<Instruction *> Q;
 	std::unordered_set<Instruction *> Erased;
 
 	auto enqueue = [&](Instruction *I) {
 		if (!I) return;
 		if (Erased.count(I)) return;
 		if (!I->getParent()) return;
-		if (InQ.insert(I).second) Q.push(I);
+		Q.push(I);
 	};
 
-	for (Instruction *I : F.collectInstructions<Instruction>())
+	for (Instruction *I : collectInstructions(F))
 		if (I->hasUses()) enqueue(I);
 
 	while (!Q.empty()) {
-		Instruction *I = Q.front();
-		Q.pop();
-		InQ.erase(I);
+		Instruction *I = Q.pop();
 
 		if (!I || Erased.count(I) || !I->getParent()) continue;
 
@@ -1180,21 +1177,20 @@ Value *InstSimplifier::simplifyPhi(PhiInst *Phi) {
 	Value *Common = nullptr;
 	bool HasUndef = false;
 
-	for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-		Value *InV = Phi->getIncomingValue(i);
-		if (!InV || InV == Phi) continue;
-		if (Value::isUndef(InV)) {
-			HasUndef = true;
-			continue;
-		}
-		if (!Common) {
-			Common = InV;
-			continue;
-		}
-		if (Common != InV) {
-			return nullptr;
-		}
-	}
+	bool Compatible = TraverseTools::forEachPhiIncoming(
+		Phi, [&](unsigned, Value *InV, BasicBlock *) {
+			if (!InV || InV == Phi) return true;
+			if (Value::isUndef(InV)) {
+				HasUndef = true;
+				return true;
+			}
+			if (!Common) {
+				Common = InV;
+				return true;
+			}
+			return Common == InV;
+		});
+	if (!Compatible) return nullptr;
 
 	if (!Common) return nullptr;
 

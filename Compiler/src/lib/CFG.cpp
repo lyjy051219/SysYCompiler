@@ -88,18 +88,6 @@ std::vector<std::unique_ptr<Function>>& Module::getFunctions(){
     return functions;
 }
 
-std::vector<Instruction *> Module::getInstructions() {
-    std::vector<Instruction *> Instructions;
-    for (const auto &FunctionPtr : functions) {
-        Function *F = FunctionPtr.get();
-        if (!F) continue;
-        auto FunctionInstructions = F->getInstructions();
-        Instructions.insert(Instructions.end(), FunctionInstructions.begin(),
-                            FunctionInstructions.end());
-    }
-    return Instructions;
-}
-
 void Module::deleteFunction(Function*ptr){
     for(auto it = functions.begin();it != functions.end();it++){
         auto func = (*it).get();
@@ -319,17 +307,6 @@ std::vector<BasicBlock *> Function::getReachableBlocks() {
     if (BB && ReachableSet.count(BB)) Blocks.push_back(BB);
   }
   return Blocks;
-}
-
-std::vector<Instruction *> Function::getInstructions() {
-  std::vector<Instruction *> Instructions;
-  for (BasicBlock *BB : *this) {
-    if (!BB) continue;
-    auto BlockInstructions = BB->getInstructions();
-    Instructions.insert(Instructions.end(), BlockInstructions.begin(),
-                        BlockInstructions.end());
-  }
-  return Instructions;
 }
 
 void Function::dropAllReferences() {
@@ -751,7 +728,7 @@ AllocaInst* BasicBlock::genAllocaInst(std::shared_ptr<IRType> irtype,std::string
 Value* BasicBlock::genLoadInst(Value* v){
     auto inst = new LoadInst(v);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 void BasicBlock::genStoreInst(Value* val,Value* ptr){
@@ -768,7 +745,7 @@ void BasicBlock::genStoreInst(Value* val,Value* ptr){
 Value* BasicBlock::genGepInst(Value* ptr){
     auto inst = new GetElementPtrInst(ptr);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
@@ -795,7 +772,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
 
     inst = new BinaryInst(A, op, B);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
   }
 
     if(a ^ b) {
@@ -818,7 +795,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
         inst = new BinaryInst(A, op, B);
     }
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation op,Value* _B){
@@ -862,31 +839,31 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation
 Value* BasicBlock::genSITOFPInst(Value* x){
     auto inst = new SITOFPInst(x);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 Value* BasicBlock::genFPTOSIInst(Value* x){
     auto inst = new FPTOSIInst(x);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 Value* BasicBlock::genZextInst(Value* x){
     auto inst = new ZextInst(x);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 Value* BasicBlock::genTruncInst(Value* x){
   auto inst = new TruncInst(x);
   push_back(inst);
-  return inst->getOprand();
+  return inst;
 }
 
 Value* BasicBlock::genSextInst(Value* x){
   auto inst = new SextInst(x);
   push_back(inst);
-  return inst->getOprand();
+  return inst;
 }
 
 BasicBlock* BasicBlock::genBlock(){
@@ -955,7 +932,7 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
     }
     auto tmp = new CallInst(BuildInFunction::genBuildInFunction(ident), args);
     push_back(tmp);
-    return tmp->getOprand();
+    return tmp;
   }
 
   if (auto func = dynamic_cast<Function*>(ModuleIR->getSymbolTable().getValueByName(ident))) {
@@ -986,7 +963,7 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
     }
     auto inst = new CallInst(func, args);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
   } else {
     std::cerr << "No Such Function!\n";
     assert(0);
@@ -1042,8 +1019,6 @@ void BasicBlock::clear(){
     for (auto *Inst : *this) assert(!Inst->hasUses());
     ChainList<BasicBlock,Instruction>::clear();
 }
-
-Value* Instruction::getOprand(){return dynamic_cast<Value*>(this);}
 
 Function* Instruction::getUserFunction(Use* U) {
   if (!U) return nullptr;
@@ -1154,7 +1129,6 @@ RetInst::RetInst(Value* retVal){
 }
 RetInst::RetInst(){instType = InstType::RET;}
 RetInst::RetInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::RET;}
-Value* RetInst::getOprand(){return nullptr;}
 Value *RetInst::getReturnValue() const {
   return getNumOperands() == 1 ? getOperand(0) : nullptr;
 }
@@ -1184,10 +1158,6 @@ BrInst::BrInst(BasicBlock* bb):Instruction(VOIDType::NewVoid(),InstType::BR){
     isCond = false;
 }
 BrInst::BrInst(std::shared_ptr<IRType> irtype,bool is_Cond):Instruction(irtype){instType = InstType::BR; isCond = is_Cond;}
-
-Value* BrInst::getOprand(){
-    return nullptr;
-}
 
 bool BrInst::isConditional() const {
   return isCond;
@@ -1283,8 +1253,6 @@ StoreInst::StoreInst(Value* val,Value* ptr){
     ident = "StoreInst";
     instType = InstType::STORE;
 }
-
-Value* getOprand(){return nullptr;}
 
 Value* StoreInst::getValueOperand() const {
     return getOperand(0);
@@ -2258,7 +2226,7 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
 
   auto *inst = new SelectInst(cond, isTrue, isFalse);
   push_back(inst);
-  return inst->getOprand();
+  return inst;
 }
 
 
@@ -2524,10 +2492,6 @@ UndefValue *UndefValue::NewUndefValue(std::shared_ptr<IRType> it) {
   return UV;
 }
 
-Value* StoreInst::getOprand(){
-    return nullptr;
-}
-
 // BitCastInst 实现
 BitCastInst::BitCastInst(Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(targetType) {
@@ -2550,7 +2514,7 @@ void BitCastInst::dumpIR() {
 Value* BasicBlock::genBitCastInst(Value* v, std::shared_ptr<IRType> targetType) {
     auto inst = new BitCastInst(v, targetType);
     push_back(inst);
-    return inst->getOprand();
+    return inst;
 }
 
 PhiInst::PhiInst(std::shared_ptr<IRType> irtype) : Instruction(irtype) {
@@ -2609,14 +2573,6 @@ void PhiInst::dumpIR() {
     }
     std::cout << "\n";
 }
-
-  std::vector<Instruction *> BasicBlock::getInstructions() {
-    std::vector<Instruction *> Instructions;
-    Instructions.reserve(static_cast<std::size_t>(Size()));
-    for (Instruction *I : *this)
-      if (I) Instructions.push_back(I);
-    return Instructions;
-  }
 
   std::vector<PhiInst*> BasicBlock::collectPhiNodes() {
     std::vector<PhiInst*> phis;

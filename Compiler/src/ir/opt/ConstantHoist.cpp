@@ -1,6 +1,7 @@
 #include "ir/opt/ConstantHoist.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -105,34 +106,31 @@ bool ConstantHoistPass::isLiteralSensitiveUse(
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
     Function &F, const LoopInfo &LI) {
     ConstantHoistCollectResult R;
-    for (BasicBlock *BB : F) {
+    TraverseTools::forEachInstruction(
+        F, [&](BasicBlock *BB, Instruction *I) {
         unsigned depth = 0;
         if (Loop *L = LI.getLoopFor(BB)) depth = L->getDepth();
-        for (Instruction *I : *BB) {
-            // PHI 的 incoming 定义点必须在 incoming block 末尾，我们的物化
-            // 指令插在非-PHI 位置无法满足这个规约
-            if (dynamic_cast<PhiInst *>(I)) continue;
-            for (size_t OperandIndex = 0;
-                 OperandIndex < I->getNumOperands(); ++OperandIndex) {
-                Use *u = I->getOperandUse(OperandIndex);
-                if (!u) continue;
-                Value *v = u->getValue();
+        // PHI 的 incoming 定义点必须在 incoming block 末尾，我们的物化
+        // 指令插在非-PHI 位置无法满足这个规约
+        if (dynamic_cast<PhiInst *>(I)) return;
+        TraverseTools::forEachOperand(
+            I, [&](size_t OperandIndex, Use *u, Value *v) {
+                if (!u) return;
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
-                    if (isLiteralSensitiveUse(I, OperandIndex)) continue;
+                    if (isLiteralSensitiveUse(I, OperandIndex)) return;
                     const int32_t val = static_cast<int32_t>(ci->getVal());
                     // 先拓宽再取绝对值，避免 abs(INT_MIN) 的 C++ UB。
                     const int64_t wideVal = static_cast<int64_t>(val);
                     const int64_t magnitude = wideVal < 0 ? -wideVal : wideVal;
-                    if (magnitude < ImmediateThreshold) continue;
+                    if (magnitude < ImmediateThreshold) return;
                     auto &C = R.intBuckets[val];
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
                     if (depth > C.maxDepth) C.maxDepth = depth;
                 }
                 // 严格浮点下不用 fadd wrapper 物化 ConstFloat。
-            }
-        }
-    }
+            });
+    });
     return R;
 }
 
@@ -214,9 +212,11 @@ bool ConstantHoistPass::materializeGroup(
             for (ConstantHoistUseSite *us : useList) userSet.insert(us->inst);
 
             Instruction *earliest = nullptr;
-            for (Instruction *I : *B) {
-                if (userSet.count(I)) { earliest = I; break; }
-            }
+            TraverseTools::forEachInstruction(*B, [&](Instruction *I) {
+                if (!userSet.count(I)) return true;
+                earliest = I;
+                return false;
+            });
             if (!earliest) continue;
 
             auto *matInst = new BinaryInst(

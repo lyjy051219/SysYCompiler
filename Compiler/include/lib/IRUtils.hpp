@@ -1,10 +1,44 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+class BasicBlock;
+class Function;
+class Instruction;
 class IRType;
+class Value;
+
+using ValueToValueMap = std::unordered_map<Value *, Value *>;
+
+struct CloneBlockRegionOptions {
+    std::function<std::string(const BasicBlock *, std::size_t)>
+        MakeBlockIdent;
+    bool ClearTailCallFlags = false;
+};
+
+struct ClonedBlockRegion {
+    ValueToValueMap VMap;
+    std::vector<BasicBlock *> SourceBlocks;
+    std::vector<BasicBlock *> ClonedBlocks;
+    std::vector<std::pair<Instruction *, Instruction *>> InstPairs;
+
+    BasicBlock *getClonedBlock(const BasicBlock *Source) const;
+    Instruction *getClonedInstruction(const Instruction *Source) const;
+};
+
+std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
+    Function &Destination,
+    const std::vector<BasicBlock *> &SourceBlocks,
+    const ValueToValueMap &InitialMap = {},
+    const CloneBlockRegionOptions &Options = {});
 
 class IRMath {
 public:

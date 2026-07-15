@@ -1,4 +1,5 @@
 #include "ir/opt/DeadFunctionElimination.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_set>
 #include <vector>
@@ -74,24 +75,19 @@ PreservationStatus DeadFunctionEliminationPass::run(
 
 		F->collectReachableBlocks(ReachableBlocks);
 
-		for (BasicBlock *BB : *F) {
-			if (!BB || !ReachableBlocks.count(BB)) continue;
+		TraverseTools::forEachInstruction(
+			*F, [&](BasicBlock *BB, Instruction *I) {
+				if (!ReachableBlocks.count(BB)) return;
+				TraverseTools::forEachOperand(
+					I, [&](size_t, Use *, Value *Operand) {
+						auto *Target = dynamic_cast<Function *>(Operand);
+						if (!Target || !InModule.count(Target)) return;
 
-			for (Instruction *I : *BB) {
-				if (!I) continue;
-
-				for (size_t OperandIndex = 0;
-					 OperandIndex < I->getNumOperands(); ++OperandIndex) {
-					auto *Target = dynamic_cast<Function *>(
-						I->getOperand(OperandIndex));
-					if (!Target || !InModule.count(Target)) continue;
-
-					// 直接调用会让 callee 可达；函数值作为普通操作数出现时，
-					// 说明地址在 live 代码里逃逸，也必须保守保留。
-					markLive(Target);
-				}
-			}
-		}
+						// 直接调用会让 callee 可达；函数值作为普通操作数出现时，
+						// 说明地址在 live 代码里逃逸，也必须保守保留。
+						markLive(Target);
+					});
+			});
 	}
 
 	std::unordered_set<Function *> Dead;

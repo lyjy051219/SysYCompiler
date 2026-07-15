@@ -2,6 +2,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_set>
 #include <unordered_map>
@@ -68,19 +69,22 @@ void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
         return;
     }
     if (auto *phi = dynamic_cast<PhiInst*>(ptr)) {
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-            collectReachableBases(phi->getIncomingValue(i),
-                                  bases, visited, escape, depth + 1);
-            if (escape) return;
-        }
+        TraverseTools::forEachPhiIncoming(
+            phi, [&](unsigned, Value *Incoming, BasicBlock *) {
+                collectReachableBases(Incoming, bases, visited,
+                                      escape, depth + 1);
+                return !escape;
+            });
         return;
     }
     if (auto *sel = dynamic_cast<SelectInst*>(ptr)) {
-        for (unsigned i = 1; i < sel->getNumOperands(); i++) {
-            collectReachableBases(sel->getOperand(i),
-                                  bases, visited, escape, depth + 1);
-            if (escape) return;
-        }
+        TraverseTools::forEachOperand(
+            sel, [&](size_t I, Use *, Value *Operand) {
+                if (I == 0) return true;
+                collectReachableBases(Operand, bases, visited,
+                                      escape, depth + 1);
+                return !escape;
+            });
         return;
     }
     // Alloca / Param / Load / Call 返回值等：Alloca 安全（非 global），其他当 escape
@@ -107,14 +111,15 @@ StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
         if (auto *gep = dynamic_cast<GetElementPtrInst*>(cur)) {
             if (gep->getNumOperands() == 0) { R.unresolved = true; return R; }
             // UL[1..] 是索引，累积（全常量才有意义）
-            for (unsigned i = 1; i < gep->getNumOperands(); i++) {
-                Value *vi = gep->getOperand(i);
+            TraverseTools::forEachOperand(
+                gep, [&](size_t I, Use *, Value *vi) {
+                if (I == 0) return;
                 if (auto *ci = dynamic_cast<ConstInt*>(vi)) {
                     idx.push_back((int64_t)ci->getVal());
                 } else {
                     R.hasVarIdx = true;
                 }
-            }
+            });
             cur = gep->getOperand(0);
             depth++;
             continue;
@@ -178,12 +183,11 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         Function *F = funcPtr.get();
         if (!F) continue;
 
-        for (BasicBlock *BB : *F) {
-            for (Instruction *I : *BB) {
+        TraverseTools::forEachInstruction(*F, [&](Instruction *I) {
                 // LoadInst → 读
                 if (auto *LI = dynamic_cast<LoadInst*>(I)) {
                     Value *ptr = LI->getPointerOperand();
-                    if (!ptr) continue;
+                    if (!ptr) return;
 
                     // 先尝试单 base 精确路径
                     StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
@@ -191,7 +195,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         if (auto *v = dynamic_cast<Variable*>(tr.base)) {
                             if (v->isGlobal()) markGlobalRead(v, &tr, reads);
                         }
-                        continue;
+                        return;
                     }
                     // 单 base 失败 → 用 PHI-aware 多 base 收集，任何一个都标 anyIndexRead
                     std::unordered_set<Value*> bases;
@@ -207,13 +211,13 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                                 if (v->isGlobal()) markGlobalRead(v, nullptr, reads);
                         }
                     }
-                    continue;
+                    return;
                 }
 
                 // CallInst → 仅当 callee 会读该 global 的时候才标
                 if (auto *CI = dynamic_cast<CallInst*>(I)) {
                     Value *callee = CI->getCallee();
-                    if (!callee) continue;
+                    if (!callee) return;
 
                     // 内置函数：按 FuncAttr 判定
                     if (auto *BIF = dynamic_cast<BuildInFunction*>(callee)) {
@@ -225,7 +229,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         if (attr == FuncAttr::Untracked) {
                             for (Variable *G : candidates)
                                 reads[G].anyIndexRead = true;
-                            continue;
+                            return;
                         }
                         bool maybeRead =
                             attr == FuncAttr::Sylib ||
@@ -251,7 +255,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                                 }
                             }
                         }
-                        continue;
+                        return;
                     }
 
                     // 用户函数：查 callee 的 SideEffectInfo，只在 RefSet 里才算读
@@ -262,7 +266,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         if (SEI.hasBuiltin) {
                             for (Variable *G : candidates)
                                 reads[G].anyIndexRead = true;
-                            continue;
+                            return;
                         }
                         // 1) 直接读的 global（callee 的 RefSet 里若有 Variable 类型）
                         for (Value *refV : SEI.RefSet) {
@@ -290,15 +294,14 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                                 }
                             }
                         }
-                        continue;
+                        return;
                     }
 
                     // 未知 callee 类型 → 保守
                     for (Variable *G : candidates) reads[G].anyIndexRead = true;
-                    continue;
+                    return;
                 }
-            }
-        }
+        });
     }
 
     // ---------- Pass 2：扫 store，按粒度决定是否删 ----------
@@ -308,7 +311,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         if (!F) continue;
 
         std::vector<StoreInst*> toDelete;
-        for (StoreInst *SI : F->collectInstructions<StoreInst>()) {
+        for (StoreInst *SI : collectInstructions<StoreInst>(*F)) {
             Value *ptr = SI->getPointerOperand();
             if (!ptr) continue;
 
@@ -375,35 +378,32 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             if (!F) continue;
             auto &AA = FAM.getResult<BasicAliasAnalysis>(*F);
             auto &LI = FAM.getResult<LoopAnalysis>(*F);
-            for (BasicBlock *BB : *F) {
-                if (!BB) continue;
-                for (Instruction *I : *BB) {
-                    if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
-                        if (isModSet(getInstModRefInfo(G, SI2, AA, LI, FAM))) {
-                            anyWrite = true;
-                            break;
-                        }
-                    } else if (auto *CI = dynamic_cast<CallInst*>(I)) {
-                        if (isModSet(getInstModRefInfo(G, CI, AA, LI, FAM))) {
-                            anyWrite = true;
-                            break;
-                        }
-                    } else if (auto *LI = dynamic_cast<LoadInst*>(I)) {
-                        Value *ptr = LI->getPointerOperand();
-                        if (!ptr) continue;
-                        StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
-                        if (tr.base == G) {
-                            // 只处理标量 load：GEP 路径必须是 {0}（即直接取值）
-                            if (!tr.hasVarIdx && !tr.unresolved &&
-                                tr.constPath.size() == 1 && tr.constPath[0] == 0)
-                                loads.push_back(LI);
-                            else if (tr.constPath.empty())
-                                loads.push_back(LI);  // 直接 load Variable 无 GEP
-                        }
+            TraverseTools::forEachInstruction(*F, [&](Instruction *I) {
+                if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
+                    if (isModSet(getInstModRefInfo(G, SI2, AA, LI, FAM))) {
+                        anyWrite = true;
+                        return false;
+                    }
+                } else if (auto *CI = dynamic_cast<CallInst*>(I)) {
+                    if (isModSet(getInstModRefInfo(G, CI, AA, LI, FAM))) {
+                        anyWrite = true;
+                        return false;
+                    }
+                } else if (auto *LI = dynamic_cast<LoadInst*>(I)) {
+                    Value *ptr = LI->getPointerOperand();
+                    if (!ptr) return true;
+                    StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
+                    if (tr.base == G) {
+                        // 只处理标量 load：GEP 路径必须是 {0}（即直接取值）
+                        if (!tr.hasVarIdx && !tr.unresolved &&
+                            tr.constPath.size() == 1 && tr.constPath[0] == 0)
+                            loads.push_back(LI);
+                        else if (tr.constPath.empty())
+                            loads.push_back(LI);  // 直接 load Variable 无 GEP
                     }
                 }
-                if (anyWrite) break;
-            }
+                return true;
+            });
             if (anyWrite) break;
         }
         if (anyWrite || loads.empty()) continue;

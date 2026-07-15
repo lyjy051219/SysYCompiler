@@ -5,11 +5,11 @@
 #include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <stack>
 
 // 查询结果的构造统一放在实现文件，头文件只暴露语义明确的工厂接口。
 LoadElimQueryResult LoadElimQueryResult::known(Value *V) {
@@ -308,9 +308,8 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     }
 
     // 环检测：当前递归栈上的块
-    if (onStack.count(BB)) {
-        return LoadElimQueryResult::unknown();
-    }
+    TraverseTools::ScopedActiveMark ActiveMark(onStack, BB);
+    if (!ActiveMark.inserted()) return LoadElimQueryResult::unknown();
 
     // 缓存命中
     auto memoIt = memo.find(BB);
@@ -318,13 +317,10 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
         return memoIt->second;
     }
 
-    onStack.insert(BB);
-
     // 块内扫描（扫全块，从末尾开始）
     LoadElimQueryResult result = scanBlockBackward(BB, P, nullptr, targetLoad, AA, LI, FAM);
 
     if (result.kind == LoadElimQueryResult::KNOWN || result.kind == LoadElimQueryResult::CLOBBERED) {
-        onStack.erase(BB);
         memo[BB] = result;
         return result;
     }
@@ -333,7 +329,6 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     auto preds = BB->getPredecessors();
     if (preds.empty()) {
         // 函数入口，P 的初始值未知
-        onStack.erase(BB);
         memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
@@ -348,7 +343,6 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
 
         if (predResult.kind == LoadElimQueryResult::CLOBBERED ||
             predResult.kind == LoadElimQueryResult::UNKNOWN) {
-            onStack.erase(BB);
             memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
@@ -362,14 +356,12 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
             }
         } else if (predResult.kind == LoadElimQueryResult::PHI_NEEDED) {
             // 前驱本身需要 PHI → 第一版不处理嵌套 PHI
-            onStack.erase(BB);
             memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
     }
 
     if ((int)predValues.size() != (int)preds.size()) {
-        onStack.erase(BB);
         memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
@@ -381,7 +373,6 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
         finalResult = LoadElimQueryResult::phiNeeded(std::move(predValues));
     }
 
-    onStack.erase(BB);
     memo[BB] = finalResult;
     return finalResult;
 }
@@ -482,18 +473,23 @@ bool LoadEliminationPass::processFunction(
     bool changed = false;
     int DominatingQueryBudget = MaxDominatingQueriesPerFunction;
 
-    // DFS 前序遍历支配树
-    std::stack<DominatorNode*> dtStack;
-    if (DT.Root) dtStack.push(DT.Root);
+    std::vector<DominatorNode *> Roots;
+    if (DT.Root) Roots.push_back(DT.Root);
+    auto DomOrder =
+        TraverseTools::buildPreOrderFromRootsCustomSucc<DominatorNode>(
+            Roots, [&DT](DominatorNode *Node) {
+                if (!Node || !Node->Block)
+                    return std::vector<DominatorNode *>{};
+                return DT.getChildNodes(Node);
+            });
 
-    while (!dtStack.empty()) {
-        DominatorNode *node = dtStack.top();
-        dtStack.pop();
+    for (DominatorNode *node : DomOrder) {
+        if (!node) continue;
         BasicBlock *BB = node->Block;
         if (!BB) continue;
 
         // 收集本块所有 load（先收集再处理，避免遍历时删指令）
-        auto loads = BB->collectInstructions<LoadInst>();
+        auto loads = collectInstructions<LoadInst>(*BB);
 
         for (LoadInst *LI2 : loads) {
             // 检查 load 是否还活着（可能被前一轮 processLoad 间接影响）
@@ -502,11 +498,6 @@ bool LoadEliminationPass::processFunction(
                                    DominatingQueryBudget);
         }
 
-        // 推入子节点（逆序推入保持前序遍历顺序）
-        std::vector<DominatorNode*> children = DT.getChildNodes(node);
-        for (auto it = children.rbegin(); it != children.rend(); ++it) {
-            dtStack.push(*it);
-        }
     }
 
     return changed;
@@ -531,7 +522,7 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     constexpr std::size_t MaxMSSAWalk = 256;
     std::vector<std::pair<LoadInst *, Value *>> MSSAReplacements;
     std::size_t QueryCount = 0;
-    for (LoadInst *Load : F.collectInstructions<LoadInst>()) {
+    for (LoadInst *Load : collectInstructions<LoadInst>(F)) {
             if (QueryCount++ >= MaxMSSAQueries) break;
             BasicBlock *BB = Load->getParent();
             if (!BB) continue;
@@ -574,10 +565,9 @@ PreservationStatus LoadEliminationPass::run(Function &F,
         auto *AsLoad = dynamic_cast<LoadInst *>(V);
         auto It = AsLoad ? Planned.find(AsLoad) : Planned.end();
         if (It == Planned.end()) return V;
-        if (!Active.insert(AsLoad).second) return nullptr;
-        Value *Resolved = ResolveReplacement(It->second, Active);
-        Active.erase(AsLoad);
-        return Resolved;
+        TraverseTools::ScopedActiveMark ActiveMark(Active, AsLoad);
+        if (!ActiveMark.inserted()) return nullptr;
+        return ResolveReplacement(It->second, Active);
     };
 
     std::vector<std::pair<LoadInst *, Value *>> ResolvedReplacements;

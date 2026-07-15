@@ -1,4 +1,5 @@
 #include "ir/opt/DAE.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 
@@ -122,7 +123,8 @@ bool DAEPass::isParamLive(
 		if (It->second == ParamLiveness::InProgress) return false;
 	}
 
-	if (!Visiting.insert(Param).second) {
+	TraverseTools::ScopedActiveMark VisitingMark(Visiting, Param);
+	if (!VisitingMark.inserted()) {
 		Memo[Param] = ParamLiveness::Dead;
 		return false;
 	}
@@ -176,7 +178,6 @@ bool DAEPass::isParamLive(
 		}
 	}
 
-	Visiting.erase(Param);
 	Memo[Param] = Live ? ParamLiveness::Live : ParamLiveness::Dead;
 	return Live;
 }

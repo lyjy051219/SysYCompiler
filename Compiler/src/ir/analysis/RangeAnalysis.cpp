@@ -1,6 +1,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/SCEV.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <queue>
 #include <algorithm>
@@ -1167,19 +1168,18 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     auto phiTy = Phi->getIRType();
     if (phiTy && phiTy->getEnum() == IR_FLOAT) {
         FloatRange fresult = FloatRange::bottom();
-        for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-            BasicBlock *pred = Phi->getIncomingBlock(i);
-            BasicBlock *phiBB = Phi->getParent();
-            if (!FeasibleEdges.count({pred, phiBB})) continue;
-
-            Value *inVal = Phi->getIncomingValue(i);
+        BasicBlock *phiBB = Phi->getParent();
+        TraverseTools::forEachPhiIncoming(
+            Phi, [this, phiBB, &fresult](unsigned, Value *inVal,
+                                         BasicBlock *pred) {
+            if (!FeasibleEdges.count({pred, phiBB})) return;
             FloatRange inRange;
             if (auto *CF = dynamic_cast<ConstFloat *>(inVal))
                 inRange = FloatRange((double)CF->getVal());
             else
                 inRange = FloatValueRanges[inVal];
             fresult = fresult.unionWith(inRange);
-        }
+            });
         // 浮点 PHI 范围更新（统一走 updateFloatRange）
         updateFloatRange(Phi, fresult);
         return;
@@ -1202,12 +1202,11 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     IntRange result = IntRange::bottom();
     KnownBits kbResult;
     bool firstKB = true;
-    for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
-        BasicBlock *pred = Phi->getIncomingBlock(i);
-        BasicBlock *phiBB = Phi->getParent();
-        if (!FeasibleEdges.count({pred, phiBB})) continue;
-
-        Value *inVal = Phi->getIncomingValue(i);
+    BasicBlock *phiBB = Phi->getParent();
+    TraverseTools::forEachPhiIncoming(
+        Phi, [this, phiBB, &result, &kbResult, &firstKB](
+                 unsigned, Value *inVal, BasicBlock *pred) {
+        if (!FeasibleEdges.count({pred, phiBB})) return;
         IntRange inRange;
         KnownBits inKB;
         if (auto *CI = dynamic_cast<ConstInt *>(inVal)) {
@@ -1221,7 +1220,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
         result = result.unionWith(inRange);
         kbResult = firstKB ? inKB : kbResult.unionWith(inKB);
         firstKB = false;
-    }
+        });
     updateBits(Phi, kbResult);
     result = tightenWithBits(Phi, result);
     updateRange(Phi, result);

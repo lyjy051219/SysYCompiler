@@ -3,7 +3,8 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
-#include "lib/CFGClone.hpp"
+#include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
@@ -19,27 +20,23 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	P.HasBody = (Callee->front() != nullptr);
 	if (!P.HasBody) return P;
 
-	for (auto* BB : *Callee) {
-		if (!BB) continue;
-		for (auto* I : *BB) {
-			if (!I) continue;
-			++P.TotalInstCount;
+	TraverseTools::forEachInstruction(*Callee, [&](Instruction *I) {
+		++P.TotalInstCount;
 
-			auto *CI = dynamic_cast<CallInst *>(I);
-			if (!CI) continue;
-			Function *CF = CI->getDirectCallee();
-			if (!CF) {
-				P.HasOtherCalls = true;
-				continue;
-			}
-
-			if (CF == Callee) {
-				++P.SelfRecursiveCallSites;
-			} else {
-				P.HasOtherCalls = true;
-			}
+		auto *CI = dynamic_cast<CallInst *>(I);
+		if (!CI) return;
+		Function *CF = CI->getDirectCallee();
+		if (!CF) {
+			P.HasOtherCalls = true;
+			return;
 		}
-	}
+
+		if (CF == Callee) {
+			++P.SelfRecursiveCallSites;
+		} else {
+			P.HasOtherCalls = true;
+		}
+	});
 
 	const SideEffectInfo& SEI = FAM.getResult<SideEffectAnalysis>(*Callee);
 	// 要求 STORE/LOAD 的基地址只能是局部变量，等价于“对外部内存无 Mod/Ref”。
@@ -100,19 +97,12 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 	std::unordered_map<Function*, int> FreqCallee;
 	std::vector<CallInst*> OriginalCallSites;
 
-	for (auto* BB : F) {
-		if (!BB) continue;
-		for (auto* I : *BB) {
-			if (!I || I->instType != Instruction::CALL) continue;
-			auto* CI = dynamic_cast<CallInst*>(I);
-			if (!CI) continue;
+	for (CallInst *CI : collectInstructions<CallInst>(F)) {
+		auto* Callee = CI->getDirectCallee();
+		if (!Callee) continue;
 
-			auto* Callee = CI->getDirectCallee();
-			if (!Callee) continue;
-
-			FreqCallee[Callee]++;
-			OriginalCallSites.push_back(CI);
-		}
+		FreqCallee[Callee]++;
+		OriginalCallSites.push_back(CI);
 	}
 
 	for (CallInst* CI : OriginalCallSites) {
@@ -130,10 +120,10 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 
 		ValueToValueMap InitialMap;
 		std::vector<RetInst*> ClonedRets;
-		std::vector<BasicBlock*> CalleeOrigBlocks;
-		for (auto* OldBB : *Callee) {
-			if (OldBB) CalleeOrigBlocks.push_back(OldBB);
-		}
+		auto CalleeOrigBlocks = TraverseTools::snapshotPointers(*Callee);
+		CalleeOrigBlocks.erase(
+			std::remove(CalleeOrigBlocks.begin(), CalleeOrigBlocks.end(), nullptr),
+			CalleeOrigBlocks.end());
 
 		for (unsigned i = 0; i < Callee->getParamCount(); ++i) {
 			Value* Param = Callee->getParam(i);
@@ -164,7 +154,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 
 		// 将 clone 入口块里的 alloca 移到 Caller 入口块最前面。
 		if (BasicBlock* CallerEntry = F.front()) {
-			auto MoveAllocas = ClonedEntry->collectInstructions<AllocaInst>();
+			auto MoveAllocas = collectInstructions<AllocaInst>(*ClonedEntry);
 
 			for (AllocaInst* AI : MoveAllocas) {
 				AI->EraseFromParent();

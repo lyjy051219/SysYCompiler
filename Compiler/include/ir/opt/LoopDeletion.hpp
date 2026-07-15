@@ -22,7 +22,6 @@ private:
 	using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;
 
 	// 删除 CFG 前先收集并验证全部替换计划，保证失败时 IR 不变。
-	static std::vector<BasicBlock *> collectLoopBlocks(Loop *L, Function *F);
 	static bool isSafeToSkipOnZeroTrip(Instruction *I);
 	static bool hasNoObservableLoopInstruction(Loop *L);
 	static bool isProvablyFiniteStrictUnitStepLoop(

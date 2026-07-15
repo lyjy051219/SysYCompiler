@@ -4,7 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-#include <queue>
+#include "lib/TraverseTools.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,6 +30,8 @@ private:
 	};
 
 	using ExitPhiMap = std::unordered_map<BasicBlock *, PhiInst *>;
+	using InstructionWorkList =
+		TraverseTools::UniqueWorkList<Instruction *>;
 
 	static bool replaceUseWithValue(Use *U, Value *V);
     Value *getValueForBlock(BasicBlock *BB,
@@ -37,8 +39,7 @@ private:
                             const Loop &L,
                             const DominatorTree &DT,
                             std::unordered_map<BasicBlock *, Value *> &MapValue,
-                            std::queue<Instruction *> &WorkList,
-                            std::unordered_set<Instruction *> &InWorkList,
+							InstructionWorkList &WorkList,
                             bool &Changed);
 
 	bool runLCSSA(Instruction *I,
@@ -46,6 +47,5 @@ private:
 							const LoopInfo &LI,
 							const DominatorTree &DT,
 							const std::unordered_set<BasicBlock *> &Reachable,
-							std::queue<Instruction *> &WorkList,
-							std::unordered_set<Instruction *> &InWorkList);
+							InstructionWorkList &WorkList);
 };

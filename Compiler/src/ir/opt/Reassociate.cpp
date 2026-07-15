@@ -79,7 +79,7 @@ bool ReassociateEngine::run() {
 		auto RPO = TraverseTools::buildRPO<BasicBlock>(Roots, F);
 		for (BasicBlock *BB : RPO) {
 			if (!BB) continue;
-			auto Insts = BB->getInstructions();
+			auto Insts = collectInstructions(*BB);
 			for (Instruction *I : Insts) {
 				if (!I || !I->getParent()) continue;
 				if (ReassociatePass::isDeadInstruction(I, FAM)) {
@@ -103,7 +103,6 @@ void ReassociateEngine::initRankMap() {
 	BlockBase.clear();
 	BlockSeq.clear();
 	Todo.clear();
-	InTodo.clear();
 
 	uint32_t Rank = 2;
 	for (auto &P : F.getParams()) {
@@ -121,8 +120,7 @@ void ReassociateEngine::initRankMap() {
 		uint32_t Base = (++Rank) << 16;
 		BlockBase[BB] = Base;
 		uint32_t Seq = 0;
-		for (auto *I : *BB) {
-			if (!I) continue;
+		TraverseTools::forEachInstruction(*BB, [&](Instruction *I) {
 			StableOrder[I] = ++NextStableOrder;
 
 			bool ShouldSkip = false;
@@ -132,9 +130,9 @@ void ReassociateEngine::initRankMap() {
 					BinaryInst::isReassociateOp(Op);
 			}
 
-			if (ShouldSkip) continue;
+			if (ShouldSkip) return;
 			Ranks[I] = Base + (++Seq);
-		}
+		});
 		BlockSeq[BB] = Seq;
 	}
 }
@@ -204,16 +202,14 @@ void ReassociateEngine::stampRank(Instruction *I) {
 
 void ReassociateEngine::pushTodo(Instruction *I) {
 	if (!I || !I->getParent()) return;
-	if (InTodo.insert(I).second) Todo.push_back(I);
+	Todo.push(I);
 }
 
 
 bool ReassociateEngine::processTodo() {
 	bool Changed = false;
 	while (!Todo.empty()) {
-		Instruction *I = Todo.back();
-		Todo.pop_back();
-		InTodo.erase(I);
+		Instruction *I = Todo.pop();
 		if (!I || !I->getParent()) continue;
 		if (ReassociatePass::isDeadInstruction(I, FAM)) continue;
 		Changed |= optimizeInst(I);

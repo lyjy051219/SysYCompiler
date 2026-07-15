@@ -2,10 +2,10 @@
 
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <cstdint>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,8 +42,8 @@ private:
 	uint64_t NextStableOrder = 0;
 	std::unordered_map<BasicBlock *, uint32_t> BlockBase;
 	std::unordered_map<BasicBlock *, uint32_t> BlockSeq;
-	std::vector<Instruction *> Todo;
-	std::unordered_set<Instruction *> InTodo;
+	TraverseTools::UniqueWorkList<
+		Instruction *, TraverseTools::WorkListOrder::LIFO> Todo;
 
 	void initRankMap();
 	uint32_t getRank(Value *V) const;

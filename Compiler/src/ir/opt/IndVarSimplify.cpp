@@ -6,6 +6,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -51,18 +52,16 @@ bool IndVarSimplifyPass::haveExactRecurrenceShape(
         return false;
 
     std::unordered_set<BasicBlock *> Seen;
-    for (unsigned I = 0; I < A->getNumIncomingValues(); ++I) {
-        BasicBlock *Pred = A->getIncomingBlock(I);
-        if (!Pred || !Seen.insert(Pred).second) return false;
-        Value *AV = A->getIncomingValue(I);
-        Value *BV = B->getIncomingFromPred(Pred);
-        if (!AV || !BV) return false;
+    if (!TraverseTools::forEachPhiIncoming(
+            A, [&](unsigned, Value *AV, BasicBlock *Pred) {
+                if (!Pred || !Seen.insert(Pred).second) return false;
+                Value *BV = B->getIncomingFromPred(Pred);
+                if (!AV || !BV) return false;
 
-        if (!L->contains(Pred)) {
-            if (AV != BV) return false;
-            continue;
-        }
-        if (!haveExactUpdateShape(AV, BV, A, B)) return false;
+                if (!L->contains(Pred)) return AV == BV;
+                return haveExactUpdateShape(AV, BV, A, B);
+            })) {
+        return false;
     }
     return Seen.size() == B->getNumIncomingValues();
 }

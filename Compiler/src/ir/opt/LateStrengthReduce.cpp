@@ -7,6 +7,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <cstdint>
 #include <unordered_set>
@@ -50,11 +51,11 @@ bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
     int32_t C = 0;
     if (V->tryGetIntConst(C)) return C >= 0;
 
-    if (Depth <= 0 || Visiting.count(V)) return false;
-    Visiting.insert(V);
+    if (Depth <= 0) return false;
+    TraverseTools::ScopedActiveMark VisitingMark(Visiting, V);
+    if (!VisitingMark.inserted()) return false;
 
     if (dynamic_cast<ZextInst *>(V)) {
-        Visiting.erase(V);
         return true;
     }
 
@@ -66,7 +67,6 @@ bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
             Result = isGuaranteedNonNegativeImpl(TV, Depth - 1, Visiting) &&
                      isGuaranteedNonNegativeImpl(FV, Depth - 1, Visiting);
         }
-        Visiting.erase(V);
         return Result;
     }
 
@@ -75,7 +75,6 @@ bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
         Value *LHS = nullptr;
         Value *RHS = nullptr;
         if (!BI->getOperands(LHS, RHS)) {
-            Visiting.erase(V);
             return false;
         }
 
@@ -112,11 +111,9 @@ bool LateStrengthReducePass::isGuaranteedNonNegativeImpl(
             default:
                 break;
         }
-        Visiting.erase(V);
         return Result;
     }
 
-    Visiting.erase(V);
     return false;
 }
 

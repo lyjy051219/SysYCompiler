@@ -6,6 +6,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <cstring>
 #include <limits>
@@ -131,20 +132,20 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     if (Allowed.count(nullptr)) Allowed.erase(nullptr);
 
     unsigned ConditionalBranches = 0;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+    auto LoopBlocks = L->getBlocksIncludingSubLoops();
+    for (BasicBlock *BB : LoopBlocks)
         if (!BB) return false;
-        for (Instruction *I : *BB) {
-            if (!I) return false;
-            if (auto *Br = dynamic_cast<BrInst *>(I)) {
-                if (Br->isConditional()) {
-                    ++ConditionalBranches;
-                    if (Br->getCondition() != TCI.ExitCmp) return false;
-                }
-                continue;
+    if (!TraverseTools::forEachInstructionInBlocks(
+            LoopBlocks, [&](Instruction *I) {
+        if (auto *Br = dynamic_cast<BrInst *>(I)) {
+            if (Br->isConditional()) {
+                ++ConditionalBranches;
+                if (Br->getCondition() != TCI.ExitCmp) return false;
             }
-            if (!Allowed.count(I)) return false;
+            return true;
         }
-    }
+        return Allowed.count(I) != 0;
+    })) return false;
     if (ConditionalBranches != 1) return false;
 
     // No value computed by the loop may be observed after it.  The memory
@@ -233,18 +234,19 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
     }
 
     std::vector<LoadInst *> Loads;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        for (Instruction *I : *BB) {
-            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
-                if (Match.Store) return false;
-                Match.Store = Store;
-            } else if (auto *Load = dynamic_cast<LoadInst *>(I)) {
-                Loads.push_back(Load);
-            } else if (dynamic_cast<CallInst *>(I)) {
-                return false;
-            }
+    auto LoopBlocks = L->getBlocksIncludingSubLoops();
+    if (!TraverseTools::forEachInstructionInBlocks(
+            LoopBlocks, [&](Instruction *I) {
+        if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+            if (Match.Store) return false;
+            Match.Store = Store;
+        } else if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+            Loads.push_back(Load);
+        } else if (dynamic_cast<CallInst *>(I)) {
+            return false;
         }
-    }
+        return true;
+    })) return false;
     if (!Match.Store || Loads.size() != 1 ||
         Match.Store->getValueOperand() != Loads.front())
         return false;
@@ -529,18 +531,19 @@ bool LoopIdiomRecognizePass::transformLoop(
 
     StoreInst *Store = nullptr;
     std::vector<LoadInst *> Loads;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        for (Instruction *I : *BB) {
-            if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-                if (Store) return false;
-                Store = SI;
-            } else if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-                Loads.push_back(LI);
-            } else if (dynamic_cast<CallInst *>(I)) {
-                return false;
-            }
+    auto LoopBlocks = L->getBlocksIncludingSubLoops();
+    if (!TraverseTools::forEachInstructionInBlocks(
+            LoopBlocks, [&](Instruction *I) {
+        if (auto *SI = dynamic_cast<StoreInst *>(I)) {
+            if (Store) return false;
+            Store = SI;
+        } else if (auto *LI = dynamic_cast<LoadInst *>(I)) {
+            Loads.push_back(LI);
+        } else if (dynamic_cast<CallInst *>(I)) {
+            return false;
         }
-    }
+        return true;
+    })) return false;
     if (!Store) return false;
 
     auto *DestGEP = dynamic_cast<GetElementPtrInst *>(

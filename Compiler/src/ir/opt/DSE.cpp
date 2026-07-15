@@ -114,7 +114,7 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
         return false;
     }
 
-    auto instructions = BB->getInstructions();
+    auto instructions = collectInstructions(*BB);
 
     bool changed = false;
     std::unordered_map<Value *, StoreInst *> pendingStores;
@@ -387,7 +387,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
-    for (StoreInst *SI : F.collectInstructions<StoreInst>()) {
+    for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
         if (queriedStores >= MaxMemorySSAStoreQueries) break;
         ++queriedStores;
         if (MSSA.isStoreValueRedundant(
@@ -409,7 +409,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 
     // === Phase 2: 全局 DSE — Forward Kill Coverage ===
     // Phase 1 之后再收集存活 store，避免对已删指令的悬空指针
-    auto allStores = F.collectInstructions<StoreInst>();
+    auto allStores = collectInstructions<StoreInst>(F);
 
     // 先收集，再统一删除
     std::vector<StoreInst *> toDelete;

@@ -3,8 +3,6 @@
 #include "lib/TraverseTools.hpp"
 
 #include <algorithm>
-#include <functional>
-#include <queue>
 #include <tuple>
 #include <utility>
 
@@ -91,24 +89,25 @@ bool PhiCongruenceMatcher::equivalentPhis(
     // unambiguously, so leave those uncommon forms alone.
     std::unordered_set<BasicBlock *> SeenA;
     std::unordered_set<BasicBlock *> SeenB;
-    for (unsigned I = 0; I < A->getNumIncomingValues(); ++I) {
-        BasicBlock *Pred = A->getIncomingBlock(I);
+    bool Equal = TraverseTools::forEachPhiIncoming(
+        A, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
         if (!Pred || !SeenA.insert(Pred).second) return false;
 
         Value *OtherIncoming = nullptr;
         unsigned Matches = 0;
-        for (unsigned J = 0; J < B->getNumIncomingValues(); ++J) {
-            if (B->getIncomingBlock(J) != Pred) continue;
-            OtherIncoming = B->getIncomingValue(J);
-            ++Matches;
-        }
+        TraverseTools::forEachPhiIncoming(
+            B, [&](unsigned, Value *Candidate, BasicBlock *CandidatePred) {
+                if (CandidatePred != Pred) return;
+                OtherIncoming = Candidate;
+                ++Matches;
+            });
         if (Matches != 1 || !SeenB.insert(Pred).second ||
-            !equivalentImpl(A->getIncomingValue(I), OtherIncoming,
-                            Depth + 1)) {
+            !equivalentImpl(Incoming, OtherIncoming, Depth + 1)) {
             return false;
         }
-    }
-    return SeenA.size() == SeenB.size();
+        return true;
+    });
+    return Equal && SeenA.size() == SeenB.size();
 }
 
 bool PhiCongruenceMatcher::equivalentImpl(
@@ -153,14 +152,11 @@ bool PhiCongruenceMatcher::equivalentImpl(
                 equivalentImpl(AL, BL, Depth + 1) &&
                 equivalentImpl(AR, BR, Depth + 1);
     } else if (IA->getNumOperands() == IB->getNumOperands()) {
-        Equal = true;
-        for (size_t I = 0; I < IA->getNumOperands(); ++I) {
-            if (!equivalentImpl(IA->getOperand(I), IB->getOperand(I),
-                                Depth + 1)) {
-                Equal = false;
-                break;
-            }
-        }
+        Equal = TraverseTools::forEachOperand(
+            IA, [&](size_t Index, Use *, Value *Operand) {
+                return equivalentImpl(
+                    Operand, IB->getOperand(Index), Depth + 1);
+            });
     }
 
     States[Pair] = Equal ? State::Equal : State::Different;
@@ -262,9 +258,9 @@ void GVNPRESolver::rebuildRPOAndReachability() {
     BasicBlock *Entry = F.front();
     if (!Entry) return;
 
-    F.collectReachableBlocks(ReachableBlocks);
     std::vector<BasicBlock *> Roots{Entry};
     RPO = TraverseTools::buildRPOFromRoots<BasicBlock>(Roots);
+    ReachableBlocks.insert(RPO.begin(), RPO.end());
 }
 
 void GVNPRESolver::buildTablesForPRE() {
@@ -292,22 +288,23 @@ void GVNPRESolver::buildAvailOut() {
     BasicBlock *Entry = F.front();
     if (!Entry) return;
 
-    // Collect domtree pre-order (entry first, then children)
-    // Use iterative DFS on domtree
-    std::vector<BasicBlock *> DomOrder;
-    {
-        std::vector<BasicBlock *> Stack{Entry};
-        while (!Stack.empty()) {
-            BasicBlock *BB = Stack.back();
-            Stack.pop_back();
-            if (!BB || isDeadBlock(BB)) continue;
-            DomOrder.push_back(BB);
-
-            for (BasicBlock *Child : DT.getChildren(BB)) {
-                if (Child && !isDeadBlock(Child)) Stack.push_back(Child);
-            }
-        }
-    }
+    // The old stack pushed children in their natural order, so LIFO visited
+    // siblings in reverse order.  Reverse the custom successor list to retain
+    // that exact order while pruning a dead child's entire dominator subtree.
+    std::vector<BasicBlock *> Roots;
+    if (!isDeadBlock(Entry)) Roots.push_back(Entry);
+    auto DomOrder =
+        TraverseTools::buildPreOrderFromRootsCustomSucc<BasicBlock>(
+            Roots, [this](BasicBlock *BB) {
+                std::vector<BasicBlock *> Children;
+                if (!BB || isDeadBlock(BB)) return Children;
+                for (BasicBlock *Child : DT.getChildren(BB)) {
+                    if (Child && !isDeadBlock(Child))
+                        Children.push_back(Child);
+                }
+                std::reverse(Children.begin(), Children.end());
+                return Children;
+            });
 
     for (BasicBlock *BB : DomOrder) {
         auto &Avail = AvailOut[BB];
@@ -496,12 +493,11 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
     if (!I) return false;
 
     auto appendOperands = [&](Instruction *Inst, std::vector<int> &Args) {
-        for (size_t OperandIndex = 0;
-             OperandIndex < Inst->getNumOperands(); ++OperandIndex) {
+        TraverseTools::forEachOperand(
+            Inst, [&](size_t, Use *, Value *Operand) {
             bool Fresh = false;
-            Args.push_back(getOrAssignValueNum(
-                Inst->getOperand(OperandIndex), Fresh));
-        }
+            Args.push_back(getOrAssignValueNum(Operand, Fresh));
+        });
     };
 
     K.Args.clear();
@@ -647,30 +643,20 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
 bool GVNPRESolver::identicalCall(CallInst *A, CallInst *B) {
     if (!A || !B) return false;
     if (A->getNumOperands() != B->getNumOperands()) return false;
-    for (size_t i = 0; i < A->getNumOperands(); ++i) {
-        if (!A->getOperand(i) || !B->getOperand(i)) return false;
-        if (A->getOperand(i) != B->getOperand(i)) return false;
-    }
-    return true;
+    return TraverseTools::forEachOperand(
+        A, [&](size_t Index, Use *, Value *Operand) {
+            Value *OtherOperand = B->getOperand(Index);
+            return Operand && OtherOperand && Operand == OtherOperand;
+        });
 }
 
 void GVNPRESolver::markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc) {
     if (!BrBB || !DeadSucc || DeadSucc == BrBB) return;
 
-    std::unordered_set<BasicBlock *> Candidate;
-    std::queue<BasicBlock *> Q;
-    Q.push(DeadSucc);
-    Candidate.insert(DeadSucc);
-
-    while (!Q.empty()) {
-        BasicBlock *Cur = Q.front();
-        Q.pop();
-        for (BasicBlock *Succ : Cur->getSuccessors()) {
-            if (!Succ || Candidate.count(Succ)) continue;
-            Candidate.insert(Succ);
-            Q.push(Succ);
-        }
-    }
+    std::vector<BasicBlock *> Roots{DeadSucc};
+    std::unordered_set<BasicBlock *> Candidate =
+        TraverseTools::collectReachableFromRoots<
+            BasicBlock, TraverseTools::WorkListOrder::FIFO>(Roots);
 
     std::vector<BasicBlock *> ToErase;
     bool Changed = true;
@@ -921,7 +907,7 @@ bool GVNPRESolver::runGVN() {
     for (BasicBlock *BB : RPO) {
         if (isDeadBlock(BB)) continue;
 
-        auto Insts = BB->getInstructions();
+        auto Insts = collectInstructions(*BB);
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
@@ -1081,13 +1067,18 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             auto VIt = ValueNum.find(DefI);
             if (VIt == ValueNum.end() || VIt->second != Num) continue;
 
-            for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-                if (Phi->getIncomingBlock(i) == ToPred) {
+            bool FoundIncoming = false;
+            TraverseTools::forEachPhiIncoming(
+                Phi, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                    if (Pred != ToPred) return true;
                     bool Fresh = false;
-                    Result = getOrAssignValueNum(Phi->getIncomingValue(i), Fresh);
-                    PhiTranslateTable[Key] = Result;
-                    return Result;
-                }
+                    Result = getOrAssignValueNum(Incoming, Fresh);
+                    FoundIncoming = true;
+                    return false;
+                });
+            if (FoundIncoming) {
+                PhiTranslateTable[Key] = Result;
+                return Result;
             }
         }
     }
@@ -1184,27 +1175,15 @@ bool GVNPRESolver::runPRE() {
 
     if (!F.front()) return false;
 
-    // DFS pre-order from entry (mirrors domtree top-down order for PRE)
-    std::unordered_set<BasicBlock *> Visited;
-    std::vector<BasicBlock *> DFSOrder;
-    {
-        std::vector<BasicBlock *> Stack;
-        Stack.push_back(F.front());
-        while (!Stack.empty()) {
-            BasicBlock *Cur = Stack.back();
-            Stack.pop_back();
-            if (!Cur || !Visited.insert(Cur).second) continue;
-            DFSOrder.push_back(Cur);
-            auto Succs = Cur->getSuccessors();
-            for (auto It = Succs.rbegin(); It != Succs.rend(); ++It)
-                if (*It) Stack.push_back(*It);
-        }
-    }
+    // Snapshot entry-reachable CFG pre-order before PRE starts mutating IR.
+    std::vector<BasicBlock *> Roots{F.front()};
+    std::vector<BasicBlock *> DFSOrder =
+        TraverseTools::buildPreOrderFromRoots<BasicBlock>(Roots);
 
     for (BasicBlock *BB : DFSOrder) {
         if (!BB || BB == F.front() || isDeadBlock(BB)) continue;
 
-        auto Insts = BB->getInstructions();
+        auto Insts = collectInstructions(*BB);
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
@@ -1273,30 +1252,23 @@ bool GVNPRESolver::runPRE() {
             Instruction *Cloned = I->clone({});
             if (!Cloned) continue;
 
-            bool OperandOK = true;
             if (I->getNumOperands() != Cloned->getNumOperands()) {
                 delete Cloned;
                 continue;
             }
 
-            for (size_t Idx = 0;
-                 OperandOK && Idx < I->getNumOperands(); ++Idx) {
-                Value *OrigV = I->getOperand(Idx);
-                if (!OrigV) {
-                    OperandOK = false;
-                    break;
-                }
+            bool OperandOK = TraverseTools::forEachOperand(
+                I, [&](size_t Idx, Use *, Value *OrigV) {
+                if (!OrigV) return false;
 
                 // Use improved resolveAvailOperand to find the right value in PREPred
                 Value *Resolved = resolveAvailOperand(OrigV, BB, PREPred);
-                if (!Resolved) {
-                    OperandOK = false;
-                    break;
-                }
+                if (!Resolved) return false;
 
                 if (Cloned->getOperand(Idx) != Resolved)
                     Cloned->replaceOperand(Idx, Resolved);
-            }
+                return true;
+            });
 
             if (!OperandOK) {
                 delete Cloned;
@@ -1363,15 +1335,6 @@ bool GVNPRESolver::runPRE() {
     }
 
     return Changed;
-}
-
-void GVNPRESolver::domTreeDFS(BasicBlock *BB,
-                              std::function<void(BasicBlock *)> Visit) {
-    if (!BB) return;
-    Visit(BB);
-    for (BasicBlock *Child : DT.getChildren(BB)) {
-        if (Child) domTreeDFS(Child, Visit);
-    }
 }
 
 PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
@@ -1455,12 +1418,13 @@ bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
     }
 
     K.Operands.reserve(I->getNumOperands());
-    for (size_t Index = 0; Index < I->getNumOperands(); ++Index) {
-        Value *Operand = I->getOperand(Index);
-        if (!Operand || Value::isUndef(Operand)) return false;
-        K.Operands.push_back(Operand);
-    }
-    return !K.Operands.empty();
+    bool OperandsOK = TraverseTools::forEachOperand(
+        I, [&](size_t, Use *, Value *Operand) {
+            if (!Operand || Value::isUndef(Operand)) return false;
+            K.Operands.push_back(Operand);
+            return true;
+        });
+    return OperandsOK && !K.Operands.empty();
 }
 
 PreservationStatus LocalGVNPass::run(Function &F,
@@ -1471,7 +1435,7 @@ PreservationStatus LocalGVNPass::run(Function &F,
         if (!BB) continue;
         std::unordered_map<LocalExprKey, Instruction *, LocalExprKeyHash> Leaders;
 
-        auto Insts = BB->getInstructions();
+        auto Insts = collectInstructions(*BB);
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;

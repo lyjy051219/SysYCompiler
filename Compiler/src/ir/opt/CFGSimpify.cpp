@@ -4,6 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
@@ -166,8 +167,7 @@ bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 	bool Changed = false;
 	BasicBlock *Entry = F.front();
 
-	std::vector<BasicBlock *> Blocks;
-	for (BasicBlock *BB : F) Blocks.push_back(BB);
+	auto Blocks = TraverseTools::snapshotPointers(F);
     //排除入口块之后，检查前驱块：没有/唯一的前驱是自己，满足条件删除
 	for (BasicBlock *BB : Blocks) {
 		if (!BB || BB == Entry) continue;
@@ -194,8 +194,7 @@ bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 	bool Changed = false;
 
-	std::vector<BasicBlock *> Blocks;
-	for (BasicBlock *BB : F) Blocks.push_back(BB);
+	auto Blocks = TraverseTools::snapshotPointers(F);
 
 	for (BasicBlock *BB : Blocks) {
 		BrInst *Br = BB->getBranchTerminator();
@@ -278,8 +277,7 @@ bool CFGSimplifyPass::eliminateDuplicatePhis(Function &F) {
 // diamond replacement; it never gets another PHI or a redundant zext wrapper.
 bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 	bool Changed = false;
-	std::vector<BasicBlock *> Blocks;
-	for (BasicBlock *BB : F) Blocks.push_back(BB);
+	auto Blocks = TraverseTools::snapshotPointers(F);
 	// This routine only replaces instructions, so the predecessor cache remains
 	// valid for its whole invocation.
 	const PredecessorMap Preds = buildPredecessorMap(F);
@@ -299,22 +297,23 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 			std::vector<bool> Bits;
 			Bits.reserve(Phi->getNumIncomingValues());
 			bool AllBooleanConstants = Phi->getNumIncomingValues() >= 2;
-			for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+			if (!TraverseTools::forEachPhiIncoming(
+					Phi, [&](unsigned, Value *Incoming, BasicBlock *) {
 				bool Bit = false;
-				Value *Incoming = Phi->getIncomingValue(I);
 				if (auto *CB = dynamic_cast<ConstBool *>(Incoming)) {
 					Bit = CB->getVal();
 				} else if (auto *CI = dynamic_cast<ConstInt *>(Incoming)) {
 					if (CI->getVal() != 0 && CI->getVal() != 1) {
-						AllBooleanConstants = false;
-						break;
+						return false;
 					}
 					Bit = CI->getVal() == 1;
 				} else {
-					AllBooleanConstants = false;
-					break;
+					return false;
 				}
 				Bits.push_back(Bit);
+				return true;
+			})) {
+				AllBooleanConstants = false;
 			}
 			if (!AllBooleanConstants) continue;
 
@@ -404,10 +403,11 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 			PhiInst *BoolPhi = nullptr;
 			if (!BooleanValue) {
 				BoolPhi = new PhiInst(INTType::NewBool());
-				for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+				TraverseTools::forEachPhiIncoming(
+					Phi, [&](unsigned I, Value *, BasicBlock *IncomingBlock) {
 					BoolPhi->addIncoming(ConstBool::newConstBool(Bits[I]),
-									 Phi->getIncomingBlock(I));
-				}
+									 IncomingBlock);
+				});
 				Phi->replaceWith(BoolPhi);
 				BooleanValue = BoolPhi;
 			}
@@ -444,8 +444,7 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 // simplifier performs the actual jump threading.
 bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 	bool Changed = false;
-	std::vector<BasicBlock *> Blocks;
-	for (BasicBlock *BB : F) Blocks.push_back(BB);
+	auto Blocks = TraverseTools::snapshotPointers(F);
 
 	for (BasicBlock *BB : Blocks) {
 		// The function entry also has an implicit predecessor.  Looking only at
@@ -595,12 +594,12 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 	for (PhiInst *Phi : BBPhis) {
 		if (!Phi || Phi->getNumIncomingValues() != Preds.size()) return false;
 		std::unordered_set<BasicBlock *> IncomingPreds;
-		for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
-			BasicBlock *Pred = Phi->getIncomingBlock(I);
-			if (!Pred || !UniquePreds.count(Pred) ||
-				!IncomingPreds.insert(Pred).second) {
-				return false;
-			}
+		if (!TraverseTools::forEachPhiIncoming(
+				Phi, [&](unsigned, Value *, BasicBlock *Pred) {
+					return Pred && UniquePreds.count(Pred) &&
+						IncomingPreds.insert(Pred).second;
+				})) {
+			return false;
 		}
 
 		for (Use *U : Phi->getUses()) {
@@ -680,8 +679,7 @@ bool CFGSimplifyPass::mergeBlocks(Function &F) {
 	bool Changed = false;
 	BasicBlock *Entry = F.front();
 
-	std::vector<BasicBlock *> Blocks;
-	for (BasicBlock *BB : F) Blocks.push_back(BB);
+	auto Blocks = TraverseTools::snapshotPointers(F);
 
 	for (BasicBlock *BB : Blocks) {
 		if (!BB || BB == Entry) continue;
@@ -698,12 +696,10 @@ bool CFGSimplifyPass::mergeBlocks(Function &F) {
 		bool HasSelfRefPhi = false;
 		for (PhiInst *Phi : BB->collectPhiNodes()) {
 			if (!Phi) continue;
-			for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i) {
-				if (Phi->getIncomingValue(i) == Phi) {
-					HasSelfRefPhi = true;
-					break;
-				}
-			}
+			HasSelfRefPhi = !TraverseTools::forEachPhiIncoming(
+				Phi, [Phi](unsigned, Value *Incoming, BasicBlock *) {
+					return Incoming != Phi;
+				});
 			if (HasSelfRefPhi) break;
 		}
 		if (HasSelfRefPhi) continue;
@@ -833,8 +829,7 @@ bool CFGSimplifyPass::simplifyBranches(Function &F) {
 	bool Changed = false;
 
 	{
-		std::vector<BasicBlock *> Blocks;
-		for (BasicBlock *BB : F) Blocks.push_back(BB);
+		auto Blocks = TraverseTools::snapshotPointers(F);
 		for (BasicBlock *BB : Blocks) {
 			if (!BB) continue;
 			if (threadBranchOnPhi(F, BB)) {
@@ -863,8 +858,7 @@ PreservationStatus CFGSimplifyPass::run(Function &F, FunctionAnalysisPassManager
 		// controller condition, which is useful algebraically but would lose the
 		// local edge facts needed by this zero-duplication transform.
 		{
-			std::vector<BasicBlock *> Blocks;
-			for (BasicBlock *BB : F) Blocks.push_back(BB);
+			auto Blocks = TraverseTools::snapshotPointers(F);
 			for (BasicBlock *BB : Blocks) {
 				if (BB) Changed |= threadBranchOnPhi(F, BB);
 			}

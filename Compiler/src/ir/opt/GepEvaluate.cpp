@@ -27,7 +27,7 @@
 bool GepEvaluatePass::evaluateGEP(Function &F) {
     bool changed = false;
 
-    auto geps = F.collectInstructions<GetElementPtrInst>();
+    auto geps = collectInstructions<GetElementPtrInst>(F);
 
     for (GetElementPtrInst *GEP : geps) {
         Value *Base = GEP->getBasePointer();

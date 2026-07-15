@@ -5,6 +5,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <vector>
 
@@ -265,12 +266,12 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 	if (!matchPattern(TrueBB, M)) return false;
 
 	std::vector<Instruction *> ToMove;
-	for (Instruction *I : *M.TrueBB) {
+	for (Instruction *I : collectInstructions(*M.TrueBB)) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
 		ToMove.push_back(I);
 	}
 	if (M.HasElse) {
-		for (Instruction *I : *M.ElseBB) {
+		for (Instruction *I : collectInstructions(*M.ElseBB)) {
 			if (!I || dynamic_cast<BrInst *>(I)) continue;
 			ToMove.push_back(I);
 		}
@@ -321,12 +322,10 @@ PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManage
 	while (true) {
 		bool Changed = false;
 
-		std::vector<BasicBlock *> Blocks;
-		for (BasicBlock *BB : F) {
-			if (BB) Blocks.push_back(BB);
-		}
+		auto Blocks = TraverseTools::snapshotPointers(F);
 
 		for (BasicBlock *BB : Blocks) {
+			if (!BB) continue;
 			if (tryConvertOne(F, BB)) {
 				Changed = true;
 				ChangedAny = true;

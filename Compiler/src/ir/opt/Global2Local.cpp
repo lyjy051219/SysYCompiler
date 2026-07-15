@@ -4,10 +4,10 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "lib/CFG.hpp"
+#include "lib/TraverseTools.hpp"
 #include "lib/TypeSystem.hpp"
 
 #include <algorithm>
-#include <unordered_set>
 #include <utility>
 
 Global2LocalPass::Global2LocalPass(bool RelaxScalarUses)
@@ -17,27 +17,15 @@ bool Global2LocalPass::isRecursiveFrom(
 	Function *Root, const FunctionCallGraph &CallGraph) {
 	if (!Root) return false;
 
-	std::vector<Function *> WorkList;
-	std::unordered_set<Function *> Visited;
 	auto RootIt = CallGraph.find(Root);
 	if (RootIt == CallGraph.end()) return false;
-	for (Function *Callee : RootIt->second) {
-		if (Callee) WorkList.push_back(Callee);
-	}
-
-	while (!WorkList.empty()) {
-		Function *Current = WorkList.back();
-		WorkList.pop_back();
-		if (Current == Root) return true;
-		if (!Current || !Visited.insert(Current).second) continue;
-
-		auto It = CallGraph.find(Current);
-		if (It == CallGraph.end()) continue;
-		for (Function *Callee : It->second) {
-			if (Callee) WorkList.push_back(Callee);
-		}
-	}
-	return false;
+	return TraverseTools::isReachableFromRootsCustomSucc<Function>(
+		RootIt->second, Root,
+		[&CallGraph](Function *Current) -> std::vector<Function *> {
+			auto It = CallGraph.find(Current);
+			return It == CallGraph.end() ? std::vector<Function *>{}
+			                            : It->second;
+		});
 }
 
 // For scalar globals, only allow very simple load/store users in main.

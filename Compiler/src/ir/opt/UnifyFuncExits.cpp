@@ -4,6 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <utility>
 #include <vector>
@@ -11,12 +12,10 @@
 PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassManager &) {
 	std::vector<std::pair<BasicBlock *, RetInst *>> retSites;
 
-	for (BasicBlock *BB : F) {
-		if (!BB || BB->empty()) continue;
-		auto *RI = dynamic_cast<RetInst *>(BB->back());
-		if (!RI) continue;
-		retSites.emplace_back(BB, RI);
-	}
+	TraverseTools::forEachInstruction<RetInst>(
+		F, [&](BasicBlock *BB, RetInst *RI) {
+			if (BB->back() == RI) retSites.emplace_back(BB, RI);
+		});
 
 	if (retSites.size() <= 1) {
 		return PreservationStatus::all();

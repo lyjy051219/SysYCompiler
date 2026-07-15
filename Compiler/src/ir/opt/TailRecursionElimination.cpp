@@ -6,6 +6,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/CFG.hpp"
 #include "lib/BaseManager.hpp"
+#include "lib/TraverseTools.hpp"
 #include <cassert>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,8 +22,8 @@ Value *TailRecursionEliminationPass::resolveRetValueForPred(Value *V,
                                      std::vector<Instruction *> &ClonedInsts,
                                      std::unordered_set<Value *> &Visiting) {
     if (!V) return nullptr;
-    if (Visiting.count(V)) return nullptr;
-    Visiting.insert(V);
+    TraverseTools::ScopedActiveMark ActiveMark(Visiting, V);
+    if (!ActiveMark.inserted()) return nullptr;
 
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
         if (Phi->getParent() != TargetBB) {
@@ -87,14 +88,8 @@ bool TailRecursionEliminationPass::isSelfCall(CallInst *CI, Function &F) {
 
 //  快速检查：函数是否包含自递归调用
 bool TailRecursionEliminationPass::hasSelfRecursion(Function &F) {
-    for (auto bb : F) {
-        for (auto inst : *bb) {
-            if (inst->instType != Instruction::CALL) continue;
-            auto *ci = dynamic_cast<CallInst*>(inst);
-            if (ci && isSelfCall(ci, F)) return true;
-        }
-    }
-    return false;
+    return !TraverseTools::forEachInstruction<CallInst>(
+        F, [&](CallInst *CI) { return !isSelfCall(CI, F); });
 }
 
 bool TailRecursionEliminationPass::isReadonlyLikeCallInst(Instruction *I,
@@ -122,17 +117,17 @@ bool TailRecursionEliminationPass::hasInterferingEarlierSelfCallInBlock(BasicBlo
                                                  Function &F,
                                                  FunctionAnalysisPassManager &FAM) {
     if (!BB || !StopCI) return false;
-    for (auto inst : *BB) {
-        if (inst == StopCI) break;
-        if (inst->instType != Instruction::CALL) continue;
-        auto *CI = dynamic_cast<CallInst *>(inst);
-        if (!CI) continue;
-        if (CI->getCallee() != &F) continue;
-
-        if (!isReadonlyLikeCallInst(CI, FAM, F)) return true;
-        if (CI->hasUses()) return true;
-    }
-    return false;
+    bool Interferes = false;
+    TraverseTools::forEachInstruction<CallInst>(*BB, [&](CallInst *CI) {
+        if (CI == StopCI) return false;
+        if (CI->getCallee() != &F) return true;
+        if (!isReadonlyLikeCallInst(CI, FAM, F) || CI->hasUses()) {
+            Interferes = true;
+            return false;
+        }
+        return true;
+    });
+    return Interferes;
 }
 
 RetInst *TailRecursionEliminationPass::getRetOnlyTerminatorBlockRet(BasicBlock *BB) {
@@ -190,10 +185,11 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
                 }
 
                 if (auto *inst = dynamic_cast<Instruction*>(curr)) {
-                    for (size_t OperandIndex = 0;
-                         OperandIndex < inst->getNumOperands(); ++OperandIndex)
-                        if (Value *Operand = inst->getOperand(OperandIndex))
+                    TraverseTools::forEachOperand(
+                        inst, [&](size_t, Use *, Value *Operand) {
+                        if (Operand)
                             worklist.push_back(Operand);
+                    });
                 }
             }
             if (hasEscapingLocalPtr) break;
@@ -321,10 +317,11 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         }
 
         // 操作数不能依赖 call 的返回值
-        for (size_t OperandIndex = 0;
-             OperandIndex < I->getNumOperands(); ++OperandIndex) {
-            if (I->getOperand(OperandIndex) == static_cast<Value *>(CI))
-                return false;
+        if (!TraverseTools::forEachOperand(
+                I, [CI](size_t, Use *, Value *Operand) {
+                    return Operand != static_cast<Value *>(CI);
+                })) {
+            return false;
         }
     }
 
@@ -351,11 +348,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 
         // 将原入口块中所有 Alloca 搬到 NewEntry 的 Br 之前
         {
-            std::vector<AllocaInst *> allocas;
-            for (auto inst : *OldEntry) {
-                if (auto *AI = dynamic_cast<AllocaInst *>(inst))
-                    allocas.push_back(AI);
-            }
+            auto allocas = collectInstructions<AllocaInst>(*OldEntry);
             Instruction *brInst = NewEntry->back();
             auto brIt = NewEntry->begin();
             while (*brIt != brInst) ++brIt;
@@ -532,10 +525,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             delete ClonedRI;
         };
 
-        std::vector<BasicBlock *> blockSnapshot;
-        for (auto bb : F) {
-            blockSnapshot.push_back(bb);
-        }
+        auto blockSnapshot = TraverseTools::snapshotPointers(F);
 
         for (auto bb : blockSnapshot) {
             Instruction *term = bb->back();

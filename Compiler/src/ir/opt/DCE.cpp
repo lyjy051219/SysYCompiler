@@ -4,9 +4,9 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "lib/TraverseTools.hpp"
 
 #include <functional>
-#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -252,14 +252,14 @@ bool DCEPass::isDeletableInstruction(
 PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	bool Changed = false;
 
-	std::queue<Instruction*> WorkQ;
-	std::unordered_set<Instruction*> InWorkQ;
+	TraverseTools::UniqueWorkList<
+		Instruction *, TraverseTools::WorkListOrder::FIFO> WorkQ;
 	std::unordered_set<Instruction*> Erased;
 
 	auto enqueue = [&](Instruction* I) {
 		if (!I) return;
 		if (Erased.count(I)) return;
-		if (InWorkQ.insert(I).second) WorkQ.push(I);
+		WorkQ.push(I);
 	};
 
 	auto tryErase = [&](Instruction* I) -> bool {
@@ -273,17 +273,12 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		// clearOperands 直接销毁 Use，同时更准确地更新上游 use count。
 		std::vector<Instruction *> OperandDefs;
 		OperandDefs.reserve(I->getNumOperands());
-		for (size_t OperandIndex = 0;
-			 OperandIndex < I->getNumOperands(); ++OperandIndex) {
-			Use* U = I->getOperandUse(OperandIndex);
-			if (!U) continue;
-
-			Value* Op = U->getValue();
-			if (!Op) continue;
-			if (Op == I) continue; // 自引用直接跳过
-			if (auto *DefI = dynamic_cast<Instruction *>(Op))
-				OperandDefs.push_back(DefI);
-		}
+		TraverseTools::forEachOperand(
+			I, [&](size_t, Use *U, Value *Op) {
+				if (!U || !Op || Op == I) return; // 自引用直接跳过
+				if (auto *DefI = dynamic_cast<Instruction *>(Op))
+					OperandDefs.push_back(DefI);
+			});
 
 		I->clearOperands();
 		for (Instruction *DefI : OperandDefs) {
@@ -304,26 +299,18 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	};
 
 	// 先拍平当前函数所有指令，避免边遍历边删除导致迭代器失效
-	std::vector<Instruction*> AllInsts;
-	for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt) {
-		BasicBlock* BB = *BBIt;
-		for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
-			AllInsts.push_back(*IIt);
-		}
-	}
+	auto AllInsts = collectInstructions(F);
 
 	// 按“种子 + 工作队列”方式做级联 DCE
 	for (Instruction* I : AllInsts) {
 		if (!I) continue;
 		if (Erased.count(I)) continue;
-		if (InWorkQ.count(I)) continue;
+		if (WorkQ.contains(I)) continue;
 
 		tryErase(I);
 
 		while (!WorkQ.empty()) {
-			Instruction* Cur = WorkQ.front();
-			WorkQ.pop();
-			InWorkQ.erase(Cur);
+			Instruction* Cur = WorkQ.pop();
 			tryErase(Cur);
 		}
 	}
