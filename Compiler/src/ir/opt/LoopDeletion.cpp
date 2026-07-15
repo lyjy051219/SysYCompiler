@@ -10,11 +10,8 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;
-
-std::vector<BasicBlock *> collectLoopBlocks(Loop *L, Function *F) {
+std::vector<BasicBlock *> LoopDeletionPass::collectLoopBlocks(
+    Loop *L, Function *F) {
     std::vector<BasicBlock *> Result;
     if (!L || !F) return Result;
     std::unordered_set<BasicBlock *> InLoop;
@@ -28,7 +25,7 @@ std::vector<BasicBlock *> collectLoopBlocks(Loop *L, Function *F) {
     return Result;
 }
 
-bool isSafeToSkipOnZeroTrip(Instruction *I) {
+bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     if (!I) return false;
     if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
     // Use the same observable-execution policy as DCE/ADCE.  Ordinary pure
@@ -56,7 +53,7 @@ bool isSafeToSkipOnZeroTrip(Instruction *I) {
     }
 }
 
-bool hasNoObservableLoopInstruction(Loop *L) {
+bool LoopDeletionPass::hasNoObservableLoopInstruction(Loop *L) {
     if (!L) return false;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
@@ -74,8 +71,8 @@ bool hasNoObservableLoopInstruction(Loop *L) {
 // intentionally narrower than a general symbolic trip-count proof: it is
 // used only to remove a loop whose body and live-outs have independently
 // proved unobservable.
-bool isProvablyFiniteStrictUnitStepLoop(SCEVResult &SE,
-                                        const LoopTripCountInfo &TCI) {
+bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
+    SCEVResult &SE, const LoopTripCountInfo &TCI) {
     if (!TCI.Valid || !TCI.IsRuntime || !TCI.L || !TCI.Header ||
         TCI.ExitingBlock != TCI.Header || !TCI.ExitCmp || !TCI.IndVar) {
         return false;
@@ -128,8 +125,9 @@ bool isProvablyFiniteStrictUnitStepLoop(SCEVResult &SE,
            (*IV->ConstantStep == -1 && Pred == BinaryInst::G);
 }
 
-Value *resolveZeroTripValue(Value *V, Loop *L, BasicBlock *PreHeader,
-                            std::unordered_set<Value *> &Active) {
+Value *LoopDeletionPass::resolveZeroTripValue(
+    Value *V, Loop *L, BasicBlock *PreHeader,
+    std::unordered_set<Value *> &Active) {
     if (!V || !L || !PreHeader) return nullptr;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I || !I->getParent() || !L->contains(I->getParent())) return V;
@@ -146,9 +144,8 @@ Value *resolveZeroTripValue(Value *V, Loop *L, BasicBlock *PreHeader,
     return Resolved;
 }
 
-bool planZeroTripPhiReplacements(Loop *L,
-                                 const LoopTripCountInfo &TCI,
-                                 PhiReplacementMap &Plan) {
+bool LoopDeletionPass::planZeroTripPhiReplacements(
+    Loop *L, const LoopTripCountInfo &TCI, PhiReplacementMap &Plan) {
     if (!L || !TCI.PreHeader || !TCI.ExitingBlock || !TCI.ExitBlock)
         return false;
 
@@ -172,8 +169,8 @@ bool planZeroTripPhiReplacements(Loop *L,
     return true;
 }
 
-bool planDeadLoopPhiReplacements(Loop *L, BasicBlock *Exit,
-                                 PhiReplacementMap &Plan) {
+bool LoopDeletionPass::planDeadLoopPhiReplacements(
+    Loop *L, BasicBlock *Exit, PhiReplacementMap &Plan) {
     if (!L || !Exit) return false;
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
         if (!Phi) return false;
@@ -196,7 +193,7 @@ bool planDeadLoopPhiReplacements(Loop *L, BasicBlock *Exit,
     return true;
 }
 
-bool outsideUsesAreCovered(
+bool LoopDeletionPass::outsideUsesAreCovered(
     Loop *L, const std::vector<BasicBlock *> &Blocks,
     const PhiReplacementMap &Plan) {
     if (!L) return false;
@@ -204,10 +201,7 @@ bool outsideUsesAreCovered(
         if (!BB) return false;
         for (Instruction *I : *BB) {
             if (!I) return false;
-            for (auto It = I->getUseList().begin();
-                 It != I->getUseList().end(); ++It) {
-                Use *U = *It;
-                if (!U || U->getValue() != I) continue;
+            for (Use *U : I->getUses()) {
                 auto *UserI = dynamic_cast<Instruction *>(U->getUser());
                 if (!UserI || !UserI->getParent()) return false;
                 if (L->contains(UserI->getParent())) continue;
@@ -219,7 +213,7 @@ bool outsideUsesAreCovered(
     return true;
 }
 
-void applyPhiReplacements(const PhiReplacementMap &Plan) {
+void LoopDeletionPass::applyPhiReplacements(const PhiReplacementMap &Plan) {
     for (const auto &KV : Plan) {
         PhiInst *Phi = KV.first;
         Value *Replacement = KV.second;
@@ -229,10 +223,10 @@ void applyPhiReplacements(const PhiReplacementMap &Plan) {
         if (KV.first) delete KV.first;
 }
 
-bool deleteLoopCFG(Loop *L, Function &F, BasicBlock *PreHeader,
-                   BasicBlock *Exit,
-                   const std::vector<BasicBlock *> &LoopBlocks,
-                   const PhiReplacementMap &PhiPlan) {
+bool LoopDeletionPass::deleteLoopCFG(
+    Loop *L, Function &F, BasicBlock *PreHeader, BasicBlock *Exit,
+    const std::vector<BasicBlock *> &LoopBlocks,
+    const PhiReplacementMap &PhiPlan) {
     if (!L || !PreHeader || !Exit || LoopBlocks.empty()) return false;
     auto *OldTerm = PreHeader->getBranchTerminator();
     if (!BasicBlock::isUncondBr(OldTerm) ||
@@ -253,7 +247,7 @@ bool deleteLoopCFG(Loop *L, Function &F, BasicBlock *PreHeader,
                 I->getIRType()->getEnum() == IR_VOID) {
                 continue;
             }
-            if (!I->getUseList().is_empty())
+            if (I->hasUses())
                 I->replaceAllUsesWith(
                     UndefValue::NewUndefValue(I->getIRType()));
         }
@@ -265,8 +259,6 @@ bool deleteLoopCFG(Loop *L, Function &F, BasicBlock *PreHeader,
         if (BB && BB->getParent() == &F) delete BB;
     return true;
 }
-
-} // namespace
 
 PreservationStatus LoopDeletionPass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {

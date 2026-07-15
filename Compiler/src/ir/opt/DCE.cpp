@@ -11,11 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-enum class ReturnProofState { Visiting, Proven, Failed };
-
-bool hasAcyclicReturningCFG(Function &F) {
+bool DCEPass::hasAcyclicReturningCFG(Function &F) {
 	auto *Entry = F.front();
 	if (!Entry) return false;
 	std::unordered_map<BasicBlock *, unsigned> Color;
@@ -43,7 +39,7 @@ bool hasAcyclicReturningCFG(Function &F) {
 	return Visit(Entry);
 }
 
-bool isGuaranteedRemovableFunction(
+bool DCEPass::isGuaranteedRemovableFunction(
 	Function &F, FunctionAnalysisPassManager &FAM,
 	std::unordered_map<Function *, ReturnProofState> &Memo) {
 	auto It = Memo.find(&F);
@@ -101,8 +97,6 @@ bool isGuaranteedRemovableFunction(
 	Memo[&F] = ReturnProofState::Proven;
 	return true;
 }
-
-} // namespace
 
 bool hasDefinedConstantShiftAmount(const Instruction *I) {
 	if (!I) return false;
@@ -225,8 +219,8 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	}
 
 	if (auto* F = dynamic_cast<Function*>(Callee)) {
-		std::unordered_map<Function *, ReturnProofState> Memo;
-		return !isGuaranteedRemovableFunction(*F, FAM, Memo);
+		std::unordered_map<Function *, DCEPass::ReturnProofState> Memo;
+		return !DCEPass::isGuaranteedRemovableFunction(*F, FAM, Memo);
 	}
 
 	return true;

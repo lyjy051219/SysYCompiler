@@ -7,6 +7,10 @@
 #include <unordered_map>
 #include <vector>
 
+StoreOnlyGlobalEliminationPass::StoreOnlyGlobalEliminationPass(
+    FunctionAnalysisPassManager &FAM)
+    : FAM(FAM) {}
+
 // =====================================================================
 // StoreOnlyGlobalElimination（索引精确 + SideEffect 集成版）
 //
@@ -303,47 +307,40 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         Function *F = funcPtr.get();
         if (!F) continue;
 
-        for (BasicBlock *BB : *F) {
-            std::vector<StoreInst*> toDelete;
-            for (Instruction *I : *BB) {
-                auto *SI = dynamic_cast<StoreInst*>(I);
-                if (!SI) continue;
-                Value *ptr = SI->getPointerOperand();
-                if (!ptr) continue;
+        std::vector<StoreInst*> toDelete;
+        for (StoreInst *SI : F->collectInstructions<StoreInst>()) {
+            Value *ptr = SI->getPointerOperand();
+            if (!ptr) continue;
 
-                StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
-                if (!tr.base) continue;
-                auto *G = dynamic_cast<Variable*>(tr.base);
-                if (!G || !G->isGlobal()) continue;
-                if (!candidates.count(G)) continue;
+            StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
+            if (!tr.base) continue;
+            auto *G = dynamic_cast<Variable*>(tr.base);
+            if (!G || !G->isGlobal() || !candidates.count(G)) continue;
 
-                auto it = reads.find(G);
-                // 情形 A：从没人读 G —— 全删
-                if (it == reads.end()) {
-                    toDelete.push_back(SI);
-                    continue;
-                }
-                const StoreOnlyGlobalReadInfo &info = it->second;
-                // 情形 B：G 被"任意索引"读过 → 保守不删
-                if (info.anyIndexRead) continue;
-                // 情形 C：G 只被常量索引读过，检查此 store 是否落在读集合之外
-                if (tr.hasVarIdx || tr.unresolved) continue;  // store 用变量索引 → 不知道影响哪个常量索引，保守
-                int64_t key = 0;
-                if (tr.constPath.size() == 1 && tr.constPath[0] == 0) {
-                    key = 0;   // 标量
-                } else if (tr.constPath.size() >= 2 && tr.constPath[0] == 0) {
-                    key = tr.constPath[1];
-                } else {
-                    continue;
-                }
-                if (!info.constIdx.count(key)) {
-                    toDelete.push_back(SI);
-                }
+            auto it = reads.find(G);
+            // 情形 A：从没人读 G —— 全删
+            if (it == reads.end()) {
+                toDelete.push_back(SI);
+                continue;
             }
-            for (StoreInst *SI : toDelete) {
-                delete SI;
-                changed = true;
+            const StoreOnlyGlobalReadInfo &info = it->second;
+            // 情形 B：G 被"任意索引"读过 → 保守不删
+            if (info.anyIndexRead) continue;
+            // 情形 C：仅有常量索引读，删除未落入读集合的写入。
+            if (tr.hasVarIdx || tr.unresolved) continue;
+            int64_t key = 0;
+            if (tr.constPath.size() == 1 && tr.constPath[0] == 0) {
+                key = 0;
+            } else if (tr.constPath.size() >= 2 && tr.constPath[0] == 0) {
+                key = tr.constPath[1];
+            } else {
+                continue;
             }
+            if (!info.constIdx.count(key)) toDelete.push_back(SI);
+        }
+        for (StoreInst *SI : toDelete) {
+            delete SI;
+            changed = true;
         }
     }
 
@@ -379,6 +376,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             auto &AA = FAM.getResult<BasicAliasAnalysis>(*F);
             auto &LI = FAM.getResult<LoopAnalysis>(*F);
             for (BasicBlock *BB : *F) {
+                if (!BB) continue;
                 for (Instruction *I : *BB) {
                     if (auto *SI2 = dynamic_cast<StoreInst*>(I)) {
                         if (isModSet(getInstModRefInfo(G, SI2, AA, LI, FAM))) {
@@ -434,12 +432,12 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
     // ---------- Pass 4：dead global removal ----------
     // 删完 store / 传播完 init 之后，有些 global 已经没任何 use 了。
     // 直接从 Module.globalvars 里 erase（unique_ptr 会析构 Variable）。
-    // 安全性：只在 useList 为空时删，Variable 析构不会级联摧毁任何 user。
+    // 安全性：只在没有使用时删除，Variable 析构不会级联摧毁任何 user。
     {
         auto &gvars = M.getGlobalVar();
         for (auto it = gvars.begin(); it != gvars.end(); ) {
             Variable *G = it->get();
-            if (G && G->isGlobal() && G->getUseList().is_empty()) {
+            if (G && G->isGlobal() && !G->hasUses()) {
                 it = gvars.erase(it);
                 changed = true;
             } else {

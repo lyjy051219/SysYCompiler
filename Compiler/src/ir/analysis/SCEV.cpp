@@ -8,14 +8,21 @@
 
 PassID SCEVAnalysis::Key;
 
-namespace {
+bool SCEVExpr::isConstant(int64_t V) const {
+    return Kind == SCEVExprKind::Constant && ConstValue == V;
+}
 
-// Resolve only SSA forwarding that is constant by construction.  This is not
-// mathematical constant folding: PHI/select forwarding cannot hide an
-// overflowing arithmetic operation, so the returned value is the exact IR
-// value on every incoming path.
-std::optional<int64_t> getTrivialExactIntConstant(
-    Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0) {
+SCEVResult::SCEVResult() = default;
+
+SCEVResult::SCEVResult(SCEVResult &&) = default;
+
+SCEVResult &SCEVResult::operator=(SCEVResult &&) = default;
+
+// 仅解析由构造方式保证为常量的 SSA 转发。这里不做数学意义上的常量折叠：
+// PHI 或 select 转发不能隐藏可能溢出的算术运算，因此返回值必须在每条输入路径上
+// 都与原始 IR 值精确一致。
+std::optional<int64_t> SCEVResult::getTrivialExactIntConstant(
+    Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V) || Depth > 32) return std::nullopt;
     if (auto *CI = dynamic_cast<ConstInt *>(V)) return CI->getVal();
     if (!Active.insert(V).second) return std::nullopt;
@@ -44,8 +51,6 @@ std::optional<int64_t> getTrivialExactIntConstant(
     Active.erase(V);
     return Result;
 }
-
-} // namespace
 
 bool SCEVExpr::isRecurrence() const {
     SCEVExprKind K = Kind;

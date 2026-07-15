@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // A compact Scalar Evolution analysis tailored to this IR.
@@ -54,9 +55,7 @@ struct SCEVExpr {
     std::vector<const SCEVExpr *> Operands;
     std::string Key;
 
-    bool isConstant(int64_t V) const {
-        return Kind == SCEVExprKind::Constant && ConstValue == V;
-    }
+    bool isConstant(int64_t V) const;
     bool isRecurrence() const;
     bool mentionsLoop(const Loop *L) const;
     static const char *kindName(SCEVExprKind K);
@@ -140,10 +139,10 @@ struct LoopRemainderInfo {
 
 class SCEVResult {
 public:
-    SCEVResult() = default;
+    SCEVResult();
     SCEVResult(Function *F, LoopInfo *LI, DominatorTree *DT);
-    SCEVResult(SCEVResult &&) = default;
-    SCEVResult &operator=(SCEVResult &&) = default;
+    SCEVResult(SCEVResult &&);
+    SCEVResult &operator=(SCEVResult &&);
     SCEVResult(const SCEVResult &) = delete;
     SCEVResult &operator=(const SCEVResult &) = delete;
 
@@ -187,6 +186,10 @@ public:
     bool invalidate(Function &F, const PreservationStatus &PA);
 
 private:
+    // SCEV 构造前解析由 SSA 转发保证的精确整数常量。
+    static std::optional<int64_t> getTrivialExactIntConstant(
+        Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0);
+
     struct UpdateDelta {
         bool SeenSelf = false;
         const SCEVExpr *Delta = nullptr;

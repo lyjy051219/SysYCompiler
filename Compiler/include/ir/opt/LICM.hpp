@@ -18,11 +18,7 @@ class MemorySSAResult;
 using ExitValueKey = std::pair<BasicBlock *, Value *>;
 
 struct ExitValueKeyHash {
-    std::size_t operator()(const ExitValueKey &K) const {
-        auto A = reinterpret_cast<std::uintptr_t>(K.first);
-        auto B = reinterpret_cast<std::uintptr_t>(K.second);
-        return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
-    }
+    std::size_t operator()(const ExitValueKey &K) const;
 };
 
 class LICMPass : public PassDescriptor<LICMPass> {
@@ -30,6 +26,16 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    static bool hasSafeExecutionPrefix(const Instruction *Candidate);
+    static bool isSpeculatableDivisionOrRemainder(Instruction *I);
+    static bool isNonFaultingStoreObject(Value *Pointer, Value *StoredValue);
+    static bool isReusableLoopInvariantCall(
+        CallInst *CI, const std::vector<Instruction *> &LoopInstructions,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
+    static bool cacheLoopInvariantCall(
+        Function &F, CallInst *CI, Loop &L, BasicBlock *PreHeader,
+        BasicBlock *Latch, const DominatorTree &DT);
     static bool areAllUsersOutsideLoop(Instruction *I, const Loop &L);
     static bool isInvariant(
         Instruction *I, const Loop &L, const DominatorTree &DT,

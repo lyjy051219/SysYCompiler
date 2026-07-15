@@ -9,9 +9,11 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 enum class UnrollKind {
@@ -88,7 +90,6 @@ struct UnrollDecision {
     Value *StabilizedInitial = nullptr;
     Value *StabilizedBound = nullptr;
 
-    std::string Reason;
 };
 
 struct PeelPredicate {
@@ -144,6 +145,15 @@ struct HeaderState {
     bool BackedgeIsOriginalPhi = false;
 };
 
+// 记录剥离后可证明稳定的循环状态；仅保存证明结果，不在决策阶段修改 IR。
+struct ProvenStablePeelState {
+    PhiInst *Phi = nullptr;
+    Value *StableValue = nullptr;
+    Value *Initial = nullptr;
+    Value *Bound = nullptr;
+};
+
+// PHI 重写统一采用“先收集并校验、再整体提交”的计划，避免留下半更新状态。
 struct PhiRewritePlan {
     PhiInst *OldPhi = nullptr;
     std::vector<PhiInst::IncomingEdge> Incoming;
@@ -157,7 +167,7 @@ public:
 
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
-    const UnrollConfig &getConfig() const { return Config; }
+    const UnrollConfig &getConfig() const;
 
     LoopUnrollResult tryToUnrollLoop(Function &F,
                                      Loop *L,
@@ -222,6 +232,8 @@ public:
                                     BasicAAResult &AA);
 
 private:
+    friend class LoopPeelingPass;
+
     UnrollConfig Config;
 
     // The loop pipeline itself is a bounded fixed point and reuses this pass
@@ -230,6 +242,42 @@ private:
     // merely because the outer pipeline ran another cleanup round.
     std::unordered_map<Function *, std::unordered_set<std::string>>
         TransformedLoopHeaders;
+
+    // 剥离合法性、稳定状态证明与失败回滚的通用辅助函数。
+    static bool containsUndef(
+        Value *V, std::unordered_set<Value *> &Active, int Depth = 0);
+    static bool isStructurallyLoopInvariant(
+        Value *V, Loop *L, std::unordered_set<Value *> &Active);
+    static std::vector<StoreInst *> collectPeelRedundantStoreCandidates(
+        Loop *L, LoopInfo &LI, BasicAAResult &AA,
+        const DominatorTree &DT);
+    static bool isDirectUnitIncrement(const InductionDescriptor &IV);
+    static Value *getStrictIncreasingHeaderBound(
+        const LoopTripCountInfo &TCI, const InductionDescriptor &IV);
+    static bool proveRuntimeTripCountAtPreheader(
+        SCEVResult &SE, const LoopTripCountInfo &TCI, RangeInfo &RI,
+        DominatorTree &DT);
+    static bool isExactInnerExitIV(
+        Value *V, const LoopTripCountInfo &TCI, PhiInst *IV);
+    static bool isValueAvailableBeforeOuterLoop(
+        Value *V, Loop *Outer, BasicBlock *PreHeader,
+        DominatorTree &DT);
+    static bool isTrivialForwardOf(
+        Value *Candidate, Value *Source,
+        std::unordered_set<Value *> &Active, int Depth = 0);
+    static std::pair<IntRange, IntRange> getFirstOuterEntryRanges(
+        Value *Initial, Value *Bound, Loop *Outer,
+        BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
+        DominatorTree &DT);
+    static bool proveInitialNotAboveBound(
+        Value *Initial, Value *Bound, Loop *Outer,
+        BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
+        DominatorTree &DT, IntRange &InitialRange, IntRange &BoundRange);
+    static std::optional<ProvenStablePeelState> findProvenStablePeelState(
+        Loop *Outer, SCEVResult &SE, RangeInfo &RI, DominatorTree &DT);
+    static void discardUncommittedPeelClones(PeeledBodyCore &Core);
+    static void discardUncommittedUnrollClones(UnrolledBodyCore &Core);
+    static UnrollConfig makePeelingOnlyConfig(UnrollConfig Config);
 
     static int nextUnrollSerial();
     static std::string makeUnrollBlockIdent(
@@ -242,7 +290,7 @@ private:
         BinaryInst *Cmp, Value *IV);
     static int peelCountForPredicate(const PeelPredicate &P);
     static bool isInternalConditionalBranch(Loop *L, BrInst *Br);
-    static UnrollDecision makeNoUnrollDecision(std::string Reason);
+    static UnrollDecision makeNoUnrollDecision();
     static bool withinThreshold(int64_t Cost, int Threshold);
     static int chooseFactorBySize(
         int BodyCost, int SizeLimit, int MaxCount);

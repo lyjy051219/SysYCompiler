@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <iostream>
 #include <sstream>
 #include <map>
 #include <unordered_set>
@@ -13,7 +14,7 @@
 
 extern std::unique_ptr<Module> ModuleIR;
 
-static bool isIntOnlyBinaryOp(BinaryInst::Operation op) {
+bool BinaryInst::isIntegerOnlyOp(BinaryInst::Operation op) {
   switch (op) {
   case BinaryInst::UDIV:
   case BinaryInst::UREM:
@@ -29,8 +30,8 @@ static bool isIntOnlyBinaryOp(BinaryInst::Operation op) {
   }
 }
 
-static Instruction::InstType mapBinaryOpToInstType(BinaryInst::Operation op,
-                                                   TypeSystem lhsTy) {
+Instruction::InstType BinaryInst::getInstType(BinaryInst::Operation op,
+                                              TypeSystem lhsTy) {
   switch (op) {
   case BinaryInst::ADD:
     return lhsTy == IR_FLOAT ? Instruction::FADD : Instruction::ADD;
@@ -70,382 +71,6 @@ static Instruction::InstType mapBinaryOpToInstType(BinaryInst::Operation op,
   }
 }
 
-bool Value::isConstZero() const {
-    if (auto num_val = dynamic_cast<const ConstInt*>(this))
-        return num_val->getVal() == 0;
-    else if (auto num_val = dynamic_cast<const ConstFloat*>(this))
-        return num_val->getVal() == 0.0f;
-    else if (auto num_val = dynamic_cast<const ConstBool*>(this))
-        return num_val->getVal() == false;
-    else
-        return false;
-}
-
-bool Value::isConstIntZero() const {
-    auto *CI = dynamic_cast<const ConstInt *>(this);
-    return CI && CI->getVal() == 0;
-}
-
-bool Value::isConstOne() const {
-    if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == 1;
-    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == 1.0f;
-    if (auto *CB = dynamic_cast<const ConstBool *>(this)) return CB->getVal();
-    return false;
-}
-
-bool Value::isConstMinusOne() const {
-    if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == -1;
-    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == -1.0f;
-    return false;
-}
-
-bool Value::isUndef() const {
-    return dynamic_cast<const UndefValue *>(this) != nullptr;
-}
-
-bool Value::tryGetBoolConst(bool &Out) const {
-    if (auto *CB = dynamic_cast<const ConstBool *>(this)) {
-        Out = CB->getVal();
-        return true;
-    }
-    if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
-        Out = CI->getVal() != 0;
-        return true;
-    }
-    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) {
-        Out = CF->getVal() != 0.0f;
-        return true;
-    }
-    return false;
-}
-
-bool Value::tryGetIntConst(int32_t &Out) const {
-    if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
-        Out = CI->getVal();
-        return true;
-    }
-    if (auto *CB = dynamic_cast<const ConstBool *>(this)) {
-        Out = CB->getVal() ? 1 : 0;
-        return true;
-    }
-    return false;
-}
-
-bool Value::tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const {
-    int32_t Raw = 0;
-    if (!tryGetIntConst(Raw)) return false;
-    Out = IRMath::normalizeSignedToWidth(Raw, Bits);
-    return true;
-}
-
-bool Value::tryGetFloatConst(float &Out) const {
-    if (auto *CF = dynamic_cast<const ConstFloat *>(this)) {
-        Out = CF->getVal();
-        return true;
-    }
-    return false;
-}
-
-bool Value::tryGetNumericFloatConst(float &Out) const {
-    if (tryGetFloatConst(Out)) return true;
-    int32_t IntValue = 0;
-    if (!tryGetIntConst(IntValue)) return false;
-    Out = static_cast<float>(IntValue);
-    return true;
-}
-
-Value *Value::stripBooleanExtension(Value *V,
-                                    BooleanExtensionKind &Kind) {
-    Kind = BooleanExtensionKind::None;
-    if (!V) return nullptr;
-    if (IRType::isBool(V->getIRType())) {
-        Kind = BooleanExtensionKind::PlainBool;
-        return V;
-    }
-
-    if (auto *ZI = dynamic_cast<ZextInst *>(V)) {
-        Value *Operand = ZI->getUnaryOperand();
-        if (Operand && IRType::isBool(Operand->getIRType())) {
-            Kind = BooleanExtensionKind::ZeroExt;
-            return Operand;
-        }
-    }
-    if (auto *SI = dynamic_cast<SextInst *>(V)) {
-        Value *Operand = SI->getUnaryOperand();
-        if (Operand && IRType::isBool(Operand->getIRType())) {
-            Kind = BooleanExtensionKind::SignExt;
-            return Operand;
-        }
-    }
-    return nullptr;
-}
-
-std::optional<int64_t> Value::getIntConstant() const {
-    int32_t Result = 0;
-    if (!tryGetIntConst(Result)) return std::nullopt;
-    return static_cast<int64_t>(Result);
-}
-
-int Value::integerBitWidth(int DefaultBits) const {
-    if (!getIRType()) return DefaultBits;
-    return getIRType()->getIntegerBitWidth(DefaultBits);
-}
-
-int Value::countUses() const {
-    int Count = 0;
-    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
-        Use *U = *It;
-        if (!U || U->getValue() != this) continue;
-        ++Count;
-    }
-    return Count;
-}
-
-int Value::countInstructionUses(Instruction **SingleUser) const {
-    if (SingleUser) *SingleUser = nullptr;
-
-    int Count = 0;
-    Instruction *OnlyInstUser = nullptr;
-    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
-        Use *U = *It;
-        if (!U || U->getValue() != this) continue;
-        auto *InstUser = dynamic_cast<Instruction *>(U->getUser());
-        if (!InstUser) continue;
-        ++Count;
-        if (Count == 1) {
-            OnlyInstUser = InstUser;
-        } else {
-            OnlyInstUser = nullptr;
-        }
-    }
-
-    if (SingleUser && Count == 1) *SingleUser = OnlyInstUser;
-    return Count;
-}
-
-std::vector<Instruction *> Value::getInstructionUsers() const {
-    std::vector<Instruction *> Users;
-    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
-        Use *U = *It;
-        if (!U || U->getValue() != this) continue;
-        if (auto *InstUser = dynamic_cast<Instruction *>(U->getUser()))
-            Users.push_back(InstUser);
-    }
-    return Users;
-}
-
-bool Value::hasUses() const {
-    return countUses() > 0;
-}
-
-bool Value::hasExactlyOneUse() const {
-    int Count = 0;
-    for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
-        Use *U = *It;
-        if (!U || U->getValue() != this) continue;
-        ++Count;
-        if (Count > 1) return false;
-    }
-    return Count == 1;
-}
-
-bool Value::isPointerValue() const {
-    return getIRType() && getIRType()->isPointer();
-}
-
-std::shared_ptr<IRType> Value::getPointeeType() const {
-    return getIRType() ? getIRType()->getPointeeType() : nullptr;
-}
-
-bool Value::hasSameStorageType(const Value *Other) const {
-    return Other && getIRType() && Other->getIRType() &&
-           getIRType()->hasSameStorageType(*Other->getIRType());
-}
-
-std::shared_ptr<IRType> Value::getPointeeType(const Value *V) {
-    return V ? V->getPointeeType() : nullptr;
-}
-
-bool Value::hasSameStorageType(const Value *A, const Value *B) {
-    return A && A->hasSameStorageType(B);
-}
-
-bool Value::isExternalVariable() const {
-    auto *Var = dynamic_cast<const Variable *>(this);
-    return Var && (Var->vartag == Variable::GlobalVariable ||
-                   Var->vartag == Variable::Param);
-}
-
-bool Value::isConstZero(const Value *V) {
-    return V && V->isConstZero();
-}
-
-bool Value::isConstIntZero(const Value *V) {
-    return V && V->isConstIntZero();
-}
-
-bool Value::isConstOne(const Value *V) {
-    return V && V->isConstOne();
-}
-
-bool Value::isConstMinusOne(const Value *V) {
-    return V && V->isConstMinusOne();
-}
-
-bool Value::isUndef(const Value *V) {
-    return V && V->isUndef();
-}
-
-bool Value::tryGetBoolConst(const Value *V, bool &Out) {
-    return V && V->tryGetBoolConst(Out);
-}
-
-bool Value::tryGetIntConst(const Value *V, int32_t &Out) {
-    return V && V->tryGetIntConst(Out);
-}
-
-bool Value::tryGetFloatConst(const Value *V, float &Out) {
-    return V && V->tryGetFloatConst(Out);
-}
-
-bool Value::areEqualConstants(const Value *A, const Value *B) {
-    if (A == B) return true;
-    if (!A || !B) return false;
-    if (auto *AI = dynamic_cast<const ConstInt *>(A)) {
-        auto *BI = dynamic_cast<const ConstInt *>(B);
-        return BI && AI->getVal() == BI->getVal();
-    }
-    if (auto *AF = dynamic_cast<const ConstFloat *>(A)) {
-        auto *BF = dynamic_cast<const ConstFloat *>(B);
-        if (!BF) return false;
-        std::uint32_t ABits = 0;
-        std::uint32_t BBits = 0;
-        float AV = AF->getVal();
-        float BV = BF->getVal();
-        std::memcpy(&ABits, &AV, sizeof(ABits));
-        std::memcpy(&BBits, &BV, sizeof(BBits));
-        return ABits == BBits;
-    }
-    if (auto *AB = dynamic_cast<const ConstBool *>(A)) {
-        auto *BB = dynamic_cast<const ConstBool *>(B);
-        return BB && AB->getVal() == BB->getVal();
-    }
-    return false;
-}
-
-bool Value::tryGetIntIndex(const Value *V, int &Out) {
-    int32_t Raw = 0;
-    if (!tryGetIntConst(V, Raw)) return false;
-    Out = static_cast<int>(Raw);
-    return true;
-}
-
-Value *Value::stripPointerCastsAndGEP(Value *V) {
-    std::unordered_set<Value *> Visited;
-    while (V && Visited.insert(V).second) {
-        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {
-            V = GEP->getOperand(0);
-            continue;
-        }
-        if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
-            V = BC->getOperand(0);
-            continue;
-        }
-        break;
-    }
-    return V;
-}
-
-bool Value::isLocalStackPointer(Value *V) {
-    return dynamic_cast<AllocaInst *>(stripPointerCastsAndGEP(V)) != nullptr;
-}
-
-Value *Value::makeZeroForType(const std::shared_ptr<IRType> &Ty) {
-    if (!Ty) return ConstInt::newConstInt(0);
-    if (Ty->isFloat()) return ConstFloat::newConstFloat(0.0f);
-    if (Ty->isBool()) return ConstBool::newConstBool(false);
-    if (Ty->isInt()) return ConstInt::newConstInt(0, Ty->getSize());
-    return ConstInt::newConstInt(0);
-}
-
-Value *Value::makeOneForType(const std::shared_ptr<IRType> &Ty) {
-    if (!Ty) return ConstInt::newConstInt(1);
-    if (Ty->isFloat()) return ConstFloat::newConstFloat(1.0f);
-    if (Ty->isBool()) return ConstBool::newConstBool(true);
-    if (Ty->isInt()) return ConstInt::newConstInt(1, Ty->getSize());
-    return ConstInt::newConstInt(1);
-}
-
-Value *Value::makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
-    if (!Ty) return ConstInt::newConstInt(-1);
-    if (Ty->isFloat()) return ConstFloat::newConstFloat(-1.0f);
-    if (Ty->isBool()) return ConstBool::newConstBool(true);
-    if (Ty->isInt()) return ConstInt::newConstInt(-1, Ty->getSize());
-    return ConstInt::newConstInt(-1);
-}
-
-Value *Value::makeUndefForType(const std::shared_ptr<IRType> &Ty) {
-    return UndefValue::NewUndefValue(Ty ? Ty : INTType::NewInt(4));
-}
-
-Value *Value::makeIntegerForType(int32_t Val,
-                                 const std::shared_ptr<IRType> &Ty) {
-    if (!Ty || !Ty->isInt()) return nullptr;
-    if (Ty->isBool()) {
-        if (Val != 0 && Val != 1) return nullptr;
-        return ConstBool::newConstBool(Val != 0);
-    }
-    return ConstInt::newConstInt(Val, Ty->getSize());
-}
-
-Value *Value::makeIntegerLike(const Value *Model, int32_t Val) {
-    return Model ? makeIntegerForType(Val, Model->getIRType()) : nullptr;
-}
-
-size_t User::getNumOperands() const {
-    return userList.size();
-}
-
-Value *User::getOperand(size_t Index) const {
-    if (Index >= userList.size() || !userList[Index]) return nullptr;
-    return userList[Index]->getValue();
-}
-
-Use *User::getOperandUse(size_t Index) const {
-    if (Index >= userList.size() || !userList[Index]) return nullptr;
-    return userList[Index].get();
-}
-
-bool User::getOperand(size_t Index, Value *&Out) const {
-    Out = getOperand(Index);
-    return Out != nullptr;
-}
-
-bool User::replaceOperand(size_t Index, Value *V) {
-    if (Index >= userList.size() || !userList[Index] || !V) return false;
-    return userList[Index]->replaceUseeWith(V);
-}
-
-bool User::eraseOperand(size_t Index) {
-    if (Index >= userList.size()) return false;
-    userList.erase(userList.begin() + static_cast<std::ptrdiff_t>(Index));
-    return true;
-}
-
-void User::clearOperands() {
-    userList.clear();
-}
-
-void Value::dumpIR() {
-    if (isConst()) std::cout << getIdent();
-    else if (isGlobal()) std::cout << "@" << getIdent();
-    else if (auto tmp = dynamic_cast<Function*>(this)) std::cout << "@" << tmp->getIdent();
-    else if (auto tmp = dynamic_cast<BuildInFunction*>(this)) std::cout << "@" << tmp->getIdent();
-    else if (getIdent() == "undef") std::cout << getIdent();
-    else std::cout << "%" << getIdent();
-}
-
-
 Function& Module::newFunction(TypeSystem ts,std::string ident){
     auto func = new Function(ts,ident);
     this->getSymbolTable().register_symbolTable(ident,func);
@@ -461,6 +86,18 @@ void Module::pushFunction(Function* func){
 
 std::vector<std::unique_ptr<Function>>& Module::getFunctions(){
     return functions;
+}
+
+std::vector<Instruction *> Module::getInstructions() {
+    std::vector<Instruction *> Instructions;
+    for (const auto &FunctionPtr : functions) {
+        Function *F = FunctionPtr.get();
+        if (!F) continue;
+        auto FunctionInstructions = F->getInstructions();
+        Instructions.insert(Instructions.end(), FunctionInstructions.begin(),
+                            FunctionInstructions.end());
+    }
+    return Instructions;
 }
 
 void Module::deleteFunction(Function*ptr){
@@ -608,9 +245,7 @@ bool Function::eraseParam(size_t Index) {
 
 std::vector<CallInst *> Function::getDirectCallSites() const {
   std::vector<CallInst *> Calls;
-  for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
-    Use *U = *It;
-    if (!U || U->getValue() != this) continue;
+  for (Use *U : getUses()) {
     auto *CI = dynamic_cast<CallInst *>(U->getUser());
     if (CI && CI->isCalleeUse(U)) Calls.push_back(CI);
   }
@@ -686,12 +321,23 @@ std::vector<BasicBlock *> Function::getReachableBlocks() {
   return Blocks;
 }
 
+std::vector<Instruction *> Function::getInstructions() {
+  std::vector<Instruction *> Instructions;
+  for (BasicBlock *BB : *this) {
+    if (!BB) continue;
+    auto BlockInstructions = BB->getInstructions();
+    Instructions.insert(Instructions.end(), BlockInstructions.begin(),
+                        BlockInstructions.end());
+  }
+  return Instructions;
+}
+
 void Function::dropAllReferences() {
   for (BasicBlock *BB : *this) {
     if (!BB) continue;
     for (Instruction *I : *BB) {
       if (!I) continue;
-      I->getUserList().clear();
+      I->clearOperands();
     }
   }
 }
@@ -859,10 +505,6 @@ bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
 
 BasicBlock::BasicBlock():Value(VOIDType::NewVoid()){};
 
-void BasicBlock::deleteBlock(){
-    this->~BasicBlock();
-}
-
 void BasicBlock::dumpIR(){
   std::cout << this->getIdent() << ":\n";
   for (auto i : (*this)) {
@@ -902,6 +544,47 @@ std::vector<BasicBlock*> BasicBlock::getPredecessors() {
     return preds;
 }
 
+CFGSnapshot::CFGSnapshot(Function &F) {
+  std::unordered_map<BasicBlock *, std::unordered_set<BasicBlock *>> SeenPreds;
+
+  // 保留终结指令中的边顺序；同一源块产生的平行边不会被合并。
+  for (BasicBlock *BB : F) {
+    if (!BB) continue;
+    auto Successors = BB->getSuccessors();
+    SuccessorEdges.emplace(BB, Successors);
+    PredecessorEdges.try_emplace(BB);
+    DistinctPredecessors.try_emplace(BB);
+
+    for (BasicBlock *Succ : Successors) {
+      if (!Succ) continue;
+      PredecessorEdges[Succ].push_back(BB);
+      if (SeenPreds[Succ].insert(BB).second)
+        DistinctPredecessors[Succ].push_back(BB);
+    }
+  }
+}
+
+const std::vector<BasicBlock *> &
+CFGSnapshot::successorEdges(BasicBlock *BB) const {
+  static const std::vector<BasicBlock *> Empty;
+  auto It = SuccessorEdges.find(BB);
+  return It == SuccessorEdges.end() ? Empty : It->second;
+}
+
+const std::vector<BasicBlock *> &
+CFGSnapshot::predecessorEdges(BasicBlock *BB) const {
+  static const std::vector<BasicBlock *> Empty;
+  auto It = PredecessorEdges.find(BB);
+  return It == PredecessorEdges.end() ? Empty : It->second;
+}
+
+const std::vector<BasicBlock *> &
+CFGSnapshot::distinctPredecessors(BasicBlock *BB) const {
+  static const std::vector<BasicBlock *> Empty;
+  auto It = DistinctPredecessors.find(BB);
+  return It == DistinctPredecessors.end() ? Empty : It->second;
+}
+
 Instruction *BasicBlock::getTerminator() {
     if (Size() == 0) return nullptr;
     Instruction *Term = back();
@@ -919,10 +602,118 @@ bool BasicBlock::hasMultipleDistinctSuccessors() {
     return false;
 }
 
-bool BasicBlock::isCriticalEdgeTo(BasicBlock *To) {
-    if (!To || !hasMultipleDistinctSuccessors()) return false;
-    auto Preds = To->getPredecessors();
-    return Preds.size() > 1;
+BasicBlock *BasicBlock::getEdgeSuccessor(const CFGEdge &Edge) {
+  if (!Edge.From) return nullptr;
+  BrInst *Br = Edge.From->getBranchTerminator();
+  if (!Br || Edge.SuccessorIndex >= Br->getSuccessorCount()) return nullptr;
+  BasicBlock *Successor = Br->getSuccessor(Edge.SuccessorIndex);
+  if (Edge.ExpectedSuccessor && Successor != Edge.ExpectedSuccessor)
+    return nullptr;
+  return Successor;
+}
+
+bool BasicBlock::isCriticalEdge(const CFGEdge &Edge) {
+  BasicBlock *To = getEdgeSuccessor(Edge);
+  if (!To || !Edge.From->hasMultipleDistinctSuccessors()) return false;
+  return To->getPredecessors().size() > 1;
+}
+
+bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
+                              CFGEdgePhiPolicy PhiPolicy) {
+  BasicBlock *From = Edge.From;
+  BasicBlock *OldSucc = getEdgeSuccessor(Edge);
+  if (!From || !OldSucc || !NewSucc || OldSucc == NewSucc) return false;
+
+  Function *F = From->getParent();
+  if (!F || NewSucc->getParent() != F) return false;
+
+  BrInst *Br = From->getBranchTerminator();
+  if (!Br) return false;
+
+  // successor 下标对应同目标边中的第几个 incoming，用它区分平行边。
+  unsigned Occurrence = 0;
+  for (unsigned I = 0; I < Edge.SuccessorIndex; ++I) {
+    if (Br->getSuccessor(I) == OldSucc) ++Occurrence;
+  }
+
+  auto OldPhis = OldSucc->collectPhiNodes();
+  for (PhiInst *Phi : OldPhis) {
+    if (!Phi || Phi->countIncomingFromPred(From) <= Occurrence) return false;
+  }
+
+  if (PhiPolicy == CFGEdgePhiPolicy::RemoveOldIncoming) {
+    // 没有 incoming 值可凭空补给已有 PHI，因此只允许重定向到无 PHI 的目标块。
+    if (!NewSucc->collectPhiNodes().empty()) return false;
+  } else {
+    BrInst *ForwardBr = NewSucc->getBranchTerminator();
+    if (!NewSucc->collectPhiNodes().empty() ||
+        !NewSucc->getPredecessors().empty() || !isUncondBr(ForwardBr) ||
+        ForwardBr->getSuccessor(0) != OldSucc) {
+      return false;
+    }
+  }
+
+  if (!Br->setSuccessor(Edge.SuccessorIndex, NewSucc)) return false;
+
+  for (PhiInst *Phi : OldPhis) {
+    if (PhiPolicy == CFGEdgePhiPolicy::RemoveOldIncoming) {
+      PhiInst::removeIncomingEdge(Phi, From, Occurrence);
+    } else {
+      PhiInst::replaceIncomingPredEdge(Phi, From, NewSucc, Occurrence);
+    }
+  }
+  return true;
+}
+
+bool BasicBlock::foldConditionalBranch(BasicBlock *BB,
+                                       unsigned TakenSuccessorIndex) {
+  if (!BB) return false;
+  BrInst *OldBr = BB->getBranchTerminator();
+  if (!OldBr || !OldBr->isConditional() ||
+      OldBr->getSuccessorCount() != 2 || TakenSuccessorIndex >= 2) {
+    return false;
+  }
+
+  unsigned RemovedSuccessorIndex = TakenSuccessorIndex == 0 ? 1 : 0;
+  BasicBlock *Taken = OldBr->getSuccessor(TakenSuccessorIndex);
+  BasicBlock *Removed = OldBr->getSuccessor(RemovedSuccessorIndex);
+  if (!Taken || !Removed) return false;
+
+  // 两条边目标相同时，精确保留 TakenSuccessorIndex 对应的 incoming。
+  unsigned RemovedOccurrence = 0;
+  for (unsigned I = 0; I < RemovedSuccessorIndex; ++I) {
+    if (OldBr->getSuccessor(I) == Removed) ++RemovedOccurrence;
+  }
+
+  auto RemovedPhis = Removed->collectPhiNodes();
+  for (PhiInst *Phi : RemovedPhis) {
+    if (!Phi || Phi->countIncomingFromPred(BB) <= RemovedOccurrence)
+      return false;
+  }
+
+  if (!BB->replaceTerminator(new BrInst(Taken))) return false;
+  for (PhiInst *Phi : RemovedPhis)
+    PhiInst::removeIncomingEdge(Phi, BB, RemovedOccurrence);
+  return true;
+}
+
+BasicBlock *BasicBlock::splitEdge(Function &F, const CFGEdge &Edge) {
+  BasicBlock *OldSucc = getEdgeSuccessor(Edge);
+  if (!Edge.From || Edge.From->getParent() != &F || !OldSucc ||
+      OldSucc->getParent() != &F) {
+    return nullptr;
+  }
+
+  auto *SplitBB = new BasicBlock();
+  F.pushBlock(SplitBB);
+  SplitBB->genUnCondInst(OldSucc);
+
+  if (!redirectEdge(Edge, SplitBB,
+                    CFGEdgePhiPolicy::PreserveIncomingThroughNewBlock)) {
+    delete SplitBB;
+    return nullptr;
+  }
+  return SplitBB;
 }
 
 void BasicBlock::genRetInst(Value* retVal){
@@ -985,7 +776,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
   bool b = (B->getIRType()->getEnum() == IR_INT);
     BinaryInst* inst;
 
-  if (isIntOnlyBinaryOp(op)) {
+  if (BinaryInst::isIntegerOnlyOp(op)) {
     if (!a) {
       A = genFPTOSIInst(A);
       a = true;
@@ -1040,7 +831,7 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb ,Value* _A,BinaryInst::Operation
     // integer division-by-zero (undef) from IEEE floating division-by-zero
     // (Inf/NaN).  The former hand-written evaluator classified both as undef
     // and additionally evaluated overflowing division/invalid shifts in C++.
-    if (!isIntOnlyBinaryOp(op) &&
+    if (!BinaryInst::isIntegerOnlyOp(op) &&
         (IRType::isFloat(A->getIRType()) ||
          IRType::isFloat(B->getIRType()))) {
       float AV = 0.0f;
@@ -1109,6 +900,44 @@ BasicBlock* BasicBlock::genBlock(std::string ident){
     bb->ident += ident;
     getParent()->pushBlock(bb);
     return bb;
+}
+
+bool BasicBlock::moveInstructionsAfter(Instruction *Position,
+                                       BasicBlock *Destination) {
+  if (!Position || !Destination || Position->getParent() != this ||
+      Destination == this)
+    return false;
+
+  Instruction *OldTerminator = getTerminator();
+  auto OldSuccessors = getSuccessors();
+  for (Instruction *I = Position->getNext(); I;) {
+    Instruction *Next = I->getNext();
+    I->EraseFromParent();
+    Destination->push_back(I);
+    I = Next;
+  }
+  if (OldTerminator && OldTerminator->getParent() == Destination) {
+    std::unordered_set<BasicBlock *> Updated;
+    for (BasicBlock *Succ : OldSuccessors) {
+      if (!Succ || !Updated.insert(Succ).second) continue;
+      replaceIncomingPredInSuccPhis(Succ, this, Destination);
+    }
+  }
+  return true;
+}
+
+BasicBlock *BasicBlock::splitBlockAfter(Instruction *Position) {
+  if (!Position || Position->getParent() != this) return nullptr;
+  Function *F = getParent();
+  if (!F) return nullptr;
+
+  auto *Continuation = new BasicBlock();
+  F->pushBlock(Continuation);
+  if (!moveInstructionsAfter(Position, Continuation)) {
+    delete Continuation;
+    return nullptr;
+  }
+  return Continuation;
 }
 
 // 在 BasicBlock::genCallInst 函数中修改类型检查逻辑
@@ -1210,7 +1039,7 @@ bool BasicBlock::insertAfterPhiNodes(BasicBlock *BB, Instruction *I) {
 }
 
 void BasicBlock::clear(){
-    for(auto inst : *this) assert(inst->getUseList().size == 0);
+    for (auto *Inst : *this) assert(!Inst->hasUses());
     ChainList<BasicBlock,Instruction>::clear();
 }
 
@@ -1360,6 +1189,10 @@ Value* BrInst::getOprand(){
     return nullptr;
 }
 
+bool BrInst::isConditional() const {
+  return isCond;
+}
+
 Value *BrInst::getCondition() const {
   return isConditional() && getNumOperands() == 3 ? getOperand(0) : nullptr;
 }
@@ -1374,6 +1207,12 @@ BasicBlock *BrInst::getSuccessor(unsigned Index) const {
   if (Index >= getSuccessorCount()) return nullptr;
   size_t OperandIndex = isConditional() ? Index + 1 : Index;
   return dynamic_cast<BasicBlock *>(getOperand(OperandIndex));
+}
+
+bool BrInst::setSuccessor(unsigned Index, BasicBlock *Successor) {
+  if (!Successor || Index >= getSuccessorCount()) return false;
+  size_t OperandIndex = isConditional() ? Index + 1 : Index;
+  return replaceOperand(OperandIndex, Successor);
 }
 
 BasicBlock *BrInst::getTrueSuccessor() const {
@@ -1637,15 +1476,14 @@ bool GetElementPtrInst::reset(Value *Base,
 }
 
 std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
-    auto &Operands = getUserList();
-    if (Operands.size() < 2 || !Operands.front()) return std::nullopt;
+    if (getNumOperands() < 2) return std::nullopt;
 
-    Value *Base = Operands.front()->getValue();
+    Value *Base = getOperand(0);
     if (!Base || !Base->getIRType()) return std::nullopt;
 
     std::shared_ptr<IRType> CurrentTy = Base->getIRType();
     int64_t LastStride = 0;
-    for (size_t I = 1; I < Operands.size(); ++I) {
+    for (size_t I = 1; I < getNumOperands(); ++I) {
         std::shared_ptr<IRType> ElementTy;
         if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
             ElementTy = PtrTy->getPointerType();
@@ -1678,31 +1516,32 @@ bool GetElementPtrInst::flattenZeroBasedChain(Value *V, Value *&Base,
         return Base != nullptr;
     }
 
-    auto &Operands = GEP->getUserList();
-    if (Operands.empty() || !Operands.front()) return false;
+    if (GEP->getNumOperands() == 0) return false;
 
-    Value *LocalBase = Operands.front()->getValue();
+    Value *LocalBase = GEP->getOperand(0);
+    if (!LocalBase) return false;
     auto *BaseGEP = dynamic_cast<GetElementPtrInst *>(LocalBase);
     if (BaseGEP) {
-        Value *FirstIndex = nullptr;
-        if (Operands.size() < 2 || !Operands[1] ||
-            !(FirstIndex = Operands[1]->getValue()) ||
+        Value *FirstIndex = GEP->getOperand(1);
+        if (!FirstIndex ||
             !FirstIndex->isConstIntZero()) {
             return false;
         }
         if (!flattenZeroBasedChain(BaseGEP, Base, Indices))
             return false;
-        for (size_t I = 2; I < Operands.size(); ++I) {
-            if (!Operands[I] || !Operands[I]->getValue()) return false;
-            Indices.push_back(Operands[I]->getValue());
+        for (size_t I = 2; I < GEP->getNumOperands(); ++I) {
+            Value *Index = GEP->getOperand(I);
+            if (!Index) return false;
+            Indices.push_back(Index);
         }
         return true;
     }
 
     Base = LocalBase;
-    for (size_t I = 1; I < Operands.size(); ++I) {
-        if (!Operands[I] || !Operands[I]->getValue()) return false;
-        Indices.push_back(Operands[I]->getValue());
+    for (size_t I = 1; I < GEP->getNumOperands(); ++I) {
+        Value *Index = GEP->getOperand(I);
+        if (!Index) return false;
+        Indices.push_back(Index);
     }
     return Base != nullptr;
 }
@@ -1748,7 +1587,7 @@ BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
     if (BinaryInst::isCompareOp(op)) {
       this->irtype = INTType::NewBool();
     }
-    this->instType = mapBinaryOpToInstType(op, x->getIRType()->getEnum());
+    this->instType = getInstType(op, x->getIRType()->getEnum());
     this->addUse(x);
     this->addUse(y);
 }
@@ -2468,8 +2307,7 @@ void Variable::dumpIR(){
     auto type = std::dynamic_pointer_cast<POINTERType>(getIRType());
     type->getPointerType()->to_string();
     std::cout<<" ";
-    if(userList.size() != 0){
-        Value* init = userList[0]->usee;
+    if (Value *init = getOperand(0)) {
         if(auto arrayInit = dynamic_cast<Initializer*>(init)) arrayInit->dumpIR();
         else init->dumpIR();
     }else std::cout<<"zeroinitializer";
@@ -2477,8 +2315,7 @@ void Variable::dumpIR(){
 }
 
  Value* Variable::getUsee(){
-    if(userList.empty()) return nullptr;
-    return userList[0]->usee;
+    return getOperand(0);
  }
 
 Value *Variable::getConstantElement(const std::vector<int> &Path) {
@@ -2556,10 +2393,10 @@ void Initializer::Var2Store(BasicBlock *bb, const std::string &name, std::vector
     }
 }
 
-static bool isAllZeroInitializer(Value *value) {
+bool Initializer::isAllZero(Value *value) {
     if (auto *init = dynamic_cast<Initializer *>(value)) {
         for (Value *element : *init) {
-            if (!isAllZeroInitializer(element)) return false;
+            if (!isAllZero(element)) return false;
         }
         return true;
     }
@@ -2575,7 +2412,7 @@ static bool isAllZeroInitializer(Value *value) {
 }
 
 void Initializer::dumpIR(){
-    if(isAllZeroInitializer(this)){
+    if(isAllZero(this)){
         std::cout << "zeroinitializer";
         return;
     }
@@ -2725,21 +2562,36 @@ void PhiInst::addIncoming(Value* val, BasicBlock* bb) {
     addUse(bb);
 }
 
+unsigned PhiInst::getNumIncomingValues() const {
+    return static_cast<unsigned>(userList.size() / 2);
+}
+
+Value *PhiInst::getIncomingValue(unsigned i) const {
+    return i < getNumIncomingValues() ? userList[i * 2]->getValue() : nullptr;
+}
+
+BasicBlock *PhiInst::getIncomingBlock(unsigned i) const {
+    if (i >= getNumIncomingValues()) return nullptr;
+    return dynamic_cast<BasicBlock *>(userList[i * 2 + 1]->getValue());
+}
+
 void PhiInst::setIncomingValue(unsigned i, Value* val) {
-    // 移除旧的 Use，创建新的
-    // 简单做法：直接修改 usee 指针
-    Use* use = userList[i * 2].get();
-    // 从旧 Value 的 UseList 中移除
-    use->removeFromUseList(use->getUser());
-    // 设置新的 usee
-    use->usee = val;
-    // 加入新 Value 的 UseList
-    val->getUseList().addUseNode(use);
+    if (!val || i >= getNumIncomingValues()) return;
+    replaceOperand(i * 2, val);
 }
 
 bool PhiInst::setIncomingBlock(unsigned i, BasicBlock *BB) {
     if (!BB || i >= getNumIncomingValues()) return false;
     return replaceOperand(i * 2 + 1, BB);
+}
+
+unsigned PhiInst::countIncomingFromPred(BasicBlock *Pred) const {
+    if (!Pred) return 0;
+    unsigned Count = 0;
+    for (unsigned I = 0; I < getNumIncomingValues(); ++I) {
+        if (getIncomingBlock(I) == Pred) ++Count;
+    }
+    return Count;
 }
 
 void PhiInst::dumpIR() {
@@ -2757,6 +2609,14 @@ void PhiInst::dumpIR() {
     }
     std::cout << "\n";
 }
+
+  std::vector<Instruction *> BasicBlock::getInstructions() {
+    std::vector<Instruction *> Instructions;
+    Instructions.reserve(static_cast<std::size_t>(Size()));
+    for (Instruction *I : *this)
+      if (I) Instructions.push_back(I);
+    return Instructions;
+  }
 
   std::vector<PhiInst*> BasicBlock::collectPhiNodes() {
     std::vector<PhiInst*> phis;
@@ -2915,11 +2775,11 @@ BrInst *BasicBlock::getBranchTerminator() {
 }
 
 bool BasicBlock::isCondBr(BrInst *Br) {
-  return Br && Br->getUserList().size() == 3;
+  return Br && Br->isConditional() && Br->getSuccessorCount() == 2;
 }
 
 bool BasicBlock::isUncondBr(BrInst *Br) {
-  return Br && Br->getUserList().size() == 1;
+  return Br && !Br->isConditional() && Br->getSuccessorCount() == 1;
 }
 //计算基本块从From到To的边数
 int BasicBlock::countEdgesToSucc(BasicBlock *To) {
@@ -2927,13 +2787,8 @@ int BasicBlock::countEdgesToSucc(BasicBlock *To) {
   if (!Br || !To) return 0;
 
   int Cnt = 0;
-  auto &UL = Br->getUserList();
-  if (UL.size() == 1) {
-    if (UL[0] && UL[0]->getValue() == To) Cnt = 1;
-  } else if (UL.size() == 3) {
-    if (UL[1] && UL[1]->getValue() == To) ++Cnt;
-    if (UL[2] && UL[2]->getValue() == To) ++Cnt;
-  }
+  for (unsigned I = 0; I < Br->getSuccessorCount(); ++I)
+    if (Br->getSuccessor(I) == To) ++Cnt;
   return Cnt;
 }
 
@@ -2993,20 +2848,43 @@ bool PhiInst::removeIncomingByPred(PhiInst *Phi, BasicBlock *Pred, int RemoveCou
   return rebuildFromIncoming(Phi, Keep);
 }
 
-bool PhiInst::replaceIncomingPred(PhiInst *Phi, BasicBlock *OldPred, BasicBlock *NewPred) {
-  if (!Phi) return false;
-  auto In = Phi->collectIncomingEdges();
-  if (In.empty()) return false;
+bool PhiInst::removeIncomingEdge(PhiInst *Phi, BasicBlock *Pred,
+                                 unsigned Occurrence) {
+  if (!Phi || !Pred) return false;
+  auto Incoming = Phi->collectIncomingEdges();
 
-  bool Changed = false;
-  for (auto &E : In) {
-    if (E.Pred == OldPred) {
-      E.Pred = NewPred;
-      Changed = true;
-    }
+  unsigned Seen = 0;
+  for (auto It = Incoming.begin(); It != Incoming.end(); ++It) {
+    if (It->Pred != Pred) continue;
+    if (Seen++ != Occurrence) continue;
+    Incoming.erase(It);
+    return rebuildFromIncoming(Phi, Incoming);
   }
-  if (!Changed) return false;
-  return rebuildFromIncoming(Phi, In);
+  return false;
+}
+
+bool PhiInst::replaceIncomingPred(PhiInst *Phi, BasicBlock *OldPred, BasicBlock *NewPred) {
+  if (!Phi || !OldPred || !NewPred) return false;
+  bool Changed = false;
+  for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+    if (Phi->getIncomingBlock(I) != OldPred) continue;
+    Changed |= Phi->setIncomingBlock(I, NewPred);
+  }
+  return Changed;
+}
+
+bool PhiInst::replaceIncomingPredEdge(PhiInst *Phi, BasicBlock *OldPred,
+                                      BasicBlock *NewPred,
+                                      unsigned Occurrence) {
+  if (!Phi || !OldPred || !NewPred || OldPred == NewPred) return false;
+
+  unsigned Seen = 0;
+  for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+    if (Phi->getIncomingBlock(I) != OldPred) continue;
+    if (Seen++ != Occurrence) continue;
+    return Phi->setIncomingBlock(I, NewPred);
+  }
+  return false;
 }
 
 void BasicBlock::removeEdgeFromSuccPhis(BasicBlock *Succ, BasicBlock *From, int RemoveCount) {
@@ -3033,13 +2911,9 @@ bool BasicBlock::redirectBranchTarget(BasicBlock *Pred, BasicBlock *OldSucc, Bas
   if (!Br) return false;
 
   bool Changed = false;
-  for (auto &UsePtr : Br->getUserList()) {
-    Use *U = UsePtr.get();
-    if (!U) continue;
-    if (U->getValue() != OldSucc) continue;
-    U->replaceUseeWith(NewSucc);
-    Changed = true;
-  }
+  for (unsigned I = 0; I < Br->getSuccessorCount(); ++I)
+    if (Br->getSuccessor(I) == OldSucc)
+      Changed |= Br->setSuccessor(I, NewSucc);
   return Changed;
 }
 
@@ -3085,9 +2959,7 @@ bool BasicBlock::onlyPhiAndTerminator() {
 
 bool BasicBlock::hasOnlyBlockLocalInstructionUsers(Instruction *I, BasicBlock *BB) {
   if (!I || !BB) return false;
-  for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
-    Use *U = *It;
-    if (!U || U->getValue() != I) continue;
+  for (Use *U : I->getUses()) {
     auto *UserI = dynamic_cast<Instruction *>(U->getUser());
     if (!UserI) return false;
     if (UserI->getParent() != BB) return false;
@@ -3099,7 +2971,7 @@ void BasicBlock::eraseBlockSafely() {
   for (Instruction *I : *this) {
     if (!I) continue;
     if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
-    if (!I->getUseList().is_empty()) {
+    if (I->hasUses()) {
       I->replaceAllUsesWith(UndefValue::NewUndefValue(I->getIRType()));
     }
   }

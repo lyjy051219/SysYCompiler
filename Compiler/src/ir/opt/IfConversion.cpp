@@ -102,8 +102,7 @@ bool IfConversionPass::usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
 	if (!BB || !Succ) return false;
 	for (Instruction *I : *BB) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
-		for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
-			Use *U = *It;
+		for (Use *U : I->getUses()) {
 			if (!U || U->getValue() != I) continue;
 			auto *UI = dynamic_cast<Instruction *>(U->getUser());
 			if (!UI) continue;

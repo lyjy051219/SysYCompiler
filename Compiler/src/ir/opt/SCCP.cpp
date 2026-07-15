@@ -7,6 +7,70 @@
 
 #include <cmath>
 
+LatticeValue::LatticeValue() : state(Top), constVal(nullptr) {}
+
+LatticeValue LatticeValue::getTop() {
+    return LatticeValue();
+}
+
+LatticeValue LatticeValue::getBottom() {
+    LatticeValue LV;
+    LV.state = Bottom;
+    return LV;
+}
+
+LatticeValue LatticeValue::getConstant(Value *V) {
+    LatticeValue LV;
+    LV.state = Constant;
+    LV.constVal = V;
+    return LV;
+}
+
+bool LatticeValue::isTop() const {
+    return state == Top;
+}
+
+bool LatticeValue::isBottom() const {
+    return state == Bottom;
+}
+
+bool LatticeValue::isConstant() const {
+    return state == Constant;
+}
+
+LatticeValue::State LatticeValue::getState() const {
+    return state;
+}
+
+Value *LatticeValue::getConstantValue() const {
+    return constVal;
+}
+
+bool LatticeValue::mergeIn(const LatticeValue &Other) {
+    if (Other.isTop()) return false;
+    if (isBottom()) return false;
+    if (Other.isBottom()) {
+        state = Bottom;
+        constVal = nullptr;
+        return true;
+    }
+    if (isTop()) {
+        state = Constant;
+        constVal = Other.constVal;
+        return true;
+    }
+    if (constVal == Other.constVal) return false;
+
+    // 不同常量对象仍可能表示相同的整数、浮点数或布尔值。
+    if (Value::areEqualConstants(constVal, Other.constVal)) return false;
+
+    state = Bottom;
+    constVal = nullptr;
+    return true;
+}
+
+SCCPSolver::SCCPSolver() = default;
+
 // SCCPSolver 实现
 LatticeValue& SCCPSolver::getValueState(Value* V) {
     auto it = ValueState.find(V);
@@ -26,12 +90,8 @@ LatticeValue& SCCPSolver::getValueState(Value* V) {
 }
 
 void SCCPSolver::pushUsersToWorkList(Value* V) {
-    for (auto it = V->getUseList().begin(); it != V->getUseList().end(); ++it) {
-        Use* U = *it;
-        if (Instruction* UserInst = dynamic_cast<Instruction*>(U->getUser())) {
-            InstWorkList.push_back(UserInst);
-        }
-    }
+    auto Users = V->getInstructionUsers();
+    InstWorkList.insert(InstWorkList.end(), Users.begin(), Users.end());
 }
 
 bool SCCPSolver::mergeInValue(Value* V, const LatticeValue& NewVal) {
@@ -507,7 +567,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
             I->replaceAllUsesWith(constVal);
 
             // 如果指令不再被使用，且无副作用，可以删除
-            if (I->getUseList().is_empty()) {
+            if (!I->hasUses()) {
                 delete I; // ~Node 会自动从链表摘除，~Use 会断开关联
             }
             changed = true;
@@ -564,7 +624,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
     // 3b. 断开不可达块中指令的 Use，然后删除指令和块
     for (BasicBlock* DeadBB : deadBlocks) {
         for (auto inst : *DeadBB) {
-            if (!inst->getUseList().is_empty()) {
+            if (inst->hasUses()) {
                 inst->replaceAllUsesWith(
                     UndefValue::NewUndefValue(inst->getIRType()));
             }

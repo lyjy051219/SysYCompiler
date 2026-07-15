@@ -293,10 +293,11 @@ graph TD
 
   ```c++
   enum TypeSystem{
-      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_FUNCTION,IR_ARRAY,IR_LABEL
-      /*,IR_VECTOR,ARM会用到这个类型*/
+      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
   };
   ```
+
+  `IR_UNDEF` 仅用于表示前端源类型转换失败，不对应可实例化的 IR 类型。
 
 - 结构：
 
@@ -305,12 +306,8 @@ graph TD
   	N1[IRType] -.- N2[TypeSystem Enum]
   	N1[IRType] -.- N3[size]
   	N1[IRType] --> N4[VOIDType]
-  	N1[IRType] --> N5[LABELTyoe]
   	N1[IRType] --> N6[INTType]
   	N1[IRType] --> N10[FLOATType]
-  	N1[IRType] --> N11[FUNCTIONType]
-  	N11[FUNCTIONType] --> N12[returnType]
-  	N11[FUNCTIONType] --> N13[paramTypes]
   	N1[IRType] --> N14[POINTERType]
   	N14[POINTERType] --> N15[pointerType]
   	N1[IRType] --> N16[ARRAYType]

@@ -1,5 +1,27 @@
 #include "ir/analysis/PostDominant.hpp"
 
+bool PostDominatorNode::isVirtualRoot() const {
+    return Block == nullptr;
+}
+
+bool PostDominatorNode::isLeaf() const {
+    return FirstChild == nullptr;
+}
+
+PostDominatorTree::PostDominatorTree() = default;
+
+PostDominatorTree::PostDominatorTree(PostDominatorTree &&other) noexcept = default;
+
+PostDominatorTree &PostDominatorTree::operator=(
+    PostDominatorTree &&other) noexcept = default;
+
+void PostDominatorTree::clear() {
+    Nodes.clear();
+    BlockToNode.clear();
+    ExitReachable.clear();
+    Root = nullptr;
+}
+
 // PostDominatorTree 查询接口实现
 BasicBlock* PostDominatorTree::getIPostDom(BasicBlock* BB) const {
     auto it = BlockToNode.find(BB);

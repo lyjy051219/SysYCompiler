@@ -27,7 +27,8 @@ struct StoreOnlyGlobalReadInfo {
 // 需要访问 FAM 以查 SideEffect/BasicAA/LoopInfo
 class StoreOnlyGlobalEliminationPass : public PassDescriptor<StoreOnlyGlobalEliminationPass> {
 public:
-    explicit StoreOnlyGlobalEliminationPass(FunctionAnalysisPassManager &FAM) : FAM(FAM) {}
+    explicit StoreOnlyGlobalEliminationPass(
+        FunctionAnalysisPassManager &FAM);
     PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
 private:
     static void collectReachableBases(

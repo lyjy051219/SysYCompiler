@@ -9,12 +9,8 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-using PredecessorMap =
-	std::unordered_map<BasicBlock *, std::vector<BasicBlock *>>;
-
-PredecessorMap buildPredecessorMap(Function &F) {
+CFGSimplifyPass::PredecessorMap
+CFGSimplifyPass::buildPredecessorMap(Function &F) {
 	PredecessorMap Result;
 	for (BasicBlock *BB : F) {
 		if (BB) Result.try_emplace(BB);
@@ -30,7 +26,7 @@ PredecessorMap buildPredecessorMap(Function &F) {
 	return Result;
 }
 
-const std::vector<BasicBlock *> &predecessorsOf(
+const std::vector<BasicBlock *> &CFGSimplifyPass::predecessorsOf(
 	BasicBlock *BB, const PredecessorMap &Preds) {
 	static const std::vector<BasicBlock *> Empty;
 	auto It = Preds.find(BB);
@@ -40,7 +36,8 @@ const std::vector<BasicBlock *> &predecessorsOf(
 // Return whether A and B denote the same boolean condition.  Negated is true
 // when A == !B.  Keep this deliberately small and purely syntactic: it is used
 // by CFG simplification, where a false positive would select the wrong edge.
-bool matchBooleanCondition(Value *A, Value *B, bool &Negated) {
+bool CFGSimplifyPass::matchBooleanCondition(
+	Value *A, Value *B, bool &Negated) {
 	Negated = false;
 	if (!A || !B || !IRType::isBool(A->getIRType()) ||
 		!IRType::isBool(B->getIRType()) || Value::isUndef(A) ||
@@ -123,9 +120,9 @@ bool matchBooleanCondition(Value *A, Value *B, bool &Negated) {
 // Map one arm of Controller's branch to the predecessor through which that
 // arm reaches Merge.  A short unique-predecessor trampoline chain is allowed;
 // this covers the common diamond and "direct edge + trampoline" shapes.
-BasicBlock *resolveArmIncomingPred(BasicBlock *Controller,
-									BasicBlock *Arm, BasicBlock *Merge,
-									const PredecessorMap &Preds) {
+BasicBlock *CFGSimplifyPass::resolveArmIncomingPred(
+	BasicBlock *Controller, BasicBlock *Arm, BasicBlock *Merge,
+	const PredecessorMap &Preds) {
 	if (!Controller || !Arm || !Merge) return nullptr;
 	if (Arm == Merge) return Controller;
 
@@ -151,7 +148,7 @@ BasicBlock *resolveArmIncomingPred(BasicBlock *Controller,
 // predecessor trampoline edges above an incoming block.  Walking those local
 // ancestors avoids scanning every block (and rescanning every predecessor)
 // for each boolean PHI in a large function.
-std::vector<BasicBlock *> collectControllerCandidates(
+std::vector<BasicBlock *> CFGSimplifyPass::collectControllerCandidates(
 	BasicBlock *IncomingPred, const PredecessorMap &Preds) {
 	std::vector<BasicBlock *> Result;
 	BasicBlock *Cur = IncomingPred;
@@ -163,8 +160,6 @@ std::vector<BasicBlock *> collectControllerCandidates(
 	}
 	return Result;
 }
-
-} // namespace
 
 //消除死块
 bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
@@ -428,7 +423,7 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 					BoolPhi->replaceWith(Phi);
 					delete BoolPhi;
 				}
-				if (InsertedNot && InsertedNot->getUseList().is_empty())
+				if (InsertedNot && !InsertedNot->hasUses())
 					delete InsertedNot;
 				continue;
 			}
@@ -563,9 +558,7 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 		return false;
 	}
 	if (CondNot) {
-		for (auto It = CondNot->getUseList().begin();
-			 It != CondNot->getUseList().end(); ++It) {
-			Use *U = *It;
+		for (Use *U : CondNot->getUses()) {
 			if (!U || U->getValue() != CondNot) continue;
 			if (U->getUser() != Br) return false;
 		}
@@ -610,9 +603,7 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 			}
 		}
 
-		for (auto It = Phi->getUseList().begin(); It != Phi->getUseList().end();
-			 ++It) {
-			Use *U = *It;
+		for (Use *U : Phi->getUses()) {
 			if (!U || U->getValue() != Phi) continue;
 			auto *UserI = dynamic_cast<Instruction *>(U->getUser());
 			if (Phi == CondPhi &&
@@ -639,17 +630,13 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 
 	// Build all successor-PHI rewrites before mutating the CFG.  An incoming
 	// value defined by a PHI in B is translated to that PHI's value on Pred->B.
-	struct PhiRewrite {
-		PhiInst *Phi = nullptr;
-		std::vector<PhiInst::IncomingEdge> Incoming;
-	};
-	std::vector<PhiRewrite> Rewrites;
+		std::vector<BranchPhiRewrite> Rewrites;
 	for (BasicBlock *Dest : {TrueBB, FalseBB}) {
 		for (PhiInst *Phi : Dest->collectPhiNodes()) {
 			if (!Phi) return false;
 			auto Old = Phi->collectIncomingEdges();
 			unsigned FromBBCount = 0;
-			PhiRewrite Rewrite;
+				BranchPhiRewrite Rewrite;
 			Rewrite.Phi = Phi;
 			for (const auto &Edge : Old) {
 				if (Edge.Pred != BB) {
@@ -791,8 +778,7 @@ bool CFGSimplifyPass::simplifyUncondBranch(Function &F, BasicBlock *BB) {
 	auto BBPhis = BB->collectPhiNodes();
 	for (PhiInst *Phi : BBPhis) {
 		if (!Phi) continue;
-		for (auto It = Phi->getUseList().begin(); It != Phi->getUseList().end(); ++It) {
-			Use *U = *It;
+		for (Use *U : Phi->getUses()) {
 			if (!U || U->getValue() != Phi) continue;
 			auto *UI = dynamic_cast<Instruction *>(U->getUser());
 			if (!UI || UI->getParent() != Succ) return false;

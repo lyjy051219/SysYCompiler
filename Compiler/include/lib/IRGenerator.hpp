@@ -1,181 +1,185 @@
 #pragma once
+
 #include "AST.hpp"
-#include "BaseManager.hpp"
-#include "TypeSystem.hpp"
-#include "SymbolTable.hpp"
 #include "CFG.hpp"
-#include "Tool.hpp"
-#include <vector>
-#include <string>
+#include "TypeSystem.hpp"
+
+#include <cstddef>
 #include <memory>
-#include <stack>
-/*所有关于上下文的东西都采用了栈的方式进行传入 */
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-class ContextType{
+// ASTVisitor 仍负责顶层、声明和语句的动态分派；表达式及其他会产生结果的
+// 子树由显式返回值的 lowering 接口处理。这样父子节点之间不再依赖共享栈。
+class IRGenerator final : public ASTVisitor {
 private:
-    //这里存储的Type是IR生成后的type
-    std::stack<TypeSystem> typestack;
+    struct LoopTargets {
+        BasicBlock* continueTarget = nullptr;
+        BasicBlock* breakTarget = nullptr;
+    };
+
+    struct GenerationContext {
+        Function* function = nullptr;
+        BasicBlock* block = nullptr;
+        std::vector<LoopTargets> loops;
+
+        bool inFunction() const noexcept { return function != nullptr; }
+    };
+
+    enum class BindingKind {
+        ConstantValue,
+        ObjectAddress,
+        ArrayParameter,
+    };
+
+    enum class InitializerRole {
+        CompleteObject,
+        ArrayElement,
+    };
+
+    struct Binding {
+        BindingKind kind = BindingKind::ObjectAddress;
+        std::shared_ptr<IRType> objectType;
+        bool isMutable = true;
+        Initializer* constantInitializer = nullptr;
+    };
+
+    // value 是常量/已退化指针或对象地址；objectType 明确描述当前对象，
+    // isAddress 决定是否 load，避免再通过下标数量和指针层级猜测。
+    struct LValueRef {
+        Value* value = nullptr;
+        std::shared_ptr<IRType> objectType;
+        bool isAddress = false;
+        bool isMutable = false;
+    };
+
+    GenerationContext context_;
+    std::unordered_map<std::string, Function*> functions_;
+    std::unordered_map<Value*, Binding> bindings_;
+
+    BasicBlock& currentBlock() const;
+    TypeSystem lowerSourceType(Type type, bool allowVoid = false) const;
+    std::shared_ptr<IRType> lowerScalarType(Type type) const;
+    bool isConstantPrimary(const HasOperand& node) const;
+    bool isConstantExpression(const UnaryExp& node) const;
+    bool isConstantExpression(const MulExp& node) const;
+    bool isConstantExpression(const AddExp& node) const;
+    bool isConstantExpression(const RelExp& node) const;
+    bool isConstantExpression(const EqExp& node) const;
+    template <typename OperandT>
+    bool hasConstantOperands(const BaseExp<OperandT>& node) const;
+    bool isConstantInitializerSyntax(const InitVal& node) const;
+
+    template <typename DefinitionT>
+    void lowerDefinition(DefinitionT& node, TypeSystem declaredType,
+                         bool isConstant);
+    void lowerParameter(FuncParam& node);
+    std::shared_ptr<IRType> lowerArrayType(
+        const ArrayList& dimensions,
+        std::shared_ptr<IRType> elementType);
+
+    Value* lowerInitializer(const InitVal& node,
+                            const std::shared_ptr<IRType>& expectedType,
+                            InitializerRole role =
+                                InitializerRole::CompleteObject);
+    Initializer* lowerInitializerList(
+        const InitValList& node,
+        const std::shared_ptr<IRType>& expectedType);
+    std::shared_ptr<IRType> initializerLeafType(
+        std::shared_ptr<IRType> type) const;
+    std::size_t initializerLeafCount(
+        std::shared_ptr<IRType> type) const;
+    void emitLocalArrayInitialization(AllocaInst* destination,
+                                      const std::shared_ptr<IRType>& arrayType,
+                                      Value* initializer);
+    void emitDynamicInitializerStores(Value* destination,
+                                      Initializer& initializer,
+                                      std::vector<int>& indices);
+
+    LValueRef lowerLValue(const LVal& node);
+    Value* lowerRValue(const LVal& node);
+    Value* decayArrayPointer(Value* pointer);
+    Value* tryLowerConstantArrayElement(
+        const Binding& binding, const std::vector<Value*>& indices);
+
+    Value* lowerPrimary(const HasOperand& node);
+    Value* lowerExpression(const UnaryExp& node);
+    Value* lowerExpression(const MulExp& node);
+    Value* lowerExpression(const AddExp& node);
+    Value* lowerExpression(const RelExp& node);
+    Value* lowerExpression(const EqExp& node);
+    Value* lowerExpression(const FuncCall& node);
+    Value* lowerExpression(const ConValue<int>& node);
+    Value* lowerExpression(const ConValue<float>& node);
+
+    template <typename OperandT>
+    Value* lowerBinaryChain(const BaseExp<OperandT>& node);
+    BinaryInst::Operation lowerBinaryOperator(Type type) const;
+    Value* emitBinary(Value* left, BinaryInst::Operation operation,
+                      Value* right);
+
+    std::vector<Value*> lowerArguments(const FuncRParamList& node);
+    Value* emitCall(const FuncCall& node, std::vector<Value*> arguments);
+    bool coerceCallArguments(const std::string& callee,
+                             std::vector<Value*>& arguments);
+
+    Value* coerce(Value* value, const std::shared_ptr<IRType>& targetType);
+    Value* toCondition(Value* value);
+    Value* logicalNot(Value* value);
+    Value* zeroValue(const std::shared_ptr<IRType>& type) const;
+
+    void emitCondition(const LOrExp& node, BasicBlock* entry,
+                       BasicBlock* isTrue, BasicBlock* isFalse);
+    void emitCondition(const LAndExp& node, BasicBlock* entry,
+                       BasicBlock* isTrue, BasicBlock* isFalse);
+    template <typename ConditionT>
+    void emitDiscardedCondition(const ConditionT& node);
+
 public:
-    void push_type(TypeSystem ty){ typestack.push(ty); }
-    void pop_type(){  typestack.pop(); }
-    TypeSystem getCurrentType() const{
-        if(typestack.empty()){
-            std::cerr<<"typestack操作不合法\n";
-            assert(0);
-        }
-        return typestack.top();
-    }
-};
+    // 编译单元
+    void visit(CompUnit& node) override;
 
-//这是IR生成相关类
-class IRGenerator : public ASTVisitor{
-private:
-    bool enterUnaryExp = false;
-    //这个Value stack是专门用来传递创建好的initval然后用于上一层addUse的
-    std::stack<Value*> valueStack;
-    //用来传递上下文的TypeSystem
-    ContextType contextType;
-    //这个Function stack用来处理当前用到的Function
-    std::stack<Function*> functionStack;
-    //当前正在构建的基本块
-    //由于基本块不会嵌套，所以设立成指针即可，不需要用到栈
-    BasicBlock* currentBasicBlock = nullptr;
-    //condBasicBlock:遇到continue跳到条件基本块
-    BasicBlock* continueBB = nullptr;  // 条件判断块
-    //endBasicBlock：遇到break跳到循环结束的块
-    BasicBlock* breakBB = nullptr;   // 循环结束块
-
-    std::stack<std::vector<Value*>> argsStack; //实参传递时使用的vector
-
-    std::stack<std::shared_ptr<IRType>> arrayTypeStack;
-
-    std::shared_ptr<IRType> currentIRType = nullptr;
-
-
-    TypeSystem ASTCastIRType(Type t); //将变量/常量类型映射为float/int
-    Value* popValue();
-    void pushValue(Value* val);
-    void getLValPointer(LVal& node);
-    void getOperand(LOrExp &node, BasicBlock* block, BasicBlock* is_true, BasicBlock* is_false);
-    void getOperand(LAndExp &node, BasicBlock* block, BasicBlock* is_true, BasicBlock* is_false);
-    template<typename T>
-    Value* getOperand(const std::list<std::unique_ptr<T>>& operands,const std::list<Type>& ops);
-    Value* getOperand(EqExp& node,BasicBlock* block);
-public:
-   // 编译单元
-    void visit(CompUnit &node) override;
     // 声明
-    void visit(ConstDecl &node) override;
-    void visit(VarDecl &node) override;
-    void visit(ConstDefList &node) override;
-    void visit(VarDefList &node) override;
-    void visit(ConstDef &node) override;
-    void visit(VarDef &node) override;
+    void visit(ConstDecl& node) override;
+    void visit(VarDecl& node) override;
+    void visit(ConstDefList& node) override;
+    void visit(VarDefList& node) override;
+    void visit(ConstDef& node) override;
+    void visit(VarDef& node) override;
+
     // 函数
-    void visit(FuncDef &node) override;
-    void visit(FuncParam &node) override;
-    void visit(FuncParamList &node) override;
+    void visit(FuncDef& node) override;
+    void visit(FuncParam& node) override;
+    void visit(FuncParamList& node) override;
+
     // 初始化
-    void visit(InitValList &node) override;
-    void visit(InitVal &node) override;
+    void visit(InitValList& node) override;
+    void visit(InitVal& node) override;
 
     // 语句
-    void visit(Block &node) override;
-    void visit(BlockItemList &node) override;
-    void visit(AssignStmt &node) override;
-    void visit(ExpStmt &node) override;
-    void visit(IfStmt &node) override;
-    void visit(WhileStmt &node) override;
-    void visit(BreakStmt &node) override;
-    void visit(ContinueStmt &node) override;
-    void visit(ReturnStmt &node) override;
-    // 表达式
-    void visit(LVal &node) override;
-    void visit(FuncCall &node) override;
-    void visit(ArrayList &node) override;
-    void visit(FuncRParamList &node) override;
-    // 表达式类
-    void visit(UnaryExp &node) override;
-    void visit(MulExp &node) override;
-    void visit(AddExp &node) override;
-    void visit(RelExp &node) override;
-    void visit(EqExp &node) override;
-    void visit(LAndExp &node) override;
-    void visit(LOrExp &node) override;
-    // 常量
-    void visit(ConValue<int> &node) override;
-    void visit(ConValue<float> &node) override;
+    void visit(Block& node) override;
+    void visit(BlockItemList& node) override;
+    void visit(AssignStmt& node) override;
+    void visit(ExpStmt& node) override;
+    void visit(IfStmt& node) override;
+    void visit(WhileStmt& node) override;
+    void visit(BreakStmt& node) override;
+    void visit(ContinueStmt& node) override;
+    void visit(ReturnStmt& node) override;
+
+    // 表达式兼容入口。IRGenerator 内部不会用这些 void Visitor 回传值。
+    void visit(LVal& node) override;
+    void visit(FuncCall& node) override;
+    void visit(ArrayList& node) override;
+    void visit(FuncRParamList& node) override;
+    void visit(UnaryExp& node) override;
+    void visit(MulExp& node) override;
+    void visit(AddExp& node) override;
+    void visit(RelExp& node) override;
+    void visit(EqExp& node) override;
+    void visit(LAndExp& node) override;
+    void visit(LOrExp& node) override;
+    void visit(ConValue<int>& node) override;
+    void visit(ConValue<float>& node) override;
 };
-template<typename T>
-Value* IRGenerator::getOperand(const std::list<std::unique_ptr<T>>& operands,const std::list<Type>& ops){
-    if(enterUnaryExp == true){
-        enterUnaryExp = false;
-        operands.front()->accept(*this);
-        enterUnaryExp = true;
-        Value* ptr = popValue();
-
-            for(auto i=ops.rbegin();i!=ops.rend();i++){
-                switch (*i)
-                {
-                case SY_NOT:
-                    switch(ptr->getIRType()->getEnum())
-                    {
-                        case IR_INT:{
-                            auto t = std::dynamic_pointer_cast<INTType>(ptr->getIRType());
-                            if(t->getIsBool())
-                                ptr=BasicBlock::genBinaryInst(currentBasicBlock,ptr,BinaryInst::E,ConstBool::newConstBool());
-                            else
-                                ptr=BasicBlock::genBinaryInst(currentBasicBlock,ptr,BinaryInst::E,ConstInt::newConstInt(0));
-                            break;}
-                        case IR_FLOAT:{ptr=BasicBlock::genBinaryInst(currentBasicBlock,ConstFloat::newConstFloat(),BinaryInst::E,ptr);break;}
-                        case IR_POINTER:{ptr=BasicBlock::genBinaryInst(currentBasicBlock,ConstPtr::newConstPtr(ptr->getIRType()),BinaryInst::E,ptr);break;}
-                        default:assert(0);
-                    }
-                case SY_ADD:
-                    break;
-                case SY_SUB:
-                    if(ptr->getIRType()->getEnum()==IR_INT)
-                        ptr=BasicBlock::genBinaryInst(currentBasicBlock,ConstInt::newConstInt(0),BinaryInst::SUB,ptr);
-                    else
-                        ptr=BasicBlock::genBinaryInst(currentBasicBlock,ConstFloat::newConstFloat(),BinaryInst::SUB,ptr);
-                    break;
-                default:
-                    assert(0);
-                    std::cerr<<"Wrong Operator in BinaryExp\n";
-                    break;
-                }
-            }
-            return ptr;
-
-    }else{
-    auto i = operands.begin();
-    (*i)->accept(*this);
-    auto oper = popValue();
-    for(auto &j:ops){
-        i++;
-        (*i)->accept(*this);
-        auto another = popValue();
-        BinaryInst::Operation opcode;
-        switch(j){
-                case SY_ADD:opcode=BinaryInst::ADD;break;
-                case SY_SUB:opcode=BinaryInst::SUB;break;
-                case SY_DIV:opcode=BinaryInst::DIV;break;
-                case SY_MUL:opcode=BinaryInst::MUL;break;
-                case SY_EQ:opcode=BinaryInst::E;break;
-                case SY_AND:opcode=BinaryInst::AND;break;
-                case SY_GREAT:opcode=BinaryInst::G;break;
-                case SY_LESS:opcode=BinaryInst::L;break;
-                case SY_GREATEQ:opcode=BinaryInst::GE;break;
-                case SY_LESSEQ:opcode=BinaryInst::LE;break;
-                case SY_MOD:opcode=BinaryInst::MOD;break;
-                case SY_NOTEQ:opcode=BinaryInst::NE;break;
-                case SY_OR:opcode=BinaryInst::OR;break;
-                default:
-                    std::cerr<<"No such Opcode\n";
-                    assert(0);
-        }
-        oper = BasicBlock::genBinaryInst(currentBasicBlock,oper,opcode,another);
-    }
-    return oper;
-    }
-}

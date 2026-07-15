@@ -74,8 +74,8 @@ public:
     unsigned DFSNumIn  = 0;   // 欧拉序进入时间戳 (用于O(1)查询)
     unsigned DFSNumOut = 0;   // 欧拉序离开时间戳
 
-    bool isVirtualRoot() const { return Block == nullptr; }
-    bool isLeaf() const { return FirstChild == nullptr; }
+    bool isVirtualRoot() const;
+    bool isLeaf() const;
 };
 
 // 后支配树
@@ -89,20 +89,15 @@ public:
     // 记录哪些块能到达出口 (即在 postdom 树中被访问到)，供 DSE 查询使用
     std::unordered_set<BasicBlock*> ExitReachable;
 
-    void clear() {
-        Nodes.clear();
-        BlockToNode.clear();
-        ExitReachable.clear();
-        Root = nullptr;
-    }
+    void clear();
 
-    PostDominatorTree() = default;
+    PostDominatorTree();
     // 禁用拷贝
     PostDominatorTree(const PostDominatorTree&) = delete;
     PostDominatorTree& operator=(const PostDominatorTree&) = delete;
     // 允许移动
-    PostDominatorTree(PostDominatorTree&& other) noexcept = default;
-    PostDominatorTree& operator=(PostDominatorTree&& other) noexcept = default;
+    PostDominatorTree(PostDominatorTree&& other) noexcept;
+    PostDominatorTree& operator=(PostDominatorTree&& other) noexcept;
 
     // ========== 对外查询接口 ==========
 

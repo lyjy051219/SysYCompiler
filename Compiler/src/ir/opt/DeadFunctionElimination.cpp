@@ -3,6 +3,10 @@
 #include <unordered_set>
 #include <vector>
 
+DeadFunctionEliminationPass::DeadFunctionEliminationPass(
+	FunctionAnalysisPassManager &FAM)
+	: FAM(FAM) {}
+
 PreservationStatus DeadFunctionEliminationPass::run(
 	Module &M,
 	ModuleAnalysisPassManager &MAM)
@@ -44,8 +48,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 		Function *F = FPtr.get();
 		if (!F) continue;
 
-		for (auto UIt = F->getUseList().begin(); UIt != F->getUseList().end(); ++UIt) {
-			Use *U = *UIt;
+		for (Use *U : F->getUses()) {
 			if (!U) continue;
 
 			auto *I = dynamic_cast<Instruction *>(U->getUser());

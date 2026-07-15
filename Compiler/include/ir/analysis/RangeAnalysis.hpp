@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <climits>
 #include <cmath>
-#include <limits>
 #include <algorithm>
 
 class Loop;
+class SCEVResult;
 
 // =====================================================================
 // RangeAnalysis — 值范围分析
@@ -87,51 +87,29 @@ struct IntRange {
     static constexpr int64_t I32_MAX = INT32_MAX;
 
     // 计算一个整数值的 trailing zero 数（0 → 31 上限避免无意义无穷）
-    static int trailingZerosOf(int64_t v) {
-        if (v == 0) return 31;  // 0 是所有 2^k 的倍数，但为防"无限 align"用 31 封顶
-        uint64_t u = (uint64_t)(v < 0 ? -v : v);
-        int n = 0;
-        while (((u >> n) & 1ULL) == 0 && n < 31) n++;
-        return n;
-    }
+    static int trailingZerosOf(int64_t v);
 
-    IntRange() : min(I32_MIN), max(I32_MAX), knownTrailingZeros(0) {}
-    explicit IntRange(int64_t val) : min(val), max(val),
-        knownTrailingZeros(trailingZerosOf(val)) {}
-    IntRange(int64_t lo, int64_t hi) : min(lo), max(hi), knownTrailingZeros(0) {}
+    IntRange();
+    explicit IntRange(int64_t val);
+    IntRange(int64_t lo, int64_t hi);
 
     // isTop 只回答"值域是不是 i32 全范围" —— 和 KnownBits lattice 解耦。
     // 之前把 knownTrailingZeros==0 也塞进判定，结果：range 全范围但 tz 推出
     // 非零时会被当成"非 Top"，下游做端点比较又退化为无意义的 -1，纯精度
     // 损失没带来任何好处；现在还原成纯 range lattice 的语义。
-    bool isTop() const { return min == I32_MIN && max == I32_MAX; }
-    bool isBottom() const { return min > max; }
-    bool isSingleValue() const { return min == max && !isBottom(); }
-    bool isNonNegative() const { return !isBottom() && min >= 0; }
-    bool isPositive() const { return !isBottom() && min > 0; }
+    bool isTop() const;
+    bool isBottom() const;
+    bool isSingleValue() const;
+    bool isNonNegative() const;
+    bool isPositive() const;
     // 是否是 2^k 的倍数（k > 0 即至少偶数）
-    bool isMultipleOf(int k) const { return knownTrailingZeros >= k; }
+    bool isMultipleOf(int k) const;
 
-    IntRange unionWith(const IntRange &other) const {
-        if (isBottom()) return other;
-        if (other.isBottom()) return *this;
-        IntRange r(std::min(min, other.min), std::max(max, other.max));
-        // trailing zeros 取两者 min（union 是保守的，只保留两侧都具备的对齐）
-        r.knownTrailingZeros = std::min(knownTrailingZeros, other.knownTrailingZeros);
-        return r;
-    }
+    IntRange unionWith(const IntRange &other) const;
+    IntRange intersectWith(const IntRange &other) const;
 
-    IntRange intersectWith(const IntRange &other) const {
-        IntRange r(std::max(min, other.min), std::min(max, other.max));
-        // intersect 时对齐取两者 max（更紧的约束胜出）
-        r.knownTrailingZeros = std::max(knownTrailingZeros, other.knownTrailingZeros);
-        return r;
-    }
-
-    bool operator==(const IntRange &o) const {
-        return min == o.min && max == o.max && knownTrailingZeros == o.knownTrailingZeros;
-    }
-    bool operator!=(const IntRange &o) const { return !(*this == o); }
+    bool operator==(const IntRange &o) const;
+    bool operator!=(const IntRange &o) const;
 
     IntRange add(const IntRange &rhs) const;
     IntRange sub(const IntRange &rhs) const;
@@ -149,8 +127,8 @@ struct IntRange {
     IntRange band(const IntRange &rhs) const;
     IntRange bor(const IntRange &rhs) const;
 
-    static IntRange bottom() { return IntRange(1, 0); }
-    static IntRange nonNegative() { return IntRange(0, I32_MAX); }
+    static IntRange bottom();
+    static IntRange nonNegative();
 };
 
 // ---------------------------------------------------------------------
@@ -178,109 +156,46 @@ struct KnownBits {
     uint32_t zero = 0;
     uint32_t one  = 0;
 
-    KnownBits() = default;
-    KnownBits(uint32_t z, uint32_t o) : zero(z), one(o) {}
+    KnownBits();
+    KnownBits(uint32_t z, uint32_t o);
 
-    static KnownBits top() { return {}; }
-    static KnownBits fromConst(int32_t v) { return {(uint32_t)~v, (uint32_t)v}; }
+    static KnownBits top();
+    static KnownBits fromConst(int32_t v);
 
-    bool isConflict() const { return (zero & one) != 0; }
-    bool isTop() const { return zero == 0 && one == 0; }
-    bool isFullyKnown() const {
-        return !isConflict() && (zero | one) == 0xFFFFFFFFu;
-    }
-    int32_t getConstant() const { return (int32_t)one; }
+    bool isConflict() const;
+    bool isTop() const;
+    bool isFullyKnown() const;
+    int32_t getConstant() const;
 
     // 低位连续的 known-zero 数（LSB 对齐信息）
-    int getTrailingZeros() const {
-        int n = 0;
-        while (n < 32 && ((zero >> n) & 1u)) n++;
-        return n;
-    }
+    int getTrailingZeros() const;
     // 低位连续的 known-one 数
-    int getTrailingOnes() const {
-        int n = 0;
-        while (n < 32 && ((one >> n) & 1u)) n++;
-        return n;
-    }
+    int getTrailingOnes() const;
     // 符号位已知为 0 / 1
-    bool knownNonNegative() const { return (zero & 0x80000000u) != 0; }
-    bool knownNegative()    const { return (one  & 0x80000000u) != 0; }
+    bool knownNonNegative() const;
+    bool knownNegative() const;
 
     // union（PHI merge）：同时确定且同值的 bit 才保留
-    KnownBits unionWith(const KnownBits &o) const {
-        return {zero & o.zero, one & o.one};
-    }
+    KnownBits unionWith(const KnownBits &o) const;
     // intersect（narrowing）：任一侧确定就保留；冲突 bit 同时丢掉避免污染
-    KnownBits intersectWith(const KnownBits &o) const {
-        uint32_t z = zero | o.zero;
-        uint32_t w = one  | o.one;
-        uint32_t conflict = z & w;
-        return {z & ~conflict, w & ~conflict};
-    }
+    KnownBits intersectWith(const KnownBits &o) const;
 
-    bool operator==(const KnownBits &o) const {
-        return zero == o.zero && one == o.one;
-    }
-    bool operator!=(const KnownBits &o) const { return !(*this == o); }
+    bool operator==(const KnownBits &o) const;
+    bool operator!=(const KnownBits &o) const;
 
     // 位运算 / 移位的 KB 传播
     // k==0 是 identity（原值不变，不能退 Top 丢信息）；k 超范围才保守 Top
-    KnownBits shl(int k) const {
-        if (k == 0) return *this;
-        if (k < 0 || k >= 32) return top();
-        uint32_t lowZero = (1u << k) - 1;
-        return {(zero << k) | lowZero, (one << k)};
-    }
-    KnownBits lshr(int k) const {
-        if (k == 0) return *this;
-        if (k < 0 || k >= 32) return top();
-        uint32_t hiZero = ~0u << (32 - k);  // 逻辑右移低位填 0 → 高位 known-zero
-        return {(zero >> k) | hiZero, (one >> k)};
-    }
-    KnownBits ashr(int k) const {
-        if (k == 0) return *this;
-        if (k < 0 || k >= 32) return top();
-        uint32_t hiMask = ~0u << (32 - k);
-        uint32_t signZero = (zero >> 31) & 1u;
-        uint32_t signOne  = (one  >> 31) & 1u;
-        return {(zero >> k) | (signZero ? hiMask : 0u),
-                (one  >> k) | (signOne  ? hiMask : 0u)};
-    }
-    KnownBits band(const KnownBits &o) const {
-        return {zero | o.zero, one & o.one};
-    }
-    KnownBits bor(const KnownBits &o) const {
-        return {zero & o.zero, one | o.one};
-    }
-    KnownBits bxor(const KnownBits &o) const {
-        uint32_t knownA = zero | one;
-        uint32_t knownB = o.zero | o.one;
-        uint32_t both = knownA & knownB;
-        uint32_t resOne  = (one ^ o.one) & both;
-        uint32_t resZero = (~resOne) & both;
-        return {resZero, resOne};
-    }
+    KnownBits shl(int k) const;
+    KnownBits lshr(int k) const;
+    KnownBits ashr(int k) const;
+    KnownBits band(const KnownBits &o) const;
+    KnownBits bor(const KnownBits &o) const;
+    KnownBits bxor(const KnownBits &o) const;
     // add/sub：我们只保留"两侧 trailing zeros 的下界"（进位会污染所有其它位）
-    KnownBits add(const KnownBits &o) const {
-        int tz = std::min(getTrailingZeros(), o.getTrailingZeros());
-        if (tz == 0) return top();
-        if (tz >= 32) return {~0u, 0};
-        return {(uint32_t)((1u << tz) - 1), 0};
-    }
-    KnownBits sub(const KnownBits &o) const {
-        int tz = std::min(getTrailingZeros(), o.getTrailingZeros());
-        if (tz == 0) return top();
-        if (tz >= 32) return {~0u, 0};
-        return {(uint32_t)((1u << tz) - 1), 0};
-    }
+    KnownBits add(const KnownBits &o) const;
+    KnownBits sub(const KnownBits &o) const;
     // mul：trailing zeros 相加；其余位全退 unknown
-    KnownBits mul(const KnownBits &o) const {
-        int tz = getTrailingZeros() + o.getTrailingZeros();
-        if (tz >= 32) return {~0u, 0};
-        if (tz == 0) return top();
-        return {(uint32_t)((1u << tz) - 1), 0};
-    }
+    KnownBits mul(const KnownBits &o) const;
 
     // 反推 IntRange（和 IntRange 联动的唯一桥）
     IntRange toIntRange() const;
@@ -301,83 +216,36 @@ struct FloatRange {
     bool mayPositiveZero;
     bool mayNegativeZero;
 
-    static constexpr double F_MIN_INF() { return -std::numeric_limits<double>::infinity(); }
-    static constexpr double F_MAX_INF() { return std::numeric_limits<double>::infinity(); }
+    static double F_MIN_INF();
+    static double F_MAX_INF();
 
     // Top: any f32 value, including NaN and either signed zero.
-    FloatRange()
-        : min(F_MIN_INF()), max(F_MAX_INF()), mayNaN(true),
-          mayPositiveZero(true), mayNegativeZero(true) {}
+    FloatRange();
 
     // Exact IEEE value.  In particular this preserves the sign of zero and
     // represents an exact NaN as "NaN-only", not as an unconstrained number.
-    explicit FloatRange(double val)
-        : min(val), max(val), mayNaN(std::isnan(val)),
-          mayPositiveZero(false), mayNegativeZero(false) {
-        if (mayNaN) {
-            min = 1.0;
-            max = 0.0;
-        } else if (val == 0.0) {
-            mayNegativeZero = std::signbit(val);
-            mayPositiveZero = !mayNegativeZero;
-        }
-    }
+    explicit FloatRange(double val);
 
     // Numeric interval known not to contain NaN.  An interval boundary at
     // numerical zero cannot distinguish its sign, so both zeros are retained.
-    FloatRange(double lo, double hi) {
-        if (std::isnan(lo) || std::isnan(hi)) {
-            min = F_MIN_INF();
-            max = F_MAX_INF();
-            mayNaN = true;
-            mayPositiveZero = true;
-            mayNegativeZero = true;
-        } else {
-            min = lo;
-            max = hi;
-            mayNaN = false;
-            bool ContainsZero = lo <= 0.0 && hi >= 0.0;
-            mayPositiveZero = ContainsZero;
-            mayNegativeZero = ContainsZero;
-        }
-    }
+    FloatRange(double lo, double hi);
 
-    bool hasNumericValues() const { return min <= max; }
-    bool mayContainNaN() const { return mayNaN; }
-    bool containsZero() const {
-        return hasNumericValues() && min <= 0.0 && max >= 0.0 &&
-               (mayPositiveZero || mayNegativeZero);
-    }
-    bool mayContainInfinity() const {
-        return hasNumericValues() && (std::isinf(min) || std::isinf(max));
-    }
-    bool isTop() const {
-        return min == F_MIN_INF() && max == F_MAX_INF() && mayNaN &&
-               mayPositiveZero && mayNegativeZero;
-    }
-    bool isBottom() const { return !hasNumericValues() && !mayNaN; }
-    bool isNaNOnly() const { return !hasNumericValues() && mayNaN; }
-    bool isExactNumericValue() const {
-        if (mayNaN || !hasNumericValues() || min != max) return false;
-        if (min != 0.0) return true;
-        return mayPositiveZero != mayNegativeZero;
-    }
-    bool isSingleValue() const {
-        return isExactNumericValue() && !std::isinf(min);
-    }
-    bool isNonNegative() const {
-        return !mayNaN && hasNumericValues() && min >= 0.0;
-    }
+    bool hasNumericValues() const;
+    bool mayContainNaN() const;
+    bool containsZero() const;
+    bool mayContainInfinity() const;
+    bool isTop() const;
+    bool isBottom() const;
+    bool isNaNOnly() const;
+    bool isExactNumericValue() const;
+    bool isSingleValue() const;
+    bool isNonNegative() const;
 
     FloatRange unionWith(const FloatRange &other) const;
     FloatRange intersectWith(const FloatRange &other) const;
 
-    bool operator==(const FloatRange &o) const {
-        return min == o.min && max == o.max && mayNaN == o.mayNaN &&
-               mayPositiveZero == o.mayPositiveZero &&
-               mayNegativeZero == o.mayNegativeZero;
-    }
-    bool operator!=(const FloatRange &o) const { return !(*this == o); }
+    bool operator==(const FloatRange &o) const;
+    bool operator!=(const FloatRange &o) const;
 
     FloatRange add(const FloatRange &rhs) const;
     FloatRange sub(const FloatRange &rhs) const;
@@ -385,12 +253,72 @@ struct FloatRange {
     FloatRange fdiv(const FloatRange &rhs) const;
 
     static FloatRange sanitize(double Lo, double Hi, bool MayNaN = false);
-    static FloatRange bottom() {
-        FloatRange R(1.0, 0.0);
-        R.mayNaN = false;
-        R.mayPositiveZero = false;
-        R.mayNegativeZero = false;
-        return R;
+    static FloatRange bottom();
+
+private:
+    static bool containsPosInf(const FloatRange &R);
+    static bool containsNegInf(const FloatRange &R);
+    static float exactF32Value(const FloatRange &R);
+    static bool eitherNaNPropagates(const FloatRange &L,
+                                    const FloatRange &R);
+
+    // 端点求值依赖具体算术操作，保留为真正的函数模板以避免类型擦除开销。
+    template <typename Fn>
+    static FloatRange evaluateFloatEndpoints(const FloatRange &L,
+                                             const FloatRange &R,
+                                             bool MayNaN, Fn Eval) {
+        FloatRange Result = FloatRange::bottom();
+        Result.mayNaN = MayNaN;
+
+        if (!L.hasNumericValues() || !R.hasNumericValues()) return Result;
+
+        // 精确值分支用于保留零的符号；区间包络在零可达时会保留两种符号。
+        if (L.isExactNumericValue() && R.isExactNumericValue()) {
+            float V = Eval(exactF32Value(L), exactF32Value(R));
+            FloatRange Exact(static_cast<double>(V));
+            Exact.mayNaN = Exact.mayNaN || MayNaN;
+            return Exact;
+        }
+
+        const float LVals[2] = {static_cast<float>(L.min),
+                                static_cast<float>(L.max)};
+        const float RVals[2] = {static_cast<float>(R.min),
+                                static_cast<float>(R.max)};
+        bool HaveNumeric = false;
+        double Lo = 0.0;
+        double Hi = 0.0;
+        bool SawNaN = MayNaN;
+        for (float LV : LVals) {
+            for (float RV : RVals) {
+                float V = Eval(LV, RV);
+                if (std::isnan(V)) {
+                    SawNaN = true;
+                    continue;
+                }
+                double D = static_cast<double>(V);
+                if (!HaveNumeric) {
+                    Lo = Hi = D;
+                    HaveNumeric = true;
+                } else {
+                    if (D < Lo) Lo = D;
+                    if (D > Hi) Hi = D;
+                }
+            }
+        }
+
+        if (!HaveNumeric) {
+            Result.mayNaN = SawNaN;
+            return Result;
+        }
+
+        Result = FloatRange(Lo, Hi);
+        Result.mayNaN = SawNaN;
+        // 包络跨过数值零时，两种有符号零都可能由浮点舍入产生。
+        if (Lo <= 0.0 && Hi >= 0.0) {
+            Result.mayPositiveZero = true;
+            Result.mayNegativeZero = true;
+        }
+        return Result;
     }
 };
 
@@ -406,8 +334,7 @@ struct LoopInductionInfo {
     int64_t upperBound;  // 上界（有效当且仅当 hasUpperBound）
     bool noWrap;         // 活动迭代中的递推已证明不回绕
 
-    LoopInductionInfo() : RecLoop(nullptr), initial(0), step(0),
-                          hasUpperBound(false), upperBound(0), noWrap(false) {}
+    LoopInductionInfo();
 };
 
 // ---------------------------------------------------------------------
@@ -471,11 +398,88 @@ public:
                               const DominatorTree &DT) const;
 
     // SCEV 接口：保留手动填充归纳变量信息的入口
-    void setLoopInduction(Value *v, const LoopInductionInfo &info) {
-        LoopInductions[v] = info;
-    }
+    void setLoopInduction(Value *v, const LoopInductionInfo &info);
 
     bool invalidate(Function &F, const PreservationStatus &PA);
+};
+
+// ---------------------------------------------------------------------
+// 范围求解器
+//
+// 保存前向传播、收窄阶段和边敏感事实所需的完整状态。实现统一放在
+// RangeAnalysis.cpp，避免大型算法体内联到所有使用该头文件的翻译单元。
+// ---------------------------------------------------------------------
+class RangeSolver {
+public:
+    std::unordered_set<BasicBlock *> ExecutableBlocks;
+    std::set<std::pair<BasicBlock *, BasicBlock *>> FeasibleEdges;
+    std::vector<BasicBlock *> BBWorkList;
+    std::vector<Instruction *> InstWorkList;
+
+    std::unordered_map<Value *, IntRange> ValueRanges;
+    std::unordered_map<Value *, FloatRange> FloatValueRanges;
+
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>>
+        ContextualRanges;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>>
+        BlockLocalRanges;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, FloatRange>>
+        FloatContextualRanges;
+    std::unordered_map<
+        Value *, std::unordered_map<
+            BasicBlock *, std::unordered_map<BasicBlock *, IntRange>>>
+        EdgeRanges;
+
+    std::unordered_map<Value *, KnownBits> ValueBits;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, KnownBits>>
+        ContextualBits;
+    std::unordered_map<
+        Value *, std::unordered_map<
+            BasicBlock *, std::unordered_map<BasicBlock *, KnownBits>>>
+        EdgeBits;
+
+    static constexpr int MAX_ENQUEUE = 32;
+    std::unordered_map<Value *, int> EnqueueCount;
+    std::unordered_set<Value *> Widened;
+    Function *CurFunc = nullptr;
+    bool NarrowingMode = false;
+    const std::unordered_map<Value *, LoopInductionInfo> *ScevInductions =
+        nullptr;
+
+    IntRange &getRange(Value *V);
+    KnownBits getBits(Value *V);
+    IntRange getRangeInBlock(Value *V, BasicBlock *BB);
+    KnownBits getBitsInBlock(Value *V, BasicBlock *BB);
+    void enqueueInstructionUsers(Value *V);
+    bool updateBits(Value *V, const KnownBits &NewBits);
+    void updateBitsContextual(Value *V, BasicBlock *Block,
+                              const KnownBits &Bits);
+    IntRange tightenWithBits(Value *V, const IntRange &NewRange);
+    bool updateRange(Value *V, const IntRange &NewRange);
+    bool updateFloatRange(Value *V, const FloatRange &NewRange);
+    void updateContextual(Value *V, BasicBlock *Block,
+                          const IntRange &Range);
+    void updateFloatContextual(Value *V, BasicBlock *Block,
+                               const FloatRange &Range);
+    void markBlockExecutable(BasicBlock *BB);
+    bool markEdgeFeasible(BasicBlock *From, BasicBlock *To);
+
+    IntRange rangeFromInduction(const LoopInductionInfo &Info) const;
+    void applySCEVContextHints(SCEVResult *SCEV);
+    void visitPhi(PhiInst *Phi);
+    void visitBinary(BinaryInst *BI);
+    void narrowBinaryBackward(BinaryInst *BI, Value *LHS, Value *RHS,
+                              const IntRange &LRange,
+                              const IntRange &RRange);
+    void visitBranch(BrInst *Br);
+    void visitCall(CallInst *CI);
+    void visitSelect(SelectInst *SI);
+    void visitCast(Instruction *I);
+    void visitInstruction(Instruction *I);
+    void runForward();
+    bool runNarrowing(Function &F);
+    void rebuildIntegerContextualFacts(Function &F);
+    RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr);
 };
 
 // ---------------------------------------------------------------------

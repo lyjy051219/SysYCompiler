@@ -5,6 +5,22 @@
 
 PassID SideEffectAnalysis::Key;
 
+bool isModSet(ModRefInfo MRI) {
+    return (unsigned(MRI) & unsigned(ModRefInfo::Mod)) != 0;
+}
+
+bool isRefSet(ModRefInfo MRI) {
+    return (unsigned(MRI) & unsigned(ModRefInfo::Ref)) != 0;
+}
+
+bool isNoModRef(ModRefInfo MRI) {
+    return MRI == ModRefInfo::NoModRef;
+}
+
+ModRefInfo unionModRef(ModRefInfo A, ModRefInfo B) {
+    return ModRefInfo(unsigned(A) | unsigned(B));
+}
+
 // SideEffectInfo::invalidate
 bool SideEffectInfo::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(SideEffectAnalysis::ID())) return false;
@@ -22,6 +38,10 @@ bool BaseAddressInfo::merge(const BaseAddressInfo& Other) {
         if (bases.insert(V).second) changed = true;
     if (Other.untracked && !untracked) { untracked = true; changed = true; }
     return changed;
+}
+
+bool BaseAddressInfo::isEmpty() const {
+    return bases.empty() && !untracked;
 }
 
 void SideEffectAnalysis::ensureInitialized(Value* V, BaseAddressInfoMap& Map) {
@@ -232,15 +252,6 @@ void SideEffectAnalysis::processBuiltinCall(
 
 // SideEffectAnalysis::run
 SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    struct PendingCall {
-        Function *Callee = nullptr;
-        std::vector<Value*> Args;
-    };
-    struct FunctionState {
-        SideEffectInfo Info;
-        std::vector<PendingCall> Calls;
-    };
-
     // Do not recursively ask FAM for a callee result here.  Analysis manager
     // caches are populated only after run() returns, so direct recursion would
     // recurse forever for a mutually-recursive SCC.  Instead, build local
@@ -248,7 +259,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
     // effects with a monotone fixed point.  This is equivalent to processing
     // call-graph SCCs bottom-up, while keeping the implementation independent
     // of a particular SCC numbering.
-    std::unordered_map<Function*, FunctionState> States;
+    std::unordered_map<Function*, SideEffectFunctionState> States;
     std::queue<Function*> WorkList;
     std::unordered_set<Function*> Enqueued;
     WorkList.push(&F);
@@ -259,7 +270,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
         WorkList.pop();
         if (!Current || States.count(Current)) continue;
 
-        FunctionState State;
+        SideEffectFunctionState State;
         SideEffectInfo &Info = State.Info;
         Info.ptrMap = buildBaseAddressInfoMap(*Current);
 
@@ -339,10 +350,10 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
     while (Changed) {
         Changed = false;
         for (auto &Entry : States) {
-            FunctionState &CallerState = Entry.second;
+            SideEffectFunctionState &CallerState = Entry.second;
             SideEffectInfo &CallerInfo = CallerState.Info;
 
-            for (const PendingCall &Call : CallerState.Calls) {
+            for (const SideEffectPendingCall &Call : CallerState.Calls) {
                 auto CalleeIt = States.find(Call.Callee);
                 if (CalleeIt == States.end()) {
                     if (!CallerInfo.hasBuiltin) {
@@ -426,24 +437,21 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
     return std::move(ResultIt->second.Info);
 }
 
-namespace {
-
-MemoryLocation getUnknownSizeMemoryLocation(Value *Pointer) {
+MemoryLocation SideEffectAnalysis::getUnknownSizeMemoryLocation(
+    Value *Pointer) {
     return {Pointer, std::nullopt};
 }
 
-std::optional<std::size_t> getConstantMemoryIntrinsicLength(
+std::optional<std::size_t> SideEffectAnalysis::getConstantMemoryIntrinsicLength(
     const std::vector<Value *> &Args) {
     if (Args.size() < 3 || !Args[2]) return std::nullopt;
     int32_t RawLength = 0;
     if (!Args[2]->tryGetIntConst(RawLength)) return std::nullopt;
 
-    // The intrinsic length is an i32 bit pattern, not a signed C count.
-    // Preserve its full unsigned range when representing it as a host size.
+    // 内建函数长度是 i32 位模式而非有符号 C 计数，转换为宿主长度时保留完整的
+    // 无符号取值范围。
     return static_cast<std::size_t>(static_cast<uint32_t>(RawLength));
 }
-
-} // namespace
 
 // 指令级副作用查询接口
 ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
@@ -515,7 +523,7 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                 if (Args.size() < 2 || !Args[0] || !Args[1])
                     return ModRefInfo::ModRef;
                 std::optional<std::size_t> Length =
-                    getConstantMemoryIntrinsicLength(Args);
+                    SideEffectAnalysis::getConstantMemoryIntrinsicLength(Args);
                 if (overlapsMemoryIntrinsicRange(Args[0], Length))
                     Result = unionModRef(Result, ModRefInfo::Mod);
                 if (Result == ModRefInfo::ModRef) return Result;
@@ -526,7 +534,7 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
             if (getIntrinsicID(BIF) == IntrinsicID::Memset) {
                 if (Args.empty() || !Args[0]) return ModRefInfo::ModRef;
                 std::optional<std::size_t> Length =
-                    getConstantMemoryIntrinsicLength(Args);
+                    SideEffectAnalysis::getConstantMemoryIntrinsicLength(Args);
                 if (overlapsMemoryIntrinsicRange(Args[0], Length))
                     Result = unionModRef(Result, ModRefInfo::Mod);
                 return Result;
@@ -618,7 +626,8 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
     // A bare pointer carries no access width.  Do not infer the pointee width:
     // callers asking about an aggregate/range may intentionally pass its first
     // element, and memory intrinsics can span beyond that nominal element.
-    return getInstModRefInfo(getUnknownSizeMemoryLocation(V), I, AA, LI, FAM);
+    return getInstModRefInfo(
+        SideEffectAnalysis::getUnknownSizeMemoryLocation(V), I, AA, LI, FAM);
 }
 
 // 函数级副作用查询接口

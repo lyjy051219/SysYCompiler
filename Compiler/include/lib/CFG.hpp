@@ -10,6 +10,7 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <type_traits>
 class Value;
 class Function;
 class BasicBlock;
@@ -17,6 +18,22 @@ class AllocaInst;
 class BinaryInst;
 class PhiInst;
 class BrInst;
+
+// CFG 边由源基本块和终结指令中的后继下标唯一标识，避免平行边退化成同一组块指针。
+struct CFGEdge {
+    BasicBlock *From = nullptr;
+    unsigned SuccessorIndex = 0;
+    // 可选的目标校验；CFG 改写后不再匹配时，该瞬时句柄自动失效。
+    BasicBlock *ExpectedSuccessor = nullptr;
+};
+
+// 重定向边时对旧后继 PHI 的处理策略。
+enum class CFGEdgePhiPolicy {
+    // 旧边彻底消失，删除旧后继中与该边对应的 incoming。
+    RemoveOldIncoming,
+    // 新块继续无条件跳向旧后继，把对应 incoming 的前驱改为新块。
+    PreserveIncomingThroughNewBlock,
+};
 
 using FunctionCallGraph =
     std::unordered_map<Function *, std::vector<Function *>>;
@@ -90,6 +107,9 @@ class BinaryInst : public Instruction{
     static bool getOperands(const BinaryInst *BI, Value *&LHS, Value *&RHS);
     bool setOperands(Value *LHS, Value *RHS);
     static bool isCompareOp(Operation Op);
+    // 统一维护操作码的类型约束和指令类别映射，避免生成器重复判断。
+    static bool isIntegerOnlyOp(Operation Op);
+    static Instruction::InstType getInstType(Operation Op, TypeSystem OperandType);
     static bool isAssociativeOp(Operation Op);
     static bool isCommutativeOp(Operation Op);
     static bool isReassociateOp(Operation Op);
@@ -121,6 +141,9 @@ class Module final{
     //注册符号表+push新Function
     void pushFunction(Function* func);
     std::vector<std::unique_ptr<Function>>& getFunctions();
+    std::vector<Instruction *> getInstructions();
+    template <typename InstT = Instruction>
+    std::vector<InstT *> collectInstructions();
     //从functions中删除指定的Function
     void deleteFunction(Function*ptr);
     Function* getMainFunction(); //寻找main函数并返回
@@ -145,6 +168,8 @@ class Module final{
 //初始化值类
 //作为InitvalList的映射类型，用来保存数组初始化的多个初始化值
 class Initializer : public Value,public std::vector<Value*>{
+    static bool isAllZero(Value *V);
+
     public:
     Initializer(std::shared_ptr<IRType> irtype);
     void dumpIR();
@@ -208,6 +233,9 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     bool isReachable(BasicBlock* BB);
     void collectReachableBlocks(std::unordered_set<BasicBlock *> &Reachable);
     std::vector<BasicBlock *> getReachableBlocks();
+    std::vector<Instruction *> getInstructions();
+    template <typename InstT = Instruction>
+    std::vector<InstT *> collectInstructions();
     void dropAllReferences();
     //调试信息打印
     void dumpIR();
@@ -245,7 +273,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
 
     virtual ~BasicBlock() = default;
     BasicBlock();
-    void deleteBlock();
     void dumpIR();
     std::vector<BasicBlock*> getSuccessors();
     std::vector<BasicBlock*> getPredecessors();
@@ -255,7 +282,14 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     static bool isUncondBr(BrInst *Br);
     int countEdgesToSucc(BasicBlock *To);
     bool hasMultipleDistinctSuccessors();
-    bool isCriticalEdgeTo(BasicBlock *To);
+    static BasicBlock *getEdgeSuccessor(const CFGEdge &Edge);
+    static bool isCriticalEdge(const CFGEdge &Edge);
+    static bool redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
+                             CFGEdgePhiPolicy PhiPolicy);
+    static bool foldConditionalBranch(BasicBlock *BB,
+                                      unsigned TakenSuccessorIndex);
+    static BasicBlock *splitEdge(Function &F, const CFGEdge &Edge);
+    // 以下低层接口只改终结指令，不自动维护 PHI；调用方须在同一事务中处理 incoming。
     static bool redirectBranchTarget(BasicBlock *Pred, BasicBlock *OldSucc, BasicBlock *NewSucc);
     static bool replaceCondBrWithUncond(BasicBlock *BB, BasicBlock *Dst);
     bool replaceTerminator(Instruction *NewTerminator);
@@ -268,6 +302,9 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     static void replaceIncomingPredInSuccPhis(BasicBlock *Succ, BasicBlock *OldPred, BasicBlock *NewPred);
     // 收集块开头连续的 PHI 指令
     std::vector<PhiInst*> collectPhiNodes();
+    std::vector<Instruction *> getInstructions();
+    template <typename InstT = Instruction>
+    std::vector<InstT *> collectInstructions();
     // 若本块只有唯一前驱，则折叠退化 PHI
     bool simplifySinglePredPhis();
     //关于指令生成
@@ -323,6 +360,10 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     bool insertAfterPhiNodes(Instruction *I);
     static bool insertBeforeTerminator(BasicBlock *BB, Instruction *I);
     static bool insertAfterPhiNodes(BasicBlock *BB, Instruction *I);
+    // 将 Position 之后的指令按原顺序搬到目标块末尾，并同步转移终结边的 PHI 前驱。
+    bool moveInstructionsAfter(Instruction *Position, BasicBlock *Destination);
+    // 在 Position 之后切分基本块，新块自动加入同一函数并接管后半段指令。
+    BasicBlock *splitBlockAfter(Instruction *Position);
     void clear();
 
     /*目前用不到
@@ -335,6 +376,19 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     Value* genTruncInst(Value* x);
     Value* genBitCastInst(Value* x);*/
     //BasicBlock* clone(std::unordered_map<Value*,Value*>&)override;
+};
+
+// CFGSnapshot 是只读快照；CFG 发生修改后，调用方必须重新构造快照。
+class CFGSnapshot final {
+    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> SuccessorEdges;
+    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> PredecessorEdges;
+    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> DistinctPredecessors;
+
+public:
+    explicit CFGSnapshot(Function &F);
+    const std::vector<BasicBlock *> &successorEdges(BasicBlock *BB) const;
+    const std::vector<BasicBlock *> &predecessorEdges(BasicBlock *BB) const;
+    const std::vector<BasicBlock *> &distinctPredecessors(BasicBlock *BB) const;
 };
 
 
@@ -365,10 +419,11 @@ class BrInst : public Instruction{
     BrInst(std::shared_ptr<IRType> irtype,bool is_Cond);
     Value* getOprand()final;
     void dumpIR() override;
-    bool isConditional() const { return isCond; }
+    bool isConditional() const;
     Value *getCondition() const;
     unsigned getSuccessorCount() const;
     BasicBlock *getSuccessor(unsigned Index) const;
+    bool setSuccessor(unsigned Index, BasicBlock *Successor);
     BasicBlock *getTrueSuccessor() const;
     BasicBlock *getFalseSuccessor() const;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -543,21 +598,29 @@ class PhiInst : public Instruction{
     PhiInst(std::shared_ptr<IRType> irtype);
     //PhiInst* clone(std::unordered_map<Value*,Value*>&)override;
     void dumpIR() override;
-    // 添加一个 incoming value: (Value*, BasicBlock*)
+    // 添加一个 incoming value: (Value*, BasicBlock*)。若同一前驱存在平行边，
+    // 同前驱 incoming 的顺序必须与该前驱终结指令中的同目标边顺序一致。
     void addIncoming(Value* val, BasicBlock* bb);
     // 获取 incoming 的数量 (每个 incoming 占 userList 中2个位置: val, bb)
-    unsigned getNumIncomingValues() const { return userList.size() / 2; }
+    unsigned getNumIncomingValues() const;
     // 获取第 i 个 incoming 的 Value
-    Value* getIncomingValue(unsigned i) { return userList[i * 2]->getValue(); }
+    Value* getIncomingValue(unsigned i) const;
     // 获取第 i 个 incoming 的 BasicBlock
-    BasicBlock* getIncomingBlock(unsigned i) { return dynamic_cast<BasicBlock*>(userList[i * 2 + 1]->getValue()); }
+    BasicBlock* getIncomingBlock(unsigned i) const;
     // 设置第 i 个 incoming 的 Value (用于重命名时更新)
     void setIncomingValue(unsigned i, Value* val);
     bool setIncomingBlock(unsigned i, BasicBlock *BB);
+    unsigned countIncomingFromPred(BasicBlock *Pred) const;
     std::vector<IncomingEdge> collectIncomingEdges();
+    // 重建可能折叠并删除 Phi；成功后调用方不得继续使用旧 Phi 指针。
     static bool rebuildFromIncoming(PhiInst *Phi, const std::vector<IncomingEdge> &Incoming);
     static bool removeIncomingByPred(PhiInst *Phi, BasicBlock *Pred, int RemoveCount);
+    static bool removeIncomingEdge(PhiInst *Phi, BasicBlock *Pred,
+                                   unsigned Occurrence);
     static bool replaceIncomingPred(PhiInst *Phi, BasicBlock *OldPred, BasicBlock *NewPred);
+    static bool replaceIncomingPredEdge(PhiInst *Phi, BasicBlock *OldPred,
+                                        BasicBlock *NewPred,
+                                        unsigned Occurrence);
     Value *getIncomingFromPred(BasicBlock *Pred);
     static bool areEquivalent(PhiInst *A, PhiInst *B);
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -628,3 +691,62 @@ class ConstBool : public ConstantSystem{
     public:
     static UndefValue* NewUndefValue(std::shared_ptr<IRType> it);
  };
+
+// 模板必须放在头文件中；统一的类型过滤接口可替代 Pass 内重复的双层遍历。
+template <typename InstT>
+std::vector<InstT *> BasicBlock::collectInstructions() {
+    static_assert(std::is_base_of_v<Instruction, InstT>,
+                  "InstT 必须派生自 Instruction");
+    std::vector<InstT *> Result;
+    for (Instruction *I : *this) {
+        if (!I) continue;
+        if constexpr (std::is_same_v<InstT, Instruction>) {
+            Result.push_back(I);
+        } else if (auto *Typed = dynamic_cast<InstT *>(I)) {
+            Result.push_back(Typed);
+        }
+    }
+    return Result;
+}
+
+template <typename InstT>
+std::vector<InstT *> Function::collectInstructions() {
+    static_assert(std::is_base_of_v<Instruction, InstT>,
+                  "InstT 必须派生自 Instruction");
+    std::vector<InstT *> Result;
+    for (BasicBlock *BB : *this) {
+        if (!BB) continue;
+        for (Instruction *I : *BB) {
+            if (!I) continue;
+            if constexpr (std::is_same_v<InstT, Instruction>) {
+                Result.push_back(I);
+            } else if (auto *Typed = dynamic_cast<InstT *>(I)) {
+                Result.push_back(Typed);
+            }
+        }
+    }
+    return Result;
+}
+
+template <typename InstT>
+std::vector<InstT *> Module::collectInstructions() {
+    static_assert(std::is_base_of_v<Instruction, InstT>,
+                  "InstT 必须派生自 Instruction");
+    std::vector<InstT *> Result;
+    for (const auto &FunctionPtr : getFunctions()) {
+        Function *F = FunctionPtr.get();
+        if (!F) continue;
+        for (BasicBlock *BB : *F) {
+            if (!BB) continue;
+            for (Instruction *I : *BB) {
+                if (!I) continue;
+                if constexpr (std::is_same_v<InstT, Instruction>) {
+                    Result.push_back(I);
+                } else if (auto *Typed = dynamic_cast<InstT *>(I)) {
+                    Result.push_back(Typed);
+                }
+            }
+        }
+    }
+    return Result;
+}

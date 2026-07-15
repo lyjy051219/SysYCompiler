@@ -2,14 +2,31 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <unordered_map>
+
 // 死代码消除 (Dead Code Elimination)
 //函数内级联删除死代码
 class DCEPass : public PassDescriptor<DCEPass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
+	// 递归函数可删除性证明的三色状态。
+	enum class ReturnProofState {
+		Visiting,
+		Proven,
+		Failed,
+	};
+
+	static bool hasAcyclicReturningCFG(Function &F);
+	static bool isGuaranteedRemovableFunction(
+		Function &F, FunctionAnalysisPassManager &FAM,
+		std::unordered_map<Function *, ReturnProofState> &Memo);
 	static bool isDeletableInstruction(
 		Instruction *I, FunctionAnalysisPassManager &FAM);
+
+	// 公共调用副作用查询复用上述私有证明过程。
+	friend bool dceCallHasSideEffect(
+		CallInst *CI, FunctionAnalysisPassManager &FAM);
 };
 
 // Reusable helper: classify whether a call has observable side effects.

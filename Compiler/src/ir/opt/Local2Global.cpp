@@ -8,12 +8,11 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
 // main 通常由运行时只调用一次，但语法并没有阻止 main 直接
 // 或间接递归。一旦递归，把 alloca 换成全局对象就会让不同栈帧
 // 共享同一份存储。
-bool isRecursiveFrom(Function *F, const FunctionCallGraph &CallGraph) {
+bool Local2GlobalPass::isRecursiveFrom(
+	Function *F, const FunctionCallGraph &CallGraph) {
 	if (!F) return false;
 
 	std::vector<Function *> WorkList;
@@ -38,8 +37,6 @@ bool isRecursiveFrom(Function *F, const FunctionCallGraph &CallGraph) {
 	}
 	return false;
 }
-
-} // namespace
 
 PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;

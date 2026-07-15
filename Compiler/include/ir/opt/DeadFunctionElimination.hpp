@@ -8,7 +8,7 @@
 // 未被标记的用户函数会在 sweep 阶段从 Module 函数表中删除。
 class DeadFunctionEliminationPass : public PassDescriptor<DeadFunctionEliminationPass> {
 public:
-	explicit DeadFunctionEliminationPass(FunctionAnalysisPassManager &FAM) : FAM(FAM) {}
+	explicit DeadFunctionEliminationPass(FunctionAnalysisPassManager &FAM);
 
 	PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
 

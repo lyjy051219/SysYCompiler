@@ -130,7 +130,7 @@ bool LoopStrengthReductionPass::materializePrefix(const std::vector<IndexCompone
 
 bool LoopStrengthReductionPass::isLoadStoreAddressUse(Instruction *UserI, Use *U) {
     if (!UserI || !U) return false;
-    int OpIdx = UserI->getUserIndex(U);
+    auto OpIdx = U->getOperandIndex();
     if (dynamic_cast<LoadInst *>(UserI)) return OpIdx == 0;
     if (dynamic_cast<StoreInst *>(UserI)) return OpIdx == 1;
     return false;
@@ -139,10 +139,7 @@ bool LoopStrengthReductionPass::isLoadStoreAddressUse(Instruction *UserI, Use *U
 int LoopStrengthReductionPass::countAddressUses(GetElementPtrInst *GEP) {
     if (!GEP) return 0;
     int Count = 0;
-    for (auto It = GEP->getUseList().begin(); It != GEP->getUseList().end();
-         ++It) {
-        Use *U = *It;
-        if (!U || U->getValue() != GEP) continue;
+    for (Use *U : GEP->getUses()) {
         auto *UserI = dynamic_cast<Instruction *>(U->getUser());
         if (isLoadStoreAddressUse(UserI, U)) ++Count;
     }
@@ -168,7 +165,7 @@ bool LoopStrengthReductionPass::getConstantOffsetGEP(GetElementPtrInst *Parent,
                                  GetElementPtrInst *&Child,
                                  int64_t &Offset) {
     Child = dynamic_cast<GetElementPtrInst *>(UserI);
-    if (!Parent || !Child || !U || Child->getUserIndex(U) != 0)
+    if (!Parent || !Child || !U || U->getOperandIndex() != 0)
         return false;
 
     if (Child->getNumIndices() != 1 || Child->getBasePointer() != Parent)
@@ -190,9 +187,7 @@ bool LoopStrengthReductionPass::collectAddressGEPFamily(
 
     bool HasAddressUse = false;
     std::vector<std::pair<GetElementPtrInst *, int64_t>> Children;
-    for (auto It = GEP->getUseList().begin(); It != GEP->getUseList().end();
-         ++It) {
-        Use *U = *It;
+    for (Use *U : GEP->getUses()) {
         if (!U || U->getValue() != GEP) continue;
         auto *UserI = dynamic_cast<Instruction *>(U->getUser());
         if (!UserI || !L->contains(UserI->getParent())) return false;
@@ -599,9 +594,7 @@ bool LoopStrengthReductionPass::collectRemovableIndexChain(
     if (!I || Out.count(I)) return true;
     if (!isRemovableIndexInst(I)) return false;
 
-    for (auto It = I->getUseList().begin(); It != I->getUseList().end();
-         ++It) {
-        Use *U = *It;
+    for (Use *U : I->getUses()) {
         if (!U || U->getValue() != I) continue;
         if (!AllowedUsers.count(U->getUser())) return false;
     }

@@ -5,22 +5,12 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 
-#include <vector>
-
 PreservationStatus Select2BranchPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	(void)FAM;
 
 	bool Changed = false;
 
-	std::vector<SelectInst *> Selects;
-	for (auto *BB : F) {
-		if (!BB) continue;
-		for (auto *I : *BB) {
-			auto *SI = dynamic_cast<SelectInst *>(I);
-			if (!SI) continue;
-			Selects.push_back(SI);
-		}
-	}
+	auto Selects = F.collectInstructions<SelectInst>();
 
 	for (SelectInst *SI : Selects) {
 		if (!SI) continue;
@@ -33,19 +23,10 @@ PreservationStatus Select2BranchPass::run(Function &F, FunctionAnalysisPassManag
 		Value *FalseVal = SI->getFalseValue();
 		if (!Cond || !TrueVal || !FalseVal) continue;
 
-		auto *MergeBB = new BasicBlock();
+		BasicBlock *MergeBB = CurBB->splitBlockAfter(SI);
+		if (!MergeBB) continue;
 		auto *TrueBB = new BasicBlock();
-		F.pushBlock(MergeBB);
 		F.pushBlock(TrueBB);
-
-		// 把 select 之后的后半段指令剪切到 MergeBB。
-		Instruction *Walker = SI->getNext();
-		while (Walker) {
-			Instruction *Next = Walker->getNext();
-			Walker->EraseFromParent();
-			MergeBB->push_back(Walker);
-			Walker = Next;
-		}
 
 		// TrueBB 无条件跳到 MergeBB。
 		TrueBB->genUnCondInst(MergeBB);

@@ -3,7 +3,57 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
-class InstSimplifier;
+class BasicAAResult;
+class DominatorTree;
+class LoopInfo;
+
+// 单条指令化简器仅保存当前函数的分析上下文；算法实现统一留在 cpp。
+class InstSimplifier {
+public:
+	InstSimplifier(DominatorTree *DT, Function *F,
+		FunctionAnalysisPassManager *FAM, BasicAAResult *AA, LoopInfo *LI);
+
+	bool run(Function &F);
+
+private:
+	// 整数 min/max 选择模式的匹配结果。
+	enum class ExtremumKind {
+		None,
+		Minimum,
+		Maximum,
+	};
+
+	DominatorTree *DT = nullptr;
+	Function *F = nullptr;
+	FunctionAnalysisPassManager *FAM = nullptr;
+	BasicAAResult *AA = nullptr;
+	LoopInfo *LI = nullptr;
+
+	bool isLoadSuitableForSinking(LoadInst *L) const;
+	Value *foldPhiOfBinary(PhiInst *Phi);
+	Value *foldPhiOfGEP(PhiInst *Phi);
+	Value *foldPhiOfLoad(PhiInst *Phi);
+	Value *simplifyInstruction(Instruction *I, bool &Changed);
+	static bool maybeSwapCommutative(
+		BinaryInst *BI, Value *&LHS, Value *&RHS, bool &Changed);
+	Value *simplifyAdd(
+		BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed);
+	Value *simplifySub(BinaryInst *BI, Value *LHS, Value *RHS);
+	Value *simplifyMul(
+		BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed);
+	Value *simplifyDiv(BinaryInst *BI, Value *LHS, Value *RHS);
+	Value *simplifyRem(BinaryInst *BI, Value *LHS, Value *RHS);
+	Value *simplifyAnd(
+		BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed);
+	Value *simplifyOr(
+		BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed);
+	Value *simplifyXor(
+		BinaryInst *BI, Value *LHS, Value *RHS, bool &Changed);
+	Value *simplifyCmp(BinaryInst *BI, Value *LHS, Value *RHS);
+	Value *simplifyBinary(BinaryInst *BI, bool &Changed);
+	Value *simplifySelect(SelectInst *SI);
+	Value *simplifyPhi(PhiInst *Phi);
+};
 
 // InstSimplifyPass:
 // 1) 以工作队列方式在函数内做局部指令化简

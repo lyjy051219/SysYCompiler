@@ -7,17 +7,8 @@
 
 bool GlobalInitializerFoldPass::isRecursiveMain(Module &M, Function *Main) {
     if (!Main) return true;
-    for (auto &FPtr : M.getFunctions()) {
-        Function *F = FPtr.get();
-        if (!F) continue;
-        for (BasicBlock *BB : *F) {
-            if (!BB) continue;
-            for (Instruction *I : *BB) {
-                auto *CI = dynamic_cast<CallInst *>(I);
-                if (CI && CI->getDirectCallee() == Main) return true;
-            }
-        }
-    }
+    for (CallInst *CI : M.collectInstructions<CallInst>())
+        if (CI->getDirectCallee() == Main) return true;
     return false;
 }
 

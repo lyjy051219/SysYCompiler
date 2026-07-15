@@ -11,16 +11,14 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
-
-bool correspondingRecurrenceValue(Value *A, Value *B,
-                                  PhiInst *APhi, PhiInst *BPhi) {
+bool IndVarSimplifyPass::correspondingRecurrenceValue(
+    Value *A, Value *B, PhiInst *APhi, PhiInst *BPhi) {
     if (A == APhi || B == BPhi) return A == APhi && B == BPhi;
     return A == B;
 }
 
-bool haveExactUpdateShape(Value *A, Value *B,
-                          PhiInst *APhi, PhiInst *BPhi) {
+bool IndVarSimplifyPass::haveExactUpdateShape(
+    Value *A, Value *B, PhiInst *APhi, PhiInst *BPhi) {
     auto *AI = dynamic_cast<BinaryInst *>(A);
     auto *BI = dynamic_cast<BinaryInst *>(B);
     if (!AI || !BI || AI->instType != BI->instType ||
@@ -46,7 +44,8 @@ bool haveExactUpdateShape(Value *A, Value *B,
 // exact SSA recurrence check.  This keeps signed/unsigned operations and
 // casts distinct even if a future analysis canonicalization happens to give
 // them the same mathematical key.
-bool haveExactRecurrenceShape(PhiInst *A, PhiInst *B, Loop *L) {
+bool IndVarSimplifyPass::haveExactRecurrenceShape(
+    PhiInst *A, PhiInst *B, Loop *L) {
     if (!A || !B || !L || A->getParent() != B->getParent() ||
         A->getNumIncomingValues() != B->getNumIncomingValues())
         return false;
@@ -68,7 +67,7 @@ bool haveExactRecurrenceShape(PhiInst *A, PhiInst *B, Loop *L) {
     return Seen.size() == B->getNumIncomingValues();
 }
 
-bool mergeExactRecurrences(Loop *L, SCEVResult &SE) {
+bool IndVarSimplifyPass::mergeExactRecurrences(Loop *L, SCEVResult &SE) {
     BasicBlock *Header = L ? L->getHeader() : nullptr;
     if (!Header) return false;
 
@@ -100,7 +99,7 @@ bool mergeExactRecurrences(Loop *L, SCEVResult &SE) {
     return Changed;
 }
 
-bool orientExitComparison(Loop *L, SCEVResult &SE) {
+bool IndVarSimplifyPass::orientExitComparison(Loop *L, SCEVResult &SE) {
     auto TCI = SE.analyzeLoopTripCount(L);
     if (!TCI || !TCI->Valid || !TCI->ExitCmp ||
         !TCI->ExitCmp->getParent()) {
@@ -131,8 +130,6 @@ bool orientExitComparison(Loop *L, SCEVResult &SE) {
     delete Cmp;
     return true;
 }
-
-} // namespace
 
 PassResult IndVarSimplifyPass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {

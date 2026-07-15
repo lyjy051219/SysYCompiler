@@ -18,16 +18,13 @@
 class SCEVExpander {
 public:
     SCEVExpander(const Loop *Scope, BasicBlock *InsertBlock,
-                 const DominatorTree &DT, unsigned Budget = 16)
-        : Scope(Scope), InsertBlock(InsertBlock), DT(DT), Budget(Budget) {}
+                 const DominatorTree &DT, unsigned Budget = 16);
 
     bool canExpand(const SCEVExpr *E) const;
     int estimateCost(const SCEVExpr *E) const;
     Value *expand(const SCEVExpr *E);
 
-    const std::vector<Instruction *> &createdInstructions() const {
-        return Created;
-    }
+    const std::vector<Instruction *> &createdInstructions() const;
 
 private:
     const Loop *Scope = nullptr;

@@ -48,6 +48,8 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 
+PassBuilder::PassBuilder() = default;
+
 // Pipeline 阶段构建器 (Phase Builders)
 // 1. 轻量级清理 Pipeline
 FunctionPassManager PassBuilder::buildLightCleanupPipeline() {

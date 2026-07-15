@@ -10,9 +10,11 @@
 #include <unordered_set>
 #include <utility>
 
-namespace {
+Global2LocalPass::Global2LocalPass(bool RelaxScalarUses)
+	: RelaxScalarUses(RelaxScalarUses) {}
 
-bool isRecursiveFrom(Function *Root, const FunctionCallGraph &CallGraph) {
+bool Global2LocalPass::isRecursiveFrom(
+	Function *Root, const FunctionCallGraph &CallGraph) {
 	if (!Root) return false;
 
 	std::vector<Function *> WorkList;
@@ -37,8 +39,6 @@ bool isRecursiveFrom(Function *Root, const FunctionCallGraph &CallGraph) {
 	}
 	return false;
 }
-
-} // namespace
 
 // For scalar globals, only allow very simple load/store users in main.
 // Complex pointer/address-taken patterns are deferred to avoid downstream IR issues.
@@ -82,7 +82,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		auto *GV = GVPtr.get();
 		if (!GV) continue;
 		if (GV->vartag != Variable::GlobalVariable) continue;
-		if (GV->getUseList().is_empty()) continue;
+		if (!GV->hasUses()) continue;
 
 		auto PtrTy = std::dynamic_pointer_cast<POINTERType>(GV->getIRType());
 		if (!PtrTy) continue;
@@ -99,9 +99,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		bool ScalarAllUsesInEntry = true;
 		BasicBlock *MainEntry = Main->front();
 
-		for (auto it = GV->getUseList().begin(); it != GV->getUseList().end(); ++it) {
-			Use *U = *it;
-			if (!U) continue;
+		for (Use *U : GV->getUses()) {
 
 			Function *UF = Instruction::getUserFunction(U);
 			if (!UF) {

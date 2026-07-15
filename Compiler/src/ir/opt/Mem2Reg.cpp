@@ -9,6 +9,14 @@
 #include <set>
 #include <stack>
 
+void AllocaInfo::clean() {
+    StoreBlocks.clear();
+    LoadBlocks.clear();
+    OnlyBlock = nullptr;
+    OnlyStore = nullptr;
+    OnlyUsedOneBlock = true;
+}
+
 unsigned BlockInfo::getInstIndex(const Instruction* I){
     auto it = InstNum.find(I);
     if(it != InstNum.end()) return it->second;
@@ -35,24 +43,20 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
     auto pointeeType = ptrType->getPointerType();
     if (!pointeeType) return false;
 
-    // 只提升标量局部对象；数组/函数/void 对象不进入 Mem2Reg。
+    // 只提升标量局部对象；数组和 void 对象不进入 Mem2Reg。
     auto pointeeEnum = pointeeType->getEnum();
-    if (pointeeEnum == IR_ARRAY || pointeeEnum == IR_FUNCTION ||
-        pointeeEnum == IR_VOID) {
+    if (pointeeEnum == IR_ARRAY || pointeeEnum == IR_VOID) {
         return false;
     }
 
-    UseList& useList = const_cast<AllocaInst*>(AI)->getUseList();
-    for (auto it = useList.begin(); it != useList.end(); ++it) {
-        Use* use = *it;
+    for (Use *use : AI->getUses()) {
         User* user = use->getUser();
         if (dynamic_cast<LoadInst*>(user)) {
             continue;
         }
         else if (auto storeInst = dynamic_cast<StoreInst*>(user)) {
             Value* storedVal = storeInst->getValueOperand();
-            int index = storeInst->getUserIndex(use);
-            if (index == 0) {
+            if (use->getOperandIndex() == 0) {
                 return false;
             }
 
@@ -74,9 +78,7 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
 
 void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
     clean();
-    UseList& useList = AI->getUseList();
-    for (auto it = useList.begin(); it != useList.end(); ++it) {
-        Use* use = *it;
+    for (Use *use : AI->getUses()) {
         User* user = use->getUser();
         Instruction* inst = dynamic_cast<Instruction*>(user);
         if (!inst) continue;
@@ -109,7 +111,7 @@ bool PromotePass::rewriteSingleStoreAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     std::vector<LoadInst*> loadsToReplace;
     std::vector<LoadInst*> loadsToKeep;
 
-    for(Use* use : AI->getUseList()){
+    for (Use *use : AI->getUses()) {
         User* user = use->getUser();
         if(dynamic_cast<StoreInst*>(user) == onlyStore) continue;
         LoadInst* LI = dynamic_cast<LoadInst*>(user);
@@ -156,7 +158,7 @@ bool PromotePass::rewriteSingleStoreAlloca(AllocaInfo &info,AllocaInst* AI,Domin
 
 bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,DominatorTree& DT,BlockInfo &blockInfo){
     std::vector<std::pair<unsigned,StoreInst*>> stores;
-    for(Use* use : AI->getUseList()){
+    for (Use *use : AI->getUses()) {
         User* user = use->getUser();
         if(StoreInst* SI = dynamic_cast<StoreInst*>(user))
             stores.push_back(std::make_pair(blockInfo.getInstIndex(SI),SI));
@@ -169,7 +171,7 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
 
     std::vector<std::pair<LoadInst*, Value*>> replacements;
 
-    for(Use* use : AI->getUseList()){
+    for (Use *use : AI->getUses()) {
         User* user = use->getUser();
         LoadInst* LI = dynamic_cast<LoadInst*>(user);
         if(!LI) continue;
@@ -202,7 +204,7 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     }
 
     std::vector<StoreInst*> storesToDelete;
-    for(Use* use : AI->getUseList()){
+    for (Use *use : AI->getUses()) {
         if(StoreInst* SI = dynamic_cast<StoreInst*>(use->getUser()))
             storesToDelete.push_back(SI);
     }
@@ -322,7 +324,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     // 简单优化: 删除无用 alloca / 单 store / 单 block
     for(unsigned i = 0; i != Allocas.size(); ++i){
         auto AI = Allocas[i];
-        if(AI->getUseList().is_empty()){
+        if (!AI->hasUses()) {
             delete AI;
             Allocas[i] = Allocas.back();
             Allocas.pop_back();
@@ -391,7 +393,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 
     std::vector<std::set<BasicBlock*>> DefBlocks(Allocas.size());
     for (unsigned i = 0; i < Allocas.size(); ++i) {
-        for (Use* use : Allocas[i]->getUseList()) {
+        for (Use *use : Allocas[i]->getUses()) {
             if (StoreInst* SI = dynamic_cast<StoreInst*>(use->getUser()))
                 DefBlocks[i].insert(SI->getParent());
         }
@@ -577,7 +579,7 @@ void PromotePass::computeLiveInBlocks(
 {
     std::vector<BasicBlock*> UseBlocksToPropagate;
 
-    for (Use* use : AI->getUseList()) {
+    for (Use *use : AI->getUses()) {
         LoadInst* LI = dynamic_cast<LoadInst*>(use->getUser());
         if (!LI) continue;
 

@@ -26,13 +26,12 @@ struct LoadElimQueryResult {
     Value *value = nullptr;
     std::vector<std::pair<BasicBlock*, Value*>> predMap;
 
-    static LoadElimQueryResult known(Value *V) { return {KNOWN, V, {}}; }
-    static LoadElimQueryResult clobbered() { return {CLOBBERED, nullptr, {}}; }
-    static LoadElimQueryResult unknown() { return {UNKNOWN, nullptr, {}}; }
-    static LoadElimQueryResult needPredecessors() { return {NEED_PREDECESSORS, nullptr, {}}; }
-    static LoadElimQueryResult phiNeeded(std::vector<std::pair<BasicBlock*, Value*>> M) {
-        return {PHI_NEEDED, nullptr, std::move(M)};
-    }
+    static LoadElimQueryResult known(Value *V);
+    static LoadElimQueryResult clobbered();
+    static LoadElimQueryResult unknown();
+    static LoadElimQueryResult needPredecessors();
+    static LoadElimQueryResult phiNeeded(
+        std::vector<std::pair<BasicBlock *, Value *>> M);
 };
 
 class LoadEliminationPass : public PassDescriptor<LoadEliminationPass> {
@@ -40,6 +39,12 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    // 反向路径扫描同时记录当前块是否只扫描目标 load 之前的前缀。
+    struct PathScanState {
+        BasicBlock *BB = nullptr;
+        bool TargetPrefixOnly = false;
+    };
+
     static constexpr int MaxQueryDepth = 8;
 
     static constexpr int MaxDominatorSearchDepth = 16;

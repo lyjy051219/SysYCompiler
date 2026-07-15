@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
+#include "lib/CFG.hpp"
 
 #include <cstddef>
 
@@ -11,4 +12,8 @@ public:
 
 private:
 	static constexpr size_t RISCVThreshold = 1024;
+
+	// 递归入口的栈对象不能提升成所有栈帧共享的全局对象。
+	static bool isRecursiveFrom(
+		Function *F, const FunctionCallGraph &CallGraph);
 };

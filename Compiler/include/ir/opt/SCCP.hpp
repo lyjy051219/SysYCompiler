@@ -19,64 +19,32 @@ private:
     Value* constVal; // 仅当 state == Constant 时有效
 
 public:
-    LatticeValue() : state(Top), constVal(nullptr) {}
+    LatticeValue();
     //创建三个状态的静态函数
-    static LatticeValue getTop() { return LatticeValue(); }
-    static LatticeValue getBottom() {
-        LatticeValue lv;
-        lv.state = Bottom;
-        return lv;
-    }
-    static LatticeValue getConstant(Value* v) {
-        LatticeValue lv;
-        lv.state = Constant;
-        lv.constVal = v;
-        return lv;
-    }
+    static LatticeValue getTop();
+    static LatticeValue getBottom();
+    static LatticeValue getConstant(Value* v);
 
-    bool isTop() const { return state == Top; }
-    bool isBottom() const { return state == Bottom; }
-    bool isConstant() const { return state == Constant; }
-    State getState() const { return state; }
+    bool isTop() const;
+    bool isBottom() const;
+    bool isConstant() const;
+    State getState() const;
 
-    Value* getConstantValue() const { return constVal; }
+    Value* getConstantValue() const;
 
     // 格合并
     // Top ∧ x = x
     // Bottom ∧ x = Bottom
     // Const(a) ∧ Const(a) = Const(a)
     // Const(a) ∧ Const(b) = Bottom (a != b)
-    bool mergeIn(const LatticeValue& other) {
-        if (other.isTop()) return false;        // Top 不改变任何值
-        if (isBottom()) return false;            // 已经是 Bottom，不会再变
-        if (other.isBottom()) {
-            state = Bottom;
-            constVal = nullptr;
-            return true;
-        }
-        // other 是 Constant
-        if (isTop()) {
-            state = Constant;
-            constVal = other.constVal;
-            return true;
-        }
-        // 都是 Constant，看值是否相同
-        if (constVal == other.constVal) return false;
-
-        // 两个不同的常量 → 值比较（ConstInt/ConstFloat/ConstBool 可能是不同指针但相同值）
-        if (Value::areEqualConstants(constVal, other.constVal)) return false;
-
-        state = Bottom;
-        constVal = nullptr;
-        return true;
-    }
+    bool mergeIn(const LatticeValue& other);
 
 };
 
 // SCCP 求解器 (Solver)
 class SCCPSolver {
 public:
-    SCCPSolver() = default;
+    SCCPSolver();
 
     // 标记一个基本块为可执行
     void markBlockExecutable(BasicBlock* BB);

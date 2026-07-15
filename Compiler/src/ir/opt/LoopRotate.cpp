@@ -103,7 +103,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     for (PhiInst *Phi : BodyPhis) {
         if (!Phi) continue;
         if (isLCSSAPhi(Phi)) continue;
-        if (Phi->getUseList().is_empty()) {
+        if (!Phi->hasUses()) {
             delete Phi;
             continue;
         }
@@ -166,8 +166,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         HeaderToPreValue[OldI] = Cloned;
 
         bool UsedInLoopNonHeader = false;
-        for (auto Uit = OldI->getUseList().begin(); Uit != OldI->getUseList().end(); ++Uit) {
-            Use *U = *Uit;
+        for (Use *U : OldI->getUses()) {
             auto *UserInst = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
             if (!UserInst) continue;
             BasicBlock *UserBB = UserInst->getParent();
@@ -193,11 +192,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         Value *BodyV = KV.second;
         Value *PreV = HeaderToPreValue.count(OldV) ? HeaderToPreValue[OldV] : OldV;
 
-        std::vector<Use *> Uses;
-        for (auto It = OldV->getUseList().begin(); It != OldV->getUseList().end(); ++It) {
-            Use *U = *It;
-            if (U && U->getValue() == OldV) Uses.push_back(U);
-        }
+        auto Uses = OldV->getUses();
 
         for (Use *U : Uses) {
             auto *UserInst = dynamic_cast<Instruction *>(U->getUser());
@@ -210,9 +205,9 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
                     if (UserInst != BodyV) {
                         U->replaceUseeWith(BodyV);
                     }
-                    int OpIdx = UserInst->getUserIndex(U);
-                    if (OpIdx >= 0 && (OpIdx % 2) == 0) {
-                        unsigned InIdx = static_cast<unsigned>(OpIdx / 2);
+                    auto OpIdx = U->getOperandIndex();
+                    if (OpIdx && (*OpIdx % 2) == 0) {
+                        unsigned InIdx = static_cast<unsigned>(*OpIdx / 2);
                         if (UserPhi->getIncomingBlock(InIdx) == Header) {
                             UserPhi->setIncomingBlock(InIdx, Body);
                         }

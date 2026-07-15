@@ -2,8 +2,11 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "lib/CFG.hpp"
+#include <cstddef>
+#include <optional>
 #include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 class Loop;
 
@@ -18,12 +21,10 @@ enum class ModRefInfo : unsigned {
     Mod      = 2, //只修改
     ModRef   = 3  //既修改也读取
 };
-inline bool isModSet(ModRefInfo MRI)  { return (unsigned(MRI) & unsigned(ModRefInfo::Mod)) != 0; }
-inline bool isRefSet(ModRefInfo MRI)  { return (unsigned(MRI) & unsigned(ModRefInfo::Ref)) != 0; }
-inline bool isNoModRef(ModRefInfo MRI){ return MRI == ModRefInfo::NoModRef; }
-inline ModRefInfo unionModRef(ModRefInfo A, ModRefInfo B) {
-    return ModRefInfo(unsigned(A) | unsigned(B));
-}
+bool isModSet(ModRefInfo MRI);
+bool isRefSet(ModRefInfo MRI);
+bool isNoModRef(ModRefInfo MRI);
+ModRefInfo unionModRef(ModRefInfo A, ModRefInfo B);
 //FuncAttr:内置函数分类
 enum class FuncAttr : unsigned {
     None         = 0,                     //无特殊属性
@@ -49,7 +50,7 @@ struct BaseAddressInfo {
     bool untracked = false;           //未追踪信息
 
     bool merge(const BaseAddressInfo& Other);
-    bool isEmpty() const { return bases.empty() && !untracked; }
+    bool isEmpty() const;
     void collectExternalBases(std::unordered_set<Value*> &Dest) const;
 };
 
@@ -66,6 +67,18 @@ struct SideEffectInfo {
     bool invalidate(Function &F, const PreservationStatus &PA);
 };
 
+// 跨函数固定点求解时记录尚待合并的调用边。
+struct SideEffectPendingCall {
+    Function *Callee = nullptr;
+    std::vector<Value *> Args;
+};
+
+// 跨函数固定点求解时保存每个函数的局部摘要和调用边。
+struct SideEffectFunctionState {
+    SideEffectInfo Info;
+    std::vector<SideEffectPendingCall> Calls;
+};
+
 //SideEffectAnalysis
 class SideEffectAnalysis : public AnalysisDescriptor<SideEffectAnalysis> {
 public:
@@ -77,6 +90,11 @@ public:
     static constexpr bool InvalidateAcrossIRUnits = true;
 
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
+
+    // 指令级副作用查询使用的内存区间辅助函数。
+    static MemoryLocation getUnknownSizeMemoryLocation(Value *Pointer);
+    static std::optional<std::size_t> getConstantMemoryIntrinsicLength(
+        const std::vector<Value *> &Args);
 
 private:
     friend AnalysisDescriptor<SideEffectAnalysis>;

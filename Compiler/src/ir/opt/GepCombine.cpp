@@ -60,11 +60,7 @@
 bool GepCombinePass::combineChainedGEPs(Function &F) {
     bool changed = false;
 
-    std::vector<GetElementPtrInst *> geps;
-    for (BasicBlock *BB : F)
-        for (Instruction *I : *BB)
-            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I))
-                geps.push_back(GEP);
+    auto geps = F.collectInstructions<GetElementPtrInst>();
 
     // 延迟删除集合，避免遍历中 delete 导致悬空指针
     std::unordered_set<GetElementPtrInst *> deleted;

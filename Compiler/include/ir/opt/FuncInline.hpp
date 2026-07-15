@@ -16,8 +16,7 @@ struct CalleeInlineProfile {
 
 class FuncInlinePass : public PassDescriptor<FuncInlinePass> {
 public:
-	explicit FuncInlinePass(bool enableRecursiveInline = true)
-		: EnableRecursiveInline(enableRecursiveInline) {}
+	explicit FuncInlinePass(bool enableRecursiveInline = true);
 
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 

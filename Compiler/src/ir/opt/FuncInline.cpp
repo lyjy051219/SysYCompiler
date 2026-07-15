@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <vector>
 
+FuncInlinePass::FuncInlinePass(bool enableRecursiveInline)
+	: EnableRecursiveInline(enableRecursiveInline) {}
 
 CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	Function* Callee, FunctionAnalysisPassManager& FAM) {
@@ -162,12 +164,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 
 		// 将 clone 入口块里的 alloca 移到 Caller 入口块最前面。
 		if (BasicBlock* CallerEntry = F.front()) {
-			std::vector<AllocaInst*> MoveAllocas;
-			for (auto* I : *ClonedEntry) {
-				if (auto* AI = dynamic_cast<AllocaInst*>(I)) {
-					MoveAllocas.push_back(AI);
-				}
-			}
+			auto MoveAllocas = ClonedEntry->collectInstructions<AllocaInst>();
 
 			for (AllocaInst* AI : MoveAllocas) {
 				AI->EraseFromParent();
@@ -182,22 +179,8 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		}
 
 		// CFG 重构：把 Call 后续指令切到 A2，A1(原块) 跳到 clone 入口。
-		auto* A2 = new BasicBlock();
-		F.pushBlock(A2);
-
-		{
-			Instruction* Cur = CI->getNext();
-			while (Cur) {
-				Instruction* Next = Cur->getNext();
-				Cur->EraseFromParent();
-				A2->push_back(Cur);
-				Cur = Next;
-			}
-		}
-
-		// 原块 successor 的 PHI incoming 现在应从 A2 进入（原 terminator 已搬到 A2）。
-		for (BasicBlock* Succ : A2->getSuccessors())
-			BasicBlock::replaceIncomingPredInSuccPhis(Succ, CallBB, A2);
+		BasicBlock *A2 = CallBB->splitBlockAfter(CI);
+		if (!A2) continue;
 
 		bool CallHasInstUsers = CI->countInstructionUses() > 0;
 

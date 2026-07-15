@@ -4,39 +4,11 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <map>
 #include <set>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-namespace {
-
-bool sameScalarConstant(Value *A, Value *B) {
-    if (A == B) return true;
-    if (!A || !B || !A->getIRType() || !B->getIRType() ||
-        !A->getIRType()->hasSameShape(*B->getIRType()))
-        return false;
-    if (auto *AI = dynamic_cast<ConstInt *>(A)) {
-        auto *BI = dynamic_cast<ConstInt *>(B);
-        return BI && AI->getVal() == BI->getVal();
-    }
-    if (auto *AF = dynamic_cast<ConstFloat *>(A)) {
-        auto *BF = dynamic_cast<ConstFloat *>(B);
-        if (!BF) return false;
-        uint32_t ABits = 0;
-        uint32_t BBits = 0;
-        float AV = AF->getVal();
-        float BV = BF->getVal();
-        std::memcpy(&ABits, &AV, sizeof(ABits));
-        std::memcpy(&BBits, &BV, sizeof(BBits));
-        return ABits == BBits;
-    }
-    return false;
-}
-
-} // namespace
 
 bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
     Variable *Source) {
@@ -51,9 +23,7 @@ bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
         Worklist.pop_back();
         if (!Pointer || !Seen.insert(Pointer).second) continue;
 
-        for (auto It = Pointer->getUseList().begin();
-             It != Pointer->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : Pointer->getUses()) {
             if (!U || U->getValue() != Pointer) continue;
             auto *I = dynamic_cast<Instruction *>(U->getUser());
             if (!I) return false;
@@ -136,7 +106,7 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
 
 void LocalAggregateSimplifyPass::deleteDeadPointerChain(Value *Pointer) {
     while (auto *I = dynamic_cast<Instruction *>(Pointer)) {
-        if (!I->getUseList().is_empty()) return;
+        if (I->hasUses()) return;
         if (!dynamic_cast<GetElementPtrInst *>(I) &&
             !dynamic_cast<BitCastInst *>(I))
             return;
@@ -430,9 +400,7 @@ bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
     // source. Treat it as immutable only when every remaining use is a
     // non-volatile memcpy source; any load, store, GEP, or unknown call makes
     // this proof fail conservatively.
-    for (auto It = Source->getUseList().begin();
-         It != Source->getUseList().end(); ++It) {
-        Use *U = *It;
+    for (Use *U : Source->getUses()) {
         if (!U || U->getValue() != Source) continue;
         auto *CI = dynamic_cast<CallInst *>(U->getUser());
         if (!CI || !CI->isNonVolatileMemcpy() || CI->getArgIndex(U) != 1)
@@ -474,9 +442,7 @@ bool LocalAggregateSimplifyPass::hasSupportedSameBlockUses(
         Worklist.pop_back();
         if (!Seen.insert(Ptr).second) continue;
 
-        for (auto It = Ptr->getUseList().begin();
-             It != Ptr->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : Ptr->getUses()) {
             if (!U || U->getValue() != Ptr) continue;
             auto *I = dynamic_cast<Instruction *>(U->getUser());
             if (!I || I->getParent() != BB) return false;
@@ -599,9 +565,7 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
     if (!AI || Count <= 0) return false;
 
     std::set<GetElementPtrInst *> SeenGEPs;
-    for (auto It = AI->getUseList().begin(); It != AI->getUseList().end();
-         ++It) {
-        Use *U = *It;
+    for (Use *U : AI->getUses()) {
         if (!U || U->getValue() != AI) continue;
 
         auto *I = dynamic_cast<Instruction *>(U->getUser());
@@ -639,9 +603,7 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
         return false;
 
     for (GetElementPtrInst *GEP : Plan.ElementPtrs) {
-        for (auto It = GEP->getUseList().begin();
-             It != GEP->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : GEP->getUses()) {
             if (!U || U->getValue() != GEP) continue;
             auto *I = dynamic_cast<Instruction *>(U->getUser());
             if (!I) return false;
@@ -689,7 +651,7 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
 
     bool AllSame = true;
     for (size_t I = 1; I < Elements.size(); ++I) {
-        if (!sameScalarConstant(Elements[0], Elements[I])) {
+        if (!Value::areEqualConstants(Elements[0], Elements[I])) {
             AllSame = false;
             break;
         }
@@ -750,7 +712,7 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         Value *First = Variable::getConstantElement(Plan.Source, {0});
         bool Uniform = First != nullptr;
         for (int I = 1; Uniform && I < Count; ++I)
-            Uniform = sameScalarConstant(
+            Uniform = Value::areEqualConstants(
                 First, Variable::getConstantElement(Plan.Source, {I}));
         if (!Uniform) return false;
     }
@@ -776,10 +738,10 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     delete Plan.InitCopy;
     for (auto It = Plan.ElementPtrs.rbegin();
          It != Plan.ElementPtrs.rend(); ++It) {
-        if ((*It)->getUseList().is_empty()) delete *It;
+        if (!(*It)->hasUses()) delete *It;
     }
 
-    if (!AI->getUseList().is_empty()) return false;
+    if (AI->hasUses()) return false;
     delete AI;
     return true;
 }
@@ -808,9 +770,7 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
     auto PtrPointeeTy = Value::getPointeeType(Ptr);
     bool PtrIsScalar = IRType::isScalar(PtrPointeeTy);
 
-    for (auto It = Ptr->getUseList().begin(); It != Ptr->getUseList().end();
-         ++It) {
-        Use *U = *It;
+    for (Use *U : Ptr->getUses()) {
         if (!U || U->getValue() != Ptr) continue;
         auto *I = dynamic_cast<Instruction *>(U->getUser());
         if (!I) return false;
@@ -903,9 +863,6 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     AllocaInst *AI) {
     constexpr int kMaxScalarizedElements = 32;
     if (!AI || !AllocaInst::isArrayAllocation(AI)) return false;
-    auto Fail = [](const char *) {
-        return false;
-    };
 
     CallInst *InitCopy = nullptr;
     Variable *InitSource = nullptr;
@@ -918,28 +875,26 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     std::map<GetElementPtrInst *, std::vector<int>> DirectPath;
     std::map<GetElementPtrInst *, std::vector<int>> TransparentPath;
 
-    for (auto It = AI->getUseList().begin(); It != AI->getUseList().end();
-         ++It) {
-        Use *U = *It;
+    for (Use *U : AI->getUses()) {
         if (!U || U->getValue() != AI) continue;
         auto *UserI = dynamic_cast<Instruction *>(U->getUser());
-        if (!UserI) return Fail("non-inst use");
+        if (!UserI) return false;
 
         int OperandIndex = UserI->getUserIndex(U);
         if (auto *CI = dynamic_cast<CallInst *>(UserI);
             CI && OperandIndex == 1 && CallInst::isNonVolatileMemcpy(CI)) {
             if (CI->getArgCount() < 2 || CI->getArg(0) != AI || InitCopy)
-                return Fail("bad memcpy operands");
+                return false;
             auto *Source = dynamic_cast<Variable *>(CI->getArg(1));
             if (!isWholeConstantCopy(CI, AI, Source))
-                return Fail("not whole const copy");
+                return false;
             InitCopy = CI;
             InitSource = Source;
             continue;
         }
 
         auto *GEP = dynamic_cast<GetElementPtrInst *>(UserI);
-        if (!GEP || OperandIndex != 0) return Fail("non-gep use");
+        if (!GEP || OperandIndex != 0) return false;
 
         std::vector<int> Path;
         std::shared_ptr<IRType> PointeeTy;
@@ -947,11 +902,11 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
             return false;
 
         if (!IRType::isScalar(PointeeTy) && PointeeTy->getEnum() != IR_ARRAY)
-            return Fail("bad pointee ty");
+            return false;
         if (IRType::isScalar(PointeeTy) &&
             !addScalarSlot(SlotTypes, Path, PointeeTy,
                            kMaxScalarizedElements))
-            return Fail("add root slot");
+            return false;
 
         if (SeenGEPs.insert(GEP).second) {
             ElementPtrs.push_back(GEP);
@@ -959,30 +914,30 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         }
     }
 
-    if (ElementPtrs.empty()) return Fail("no element ptrs");
+    if (ElementPtrs.empty()) return false;
 
     for (GetElementPtrInst *GEP : ElementPtrs) {
         auto PathIt = DirectPath.find(GEP);
-        if (PathIt == DirectPath.end()) return Fail("missing direct path");
+        if (PathIt == DirectPath.end()) return false;
         if (!collectScalarizedPointerUses(
                 AI, GEP, PathIt->second, TransparentPtrs, TransparentPath,
                 SeenTransparent, MemoryAccesses, SlotTypes,
                 kMaxScalarizedElements))
-            return Fail("collect uses");
+            return false;
     }
 
-    if (SlotTypes.empty()) return Fail("no slots");
+    if (SlotTypes.empty()) return false;
 
     if (InitCopy) {
         for (Instruction *Access : MemoryAccesses) {
-            if (!Access) return Fail("bad memory access");
+            if (!Access) return false;
             if (Access->getParent() == InitCopy->getParent()) {
                 if (!Instruction::comesBefore(InitCopy, Access))
-                    return Fail("access before init");
+                    return false;
                 continue;
             }
             if (InitCopy->getParent() != AI->getParent())
-                return Fail("access before init");
+                return false;
         }
     }
 
@@ -993,7 +948,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
             if (!Init || !Init->getIRType() || !Entry.second ||
                 Init->getIRType()->getEnum() != Entry.second->getEnum() ||
                 Init->getIRType()->getSize() != Entry.second->getSize())
-                return Fail("bad init element");
+                return false;
             InitialValues[Entry.first] = Init;
         }
     }
@@ -1030,7 +985,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         auto SlotIt = Slots.find(PathIt->second);
         if (SlotIt != Slots.end())
             GEP->replaceAllUsesWith(SlotIt->second);
-        if (!GEP->getUseList().is_empty()) return false;
+        if (GEP->hasUses()) return false;
         delete GEP;
     }
 
@@ -1040,13 +995,13 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         auto SlotIt = Slots.find(PathIt->second);
         if (SlotIt != Slots.end())
             GEP->replaceAllUsesWith(SlotIt->second);
-        if (!GEP->getUseList().is_empty()) return false;
+        if (GEP->hasUses()) return false;
         delete GEP;
     }
 
     if (InitCopy) delete InitCopy;
 
-    if (!AI->getUseList().is_empty()) return false;
+    if (AI->hasUses()) return false;
     delete AI;
     return true;
 }
@@ -1063,9 +1018,7 @@ LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
         Worklist.pop_back();
         if (!SeenValues.insert(Ptr).second) continue;
 
-        for (auto It = Ptr->getUseList().begin();
-             It != Ptr->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : Ptr->getUses()) {
             if (!U || U->getValue() != Ptr) continue;
             auto *I = dynamic_cast<Instruction *>(U->getUser());
             if (!I) {
@@ -1116,10 +1069,10 @@ bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     for (auto It = Uses.DerivedPointers.rbegin();
          It != Uses.DerivedPointers.rend(); ++It) {
         Instruction *I = *It;
-        if (I->getUseList().is_empty()) delete I;
+        if (!I->hasUses()) delete I;
     }
 
-    if (!AI->getUseList().is_empty()) return false;
+    if (AI->hasUses()) return false;
     delete AI;
     return true;
 }

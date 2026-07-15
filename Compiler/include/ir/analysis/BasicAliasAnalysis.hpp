@@ -29,9 +29,8 @@ struct MemoryLocation {
     Value *Pointer = nullptr;
     std::optional<std::size_t> Size;
 
-    MemoryLocation() = default;
-    MemoryLocation(Value *P, std::optional<std::size_t> S)
-        : Pointer(P), Size(S) {}
+    MemoryLocation();
+    MemoryLocation(Value *P, std::optional<std::size_t> S);
 
     static MemoryLocation get(const LoadInst *Load);
     static MemoryLocation get(const StoreInst *Store);
@@ -41,9 +40,9 @@ struct MemoryLocation {
 // BasicAAResult：别名分析结果
 class BasicAAResult {
 public:
-    BasicAAResult() = default;
-    BasicAAResult(BasicAAResult&&) = default;
-    BasicAAResult& operator=(BasicAAResult&&) = default;
+    BasicAAResult();
+    BasicAAResult(BasicAAResult&&);
+    BasicAAResult& operator=(BasicAAResult&&);
     BasicAAResult(const BasicAAResult&) = delete;
     BasicAAResult& operator=(const BasicAAResult&) = delete;
     bool invalidate(Function &F, const PreservationStatus &PA);
@@ -68,12 +67,15 @@ public:
 private:
     friend class BasicAliasAnalysis;
 
+    // BasicAA 内部共用的溢出检查与指针来源判定。
+    static bool checkedAdd(long long A, long long B, long long &Result);
+    static bool checkedSub(long long A, long long B, long long &Result);
+    static bool checkedMul(long long A, long long B, long long &Result);
+    static bool hasUndefPointerOrigin(
+        Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0);
+
     struct ValuePairHash {
-        std::size_t operator()(const std::pair<Value*, Value*>& P) const {
-            auto H1 = static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(P.first));
-            auto H2 = static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(P.second));
-            return H1 ^ (H2 + 0x9e3779b97f4a7c15ULL + (H1 << 6) + (H1 >> 2));
-        }
+        std::size_t operator()(const std::pair<Value*, Value*>& P) const;
     };
 
     struct LinearGEP {

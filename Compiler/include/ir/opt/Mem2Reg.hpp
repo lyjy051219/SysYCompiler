@@ -56,13 +56,7 @@ struct AllocaInfo{
     StoreInst* OnlyStore;
     bool OnlyUsedOneBlock;
 
-    void clean(){
-        StoreBlocks.clear();
-        LoadBlocks.clear();
-        OnlyBlock = nullptr;
-        OnlyStore = nullptr;
-        OnlyUsedOneBlock = true;
-    }
+    void clean();
 
     void AnalyzeAlloca(AllocaInst*AI);
 };

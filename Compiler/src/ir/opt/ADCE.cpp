@@ -217,7 +217,7 @@ bool ADCEPass::sweep(
     }
 
     for (Instruction *I : deadInsts) {
-        if (!I->getUseList().is_empty()) {
+        if (I->hasUses()) {
             I->replaceAllUsesWith(UndefValue::NewUndefValue(I->getIRType()));
         }
         delete I;

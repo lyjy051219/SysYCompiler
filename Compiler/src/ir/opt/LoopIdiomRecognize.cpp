@@ -151,9 +151,7 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     // effect is the only live-out and is replaced by the intrinsic call.
     for (Instruction *I : Allowed) {
         if (!I) continue;
-        for (auto It = I->getUseList().begin();
-             It != I->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : I->getUses()) {
             auto *UserI = U ? dynamic_cast<Instruction *>(U->getUser()) : nullptr;
             if (!UserI || !UserI->getParent() ||
                 !L->contains(UserI->getParent()))
@@ -343,9 +341,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     // Whole-object escape proof for the temporary.  Exactly the first-loop
     // store and second-loop load may use its two derived element pointers.
     std::unordered_set<Value *> TempPointerUses;
-    for (auto It = Temporary->getUseList().begin();
-         It != Temporary->getUseList().end(); ++It) {
-        Use *U = *It;
+    for (Use *U : Temporary->getUses()) {
         if (!U || U->getValue() != Temporary) continue;
         Value *User = dynamic_cast<Value *>(U->getUser());
         if (User != TempWrite && User != TempRead) return false;
@@ -357,9 +353,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
                       std::make_pair(static_cast<Value *>(TempRead),
                                     static_cast<Instruction *>(Second.Load))}) {
         unsigned Uses = 0;
-        for (auto It = Pair.first->getUseList().begin();
-             It != Pair.first->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : Pair.first->getUses()) {
             if (!U || U->getValue() != Pair.first) continue;
             if (U->getUser() != Pair.second) return false;
             ++Uses;
@@ -489,13 +483,13 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
             delete I;
         for (Instruction *I : {static_cast<Instruction *>(First.Load),
                                static_cast<Instruction *>(Second.Load)})
-            if (I->getUseList().is_empty()) delete I;
+            if (!I->hasUses()) delete I;
         for (Instruction *I : {static_cast<Instruction *>(First.Source.GEP),
                                static_cast<Instruction *>(TempWrite),
                                static_cast<Instruction *>(TempRead),
                                static_cast<Instruction *>(Second.Destination.GEP)})
-            if (I->getUseList().is_empty()) delete I;
-        if (Temporary->getUseList().is_empty()) delete Temporary;
+            if (!I->hasUses()) delete I;
+        if (!Temporary->hasUses()) delete Temporary;
     }
     return true;
 
@@ -799,9 +793,9 @@ bool LoopIdiomRecognizePass::transformLoop(
         CFGChanged = true;
     } else {
         delete Store;
-        if (SourceLoad && SourceLoad->getUseList().is_empty()) delete SourceLoad;
-        if (SourceGEP && SourceGEP->getUseList().is_empty()) delete SourceGEP;
-        if (DestGEP && DestGEP->getUseList().is_empty()) delete DestGEP;
+        if (SourceLoad && !SourceLoad->hasUses()) delete SourceLoad;
+        if (SourceGEP && !SourceGEP->hasUses()) delete SourceGEP;
+        if (DestGEP && !DestGEP->hasUses()) delete DestGEP;
     }
     return true;
 }

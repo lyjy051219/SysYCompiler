@@ -6,9 +6,66 @@
 
 #include <unordered_set>
 
-namespace {
+MemoryAccess::MemoryAccess(Kind K, unsigned AccessID, BasicBlock *BB,
+                           Instruction *I)
+    : AccessKind(K), ID(AccessID), Block(BB), Inst(I) {}
 
-bool isInvariantInLoop(Value *V, const Loop *L) {
+MemoryAccess::Kind MemoryAccess::getKind() const {
+    return AccessKind;
+}
+
+bool MemoryAccess::isLiveOnEntry() const {
+    return AccessKind == Kind::LiveOnEntry;
+}
+
+bool MemoryAccess::isPhi() const {
+    return AccessKind == Kind::Phi;
+}
+
+bool MemoryAccess::isUse() const {
+    return AccessKind == Kind::Use;
+}
+
+bool MemoryAccess::isDef() const {
+    return AccessKind == Kind::Def;
+}
+
+unsigned MemoryAccess::getID() const {
+    return ID;
+}
+
+BasicBlock *MemoryAccess::getBlock() const {
+    return Block;
+}
+
+Instruction *MemoryAccess::getInstruction() const {
+    return Inst;
+}
+
+MemoryAccess *MemoryAccess::getDefiningAccess() const {
+    return DefiningAccess;
+}
+
+const std::vector<std::pair<BasicBlock *, MemoryAccess *>> &
+MemoryAccess::getIncomingAccesses() const {
+    return IncomingAccesses;
+}
+
+MemorySSAResult::MemorySSAResult() = default;
+
+MemorySSAResult::MemorySSAResult(MemorySSAResult &&) noexcept = default;
+
+MemorySSAResult &MemorySSAResult::operator=(MemorySSAResult &&) noexcept = default;
+
+MemoryAccess *MemorySSAResult::getLiveOnEntry() const {
+    return LiveOnEntry;
+}
+
+std::size_t MemorySSAResult::size() const {
+    return OwnedAccesses.size();
+}
+
+bool MemorySSAResult::isInvariantInLoop(Value *V, const Loop *L) {
     if (!V || !L) return true;
     if (V->isConst()) return true;
     if (auto *Var = dynamic_cast<Variable *>(V))
@@ -18,15 +75,13 @@ bool isInvariantInLoop(Value *V, const Loop *L) {
     return !BB || !L->contains(BB);
 }
 
-bool storeFullyCoversItsPointer(const StoreInst *SI) {
+bool MemorySSAResult::storeFullyCoversItsPointer(const StoreInst *SI) {
     Value *P = SI ? SI->getPointerOperand() : nullptr;
     Value *V = SI ? SI->getValueOperand() : nullptr;
     std::shared_ptr<IRType> Pointee = P ? P->getPointeeType() : nullptr;
     return Pointee && V && V->getIRType() &&
            Pointee->hasSameShape(*V->getIRType());
 }
-
-} // namespace
 
 MemoryAccess *MemorySSAResult::createAccess(MemoryAccess::Kind K,
                                             BasicBlock *BB,

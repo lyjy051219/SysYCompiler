@@ -8,6 +8,8 @@
 #include <tuple>
 #include <utility>
 
+GVNPREPass::GVNPREPass(bool EnablePRE) : EnablePRE(EnablePRE) {}
+
 bool ExprKey::operator==(const ExprKey &RHS) const {
     return Opcode == RHS.Opcode && Args == RHS.Args;
 }
@@ -35,155 +37,135 @@ std::size_t PhiTranslateKeyHash::operator()(const PhiTranslateKey &K) const {
     return H;
 }
 
-namespace {
+bool PhiCongruenceMatcher::ValuePair::operator==(
+    const ValuePair &Other) const {
+    return A == Other.A && B == Other.B;
+}
 
-// Cyclic SSA recurrences cannot be compared by assigning fresh numbers to
-// PHIs: the distinct seed numbers keep otherwise identical backedge
-// expressions apart forever.  This matcher compares two pure SSA subgraphs
-// co-inductively.  Encountering the same pair while it is being checked means
-// that both recurrences have advanced through the same cycle; equality still
-// has to be established by their non-cyclic inputs (normally the preheader
-// values).
-struct ValuePair {
-    Value *A = nullptr;
-    Value *B = nullptr;
+std::size_t PhiCongruenceMatcher::ValuePairHash::operator()(
+    const ValuePair &P) const {
+    std::size_t H = reinterpret_cast<std::uintptr_t>(P.A);
+    const auto R = reinterpret_cast<std::uintptr_t>(P.B);
+    H ^= R + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+    return H;
+}
 
-    bool operator==(const ValuePair &Other) const {
-        return A == Other.A && B == Other.B;
+bool PhiCongruenceMatcher::equivalent(Value *A, Value *B) {
+    return equivalentImpl(A, B, 0);
+}
+
+PhiCongruenceMatcher::ValuePair PhiCongruenceMatcher::canonicalPair(
+    Value *A, Value *B) {
+    if (std::less<Value *>{}(B, A)) std::swap(A, B);
+    return {A, B};
+}
+
+bool PhiCongruenceMatcher::isSupportedPureInstruction(Instruction *I) {
+    if (!I) return false;
+    if (dynamic_cast<BinaryInst *>(I) || dynamic_cast<PhiInst *>(I))
+        return true;
+    switch (I->instType) {
+    case Instruction::GEP:
+    case Instruction::SELECT:
+    case Instruction::TRUNC:
+    case Instruction::ZEXT:
+    case Instruction::SEXT:
+    case Instruction::FPTOSI:
+    case Instruction::SITOFP:
+    case Instruction::BITCAST:
+        return true;
+    default:
+        return false;
     }
-};
+}
 
-struct ValuePairHash {
-    std::size_t operator()(const ValuePair &P) const {
-        std::size_t H = reinterpret_cast<std::uintptr_t>(P.A);
-        const auto R = reinterpret_cast<std::uintptr_t>(P.B);
-        H ^= R + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
-        return H;
-    }
-};
-
-class PhiCongruenceMatcher {
-public:
-    bool equivalent(Value *A, Value *B) {
-        return equivalentImpl(A, B, 0);
+bool PhiCongruenceMatcher::equivalentPhis(
+    PhiInst *A, PhiInst *B, unsigned Depth) {
+    if (!A || !B || A->getParent() != B->getParent() ||
+        A->getNumIncomingValues() != B->getNumIncomingValues()) {
+        return false;
     }
 
-private:
-    enum class State : unsigned char { Visiting, Equal, Different };
-    std::unordered_map<ValuePair, State, ValuePairHash> States;
+    // Match by predecessor rather than operand order.  Duplicate incoming
+    // blocks are edge-sensitive in this IR and cannot be translated
+    // unambiguously, so leave those uncommon forms alone.
+    std::unordered_set<BasicBlock *> SeenA;
+    std::unordered_set<BasicBlock *> SeenB;
+    for (unsigned I = 0; I < A->getNumIncomingValues(); ++I) {
+        BasicBlock *Pred = A->getIncomingBlock(I);
+        if (!Pred || !SeenA.insert(Pred).second) return false;
 
-    static ValuePair canonicalPair(Value *A, Value *B) {
-        if (std::less<Value *>{}(B, A)) std::swap(A, B);
-        return {A, B};
-    }
-
-    static bool isSupportedPureInstruction(Instruction *I) {
-        if (!I) return false;
-        if (dynamic_cast<BinaryInst *>(I) || dynamic_cast<PhiInst *>(I))
-            return true;
-        switch (I->instType) {
-        case Instruction::GEP:
-        case Instruction::SELECT:
-        case Instruction::TRUNC:
-        case Instruction::ZEXT:
-        case Instruction::SEXT:
-        case Instruction::FPTOSI:
-        case Instruction::SITOFP:
-        case Instruction::BITCAST:
-            return true;
-        default:
+        Value *OtherIncoming = nullptr;
+        unsigned Matches = 0;
+        for (unsigned J = 0; J < B->getNumIncomingValues(); ++J) {
+            if (B->getIncomingBlock(J) != Pred) continue;
+            OtherIncoming = B->getIncomingValue(J);
+            ++Matches;
+        }
+        if (Matches != 1 || !SeenB.insert(Pred).second ||
+            !equivalentImpl(A->getIncomingValue(I), OtherIncoming,
+                            Depth + 1)) {
             return false;
         }
     }
+    return SeenA.size() == SeenB.size();
+}
 
-    bool equivalentPhis(PhiInst *A, PhiInst *B, unsigned Depth) {
-        if (!A || !B || A->getParent() != B->getParent() ||
-            A->getNumIncomingValues() != B->getNumIncomingValues()) {
-            return false;
-        }
+bool PhiCongruenceMatcher::equivalentImpl(
+    Value *A, Value *B, unsigned Depth) {
+    if (A == B) return A && !Value::isUndef(A);
+    if (!A || !B || Value::isUndef(A) || Value::isUndef(B) ||
+        Depth > 128 || A->getIRType().get() != B->getIRType().get()) {
+        return false;
+    }
 
-        // Match by predecessor rather than operand order.  Duplicate incoming
-        // blocks are edge-sensitive in this IR and cannot be translated
-        // unambiguously, so leave those uncommon forms alone.
-        std::unordered_set<BasicBlock *> SeenA;
-        std::unordered_set<BasicBlock *> SeenB;
-        for (unsigned I = 0; I < A->getNumIncomingValues(); ++I) {
-            BasicBlock *Pred = A->getIncomingBlock(I);
-            if (!Pred || !SeenA.insert(Pred).second) return false;
+    auto *IA = dynamic_cast<Instruction *>(A);
+    auto *IB = dynamic_cast<Instruction *>(B);
+    if (!IA || !IB || IA->instType != IB->instType ||
+        !isSupportedPureInstruction(IA) ||
+        !isSupportedPureInstruction(IB)) {
+        // Constants are interned by representation, and parameters/globals
+        // are only equal by identity (handled above).
+        return false;
+    }
 
-            Value *OtherIncoming = nullptr;
-            unsigned Matches = 0;
-            for (unsigned J = 0; J < B->getNumIncomingValues(); ++J) {
-                if (B->getIncomingBlock(J) != Pred) continue;
-                OtherIncoming = B->getIncomingValue(J);
-                ++Matches;
-            }
-            if (Matches != 1 || !SeenB.insert(Pred).second ||
-                !equivalentImpl(A->getIncomingValue(I), OtherIncoming,
+    ValuePair Pair = canonicalPair(A, B);
+    auto It = States.find(Pair);
+    if (It != States.end()) {
+        if (It->second == State::Visiting || It->second == State::Equal)
+            return true;
+        return false;
+    }
+    States.emplace(Pair, State::Visiting);
+
+    bool Equal = false;
+    if (auto *PA = dynamic_cast<PhiInst *>(IA)) {
+        Equal = equivalentPhis(PA, dynamic_cast<PhiInst *>(IB), Depth);
+    } else if (auto *BA = dynamic_cast<BinaryInst *>(IA)) {
+        auto *BB = dynamic_cast<BinaryInst *>(IB);
+        Value *AL = nullptr;
+        Value *AR = nullptr;
+        Value *BL = nullptr;
+        Value *BR = nullptr;
+        Equal = BB && BA->getOp() == BB->getOp() &&
+                BinaryInst::getOperands(BA, AL, AR) &&
+                BinaryInst::getOperands(BB, BL, BR) &&
+                equivalentImpl(AL, BL, Depth + 1) &&
+                equivalentImpl(AR, BR, Depth + 1);
+    } else if (IA->getNumOperands() == IB->getNumOperands()) {
+        Equal = true;
+        for (size_t I = 0; I < IA->getNumOperands(); ++I) {
+            if (!equivalentImpl(IA->getOperand(I), IB->getOperand(I),
                                 Depth + 1)) {
-                return false;
+                Equal = false;
+                break;
             }
         }
-        return SeenA.size() == SeenB.size();
     }
 
-    bool equivalentImpl(Value *A, Value *B, unsigned Depth) {
-        if (A == B) return A && !Value::isUndef(A);
-        if (!A || !B || Value::isUndef(A) || Value::isUndef(B) ||
-            Depth > 128 || A->getIRType().get() != B->getIRType().get()) {
-            return false;
-        }
-
-        auto *IA = dynamic_cast<Instruction *>(A);
-        auto *IB = dynamic_cast<Instruction *>(B);
-        if (!IA || !IB || IA->instType != IB->instType ||
-            !isSupportedPureInstruction(IA) ||
-            !isSupportedPureInstruction(IB)) {
-            // Constants are interned by representation, and parameters/globals
-            // are only equal by identity (handled above).
-            return false;
-        }
-
-        ValuePair Pair = canonicalPair(A, B);
-        auto It = States.find(Pair);
-        if (It != States.end()) {
-            if (It->second == State::Visiting || It->second == State::Equal)
-                return true;
-            return false;
-        }
-        States.emplace(Pair, State::Visiting);
-
-        bool Equal = false;
-        if (auto *PA = dynamic_cast<PhiInst *>(IA)) {
-            Equal = equivalentPhis(PA, dynamic_cast<PhiInst *>(IB), Depth);
-        } else if (auto *BA = dynamic_cast<BinaryInst *>(IA)) {
-            auto *BB = dynamic_cast<BinaryInst *>(IB);
-            Value *AL = nullptr;
-            Value *AR = nullptr;
-            Value *BL = nullptr;
-            Value *BR = nullptr;
-            Equal = BB && BA->getOp() == BB->getOp() &&
-                    BinaryInst::getOperands(BA, AL, AR) &&
-                    BinaryInst::getOperands(BB, BL, BR) &&
-                    equivalentImpl(AL, BL, Depth + 1) &&
-                    equivalentImpl(AR, BR, Depth + 1);
-        } else if (IA->getNumOperands() == IB->getNumOperands()) {
-            Equal = true;
-            for (size_t I = 0; I < IA->getNumOperands(); ++I) {
-                if (!equivalentImpl(IA->getOperand(I), IB->getOperand(I),
-                                    Depth + 1)) {
-                    Equal = false;
-                    break;
-                }
-            }
-        }
-
-        States[Pair] = Equal ? State::Equal : State::Different;
-        return Equal;
-    }
-};
-
-} // namespace
+    States[Pair] = Equal ? State::Equal : State::Different;
+    return Equal;
+}
 
 GVNPRESolver::GVNPRESolver(Function &F,
                            FunctionAnalysisPassManager &FAM,
@@ -939,8 +921,7 @@ bool GVNPRESolver::runGVN() {
     for (BasicBlock *BB : RPO) {
         if (isDeadBlock(BB)) continue;
 
-        std::vector<Instruction *> Insts;
-        for (Instruction *I : *BB) Insts.push_back(I);
+        auto Insts = BB->getInstructions();
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
@@ -1223,8 +1204,7 @@ bool GVNPRESolver::runPRE() {
     for (BasicBlock *BB : DFSOrder) {
         if (!BB || BB == F.front() || isDeadBlock(BB)) continue;
 
-        std::vector<Instruction *> Insts;
-        for (Instruction *I : *BB) Insts.push_back(I);
+        auto Insts = BB->getInstructions();
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
@@ -1417,35 +1397,26 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
     return PA;
 }
 
-namespace {
+bool LocalGVNPass::LocalExprKey::operator==(
+    const LocalExprKey &Other) const {
+    return Opcode == Other.Opcode && SubOpcode == Other.SubOpcode &&
+           ResultType == Other.ResultType && Operands == Other.Operands;
+}
 
-struct LocalExprKey {
-    unsigned Opcode = 0;
-    unsigned SubOpcode = 0;
-    const IRType *ResultType = nullptr;
-    std::vector<Value *> Operands;
+std::size_t LocalGVNPass::LocalExprKeyHash::operator()(
+    const LocalExprKey &K) const {
+    std::size_t H = static_cast<std::size_t>(K.Opcode);
+    auto mix = [&](std::size_t V) {
+        H ^= V + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+    };
+    mix(static_cast<std::size_t>(K.SubOpcode));
+    mix(reinterpret_cast<std::uintptr_t>(K.ResultType));
+    for (Value *V : K.Operands)
+        mix(reinterpret_cast<std::uintptr_t>(V));
+    return H;
+}
 
-    bool operator==(const LocalExprKey &Other) const {
-        return Opcode == Other.Opcode && SubOpcode == Other.SubOpcode &&
-               ResultType == Other.ResultType && Operands == Other.Operands;
-    }
-};
-
-struct LocalExprKeyHash {
-    std::size_t operator()(const LocalExprKey &K) const {
-        std::size_t H = static_cast<std::size_t>(K.Opcode);
-        auto mix = [&](std::size_t V) {
-            H ^= V + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
-        };
-        mix(static_cast<std::size_t>(K.SubOpcode));
-        mix(reinterpret_cast<std::uintptr_t>(K.ResultType));
-        for (Value *V : K.Operands)
-            mix(reinterpret_cast<std::uintptr_t>(V));
-        return H;
-    }
-};
-
-bool buildLocalExprKey(Instruction *I, LocalExprKey &K) {
+bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
     if (!I || !I->getIRType() || I->getIRType()->getEnum() == IR_VOID)
         return false;
 
@@ -1492,8 +1463,6 @@ bool buildLocalExprKey(Instruction *I, LocalExprKey &K) {
     return !K.Operands.empty();
 }
 
-} // namespace
-
 PreservationStatus LocalGVNPass::run(Function &F,
                                      FunctionAnalysisPassManager &) {
     bool Changed = false;
@@ -1502,8 +1471,7 @@ PreservationStatus LocalGVNPass::run(Function &F,
         if (!BB) continue;
         std::unordered_map<LocalExprKey, Instruction *, LocalExprKeyHash> Leaders;
 
-        std::vector<Instruction *> Insts;
-        for (Instruction *I : *BB) Insts.push_back(I);
+        auto Insts = BB->getInstructions();
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;

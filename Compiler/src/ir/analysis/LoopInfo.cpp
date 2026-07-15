@@ -3,6 +3,60 @@
 #include <queue>
 #include <algorithm>
 
+Loop::Loop() = default;
+
+BasicBlock *Loop::getHeader() const {
+    return Header;
+}
+
+Loop *Loop::getParentLoop() const {
+    return ParentLoop;
+}
+
+const std::vector<Loop *> &Loop::getSubLoops() const {
+    return SubLoops;
+}
+
+const std::vector<BasicBlock *> &Loop::getBlocks() const {
+    return Blocks;
+}
+
+const std::vector<BasicBlock *> &Loop::getBackedgeSrcs() const {
+    return BackedgeSrcs;
+}
+
+unsigned Loop::getDepth() const {
+    unsigned Depth = 1;
+    for (Loop *Parent = ParentLoop; Parent; Parent = Parent->ParentLoop)
+        ++Depth;
+    return Depth;
+}
+
+bool Loop::isInnermost() const {
+    return SubLoops.empty();
+}
+
+LoopInfo::LoopInfo() = default;
+
+LoopInfo::LoopInfo(LoopInfo &&) = default;
+
+LoopInfo &LoopInfo::operator=(LoopInfo &&) = default;
+
+void LoopInfo::clear() {
+    Loops.clear();
+    TopLevelLoops.clear();
+    BBToLoop.clear();
+}
+
+Loop *LoopInfo::getLoopFor(BasicBlock *BB) const {
+    auto It = BBToLoop.find(BB);
+    return It != BBToLoop.end() ? It->second : nullptr;
+}
+
+const std::vector<Loop *> &LoopInfo::getTopLevelLoops() const {
+    return TopLevelLoops;
+}
+
 // Loop::contains --外界使用这个AnalysisPass的接口
 bool Loop::contains(BasicBlock* BB) const {
     for (BasicBlock* b : Blocks)

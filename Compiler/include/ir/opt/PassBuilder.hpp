@@ -12,7 +12,7 @@ enum class OptimizationLevel{
 
 class PassBuilder{
     public:
-    explicit PassBuilder() = default;
+    explicit PassBuilder();
     //AnalysisPass注册相关函数
     void registerModuleAnalyses(ModuleAnalysisPassManager &MAM);
     void registerFunctionAnalyses(FunctionAnalysisPassManager &FAM);

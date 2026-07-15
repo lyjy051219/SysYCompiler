@@ -19,6 +19,14 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    // 块内覆盖判定与逃逸检查均为 DSE 的实现细节。
+    static bool storesHaveIdenticalCoverage(const StoreInst *First,
+                                             const StoreInst *Second);
+    static bool storeFullyCoversPointer(Value *Pointer,
+                                        const StoreInst *Store);
+    static bool isNonEscapingLocalStackPointer(Value *Pointer);
+    static bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
+                                       const LoopInfo &LI);
     static bool eliminateInBlock(BasicBlock *BB);
     static DSEBlockColor classifyFrom(
         Instruction *First, const MemoryLocation &Location, BasicAAResult &AA,

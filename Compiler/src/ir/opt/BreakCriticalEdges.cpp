@@ -5,23 +5,24 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 
-#include <utility>
 #include <vector>
 
 
 PreservationStatus BreakCriticalEdgesPass::run(Function &F, FunctionAnalysisPassManager &) {
-	std::vector<std::pair<BasicBlock *, BasicBlock *>> CriticalEdges;
+	std::vector<CFGEdge> CriticalEdges;
+	CFGSnapshot CFG(F);
 
 	for (BasicBlock *From : F) {
 		if (!From) continue;
-		auto Succs = From->getSuccessors();
-		if (Succs.size() != 2) continue;
-		if (Succs[0] == Succs[1]) continue;
+		const auto &Successors = CFG.successorEdges(From);
+		if (Successors.size() != 2 || Successors[0] == Successors[1]) {
+			continue;
+		}
 
-		for (BasicBlock *To : Succs) {
-			if (From->isCriticalEdgeTo(To)) {
-				CriticalEdges.emplace_back(From, To);
-			}
+		for (unsigned Index = 0; Index < Successors.size(); ++Index) {
+			BasicBlock *To = Successors[Index];
+			if (CFG.distinctPredecessors(To).size() <= 1) continue;
+			CriticalEdges.push_back({From, Index, To});
 		}
 	}
 
@@ -31,26 +32,10 @@ PreservationStatus BreakCriticalEdgesPass::run(Function &F, FunctionAnalysisPass
 
 	bool Changed = false;
 
-	for (const auto &Edge : CriticalEdges) {
-		BasicBlock *From = Edge.first;
-		BasicBlock *To = Edge.second;
-		if (!From || !To) continue;
-
+	for (const CFGEdge &Edge : CriticalEdges) {
 		// 保护性重检：前面拆边可能改变 CFG 形态。
-		if (!From->isCriticalEdgeTo(To)) continue;
-
-		auto *SplitBB = new BasicBlock();
-		F.pushBlock(SplitBB);
-		SplitBB->genUnCondInst(To);
-
-		bool Redirected = BasicBlock::redirectBranchTarget(From, To, SplitBB);
-		if (!Redirected) {
-			SplitBB->eraseBlockSafely();
-			continue;
-		}
-
-		BasicBlock::replaceIncomingPredInSuccPhis(To, From, SplitBB);
-		Changed = true;
+		if (!BasicBlock::isCriticalEdge(Edge)) continue;
+		if (BasicBlock::splitEdge(F, Edge)) Changed = true;
 	}
 
 	if (!Changed) return PreservationStatus::all();

@@ -2,6 +2,22 @@
 
 // DominatorTree Implementation
 
+bool DominatorNode::isLeaf() const {
+    return FirstChild == nullptr;
+}
+
+DominatorTree::DominatorTree() = default;
+
+DominatorTree::DominatorTree(DominatorTree &&other) noexcept = default;
+
+DominatorTree &DominatorTree::operator=(DominatorTree &&other) noexcept = default;
+
+void DominatorTree::clear() {
+    Nodes.clear();
+    BlockToNode.clear();
+    Root = nullptr;
+}
+
 BasicBlock* DominatorTree::getIDom(BasicBlock* BB) const {
     auto it = BlockToNode.find(BB);
     if (it == BlockToNode.end()) return nullptr;

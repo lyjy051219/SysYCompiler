@@ -13,13 +13,17 @@
 #include <unordered_set>
 #include <vector>
 
-namespace {
+std::size_t ExitValueKeyHash::operator()(const ExitValueKey &K) const {
+	auto A = reinterpret_cast<std::uintptr_t>(K.first);
+	auto B = reinterpret_cast<std::uintptr_t>(K.second);
+	return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
+}
 
 // 在同一基本块中，即使候选指令的块支配了所有 exit/latch，
 // 它前面仍可能有不返回的 call 或会 fault 的内存/除法指令。
 // 把候选移到 preheader 会让它在这些指令之前执行，所以这种
 // 情况不能仅凭基本块支配关系宣称 must-execute。
-bool hasSafeExecutionPrefix(const Instruction *Candidate) {
+bool LICMPass::hasSafeExecutionPrefix(const Instruction *Candidate) {
 	BasicBlock *BB = Candidate ? Candidate->getParent() : nullptr;
 	if (!BB) return false;
 
@@ -38,7 +42,7 @@ bool hasSafeExecutionPrefix(const Instruction *Candidate) {
 // 无 must-execute 证明时，只允许提前执行明确不会除零的
 // div/rem。signed div/rem 的 INT_MIN, -1 在不同 IR/目标
 // 语义下可能产生 poison 或 trap，因此保守拒绝 -1。
-bool isSpeculatableDivisionOrRemainder(Instruction *I) {
+bool LICMPass::isSpeculatableDivisionOrRemainder(Instruction *I) {
 	auto *BI = dynamic_cast<BinaryInst *>(I);
 	Value *Dividend = nullptr;
 	Value *Divisor = nullptr;
@@ -66,7 +70,7 @@ bool isSpeculatableDivisionOrRemainder(Instruction *I) {
 // non-faulting proof deliberately narrow: a direct global/alloca object or a
 // structurally in-bounds, all-constant GEP rooted at one.  Casts, parameters
 // and symbolic indices are rejected instead of guessing object bounds.
-bool isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
+bool LICMPass::isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
 	if (!Ptr || !StoredValue || !StoredValue->getIRType()) return false;
 	auto IsOwnedRoot = [](Value *V) {
 		if (auto *Var = dynamic_cast<Variable *>(V)) return Var->isGlobal();
@@ -113,7 +117,7 @@ bool isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
 // respect to the loop.  SideEffectAnalysis supplies the memory summary; reject
 // unknown/builtin effects, all writes, and any read location that the loop may
 // modify.
-bool isReusableLoopInvariantCall(
+bool LICMPass::isReusableLoopInvariantCall(
 	CallInst *CI,
 	const std::vector<Instruction *> &LoopInsts,
 	BasicAAResult &AA,
@@ -179,7 +183,7 @@ bool isReusableLoopInvariantCall(
 // ordering relative to every instruction before CI, and the behaviour of a
 // trapping or non-returning first call.  BB must dominate the unique latch so
 // every iteration that continues to the next one has produced ValuePhi.
-bool cacheLoopInvariantCall(
+bool LICMPass::cacheLoopInvariantCall(
 	Function &F,
 	CallInst *CI,
 	Loop &L,
@@ -196,7 +200,7 @@ bool cacheLoopInvariantCall(
 	if (!L.contains(BB) || !DT.dominates(BB, Latch)) return false;
 	if (!CI->getIRType() || CI->getIRType()->getEnum() == IR_VOID)
 		return false;
-	if (CI->getUseList().is_empty()) return false;
+	if (!CI->hasUses()) return false;
 
 	// A well-formed basic block must retain a terminator in the continuation.
 	std::vector<Instruction *> Tail;
@@ -243,12 +247,7 @@ bool cacheLoopInvariantCall(
 		BasicBlock::replaceIncomingPredInSuccPhis(Succ, BB, MergeBB);
 	}
 
-	std::vector<Use *> OriginalUses;
-	for (auto It = CI->getUseList().begin();
-		 It != CI->getUseList().end(); ++It) {
-		Use *U = *It;
-		if (U && U->getValue() == CI) OriginalUses.push_back(U);
-	}
+	auto OriginalUses = CI->getUses();
 
 	auto *ValuePhi = new PhiInst(CI->getIRType());
 	ValuePhi->setIdent(ValuePhi->getIdent() + ".licm.value");
@@ -281,13 +280,9 @@ bool cacheLoopInvariantCall(
 	return true;
 }
 
-} // namespace
-
-
 // 1) 检查所有 user 是否都在循环外
 bool LICMPass::areAllUsersOutsideLoop(Instruction *I, const Loop &L) {
-	for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
-		Use *U = *It;
+	for (Use *U : I->getUses()) {
 		if (!U || U->getValue() != I) continue;
 		auto *UI = dynamic_cast<Instruction *>(U->getUser());
 		if (!UI) continue;
@@ -690,11 +685,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				}
 
 				bool RewriteOK = true;
-				std::vector<Use *> Uses;
-				for (auto Uit = I->getUseList().begin(); Uit != I->getUseList().end(); ++Uit) {
-					Use *U = *Uit;
-					if (U && U->getValue() == I) Uses.push_back(U);
-				}
+				auto Uses = I->getUses();
 
 				for (Use *U : Uses) {
 					auto *UI = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);

@@ -20,10 +20,6 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-using BlockSet = std::unordered_set<BasicBlock *>;
-
 // Absolute caps protect compile time.  Profitability is governed primarily by
 // the relative function-size budget below: unlike the old 20/96 whole-loop
 // cap, these limits apply only to the specialized side that is actually
@@ -34,64 +30,13 @@ constexpr std::size_t MaxNonTrivialCloneInstructions = 192;
 constexpr std::size_t MaxClonePercentOfFunction = 30;
 constexpr std::size_t MaxGeneratedClonePercentOfFunction = 15;
 
-struct CanonicalLoopShape {
-    BasicBlock *Header = nullptr;
-    BasicBlock *PreHeader = nullptr;
-    BasicBlock *Latch = nullptr;
-};
-
-struct TrivialCandidate {
-    Loop *L = nullptr;
-    CanonicalLoopShape Shape;
-    BasicBlock *Parent = nullptr;
-    BrInst *Branch = nullptr;
-    Value *Condition = nullptr;
-    BasicBlock *Exit = nullptr;
-    BasicBlock *Continue = nullptr;
-    bool ExitOnTrue = false;
-};
-
-struct EntryKnownCandidate {
-    Loop *L = nullptr;
-    Value *Condition = nullptr;
-    std::vector<BasicBlock *> AllBlocks;
-    bool KnownValue = false;
-};
-
-struct NonTrivialCandidate {
-    Loop *L = nullptr;
-    CanonicalLoopShape Shape;
-    BasicBlock *Parent = nullptr;
-    BrInst *Branch = nullptr;
-    Value *Condition = nullptr;
-    BasicBlock *TrueSucc = nullptr;
-    BasicBlock *FalseSucc = nullptr;
-    std::vector<BasicBlock *> AllBlocks;
-    BlockSet TrueReachable;
-    BlockSet FalseReachable;
-    // Directional specialization plan.  OriginalValue is kept in the
-    // original block layout; the opposite value is cloned.  Keeping the
-    // larger, normally hot path original avoids adding a jump to tight loops.
-    bool OriginalValue = false;
-    BasicBlock *OriginalSucc = nullptr;
-    BasicBlock *CloneSucc = nullptr;
-    BlockSet OriginalReachable;
-    BlockSet CloneReachable;
-    std::int64_t Benefit = 0;
-    std::int64_t Cost = 0;
-    unsigned ControlUses = 0;
-    std::size_t CloneInstructions = 0;
-    std::size_t CloneWeight = 0;
-    bool GeneratedByLoopTransform = false;
-};
-
-bool isBooleanNonConstant(Value *V) {
+bool LoopUnswitchPass::isBooleanNonConstant(Value *V) {
     if (!V || Value::isUndef(V) || V->isConst() || !V->getIRType())
         return false;
     return V->getIRType() == INTType::NewBool();
 }
 
-bool isAvailableAt(Value *V, Instruction *UsePoint, const Loop &L,
+bool LoopUnswitchPass::isAvailableAt(Value *V, Instruction *UsePoint, const Loop &L,
                    const DominatorTree &DT) {
     if (!V || !UsePoint || Value::isUndef(V)) return false;
     if (V->isConst() || dynamic_cast<Function *>(V) ||
@@ -107,7 +52,7 @@ bool isAvailableAt(Value *V, Instruction *UsePoint, const Loop &L,
     return DT.dominatesValue(I, UsePoint);
 }
 
-bool getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape) {
+bool LoopUnswitchPass::getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape) {
     if (!L || !L->getHeader() || !LCSSAPass::isLCSSAForm(L)) return false;
     BasicBlock *PreHeader = nullptr;
     BasicBlock *Latch = nullptr;
@@ -124,11 +69,11 @@ bool getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape) {
     return true;
 }
 
-bool isDirectLoopBlock(const LoopInfo &LI, Loop *L, BasicBlock *BB) {
+bool LoopUnswitchPass::isDirectLoopBlock(const LoopInfo &LI, Loop *L, BasicBlock *BB) {
     return L && BB && LI.getLoopFor(BB) == L;
 }
 
-std::vector<BasicBlock *> collectExitingBlocks(Loop &L) {
+std::vector<BasicBlock *> LoopUnswitchPass::collectExitingBlocks(Loop &L) {
     std::vector<BasicBlock *> Result;
     for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
         if (BB && L.isExitingBlock(BB)) Result.push_back(BB);
@@ -136,7 +81,7 @@ std::vector<BasicBlock *> collectExitingBlocks(Loop &L) {
     return Result;
 }
 
-bool isMustExecuteBeforeLoopProgress(BasicBlock *Parent, Loop &L,
+bool LoopUnswitchPass::isMustExecuteBeforeLoopProgress(BasicBlock *Parent, Loop &L,
                                      const DominatorTree &DT) {
     if (!Parent) return false;
     for (BasicBlock *Backedge : L.getBackedgeSrcs()) {
@@ -148,7 +93,7 @@ bool isMustExecuteBeforeLoopProgress(BasicBlock *Parent, Loop &L,
     return true;
 }
 
-bool isSafeTrivialPrefix(const TrivialCandidate &C, const LoopInfo &LI,
+bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const LoopInfo &LI,
                          const DominatorTree &DT,
                          const MemorySSAResult &MSSA) {
     if (!C.L || !C.Parent || !C.Branch || !C.Shape.Header) return false;
@@ -209,7 +154,7 @@ bool isSafeTrivialPrefix(const TrivialCandidate &C, const LoopInfo &LI,
     return true;
 }
 
-bool validateTrivialExitPhis(const TrivialCandidate &C,
+bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
                              const DominatorTree &DT) {
     if (!C.Exit || !C.Shape.PreHeader || !C.Shape.PreHeader->getTerminator())
         return false;
@@ -247,7 +192,8 @@ bool validateTrivialExitPhis(const TrivialCandidate &C,
     return true;
 }
 
-std::optional<TrivialCandidate> findTrivialCandidate(
+std::optional<LoopUnswitchPass::TrivialCandidate>
+LoopUnswitchPass::findTrivialCandidate(
     Function &F, LoopInfo &LI, const DominatorTree &DT,
     const MemorySSAResult &MSSA) {
     std::vector<BasicBlock *> DomOrder = DT.getBlocksInPreOrder();
@@ -297,15 +243,10 @@ std::optional<TrivialCandidate> findTrivialCandidate(
     return std::nullopt;
 }
 
-bool replaceConditionUsesInBlocks(Value *Condition, const BlockSet &Blocks,
+bool LoopUnswitchPass::replaceConditionUsesInBlocks(Value *Condition, const BlockSet &Blocks,
                                   bool KnownValue) {
     if (!Condition || Blocks.empty()) return false;
-    std::vector<Use *> Uses;
-    for (auto It = Condition->getUseList().begin();
-         It != Condition->getUseList().end(); ++It) {
-        Use *U = *It;
-        if (U && U->getValue() == Condition) Uses.push_back(U);
-    }
+    auto Uses = Condition->getUses();
     Value *Replacement = ConstBool::newConstBool(KnownValue);
     bool Changed = false;
     for (Use *U : Uses) {
@@ -317,7 +258,7 @@ bool replaceConditionUsesInBlocks(Value *Condition, const BlockSet &Blocks,
     return Changed;
 }
 
-void setHeaderPredecessor(BasicBlock *Header, BasicBlock *OldPreHeader,
+void LoopUnswitchPass::setHeaderPredecessor(BasicBlock *Header, BasicBlock *OldPreHeader,
                           BasicBlock *NewPreHeader) {
     if (!Header || !OldPreHeader || !NewPreHeader) return;
     for (PhiInst *Phi : Header->collectPhiNodes()) {
@@ -328,7 +269,7 @@ void setHeaderPredecessor(BasicBlock *Header, BasicBlock *OldPreHeader,
     }
 }
 
-bool transformTrivial(Function &F, const TrivialCandidate &C) {
+bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) {
     if (!C.L || !C.Shape.Header || !C.Shape.PreHeader || !C.Parent ||
         !C.Branch || !C.Exit || !C.Continue) {
         return false;
@@ -449,7 +390,8 @@ bool transformTrivial(Function &F, const TrivialCandidate &C) {
     return true;
 }
 
-BlockSet collectSpecializedReachable(Loop &L, BasicBlock *Parent,
+LoopUnswitchPass::BlockSet
+LoopUnswitchPass::collectSpecializedReachable(Loop &L, BasicBlock *Parent,
                                      BasicBlock *ChosenSuccessor) {
     BlockSet Reachable;
     BasicBlock *Header = L.getHeader();
@@ -473,7 +415,7 @@ BlockSet collectSpecializedReachable(Loop &L, BasicBlock *Parent,
     return Reachable;
 }
 
-bool isActiveSpecializedEdge(BasicBlock *Pred, BasicBlock *Succ,
+bool LoopUnswitchPass::isActiveSpecializedEdge(BasicBlock *Pred, BasicBlock *Succ,
                              BasicBlock *Parent,
                              BasicBlock *ChosenSuccessor) {
     if (!Pred || !Succ) return false;
@@ -481,8 +423,8 @@ bool isActiveSpecializedEdge(BasicBlock *Pred, BasicBlock *Succ,
     return Pred->countEdgesToSucc(Succ) > 0;
 }
 
-std::size_t countInstructions(const std::vector<BasicBlock *> &Blocks,
-                              const BlockSet *Filter = nullptr) {
+std::size_t LoopUnswitchPass::countInstructions(const std::vector<BasicBlock *> &Blocks,
+                                                const BlockSet *Filter) {
     std::size_t Count = 0;
     for (BasicBlock *BB : Blocks) {
         if (!BB || (Filter && !Filter->count(BB))) continue;
@@ -491,12 +433,10 @@ std::size_t countInstructions(const std::vector<BasicBlock *> &Blocks,
     return Count;
 }
 
-unsigned countControlUses(Value *Condition, Loop &L) {
+unsigned LoopUnswitchPass::countControlUses(Value *Condition, Loop &L) {
     if (!Condition) return 0;
     std::unordered_set<Instruction *> Seen;
-    for (auto It = Condition->getUseList().begin();
-         It != Condition->getUseList().end(); ++It) {
-        Use *U = *It;
+    for (Use *U : Condition->getUses()) {
         auto *I = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
         if (!I || !I->getParent() || !L.contains(I->getParent())) continue;
         if (auto *Br = dynamic_cast<BrInst *>(I)) {
@@ -508,7 +448,7 @@ unsigned countControlUses(Value *Condition, Loop &L) {
     return static_cast<unsigned>(Seen.size());
 }
 
-Value *stripBooleanNot(Value *V, bool &Inverted) {
+Value *LoopUnswitchPass::stripBooleanNot(Value *V, bool &Inverted) {
     Inverted = false;
     for (unsigned Depth = 0; V && Depth != 8; ++Depth) {
         auto *BI = dynamic_cast<BinaryInst *>(V);
@@ -533,7 +473,7 @@ Value *stripBooleanNot(Value *V, bool &Inverted) {
     return V;
 }
 
-std::optional<bool> evaluateConstantBoolean(Value *Condition) {
+std::optional<bool> LoopUnswitchPass::evaluateConstantBoolean(Value *Condition) {
     if (!Condition || Value::isUndef(Condition)) return std::nullopt;
     if (auto *CB = dynamic_cast<ConstBool *>(Condition))
         return CB->getVal();
@@ -552,7 +492,7 @@ std::optional<bool> evaluateConstantBoolean(Value *Condition) {
     return FoldedBool->getVal() != Inverted;
 }
 
-unsigned predicateRelationMask(BinaryInst::Operation Op) {
+unsigned LoopUnswitchPass::predicateRelationMask(BinaryInst::Operation Op) {
     constexpr unsigned LT = 1U;
     constexpr unsigned EQ = 2U;
     constexpr unsigned GT = 4U;
@@ -567,9 +507,8 @@ unsigned predicateRelationMask(BinaryInst::Operation Op) {
     }
 }
 
-using ClosedInterval = std::pair<std::int64_t, std::int64_t>;
-
-std::vector<ClosedInterval> predicateIntervals(BinaryInst::Operation Op,
+std::vector<LoopUnswitchPass::ClosedInterval>
+LoopUnswitchPass::predicateIntervals(BinaryInst::Operation Op,
                                                std::int64_t Bound) {
     constexpr std::int64_t Min =
         static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min());
@@ -596,7 +535,7 @@ std::vector<ClosedInterval> predicateIntervals(BinaryInst::Operation Op,
     return Result;
 }
 
-bool intervalsAreSubset(const std::vector<ClosedInterval> &A,
+bool LoopUnswitchPass::intervalsAreSubset(const std::vector<ClosedInterval> &A,
                         const std::vector<ClosedInterval> &B) {
     for (const ClosedInterval &Need : A) {
         std::int64_t CoveredThrough = Need.first - 1;
@@ -612,13 +551,8 @@ bool intervalsAreSubset(const std::vector<ClosedInterval> &A,
     return true;
 }
 
-struct IntegerBoundPredicate {
-    Value *Variable = nullptr;
-    BinaryInst::Operation Predicate = BinaryInst::E;
-    std::int32_t Bound = 0;
-};
-
-std::optional<IntegerBoundPredicate> normalizeIntegerBound(Value *V) {
+std::optional<LoopUnswitchPass::IntegerBoundPredicate>
+LoopUnswitchPass::normalizeIntegerBound(Value *V) {
     auto *BI = dynamic_cast<BinaryInst *>(V);
     if (!BI || !BinaryInst::isCompareOp(BI->getOp())) return std::nullopt;
     Value *L = BI->getOperand(0);
@@ -642,7 +576,7 @@ std::optional<IntegerBoundPredicate> normalizeIntegerBound(Value *V) {
         Variable, Predicate, static_cast<std::int32_t>(Bound->getVal())};
 }
 
-std::optional<bool> proveBaseConditionFromGuard(Value *Target,
+std::optional<bool> LoopUnswitchPass::proveBaseConditionFromGuard(Value *Target,
                                                 Value *Guard,
                                                 bool GuardKnown) {
     if (!Target || !Guard) return std::nullopt;
@@ -703,7 +637,7 @@ std::optional<bool> proveBaseConditionFromGuard(Value *Target,
     return std::nullopt;
 }
 
-std::optional<bool> proveConditionFromGuard(Value *Target, Value *Guard,
+std::optional<bool> LoopUnswitchPass::proveConditionFromGuard(Value *Target, Value *Guard,
                                             bool GuardKnown) {
     bool TargetInverted = false;
     bool GuardInverted = false;
@@ -715,7 +649,7 @@ std::optional<bool> proveConditionFromGuard(Value *Target, Value *Guard,
     return *Result != TargetInverted;
 }
 
-bool conditionIsStableAcrossGuardLoop(Value *Condition, BasicBlock *GuardBB,
+bool LoopUnswitchPass::conditionIsStableAcrossGuardLoop(Value *Condition, BasicBlock *GuardBB,
                                       BasicBlock *PreHeader,
                                       const LoopInfo &LI,
                                       const DominatorTree &DT) {
@@ -728,7 +662,7 @@ bool conditionIsStableAcrossGuardLoop(Value *Condition, BasicBlock *GuardBB,
                          *GuardLoop, DT);
 }
 
-std::optional<bool> getEntryKnownValue(
+std::optional<bool> LoopUnswitchPass::getEntryKnownValue(
     Value *Condition, BasicBlock *PreHeader, const LoopInfo &LI,
     const DominatorTree &DT) {
     if (!Condition || !PreHeader) return std::nullopt;
@@ -808,7 +742,7 @@ std::optional<bool> getEntryKnownValue(
     return std::nullopt;
 }
 
-bool cloneClosureIsLegal(const NonTrivialCandidate &C) {
+bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
     if (!C.L || !C.Parent || !C.CloneSucc || !C.OriginalSucc)
         return false;
     for (BasicBlock *BB : C.AllBlocks) {
@@ -863,7 +797,7 @@ bool cloneClosureIsLegal(const NonTrivialCandidate &C) {
     return true;
 }
 
-bool hasAnyCall(const std::vector<BasicBlock *> &Blocks) {
+bool LoopUnswitchPass::hasAnyCall(const std::vector<BasicBlock *> &Blocks) {
     for (BasicBlock *BB : Blocks) {
         if (!BB) return true;
         for (Instruction *I : *BB)
@@ -872,7 +806,7 @@ bool hasAnyCall(const std::vector<BasicBlock *> &Blocks) {
     return false;
 }
 
-std::size_t estimateExitPhiCost(Loop &L) {
+std::size_t LoopUnswitchPass::estimateExitPhiCost(Loop &L) {
     std::size_t Count = 0;
     for (BasicBlock *Exit : L.getExitBlocks()) {
         if (Exit) Count += Exit->collectPhiNodes().size();
@@ -880,7 +814,7 @@ std::size_t estimateExitPhiCost(Loop &L) {
     return Count;
 }
 
-bool validateVersionedExitPhis(const NonTrivialCandidate &C) {
+bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
     if (!C.L) return false;
     for (BasicBlock *Exit : C.L->getExitBlocks()) {
         if (!Exit) return false;
@@ -921,7 +855,8 @@ bool validateVersionedExitPhis(const NonTrivialCandidate &C) {
     return true;
 }
 
-std::vector<EntryKnownCandidate> findEntryKnownCandidates(
+std::vector<LoopUnswitchPass::EntryKnownCandidate>
+LoopUnswitchPass::findEntryKnownCandidates(
     LoopInfo &LI, const DominatorTree &DT) {
     std::vector<EntryKnownCandidate> Result;
     for (Loop *L : LI.getLoopsInPostOrder()) {
@@ -960,22 +895,22 @@ std::vector<EntryKnownCandidate> findEntryKnownCandidates(
     return Result;
 }
 
-std::vector<BasicBlock *> collectFunctionBlocks(Function &F) {
+std::vector<BasicBlock *> LoopUnswitchPass::collectFunctionBlocks(Function &F) {
     std::vector<BasicBlock *> Blocks;
     for (BasicBlock *BB : F)
         if (BB) Blocks.push_back(BB);
     return Blocks;
 }
 
-std::size_t weightedRegionSize(const std::vector<BasicBlock *> &Blocks,
-                               const BlockSet *Filter = nullptr) {
+std::size_t LoopUnswitchPass::weightedRegionSize(const std::vector<BasicBlock *> &Blocks,
+                                                 const BlockSet *Filter) {
     std::size_t BlockCount = 0;
     for (BasicBlock *BB : Blocks)
         if (BB && (!Filter || Filter->count(BB))) ++BlockCount;
     return countInstructions(Blocks, Filter) + 3 * BlockCount;
 }
 
-bool hasLoopTransformProvenance(
+bool LoopUnswitchPass::hasLoopTransformProvenance(
     const std::vector<BasicBlock *> &Blocks) {
     for (BasicBlock *BB : Blocks) {
         if (!BB) continue;
@@ -988,7 +923,7 @@ bool hasLoopTransformProvenance(
     return false;
 }
 
-unsigned invariantScope(Value *Condition, Loop *L,
+unsigned LoopUnswitchPass::invariantScope(Value *Condition, Loop *L,
                         const DominatorTree &DT) {
     unsigned Scope = 1;
     for (Loop *Parent = L ? L->getParentLoop() : nullptr;
@@ -1006,7 +941,7 @@ unsigned invariantScope(Value *Condition, Loop *L,
     return Scope;
 }
 
-bool chooseDirectionalClonePlan(NonTrivialCandidate &C) {
+bool LoopUnswitchPass::chooseDirectionalClonePlan(NonTrivialCandidate &C) {
     const std::size_t TrueWeight =
         weightedRegionSize(C.AllBlocks, &C.TrueReachable);
     const std::size_t FalseWeight =
@@ -1025,7 +960,8 @@ bool chooseDirectionalClonePlan(NonTrivialCandidate &C) {
     return C.OriginalSucc && C.CloneSucc;
 }
 
-std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
+std::optional<LoopUnswitchPass::NonTrivialCandidate>
+LoopUnswitchPass::findBestNonTrivialCandidate(
     Function &F, LoopInfo &LI, const DominatorTree &DT, SCEVResult &SE) {
     std::optional<NonTrivialCandidate> Best;
     auto Consider = [&](NonTrivialCandidate C) {
@@ -1170,23 +1106,15 @@ std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
     return Best;
 }
 
-Value *mapValue(Value *V, const ValueToValueMap &VMap) {
+Value *LoopUnswitchPass::mapValue(Value *V, const ValueToValueMap &VMap) {
     auto It = VMap.find(V);
     return It == VMap.end() ? V : It->second;
 }
 
-bool pruneClonedPhis(ClonedBlockRegion &Region,
+bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
                      const NonTrivialCandidate &C,
                      BasicBlock *ClonedPreHeader) {
-    struct Plan {
-        PhiInst *Original = nullptr;
-        PhiInst *Cloned = nullptr;
-        std::vector<PhiInst::IncomingEdge> Incoming;
-        Value *Replacement = nullptr;
-        PhiInst *NewPhi = nullptr;
-    };
-
-    std::vector<Plan> Plans;
+    std::vector<PhiPrunePlan> Plans;
     for (const auto &Pair : Region.InstPairs) {
         auto *OldPhi = dynamic_cast<PhiInst *>(Pair.first);
         if (!OldPhi) continue;
@@ -1194,7 +1122,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
         if (!NewPhi) return false;
         BasicBlock *OldBB = OldPhi->getParent();
 
-        Plan P;
+        PhiPrunePlan P;
         P.Original = OldPhi;
         P.Cloned = NewPhi;
         for (unsigned I = 0; I < OldPhi->getNumIncomingValues(); ++I) {
@@ -1225,7 +1153,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
     // Retained multi-incoming PHIs break such chains, so conservatively reject
     // only cycles made entirely from singleton replacements.
     std::unordered_map<Value *, Value *> SingletonReplacements;
-    for (Plan &P : Plans) {
+    for (PhiPrunePlan &P : Plans) {
         if (P.Incoming.size() != 1) continue;
         Value *Replacement = P.Incoming.front().V;
         if (Replacement == P.Cloned) {
@@ -1243,7 +1171,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
     }
 
     std::unordered_map<Value *, Value *> PhiReplacements;
-    for (Plan &P : Plans) {
+    for (PhiPrunePlan &P : Plans) {
         if (P.Incoming.empty()) {
             P.Replacement = UndefValue::NewUndefValue(
                 P.Cloned->getIRType());
@@ -1267,7 +1195,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
         return V;
     };
 
-    for (Plan &P : Plans) {
+    for (PhiPrunePlan &P : Plans) {
         if (P.NewPhi) {
             for (const auto &In : P.Incoming) {
                 Value *Resolved = Resolve(In.V);
@@ -1282,7 +1210,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
         Region.VMap[P.Original] = P.Replacement;
     }
 
-    for (Plan &P : Plans) {
+    for (PhiPrunePlan &P : Plans) {
         Value *Replacement = P.NewPhi
                                  ? static_cast<Value *>(P.NewPhi)
                                  : P.Replacement;
@@ -1293,7 +1221,7 @@ bool pruneClonedPhis(ClonedBlockRegion &Region,
     return true;
 }
 
-void destroyBlocks(std::vector<BasicBlock *> Blocks) {
+void LoopUnswitchPass::destroyBlocks(std::vector<BasicBlock *> Blocks) {
     for (BasicBlock *BB : Blocks) {
         if (!BB) continue;
         for (Instruction *I : *BB)
@@ -1304,7 +1232,7 @@ void destroyBlocks(std::vector<BasicBlock *> Blocks) {
     for (BasicBlock *BB : Blocks) delete BB;
 }
 
-PhiInst *buildExitProxyValue(
+PhiInst *LoopUnswitchPass::buildExitProxyValue(
     const std::shared_ptr<IRType> &Ty,
     const std::vector<PhiInst::IncomingEdge> &Incoming,
     BasicBlock *Proxy, const std::string &Name) {
@@ -1316,20 +1244,8 @@ PhiInst *buildExitProxyValue(
     return Phi;
 }
 
-struct VersionedExitPhiPlan {
-    PhiInst *OldPhi = nullptr;
-    std::vector<PhiInst::IncomingEdge> OriginalIncoming;
-    std::vector<PhiInst::IncomingEdge> CloneIncoming;
-};
-
-struct VersionedExitPlan {
-    BasicBlock *Exit = nullptr;
-    std::vector<BasicBlock *> OriginalPreds;
-    std::vector<BasicBlock *> ClonePreds;
-    std::vector<VersionedExitPhiPlan> PhiPlans;
-};
-
-std::optional<VersionedExitPlan> planVersionedExit(
+std::optional<LoopUnswitchPass::VersionedExitPlan>
+LoopUnswitchPass::planVersionedExit(
     BasicBlock *Exit, const NonTrivialCandidate &C,
     ClonedBlockRegion &Region) {
     if (!Exit) return std::nullopt;
@@ -1388,7 +1304,7 @@ std::optional<VersionedExitPlan> planVersionedExit(
     return Plan;
 }
 
-void applyVersionedExitPlan(Function &F, VersionedExitPlan &Plan) {
+void LoopUnswitchPass::applyVersionedExitPlan(Function &F, VersionedExitPlan &Plan) {
     BasicBlock *Exit = Plan.Exit;
     if (!Exit || (Plan.OriginalPreds.empty() && Plan.ClonePreds.empty()))
         return;
@@ -1458,7 +1374,7 @@ void applyVersionedExitPlan(Function &F, VersionedExitPlan &Plan) {
     if (CloneProxy) CloneProxy->genUnCondInst(Exit);
 }
 
-void eraseDeadOriginalBlocks(const std::vector<BasicBlock *> &AllBlocks,
+void LoopUnswitchPass::eraseDeadOriginalBlocks(const std::vector<BasicBlock *> &AllBlocks,
                              const BlockSet &LiveBlocks) {
     BlockSet Dead;
     for (BasicBlock *BB : AllBlocks)
@@ -1477,7 +1393,7 @@ void eraseDeadOriginalBlocks(const std::vector<BasicBlock *> &AllBlocks,
     }
 }
 
-bool transformEntryKnown(const EntryKnownCandidate &C) {
+bool LoopUnswitchPass::transformEntryKnown(const EntryKnownCandidate &C) {
     if (!C.Condition || !C.L) return false;
     BlockSet Blocks;
     for (BasicBlock *BB : C.AllBlocks)
@@ -1485,7 +1401,7 @@ bool transformEntryKnown(const EntryKnownCandidate &C) {
     return replaceConditionUsesInBlocks(C.Condition, Blocks, C.KnownValue);
 }
 
-bool transformNonTrivial(Function &F, NonTrivialCandidate &C) {
+bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) {
     if (!C.L || !C.Shape.Header || !C.Shape.PreHeader || !C.Parent ||
         !C.Branch || !C.TrueSucc || !C.FalseSucc || !C.OriginalSucc ||
         !C.CloneSucc) {
@@ -1606,8 +1522,6 @@ bool transformNonTrivial(Function &F, NonTrivialCandidate &C) {
     eraseDeadOriginalBlocks(C.AllBlocks, C.OriginalReachable);
     return true;
 }
-
-} // namespace
 
 PassResult LoopUnswitchPass::run(Function &F,
                                  FunctionAnalysisPassManager &FAM) {

@@ -12,6 +12,7 @@
 class BasicAAResult;
 struct MemoryLocation;
 class LoopInfo;
+class Loop;
 
 // A deliberately small, conservative MemorySSA for this IR.  It models one
 // unified memory state: stores and calls are MemoryDefs, loads are MemoryUses,
@@ -22,29 +23,26 @@ class MemoryAccess {
 public:
     enum class Kind { LiveOnEntry, Phi, Use, Def };
 
-    Kind getKind() const { return AccessKind; }
-    bool isLiveOnEntry() const { return AccessKind == Kind::LiveOnEntry; }
-    bool isPhi() const { return AccessKind == Kind::Phi; }
-    bool isUse() const { return AccessKind == Kind::Use; }
-    bool isDef() const { return AccessKind == Kind::Def; }
+    Kind getKind() const;
+    bool isLiveOnEntry() const;
+    bool isPhi() const;
+    bool isUse() const;
+    bool isDef() const;
 
-    unsigned getID() const { return ID; }
-    BasicBlock *getBlock() const { return Block; }
-    Instruction *getInstruction() const { return Inst; }
-    MemoryAccess *getDefiningAccess() const { return DefiningAccess; }
+    unsigned getID() const;
+    BasicBlock *getBlock() const;
+    Instruction *getInstruction() const;
+    MemoryAccess *getDefiningAccess() const;
 
     const std::vector<std::pair<BasicBlock *, MemoryAccess *>> &
-    getIncomingAccesses() const {
-        return IncomingAccesses;
-    }
+    getIncomingAccesses() const;
 
 private:
     friend class MemorySSAResult;
     friend class MemorySSAAnalysis;
 
     MemoryAccess(Kind K, unsigned AccessID, BasicBlock *BB = nullptr,
-                 Instruction *I = nullptr)
-        : AccessKind(K), ID(AccessID), Block(BB), Inst(I) {}
+                 Instruction *I = nullptr);
 
     Kind AccessKind;
     unsigned ID = 0;
@@ -56,13 +54,13 @@ private:
 
 class MemorySSAResult {
 public:
-    MemorySSAResult() = default;
-    MemorySSAResult(MemorySSAResult &&) noexcept = default;
-    MemorySSAResult &operator=(MemorySSAResult &&) noexcept = default;
+    MemorySSAResult();
+    MemorySSAResult(MemorySSAResult &&) noexcept;
+    MemorySSAResult &operator=(MemorySSAResult &&) noexcept;
     MemorySSAResult(const MemorySSAResult &) = delete;
     MemorySSAResult &operator=(const MemorySSAResult &) = delete;
 
-    MemoryAccess *getLiveOnEntry() const { return LiveOnEntry; }
+    MemoryAccess *getLiveOnEntry() const;
     MemoryAccess *getMemoryAccess(Instruction *I) const;
     MemoryAccess *getBlockEntry(BasicBlock *BB) const;
     MemoryAccess *getBlockExit(BasicBlock *BB) const;
@@ -106,10 +104,14 @@ public:
         std::size_t MaxVisitedAccesses = 256) const;
 
     bool invalidate(Function &F, const PreservationStatus &PA);
-    std::size_t size() const { return OwnedAccesses.size(); }
+    std::size_t size() const;
 
 private:
     friend class MemorySSAAnalysis;
+
+    // MemorySSA 冗余存储判定使用的循环不变量与写入宽度检查。
+    static bool isInvariantInLoop(Value *V, const Loop *L);
+    static bool storeFullyCoversItsPointer(const StoreInst *SI);
 
     MemoryAccess *createAccess(MemoryAccess::Kind K, BasicBlock *BB = nullptr,
                                Instruction *I = nullptr);

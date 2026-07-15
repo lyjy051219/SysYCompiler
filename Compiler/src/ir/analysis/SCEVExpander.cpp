@@ -2,6 +2,14 @@
 
 #include <limits>
 
+SCEVExpander::SCEVExpander(const Loop *Scope, BasicBlock *InsertBlock,
+                           const DominatorTree &DT, unsigned Budget)
+    : Scope(Scope), InsertBlock(InsertBlock), DT(DT), Budget(Budget) {}
+
+const std::vector<Instruction *> &SCEVExpander::createdInstructions() const {
+    return Created;
+}
+
 bool SCEVExpander::isAvailable(Value *V) const {
     if (!V || Value::isUndef(V) || !InsertBlock) return false;
     if (V->isConst()) return true;

@@ -62,7 +62,7 @@ public:
     unsigned DFSNumOut = 0;  // 离开时间戳
 
     // 辅助函数：是否是叶子节点
-    bool isLeaf() const { return FirstChild == nullptr; }
+    bool isLeaf() const;
 };
 
 class DominatorTree {
@@ -73,20 +73,16 @@ public:
     std::vector<DominatorNode> Nodes;
     std::unordered_map<BasicBlock*, unsigned> BlockToNode;
 
-    void clear() {
-        Nodes.clear();
-        BlockToNode.clear();
-        Root = nullptr;
-    }
+    void clear();
 
-    DominatorTree() = default;
+    DominatorTree();
     //禁用拷贝
     DominatorTree(const DominatorTree&) = delete;
     DominatorTree& operator=(const DominatorTree&) = delete;
 
     //允许移动
-    DominatorTree(DominatorTree&& other) noexcept = default;
-    DominatorTree& operator=(DominatorTree&& other) noexcept = default;
+    DominatorTree(DominatorTree&& other) noexcept;
+    DominatorTree& operator=(DominatorTree&& other) noexcept;
 
     // 查询接口
     BasicBlock* getIDom(BasicBlock* BB) const;

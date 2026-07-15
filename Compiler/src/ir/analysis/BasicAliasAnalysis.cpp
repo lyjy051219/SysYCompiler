@@ -7,9 +7,27 @@
 #include <cstdlib>
 #include <limits>
 
-namespace {
+MemoryLocation::MemoryLocation() = default;
 
-bool checkedAdd(long long A, long long B, long long &Result) {
+MemoryLocation::MemoryLocation(Value *P, std::optional<std::size_t> S)
+    : Pointer(P), Size(S) {}
+
+BasicAAResult::BasicAAResult() = default;
+
+BasicAAResult::BasicAAResult(BasicAAResult &&) = default;
+
+BasicAAResult &BasicAAResult::operator=(BasicAAResult &&) = default;
+
+std::size_t BasicAAResult::ValuePairHash::operator()(
+    const std::pair<Value *, Value *> &P) const {
+    auto H1 = static_cast<std::size_t>(
+        reinterpret_cast<std::uintptr_t>(P.first));
+    auto H2 = static_cast<std::size_t>(
+        reinterpret_cast<std::uintptr_t>(P.second));
+    return H1 ^ (H2 + 0x9e3779b97f4a7c15ULL + (H1 << 6) + (H1 >> 2));
+}
+
+bool BasicAAResult::checkedAdd(long long A, long long B, long long &Result) {
     if ((B > 0 && A > std::numeric_limits<long long>::max() - B) ||
         (B < 0 && A < std::numeric_limits<long long>::min() - B))
         return false;
@@ -17,7 +35,7 @@ bool checkedAdd(long long A, long long B, long long &Result) {
     return true;
 }
 
-bool checkedSub(long long A, long long B, long long &Result) {
+bool BasicAAResult::checkedSub(long long A, long long B, long long &Result) {
     if (B == std::numeric_limits<long long>::min()) {
         if (A >= 0) return false;
         Result = A - B;
@@ -26,7 +44,7 @@ bool checkedSub(long long A, long long B, long long &Result) {
     return checkedAdd(A, -B, Result);
 }
 
-bool checkedMul(long long A, long long B, long long &Result) {
+bool BasicAAResult::checkedMul(long long A, long long B, long long &Result) {
     if (A == 0 || B == 0) {
         Result = 0;
         return true;
@@ -51,8 +69,8 @@ bool checkedMul(long long A, long long B, long long &Result) {
     return true;
 }
 
-bool hasUndefPointerOrigin(Value *V, std::unordered_set<Value *> &Active,
-                           unsigned Depth = 0) {
+bool BasicAAResult::hasUndefPointerOrigin(
+    Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V)) return true;
     if (Depth > 32) return true;
 
@@ -77,8 +95,6 @@ bool hasUndefPointerOrigin(Value *V, std::unordered_set<Value *> &Active,
     Active.erase(V);
     return false;
 }
-
-} // namespace
 
 MemoryLocation MemoryLocation::get(const LoadInst *Load) {
     if (!Load) return {};
@@ -603,57 +619,6 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     // lower-bound argument below.  Until SCEV can attach an explicit finite
     // no-wrap proof, variable-distance GEPs must remain MayAlias.
     return AliasInfo::MayAlias;
-
-#if 0
-    if (DiffVars.size() != 2) {
-        return AliasInfo::MayAlias;
-    }
-
-    auto It = DiffVars.begin();
-    Value* A = It->first;
-    long long Scale = It->second;
-    ++It;
-    Value* B = It->first;
-    long long OtherScale = It->second;
-
-    if (Scale == 0 ||
-        Scale == std::numeric_limits<long long>::min() ||
-        OtherScale == std::numeric_limits<long long>::min() ||
-        Scale != -OtherScale) {
-        return AliasInfo::MayAlias;
-    }
-    if (Scale < 0) {
-        Scale = -Scale;
-        std::swap(A, B);
-    }
-
-    Threshold = std::max<std::size_t>(1, Threshold);
-    if (Threshold > static_cast<std::size_t>(
-                        std::numeric_limits<long long>::max()))
-        return AliasInfo::MayAlias;
-    if (auto LB = lowerBoundDiff(A, B, LI)) {
-        long long ScaledLB = 0;
-        long long MinDiff = 0;
-        if (!checkedMul(Scale, *LB, ScaledLB) ||
-            !checkedAdd(ConstDiff, ScaledLB, MinDiff))
-            return AliasInfo::MayAlias;
-        if (MinDiff >= static_cast<long long>(Threshold)) {
-            return AliasInfo::NoAlias;
-        }
-    }
-    if (auto LB = lowerBoundDiff(B, A, LI)) {
-        long long ScaledLB = 0;
-        long long MaxDiff = 0;
-        if (!checkedMul(Scale, *LB, ScaledLB) ||
-            !checkedSub(ConstDiff, ScaledLB, MaxDiff))
-            return AliasInfo::MayAlias;
-        if (MaxDiff <= -static_cast<long long>(Threshold)) {
-            return AliasInfo::NoAlias;
-        }
-    }
-
-    return AliasInfo::MayAlias;
-#endif
 }
 
 AliasInfo BasicAAResult::aliasGEP(

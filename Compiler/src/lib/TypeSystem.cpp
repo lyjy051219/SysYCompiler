@@ -157,14 +157,13 @@ std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){
             return std::static_pointer_cast<IRType>(FLOATType::NewFloat());
         case IR_VOID:
             return std::static_pointer_cast<IRType>(VOIDType::NewVoid());
-        case IR_LABEL:
-            return std::static_pointer_cast<IRType>(LABELType::NewLabel());
+        case IR_POINTER:
         case IR_ARRAY:
-            //ARRAY类型的具体创建在外面ArrayList visit的相关地方，所以传入这个函数的这个类型不需要去进行动了
-        default:
-            // 对于不包括的类型（IR_POINTER, IR_FUNCTION, IR_ARRAY），返回nullptr
+        case IR_UNDEF:
+            // 复合类型缺少结构信息，IR_UNDEF 只是前端失败哨兵。
             return nullptr;
     }
+    return nullptr;
 }
 
 //Void
@@ -173,13 +172,6 @@ std::shared_ptr<VOIDType> VOIDType::NewVoid(){
     return single;
 }
 void VOIDType::to_string() const { std::cout << "void"; }
-
-//Label
-std::shared_ptr<LABELType> LABELType::NewLabel(){
-    static std::shared_ptr<LABELType> single(new LABELType());
-    return single;
-}
-void LABELType::to_string() const { std::cout << "label"; }
 
 //Int
 std::shared_ptr<INTType> INTType::NewBool(){
@@ -210,30 +202,6 @@ std::shared_ptr<FLOATType> FLOATType::NewFloat(){
 void FLOATType::to_string() const { std::cout << "float"; }
 
 //复合类型
-/*
-//Function
-std::shared_ptr<FUNCTIONType> FUNCTIONType::NewFunction(const std::shared_ptr<IRType> &returnType,
-                                                     const std::vector<std::shared_ptr<IRType>> &paramTypes){
-     static std::map<std::pair<std::shared_ptr<IRType>, std::vector<std::shared_ptr<IRType>>>,
-                        std::shared_ptr<FUNCTIONType>> m;
-
-        auto key = std::make_pair(returnType, paramTypes);
-        auto& ptr = m[key];
-        if (!ptr) {
-            ptr = std::shared_ptr<FUNCTIONType>(new FUNCTIONType(returnType, paramTypes));
-        }
-        return ptr;
-}
-std::string FUNCTIONType::to_string()const{
-    std::string res = returnType->to_string() +"(";
-    for(size_t i = 0;i < paramTypes.size();i++){
-        if(i>0) res += ",";
-        res += paramTypes[i]->to_string();
-    }
-    res += ")";
-    return res;
-}
-*/
 //Pointer
 std::shared_ptr<POINTERType> POINTERType::NewPointer(std::shared_ptr<IRType> pointerType){
     static std::map<std::shared_ptr<IRType>,std::shared_ptr<POINTERType>> m;

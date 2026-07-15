@@ -2,8 +2,6 @@
 #include <vector>
 #include <memory>
 #include <string>
-#include <unordered_map>
-#include <iostream>
 #include <cstdint>
 #include <optional>
 #include "TypeSystem.hpp"
@@ -42,7 +40,10 @@ class PhiInst;
 设计特点，禁止被移动和拷贝，禁止被继承*/
 
 class Use final{
-public:
+    friend class UseList;
+    friend class Value;
+
+private:
     //指向这条Use关系的使用者user
     User* user = nullptr;
     //指向这条Use关系的被使用者usee
@@ -51,12 +52,15 @@ public:
     Use* next = nullptr;
     //指向本个/上一个关联相同usee的Use关系的next指针的地址
     Use** prev = nullptr;
+    // 从当前 Value 的 use-list 解链；重复调用安全。
+    void removeFromUseList();
     /*解析prev：
     prev:指向的是前一个Use对象的next的指针的地址
     *prev指向的是前一个Use对象的next地址/也可以理解成是当前Use对象的地址
     next指向的就是下一个对象的的地址
     好处：无需特别判断头结点的情况
     */
+public:
     //禁止直接构造
     Use()=delete;
     //禁止拷贝和移动
@@ -68,18 +72,24 @@ public:
     //通过Value访问UseList利用其addUseNode函数进行插入该结点
     Use(User* er ,Value* ee);
     ~Use();
-    User* getUser() const {return user;}
-    Value* getValue() const {return usee;}
+    User* getUser() const;
+    Value* getValue() const;
+    std::optional<std::size_t> getOperandIndex() const;
     //替换当前 Use 关系中的目标 Value (被使用者)
     bool replaceUseeWith(Value* V);
-    //一定是User调用这个函数
-    void removeFromUseList(User*);
 };
 
 class UseList final{
+   friend class Use;
+   friend class Value;
+
    private:
    Use* head = nullptr;
+   Use*& getHead();
+   Use* getHead() const;
+   void addUseNode(Use* newNode);
    public:
+   // 保留既有字段以兼容只读的后端调用；中端统一通过 Value 接口访问。
    int size = 0;
    UseList()= default;
    //禁止拷贝和移动
@@ -87,33 +97,23 @@ class UseList final{
    UseList(UseList&&) = delete;
    UseList& operator=(const UseList& u) = delete;
    UseList& operator=(UseList&& u) = delete;
-   //头插法
-   void addUseNode(Use* newNode);
-
-   Use* getBack();
-   Use*& getHead(){return head;}
-   Use* getHead() const {return head;}
-   bool is_empty() const {return head == nullptr;}
+   int getSize() const;
+   bool is_empty() const;
 
    //实现迭代器--只能正向进行遍历
     class iterator{
         Use *ptr;
         public:
-        iterator(Use *_ptr):ptr(_ptr){}
-
-        iterator& operator++(){
-            ptr=ptr->next;
-            return *this;
-        }
-
-        Use* operator*(){return ptr;}
-        bool operator==(const iterator& other)const{return ptr==other.ptr;}
-        bool operator!=(const iterator& other)const{return ptr!=other.ptr;}
+        explicit iterator(Use *_ptr);
+        iterator& operator++();
+        Use* operator*() const;
+        bool operator==(const iterator& other) const;
+        bool operator!=(const iterator& other) const;
     };
-    iterator begin(){return iterator(this->head);}
-    iterator end(){return iterator(nullptr);}
-    iterator begin() const {return iterator(this->head);}
-    iterator end() const {return iterator(nullptr);}
+    iterator begin();
+    iterator end();
+    iterator begin() const;
+    iterator end() const;
     /*使用示例：
     for(UserList::iterator it = list.begin(); it != list.end(); ++it) {
     Use* currentUse = *it;
@@ -142,15 +142,15 @@ class Value{
    //只能通过这两种方式构造对象，其他方式构建对象不行
    Value(std::shared_ptr<IRType> irtype);
    Value(std::shared_ptr<IRType> irtype,std::string ident);
-   virtual bool isConst(){ return false; }
-   virtual bool isGlobal(){ return false; }
-   std::shared_ptr<IRType> getIRType(){return irtype;}
-   std::shared_ptr<IRType> getIRType() const {return irtype;}
-   void setIRType(std::shared_ptr<IRType> it){this->irtype = it;}
-   void setIdent(std::string id){this->ident = id;}
-   std::string getIdent() const { return ident;}
-   UseList& getUseList(){return useList;}
-   const UseList& getUseList() const {return useList;}
+   virtual bool isConst();
+   virtual bool isGlobal();
+   std::shared_ptr<IRType> getIRType();
+   std::shared_ptr<IRType> getIRType() const;
+   void setIRType(std::shared_ptr<IRType> Type);
+   void setIdent(std::string Ident);
+   std::string getIdent() const;
+   UseList& getUseList();
+   const UseList& getUseList() const;
    bool isConstZero() const;
    bool isConstIntZero() const;
    bool isConstOne() const;
@@ -165,6 +165,9 @@ class Value{
    int integerBitWidth(int DefaultBits = 32) const;
    int countUses() const;
    int countInstructionUses(Instruction **SingleUser = nullptr) const;
+   // 返回可跨 RAUW/换边使用的 Use 指针快照；删除其所属 User 会使对应指针失效。
+   std::vector<Use *> getUses() const;
+   Use *getSingleUse() const;
    std::vector<Instruction *> getInstructionUsers() const;
    bool hasUses() const;
    bool hasExactlyOneUse() const;
@@ -195,21 +198,7 @@ class Value{
    static Value *makeIntegerForType(int32_t Val,
                                     const std::shared_ptr<IRType> &Ty);
    static Value *makeIntegerLike(const Value *Model, int32_t Val);
-   void replaceAllUsesWith(Value* val){
-        this->useList.size = 0;
-        Use* head = this->useList.getHead();
-        this->useList.getHead() = nullptr;
-        while(head){
-            head->usee = val;
-            Use* temp = head->next;
-            // 断开旧链接
-            head->next = nullptr;
-            head->prev = nullptr;
-            // 插入到新 Value 的 UseList
-            val->getUseList().addUseNode(head);
-            head = temp;
-        }
-   }
+   void replaceAllUsesWith(Value* Val);
    void dumpIR();
    //如果一个Value一定需要copy，就需要用到clone,不允许使用构造函数copyValue
    //virtual Value* clone(std::unordered_map<Value*,Value*>&) = 0;
@@ -230,14 +219,16 @@ class User : public Value{
    std::vector<std::unique_ptr<Use>> userList;
 
    public:
-   virtual ~User()=default;
+   ~User() override;
    User();
    User(std::shared_ptr<IRType> irtype);
 
-    std::vector<std::unique_ptr<Use>>& getUserList(){return this->userList;}
-    const std::vector<std::unique_ptr<Use>>& getUserList() const {return this->userList;}
+    std::vector<std::unique_ptr<Use>>& getUserList();
+    const std::vector<std::unique_ptr<Use>>& getUserList() const;
     size_t getNumOperands() const;
     Value *getOperand(size_t Index) const;
+    // 返回操作数快照，避免各 Pass 直接依赖 userList 的存储细节。
+    std::vector<Value *> getOperands() const;
     Use *getOperandUse(size_t Index) const;
     bool getOperand(size_t Index, Value *&Out) const;
     bool replaceOperand(size_t Index, Value *V);
@@ -251,85 +242,3 @@ class User : public Value{
    void addUse(Value* v);
    //virtual Value* clone(std::unordered_map<Value*,Value*>&)override;
 };
-
-
-inline Use::Use(User* er ,Value* ee) : user(er), usee(ee) {
-    usee->getUseList().addUseNode(this);
-}
-
-inline Use::~Use() {
-    removeFromUseList(user);
-}
-
-inline void Use::removeFromUseList(User*) {
-    if (usee) {
-        usee->getUseList().size--;
-        if (prev) {
-            *prev = next;
-        }
-        if (next != nullptr) {
-            next->prev = prev;
-        }
-    }
-}
-
-inline void UseList::addUseNode(Use* newNode) {
-    size++;
-    newNode->next = head;
-    if (head != nullptr) {
-        head->prev = &(newNode->next);
-    }
-    newNode->prev = &head;
-    head = newNode;
-}
-
-inline Use* UseList::getBack() {
-    if (is_empty()) {
-        return nullptr;
-    }
-    Use* current = head;
-    while (current->next != nullptr) {
-        current = current->next;
-    }
-    return current;
-}
-
-inline int Value::generateNum(const std::string& s) {
-    static std::unordered_map<std::string, int> cnt;
-    return cnt[s]++;
-}
-
-inline Value::~Value(){while (!useList.is_empty()) delete useList.getHead()->user;}
-
-inline Value::Value(std::shared_ptr<IRType> irtype) : irtype(irtype) {
-    ident = ".";
-    ident += std::to_string(generateNum("."));
-}
-
-inline Value::Value(std::shared_ptr<IRType> irtype, std::string ident)
-    : irtype(irtype), ident(ident), num(generateNum(ident)) {}
-
-
-inline User::User():Value(VOIDType::NewVoid()){} // 需要传入有效的IRType
-
-inline User::User(std::shared_ptr<IRType> irtype) : Value(irtype) {}
-
-inline int User::getUserIndex(const Use* u) const {
-    for (size_t i = 0; i < userList.size(); i++) {
-        if (userList[i].get() == u)
-            return i;
-    }
-    return -1;
-}
-
-inline void User::addUse(Value* v) {
-    userList.push_back(std::make_unique<Use>(this, v));
-}
-
-inline bool Use::replaceUseeWith(Value* V) {
-    if (!V || usee == V) return false;
-    removeFromUseList(user);
-    usee = V;
-    V->getUseList().addUseNode(this);
-    return true;
-}

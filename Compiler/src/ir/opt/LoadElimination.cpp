@@ -11,6 +11,28 @@
 #include <vector>
 #include <stack>
 
+// 查询结果的构造统一放在实现文件，头文件只暴露语义明确的工厂接口。
+LoadElimQueryResult LoadElimQueryResult::known(Value *V) {
+    return {KNOWN, V, {}};
+}
+
+LoadElimQueryResult LoadElimQueryResult::clobbered() {
+    return {CLOBBERED, nullptr, {}};
+}
+
+LoadElimQueryResult LoadElimQueryResult::unknown() {
+    return {UNKNOWN, nullptr, {}};
+}
+
+LoadElimQueryResult LoadElimQueryResult::needPredecessors() {
+    return {NEED_PREDECESSORS, nullptr, {}};
+}
+
+LoadElimQueryResult LoadElimQueryResult::phiNeeded(
+    std::vector<std::pair<BasicBlock *, Value *>> M) {
+    return {PHI_NEEDED, nullptr, std::move(M)};
+}
+
 // =====================================================================
 // LoadElimination++ — Available Memory Value Forwarding
 //
@@ -92,17 +114,13 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
     if (!CandidateBB || !TargetBB || CandidateBB == TargetBB) return false;
     if (!DT.dominates(CandidateBB, TargetBB)) return false;
 
-    struct ScanState {
-        BasicBlock *BB;
-        bool TargetPrefixOnly;
-    };
-    std::vector<ScanState> worklist{{TargetBB, true}};
+    std::vector<PathScanState> worklist{{TargetBB, true}};
     std::unordered_set<BasicBlock *> visited;
     int scannedBlocks = 0;
     int scannedInstructions = 0;
 
     while (!worklist.empty()) {
-        ScanState State = worklist.back();
+        PathScanState State = worklist.back();
         worklist.pop_back();
         BasicBlock *BB = State.BB;
         if (!BB) return false;
@@ -475,12 +493,7 @@ bool LoadEliminationPass::processFunction(
         if (!BB) continue;
 
         // 收集本块所有 load（先收集再处理，避免遍历时删指令）
-        std::vector<LoadInst*> loads;
-        for (Instruction *I : *BB) {
-            if (auto *LI2 = dynamic_cast<LoadInst*>(I)) {
-                loads.push_back(LI2);
-            }
-        }
+        auto loads = BB->collectInstructions<LoadInst>();
 
         for (LoadInst *LI2 : loads) {
             // 检查 load 是否还活着（可能被前一轮 processLoad 间接影响）
@@ -518,10 +531,10 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     constexpr std::size_t MaxMSSAWalk = 256;
     std::vector<std::pair<LoadInst *, Value *>> MSSAReplacements;
     std::size_t QueryCount = 0;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *Load = dynamic_cast<LoadInst *>(I);
-            if (!Load || QueryCount++ >= MaxMSSAQueries) continue;
+    for (LoadInst *Load : F.collectInstructions<LoadInst>()) {
+            if (QueryCount++ >= MaxMSSAQueries) break;
+            BasicBlock *BB = Load->getParent();
+            if (!BB) continue;
 
             MemoryAccess *Clobber = MSSA.getClobberingAccess(
                 Load, MemoryLocation::get(Load), AA, LI, FAM,
@@ -542,7 +555,6 @@ PreservationStatus LoadEliminationPass::run(Function &F,
             Value *Stored = Store->getValueOperand();
             if (!isTypeCompatible(Stored, Load)) continue;
             MSSAReplacements.push_back({Load, Stored});
-        }
     }
 
     // A forwarded store value can itself be an earlier load that is also in

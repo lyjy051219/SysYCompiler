@@ -129,10 +129,8 @@ bool DAEPass::isParamLive(
 	Memo[Param] = ParamLiveness::InProgress;
 
 	bool Live = false;
-	if (Param->getUseList().size != 0) {
-		for (auto UIt = Param->getUseList().begin(); UIt != Param->getUseList().end(); ++UIt) {
-			Use *U = *UIt;
-			if (!U) continue;
+	if (Param->hasUses()) {
+		for (Use *U : Param->getUses()) {
 
 			User *UseUser = U->getUser();
 			if (!UseUser) {

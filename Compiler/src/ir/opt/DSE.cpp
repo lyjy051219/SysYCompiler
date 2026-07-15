@@ -30,17 +30,16 @@
 // Phase 1: 块内 DSE
 // =====================================================================
 
-namespace {
-
-bool storesHaveIdenticalCoverage(const StoreInst *First,
-                                 const StoreInst *Second) {
+bool DSEPass::storesHaveIdenticalCoverage(const StoreInst *First,
+                                          const StoreInst *Second) {
     Value *FirstValue = First ? First->getValueOperand() : nullptr;
     Value *SecondValue = Second ? Second->getValueOperand() : nullptr;
     return FirstValue && SecondValue && FirstValue->getIRType() &&
            FirstValue->getIRType() == SecondValue->getIRType();
 }
 
-bool storeFullyCoversPointer(Value *Pointer, const StoreInst *Store) {
+bool DSEPass::storeFullyCoversPointer(
+    Value *Pointer, const StoreInst *Store) {
     std::shared_ptr<IRType> PointeeTy =
         Pointer ? Pointer->getPointeeType() : nullptr;
     Value *StoredValue = Store ? Store->getValueOperand() : nullptr;
@@ -51,7 +50,7 @@ bool storeFullyCoversPointer(Value *Pointer, const StoreInst *Store) {
 // A stack allocation is private at function exit only while none of its
 // derived pointers escapes.  Merely tracing P back to an alloca is not enough:
 // the address may have been stored elsewhere or retained by an earlier call.
-bool isNonEscapingLocalStackPointer(Value *Pointer) {
+bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
     auto *Root = dynamic_cast<AllocaInst *>(
         Value::stripPointerCastsAndGEP(Pointer));
     if (!Root) return false;
@@ -63,9 +62,7 @@ bool isNonEscapingLocalStackPointer(Value *Pointer) {
         Worklist.pop_back();
         if (!Current || !Visited.insert(Current).second) continue;
 
-        for (auto It = Current->getUseList().begin();
-             It != Current->getUseList().end(); ++It) {
-            Use *U = *It;
+        for (Use *U : Current->getUses()) {
             if (!U || U->getValue() != Current) continue;
             User *Usr = U->getUser();
             if (!Usr) return false;
@@ -111,16 +108,13 @@ bool isNonEscapingLocalStackPointer(Value *Pointer) {
 // 如果 load q 没有清除 p 的候选，第一个 store 会被错删。同理，
 // 一个仅 MayAlias 的 store 不能当作完整覆盖证明；这里也将它作为
 // 保守的候选边界，避免未来引入不同访存宽度后误判。
-bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
-                            const LoopInfo &LoopInfo) {
+bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
+                                     const LoopInfo &LoopInfo) {
     if (BB == nullptr) {
         return false;
     }
 
-    std::vector<Instruction *> instructions;
-    for (Instruction *I : *BB) {
-        instructions.push_back(I);
-    }
+    auto instructions = BB->getInstructions();
 
     bool changed = false;
     std::unordered_map<Value *, StoreInst *> pendingStores;
@@ -208,8 +202,6 @@ bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
 
     return changed;
 }
-
-} // namespace
 
 // 保留类内原有 helper 的 ABI；真正的块内 DSE 需要 AA/LoopInfo，
 // run() 会调用上面的 eliminateInBlockWithAA。没有别名信息时不做
@@ -395,15 +387,12 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            auto *SI = dynamic_cast<StoreInst *>(I);
-            if (!SI || queriedStores >= MaxMemorySSAStoreQueries) continue;
-            ++queriedStores;
-            if (MSSA.isStoreValueRedundant(
-                    SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
-                redundantValueStores.push_back(SI);
-            }
+    for (StoreInst *SI : F.collectInstructions<StoreInst>()) {
+        if (queriedStores >= MaxMemorySSAStoreQueries) break;
+        ++queriedStores;
+        if (MSSA.isStoreValueRedundant(
+                SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
+            redundantValueStores.push_back(SI);
         }
     }
     for (StoreInst *SI : redundantValueStores) {
@@ -420,14 +409,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 
     // === Phase 2: 全局 DSE — Forward Kill Coverage ===
     // Phase 1 之后再收集存活 store，避免对已删指令的悬空指针
-    std::vector<StoreInst *> allStores;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-                allStores.push_back(SI);
-            }
-        }
-    }
+    auto allStores = F.collectInstructions<StoreInst>();
 
     // 先收集，再统一删除
     std::vector<StoreInst *> toDelete;

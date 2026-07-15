@@ -27,13 +27,7 @@
 bool GepEvaluatePass::evaluateGEP(Function &F) {
     bool changed = false;
 
-    std::vector<GetElementPtrInst *> geps;
-    for (BasicBlock *BB : F) {
-        for (Instruction *I : *BB) {
-            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I))
-                geps.push_back(GEP);
-        }
-    }
+    auto geps = F.collectInstructions<GetElementPtrInst>();
 
     for (GetElementPtrInst *GEP : geps) {
         Value *Base = GEP->getBasePointer();

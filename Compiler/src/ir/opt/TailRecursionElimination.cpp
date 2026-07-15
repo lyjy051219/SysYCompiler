@@ -273,7 +273,7 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
 
                 // 只能被使用一次且 User 是 Ret
                 if (!BI->hasExactlyOneUse()) return false;
-                Use *singleUse = BI->getUseList().getHead();
+                Use *singleUse = BI->getSingleUse();
                 if (!singleUse || singleUse->getUser() != RI) return false;
 
                 AccInst = BI;

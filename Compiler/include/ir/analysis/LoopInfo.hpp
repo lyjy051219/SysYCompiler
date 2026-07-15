@@ -28,26 +28,21 @@ public:
     // 回边起始节点列表（回边终点即 Header）
     std::vector<BasicBlock*> BackedgeSrcs;
 
-    Loop() = default;
+    Loop();
 
     // 获取循环头
-    BasicBlock* getHeader() const { return Header; }
+    BasicBlock* getHeader() const;
     // 获取父循环
-    Loop* getParentLoop() const { return ParentLoop; }
+    Loop* getParentLoop() const;
     // 获取所有子循环
-    const std::vector<Loop*>& getSubLoops() const { return SubLoops; }
+    const std::vector<Loop*>& getSubLoops() const;
     // 获取直接属于该循环的块（不含子循环的块）
-    const std::vector<BasicBlock*>& getBlocks() const { return Blocks; }
+    const std::vector<BasicBlock*>& getBlocks() const;
     // 获取回边起始块
-    const std::vector<BasicBlock*>& getBackedgeSrcs() const { return BackedgeSrcs; }
+    const std::vector<BasicBlock*>& getBackedgeSrcs() const;
 
     // 获取循环深度（1 表示最外层）
-    unsigned getDepth() const {
-        unsigned depth = 1;
-        for (Loop* p = ParentLoop; p != nullptr; p = p->ParentLoop)
-            ++depth;
-        return depth;
-    }
+    unsigned getDepth() const;
     // 该块是否在本循环中（包括子循环）
     bool contains(BasicBlock* BB) const;
     // 收集本循环（含子循环）通向循环外部的出口块
@@ -65,7 +60,7 @@ public:
     // 检查是否满足 LoopSimplify 的基础形状：唯一 PreHeader、唯一 Latch、Dedicated Exits
     bool getLoopSimplifyForm(BasicBlock* &PreHeader, BasicBlock* &Latch) const;
     // 是否是最内层循环（没有子循环）
-    bool isInnermost() const { return SubLoops.empty(); }
+    bool isInnermost() const;
 };
 
 // 分析结果：整个函数的循环结构
@@ -79,26 +74,19 @@ public:
     // BasicBlock -> 直接所属的最内层 Loop（nullptr 表示不在任何循环中）
     std::unordered_map<BasicBlock*, Loop*> BBToLoop;
 
-    LoopInfo() = default;
-    LoopInfo(LoopInfo&&) = default;
-    LoopInfo& operator=(LoopInfo&&) = default;
+    LoopInfo();
+    LoopInfo(LoopInfo&&);
+    LoopInfo& operator=(LoopInfo&&);
     LoopInfo(const LoopInfo&) = delete;
     LoopInfo& operator=(const LoopInfo&) = delete;
 
-    void clear() {
-        Loops.clear();
-        TopLevelLoops.clear();
-        BBToLoop.clear();
-    }
+    void clear();
 
     // 查询某块所在的最内层循环（nullptr 表示不在循环中）
-    Loop* getLoopFor(BasicBlock* BB) const {
-        auto it = BBToLoop.find(BB);
-        return it != BBToLoop.end() ? it->second : nullptr;
-    }
+    Loop* getLoopFor(BasicBlock* BB) const;
 
     // 获取顶层循环列表
-    const std::vector<Loop*>& getTopLevelLoops() const { return TopLevelLoops; }
+    const std::vector<Loop*>& getTopLevelLoops() const;
     std::vector<Loop*> getLoopsInPostOrder(
         bool ReverseSiblingOrder = false) const;
 

@@ -16,8 +16,7 @@ bool LateDeadGlobalCleanupPass::collectDeadStoresForGlobal(
     if (!G->hasUses()) return false;
 
     std::vector<StoreInst *> LocalStores;
-    for (auto It = G->getUseList().begin(); It != G->getUseList().end(); ++It) {
-        Use *U = *It;
+    for (Use *U : G->getUses()) {
         if (!U || U->getValue() != G) return false;
         auto *SI = dynamic_cast<StoreInst *>(U->getUser());
         if (!SI || SI->getPointerOperand() != G) return false;
@@ -39,7 +38,7 @@ PreservationStatus LateDeadGlobalCleanupPass::run(
 
     for (auto &GPtr : M.getGlobalVar()) {
         Variable *G = GPtr.get();
-        if (G && G->getUseList().is_empty()) {
+        if (G && !G->hasUses()) {
             HasUnusedGlobal = true;
         }
         const size_t Before = StoresToDelete.size();
@@ -66,7 +65,7 @@ PreservationStatus LateDeadGlobalCleanupPass::run(
     auto &Globals = M.getGlobalVar();
     for (auto It = Globals.begin(); It != Globals.end();) {
         Variable *G = It->get();
-        if (G && G->getUseList().is_empty()) {
+        if (G && !G->hasUses()) {
             It = Globals.erase(It);
             Changed = true;
             continue;

@@ -52,6 +52,38 @@ struct AvailEntry {
 };
 using AvailSet = std::unordered_map<int, AvailEntry>;
 
+// 以共同归纳方式比较循环 PHI 所形成的纯 SSA 子图。
+class PhiCongruenceMatcher {
+public:
+	bool equivalent(Value *A, Value *B);
+
+private:
+	// 对称值对作为递归比较的记忆化键。
+	struct ValuePair {
+		Value *A = nullptr;
+		Value *B = nullptr;
+
+		bool operator==(const ValuePair &Other) const;
+	};
+
+	struct ValuePairHash {
+		std::size_t operator()(const ValuePair &P) const;
+	};
+
+	enum class State : unsigned char {
+		Visiting,
+		Equal,
+		Different,
+	};
+
+	std::unordered_map<ValuePair, State, ValuePairHash> States;
+
+	static ValuePair canonicalPair(Value *A, Value *B);
+	static bool isSupportedPureInstruction(Instruction *I);
+	bool equivalentPhis(PhiInst *A, PhiInst *B, unsigned Depth);
+	bool equivalentImpl(Value *A, Value *B, unsigned Depth);
+};
+
 class GVNPRESolver {
 public:
 	GVNPRESolver(Function &F,
@@ -165,17 +197,33 @@ private:
 // - PRE：部分冗余消除（基于 PHITranslate + AVAIL_OUT 集合）
 class GVNPREPass : public PassDescriptor<GVNPREPass> {
 public:
-	explicit GVNPREPass(bool EnablePRE = true) : EnablePRE(EnablePRE) {}
+	explicit GVNPREPass(bool EnablePRE = true);
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
 	bool EnablePRE = true;
 };
 
-// A deliberately linear, block-local value numbering pass.  It handles only
-// side-effect-free SSA expressions and therefore remains cheap enough to run
-// even when the full GVN/PRE solver rejects a very large function.
+// 线性的块内值编号 Pass；只处理无副作用的 SSA 表达式，供完整
+// GVN/PRE 因函数规模过大而跳过时提供低成本化简。
 class LocalGVNPass : public PassDescriptor<LocalGVNPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
+
+private:
+	// 块内表达式键只编码无副作用指令的操作码、类型和操作数。
+	struct LocalExprKey {
+		unsigned Opcode = 0;
+		unsigned SubOpcode = 0;
+		const IRType *ResultType = nullptr;
+		std::vector<Value *> Operands;
+
+		bool operator==(const LocalExprKey &Other) const;
+	};
+
+	struct LocalExprKeyHash {
+		std::size_t operator()(const LocalExprKey &K) const;
+	};
+
+	static bool buildLocalExprKey(Instruction *I, LocalExprKey &K);
 };

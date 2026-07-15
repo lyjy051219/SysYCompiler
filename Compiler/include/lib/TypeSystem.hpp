@@ -10,11 +10,10 @@
 
 //IR类型系统
 //单例+静态工厂模式--子类使用+shared_ptr包装裸指针
-//对于嵌套的函数使用了符号表中的层数进行静态返回，而不是动态计算
+//复合类型的嵌套层数在构造时计算并缓存
 
 enum TypeSystem{
-    IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_FUNCTION,IR_ARRAY,IR_LABEL,IR_UNDEF
-    /*,IR_VECTOR,ARM会用到这个类型*/
+    IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
 };
 class IRType{
     private:
@@ -70,7 +69,7 @@ class IRType{
                                     int FlatIndex,
                                     std::vector<int> &Path,
                                     std::shared_ptr<IRType> &ElementTy);
-    //这个版本的不包括Function，Pointer，Array
+    //复合类型需要额外结构信息，不能仅通过枚举创建。
     static std::shared_ptr<IRType> NewTypeByTypeSystem(TypeSystem type);
 
 };
@@ -82,13 +81,6 @@ class VOIDType : public IRType{
     static std::shared_ptr<VOIDType> NewVoid();
    void to_string() const override;
 
-};
-
-class LABELType : public IRType{
-    LABELType():IRType(IR_LABEL){size = 0;}
-    public:
-    static std::shared_ptr<LABELType> NewLabel();
-   void to_string() const override;
 };
 
 class INTType : public IRType{
@@ -110,23 +102,6 @@ class FLOATType : public IRType{
    void to_string() const override;
 };
 
-/*
-//函数类型属于组合类型不属于嵌套类型
-//函数类型，函数类型包括返回值类型和参数类型
-class FUNCTIONType : public IRType{
-    std::shared_ptr<IRType> returnType;
-    std::vector<std::shared_ptr<IRType>> paramTypes;
-    FUNCTIONType(std::shared_ptr<IRType> returnType, std::vector<std::shared_ptr<IRType>> paramTypes)
-        : IRType(IR_FUNCTION),
-         returnType(std::move(returnType)),
-         paramTypes(std::move(paramTypes)){size = 0;} //函数类型没有大小
-    public:
-    static std::shared_ptr<FUNCTIONType> NewFunction(const std::shared_ptr<IRType> &returnType,const std::vector<std::shared_ptr<IRType>> & paramTypes);
-   void to_string() const override;
-    std::shared_ptr<IRType> getReturnType() const { return returnType; }
-    std::vector<std::shared_ptr<IRType>> getParamTypes() const { return paramTypes; }
-
-};*/
 
 //下面2个是复合类型
 class POINTERType : public IRType{
@@ -173,10 +148,3 @@ class ARRAYType : public IRType{
     int getScope()final;
     //获取总元素数量和获取所有维度不知道用不用，有待观察
 };
-
-/*
-如果后面需要写arm的话，就需要写一下vector类型
-class VECTORType{
-
-};
-*/

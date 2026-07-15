@@ -18,8 +18,7 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
     for (BasicBlock *BB : L->getBlocks()) {
         for (auto It = BB->begin(); It != BB->end(); ++It) {
             Instruction *Def = *It;
-            for (auto Uit = Def->getUseList().begin(); Uit != Def->getUseList().end(); ++Uit) {
-                Use *U = *Uit;
+            for (Use *U : Def->getUses()) {
                 auto *UserInst = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
                 if (!UserInst) {
                     continue;
@@ -28,11 +27,12 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
                 auto *UserPhi = dynamic_cast<PhiInst *>(UserInst);
                 BasicBlock *UseBlock = nullptr;
                 if (UserPhi) {
-                    int OpIdx = UserInst->getUserIndex(U);
-                    if (OpIdx < 0 || (OpIdx % 2) != 0) {
+                    auto OpIdx = U->getOperandIndex();
+                    if (!OpIdx || (*OpIdx % 2) != 0) {
                         continue;
                     }
-                    UseBlock = UserPhi->getIncomingBlock(static_cast<unsigned>(OpIdx / 2));
+                    UseBlock = UserPhi->getIncomingBlock(
+                        static_cast<unsigned>(*OpIdx / 2));
                 } else {
                     UseBlock = UserInst->getParent();
                 }
@@ -144,7 +144,7 @@ bool LCSSAPass::runLCSSA(Instruction *I,
     }
     BasicBlock *DefBB = I->getParent();
     if (!DefBB) return false;
-    if (I->getUseList().is_empty()) return false;
+    if (!I->hasUses()) return false;
 
     Loop *L = LI.getLoopFor(DefBB);
     if (!L) return false;
@@ -157,11 +157,7 @@ bool LCSSAPass::runLCSSA(Instruction *I,
     bool Changed = false;
 
     //第二步，寻找这条指令在循环外部的Uses
-    std::vector<Use *> Uses;
-    for (auto It = I->getUseList().begin(); It != I->getUseList().end(); ++It) {
-        Use *U = *It;
-        if (U) Uses.push_back(U);
-    }
+    auto Uses = I->getUses();
     //定义在循环外部的Use集合
     std::vector<ExternalUse> Boundaries;
     for (Use *U : Uses) {
@@ -174,11 +170,12 @@ bool LCSSAPass::runLCSSA(Instruction *I,
         BasicBlock *UseBlock = nullptr;
 
         if (UserPhi) {
-            int OpIndex = UserInst->getUserIndex(U);
-            if (OpIndex < 0 || (OpIndex % 2) != 0) {
+            auto OpIndex = U->getOperandIndex();
+            if (!OpIndex || (*OpIndex % 2) != 0) {
                 continue;
             }
-            UseBlock = UserPhi->getIncomingBlock(static_cast<unsigned>(OpIndex / 2));
+            UseBlock = UserPhi->getIncomingBlock(
+                static_cast<unsigned>(*OpIndex / 2));
         } else {
             //情况2：如果正常指令，它的UseBlock就是它所在的基本块
             UseBlock = UserInst->getParent();
@@ -307,7 +304,7 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
 
             for (Instruction *Inst : *BB) {
                 if (!Inst) continue;
-                if (Inst->getUseList().is_empty()) continue;
+                if (!Inst->hasUses()) continue;
                 if (auto *Phi = dynamic_cast<PhiInst *>(Inst)) {
                     if (Phi->getIdent().find(".lcssa") != std::string::npos) continue;
                 }
