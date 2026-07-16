@@ -575,6 +575,66 @@ LayoutCost computeLayoutCost(
   return cost;
 }
 
+void considerBackedgeFallthroughOrders(
+    const MachineFunction &mf, const std::vector<int> &seed,
+    const LayoutCost &seedCost, const MachineLoopAnalysis::Result &loops,
+    const MachineBlockFrequencyAnalysis::Result &frequencies,
+    const std::map<std::string, SavedControl> &controls,
+    bool useWeightedOrientation, std::vector<int> &bestOrder,
+    LayoutCost &bestCost) {
+  if (!useWeightedOrientation ||
+      std::getenv("BACKEND_DISABLE_BACKEDGE_FALLTHROUGH_PLACEMENT") !=
+          nullptr) {
+    return;
+  }
+
+  for (const auto &[latch, header] : loops.backedges) {
+    if (latch < 0 || header <= 0 || latch == header ||
+        latch >= static_cast<int>(mf.blocks.size()) ||
+        header >= static_cast<int>(mf.blocks.size())) {
+      continue;
+    }
+
+    const std::string &latchLabel =
+        mf.blocks[static_cast<std::size_t>(latch)].label;
+    const std::string &headerLabel =
+        mf.blocks[static_cast<std::size_t>(header)].label;
+    const auto saved = controls.find(latchLabel);
+    if (saved == controls.end() ||
+        saved->second.kind != ControlKind::Unconditional ||
+        saved->second.trueTarget != headerLabel) {
+      continue;
+    }
+
+    std::vector<int> trial = seed;
+    const auto latchPosition = std::find(trial.begin(), trial.end(), latch);
+    if (latchPosition == trial.end()) {
+      throw BackendError("backedge latch missing from placement order");
+    }
+    trial.erase(latchPosition);
+    const auto headerPosition = std::find(trial.begin(), trial.end(), header);
+    if (headerPosition == trial.end()) {
+      throw BackendError("backedge header missing from placement order");
+    }
+    trial.insert(headerPosition, latch);
+
+    const LayoutCost trialCost = computeLayoutCost(
+        mf, trial, controls, frequencies, useWeightedOrientation);
+    // A loop rotation changes the branch direction and code adjacency.  Only
+    // accept it for the primary objective: replacing a more frequently
+    // executed explicit jump with a cheaper one.  Static-size or displacement
+    // tie breakers alone are not sufficient evidence for rotating a loop.
+    if (trialCost.dynamicJumpExecutions >=
+        seedCost.dynamicJumpExecutions) {
+      continue;
+    }
+    if (trialCost < bestCost) {
+      bestOrder = std::move(trial);
+      bestCost = trialCost;
+    }
+  }
+}
+
 uint64_t
 weightedFallthrough(const std::vector<int> &order,
                     const MachineBlockFrequencyAnalysis::Result &frequencies) {
@@ -804,12 +864,21 @@ bool runBlockPlacement(
   const LayoutCost originalCost =
       computeLayoutCost(mf, originalOrder, controls, frequencies,
                         useWeightedOrientation);
-  const LayoutCost candidateCost = useWeightedOrientation
-                                       ? computeLayoutCost(
-                                             mf, candidateOrder, controls,
-                                             frequencies,
-                                             useWeightedOrientation)
-                                       : originalCost;
+  LayoutCost candidateCost = useWeightedOrientation
+                                 ? computeLayoutCost(mf, candidateOrder,
+                                                     controls, frequencies,
+                                                     useWeightedOrientation)
+                                 : originalCost;
+  if (useWeightedOrientation) {
+    const std::vector<int> pettisHansenOrder = candidateOrder;
+    const LayoutCost pettisHansenCost = candidateCost;
+    considerBackedgeFallthroughOrders(
+        mf, originalOrder, originalCost, loops, frequencies, controls,
+        useWeightedOrientation, candidateOrder, candidateCost);
+    considerBackedgeFallthroughOrders(
+        mf, pettisHansenOrder, pettisHansenCost, loops, frequencies, controls,
+        useWeightedOrientation, candidateOrder, candidateCost);
+  }
 
   const std::vector<int> *selectedOrder = &originalOrder;
   const LayoutCost *selectedCost = &originalCost;

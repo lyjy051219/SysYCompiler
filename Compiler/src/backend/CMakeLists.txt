@@ -47,6 +47,15 @@ if(BUILD_BACKEND_TESTS)
     set_tests_properties(pre_ra_guarded_loop_preheader_tests PROPERTIES
         ENVIRONMENT "BACKEND_VERIFY_MIR=1")
 
+    add_executable(pre_ra_loop_latch_recurrence_sink_tests
+        rv/tests/PreRALoopLatchRecurrenceSinkTests.cpp)
+    target_link_libraries(pre_ra_loop_latch_recurrence_sink_tests
+        PRIVATE Backend)
+    add_test(NAME pre_ra_loop_latch_recurrence_sink_tests
+        COMMAND pre_ra_loop_latch_recurrence_sink_tests)
+    set_tests_properties(pre_ra_loop_latch_recurrence_sink_tests PROPERTIES
+        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
+
     add_executable(select_lowering_tests rv/tests/SelectLoweringTests.cpp)
     target_link_libraries(select_lowering_tests PRIVATE Backend)
     add_test(NAME select_lowering_tests COMMAND select_lowering_tests)
@@ -79,6 +88,25 @@ if(BUILD_BACKEND_TESTS)
     add_executable(codegen_prepare_tests rv/tests/CodeGenPrepareTests.cpp)
     target_link_libraries(codegen_prepare_tests PRIVATE Backend)
     add_test(NAME codegen_prepare_tests COMMAND codegen_prepare_tests)
+
+    add_executable(tail_recursion_elimination_tests
+        rv/tests/TailRecursionEliminationTests.cpp)
+    target_link_libraries(tail_recursion_elimination_tests PRIVATE Backend Opt)
+    add_test(NAME tail_recursion_elimination_tests
+        COMMAND tail_recursion_elimination_tests)
+
+    add_executable(hot_global_address_regalloc_tests
+        rv/tests/HotGlobalAddressRegAllocTests.cpp)
+    target_link_libraries(hot_global_address_regalloc_tests PRIVATE Backend)
+    add_test(NAME hot_global_address_regalloc_tests
+        COMMAND hot_global_address_regalloc_tests)
+
+    add_executable(pre_ra_loop_invariant_immediate_hoist_tests
+        rv/tests/PreRALoopInvariantImmediateHoistTests.cpp)
+    target_link_libraries(pre_ra_loop_invariant_immediate_hoist_tests
+        PRIVATE Backend)
+    add_test(NAME pre_ra_loop_invariant_immediate_hoist_tests
+        COMMAND pre_ra_loop_invariant_immediate_hoist_tests)
 
     add_executable(post_ra_list_schedule_tests rv/tests/PostRAListScheduleTests.cpp)
     target_link_libraries(post_ra_list_schedule_tests PRIVATE Backend)

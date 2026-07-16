@@ -11,6 +11,55 @@
 #include <unordered_set>
 #include <vector>
 
+namespace {
+
+// Recognize the integer/floating accumulator form produced by a pair of
+// recursive calls in one block:
+//
+//   Earlier = self(...)
+//   Tail    = self(...)
+//   Result  = Earlier op Tail
+//
+// Eliminating Tail does not reorder Earlier or any of its side effects.  Its
+// result is accumulated before the backedge, exactly as for the existing
+// `local_value op self(...)` form.  Requiring Earlier's sole use to be this
+// combine keeps the exception narrow and lets analyzeCallRetRange validate the
+// remaining call-to-return shape.
+bool isAccumulatorSiblingSelfCall(CallInst *Earlier, CallInst *Tail,
+                                  Function &F) {
+    if (!Earlier || !Tail || Earlier == Tail ||
+        Earlier->getCallee() != &F || Tail->getCallee() != &F ||
+        Earlier->getParent() != Tail->getParent() ||
+        !Earlier->hasExactlyOneUse()) {
+        return false;
+    }
+
+    bool EarlierPrecedesTail = false;
+    for (Instruction *I : *Earlier->getParent()) {
+        if (I == Earlier) EarlierPrecedesTail = true;
+        if (I == Tail) break;
+    }
+    if (!EarlierPrecedesTail) return false;
+
+    Use *OnlyUse = Earlier->getUseList().getHead();
+    auto *Combine =
+        OnlyUse ? dynamic_cast<BinaryInst *>(OnlyUse->getUser()) : nullptr;
+    if (!Combine || (Combine->getOp() != BinaryInst::ADD &&
+                     Combine->getOp() != BinaryInst::MUL) ||
+        !Combine->getIRType() ||
+        Combine->getIRType()->getEnum() != IR_INT) {
+        return false;
+    }
+
+    Value *LHS = nullptr;
+    Value *RHS = nullptr;
+    return Combine->getOperands(LHS, RHS) &&
+           ((LHS == Earlier && RHS == Tail) ||
+            (LHS == Tail && RHS == Earlier));
+}
+
+} // namespace
+
 // 将目标 Ret 的返回值映射到 Pred 上可用的 SSA 值。
 // 允许处理位于 TargetBB 中的 PHI 与 BitCast 链，其他 TargetBB 本地指令一律判为不合法。
 Value *TailRecursionEliminationPass::resolveRetValueForPred(Value *V,
@@ -129,6 +178,7 @@ bool TailRecursionEliminationPass::hasInterferingEarlierSelfCallInBlock(BasicBlo
         if (!CI) continue;
         if (CI->getCallee() != &F) continue;
 
+        if (isAccumulatorSiblingSelfCall(CI, StopCI, F)) continue;
         if (!isReadonlyLikeCallInst(CI, FAM, F)) return true;
         if (CI->hasUses()) return true;
     }
@@ -239,7 +289,8 @@ CallInst *TailRecursionEliminationPass::findSelfCall(BasicBlock *BB, Function &F
 bool TailRecursionEliminationPass::analyzeCallRetRange(
         CallInst *CI, RetInst *RI, Function &F,
         FunctionAnalysisPassManager &FAM,
-        BinaryInst *&AccInst) {
+        BinaryInst *&AccInst,
+        BasicBlock *ForwardingRetBlock) {
     AccInst = nullptr;
 
     // 收集 call 与 ret 之间的指令 (不含 call 和 ret)
@@ -251,8 +302,12 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         // ----- 识别累加器模式 -----
         if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
             auto op = BI->getOp();
-            // 只放行 ADD 和 MUL (满足交换律+结合律)
+            // Only integer ADD/MUL are associative under the IR semantics.
+            // Floating-point recursion cannot be reassociated without an
+            // explicit fast-math contract, which this IR does not carry.
             if (op == BinaryInst::ADD || op == BinaryInst::MUL) {
+                if (!BI->getIRType() || BI->getIRType()->getEnum() != IR_INT)
+                    return false;
                 // 不支持多条累加指令
                 if (AccInst) return false;
 
@@ -265,16 +320,49 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
                 bool op1IsCall = (Op1 == static_cast<Value *>(CI));
                 if (!(op0IsCall ^ op1IsCall)) return false;
 
-                // 另一个操作数不能是对自身的递归调用
+                // A preceding sibling self-call is safe when this combine is
+                // its only use.  The sibling remains in place; only CI becomes
+                // the loop backedge and the sibling result feeds AccPhi.
                 Value *OtherOp = op0IsCall ? Op1 : Op0;
                 if (auto *OtherCI = dynamic_cast<CallInst *>(OtherOp)) {
-                    if (isSelfCall(OtherCI, F)) return false;
+                    if (isSelfCall(OtherCI, F) &&
+                        !isAccumulatorSiblingSelfCall(OtherCI, CI, F)) {
+                        return false;
+                    }
                 }
 
-                // 只能被使用一次且 User 是 Ret
-                if (!BI->hasExactlyOneUse()) return false;
-                Use *singleUse = BI->getUseList().getHead();
-                if (!singleUse || singleUse->getUser() != RI) return false;
+                // A direct return has exactly one use.  For the common
+                // `br return.block` form, cloning the return temporarily adds
+                // a second use while the original PHI/Ret forwarding edge is
+                // still present.  Permit only that ret-only block's forwarding
+                // use; the edge is removed immediately after analysis.
+                unsigned RetUses = 0;
+                unsigned ForwardingUses = 0;
+                for (auto UseIt = BI->getUseList().begin();
+                     UseIt != BI->getUseList().end(); ++UseIt) {
+                    Use *CurrentUse = *UseIt;
+                    if (!CurrentUse || CurrentUse->getValue() != BI)
+                        continue;
+                    if (CurrentUse->getUser() == RI) {
+                        ++RetUses;
+                        continue;
+                    }
+                    auto *ForwardingInst = dynamic_cast<Instruction *>(
+                        CurrentUse->getUser());
+                    if (ForwardingRetBlock && ForwardingInst &&
+                        ForwardingInst->getParent() == ForwardingRetBlock &&
+                        (dynamic_cast<PhiInst *>(ForwardingInst) ||
+                         dynamic_cast<RetInst *>(ForwardingInst))) {
+                        ++ForwardingUses;
+                        continue;
+                    }
+                    return false;
+                }
+                if (RetUses != 1 ||
+                    (!ForwardingRetBlock && ForwardingUses != 0) ||
+                    (ForwardingRetBlock && ForwardingUses != 1)) {
+                    return false;
+                }
 
                 AccInst = BI;
                 continue;
@@ -630,7 +718,8 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 }
 
                 // 跨块路径也复用 call..ret 分析逻辑，支持累加器识别。
-                if (!analyzeCallRetRange(CI, ClonedRI, F, FAM, AccInst)) {
+                if (!analyzeCallRetRange(CI, ClonedRI, F, FAM, AccInst,
+                                         CurTarget)) {
                     rollbackClonedArtifacts(bb, ClonedRI, ClonedSupportInsts);
                     continue;
                 }
@@ -657,8 +746,22 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             if (!CI->isInBlock(bb) || !WorkRI->isInBlock(bb))
                 continue;
 
+            const bool createsAccumulator = AccInst && !AccPhi;
             if (eliminateTailRecursion(bb, CI, WorkRI, AccInst, F, FAM,
                                        LoopHeader, ArgPhis, AccPhi)) {
+                // A plain tail site may have been converted before the first
+                // accumulator site was discovered.  Once AccPhi is created,
+                // every pre-existing backedge must explicitly carry it
+                // through; otherwise the loop-header PHI is missing incoming
+                // values for valid predecessors.
+                if (createsAccumulator && AccPhi) {
+                    // Follow function order rather than unordered_set bucket
+                    // order so emitted PHI operands remain deterministic.
+                    for (BasicBlock *Candidate : blockSnapshot) {
+                        if (transformedBlocks.count(Candidate) != 0)
+                            AccPhi->addIncoming(AccPhi, Candidate);
+                    }
+                }
                 changed = true;
                 progress = true;
                 transformedBlocks.insert(bb);

@@ -1105,10 +1105,23 @@ std::optional<PrepareCandidate> tryBuildCandidate(
     if (!UserInst)
       return std::nullopt;
     BasicBlock *UserBB = UserInst->getParent();
-    if (!UserBB || !L->contains(UserBB))
+    if (!UserBB)
       return std::nullopt;
     if (dynamic_cast<PhiInst *>(UserInst))
       return std::nullopt;
+
+    // A loop-produced address may remain live into a dominated exit block.
+    // This is common after unrolling: the final adjacent address is reused by
+    // a scalar remainder, so rejecting every out-of-loop use prevents the
+    // whole constant-offset GEP cluster from sharing one pointer IV.  The
+    // replacement pointer is defined in the loop header and therefore also
+    // dominates any non-PHI use already dominated by the original GEP block.
+    // Keep PHIs excluded because their edge-specific dominance rule needs
+    // separate handling.
+    if (!L->contains(UserBB) &&
+        !DT.dominates(GEP.getParent(), UserBB)) {
+      return std::nullopt;
+    }
   }
 
   PrepareCandidate Candidate;

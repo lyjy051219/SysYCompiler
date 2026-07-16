@@ -50,7 +50,8 @@ private:
     // AccInst 输出检测到的累加器指令 (可为 nullptr)
     bool analyzeCallRetRange(CallInst *CI, RetInst *RI, Function &F,
                              FunctionAnalysisPassManager &FAM,
-                             BinaryInst *&AccInst);
+                             BinaryInst *&AccInst,
+                             BasicBlock *ForwardingRetBlock = nullptr);
 
     // 执行尾递归 → 循环 变换 (单个基本块)
     // 返回 true 表示发生了变换

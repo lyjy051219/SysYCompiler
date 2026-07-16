@@ -63,6 +63,14 @@ struct MachineInstr {
   std::vector<PhysReg> implicitUses;
   bool sideEffects = false;
   bool terminator = false;
+  // Set on COPYs emitted while lowering PHI incoming values.  Register
+  // allocation uses this provenance to distinguish loop-carried transfers
+  // from ordinary copies and from mutually exclusive diamond edges.
+  bool phiCopy = false;
+  // Some COPY instructions are ordering barriers rather than ordinary value
+  // transfers.  In particular, the temporary and rotations used to serialize
+  // a cyclic PHI bundle must not be undone by register coalescing.
+  bool copyCoalescingBarrier = false;
   std::string comment;
 };
 
