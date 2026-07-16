@@ -1,5 +1,6 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/SCEV.hpp"
 #include "lib/TraverseTools.hpp"
 
 #include <algorithm>
@@ -14,6 +15,8 @@ MemoryLocation::MemoryLocation(Value *P, std::optional<std::size_t> S)
     : Pointer(P), Size(S) {}
 
 BasicAAResult::BasicAAResult() = default;
+
+BasicAAResult::BasicAAResult(SCEVResult *SCEV) : SE(SCEV) {}
 
 BasicAAResult::BasicAAResult(BasicAAResult &&) = default;
 
@@ -114,7 +117,8 @@ MemoryLocation MemoryLocation::get(const StoreInst *Store) {
 }
 
 bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
-    if (PA.isKept(BasicAliasAnalysis::ID())) {
+    if (PA.isKept(BasicAliasAnalysis::ID()) &&
+        (!SE || PA.isKept(SCEVAnalysis::ID()))) {
         return false;
     }
     (void)F;
@@ -477,28 +481,17 @@ BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
         return std::nullopt;
     }
 
-    Value* Start = nullptr;
-    Value* Update = nullptr;
-    if (!forEachPhiIncoming(
-            Phi, [&](unsigned, Value *V, BasicBlock *Pred) {
-                if (!V || !Pred) return false;
-                if (L->contains(Pred)) {
-                    if (Update && Update != V) return false;
-                    Update = V;
-                } else {
-                    if (Start && Start != V) return false;
-                    Start = V;
-                }
-                return true;
-            })) {
+    if (!SE) return std::nullopt;
+    auto Induction = SE->getCanonicalInduction(L);
+    if (!Induction || !Induction->Valid || Induction->Phi != Phi ||
+        !Induction->StartValue || !Induction->UpdateValue ||
+        !Induction->ConstantStep || *Induction->ConstantStep <= 0 ||
+        !SE->isKnownNoWrapInductionValue(L, Induction->UpdateValue)) {
         return std::nullopt;
     }
-
-    auto Step = getAdditiveOffsetFrom(Update, Phi);
-    if (!Start || !Step || *Step <= 0) {
-        return std::nullopt;
-    }
-    return PositivePhiRecurrence{Start, *Step, L};
+    return PositivePhiRecurrence{Induction->StartValue,
+                                 Induction->UpdateValue,
+                                 *Induction->ConstantStep, L};
 }
 
 std::optional<long long>
@@ -508,11 +501,7 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
         return std::nullopt;
     }
 
-    if (auto Direct = getAdditiveOffsetFrom(Greater, Lesser)) {
-        if (*Direct >= 0) {
-            return *Direct;
-        }
-    }
+    if (Greater == Lesser) return 0;
 
     auto Dec = decomposeAdditive(Greater);
     if (!Dec.Valid) {
@@ -530,7 +519,15 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
     }
 
     auto StartOff = getAdditiveOffsetFrom(Rec->Start, Lesser);
-    if (!StartOff) {
+    if (!StartOff || *StartOff != 0) {
+        return std::nullopt;
+    }
+
+    // A positive syntactic offset is not a signed lower bound when i32 ADD
+    // may wrap.  Consume only the exact canonical update covered by SCEV's
+    // finite/no-wrap proof; arbitrary `phi + C` remains unknown.
+    if (Dec.Offset != 0 &&
+        (Greater != Rec->Update || Dec.Offset != Rec->Step)) {
         return std::nullopt;
     }
 
@@ -545,8 +542,6 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
 AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     const std::unordered_map<Value*, long long>& DiffVars,
     long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
-    (void)LI;
-
     // First handle an affine relation encoded directly in SSA, such as
     //   j = i + 1;  A[j] versus A[i].
     // This proof does not assume no-wrap.  For signed i32 ADD/SUB, `j - i`
@@ -583,16 +578,15 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
             if (Offset && Ty && BTy && Ty->isInt() &&
                 BTy->isInt() && Ty->getIntegerBitWidth(32) == 32 &&
                 BTy->getIntegerBitWidth(32) == 32) {
-                constexpr long long Modulus = 1LL << 32;
                 // A chain of i32 additions can accumulate more than one full
                 // modulus in the mathematical decomposition.  Normalize it
                 // first; the signed difference of the two final i32 values
                 // is then either R or R-2^32 (only zero when R is zero).
-                long long Residue = *Offset % Modulus;
-                if (Residue < 0) Residue += Modulus;
+                long long Residue = *Offset % I32Modulus;
+                if (Residue < 0) Residue += I32Modulus;
                 std::vector<long long> Representatives{Residue};
                 if (Residue != 0)
-                    Representatives.push_back(Residue - Modulus);
+                    Representatives.push_back(Residue - I32Modulus);
 
                 bool AllDisjoint = true;
                 for (long long IndexDiff : Representatives) {
@@ -609,13 +603,34 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
                 }
                 if (AllDisjoint) return AliasInfo::NoAlias;
             }
+
+            // When SCEV proves a finite canonical recurrence, its exact
+            // update has a mathematical lower bound relative to the invariant
+            // start.  This covers variable distances such as j=i+1 without
+            // treating every positive-looking i32 ADD as non-wrapping.
+            if (auto Lower = lowerBoundDiff(A, B, LI)) {
+                long long Scaled = 0;
+                long long MinByteDiff = 0;
+                if (checkedMul(Scale, *Lower, Scaled) &&
+                    checkedAdd(ConstDiff, Scaled, MinByteDiff) &&
+                    MinByteDiff >= static_cast<long long>(Threshold)) {
+                    return AliasInfo::NoAlias;
+                }
+            }
+            if (auto ReverseLower = lowerBoundDiff(B, A, LI)) {
+                long long Scaled = 0;
+                long long MaxByteDiff = 0;
+                if (checkedMul(Scale, *ReverseLower, Scaled) &&
+                    checkedSub(ConstDiff, Scaled, MaxByteDiff) &&
+                    MaxByteDiff <= -static_cast<long long>(Threshold)) {
+                    return AliasInfo::NoAlias;
+                }
+            }
         }
     }
 
     // Integer ADD/SUB and PHI recurrences in this IR carry no no-wrap flag.
-    // A syntactically positive step can wrap and invalidate every mathematical
-    // lower-bound argument below.  Until SCEV can attach an explicit finite
-    // no-wrap proof, variable-distance GEPs must remain MayAlias.
+    // Recurrences not covered by the explicit SCEV proof remain MayAlias.
     return AliasInfo::MayAlias;
 }
 
@@ -1057,11 +1072,9 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     return Result;
 }
 
-PassID BasicAliasAnalysis::Key;
-
 BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    BasicAAResult Result;
-    (void)FAM;
+    auto &SE = FAM.getResult<SCEVAnalysis>(F);
+    BasicAAResult Result(&SE);
 
     std::vector<unsigned> PointerParams;
     PointerParams.reserve(F.getParamCount());

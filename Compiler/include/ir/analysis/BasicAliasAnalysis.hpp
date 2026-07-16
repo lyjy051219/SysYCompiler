@@ -9,6 +9,7 @@
 
 class LoopInfo;
 class Loop;
+class SCEVResult;
 
 //别名分析：采用即时计算两个指针的关系
 //如果实现了select指令，那么需要补全aliasSelect函数
@@ -41,6 +42,7 @@ struct MemoryLocation {
 class BasicAAResult {
 public:
     BasicAAResult();
+    explicit BasicAAResult(SCEVResult *SE);
     BasicAAResult(BasicAAResult&&);
     BasicAAResult& operator=(BasicAAResult&&);
     BasicAAResult(const BasicAAResult&) = delete;
@@ -66,6 +68,8 @@ public:
 
 private:
     friend class BasicAliasAnalysis;
+
+    static constexpr long long I32Modulus = 1LL << 32;
 
     // BasicAA 内部共用的溢出检查与指针来源判定。
     static bool checkedAdd(long long A, long long B, long long &Result);
@@ -97,9 +101,12 @@ private:
 
     struct PositivePhiRecurrence {
         Value* Start = nullptr;
+        Value* Update = nullptr;
         long long Step = 0;
         const Loop* L = nullptr;
     };
+
+    SCEVResult *SE = nullptr;
 
     Value* stripBaseInst(Value* V) const;
     Value* getBaseAddress(Value* V) const;
@@ -157,5 +164,5 @@ public:
 
 private:
     friend AnalysisDescriptor<BasicAliasAnalysis>;
-    static PassID Key;
+    inline static PassID Key;
 };

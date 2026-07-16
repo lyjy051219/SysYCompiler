@@ -3,7 +3,9 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/IRUtils.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,6 +27,21 @@ public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    // Absolute caps protect compile time. Profitability is governed primarily
+    // by the relative function-size budgets below; the absolute limits apply
+    // only to the specialized side that would actually be cloned.
+    static constexpr std::size_t MaxNonTrivialCloneBlocks = 32;
+    static constexpr std::size_t MaxNonTrivialCloneInstructions = 192;
+    static constexpr std::size_t MaxClonePercentOfFunction = 30;
+    static constexpr std::size_t MaxGeneratedClonePercentOfFunction = 15;
+    static constexpr unsigned RelationLessMask = 1U;
+    static constexpr unsigned RelationEqualMask = 2U;
+    static constexpr unsigned RelationGreaterMask = 4U;
+    static constexpr std::int64_t PredicateMinimum =
+        static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min());
+    static constexpr std::int64_t PredicateMaximum =
+        static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max());
+
     using BlockSet = std::unordered_set<BasicBlock *>;
     using ClosedInterval = std::pair<std::int64_t, std::int64_t>;
 
@@ -178,6 +195,8 @@ private:
         const std::vector<BasicBlock *> &Blocks,
         const BlockSet *Filter = nullptr);
     static bool hasLoopTransformProvenance(
+        const std::vector<BasicBlock *> &Blocks);
+    static bool hasTilingProvenance(
         const std::vector<BasicBlock *> &Blocks);
     static unsigned invariantScope(Value *Condition, Loop *L,
                                    const DominatorTree &DT);

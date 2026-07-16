@@ -7,8 +7,6 @@
 #include <sstream>
 #include <unordered_set>
 
-PassID SCEVAnalysis::Key;
-
 bool SCEVExpr::isConstant(int64_t V) const {
     return Kind == SCEVExprKind::Constant && ConstValue == V;
 }
@@ -555,11 +553,60 @@ const SCEVExpr *SCEVResult::tryHeaderPhi(PhiInst *Phi, const Loop *L) {
 
 std::optional<SCEVResult::UpdateDelta>
 SCEVResult::findAdditiveDelta(PhiInst *Self, Value *V, const Loop *L) {
+    std::unordered_set<Value *> Active;
+    return findAdditiveDeltaImpl(Self, V, L, Active, 0);
+}
+
+std::optional<SCEVResult::UpdateDelta>
+SCEVResult::findAdditiveDeltaImpl(
+    PhiInst *Self, Value *V, const Loop *L,
+    std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V) return std::nullopt;
     if (V == Self) return UpdateDelta{true, makeConstant(0, Self->getIRType())};
+    if (Depth > 64) return std::nullopt;
 
     if (isLoopInvariant(V, L))
         return UpdateDelta{false, getSCEV(V)};
+
+    // LoopSimplify merges multiple continue/backedge paths through a latch
+    // PHI.  That PHI still denotes one affine update when every incoming path
+    // computes exactly the same delta from Self.  Recognize only that strict
+    // equality case; a cyclic merge or one differing path remains unknown.
+    if (auto *Merge = dynamic_cast<PhiInst *>(V)) {
+        if (!Merge->getParent() || !L->contains(Merge->getParent()) ||
+            !Active.insert(Merge).second) {
+            return std::nullopt;
+        }
+
+        std::optional<UpdateDelta> Common;
+        bool Valid = Merge->getNumIncomingValues() != 0;
+        forEachPhiIncoming(
+            Merge, [&](unsigned, Value *Incoming, BasicBlock *Pred) {
+                if (!Valid || !Incoming || !Pred || Incoming == Merge ||
+                    !L->contains(Pred)) {
+                    Valid = false;
+                    return false;
+                }
+                auto Current = findAdditiveDeltaImpl(
+                    Self, Incoming, L, Active, Depth + 1);
+                if (!Current || !Current->SeenSelf || !Current->Delta) {
+                    Valid = false;
+                    return false;
+                }
+                if (!Common) {
+                    Common = *Current;
+                    return true;
+                }
+                if (Common->SeenSelf != Current->SeenSelf ||
+                    !sameExpr(Common->Delta, Current->Delta)) {
+                    Valid = false;
+                    return false;
+                }
+                return true;
+            });
+        Active.erase(Merge);
+        return Valid ? Common : std::nullopt;
+    }
 
     auto *BI = dynamic_cast<BinaryInst *>(V);
     if (!BI) return std::nullopt;
@@ -569,8 +616,8 @@ SCEVResult::findAdditiveDelta(PhiInst *Self, Value *V, const Loop *L) {
     if (!A || !B) return std::nullopt;
 
     BinaryInst::Operation Op = BI->getOp();
-    auto DA = findAdditiveDelta(Self, A, L);
-    auto DB = findAdditiveDelta(Self, B, L);
+    auto DA = findAdditiveDeltaImpl(Self, A, L, Active, Depth + 1);
+    auto DB = findAdditiveDeltaImpl(Self, B, L, Active, Depth + 1);
 
     if (!DA || !DB) return std::nullopt;
 
@@ -878,6 +925,125 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
     return Info;
 }
 
+bool SCEVResult::isKnownFiniteLoop(const Loop *L) {
+    auto Induction = getCanonicalInduction(L);
+    auto Trip = analyzeLoopTripCount(L);
+    if (!Induction || !Trip || !Induction->Valid || !Trip->Valid ||
+        !Induction->Phi || !Induction->ConstantStep) {
+        return false;
+    }
+    if (Trip->ProvenNoWrap) return true;
+    if (!hasStrictUnitStepExit(*Induction, *Trip)) {
+        return false;
+    }
+    return Trip->ComparePhase == LoopExitComparePhase::HeaderPhi ||
+           (Trip->ComparePhase == LoopExitComparePhase::BackedgeUpdate &&
+            isBackedgeUpdateStartSafe(L, *Induction, *Trip));
+}
+
+bool SCEVResult::isKnownNoWrapInductionValue(const Loop *L, Value *V) {
+    if (!L || !V) return false;
+    auto Induction = getCanonicalInduction(L);
+    auto Trip = analyzeLoopTripCount(L);
+    if (!Induction || !Trip || !Induction->Valid || !Trip->Valid ||
+        (V != Induction->Phi && V != Induction->UpdateValue)) {
+        return false;
+    }
+    if (Trip->ProvenNoWrap) return true;
+    if (!hasStrictUnitStepExit(*Induction, *Trip)) return false;
+    return Trip->ComparePhase == LoopExitComparePhase::HeaderPhi ||
+           (Trip->ComparePhase == LoopExitComparePhase::BackedgeUpdate &&
+            isBackedgeUpdateStartSafe(L, *Induction, *Trip));
+}
+
+bool SCEVResult::hasStrictUnitStepExit(
+    const InductionDescriptor &Induction,
+    const LoopTripCountInfo &Trip) const {
+    auto InductionType = Induction.Phi
+        ? Induction.Phi->getIRType()
+        : nullptr;
+    if (!Trip.Valid || !Trip.ExitCmp || !Trip.Header ||
+        (Trip.ExitingBlock != Trip.Header &&
+         Trip.ExitingBlock != Trip.Latch) || !Trip.IndVar ||
+        Trip.IndVar != Induction.Phi || !Induction.Phi ||
+        !Induction.UpdateValue || !Induction.ConstantStep ||
+        Trip.ComparePhase == LoopExitComparePhase::Unknown ||
+        !InductionType || !InductionType->isInt() ||
+        InductionType->getIntegerBitWidth(32) != 32) {
+        return false;
+    }
+
+    // A latch test of the header PHI may still compute the next update on the
+    // final, failing iteration.  That update can wrap even though `phi < B`
+    // itself gives a finite PHI sequence (for example B == INT_MAX).  Keep the
+    // no-wrap API restricted to a true header test; exact-update latch tests
+    // are safe after the separate first-update check below.
+    if (Trip.ComparePhase == LoopExitComparePhase::HeaderPhi &&
+        Trip.ExitingBlock == Trip.Latch) {
+        return false;
+    }
+
+    BinaryInst::Operation Predicate = Trip.ContinueOnTrue
+        ? Trip.ExitCmp->getOp()
+        : BinaryInst::negatePredicate(Trip.ExitCmp->getOp());
+    Value *LHS = Trip.ExitCmp->getOperand(0);
+    Value *RHS = Trip.ExitCmp->getOperand(1);
+    Value *Compared = Trip.ComparePhase == LoopExitComparePhase::HeaderPhi
+        ? static_cast<Value *>(Induction.Phi)
+        : Induction.UpdateValue;
+    if (RHS == Compared) {
+        std::swap(LHS, RHS);
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (LHS != Compared) return false;
+
+    return (*Induction.ConstantStep == 1 &&
+            Predicate == BinaryInst::L) ||
+           (*Induction.ConstantStep == -1 &&
+            Predicate == BinaryInst::G);
+}
+
+bool SCEVResult::isBackedgeUpdateStartSafe(
+    const Loop *L, const InductionDescriptor &Induction,
+    const LoopTripCountInfo &) {
+    if (!L || !Induction.StartValue || !Induction.ConstantStep)
+        return false;
+
+    if (Induction.ConstantStart) {
+        if (*Induction.ConstantStart < IntRange::I32_MIN ||
+            *Induction.ConstantStart > IntRange::I32_MAX) {
+            return false;
+        }
+        if (*Induction.ConstantStep == 1)
+            return *Induction.ConstantStart < IntRange::I32_MAX;
+        if (*Induction.ConstantStep == -1)
+            return *Induction.ConstantStart > IntRange::I32_MIN;
+        return false;
+    }
+
+    // A nested loop may start at the currently active induction value of an
+    // ancestor.  If that ancestor's own unit update is proven non-wrapping,
+    // the active value is safe for one update in the same direction.  Walk
+    // only parents, so the recursive proof cannot cycle.
+    for (Loop *Ancestor = L->getParentLoop(); Ancestor;
+         Ancestor = Ancestor->getParentLoop()) {
+        auto AncestorInduction = getCanonicalInduction(Ancestor);
+        if (!AncestorInduction || !AncestorInduction->Valid ||
+            !AncestorInduction->Phi ||
+            AncestorInduction->ConstantStep != Induction.ConstantStep) {
+            continue;
+        }
+        if (Induction.StartValue != AncestorInduction->Phi &&
+            !sameExpr(Induction.Start,
+                      getSCEV(AncestorInduction->Phi))) {
+            continue;
+        }
+        return isKnownNoWrapInductionValue(
+            Ancestor, AncestorInduction->Phi);
+    }
+    return false;
+}
+
 bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     const LoopTripCountInfo &Info, RangeInfo &RI, DominatorTree &DomTree) {
     if (!Info.Valid || !Info.IsRuntime || !Info.L || !Info.PreHeader ||
@@ -1127,6 +1293,10 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     } else if (!ComparesExactHeaderPhi) {
         return false;
     }
+
+    Info.ComparePhase = ComparesExactBackedgeUpdate
+        ? LoopExitComparePhase::BackedgeUpdate
+        : LoopExitComparePhase::HeaderPhi;
 
     Info.Start = Start;
     Info.Step = Affine->Step;

@@ -20,16 +20,6 @@
 #include <utility>
 #include <vector>
 
-// Absolute caps protect compile time.  Profitability is governed primarily by
-// the relative function-size budget below: unlike the old 20/96 whole-loop
-// cap, these limits apply only to the specialized side that is actually
-// cloned.  This admits a large loop with a small cold arm without admitting a
-// near-duplicate of a small function.
-constexpr std::size_t MaxNonTrivialCloneBlocks = 32;
-constexpr std::size_t MaxNonTrivialCloneInstructions = 192;
-constexpr std::size_t MaxClonePercentOfFunction = 30;
-constexpr std::size_t MaxGeneratedClonePercentOfFunction = 15;
-
 bool LoopUnswitchPass::isBooleanNonConstant(Value *V) {
     if (!V || Value::isUndef(V) || V->isConst() || !V->getIRType())
         return false;
@@ -522,16 +512,13 @@ std::optional<bool> LoopUnswitchPass::evaluateConstantBoolean(Value *Condition) 
 }
 
 unsigned LoopUnswitchPass::predicateRelationMask(BinaryInst::Operation Op) {
-    constexpr unsigned LT = 1U;
-    constexpr unsigned EQ = 2U;
-    constexpr unsigned GT = 4U;
     switch (Op) {
-    case BinaryInst::L:  return LT;
-    case BinaryInst::LE: return LT | EQ;
-    case BinaryInst::E:  return EQ;
-    case BinaryInst::NE: return LT | GT;
-    case BinaryInst::GE: return EQ | GT;
-    case BinaryInst::G:  return GT;
+    case BinaryInst::L:  return RelationLessMask;
+    case BinaryInst::LE: return RelationLessMask | RelationEqualMask;
+    case BinaryInst::E:  return RelationEqualMask;
+    case BinaryInst::NE: return RelationLessMask | RelationGreaterMask;
+    case BinaryInst::GE: return RelationEqualMask | RelationGreaterMask;
+    case BinaryInst::G:  return RelationGreaterMask;
     default:             return 0;
     }
 }
@@ -539,26 +526,22 @@ unsigned LoopUnswitchPass::predicateRelationMask(BinaryInst::Operation Op) {
 std::vector<LoopUnswitchPass::ClosedInterval>
 LoopUnswitchPass::predicateIntervals(BinaryInst::Operation Op,
                                                std::int64_t Bound) {
-    constexpr std::int64_t Min =
-        static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min());
-    constexpr std::int64_t Max =
-        static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max());
     std::vector<ClosedInterval> Result;
     auto Add = [&](std::int64_t L, std::int64_t R) {
-        L = std::max(L, Min);
-        R = std::min(R, Max);
+        L = std::max(L, PredicateMinimum);
+        R = std::min(R, PredicateMaximum);
         if (L <= R) Result.emplace_back(L, R);
     };
     switch (Op) {
-    case BinaryInst::L:  Add(Min, Bound - 1); break;
-    case BinaryInst::LE: Add(Min, Bound); break;
+    case BinaryInst::L:  Add(PredicateMinimum, Bound - 1); break;
+    case BinaryInst::LE: Add(PredicateMinimum, Bound); break;
     case BinaryInst::E:  Add(Bound, Bound); break;
     case BinaryInst::NE:
-        Add(Min, Bound - 1);
-        Add(Bound + 1, Max);
+        Add(PredicateMinimum, Bound - 1);
+        Add(Bound + 1, PredicateMaximum);
         break;
-    case BinaryInst::GE: Add(Bound, Max); break;
-    case BinaryInst::G:  Add(Bound + 1, Max); break;
+    case BinaryInst::GE: Add(Bound, PredicateMaximum); break;
+    case BinaryInst::G:  Add(Bound + 1, PredicateMaximum); break;
     default: break;
     }
     return Result;
@@ -963,6 +946,15 @@ bool LoopUnswitchPass::hasLoopTransformProvenance(
     return false;
 }
 
+bool LoopUnswitchPass::hasTilingProvenance(
+    const std::vector<BasicBlock *> &Blocks) {
+    for (BasicBlock *BB : Blocks) {
+        if (BB && BB->getIdent().find(".tile.") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 unsigned LoopUnswitchPass::invariantScope(Value *Condition, Loop *L,
                         const DominatorTree &DT) {
     unsigned Scope = 1;
@@ -1028,6 +1020,10 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
 
         std::vector<BasicBlock *> AllBlocks = L->getBlocksInFunctionOrder();
         if (AllBlocks.empty()) continue;
+        // Tile guards are deliberate strip-mining control.  Versioning one of
+        // them duplicates a remainder path around the tiled loop, increasing
+        // CFG pressure without removing a source-level invariant branch.
+        if (hasTilingProvenance(AllBlocks)) continue;
         for (BasicBlock *BB : AllBlocks) {
             if (!isDirectLoopBlock(LI, L, BB)) continue;
             BrInst *Br = BB->getBranchTerminator();

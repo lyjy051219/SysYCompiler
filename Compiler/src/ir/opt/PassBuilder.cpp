@@ -44,9 +44,14 @@
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/opt/GlobalInitializerFold.hpp"
 #include "ir/opt/LoopIdiomRecognize.hpp"
+#include "ir/opt/LoopInterchange.hpp"
+#include "ir/opt/LoopFusion.hpp"
+#include "ir/opt/UnrollAndJam.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
+#include "ir/analysis/LoopDependence.hpp"
+#include "ir/analysis/LoopAccessAnalysis.hpp"
 
 PassBuilder::PassBuilder() = default;
 
@@ -158,6 +163,9 @@ FunctionPassManager PassBuilder::buildEarlyPeelingPipeline() {
         FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
     CallAndInvariantCleanup.addPass(LCSSAPass());
     CallAndInvariantCleanup.addPass(IndVarSimplifyPass());
+    // Schedule transforms are registered only in the post-inline main loop
+    // pipeline. Repeating them here would create another pass instance with a
+    // fresh growth budget and reshape a callee that is immediately inlined.
     CallAndInvariantCleanup.addPass(LICMPass());
     CallAndInvariantCleanup.addPass(LocalGVNPass());
     // Peeling splits the one-time prefix from the stable residual loop.  PRE
@@ -241,6 +249,20 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
+
+    // Consume source-level affine coordinates before rotation/LSR obscure
+    // them.  Keep the default schedule limited to transforms with a measured
+    // corpus win: rectangular interchange, proven integer-reduction fusion,
+    // and cache-footprint-gated reduction-aware unroll-and-jam.
+    //
+    // LoopDistribution and LoopTiling remain available as explicit passes,
+    // but their current perfect-nest/two-axis forms do not implement the
+    // imperfect TRSM schedule or three-axis 01_mm working-set tiling.  Running
+    // them here would add analysis work without a demonstrated target gain.
+    FPM.addPass(IndVarSimplifyPass());
+    FPM.addPass(LoopInterchangePass());
+    FPM.addPass(LoopFusionPass());
+    FPM.addPass(UnrollAndJamPass());
 
     // 先旋转/规范化，再重新建立 LoopSimplify + LCSSA，让 Unroll 看到更稳定的
     // trip-count 和 latch/header 形态。

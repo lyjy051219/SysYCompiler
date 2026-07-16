@@ -87,6 +87,12 @@ struct InductionDescriptor {
     bool Valid = false;
 };
 
+enum class LoopExitComparePhase {
+    Unknown,
+    HeaderPhi,
+    BackedgeUpdate
+};
+
 struct LoopTripCountInfo {
     const Loop *L = nullptr;
 
@@ -98,6 +104,7 @@ struct LoopTripCountInfo {
 
     BinaryInst *ExitCmp = nullptr;
     bool ContinueOnTrue = true;
+    LoopExitComparePhase ComparePhase = LoopExitComparePhase::Unknown;
 
     PhiInst *IndVar = nullptr;
 
@@ -166,6 +173,16 @@ public:
     std::optional<LoopRemainderInfo> getRemainderInfo(const Loop *L,
                                                       int64_t Factor);
     std::optional<InductionDescriptor> getCanonicalInduction(const Loop *L);
+    // Prove that every execution leaves L after finitely many iterations.
+    // Besides an explicit no-wrap trip-count proof, accept strict signed
+    // unit-step forms whose compared recurrence value reaches the bound
+    // before overflow.  This also covers a uniform continue-merge latch PHI.
+    bool isKnownFiniteLoop(const Loop *L);
+    // True for the canonical header value and exact backedge update when the
+    // loop's finite-iteration proof also proves that recurrence cannot wrap
+    // before the modeled exit.  Consumers use this instead of inferring
+    // no-wrap from a syntactically positive ADD.
+    bool isKnownNoWrapInductionValue(const Loop *L, Value *V);
     // Contextual proof for a symbolic, header-tested unit-stride loop.  The
     // mathematical SCEV count is usable only when both the recurrence and the
     // eagerly expanded distance are proved not to wrap on every path reaching
@@ -236,6 +253,9 @@ private:
     const SCEVExpr *tryHeaderPhi(PhiInst *Phi, const Loop *L);
     std::optional<UpdateDelta> findAdditiveDelta(PhiInst *Self, Value *V,
                                                  const Loop *L);
+    std::optional<UpdateDelta> findAdditiveDeltaImpl(
+        PhiInst *Self, Value *V, const Loop *L,
+        std::unordered_set<Value *> &Active, unsigned Depth);
     const SCEVExpr *trySimpleMulDivRec(PhiInst *Self, Value *Update,
                                        Value *Start, const Loop *L);
 
@@ -251,6 +271,12 @@ private:
     const SCEVExpr *tripFromComparison(const Loop *L, BinaryInst *Cmp,
                                        bool ContinueOnTrue);
     bool fillTripCountFromComparison(LoopTripCountInfo &Info);
+    bool hasStrictUnitStepExit(
+        const InductionDescriptor &Induction,
+        const LoopTripCountInfo &Trip) const;
+    bool isBackedgeUpdateStartSafe(
+        const Loop *L, const InductionDescriptor &Induction,
+        const LoopTripCountInfo &Trip);
     PhiInst *findPhiForAddRec(const Loop *L, const SCEVExpr *AddRec);
     PhiInst *findPhiForAffineRec(const Loop *L, const SCEVAffineInfo &Affine);
 };
@@ -262,5 +288,5 @@ public:
 
 private:
     friend AnalysisDescriptor<SCEVAnalysis>;
-    static PassID Key;
+    inline static PassID Key;
 };

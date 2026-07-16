@@ -41,6 +41,46 @@ bool LICMPass::hasSafeExecutionPrefix(const Instruction *Candidate) {
 	return false;
 }
 
+bool LICMPass::hasPreheaderDereferenceProof(
+	LoadInst *Load, const Loop &L, BasicAAResult &AA,
+	const LoopInfo &LI) {
+	if (!Load) return false;
+	BasicBlock *PreHeader = nullptr;
+	BasicBlock *Latch = nullptr;
+	if (!L.getLoopSimplifyForm(PreHeader, Latch) || !PreHeader || !Latch)
+		return false;
+
+	const MemoryLocation Candidate = MemoryLocation::get(Load);
+	bool Proven = false;
+	for (Instruction *I : *PreHeader) {
+		if (!I) return false;
+		if (dynamic_cast<BrInst *>(I) || dynamic_cast<RetInst *>(I)) break;
+		if (dynamic_cast<CallInst *>(I)) {
+			// An unknown call may invalidate a parameter-backed object.  A
+			// matching access after the call can establish the proof again.
+			Proven = false;
+			continue;
+		}
+
+		MemoryLocation Existing;
+		if (auto *ExistingLoad = dynamic_cast<LoadInst *>(I))
+			Existing = MemoryLocation::get(ExistingLoad);
+		else if (auto *ExistingStore = dynamic_cast<StoreInst *>(I))
+			Existing = MemoryLocation::get(ExistingStore);
+		else
+			continue;
+
+		// Reaching the same address proves only the number of bytes touched by
+		// the earlier access.  Do not use a narrower byte/element access to
+		// speculate a wider load.
+		if (Candidate.Size && Existing.Size &&
+			*Existing.Size >= *Candidate.Size &&
+			AA.alias(Candidate, Existing, LI) == AliasInfo::MustAlias)
+			Proven = true;
+	}
+	return Proven;
+}
+
 // 无 must-execute 证明时，只允许提前执行明确不会除零的
 // div/rem。signed div/rem 的 INT_MIN, -1 在不同 IR/目标
 // 语义下可能产生 poison 或 trap，因此保守拒绝 -1。
@@ -399,11 +439,14 @@ bool LICMPass::isSafeToMove(
 		// 推测执行的指令。Sink 会消除原本可能发生的 fault；
 		// Hoist 则只在指令已证明 must-execute 时允许。
 		if (ForSink) return false;
-		if (!AggressiveHoist || !hasSafeExecutionPrefix(I)) return false;
-		if (I->getParent() != L.getHeader()) return false;
-
+		const bool HeaderMustExecute =
+			AggressiveHoist && I->getParent() == L.getHeader() &&
+			hasSafeExecutionPrefix(I);
+		const bool PreheaderAlreadyDereferenced =
+			hasPreheaderDereferenceProof(LIst, L, AA, LI);
 		Value *Ptr = LIst->getPointerOperand();
 		if (!Ptr) return false;
+		if (!HeaderMustExecute && !PreheaderAlreadyDereferenced) return false;
 
 		// A unique reaching memory state outside the loop proves that every
 		// dynamic execution of this load (including executions reached through
@@ -425,21 +468,19 @@ bool LICMPass::isSafeToMove(
 		}
 		if (MSSAProvesNoLoopClobber) return true;
 
-			bool UseIndexRange = LIst->getIRType() &&
-				LIst->getIRType()->getEnum() != IR_FLOAT;
 			MemoryLocation LoadLocation = MemoryLocation::get(LIst);
 			for (Instruction *J : LoopInsts) {
 				if (!J || J == I) continue;
-				if (UseIndexRange) {
-					if (auto *SI = dynamic_cast<StoreInst *>(J)) {
-						Value *StorePtr = SI->getPointerOperand();
-						if (!StorePtr) return false;
-						if (AA.aliasWithIndexRange(
-								LoadLocation, MemoryLocation::get(SI), LI) ==
-							AliasInfo::NoAlias)
-							continue;
-						return false;
-					}
+				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
+					Value *StorePtr = SI->getPointerOperand();
+					if (!StorePtr) return false;
+					// MemoryLocation carries the actual byte width, so the same
+					// index-distance proof is valid for integer and float loads.
+					AliasInfo Alias = AA.aliasWithIndexRange(
+						LoadLocation, MemoryLocation::get(SI), LI);
+					if (Alias == AliasInfo::NoAlias)
+						continue;
+					return false;
 				}
 				ModRefInfo MRI = getInstModRefInfo(
 					LoadLocation, J, AA, LI, FAM);

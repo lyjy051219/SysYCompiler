@@ -27,6 +27,9 @@ public:
 
 private:
     static bool hasSafeExecutionPrefix(const Instruction *Candidate);
+    static bool hasPreheaderDereferenceProof(
+        LoadInst *Load, const Loop &L, BasicAAResult &AA,
+        const LoopInfo &LI);
     static bool isSpeculatableDivisionOrRemainder(Instruction *I);
     static bool isNonFaultingStoreObject(Value *Pointer, Value *StoredValue);
     static bool isReusableLoopInvariantCall(
