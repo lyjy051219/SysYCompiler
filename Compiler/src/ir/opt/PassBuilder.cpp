@@ -9,6 +9,7 @@
 #include "ir/opt/SCCP.hpp"
 #include "ir/opt/InstSimplify.hpp"
 #include "ir/opt/FuncInline.hpp"
+#include "ir/opt/FunctionMemoization.hpp"
 #include "ir/opt/LoopSimplify.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "ir/opt/LoopRotate.hpp"
@@ -509,6 +510,9 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 
     // 循环 DCE/CFG 清理后做最终函数图收敛，避免 late/backend 继续处理死函数体。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
+
+    // 在主体标量与循环优化完成后，为严格纯净的重叠递归插入有界精确键缓存。
+    MPM.addPass(FunctionMemoizationPass(FAM));
 
     // O2 及以上可以跑更多激进的后端准备优化，目前 O1 和 O2 复用流水线
     if (Level == OptimizationLevel::O2) {
