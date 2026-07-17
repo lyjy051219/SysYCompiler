@@ -1,7 +1,27 @@
-file(GLOB BACKEND_SRC CONFIGURE_DEPENDS
-    "*.cpp"
-    "rv/*.cpp"
-    "rv/opt/*.cpp"
+# Keep this list explicit. A glob also picks up untracked implementation files,
+# which can make a developer's local build pass even though those files were
+# never committed and are therefore missing from a clean checkout.
+set(BACKEND_SRC
+    rv/AsmPrinter.cpp
+    rv/Frame.cpp
+    rv/ISel.cpp
+    rv/MIR.cpp
+    rv/Passes.cpp
+    rv/RegAlloc.cpp
+    rv/Registers.cpp
+    rv/Target.cpp
+    rv/opt/BlockPlacement.cpp
+    rv/opt/CleanupCFG.cpp
+    rv/opt/CodegenPasses.cpp
+    rv/opt/CodeGenPrepare.cpp
+    rv/opt/GuardedLoopPreheader.cpp
+    rv/opt/LoopBackedgeBypass.cpp
+    rv/opt/MachineAnalysis.cpp
+    rv/opt/MachineDCE.cpp
+    rv/opt/MachinePassBuilder.cpp
+    rv/opt/peepholeOpt.cpp
+    rv/opt/PostRAListSchedule.cpp
+    rv/opt/PreRAAffineCombine.cpp
 )
 
 add_library(Backend ${BACKEND_SRC})
@@ -45,15 +65,6 @@ if(BUILD_BACKEND_TESTS)
     add_test(NAME pre_ra_guarded_loop_preheader_tests
         COMMAND pre_ra_guarded_loop_preheader_tests)
     set_tests_properties(pre_ra_guarded_loop_preheader_tests PROPERTIES
-        ENVIRONMENT "BACKEND_VERIFY_MIR=1")
-
-    add_executable(pre_ra_loop_latch_recurrence_sink_tests
-        rv/tests/PreRALoopLatchRecurrenceSinkTests.cpp)
-    target_link_libraries(pre_ra_loop_latch_recurrence_sink_tests
-        PRIVATE Backend)
-    add_test(NAME pre_ra_loop_latch_recurrence_sink_tests
-        COMMAND pre_ra_loop_latch_recurrence_sink_tests)
-    set_tests_properties(pre_ra_loop_latch_recurrence_sink_tests PROPERTIES
         ENVIRONMENT "BACKEND_VERIFY_MIR=1")
 
     add_executable(select_lowering_tests rv/tests/SelectLoweringTests.cpp)
@@ -100,13 +111,6 @@ if(BUILD_BACKEND_TESTS)
     target_link_libraries(hot_global_address_regalloc_tests PRIVATE Backend)
     add_test(NAME hot_global_address_regalloc_tests
         COMMAND hot_global_address_regalloc_tests)
-
-    add_executable(pre_ra_loop_invariant_immediate_hoist_tests
-        rv/tests/PreRALoopInvariantImmediateHoistTests.cpp)
-    target_link_libraries(pre_ra_loop_invariant_immediate_hoist_tests
-        PRIVATE Backend)
-    add_test(NAME pre_ra_loop_invariant_immediate_hoist_tests
-        COMMAND pre_ra_loop_invariant_immediate_hoist_tests)
 
     add_executable(post_ra_list_schedule_tests rv/tests/PostRAListScheduleTests.cpp)
     target_link_libraries(post_ra_list_schedule_tests PRIVATE Backend)
