@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <set>
@@ -596,6 +597,292 @@ void addPlanUses(const SynthesisPlan &plan, UseCountTable &counts) {
   }
 }
 
+struct SignedPow2DivisionGroup {
+  std::size_t begin = 0;
+  unsigned shift = 0;
+  MachineReg dividend;
+  MachineReg sign;
+  MachineReg bias;
+  MachineReg adjusted;
+  MachineReg quotient;
+};
+
+std::optional<SignedPow2DivisionGroup>
+matchSignedPow2DivisionGroup(const MachineBasicBlock &block,
+                            std::size_t begin,
+                            const DefinitionTable &definitions,
+                            const UseCountTable &uses) {
+  if (begin + 4 > block.instrs.size()) {
+    return std::nullopt;
+  }
+
+  const MachineInstr &sign = block.instrs[begin];
+  const MachineInstr &bias = block.instrs[begin + 1];
+  const MachineInstr &adjusted = block.instrs[begin + 2];
+  const MachineInstr &quotient = block.instrs[begin + 3];
+  if (sign.opcode != Opcode::SRAIW || bias.opcode != Opcode::SRLIW ||
+      adjusted.opcode != Opcode::ADDW || quotient.opcode != Opcode::SRAIW ||
+      !hasPureGpr32Def(sign) || !hasPureGpr32Def(bias) ||
+      !hasPureGpr32Def(adjusted) || !hasPureGpr32Def(quotient) ||
+      sign.uses.size() != 2 || bias.uses.size() != 2 ||
+      adjusted.uses.size() != 2 || quotient.uses.size() != 2 ||
+      !isRegOperand(sign, 0) || !isImmOperand(sign, 1) ||
+      !isRegOperand(bias, 0) || !isImmOperand(bias, 1) ||
+      !isRegOperand(adjusted, 0) || !isRegOperand(adjusted, 1) ||
+      !isRegOperand(quotient, 0) || !isImmOperand(quotient, 1) ||
+      sign.uses[0].regValue.rc != RegClass::GPR32 ||
+      sign.uses[1].immValue != 31) {
+    return std::nullopt;
+  }
+
+  const int64_t shift = quotient.uses[1].immValue;
+  if (shift <= 0 || shift >= 32 ||
+      bias.uses[1].immValue != 32 - shift) {
+    return std::nullopt;
+  }
+
+  SignedPow2DivisionGroup group;
+  group.begin = begin;
+  group.shift = static_cast<unsigned>(shift);
+  group.dividend = sign.uses[0].regValue;
+  group.sign = sign.defs.front().regValue;
+  group.bias = bias.defs.front().regValue;
+  group.adjusted = adjusted.defs.front().regValue;
+  group.quotient = quotient.defs.front().regValue;
+
+  if (!sameRegister(bias.uses[0].regValue, group.sign) ||
+      !sameRegister(adjusted.uses[0].regValue, group.dividend) ||
+      !sameRegister(adjusted.uses[1].regValue, group.bias) ||
+      !sameRegister(quotient.uses[0].regValue, group.adjusted)) {
+    return std::nullopt;
+  }
+
+  auto hasUniqueDefinition = [&](const MachineReg &reg) {
+    const auto found = definitions.find(reg.id);
+    return !reg.physical && found != definitions.end() &&
+           found->second.count == 1;
+  };
+  auto hasUseCount = [&](const MachineReg &reg, std::size_t count) {
+    const auto found = uses.find(reg.id);
+    return found != uses.end() && found->second == count;
+  };
+  if (!hasUniqueDefinition(group.sign) ||
+      !hasUniqueDefinition(group.bias) ||
+      !hasUniqueDefinition(group.adjusted) ||
+      !hasUniqueDefinition(group.quotient) ||
+      !hasUseCount(group.sign, 1) || !hasUseCount(group.bias, 1) ||
+      !hasUseCount(group.adjusted, 1)) {
+    return std::nullopt;
+  }
+  return group;
+}
+
+bool foldChainedSignedPow2Divisions(MachineFunction &mf) {
+  if (std::getenv("BACKEND_DISABLE_CHAINED_SIGNED_DIV_FOLD") != nullptr) {
+    return false;
+  }
+
+  bool changed = false;
+  for (;;) {
+    const DefinitionTable definitions = collectDefinitions(mf);
+    const UseCountTable uses = collectUseCounts(mf);
+    bool foldedOne = false;
+
+    for (MachineBasicBlock &block : mf.blocks) {
+      for (std::size_t begin = 0; begin < block.instrs.size(); ++begin) {
+        auto first = matchSignedPow2DivisionGroup(block, begin, definitions,
+                                                  uses);
+        if (!first) {
+          continue;
+        }
+
+        std::vector<SignedPow2DivisionGroup> chain{*first};
+        unsigned totalShift = first->shift;
+        for (std::size_t nextBegin = begin + 4;; nextBegin += 4) {
+          auto next = matchSignedPow2DivisionGroup(block, nextBegin,
+                                                   definitions, uses);
+          if (!next || !sameRegister(next->dividend,
+                                     chain.back().quotient) ||
+              totalShift + next->shift > 31) {
+            break;
+          }
+
+          const auto quotientUses = uses.find(chain.back().quotient.id);
+          if (quotientUses == uses.end() || quotientUses->second != 2) {
+            break;
+          }
+          totalShift += next->shift;
+          chain.push_back(*next);
+        }
+
+        if (chain.size() < 2) {
+          continue;
+        }
+
+        // Integer division truncating toward zero is transitive for positive
+        // divisors: trunc(trunc(x / 2^a) / 2^b) equals
+        // trunc(x / 2^(a+b)).  The canonical four-instruction sequence is
+        // therefore reusable with the summed shift.  Keeping the total below
+        // 32 also keeps every RISC-V word shift immediate well-defined.
+        MachineInstr &firstBias = block.instrs[begin + 1];
+        MachineInstr &firstQuotient = block.instrs[begin + 3];
+        firstBias.uses[1] = MachineOperand::imm(32 - totalShift);
+        firstQuotient.defs[0] =
+            MachineOperand::reg(chain.back().quotient);
+        firstQuotient.uses[1] = MachineOperand::imm(totalShift);
+        if (!block.instrs[chain.back().begin + 3].comment.empty()) {
+          firstQuotient.comment =
+              block.instrs[chain.back().begin + 3].comment;
+        }
+        block.instrs.erase(
+            block.instrs.begin() + static_cast<std::ptrdiff_t>(begin + 4),
+            block.instrs.begin() + static_cast<std::ptrdiff_t>(begin +
+                                                               4 * chain.size()));
+        changed = true;
+        foldedOne = true;
+        break;
+      }
+      if (foldedOne) {
+        break;
+      }
+    }
+
+    if (!foldedOne) {
+      return changed;
+    }
+  }
+}
+
+bool foldSignedDivisionByTwoBias(MachineFunction &mf) {
+  const DefinitionTable definitions = collectDefinitions(mf);
+  const UseCountTable uses = collectUseCounts(mf);
+  bool changed = false;
+
+  for (MachineBasicBlock &block : mf.blocks) {
+    for (std::size_t index = 0; index + 1 < block.instrs.size();) {
+      const MachineInstr &sign = block.instrs[index];
+      const MachineInstr &mask = block.instrs[index + 1];
+      if (sign.opcode != Opcode::SRAIW || mask.opcode != Opcode::ANDI ||
+          !hasPureGpr32Def(sign) || !hasPureGpr32Def(mask) ||
+          sign.uses.size() != 2 || mask.uses.size() != 2 ||
+          !isRegOperand(sign, 0) || !isImmOperand(sign, 1) ||
+          !isRegOperand(mask, 0) || !isImmOperand(mask, 1) ||
+          sign.uses[0].regValue.rc != RegClass::GPR32 ||
+          sign.uses[1].immValue != 31 || mask.uses[1].immValue != 1) {
+        ++index;
+        continue;
+      }
+
+      const MachineReg signReg = sign.defs.front().regValue;
+      if (!sameRegister(mask.uses[0].regValue, signReg)) {
+        ++index;
+        continue;
+      }
+
+      const auto definition = definitions.find(signReg.id);
+      const auto use = uses.find(signReg.id);
+      const MachineReg resultReg = mask.defs.front().regValue;
+      const auto resultDefinition = definitions.find(resultReg.id);
+      if (definition == definitions.end() || definition->second.count != 1 ||
+          use == uses.end() || use->second != 1 ||
+          resultDefinition == definitions.end() ||
+          resultDefinition->second.count != 1) {
+        ++index;
+        continue;
+      }
+
+      // For i32 division by two, `(x >>s 31) & 1` is exactly the sign bit.
+      // Reading it directly with SRLIW removes the intermediate all-zero/all-one
+      // sign value.  Do not generalize this to masks wider than one bit: for a
+      // positive x such as 0x40000003, `x >>u 30` is non-zero while the signed
+      // bias must remain zero.
+      MachineInstr folded = mask;
+      folded.opcode = Opcode::SRLIW;
+      folded.uses[0] = sign.uses[0];
+      folded.uses[1] = sign.uses[1];
+      if (folded.comment.empty()) {
+        folded.comment = sign.comment;
+      }
+      block.instrs[index] = std::move(folded);
+      block.instrs.erase(block.instrs.begin() +
+                         static_cast<std::ptrdiff_t>(index + 1));
+      changed = true;
+      ++index;
+    }
+  }
+
+  return changed;
+}
+
+bool foldNarrowSignedDivisionBias(MachineFunction &mf) {
+  if (std::getenv("BACKEND_DISABLE_NARROW_SIGNED_DIV_BIAS_FOLD") != nullptr) {
+    return false;
+  }
+  const DefinitionTable definitions = collectDefinitions(mf);
+  bool changed = false;
+
+  auto uniqueDefinition = [&](const MachineReg &reg)
+      -> const MachineInstr * {
+    if (reg.physical) {
+      return nullptr;
+    }
+    const auto found = definitions.find(reg.id);
+    if (found == definitions.end() || found->second.count != 1) {
+      return nullptr;
+    }
+    return &mf.blocks[found->second.blockIndex]
+                .instrs[found->second.instrIndex];
+  };
+
+  for (MachineBasicBlock &block : mf.blocks) {
+    for (MachineInstr &bias : block.instrs) {
+      if (bias.opcode != Opcode::SRLIW || !hasPureGpr32Def(bias) ||
+          bias.uses.size() != 2 || !isRegOperand(bias, 0) ||
+          !isImmOperand(bias, 1)) {
+        continue;
+      }
+
+      const int64_t biasShift = bias.uses[1].immValue;
+      if (biasShift <= 0 || biasShift >= 32) {
+        continue;
+      }
+      const int64_t correctionBits = 32 - biasShift;
+
+      const MachineInstr *sign = uniqueDefinition(bias.uses[0].regValue);
+      if (sign == nullptr || sign->opcode != Opcode::SRAIW ||
+          !hasPureGpr32Def(*sign) || sign->uses.size() != 2 ||
+          !isRegOperand(*sign, 0) || !isImmOperand(*sign, 1) ||
+          sign->uses[1].immValue != 31) {
+        continue;
+      }
+
+      const MachineReg narrowed = sign->uses[0].regValue;
+      const MachineInstr *narrowing = uniqueDefinition(narrowed);
+      if (narrowing == nullptr || narrowing->opcode != Opcode::SRAIW ||
+          !hasPureGpr32Def(*narrowing) || narrowing->uses.size() != 2 ||
+          !isRegOperand(*narrowing, 0) || !isImmOperand(*narrowing, 1) ||
+          narrowing->uses[1].immValue < correctionBits ||
+          narrowing->uses[1].immValue >= 32) {
+        continue;
+      }
+
+      // Let q be the result of SRAIW by at least k bits.  A non-negative q
+      // cannot have any of its top k word bits set, while a negative q has all
+      // of them set.  Therefore, for correctionBits=k,
+      //
+      //   ((q sraiw 31) srliw (32-k)) == (q srliw (32-k)).
+      //
+      // This is the signed power-of-two division bias used by instruction
+      // selection.  The range proof is essential: without the preceding word
+      // shift, a large positive value could have non-zero top bits.
+      bias.uses[0] = MachineOperand::reg(narrowed);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 MachinePreservationStatus preserveBlockStructureAnalyses() {
   auto status = MachinePreservationStatus::none();
   status.keep<MachineCFGAnalysis>();
@@ -607,9 +894,11 @@ MachinePreservationStatus preserveBlockStructureAnalyses() {
 } // namespace
 
 bool runPreRAAffineCombine(MachineFunction &mf) {
+  bool changed = foldChainedSignedPow2Divisions(mf);
+  changed = foldSignedDivisionByTwoBias(mf) || changed;
+  changed = foldNarrowSignedDivisionBias(mf) || changed;
   const DefinitionTable definitions = collectDefinitions(mf);
   UseCountTable useCounts = collectUseCounts(mf);
-  bool changed = false;
 
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {

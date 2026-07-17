@@ -32,8 +32,8 @@ enum class Opcode {
   XORI, SLL, SLLW, SRAW, SRLW, SLLI, SLLIW, SRAI, SRAIW, SRLIW, SLT, SLTU,
   SEQZ, SNEZ, FEQ_S, FLT_S, FLE_S, FADD_S, FSUB_S, FMUL_S,
   FDIV_S, FCVT_W_S, FCVT_S_W, LBU, SB, LW, SW, LD, SD, FLW, FSW, GEP,
-  MEMCPY_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J, PHI, SELECT,
-  PARALLEL_COPY
+  MEMCPY_INLINE, MEMSET_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J,
+  PHI, SELECT, PARALLEL_COPY
 };
 
 enum class OperandKind { Reg, Imm, FrameIndex, Global, Block, ValueRef };
@@ -63,6 +63,14 @@ struct MachineInstr {
   std::vector<PhysReg> implicitUses;
   bool sideEffects = false;
   bool terminator = false;
+  // Set on COPYs emitted while lowering PHI incoming values.  Register
+  // allocation uses this provenance to distinguish loop-carried transfers
+  // from ordinary copies and from mutually exclusive diamond edges.
+  bool phiCopy = false;
+  // Some COPY instructions are ordering barriers rather than ordinary value
+  // transfers.  In particular, the temporary and rotations used to serialize
+  // a cyclic PHI bundle must not be undone by register coalescing.
+  bool copyCoalescingBarrier = false;
   std::string comment;
 };
 

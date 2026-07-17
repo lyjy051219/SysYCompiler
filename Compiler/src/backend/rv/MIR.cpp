@@ -127,6 +127,8 @@ const char *opcodeName(Opcode opcode) {
     return "GEP";
   case Opcode::MEMCPY_INLINE:
     return "MEMCPY_INLINE";
+  case Opcode::MEMSET_INLINE:
+    return "MEMSET_INLINE";
   case Opcode::CALL:
     return "CALL";
   case Opcode::RET:

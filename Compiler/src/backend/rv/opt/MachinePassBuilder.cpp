@@ -143,6 +143,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   // 例如拷贝合并，机器层公共子表达式删除，块布局调整。
   addOptionalPass(MPM, Options, "branch-compare-folding",
                   BranchCompareFoldingPass());
+  addOptionalPass(MPM, Options, "pre-ra-loop-invariant-immediate-hoist",
+                  PreRALoopInvariantImmediateHoistPass());
   addOptionalPass(MPM, Options, "pre-ra-global-address-reuse",
                   PreRAGlobalAddressReusePass());
 
@@ -174,6 +176,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   }
   addOptionalPass(MPM, Options, "pre-ra-guarded-loop-preheader",
                   PreRAGuardedLoopPreheaderPass());
+  addOptionalPass(MPM, Options, "pre-ra-loop-latch-recurrence-sink",
+                  PreRALoopLatchRecurrenceSinkPass());
   return MPM;
 }
 

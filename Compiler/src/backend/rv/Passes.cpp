@@ -537,6 +537,7 @@ MachineInstr makeCopy(MachineReg dst, MachineReg src) {
   copy.opcode = dst.rc == RegClass::FPR32 ? Opcode::F_COPY : Opcode::COPY;
   copy.defs.push_back(MachineOperand::reg(dst));
   copy.uses.push_back(MachineOperand::reg(src));
+  copy.phiCopy = true;
   return copy;
 }
 
@@ -607,6 +608,8 @@ std::vector<MachineInstr> buildPhiCopies(MachineFunction &mf,
                      }),
       pendingCopies.end());
 
+  const std::size_t serializedCopyBegin = copies.size();
+  bool hasCycle = false;
   while (!pendingCopies.empty()) {
     auto Ready = pendingCopies.end();
     for (auto It = pendingCopies.begin(); It != pendingCopies.end(); ++It) {
@@ -629,12 +632,26 @@ std::vector<MachineInstr> buildPhiCopies(MachineFunction &mf,
 
     // A remaining cycle needs one saved old value. Replacing every use of the
     // chosen source breaks the cycle without penalizing acyclic copy chains.
+    hasCycle = true;
     const MachineReg CycleSource = pendingCopies.front().src;
     MachineReg Temp = mf.createVReg(CycleSource.rc);
     copies.push_back(makeCopy(Temp, CycleSource));
     for (CopyPair &Copy : pendingCopies) {
       if (SameReg(Copy.src, CycleSource))
         Copy.src = Temp;
+    }
+  }
+
+  if (hasCycle) {
+    // Keep the whole serialized bundle intact.  Marking only the temporary
+    // save is insufficient: coalescing one of the rotations can recreate the
+    // parallel-copy cycle that the temporary was introduced to break.
+    for (std::size_t index = serializedCopyBegin; index < copies.size();
+         ++index) {
+      if (copies[index].opcode == Opcode::COPY ||
+          copies[index].opcode == Opcode::F_COPY) {
+        copies[index].copyCoalescingBarrier = true;
+      }
     }
   }
   return copies;

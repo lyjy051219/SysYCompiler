@@ -31,9 +31,10 @@
 评分规则：
 
   1. 我方和 baseline 在所有预热、计时轮次都 AC，case 才计分。
-  2. baseline 默认是我方前中端 IR 交给 clang-18 -O3 -ffp-contract=off
-     生成的 RISC-V 程序；llc-ir 跳过 clang 的 IR 优化，只运行 LLVM codegen，
-     并使用 static relocation 匹配我方后端。两种 baseline 的分数不可直接相减。
+  2. baseline 默认把我方前中端 IR 与性能 runtime IR 经 llvm-link 合并，再交给
+     clang-18 -O3 -ffp-contract=off 生成 RISC-V 程序；llc-ir 跳过 clang 的
+     IR 优化，只运行 LLVM codegen，并使用 static relocation 匹配我方后端。
+     两种 baseline 的分数不可直接相减。
   3. 默认每个可执行文件预热 5 轮，再计时 5 轮。
   4. 单项分 = baseline_平均时间 / 我方平均时间 * 100，默认不封顶。
   5. 总分 = 所有单项分的几何平均。
@@ -92,7 +93,11 @@ LLVM_RISCV_CPU = "generic-rv64"
 LLVM_RISCV_FEATURES = "+m,+a,+f,+d,+c,+zicsr,+zifencei,+relax"
 LLVM_RISCV_ABI = "lp64d"
 DEFAULT_LLC_RELOCATION_MODEL = "static"
-LLVM_RUNTIME_DECLARATIONS = """\
+
+# Only used when reading IR produced by the pre-29450d7 middle-end, which
+# embedded runtime/runtime.ll before the application module.  Current IR
+# already carries its own external declarations and never uses this fallback.
+LEGACY_RUNTIME_DECLARATIONS = """\
 declare i32 @getint()
 declare i32 @getch()
 declare float @getfloat()
@@ -106,9 +111,58 @@ declare void @putfarray(i32, float*)
 declare void @putf(i8*, ...)
 declare void @_sysy_starttime(i32)
 declare void @_sysy_stoptime(i32)
-declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg)
+declare void @llvm.memcpy.p0.p0.i32(ptr, ptr, i32, i1)
+declare void @llvm.memmove.p0.p0.i32(ptr, ptr, i32, i1)
+declare void @llvm.memset.p0.i32(ptr, i8, i32, i1)
 
 """
+RUNTIME_API_SYMBOLS = (
+    "getint",
+    "getch",
+    "getfloat",
+    "getarray",
+    "getfarray",
+    "putint",
+    "putch",
+    "putfloat",
+    "putarray",
+    "putfarray",
+    "putf",
+    "_sysy_starttime",
+    "_sysy_stoptime",
+)
+RUNTIME_DEFINITION_RE = re.compile(
+    r"(?m)^[ \t]*define\b[^\n@]*@(?:" +
+    "|".join(re.escape(symbol) for symbol in RUNTIME_API_SYMBOLS) +
+    r")\s*\("
+)
+IR_FUNCTION_NAME_RE = re.compile(r"@([-A-Za-z$._0-9]+)\s*\(")
+
+ASSEMBLY_STAT_KEYS = (
+    "instructions",
+    "moves",
+    "loads",
+    "stores",
+    "branches_jumps",
+    "multiplies",
+    "divides_remainders",
+)
+ASSEMBLY_LOAD_OPS = {
+    "lb", "lbu", "lh", "lhu", "lw", "lwu", "ld", "flw", "fld",
+    "lr.w", "lr.d",
+}
+ASSEMBLY_STORE_OPS = {
+    "sb", "sh", "sw", "sd", "fsw", "fsd", "sc.w", "sc.d",
+}
+ASSEMBLY_CONTROL_OPS = {
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "beqz", "bnez",
+    "ble", "bgt", "bleu", "bgtu", "blez", "bgez", "bltz", "bgtz",
+    "j", "jal", "jalr", "jr", "ret", "call", "tail",
+}
+ASSEMBLY_MULTIPLY_OPS = {"mul", "mulh", "mulhsu", "mulhu", "mulw"}
+ASSEMBLY_DIVIDE_REMAINDER_OPS = {
+    "div", "divu", "divw", "divuw", "rem", "remu", "remw", "remuw",
+}
 
 
 @dataclass
@@ -169,6 +223,8 @@ def parse_args() -> argparse.Namespace:
                         help="baseline executable source; default: clang-ir")
     parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-18"),
                         help="clang used for the clang-ir baseline")
+    parser.add_argument("--llvm-link", default=os.environ.get("LLVM_LINK", "llvm-link-18"),
+                        help="llvm-link used to combine application and runtime IR")
     parser.add_argument("--clang-opt-level", choices=["O0", "O1", "O2", "O3"],
                         default="O3", help="clang optimization level for clang-ir baseline")
     parser.add_argument("--clang-extra", action="append", default=[],
@@ -198,6 +254,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-stat", choices=["mean", "median", "trimmed-mean"],
                         default="mean",
                         help="per-case runtime statistic; official default: mean")
+    parser.add_argument(
+        "--cpu-affinity",
+        default=os.environ.get("PERF_CPU_AFFINITY"),
+        metavar="CPU-LIST",
+        help="pin each qemu timing run with taskset (for example: 0 or 2-3)",
+    )
     parser.add_argument("--clock-jump-retries", type=int, default=5,
                         help="rerun an attempt when SysY wall-clock TOTAL is impossible")
     parser.add_argument("--no-clock-jump-filter", action="store_true",
@@ -253,6 +315,22 @@ def probe_llc(args: argparse.Namespace) -> None:
     args.llc_version = version_lines[0] if version_lines else "unknown"
 
 
+def probe_llvm_link(args: argparse.Namespace) -> None:
+    resolved = shutil.which(args.llvm_link)
+    if resolved is None:
+        fail(f"llvm-link executable not found: {args.llvm_link}")
+    try:
+        ret = run_command([resolved, "--version"], timeout=10)
+    except subprocess.TimeoutExpired:
+        fail(f"timed out while querying llvm-link version: {resolved}")
+    if ret.returncode != 0:
+        fail(f"cannot query llvm-link version: {args.llvm_link}")
+    version_text = (ret.stdout + ret.stderr).decode("utf-8", errors="replace")
+    version_lines = [line.strip() for line in version_text.splitlines() if line.strip()]
+    args.llvm_link_resolved = str(Path(resolved).resolve())
+    args.llvm_link_version = version_lines[0] if version_lines else "unknown"
+
+
 def run_setup_command(args, stage: str, timeout: int) -> None:
     ret = subprocess.run(
         args,
@@ -293,6 +371,7 @@ RISCV_AS = RISCV_PREFIX + "as"
 QEMU = shutil.which("qemu-riscv64")
 if not QEMU:
     fail("qemu-riscv64 not found")
+TASKSET = shutil.which("taskset")
 
 
 def build_cmake_target(build_dir: Path, target: str, configure_options: list,
@@ -371,6 +450,16 @@ def disabled_backend_passes(args: argparse.Namespace) -> list:
     disabled = []
     for item in args.disable_backend_pass:
         disabled.extend(part.strip() for part in item.split(",") if part.strip())
+    return disabled
+
+
+def effective_disabled_backend_passes(args: argparse.Namespace) -> list:
+    disabled = [
+        item.strip()
+        for item in os.environ.get("BACKEND_DISABLE_PASSES", "").split(",")
+        if item.strip()
+    ]
+    disabled.extend(disabled_backend_passes(args))
     return disabled
 
 
@@ -570,26 +659,88 @@ def compile_gcc_o3(case: Path, case_dir: Path, header: Path, args: argparse.Name
     return exe_file
 
 
-def sanitize_ir_for_llvm_riscv(input_file: Path, output_file: Path,
-                               runtime_prefix: str) -> None:
-    text = input_file.read_text(encoding="utf-8")
-    official_runtime = OFFICIAL_RUNTIME_LL.read_text(encoding="utf-8")
-    if not text.startswith(official_runtime):
+def append_missing_legacy_runtime_declarations(text: str) -> str:
+    missing = []
+    for declaration in LEGACY_RUNTIME_DECLARATIONS.splitlines():
+        if not declaration:
+            continue
+        match = IR_FUNCTION_NAME_RE.search(declaration)
+        if match is None:
+            raise RuntimeError(f"invalid legacy runtime declaration: {declaration}")
+        symbol = re.escape(match.group(1))
+        if re.search(
+            rf"(?m)^[ \t]*(?:declare|define)\b[^\n@]*@{symbol}[ \t]*\(",
+            text,
+        ):
+            continue
+        missing.append(declaration)
+
+    if not missing:
+        return text
+    return text.rstrip() + "\n\n" + "\n".join(missing) + "\n"
+
+
+def normalize_middle_ir(text: str) -> str:
+    """Return an application module for both current and legacy emitters.
+
+    Current middle-end IR is already a standalone application module with
+    external runtime declarations.  Older builds prepended the exact contents
+    of runtime/runtime.ll; strip only that known prefix and restore declarations
+    needed to parse the remaining application IR.  Refuse unknown embedded
+    runtimes instead of guessing where their module ends.
+    """
+
+    if OFFICIAL_RUNTIME_LL.exists():
+        official_runtime = OFFICIAL_RUNTIME_LL.read_text(encoding="utf-8")
+        if official_runtime and text.startswith(official_runtime):
+            app_ir = text[len(official_runtime):].lstrip("\r\n")
+            return append_missing_legacy_runtime_declarations(app_ir)
+
+    if RUNTIME_DEFINITION_RE.search(text):
         raise RuntimeError(
-            "middle-end IR does not start with the official runtime; "
-            "cannot safely substitute the performance runtime"
+            "middle-end IR embeds an unknown runtime implementation; expected "
+            "external declarations or an exact runtime/runtime.ll prefix"
         )
-    text = runtime_prefix + text[len(official_runtime):]
-    # runtime/runtime.ll is produced on the host and may carry x86 function
-    # target attributes. Keep the IR body intact, but let the selected LLVM
-    # code generator choose the RISC-V CPU/features.
-    text = re.sub(r'\s+"target-(?:cpu|features)"="[^"]*"', "", text)
+    return text
+
+
+def sanitize_ir_for_llvm_riscv(input_file: Path, output_file: Path,
+                               *, normalize_middle_end: bool = False) -> None:
+    text = input_file.read_text(encoding="utf-8")
+    if normalize_middle_end:
+        text = normalize_middle_ir(text)
+    if not text.strip():
+        raise RuntimeError(f"empty LLVM IR module: {input_file}")
+
+    # Runtime IR can be generated on an x86 host.  The command line selects the
+    # RISC-V target, so discard module and function attributes that would pin
+    # LLVM to the host target while preserving every other module entity.
+    text = re.sub(
+        r'(?m)^[ \t]*target[ \t]+(?:datalayout|triple)[ \t]*=.*(?:\r?\n|\Z)',
+        "",
+        text,
+    )
+    text = re.sub(
+        r'[ \t]*"target-(?:cpu|features)"[ \t]*=[ \t]*"[^"]*"',
+        "",
+        text,
+    )
+    # LLVM rejects an attribute group with no attributes.  Keep an empty CPU
+    # marker only when removing host attributes emptied the whole group; an
+    # empty value lets the command-line TargetMachine select the actual CPU.
+    text = re.sub(
+        r'(?m)^([ \t]*attributes[ \t]+#[0-9]+[ \t]*=[ \t]*\{)'
+        r'[ \t]*(\}[ \t]*(?:;[^\r\n]*)?(?:\r?\n|\Z))',
+        r'\1 "target-cpu"="" \2',
+        text,
+    )
+    if not text.strip():
+        raise RuntimeError(f"LLVM IR module is empty after target cleanup: {input_file}")
     output_file.write_text(text, encoding="utf-8")
 
 
 def prepare_llvm_ir_baseline(case: Path, case_dir: Path,
-                             args: argparse.Namespace,
-                             runtime_prefix: str) -> Path:
+                             args: argparse.Namespace) -> Path:
     ir_file = case_dir / "baseline.ll"
     llvm_ir_file = case_dir / "baseline_sanitized.ll"
 
@@ -601,16 +752,43 @@ def prepare_llvm_ir_baseline(case: Path, case_dir: Path,
             ret.stderr.decode("utf-8", errors="replace")[-3000:]
         )
 
-    sanitize_ir_for_llvm_riscv(ir_file, llvm_ir_file, runtime_prefix)
+    sanitize_ir_for_llvm_riscv(
+        ir_file, llvm_ir_file, normalize_middle_end=True
+    )
     return llvm_ir_file
+
+
+def link_performance_runtime(app_ir_file: Path, case_dir: Path,
+                             args: argparse.Namespace) -> Path:
+    runtime_ir_file = case_dir / "performance_runtime_sanitized.ll"
+    linked_ir_file = case_dir / "baseline_linked.ll"
+    sanitize_ir_for_llvm_riscv(RUNTIME_LL, runtime_ir_file)
+
+    # Keep runtime first to stay close to the historical runtime+application
+    # module order used by clang-ir performance reports.
+    ret = run_command(
+        [
+            args.llvm_link_resolved,
+            "-S",
+            str(runtime_ir_file),
+            str(app_ir_file),
+            "-o",
+            str(linked_ir_file),
+        ],
+        timeout=args.compile_timeout,
+    )
+    if ret.returncode != 0:
+        raise RuntimeError(
+            "llvm-link application/runtime IR error\n" +
+            ret.stderr.decode("utf-8", errors="replace")[-3000:]
+        )
+    return linked_ir_file
 
 
 def compile_clang_ir_baseline(case: Path, case_dir: Path,
                               args: argparse.Namespace) -> Path:
-    performance_runtime = RUNTIME_LL.read_text(encoding="utf-8")
-    llvm_ir_file = prepare_llvm_ir_baseline(
-        case, case_dir, args, performance_runtime
-    )
+    app_ir_file = prepare_llvm_ir_baseline(case, case_dir, args)
+    llvm_ir_file = link_performance_runtime(app_ir_file, case_dir, args)
     asm_file = case_dir / "baseline_clang.s"
     obj_file = case_dir / "baseline_clang.o"
     exe_file = case_dir / "baseline_clang.exe"
@@ -669,9 +847,7 @@ def llc_codegen_flags(args: argparse.Namespace) -> list:
 
 def compile_llc_ir_baseline(case: Path, case_dir: Path, runtime_obj: Path,
                             args: argparse.Namespace) -> Path:
-    llvm_ir_file = prepare_llvm_ir_baseline(
-        case, case_dir, args, LLVM_RUNTIME_DECLARATIONS
-    )
+    llvm_ir_file = prepare_llvm_ir_baseline(case, case_dir, args)
     asm_file = case_dir / "baseline_llc.s"
     obj_file = case_dir / "baseline_llc.o"
     exe_file = case_dir / "baseline_llc.exe"
@@ -751,8 +927,11 @@ def expected_output(expected_file: Path) -> str:
 
 def run_and_compare(exe: Path, input_file: Path, expected_text: str,
                     args: argparse.Namespace, label: str, case: Path) -> RunResult:
+    command = [QEMU, str(exe)]
+    if args.cpu_affinity:
+        command = [TASKSET, "-c", args.cpu_affinity, *command]
     try:
-        ret = run_command([QEMU, str(exe)], timeout=args.run_timeout, stdin_path=input_file)
+        ret = run_command(command, timeout=args.run_timeout, stdin_path=input_file)
     except subprocess.TimeoutExpired:
         return RunResult("TLE", float(args.run_timeout), f"{label} qemu timeout after {args.run_timeout}s")
 
@@ -861,6 +1040,133 @@ def format_case(case: Path, max_len=42) -> str:
     return text.ljust(max_len)
 
 
+def file_sha256(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def baseline_assembly_path(case_dir: Path, args: argparse.Namespace) -> Path | None:
+    if args.baseline == "clang-ir":
+        return case_dir / "baseline_clang.s"
+    if args.baseline == "llc-ir":
+        return case_dir / "baseline_llc.s"
+    # The gcc-o3 path currently compiles and links in one driver invocation.
+    return None
+
+
+def assembly_opcode_counts(path: Path | None) -> dict:
+    counts = {key: None for key in ASSEMBLY_STAT_KEYS}
+    if path is None or not path.exists():
+        return counts
+
+    counts = {key: 0 for key in ASSEMBLY_STAT_KEYS}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if ":" in line:
+            possible_label, remainder = line.split(":", 1)
+            if re.fullmatch(r"[-A-Za-z$._0-9]+", possible_label.strip()):
+                line = remainder.strip()
+        if not line or line.startswith("."):
+            continue
+        opcode = line.split(None, 1)[0].lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_.]*", opcode):
+            continue
+
+        counts["instructions"] += 1
+        if opcode == "mv" or opcode.startswith("fmv."):
+            counts["moves"] += 1
+        if opcode in ASSEMBLY_LOAD_OPS:
+            counts["loads"] += 1
+        if opcode in ASSEMBLY_STORE_OPS:
+            counts["stores"] += 1
+        if opcode in ASSEMBLY_CONTROL_OPS:
+            counts["branches_jumps"] += 1
+        if opcode in ASSEMBLY_MULTIPLY_OPS or opcode.startswith(
+            ("fmul.", "fmadd.", "fmsub.", "fnmadd.", "fnmsub.")
+        ):
+            counts["multiplies"] += 1
+        if opcode in ASSEMBLY_DIVIDE_REMAINDER_OPS or opcode.startswith("fdiv."):
+            counts["divides_remainders"] += 1
+    return counts
+
+
+def write_hotspot_report(work_root: Path, results: list,
+                         args: argparse.Namespace) -> Path:
+    hotspot_path = work_root / "reports" / "hotspots.csv"
+    relative_rank = {
+        id(result): rank
+        for rank, result in enumerate(
+            sorted(results, key=lambda item: 100.0 - item.raw_score, reverse=True), 1
+        )
+    }
+    absolute_rank = {
+        id(result): rank
+        for rank, result in enumerate(
+            sorted(results, key=lambda item: item.ours_avg - item.baseline_avg,
+                   reverse=True), 1
+        )
+    }
+    ordered_results = sorted(
+        results, key=lambda item: item.ours_avg - item.baseline_avg, reverse=True
+    )
+
+    stat_columns = []
+    for key in ASSEMBLY_STAT_KEYS:
+        stat_columns.extend([f"ours_{key}", f"baseline_{key}"])
+
+    with hotspot_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "case",
+            "relative_gap_rank",
+            "relative_gap_percent",
+            "absolute_gap_rank",
+            "absolute_gap_seconds",
+            "baseline_time",
+            "ours_time",
+            "raw_score",
+            "case_dir",
+            "ours_asm",
+            "baseline_asm",
+            *stat_columns,
+        ])
+        for result in ordered_results:
+            try:
+                case_name = str(result.case.relative_to(TESTS_ROOT))
+            except ValueError:
+                case_name = str(result.case)
+            case_dir = work_root / "cases" / safe_case_id(result.case)
+            ours_asm = case_dir / "ours.s"
+            baseline_asm = baseline_assembly_path(case_dir, args)
+            ours_stats = assembly_opcode_counts(ours_asm)
+            baseline_stats = assembly_opcode_counts(baseline_asm)
+            stat_values = []
+            for key in ASSEMBLY_STAT_KEYS:
+                stat_values.extend([ours_stats[key], baseline_stats[key]])
+            writer.writerow([
+                case_name,
+                relative_rank[id(result)],
+                f"{100.0 - result.raw_score:.6f}",
+                absolute_rank[id(result)],
+                f"{result.ours_avg - result.baseline_avg:.9f}",
+                f"{result.baseline_avg:.9f}",
+                f"{result.ours_avg:.9f}",
+                f"{result.raw_score:.6f}",
+                str(case_dir),
+                str(ours_asm),
+                str(baseline_asm) if baseline_asm is not None else "",
+                *stat_values,
+            ])
+    return hotspot_path
+
+
 def write_reports(work_root: Path, results: list, failures: list, args: argparse.Namespace) -> None:
     reports = work_root / "reports"
     csv_path = reports / "score_cases.csv"
@@ -898,6 +1204,8 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
                 " ".join(f"{x:.9f}" for x in result.ours_runs),
             ])
 
+    hotspot_path = write_hotspot_report(work_root, results, args)
+
     baseline_total_runtime = sum(sum(result.baseline_runs) for result in results)
     ours_total_runtime = sum(sum(result.ours_runs) for result in results)
     timed_run_count = sum(len(result.ours_runs) for result in results)
@@ -906,17 +1214,27 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
         "baseline": args.baseline,
         "warmups": args.warmups,
         "runs": args.runs,
+        "under_standard": args.warmups < 5 or args.runs < 2,
         "time_stat": args.time_stat,
+        "cpu_affinity": args.cpu_affinity,
         "case_count": len(results),
         "failure_count": len(failures),
         "score": geometric_mean([result.score for result in results]) if not failures else None,
         "raw_score": geometric_mean([result.raw_score for result in results]) if not failures else None,
         "score_cap": args.cap_score,
+        "compiler": str(COMPILER),
+        "compiler_sha256": file_sha256(COMPILER),
+        "gpr_virtual_copy_coalescing":
+            os.environ.get("BACKEND_DISABLE_GPR_VREG_COALESCING") is None,
+        "effective_disabled_backend_passes": effective_disabled_backend_passes(args),
         "clang": args.clang if args.baseline == "clang-ir" else None,
         "clang_opt_level": args.clang_opt_level if args.baseline == "clang-ir" else None,
         "clang_fp_contract": args.clang_fp_contract if args.baseline == "clang-ir" else None,
         "clang_extra": args.clang_extra if args.baseline == "clang-ir" else None,
         "clang_relocation_model": "driver-default" if args.baseline == "clang-ir" else None,
+        "llvm_link": args.llvm_link if args.baseline == "clang-ir" else None,
+        "llvm_link_resolved": args.llvm_link_resolved if args.baseline == "clang-ir" else None,
+        "llvm_link_version": args.llvm_link_version if args.baseline == "clang-ir" else None,
         "llc": args.llc if args.baseline == "llc-ir" else None,
         "llc_resolved": args.llc_resolved if args.baseline == "llc-ir" else None,
         "llc_version": args.llc_version if args.baseline == "llc-ir" else None,
@@ -937,6 +1255,7 @@ def write_reports(work_root: Path, results: list, failures: list, args: argparse
         "ours_average_timed_runtime": ours_total_runtime / timed_run_count if timed_run_count else None,
         "timed_run_count": timed_run_count,
         "csv": str(csv_path),
+        "hotspots_csv": str(hotspot_path),
     }
     (reports / "score_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -953,16 +1272,18 @@ def main() -> int:
         fail("official scoring requires --warmups >= 5 and --runs >= 2; add --allow-under-standard for smoke tests")
     if args.warmups < 0 or args.runs <= 0:
         fail("warmups must be >= 0 and runs must be > 0")
+    if args.cpu_affinity and TASKSET is None:
+        fail("--cpu-affinity requires taskset")
     if not TESTS_ROOT.exists():
         fail(f"tests directory not found: {TESTS_ROOT}")
     if not RUNTIME_C.exists():
         fail(f"runtime library not found: {RUNTIME_C}")
     if args.baseline == "clang-ir" and not RUNTIME_LL.exists():
         fail(f"runtime IR not found: {RUNTIME_LL}")
-    if args.baseline in ("clang-ir", "llc-ir") and not OFFICIAL_RUNTIME_LL.exists():
-        fail(f"official runtime IR not found: {OFFICIAL_RUNTIME_LL}")
     if args.baseline == "clang-ir" and shutil.which(args.clang) is None:
         fail(f"clang executable not found: {args.clang}")
+    if args.baseline == "clang-ir":
+        probe_llvm_link(args)
     if args.baseline == "llc-ir":
         probe_llc(args)
 
@@ -990,6 +1311,11 @@ def main() -> int:
         f"{Color.YELLOW}[SETUP]{Color.RESET} runtime: "
         f"{PERFORMANCE_RUNTIME_DIR} (CLOCK_MONOTONIC)"
     )
+    if args.cpu_affinity:
+        print(
+            f"{Color.YELLOW}[SETUP]{Color.RESET} qemu cpu affinity: "
+            f"{args.cpu_affinity}"
+        )
     if args.baseline == "gcc-o3":
         baseline_flags = [f"-ffp-contract={args.gcc_fp_contract}"] + args.gcc_extra
         print(f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: {RISCV_GCC} -O3 {' '.join(baseline_flags)}")
@@ -1000,7 +1326,8 @@ def main() -> int:
         ] + args.clang_extra
         print(
             f"{Color.YELLOW}[SETUP]{Color.RESET} baseline: "
-            f"{MIDDLE_COMPILER} IR -> {args.clang} {' '.join(clang_flags)}"
+            f"{MIDDLE_COMPILER} app IR + runtime IR -> "
+            f"{args.llvm_link_resolved} -> {args.clang} {' '.join(clang_flags)}"
         )
     else:
         llc_flags = llc_codegen_flags(args) + args.llc_extra

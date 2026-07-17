@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
@@ -121,16 +122,16 @@ void invalidateAnalysesAfterRewrite(MachineFunction &mf,
   }
 }
 
-std::vector<int> getLoopDepth(MachineFunction &mf,
-                              MachineFunctionAnalysisManager *am) {
+MachineLoopAnalysis::Result
+getLoopInfo(MachineFunction &mf, MachineFunctionAnalysisManager *am) {
   if (am != nullptr) {
-    return am->getResult<MachineLoopAnalysis>(mf).depth;
+    return am->getResult<MachineLoopAnalysis>(mf);
   }
 
   MachineFunctionAnalysisManager localAM;
   localAM.registerPass([] { return MachineCFGAnalysis(); });
   localAM.registerPass([] { return MachineLoopAnalysis(); });
-  return localAM.getResult<MachineLoopAnalysis>(mf).depth;
+  return localAM.getResult<MachineLoopAnalysis>(mf);
 }
 
 struct ProgramInfo {
@@ -138,20 +139,33 @@ struct ProgramInfo {
   std::map<uint32_t, uint64_t> heat;
   std::map<uint32_t, MachineInstr> rematerializable;
   std::set<uint32_t> generatedBySpill;
+  std::set<std::size_t> loopLatchBlocks;
+  bool aggressiveLARematerialization = false;
+  bool coalesceGPRVirtualCopies = true;
 };
 
 ProgramInfo analyzeProgram(const MachineFunction &mf,
                            const std::set<uint32_t> &generatedBySpill,
-                           const std::vector<int> &loopDepth) {
+                           const MachineLoopAnalysis::Result &loopInfo) {
   ProgramInfo info;
   info.classes = collectVRegs(mf);
   info.generatedBySpill = generatedBySpill;
+  info.aggressiveLARematerialization =
+      std::getenv("BACKEND_AGGRESSIVE_LA_REMAT") != nullptr;
+  info.coalesceGPRVirtualCopies =
+      std::getenv("BACKEND_DISABLE_GPR_VREG_COALESCING") == nullptr;
+  for (const auto &[latch, header] : loopInfo.backedges) {
+    (void)header;
+    if (latch >= 0) {
+      info.loopLatchBlocks.insert(static_cast<std::size_t>(latch));
+    }
+  }
   std::map<uint32_t, int> defCount;
   std::map<uint32_t, MachineInstr> candidates;
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
     uint64_t blockHeat = 1;
-    for (int i = 0; i < std::min(loopDepth[blockIndex], 3); ++i) {
+    for (int i = 0; i < std::min(loopInfo.depth[blockIndex], 3); ++i) {
       blockHeat *= 10;
     }
     for (const MachineInstr &instr : mf.blocks[blockIndex].instrs) {
@@ -183,6 +197,7 @@ struct Move {
   Node dst = 0;
   Node src = 0;
   MoveState state = MoveState::WorkList;
+  bool virtualCoalescingEligible = false;
 };
 
 struct AllocationGraph {
@@ -217,6 +232,34 @@ struct AllocationGraph {
     }
   }
 };
+
+std::string allocationNodeName(Node node) {
+  if (isPhysicalNode(node)) {
+    return std::string("physical register ") + regName(nodePhysicalReg(node));
+  }
+  return "virtual register " + std::to_string(node);
+}
+
+void validateAllocationGraph(const AllocationGraph &graph) {
+  auto requireDegree = [&](Node node) {
+    if (graph.degree.count(node) == 0) {
+      throw BackendError("register allocation graph contains " +
+                         allocationNodeName(node) +
+                         " outside the allocatable color set");
+    }
+  };
+
+  for (const auto &[node, neighbors] : graph.adjacency) {
+    requireDegree(node);
+    for (Node neighbor : neighbors) {
+      requireDegree(neighbor);
+    }
+  }
+  for (const Move &move : graph.moves) {
+    requireDegree(move.dst);
+    requireDegree(move.src);
+  }
+}
 
 bool nodeMatchesBank(Node node, bool floatBank,
                      const std::map<uint32_t, RegClass> &classes) {
@@ -334,7 +377,7 @@ AllocationGraph buildAllocationGraph(const MachineFunction &mf,
         }
       }
 
-      const bool copy =
+      const bool registerCopy =
           isCopyForBank(*it, floatBank) && it->defs.size() == 1 &&
           it->uses.size() == 1 && it->defs[0].kind == OperandKind::Reg &&
           it->uses[0].kind == OperandKind::Reg &&
@@ -343,6 +386,7 @@ AllocationGraph buildAllocationGraph(const MachineFunction &mf,
            getRegisterInfo(it->defs[0].regValue.phys).allocatable) &&
           (!it->uses[0].regValue.physical ||
            getRegisterInfo(it->uses[0].regValue.phys).allocatable);
+      const bool copy = registerCopy && !it->copyCoalescingBarrier;
       if (copy) {
         Node dst = it->defs[0].regValue.physical
                        ? physicalNode(it->defs[0].regValue.phys)
@@ -354,9 +398,29 @@ AllocationGraph buildAllocationGraph(const MachineFunction &mf,
             nodeMatchesBank(src, floatBank, info.classes)) {
           currentLive.erase(src);
           const std::size_t moveIndex = graph.moves.size();
-          graph.moves.push_back(Move{dst, src, MoveState::WorkList});
+          const bool virtualCoalescingEligible =
+              !it->phiCopy || info.loopLatchBlocks.count(blockIndex) != 0;
+          graph.moves.push_back(Move{dst, src, MoveState::WorkList,
+                                     virtualCoalescingEligible});
           graph.moveList[dst].insert(moveIndex);
           graph.moveList[src].insert(moveIndex);
+        }
+      }
+
+      if (registerCopy && it->copyCoalescingBarrier) {
+        // A barrier is stronger than merely freezing a move: frozen moves
+        // still carry color affinity.  An explicit interference edge makes
+        // the serialized cycle survive both coalescing and color selection.
+        std::vector<Node> barrierDefs = virtualDefs;
+        barrierDefs.insert(barrierDefs.end(), physicalDefs.begin(),
+                           physicalDefs.end());
+        std::vector<Node> barrierUses = virtualUses;
+        barrierUses.insert(barrierUses.end(), physicalUses.begin(),
+                           physicalUses.end());
+        for (Node def : barrierDefs) {
+          for (Node use : barrierUses) {
+            graph.addEdge(def, use, false);
+          }
         }
       }
 
@@ -394,6 +458,7 @@ AllocationGraph buildAllocationGraph(const MachineFunction &mf,
   for (Node node : graph.precolored) {
     graph.degree[node] = std::numeric_limits<int>::max() / 4;
   }
+  validateAllocationGraph(graph);
   return graph;
 }
 
@@ -673,9 +738,13 @@ private:
       return;
     }
 
-    // 当前流水线在分配前把 PHI 展开为带临时值的 COPY。
-    // 虚拟节点直接合并会绕过该临时值承担的并行复制隔离，因此只保留同色亲和性。
-    if (graph_.precolored.count(keep) == 0) {
+    // Cyclic PHI bundles carry an explicit barrier and never enter the move
+    // worklist.  Ordinary GPR COPYs and acyclic PHI bundles can therefore use
+    // the existing conservative test below.  Keep an emergency A/B switch so
+    // the old affinity-only behavior remains directly reproducible.
+    if (graph_.precolored.count(keep) == 0 &&
+        (!info_.coalesceGPRVirtualCopies ||
+         !move.virtualCoalescingEligible)) {
       move.state = MoveState::Frozen;
       addWorkList(keep);
       addWorkList(removed);
@@ -736,9 +805,33 @@ private:
     const uint64_t heat = info_.heat.count(node) != 0 ? info_.heat.at(node) : 1;
     const uint64_t degree =
         static_cast<uint64_t>(std::max(1, graph_.degree.at(node)));
-    const uint64_t score = generated ? std::numeric_limits<uint64_t>::max()
-                                     : (heat * 1024U) / degree;
-    return std::make_tuple(rematerializable ? 0 : 1, score, node);
+    uint64_t score = (heat * 1024U) / degree;
+
+    if (info_.aggressiveLARematerialization) {
+      score = generated ? std::numeric_limits<uint64_t>::max() : score;
+      return std::make_tuple(rematerializable ? 0 : 1, score, node);
+    }
+
+    // Rematerialization is not uniformly cheap.  A signed-12-bit LI costs one
+    // instruction and deserves a small spill preference, whereas a large LI
+    // or LA expands to multiple instructions.  Treating all of them as
+    // categorically cheaper than every normal value made hot loop-invariant
+    // constants and global bases the first spill candidates, regardless of
+    // weighted use count.  Let the multi-instruction forms compete by the same
+    // heat/degree cost as an ordinary spill and keep generated spill temps as
+    // the last resort so rewriting still converges.
+    const MachineInstr *rematDefinition =
+        rematerializable ? &info_.rematerializable.at(node) : nullptr;
+    const bool cheapSingleInstructionLI =
+        rematDefinition && rematDefinition->opcode == Opcode::LI &&
+        rematDefinition->uses.size() == 1 &&
+        rematDefinition->uses.front().kind == OperandKind::Imm &&
+        rematDefinition->uses.front().immValue >= -2048 &&
+        rematDefinition->uses.front().immValue <= 2047;
+    if (cheapSingleInstructionLI) {
+      score = std::max<uint64_t>(1, score / 2);
+    }
+    return std::make_tuple(generated ? 1 : 0, score, node);
   }
 
   void selectSpill() {
@@ -1111,8 +1204,8 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
     if (stats != nullptr) {
       ++stats->rounds;
     }
-    const std::vector<int> loopDepth = getLoopDepth(mf, am);
-    ProgramInfo info = analyzeProgram(mf, generatedBySpill, loopDepth);
+    const MachineLoopAnalysis::Result loopInfo = getLoopInfo(mf, am);
+    ProgramInfo info = analyzeProgram(mf, generatedBySpill, loopInfo);
     if (info.classes.empty()) {
       return;
     }
@@ -1129,10 +1222,17 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
     spills.insert(spills.end(), fpr.spills.begin(), fpr.spills.end());
     if (!spills.empty()) {
       // 高压函数若逐轮只挑出一个常量，会退化为与常量数成正比的重分配轮次。
-      // 既然 LI/LA 无需栈槽，可在首次确认压力后批量缩短其生命周期。
+      // 只批量处理冷 LI。循环热 LI/LA 都必须交给着色器的热度模型；否则
+      // loop-invariant immediate hoist 和全局基址复用会在这里被反向拆回每次 use
+      // 一份。单个直线块中的一处定义+一处使用 heat=3，仍覆盖原本为编译时间
+      // 收敛而设置的常见批处理场景。
       for (const auto &[id, definition] : info.rematerializable) {
-        (void)definition;
-        spills.push_back(id);
+        const uint64_t heat =
+            info.heat.count(id) != 0 ? info.heat.at(id) : 1;
+        if (info.aggressiveLARematerialization ||
+            (definition.opcode == Opcode::LI && heat <= 3)) {
+          spills.push_back(id);
+        }
       }
       if (info.classes.size() > 64 || round >= 1) {
         std::vector<uint32_t> batch;

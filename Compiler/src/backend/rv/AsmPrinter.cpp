@@ -793,6 +793,59 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     out_ << done << ":\n";
     return;
   }
+  case Opcode::MEMSET_INLINE: {
+    if (instr.uses.size() < 3 || instr.uses[1].kind != OperandKind::Imm ||
+        instr.uses[2].kind != OperandKind::Imm) {
+      throw BackendError("malformed MEMSET_INLINE instruction");
+    }
+    const std::string dst = operandReg(instr.uses[0]);
+    const int64_t byte = instr.uses[1].immValue;
+    const int64_t size = instr.uses[2].immValue;
+    if (byte < 0 || byte > 255 || size < 0) {
+      throw BackendError("invalid MEMSET_INLINE operands");
+    }
+
+    const int id = pcrelId_++;
+    const std::string wordLoop = ".Lmemset" + std::to_string(id) + ".loopw";
+    const std::string byteLoop = ".Lmemset" + std::to_string(id) + ".loopb";
+    const std::string byteStart = ".Lmemset" + std::to_string(id) + ".bytes";
+    const std::string done = ".Lmemset" + std::to_string(id) + ".done";
+    const int64_t wordCount = size / 4;
+    const int64_t byteCount = size % 4;
+    const uint32_t repeated = static_cast<uint32_t>(byte) * 0x01010101u;
+
+    out_ << "    mv " << regName(kReservedMemcpyDst) << ", " << dst << '\n';
+    out_ << "    li " << regName(kReservedMemcpyTmp) << ", "
+         << static_cast<uint64_t>(repeated) << '\n';
+    out_ << "    li " << regName(kReservedGprScratch) << ", " << wordCount
+         << '\n';
+    out_ << "    beqz " << regName(kReservedGprScratch) << ", " << byteStart
+         << '\n';
+    out_ << wordLoop << ":\n";
+    out_ << "    sw " << regName(kReservedMemcpyTmp) << ", 0("
+         << regName(kReservedMemcpyDst) << ")\n";
+    out_ << "    addi " << regName(kReservedMemcpyDst) << ", "
+         << regName(kReservedMemcpyDst) << ", 4\n";
+    out_ << "    addi " << regName(kReservedGprScratch) << ", "
+         << regName(kReservedGprScratch) << ", -1\n";
+    out_ << "    bnez " << regName(kReservedGprScratch) << ", " << wordLoop
+         << '\n';
+    out_ << byteStart << ":\n";
+    out_ << "    li " << regName(kReservedGprScratch) << ", " << byteCount
+         << '\n';
+    out_ << "    beqz " << regName(kReservedGprScratch) << ", " << done << '\n';
+    out_ << byteLoop << ":\n";
+    out_ << "    sb " << regName(kReservedMemcpyTmp) << ", 0("
+         << regName(kReservedMemcpyDst) << ")\n";
+    out_ << "    addi " << regName(kReservedMemcpyDst) << ", "
+         << regName(kReservedMemcpyDst) << ", 1\n";
+    out_ << "    addi " << regName(kReservedGprScratch) << ", "
+         << regName(kReservedGprScratch) << ", -1\n";
+    out_ << "    bnez " << regName(kReservedGprScratch) << ", " << byteLoop
+         << '\n';
+    out_ << done << ":\n";
+    return;
+  }
   case Opcode::RET:
     if (currentFunction_) {
       const bool containsCall = functionContainsCall(*currentFunction_);

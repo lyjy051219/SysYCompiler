@@ -92,6 +92,14 @@ PreRAGlobalAddressReusePass::run(MachineFunction &mf,
 }
 
 MachinePreservationStatus
+PreRALoopInvariantImmediateHoistPass::run(
+    MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  const bool changed = runPreRALoopInvariantImmediateHoist(mf, am);
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
 PreRAAddressCombinePass::run(MachineFunction &mf,
                              MachineFunctionAnalysisManager &am) {
   (void)am;
@@ -122,6 +130,13 @@ MachinePreservationStatus PreRAGuardedLoopPreheaderPass::run(
     MachineFunction &mf, MachineFunctionAnalysisManager &am) {
   const bool changed = runPreRAGuardedLoopPreheader(mf, am);
   return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus PreRALoopLatchRecurrenceSinkPass::run(
+    MachineFunction &mf, MachineFunctionAnalysisManager &am) {
+  const bool changed = runPreRALoopLatchRecurrenceSink(mf, am);
+  return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
 }
 

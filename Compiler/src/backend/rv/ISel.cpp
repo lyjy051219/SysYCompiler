@@ -1812,18 +1812,101 @@ void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
   }
 }
 
+void lowerLibcMemoryCall(MachineFunction &mf, MachineBasicBlock &mbb,
+                         LoweringState &state,
+                         std::initializer_list<Value *> arguments,
+                         const std::string &intrinsicName,
+                         const std::string &libcName) {
+  constexpr PhysReg gprArgs[] = {PhysReg::A0, PhysReg::A1, PhysReg::A2};
+  if (arguments.size() != std::size(gprArgs)) {
+    throw BackendError("malformed " + intrinsicName +
+                       "; expected three memory arguments");
+  }
+
+  // Materialize every source before writing any ABI register.  This preserves
+  // parallel-copy semantics when register allocation gives a source one of
+  // a0-a2.
+  std::vector<MachineReg> argumentRegs;
+  argumentRegs.reserve(arguments.size());
+  std::size_t argumentIndex = 0;
+  for (Value *argument : arguments) {
+    if (isPointerType(argument->getIRType())) {
+      argumentRegs.push_back(materializeAddress(
+          mf, mbb, addressForValue(mf, mbb, state, argument, intrinsicName)));
+    } else if (argumentIndex == 2) {
+      if (!argument->getIRType() ||
+          argument->getIRType()->getEnum() != IR_INT) {
+        throw BackendError("malformed " + intrinsicName +
+                           "; memory size must be an integer");
+      }
+
+      int64_t constantSize = 0;
+      if (intConstant(argument, constantSize)) {
+        if (constantSize < 0) {
+          throw BackendError("unsupported " + intrinsicName +
+                             " size; expected a non-negative byte count");
+        }
+        argumentRegs.push_back(
+            materializeInt(mf, mbb, constantSize, RegClass::GPR64));
+      } else if (argument->getIRType()->getIntegerBitWidth(32) == 32) {
+        MachineReg size = valueReg(mf, mbb, argument);
+        MachineReg mask = materializeInt(
+            mf, mbb, std::numeric_limits<uint32_t>::max(), RegClass::GPR64);
+        MachineReg widened = mf.createVReg(RegClass::GPR64);
+        appendRegInstr(mbb, Opcode::AND, widened, {size, mask});
+        argumentRegs.push_back(widened);
+      } else {
+        throw BackendError("unsupported dynamic 64-bit size in " +
+                           intrinsicName);
+      }
+    } else {
+      argumentRegs.push_back(valueReg(mf, mbb, argument));
+    }
+    ++argumentIndex;
+  }
+
+  for (std::size_t i = 0; i < argumentRegs.size(); ++i) {
+    appendRegInstr(mbb, Opcode::COPY,
+                   MachineReg::preg(gprArgs[i], RegClass::GPR64),
+                   {argumentRegs[i]});
+  }
+
+  MachineInstr call;
+  call.opcode = Opcode::CALL;
+  call.uses.push_back(MachineOperand::global(libcName));
+  call.implicitUses.assign(std::begin(gprArgs), std::end(gprArgs));
+  call.implicitDefs.push_back(PhysReg::RA);
+  call.sideEffects = true;
+  mbb.instrs.push_back(std::move(call));
+}
+
+void requireNonVolatileMemoryIntrinsic(CallInst &inst,
+                                       const std::string &name) {
+  Value *volatileValue = requiredUseValue(inst, 4, name);
+  int64_t isVolatile = 0;
+  if (!intConstant(volatileValue, isVolatile) || isVolatile != 0) {
+    throw BackendError("unsupported volatile memory intrinsic " + name);
+  }
+}
+
 void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
                  LoweringState &state, CallInst &inst,
                  const std::string &name) {
   constexpr int64_t kLoopMemcpyThreshold = 256;
+  requireNonVolatileMemoryIntrinsic(inst, name);
   Value *dst = requiredUseValue(inst, 1, name);
   Value *src = requiredUseValue(inst, 2, name);
   Value *sizeValue = requiredUseValue(inst, 3, name);
 
   int64_t size = 0;
-  if (!intConstant(sizeValue, size) || size < 0) {
+  const bool sizeIsConstant = intConstant(sizeValue, size);
+  if (sizeIsConstant && size < 0) {
     throw BackendError("unsupported " + name +
-                       " size; only non-negative constant sizes are lowered");
+                       " size; expected a non-negative byte count");
+  }
+  if (!sizeIsConstant) {
+    lowerLibcMemoryCall(mf, mbb, state, {dst, src, sizeValue}, name, "memcpy");
+    return;
   }
 
   Address dstAddress = addressForValue(mf, mbb, state, dst, name);
@@ -1843,7 +1926,7 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
     loop.uses.push_back(MachineOperand::reg(dstReg));
     loop.uses.push_back(MachineOperand::reg(srcReg));
     loop.uses.push_back(MachineOperand::imm(size));
-    loop.implicitDefs = {PhysReg::T3, PhysReg::T4, PhysReg::T5};
+    loop.implicitDefs = {PhysReg::T3, PhysReg::T4, PhysReg::T5, PhysReg::T6};
     loop.sideEffects = true;
     mbb.instrs.push_back(std::move(loop));
     return;
@@ -1872,6 +1955,60 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 }
 
+void lowerMemset(MachineFunction &mf, MachineBasicBlock &mbb,
+                 LoweringState &state, CallInst &inst,
+                 const std::string &name) {
+  constexpr int64_t kLoopMemsetThreshold = 256;
+  requireNonVolatileMemoryIntrinsic(inst, name);
+  Value *dst = requiredUseValue(inst, 1, name);
+  Value *byteValue = requiredUseValue(inst, 2, name);
+  Value *sizeValue = requiredUseValue(inst, 3, name);
+
+  int64_t byte = 0;
+  int64_t size = 0;
+  const bool byteIsConst = intConstant(byteValue, byte);
+  const bool sizeIsConst = intConstant(sizeValue, size);
+
+  if (sizeIsConst && size < 0) {
+    throw BackendError("unsupported " + name +
+                       " size; expected a non-negative byte count");
+  }
+  if (!byteIsConst || !sizeIsConst || byte < 0 || byte > 255) {
+    lowerLibcMemoryCall(mf, mbb, state, {dst, byteValue, sizeValue}, name,
+                        "memset");
+    return;
+  }
+
+  Address dstAddress = addressForValue(mf, mbb, state, dst, name);
+  if (size > kLoopMemsetThreshold) {
+    MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);
+    MachineInstr loop;
+    loop.opcode = Opcode::MEMSET_INLINE;
+    loop.uses.push_back(MachineOperand::reg(dstReg));
+    loop.uses.push_back(MachineOperand::imm(byte));
+    loop.uses.push_back(MachineOperand::imm(size));
+    loop.implicitDefs = {PhysReg::T3, PhysReg::T5, PhysReg::T6};
+    loop.sideEffects = true;
+    mbb.instrs.push_back(std::move(loop));
+    return;
+  }
+
+  const uint32_t repeated = static_cast<uint32_t>(byte) * 0x01010101u;
+  MachineReg word = materializeInt(mf, mbb, static_cast<int64_t>(repeated),
+                                   RegClass::GPR32);
+  int64_t offset = 0;
+  for (; offset + 4 <= size; offset += 4) {
+    Address address = dstAddress;
+    address.offset += offset;
+    appendStore(mbb, Opcode::SW, word, address);
+  }
+  for (; offset < size; ++offset) {
+    Address address = dstAddress;
+    address.offset += offset;
+    appendStore(mbb, Opcode::SB, word, address);
+  }
+}
+
 void lowerUnsupported(MachineFunction &mf, MachineBasicBlock &mbb,
                       Instruction &inst);
 
@@ -1883,6 +2020,20 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   if (name == "llvm.memcpy.p0.p0.i32" ||
       name == "llvm.memcpy.p0i8.p0i8.i32") {
     lowerMemcpy(mf, mbb, state, inst, name);
+    return;
+  }
+  if (name == "llvm.memset.p0.i32" || name == "llvm.memset.p0i8.i32" ||
+      name == "llvm.memset.p0i8.i64" || name == "llvm.memset.p0.i64") {
+    lowerMemset(mf, mbb, state, inst, name);
+    return;
+  }
+  if (name == "llvm.memmove.p0.p0.i32" ||
+      name == "llvm.memmove.p0i8.p0i8.i32") {
+    requireNonVolatileMemoryIntrinsic(inst, name);
+    Value *dst = requiredUseValue(inst, 1, name);
+    Value *src = requiredUseValue(inst, 2, name);
+    Value *size = requiredUseValue(inst, 3, name);
+    lowerLibcMemoryCall(mf, mbb, state, {dst, src, size}, name, "memmove");
     return;
   }
 

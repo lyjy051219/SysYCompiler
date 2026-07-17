@@ -43,7 +43,11 @@ constexpr std::array<RegisterInfo, kNumRegs> kRegisterInfos{{
     {PhysReg::T3, "t3", true, true, false, false},
     {PhysReg::T4, "t4", true, true, false, false},
     {PhysReg::T5, "t5", true, true, false, false},
-    {PhysReg::T6, "t6", true, true, false, false},
+    // t6 is reserved for late assembly expansion and must never participate in
+    // register allocation.  In particular, MEMSET_INLINE names it as an
+    // implicit clobber even though it is intentionally absent from
+    // kGPRAllocatable.
+    {PhysReg::T6, "t6", false, true, false, false},
     {PhysReg::FT0, "ft0", true, true, false, true},
     {PhysReg::FT1, "ft1", true, true, false, true},
     {PhysReg::FT2, "ft2", true, true, false, true},
