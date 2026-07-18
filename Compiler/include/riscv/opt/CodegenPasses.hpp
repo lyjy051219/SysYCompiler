@@ -69,6 +69,12 @@ struct PreRALoopInvariantImmediateHoistPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 把循环内重复的、由循环不变 GPR 位模式驱动的 FMV_W_X 提到 preheader。
+struct PreRALoopInvariantFloatMaterializationPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配前把局部 i32 加减/左移 DAG 归一化为更短的仿射表达式
 struct PreRAAffineCombinePass {
   MachinePreservationStatus run(MachineFunction &mf,
@@ -101,6 +107,12 @@ struct PreRAGuardedLoopPreheaderPass {
 
 // 把仅供回边 PHI copy 使用的自递增计算下沉到该回边，保留退出边上的旧值。
 struct PreRALoopLatchRecurrenceSinkPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 删除与正整数步长索引重复的常量步长循环计数器。
+struct PreRARedundantLoopIVPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };

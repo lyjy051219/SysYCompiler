@@ -4,6 +4,7 @@
 #include "../../../include/riscv/Target.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -674,6 +675,252 @@ void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
   }
 }
 
+bool isVirtualGPR(MachineReg reg) {
+  return reg.isValid() && !reg.physical && isGPR(reg);
+}
+
+bool operandUsesMachineReg(const MachineFunction &mf,
+                           const MachineOperand &operand,
+                           MachineReg target) {
+  if (operand.kind == OperandKind::Reg) {
+    return !operand.regValue.physical &&
+           sameMachineReg(operand.regValue, target);
+  }
+  if (operand.kind != OperandKind::ValueRef || !operand.valueRef) {
+    return false;
+  }
+  auto mapped = mf.valueRegs.find(operand.valueRef);
+  return mapped != mf.valueRegs.end() && !mapped->second.physical &&
+         sameMachineReg(mapped->second, target);
+}
+
+bool hasNoUseAfterSelect(const MachineFunction &mf, MachineReg target,
+                         std::size_t selectBlock,
+                         std::size_t selectIndex) {
+  bool usedBySelect = false;
+  for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size(); ++blockIndex) {
+    const MachineBasicBlock &block = mf.blocks[blockIndex];
+    for (std::size_t instrIndex = 0; instrIndex < block.instrs.size();
+         ++instrIndex) {
+      for (const MachineOperand &use : block.instrs[instrIndex].uses) {
+        if (!operandUsesMachineReg(mf, use, target)) {
+          continue;
+        }
+        if (use.kind != OperandKind::Reg || blockIndex != selectBlock ||
+            instrIndex > selectIndex) {
+          return false;
+        }
+        usedBySelect |= instrIndex == selectIndex;
+      }
+    }
+  }
+  return usedBySelect;
+}
+
+void canonicalizeNegatedAddForReuse(MachineFunction &mf,
+                                    std::size_t blockIndex,
+                                    std::size_t selectIndex,
+                                    MachineReg result) {
+  if (result.rc != RegClass::GPR32) {
+    return;
+  }
+  MachineBasicBlock &block = mf.blocks[blockIndex];
+  MachineInstr *addition = nullptr;
+  std::size_t additionIndex = 0;
+  for (std::size_t index = 0; index < selectIndex; ++index) {
+    MachineInstr &instr = block.instrs[index];
+    if (instr.defs.size() == 1 && instr.defs.front().kind == OperandKind::Reg &&
+        sameMachineReg(instr.defs.front().regValue, result)) {
+      addition = &instr;
+      additionIndex = index;
+    }
+  }
+  if (addition == nullptr || addition->opcode != Opcode::ADDW ||
+      addition->sideEffects || addition->terminator ||
+      !addition->implicitDefs.empty() || !addition->implicitUses.empty() ||
+      addition->uses.size() != 2 ||
+      addition->uses[0].kind != OperandKind::Reg ||
+      addition->uses[1].kind != OperandKind::Reg) {
+    return;
+  }
+
+  for (std::size_t negatedIndex = 0; negatedIndex < 2; ++negatedIndex) {
+    const MachineReg negated = addition->uses[negatedIndex].regValue;
+    const MachineReg other = addition->uses[1 - negatedIndex].regValue;
+    if (negated.physical || negated.rc != RegClass::GPR32 ||
+        other.rc != RegClass::GPR32) {
+      continue;
+    }
+    const MachineInstr *negation = nullptr;
+    std::size_t negationBlock = 0;
+    std::size_t negationIndex = 0;
+    bool multipleDefinitions = false;
+    for (std::size_t candidateBlockIndex = 0;
+         candidateBlockIndex < mf.blocks.size(); ++candidateBlockIndex) {
+      const MachineBasicBlock &candidateBlock = mf.blocks[candidateBlockIndex];
+      for (std::size_t candidateIndex = 0;
+           candidateIndex < candidateBlock.instrs.size(); ++candidateIndex) {
+        const MachineInstr &instr = candidateBlock.instrs[candidateIndex];
+        for (const MachineOperand &def : instr.defs) {
+          if (def.kind != OperandKind::Reg ||
+              !sameMachineReg(def.regValue, negated)) {
+            continue;
+          }
+          if (negation != nullptr) {
+            multipleDefinitions = true;
+            break;
+          }
+          negation = &instr;
+          negationBlock = candidateBlockIndex;
+          negationIndex = candidateIndex;
+        }
+        if (multipleDefinitions)
+          break;
+      }
+      if (multipleDefinitions)
+        break;
+    }
+    if (!multipleDefinitions && negation != nullptr &&
+        negationBlock == blockIndex && negationIndex < additionIndex &&
+        negation->opcode == Opcode::SUBW &&
+        !negation->sideEffects && !negation->terminator &&
+        negation->implicitDefs.empty() && negation->implicitUses.empty() &&
+        negation->uses.size() == 2 &&
+        negation->uses[0].kind == OperandKind::Reg &&
+        negation->uses[0].regValue.physical &&
+        negation->uses[0].regValue.phys == PhysReg::X0 &&
+        negation->uses[1].kind == OperandKind::Reg &&
+        negation->uses[1].regValue.rc == RegClass::GPR32) {
+      addition->opcode = Opcode::SUBW;
+      addition->uses[0] = MachineOperand::reg(other);
+      addition->uses[1] = negation->uses[1];
+      return;
+    }
+  }
+}
+
+// Reuse an otherwise-dead selected value as the SELECT result.  The scan is
+// intentionally local to the SELECT block: this avoids needing a dominance
+// analysis while still covering the normal SSA shape (the result is consumed
+// by the tail that is moved to the done block).
+bool tryReuseSelectOperand(MachineFunction &mf, std::size_t blockIndex,
+                           std::size_t selectIndex) {
+  if (std::getenv("BACKEND_DISABLE_SELECT_OPERAND_REUSE") != nullptr) {
+    return false;
+  }
+  MachineBasicBlock &block = mf.blocks[blockIndex];
+  if (selectIndex >= block.instrs.size()) {
+    return false;
+  }
+  MachineInstr &select = block.instrs[selectIndex];
+  if (select.opcode != Opcode::SELECT || select.defs.size() != 1 ||
+      select.uses.size() != 3 || select.defs.front().kind != OperandKind::Reg ||
+      select.sideEffects || select.terminator || !select.implicitDefs.empty() ||
+      !select.implicitUses.empty()) {
+    return false;
+  }
+  for (const MachineOperand &use : select.uses) {
+    if (use.kind != OperandKind::Reg) {
+      return false;
+    }
+  }
+
+  const MachineReg dst = select.defs.front().regValue;
+  const MachineReg condition = select.uses[0].regValue;
+  const MachineReg trueValue = select.uses[1].regValue;
+  const MachineReg falseValue = select.uses[2].regValue;
+  if (!isVirtualGPR(dst) || sameMachineReg(dst, condition) ||
+      sameMachineReg(dst, trueValue) || sameMachineReg(dst, falseValue)) {
+    return false;
+  }
+
+  // The destination must have exactly this one explicit definition, and all
+  // of its uses must be in the post-SELECT tail of this same block.
+  std::size_t destinationDefs = 0;
+  for (std::size_t currentBlock = 0; currentBlock < mf.blocks.size();
+       ++currentBlock) {
+    const MachineBasicBlock &candidateBlock = mf.blocks[currentBlock];
+    for (std::size_t instrIndex = 0; instrIndex < candidateBlock.instrs.size();
+         ++instrIndex) {
+      const MachineInstr &instr = candidateBlock.instrs[instrIndex];
+      for (const MachineOperand &def : instr.defs) {
+        if (def.kind == OperandKind::Reg &&
+            sameMachineReg(def.regValue, dst)) {
+          ++destinationDefs;
+          if (currentBlock != blockIndex || instrIndex != selectIndex) {
+            return false;
+          }
+        }
+      }
+      for (const MachineOperand &use : instr.uses) {
+        if (!operandUsesMachineReg(mf, use, dst)) {
+          continue;
+        }
+        // PHI ValueRefs are resolved later, so changing only machine operands
+        // cannot rewrite them safely.  Reject this case conservatively.
+        if (use.kind == OperandKind::ValueRef ||
+            currentBlock != blockIndex || instrIndex <= selectIndex) {
+          return false;
+        }
+      }
+    }
+  }
+  if (destinationDefs != 1) {
+    return false;
+  }
+
+  auto reusable = [&](MachineReg operand) {
+    if (!isVirtualGPR(operand) || operand.rc != dst.rc ||
+        sameMachineReg(operand, dst) ||
+        !hasNoUseAfterSelect(mf, operand, blockIndex, selectIndex)) {
+      return false;
+    }
+    std::size_t operandDefs = 0;
+    for (std::size_t currentBlock = 0; currentBlock < mf.blocks.size();
+         ++currentBlock) {
+      const MachineBasicBlock &candidateBlock = mf.blocks[currentBlock];
+      for (std::size_t instrIndex = 0; instrIndex < candidateBlock.instrs.size();
+           ++instrIndex) {
+        for (const MachineOperand &def : candidateBlock.instrs[instrIndex].defs) {
+          if (def.kind != OperandKind::Reg ||
+              !sameMachineReg(def.regValue, operand)) {
+            continue;
+          }
+          if (++operandDefs > 1 || currentBlock != blockIndex ||
+              instrIndex >= selectIndex) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  };
+
+  // False is preferred so the false edge is the identity path in the common
+  // layout, leaving only one real transfer in the diamond.
+  MachineReg replacement;
+  if (reusable(falseValue)) {
+    replacement = falseValue;
+  } else if (reusable(trueValue)) {
+    replacement = trueValue;
+  } else {
+    return false;
+  }
+
+  canonicalizeNegatedAddForReuse(mf, blockIndex, selectIndex, replacement);
+  for (std::size_t instrIndex = selectIndex + 1;
+       instrIndex < block.instrs.size(); ++instrIndex) {
+    for (MachineOperand &use : block.instrs[instrIndex].uses) {
+      if (use.kind == OperandKind::Reg &&
+          sameMachineReg(use.regValue, dst)) {
+        use.regValue = replacement;
+      }
+    }
+  }
+  select.defs.front().regValue = replacement;
+  return true;
+}
+
 } // namespace
 
 void rebuildCFG(MachineFunction &mf) {
@@ -752,6 +999,14 @@ bool lowerSelectPseudo(MachineFunction &mf, bool branchlessOnly) {
     return lowerBranchlessSelects(mf);
   }
 
+  constexpr std::size_t kSelectReuseInstructionBudget = 4096;
+  std::size_t instructionCount = 0;
+  for (const MachineBasicBlock &candidateBlock : mf.blocks) {
+    instructionCount += candidateBlock.instrs.size();
+  }
+  const bool allowOperandReuse =
+      instructionCount <= kSelectReuseInstructionBudget;
+
   int selectId = 0;
   bool changed = false;
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
@@ -764,10 +1019,19 @@ bool lowerSelectPseudo(MachineFunction &mf, bool branchlessOnly) {
     if (selectIt == block.instrs.end()) {
       continue;
     }
-    if (selectIt->defs.empty() || selectIt->uses.size() < 3) {
+    if (selectIt->defs.size() != 1 || selectIt->uses.size() != 3 ||
+        selectIt->defs.front().kind != OperandKind::Reg ||
+        std::any_of(selectIt->uses.begin(), selectIt->uses.end(),
+                    [](const MachineOperand &operand) {
+                      return operand.kind != OperandKind::Reg;
+                    })) {
       throw BackendError("malformed SELECT pseudo");
     }
 
+    const std::size_t selectIndex =
+        static_cast<std::size_t>(std::distance(block.instrs.begin(), selectIt));
+    const bool reusedOperand =
+        allowOperandReuse && tryReuseSelectOperand(mf, blockIndex, selectIndex);
     MachineInstr select = *selectIt;
     changed = true;
     std::vector<MachineInstr> tail(selectIt + 1, block.instrs.end());
@@ -791,12 +1055,20 @@ bool lowerSelectPseudo(MachineFunction &mf, bool branchlessOnly) {
     block.instrs.push_back(std::move(branch));
     appendJump(block, falseBlock.label);
 
-    trueBlock.instrs.push_back(makeParallelCopy(select.defs.front().regValue,
-                                                select.uses[1].regValue));
+    if (!reusedOperand ||
+        !sameMachineReg(select.defs.front().regValue,
+                        select.uses[1].regValue)) {
+      trueBlock.instrs.push_back(makeParallelCopy(select.defs.front().regValue,
+                                                  select.uses[1].regValue));
+    }
     appendJump(trueBlock, doneBlock.label);
 
-    falseBlock.instrs.push_back(makeParallelCopy(select.defs.front().regValue,
-                                                 select.uses[2].regValue));
+    if (!reusedOperand ||
+        !sameMachineReg(select.defs.front().regValue,
+                        select.uses[2].regValue)) {
+      falseBlock.instrs.push_back(makeParallelCopy(
+          select.defs.front().regValue, select.uses[2].regValue));
+    }
     appendJump(falseBlock, doneBlock.label);
 
     doneBlock.instrs = std::move(tail);

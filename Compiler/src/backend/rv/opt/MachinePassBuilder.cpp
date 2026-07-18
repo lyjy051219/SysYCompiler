@@ -145,6 +145,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
                   BranchCompareFoldingPass());
   addOptionalPass(MPM, Options, "pre-ra-loop-invariant-immediate-hoist",
                   PreRALoopInvariantImmediateHoistPass());
+  addOptionalPass(MPM, Options, "pre-ra-loop-invariant-float-materialization",
+                  PreRALoopInvariantFloatMaterializationPass());
   addOptionalPass(MPM, Options, "pre-ra-global-address-reuse",
                   PreRAGlobalAddressReusePass());
 
@@ -178,6 +180,10 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
                   PreRAGuardedLoopPreheaderPass());
   addOptionalPass(MPM, Options, "pre-ra-loop-latch-recurrence-sink",
                   PreRALoopLatchRecurrenceSinkPass());
+  addOptionalPass(MPM, Options, "pre-ra-redundant-loop-iv",
+                  PreRARedundantLoopIVPass());
+  addOptionalPass(MPM, Options, "pre-ra-machine-dce",
+                  PreRAMachineDCEPass());
   return MPM;
 }
 

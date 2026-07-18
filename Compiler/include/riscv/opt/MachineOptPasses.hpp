@@ -11,6 +11,8 @@ bool runBranchCompareFolding(MachineFunction &mf);
 bool runPreRAGlobalAddressReuse(MachineFunction &mf);
 bool runPreRALoopInvariantImmediateHoist(
     MachineFunction &mf, MachineFunctionAnalysisManager &am);
+bool runPreRALoopInvariantFloatMaterialization(
+    MachineFunction &mf, MachineFunctionAnalysisManager &am);
 bool runPreRAAffineCombine(MachineFunction &mf);
 bool runPreRAAddressCombine(MachineFunction &mf);
 bool runPreRACopyPropagation(MachineFunction &mf);
@@ -19,6 +21,8 @@ bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
                                   MachineFunctionAnalysisManager &am);
 bool runPreRALoopLatchRecurrenceSink(
     MachineFunction &mf, MachineFunctionAnalysisManager &am);
+bool runPreRARedundantLoopIV(MachineFunction &mf,
+                             MachineFunctionAnalysisManager &am);
 bool runPreRAMachineDCE(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);
