@@ -11,6 +11,8 @@
 #include <vector>
 
 class BasicBlock;
+class BinaryInst;
+class BrInst;
 class DominatorTree;
 class Instruction;
 class Loop;
@@ -23,11 +25,8 @@ struct SCEVExpr;
 class Use;
 class Value;
 
-// Conservatively permute two adjacent loop axes which enumerate the exact
-// same iteration domain.  The CFG stays in place; payload uses of the two
-// canonical IVs are exchanged simultaneously.  For a rectangular domain this
-// is exactly the schedule transformation (outer, inner) -> (inner, outer),
-// while avoiding the fragile PHI/exit rewiring of a physical CFG swap.
+// 保守交换两个相邻循环轴。矩形同域优先交换规范归纳变量的角色；经过
+// 分布形成的受限非完美循环则在完整依赖与 CFG 证明后执行物理交换。
 class LoopInterchangePass : public PassDescriptor<LoopInterchangePass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -65,12 +64,35 @@ private:
         long long LocalityBenefit = 0;
     };
 
+    struct RotatedNestCandidate {
+        Loop *Outer = nullptr;
+        Loop *Inner = nullptr;
+        BasicBlock *Guard = nullptr;
+        BasicBlock *OuterHeader = nullptr;
+        BasicBlock *Prefix = nullptr;
+        BasicBlock *InnerHeader = nullptr;
+        BasicBlock *InnerBody = nullptr;
+        BasicBlock *OuterLatch = nullptr;
+        BasicBlock *Exit = nullptr;
+        PhiInst *OuterIV = nullptr;
+        PhiInst *InnerIV = nullptr;
+        BinaryInst *OuterFirstCmp = nullptr;
+        Value *OuterStartValue = nullptr;
+        unsigned OuterStartIndex = 0;
+        unsigned InnerStartIndex = 0;
+        unsigned InnerBackedgeIndex = 0;
+        bool OuterContinueOnTrue = true;
+        bool InnerContinueOnTrue = true;
+        long long LocalityBenefit = 0;
+    };
+
     static bool sameIterationDomain(Loop *Outer, Loop *Inner,
                                     SCEVResult &SE,
                                     PhiInst *&OuterIV,
                                     PhiInst *&InnerIV);
     static bool hasOnlyCanonicalHeaderPhi(Loop *L, PhiInst *IV);
-    static bool hasTriangularDescendant(Loop *Inner, SCEVResult &SE);
+    static bool hasUnsupportedDescendantDomain(Loop *Inner,
+                                               SCEVResult &SE);
     static bool isPureSinkInstruction(Instruction *I);
     static bool collectSinkablePrefix(Candidate &C);
     static bool collectRoleUses(Candidate &C);
@@ -84,6 +106,12 @@ private:
                                   const DominatorTree &DT,
                                   const PostDominatorTree &PDT);
     static bool applyCandidate(Function &F, Candidate &C);
+    static bool buildRotatedNestCandidate(
+        Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
+        DominatorTree &DT, PostDominatorTree &PDT,
+        LoopDependenceInfo &LD, RotatedNestCandidate &C);
+    static bool applyRotatedNestCandidate(
+        Function &F, RotatedNestCandidate &C);
     static bool expressionKeysEqual(const SCEVExpr *A,
                                     const SCEVExpr *B);
     static unsigned stridePenalty(std::int64_t Stride);

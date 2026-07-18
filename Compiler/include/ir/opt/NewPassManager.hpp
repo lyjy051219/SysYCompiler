@@ -202,20 +202,23 @@ private:
     std::map<PassID*, PassPtr> AnalysisPasses;
     std::map<CacheKey, ResultPtr> ResultCache;
     std::set<PassID*> CrossUnitAnalysisIDs;
-    // Dependencies are discovered from nested getResult() calls while an
-    // analysis is being constructed.  This keeps invalidation aligned with
-    // the code that actually consumes an analysis instead of a duplicated,
-    // manually maintained dependency table.
-    std::map<PassID*, std::set<PassID*>> AnalysisDependencies;
-    std::vector<PassID*> ActiveAnalysisStack;
+    // 分析构造期间的嵌套 getResult() 会形成精确到缓存键的依赖边。
+    // 正向图用于删除旧边，反向图用于在依赖失效后驱逐所有传递依赖者。
+    std::map<CacheKey, std::set<CacheKey>> AnalysisDependencies;
+    std::map<CacheKey, std::set<CacheKey>> ReverseAnalysisDependencies;
+    std::vector<CacheKey> ActiveAnalysisStack;
     std::function<void()> IRMutationCallback;
+
+    void recordDependency(const CacheKey &Dependent,
+                          const CacheKey &Dependency);
+    void eraseCachedResults(const std::set<CacheKey> &Keys);
 
 public:
     AnalysisPassManager() = default;
     AnalysisPassManager(AnalysisPassManager &&) = default;
     AnalysisPassManager& operator=(AnalysisPassManager &&) = default;
 
-    void clear() { ResultCache.clear(); }
+    void clear();
 
     void setIRMutationCallback(std::function<void()> Callback) {
         IRMutationCallback = std::move(Callback);
@@ -225,13 +228,10 @@ public:
     typename PassT::Result &getResult(IRUnitT &IR) {
         assert(AnalysisPasses.count(PassT::ID()) && "Pass not registered");
         PassID *RequestedID = PassT::ID();
-        if (!ActiveAnalysisStack.empty() &&
-            ActiveAnalysisStack.back() != RequestedID) {
-            AnalysisDependencies[ActiveAnalysisStack.back()].insert(
-                RequestedID);
-        }
-
         auto Key = CacheKey{RequestedID, &IR};
+        if (!ActiveAnalysisStack.empty())
+            recordDependency(ActiveAnalysisStack.back(), Key);
+
         auto it = ResultCache.find(Key);
         if (it != ResultCache.end()) {
             using WrapperT = AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
@@ -240,12 +240,12 @@ public:
         auto &Pass = *AnalysisPasses.at(RequestedID);
 
         struct ActiveAnalysisGuard {
-            std::vector<PassID*> &Stack;
-            explicit ActiveAnalysisGuard(std::vector<PassID*> &Stack,
-                                         PassID *ID)
-                : Stack(Stack) { Stack.push_back(ID); }
+            std::vector<CacheKey> &Stack;
+            explicit ActiveAnalysisGuard(std::vector<CacheKey> &Stack,
+                                         CacheKey Key)
+                : Stack(Stack) { Stack.push_back(Key); }
             ~ActiveAnalysisGuard() { Stack.pop_back(); }
-        } Guard(ActiveAnalysisStack, RequestedID);
+        } Guard(ActiveAnalysisStack, Key);
 
         ResultCache[Key] = Pass.run(IR, *this);
         using WrapperT = AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
@@ -281,67 +281,10 @@ public:
         return true;
     }
 
-    void invalidate(IRUnitT &IR, const PassResult &Result) {
-        if (!Result.changedIR()) return;
+    void invalidate(IRUnitT &IR, const PassResult &Result);
 
-        const PreservationStatus &PA = Result.preservedAnalyses();
-
-        // First ask each result whether it remains valid.  Then propagate
-        // invalidity through the dependencies observed while analyses were
-        // constructed.  The closure is per cache key, so invalidating an
-        // ordinary function analysis does not evict the same analysis for an
-        // unrelated function; analyses marked cross-unit are relevant for all
-        // keys by construction.
-        std::set<CacheKey> RelevantKeys;
-        std::set<CacheKey> InvalidKeys;
-        for (auto &Entry : ResultCache) {
-            PassID *AnalysisID = Entry.first.first;
-            const bool IsCrossUnit =
-                CrossUnitAnalysisIDs.count(AnalysisID) != 0;
-            if (!IsCrossUnit && Entry.first.second != &IR) continue;
-            RelevantKeys.insert(Entry.first);
-            if (!PA.isKept(AnalysisID) ||
-                Entry.second->invalidate(*Entry.first.second, PA)) {
-                InvalidKeys.insert(Entry.first);
-            }
-        }
-
-        bool AddedInvalid = true;
-        while (AddedInvalid) {
-            AddedInvalid = false;
-            for (const CacheKey &Key : RelevantKeys) {
-                if (InvalidKeys.count(Key)) continue;
-                auto DepIt = AnalysisDependencies.find(Key.first);
-                if (DepIt == AnalysisDependencies.end()) continue;
-                for (PassID *Dependency : DepIt->second) {
-                    if (Dependency == Key.first) continue;
-                    const CacheKey DependencyKey{Dependency, Key.second};
-                    if (!PA.isKept(Dependency) ||
-                        InvalidKeys.count(DependencyKey)) {
-                        InvalidKeys.insert(Key);
-                        AddedInvalid = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (const CacheKey &Key : InvalidKeys)
-            ResultCache.erase(Key);
-
-        // This hook is primarily used by the module analysis manager to
-        // invalidate function analyses.  It is driven by Changed rather than
-        // by the preservation set: those facts are intentionally independent.
-        if (!PA.wasCrossUnitInvalidationHandled() && IRMutationCallback)
-            IRMutationCallback();
-    }
-
-    // Compatibility for the few transforms that explicitly invalidate in
-    // the middle of their run.  Their historical convention is retained at
-    // this boundary; new code should pass an explicit PassResult.
-    void invalidate(IRUnitT &IR, PreservationStatus PA) {
-        invalidate(IR, PassResult::fromLegacy(std::move(PA)));
-    }
+    // 兼容少数在执行过程中主动失效分析的旧变换；新代码应显式传递 PassResult。
+    void invalidate(IRUnitT &IR, PreservationStatus PA);
 };
 
 extern template class AnalysisPassManager<Module>;

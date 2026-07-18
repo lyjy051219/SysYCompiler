@@ -192,7 +192,8 @@ bool LoopUnrollPass::isDirectUnitIncrement(const InductionDescriptor &IV) {
 Value *LoopUnrollPass::getStrictIncreasingHeaderBound(
     const LoopTripCountInfo &TCI, const InductionDescriptor &IV) {
     if (!TCI.Valid || !TCI.ExitCmp || !TCI.ExitingBlock || !TCI.Header ||
-        TCI.ExitingBlock != TCI.Header || !IV.Valid || !IV.Phi ||
+        !TCI.Latch || TCI.ExitingBlock != TCI.Header ||
+        TCI.ExitingBlock == TCI.Latch || !IV.Valid || !IV.Phi ||
         !IV.ConstantStep || *IV.ConstantStep != 1) {
         return nullptr;
     }
@@ -305,8 +306,9 @@ std::pair<IntRange, IntRange> LoopUnrollPass::getFirstOuterEntryRanges(
     // For a header-tested loop, only the continue edge reaches the peeled
     // body.  Its condition is therefore another exact first-iteration fact.
     auto OuterTCI = SE.analyzeLoopTripCount(Outer);
-    if (OuterTCI && OuterTCI->Valid &&
-        OuterTCI->ExitingBlock == OuterTCI->Header) {
+    if (OuterTCI && OuterTCI->Valid && OuterTCI->Latch &&
+        OuterTCI->ExitingBlock == OuterTCI->Header &&
+        OuterTCI->ExitingBlock != OuterTCI->Latch) {
         auto *Br = OuterTCI->Header->getBranchTerminator();
         BasicBlock *Continue = nullptr;
         if (Br && Br->isConditional()) {
@@ -1899,8 +1901,15 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
         if (BB) PreCloneLoopBlocks.insert(BB);
     }
-    bool PreCloneHeaderExiting =
-        PreCloneShape->Exiting && PreCloneShape->Header &&
+    const bool PreCloneLatchExiting =
+        PreCloneShape->Exiting && PreCloneShape->Latch &&
+        PreCloneShape->Exiting == PreCloneShape->Latch;
+    // 单块循环的 header、latch 与 exiting 是同一块，但它先执行循环体再
+    // 沿回边继续，语义上必须归入 latch-tested。两类若同时置真，后续
+    // CFG 会按 latch 连接，而 tail PHI 却会错误地按 header 选择前驱。
+    const bool PreCloneHeaderExiting =
+        !PreCloneLatchExiting && PreCloneShape->Exiting &&
+        PreCloneShape->Header &&
         PreCloneShape->Exiting == PreCloneShape->Header;
     std::vector<ExitRegionDataUse> ExitRegionUses =
         collectExitRegionDataUsesFrom(PreCloneShape->Exit,
@@ -1912,9 +1921,9 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     if (!Core) {
         return LoopUnrollResult::Unmodified;
     }
-    bool LatchExiting = hasLatchExitShape(*Core);
-    bool HeaderExiting =
-        Core->Shape.Exiting && Core->Shape.Header &&
+    const bool LatchExiting = hasLatchExitShape(*Core);
+    const bool HeaderExiting =
+        !LatchExiting && Core->Shape.Exiting && Core->Shape.Header &&
         Core->Shape.Exiting == Core->Shape.Header;
     if (!LatchExiting && !HeaderExiting) {
         discardUncommittedUnrollClones(*Core);
@@ -3098,14 +3107,12 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
     Value *Remainder = nullptr;
     Value *NumGroups = nullptr;
 
-    // For a header-tested runtime loop SCEV constructs TripCount as
-    // max(0, raw-distance), so it is signed-nonnegative.  Runtime factors are
-    // currently selected from {2, 4}; for any positive power of two we can
-    // therefore generate the exact quotient/remainder directly.  Besides
-    // avoiding DIV/REM, this records the nonnegative fact in the generated IR
-    // instead of asking a later range pass to rediscover it.
+    // runtime 决策只有在 trip count 的固定位宽计算已被证明无回绕后才会
+    // 到达这里。header-test 的 max(0, distance) 与 update-test 的
+    // max(0, distance)+1 都非负，因此二次幂因子可统一使用移位和掩码，
+    // 不必再依赖 exiting 块恰好同时也是 header 这一结构巧合。
     const bool CanUsePowerOfTwoForm =
-        TCI->ExitingBlock == TCI->Header &&
+        Decision.TripCountIsProven &&
         IRMath::isPowerOf2(Decision.Count);
     if (CanUsePowerOfTwoForm) {
         Value *Mask = makeTypedIntConstant(
@@ -3123,9 +3130,7 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
         Remainder = RemainderInst;
         NumGroups = NumGroupsInst;
     } else {
-        // A latch-tested symbolic count is max(0, distance) + 1.  Without a
-        // no-overflow proof that final add is not guaranteed nonnegative, so
-        // retain signed DIV/MOD semantics for this uncommon shape.
+        // 非二次幂因子保留通用的有符号除法与取模路径。
         Value *Factor = makeTypedIntConstant(
             Decision.Count, TripCount->getIRType());
         if (!Factor) return LoopUnrollResult::Unmodified;
@@ -3198,8 +3203,11 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
-    bool LatchExiting = ShapeOpt->Exiting == ShapeOpt->Latch;
-    bool HeaderExiting = ShapeOpt->Exiting == ShapeOpt->Header;
+    // 与 remainder unroll 使用相同的互斥分类。单块循环若同时进入两种
+    // 处理路径，克隆退出边与原循环 PHI 的前驱会来自不同复制体。
+    const bool LatchExiting = ShapeOpt->Exiting == ShapeOpt->Latch;
+    const bool HeaderExiting =
+        !LatchExiting && ShapeOpt->Exiting == ShapeOpt->Header;
     if (!LatchExiting && !HeaderExiting) {
         return LoopUnrollResult::Unmodified;
     }

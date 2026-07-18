@@ -111,6 +111,122 @@ void PassResult::merge(const PassResult &Arg) {
     Preserved.merge(Arg.Preserved);
 }
 
+template <typename IRUnitT>
+void AnalysisPassManager<IRUnitT>::recordDependency(
+    const typename AnalysisPassManager<IRUnitT>::CacheKey &Dependent,
+    const typename AnalysisPassManager<IRUnitT>::CacheKey &Dependency) {
+    if (Dependent == Dependency) return;
+
+    auto &Dependencies = AnalysisDependencies[Dependent];
+    if (!Dependencies.insert(Dependency).second) return;
+    ReverseAnalysisDependencies[Dependency].insert(Dependent);
+}
+
+template <typename IRUnitT>
+void AnalysisPassManager<IRUnitT>::eraseCachedResults(
+    const std::set<typename AnalysisPassManager<IRUnitT>::CacheKey> &Keys) {
+    for (const CacheKey &Key : Keys) ResultCache.erase(Key);
+
+    // 先移除每个失效结果的出边，并同步更新依赖对象的反向边。
+    for (const CacheKey &Key : Keys) {
+        auto ForwardIt = AnalysisDependencies.find(Key);
+        if (ForwardIt == AnalysisDependencies.end()) continue;
+
+        std::set<CacheKey> Dependencies = std::move(ForwardIt->second);
+        AnalysisDependencies.erase(ForwardIt);
+        for (const CacheKey &Dependency : Dependencies) {
+            auto ReverseIt = ReverseAnalysisDependencies.find(Dependency);
+            if (ReverseIt == ReverseAnalysisDependencies.end()) continue;
+            ReverseIt->second.erase(Key);
+            if (ReverseIt->second.empty())
+                ReverseAnalysisDependencies.erase(ReverseIt);
+        }
+    }
+
+    // 再移除指向失效结果的入边。集合副本避免在遍历时修改同一容器。
+    for (const CacheKey &Key : Keys) {
+        auto ReverseIt = ReverseAnalysisDependencies.find(Key);
+        if (ReverseIt == ReverseAnalysisDependencies.end()) continue;
+
+        std::set<CacheKey> Dependents = std::move(ReverseIt->second);
+        ReverseAnalysisDependencies.erase(ReverseIt);
+        for (const CacheKey &Dependent : Dependents) {
+            auto ForwardIt = AnalysisDependencies.find(Dependent);
+            if (ForwardIt == AnalysisDependencies.end()) continue;
+            ForwardIt->second.erase(Key);
+            if (ForwardIt->second.empty())
+                AnalysisDependencies.erase(ForwardIt);
+        }
+    }
+}
+
+template <typename IRUnitT>
+void AnalysisPassManager<IRUnitT>::clear() {
+    assert(ActiveAnalysisStack.empty() &&
+           "cannot clear analyses while an analysis is running");
+    ResultCache.clear();
+    AnalysisDependencies.clear();
+    ReverseAnalysisDependencies.clear();
+}
+
+template <typename IRUnitT>
+void AnalysisPassManager<IRUnitT>::invalidate(
+    IRUnitT &IR, const PassResult &Result) {
+    if (!Result.changedIR()) return;
+
+    const PreservationStatus &PA = Result.preservedAnalyses();
+    std::set<CacheKey> InvalidKeys;
+
+    // 初始集合包含当前单元的结果，以及所有声明为跨单元的结果。
+    for (auto &Entry : ResultCache) {
+        PassID *AnalysisID = Entry.first.first;
+        const bool IsCrossUnit =
+            CrossUnitAnalysisIDs.count(AnalysisID) != 0;
+        if (!IsCrossUnit && Entry.first.second != &IR) continue;
+        if (!PA.isKept(AnalysisID) ||
+            Entry.second->invalidate(*Entry.first.second, PA)) {
+            InvalidKeys.insert(Entry.first);
+        }
+    }
+
+    // 沿缓存键反向依赖图求闭包；跨单元分析的任一结果失效时，同类型的
+    // 全部缓存结果都要进入闭包，再继续传播到各自的普通依赖者。
+    std::vector<CacheKey> Worklist(InvalidKeys.begin(), InvalidKeys.end());
+    std::set<PassID *> ExpandedCrossUnitIDs;
+    for (std::size_t Index = 0; Index < Worklist.size(); ++Index) {
+        const CacheKey Key = Worklist[Index];
+        PassID *AnalysisID = Key.first;
+        if (CrossUnitAnalysisIDs.count(AnalysisID) &&
+            ExpandedCrossUnitIDs.insert(AnalysisID).second) {
+            for (const auto &Entry : ResultCache) {
+                if (Entry.first.first != AnalysisID) continue;
+                if (InvalidKeys.insert(Entry.first).second)
+                    Worklist.push_back(Entry.first);
+            }
+        }
+
+        auto ReverseIt = ReverseAnalysisDependencies.find(Key);
+        if (ReverseIt == ReverseAnalysisDependencies.end()) continue;
+        for (const CacheKey &Dependent : ReverseIt->second) {
+            if (!ResultCache.count(Dependent)) continue;
+            if (InvalidKeys.insert(Dependent).second)
+                Worklist.push_back(Dependent);
+        }
+    }
+
+    eraseCachedResults(InvalidKeys);
+
+    // 模块管理器利用回调同步清理函数分析；桥接器已处理时不重复执行。
+    if (!PA.wasCrossUnitInvalidationHandled() && IRMutationCallback)
+        IRMutationCallback();
+}
+
+template <typename IRUnitT>
+void AnalysisPassManager<IRUnitT>::invalidate(
+    IRUnitT &IR, PreservationStatus PA) {
+    invalidate(IR, PassResult::fromLegacy(std::move(PA)));
+}
+
 ModuleFunctionBridge::ModuleFunctionBridge(
     std::unique_ptr<FunctionPassInterfaceT> Pass,
     FunctionAnalysisPassManager &FAM)

@@ -1,8 +1,10 @@
 #include "ir/opt/LoopDistribution.hpp"
 
+#include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopDependence.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
+#include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
@@ -29,7 +31,8 @@ bool LoopDistributionPass::hasUnsupportedInstruction(Instruction *I) {
 }
 
 bool LoopDistributionPass::valueDependsOnLoad(
-    Value *V, std::unordered_set<Value *> &Seen, unsigned Depth) {
+    Value *V, std::unordered_set<Value *> &Seen,
+    const BlockSet &LoopBlocks, unsigned Depth) {
     if (!V) return false;
     // Exhausting the proof budget is unknown, not evidence of purity.  Treat
     // it like a load-dependent condition so distribution is conservatively
@@ -38,10 +41,14 @@ bool LoopDistributionPass::valueDependsOnLoad(
     if (!Seen.insert(V).second) return false;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return false;
+    // 循环外已经求值的 load/call 是分布域的不变量，克隆循环不会重复执行
+    // 它们；只有循环内部计算出的内存相关条件才可能改变两分区的控制轨迹。
+    if (!I->getParent() || !LoopBlocks.count(I->getParent())) return false;
     if (dynamic_cast<LoadInst *>(I) || dynamic_cast<CallInst *>(I))
         return true;
     for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
-        if (valueDependsOnLoad(I->getOperand(Index), Seen, Depth + 1))
+        if (valueDependsOnLoad(I->getOperand(Index), Seen, LoopBlocks,
+                               Depth + 1))
             return true;
     }
     return false;
@@ -49,11 +56,13 @@ bool LoopDistributionPass::valueDependsOnLoad(
 
 bool LoopDistributionPass::hasMemoryDependentControl(
     const std::vector<BasicBlock *> &Blocks) {
+    BlockSet LoopBlocks(Blocks.begin(), Blocks.end());
     for (BasicBlock *BB : Blocks) {
         auto *Br = BB ? BB->getBranchTerminator() : nullptr;
         if (!BasicBlock::isCondBr(Br)) continue;
         std::unordered_set<Value *> Seen;
-        if (valueDependsOnLoad(Br->getCondition(), Seen)) return true;
+        if (valueDependsOnLoad(Br->getCondition(), Seen, LoopBlocks))
+            return true;
     }
     return false;
 }
@@ -151,7 +160,8 @@ LoopDistributionPass::getDistributionShape(Function &F, Loop *L) {
 
 LoopDistributionPass::InstructionSet
 LoopDistributionPass::collectBackwardSlice(
-    StoreInst *Root, const BlockSet &LoopBlocks) {
+    StoreInst *Root, const BlockSet &LoopBlocks,
+    const InstructionSet *StopValues) {
     InstructionSet Slice;
     std::vector<Instruction *> WorkList;
     if (Root) WorkList.push_back(Root);
@@ -163,6 +173,7 @@ LoopDistributionPass::collectBackwardSlice(
             !Slice.insert(I).second) {
             continue;
         }
+        if (StopValues && StopValues->count(I)) continue;
         for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
             auto *Def = dynamic_cast<Instruction *>(I->getOperand(Index));
             if (Def && Def->getParent() && LoopBlocks.count(Def->getParent()))
@@ -170,6 +181,113 @@ LoopDistributionPass::collectBackwardSlice(
         }
     }
     return Slice;
+}
+
+bool LoopDistributionPass::isAnchorOrderedDistributionLegal(
+    const DistributionPlan &Plan, LoopDependenceInfo &LD,
+    DominatorTree &DT) {
+    const DistributionShape &Shape = Plan.Shape;
+    if (!Shape.L || !Shape.Header || Plan.FirstStores.size() != 1)
+        return false;
+
+    StoreInst *Anchor = Plan.FirstStores.front();
+    BasicBlock *AnchorBlock = Anchor ? Anchor->getParent() : nullptr;
+    if (!AnchorBlock || !Shape.L->contains(AnchorBlock) ||
+        !DT.dominates(Shape.Header, AnchorBlock) ||
+        !DT.dominates(AnchorBlock, Shape.Latch)) {
+        return false;
+    }
+
+    std::vector<Instruction *> FirstMemory;
+    for (Instruction *I : Plan.FirstSlice) {
+        if (!dynamic_cast<LoadInst *>(I) &&
+            !dynamic_cast<StoreInst *>(I)) {
+            continue;
+        }
+        // 该保守子集要求第一分区的内存访问都与桥接 store 位于同一块，
+        // 并在它之前完成，从而无需猜测复杂 CFG 中的动态语句顺序。
+        if (I->getParent() != AnchorBlock ||
+            (I != Anchor && !I->comesBefore(Anchor))) {
+            return false;
+        }
+        FirstMemory.push_back(I);
+    }
+
+    for (Instruction *Second : Plan.SecondLegalitySlice) {
+        if (!dynamic_cast<LoadInst *>(Second) &&
+            !dynamic_cast<StoreInst *>(Second)) {
+            continue;
+        }
+        if (!Second->getParent() || !Shape.L->contains(Second->getParent()))
+            return false;
+        if (Second->getParent() == AnchorBlock) {
+            if (!Anchor->comesBefore(Second)) return false;
+        } else if (!DT.dominates(AnchorBlock, Second->getParent())) {
+            return false;
+        }
+        for (Instruction *First : FirstMemory) {
+            if (!LD.isConflictLocalToIteration(First, Second, Shape.L))
+                return false;
+        }
+    }
+    return true;
+}
+
+bool LoopDistributionPass::buildForwardingPlan(
+    DistributionPlan &Plan, const BlockSet &Blocks,
+    LoopDependenceInfo &LD, DominatorTree &DT,
+    const LoopInfo &LI) {
+    if (!Plan.Shape.L || !Plan.Shape.Header ||
+        Plan.FirstStores.size() != 1 || Plan.SecondStores.empty()) {
+        return false;
+    }
+
+    StoreInst *Store = Plan.FirstStores.front();
+    auto *Producer = Store
+        ? dynamic_cast<Instruction *>(Store->getValueOperand())
+        : nullptr;
+    BasicBlock *StoreBlock = Store ? Store->getParent() : nullptr;
+    if (!Store || !Producer || !StoreBlock ||
+        LI.getLoopFor(StoreBlock) != Plan.Shape.L ||
+        !DT.dominates(Plan.Shape.Header, StoreBlock) ||
+        !DT.dominates(StoreBlock, Plan.Shape.Latch) ||
+        !Plan.FirstSlice.count(Producer) ||
+        !Plan.SecondSlice.count(Producer) ||
+        !LD.isConflictLocalToIteration(Store, Store, Plan.Shape.L)) {
+        return false;
+    }
+
+    bool HasForwardedUse = false;
+    for (Use *U : Producer->getUses()) {
+        auto *UserI = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
+        if (!UserI || !UserI->getParent() ||
+            !Blocks.count(UserI->getParent())) {
+            return false;
+        }
+        if (!Plan.SecondSlice.count(UserI)) continue;
+        // reload 会插在原 store 的位置；同块内位于 store 之前的使用不受
+        // 该定义支配，不能作为跨分区桥接点。
+        if (UserI->getParent() == StoreBlock) {
+            if (!Store->comesBefore(UserI)) return false;
+        } else if (!DT.dominates(StoreBlock, UserI->getParent())) {
+            return false;
+        }
+        HasForwardedUse = true;
+    }
+    if (!HasForwardedUse) return false;
+
+    InstructionSet Stops;
+    Stops.insert(Producer);
+    InstructionSet EffectiveSecond;
+    for (StoreInst *Root : Plan.SecondStores) {
+        mergeSlice(EffectiveSecond,
+                   collectBackwardSlice(Root, Blocks, &Stops));
+    }
+    if (EffectiveSecond.empty()) return false;
+
+    Plan.SecondLegalitySlice = std::move(EffectiveSecond);
+    Plan.ForwardedValues.push_back({Store, Producer});
+    return isAnchorOrderedDistributionLegal(Plan, LD, DT);
 }
 
 void LoopDistributionPass::mergeSlice(InstructionSet &Into,
@@ -242,9 +360,32 @@ unsigned LoopDistributionPass::localityDistance(
     return Distance >= 100 ? Distance : 0;
 }
 
+unsigned LoopDistributionPass::interchangeOpportunity(
+    const InstructionSet &Slice, Loop *L, LoopDependenceInfo &LD) {
+    if (!L || L->getSubLoops().size() != 1) return 0;
+    Loop *Inner = L->getSubLoops().front();
+    if (!Inner || !LD.isInterchangeLegal(L, Inner)) return 0;
+
+    unsigned Benefit = 0;
+    for (Instruction *I : Slice) {
+        const bool IsStore = dynamic_cast<StoreInst *>(I) != nullptr;
+        const bool IsLoad = dynamic_cast<LoadInst *>(I) != nullptr;
+        if (!IsStore && !IsLoad) continue;
+        auto OuterStride = LD.getByteStride(I, L);
+        auto InnerStride = LD.getByteStride(I, Inner);
+        if (!OuterStride || !InnerStride) continue;
+        const unsigned OuterCost = strideBucket(*OuterStride);
+        const unsigned InnerCost = strideBucket(*InnerStride);
+        if (InnerCost <= OuterCost) continue;
+        Benefit += (IsStore ? 2U : 1U) * (InnerCost - OuterCost);
+    }
+    return Benefit;
+}
+
 std::optional<LoopDistributionPass::DistributionPlan>
 LoopDistributionPass::findDistributionPlan(
-    Function &F, Loop *L, LoopDependenceInfo &LD) {
+    Function &F, Loop *L, LoopDependenceInfo &LD,
+    DominatorTree &DT, const LoopInfo &LI, SCEVResult &SE) {
     auto Shape = getDistributionShape(F, L);
     if (!Shape) return std::nullopt;
 
@@ -262,13 +403,6 @@ LoopDistributionPass::findDistributionPlan(
         for (std::size_t I = Cut; I < Slices.size(); ++I)
             mergeSlice(Second, Slices[I]);
 
-        const unsigned Distance =
-            localityDistance(First, Second, Shape->L, LD);
-        if (Distance == 0 ||
-            !LD.isDistributionLegal(Shape->L, First, Second)) {
-            continue;
-        }
-
         DistributionPlan Plan;
         Plan.Shape = *Shape;
         Plan.FirstStores.assign(Shape->Stores.begin(),
@@ -277,6 +411,36 @@ LoopDistributionPass::findDistributionPlan(
                                  Shape->Stores.end());
         Plan.FirstSlice = First;
         Plan.SecondSlice = std::move(Second);
+        Plan.SecondLegalitySlice = Plan.SecondSlice;
+        const bool DirectlyLegal = LD.isDistributionLegal(
+            Shape->L, Plan.FirstSlice, Plan.SecondLegalitySlice);
+        const bool ForwardLegal = !DirectlyLegal &&
+            buildForwardingPlan(Plan, Blocks, LD, DT, LI);
+        if (!DirectlyLegal && !ForwardLegal)
+            continue;
+
+        unsigned Distance = localityDistance(
+            Plan.FirstSlice, Plan.SecondLegalitySlice, Shape->L, LD);
+        if (Distance == 0 && !Plan.ForwardedValues.empty()) {
+            // imperfect nest 的整体画像可能相近，但第二分区独立交换外轴和
+            // 唯一子轴后仍能把大步长访问变成连续访问。只有依赖分析已经
+            // 证明可交换且至少改善一个 stride 档位时才承担克隆开销。
+            const unsigned Opportunity = interchangeOpportunity(
+                Plan.SecondLegalitySlice, Shape->L, LD);
+            if (Opportunity != 0) Distance = 100 * Opportunity;
+        }
+        if (Distance == 0) continue;
+        for (Loop *SubLoop : Shape->L->getSubLoops()) {
+            if (isPrunableFirstLoop(SubLoop, Plan, SE))
+                Plan.PrunedFirstLoops.push_back(SubLoop);
+        }
+        // 当前 CFG 提交只删除一个独立叶循环；多个待删子循环需要额外的
+        // 出口与支配关系重建，不能复用单循环证明。
+        if (Plan.PrunedFirstLoops.size() > 1) continue;
+        if (!Plan.ForwardedValues.empty() &&
+            Plan.PrunedFirstLoops.empty()) {
+            continue;
+        }
         Plan.LocalityDistance = Distance;
         if (!Best || Plan.LocalityDistance > Best->LocalityDistance)
             Best = std::move(Plan);
@@ -296,6 +460,124 @@ void LoopDistributionPass::destroyClonedBlocks(
     for (BasicBlock *BB : Blocks)
         delete BB;
     Blocks.clear();
+}
+
+void LoopDistributionPass::deleteDeadClonedSlice(
+    Instruction *Root, const BlockSet &ClonedBlocks) {
+    std::vector<Instruction *> WorkList;
+    std::unordered_set<Instruction *> Pending;
+    if (Root) {
+        WorkList.push_back(Root);
+        Pending.insert(Root);
+    }
+    while (!WorkList.empty()) {
+        Instruction *I = WorkList.back();
+        WorkList.pop_back();
+        Pending.erase(I);
+        if (!I || !I->getParent() ||
+            !ClonedBlocks.count(I->getParent()) ||
+            I->hasUses() ||
+            dynamic_cast<StoreInst *>(I) || dynamic_cast<CallInst *>(I) ||
+            dynamic_cast<BrInst *>(I) || dynamic_cast<RetInst *>(I) ||
+            dynamic_cast<PhiInst *>(I) || dynamic_cast<AllocaInst *>(I) ||
+            dceInstructionMustBePreserved(I)) {
+            continue;
+        }
+
+        std::vector<Instruction *> Operands;
+        for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+            auto *Operand = dynamic_cast<Instruction *>(I->getOperand(Index));
+            if (Operand && Operand->getParent() &&
+                ClonedBlocks.count(Operand->getParent())) {
+                Operands.push_back(Operand);
+            }
+        }
+        I->clearOperands();
+        delete I;
+        for (Instruction *Operand : Operands) {
+            if (Operand && Pending.insert(Operand).second)
+                WorkList.push_back(Operand);
+        }
+    }
+}
+
+bool LoopDistributionPass::isPrunableFirstLoop(
+    Loop *L, const DistributionPlan &Plan, SCEVResult &SE) {
+    if (!L || !L->getHeader() || !L->getSubLoops().empty() ||
+        !SE.isKnownFiniteLoop(L)) {
+        return false;
+    }
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return false;
+    }
+    auto *PreBr = PreHeader->getBranchTerminator();
+    const auto Exits = L->getExitBlocks();
+    if (!BasicBlock::isUncondBr(PreBr) ||
+        PreBr->getTrueSuccessor() != L->getHeader() ||
+        Exits.size() != 1 || !Exits.front() ||
+        L->contains(Plan.Shape.Exiting) ||
+        !Plan.Shape.L->contains(Exits.front()) ||
+        !Exits.front()->collectPhiNodes().empty()) {
+        return false;
+    }
+
+    std::unordered_set<StoreInst *> RemovedStores(
+        Plan.SecondStores.begin(), Plan.SecondStores.end());
+    bool RemovesStatement = false;
+    for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I) return false;
+            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+                if (!RemovedStores.count(Store)) return false;
+                RemovesStatement = true;
+                continue;
+            }
+            if (dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<RetInst *>(I) ||
+                dynamic_cast<AllocaInst *>(I) ||
+                dceInstructionMustBePreserved(I)) {
+                return false;
+            }
+            for (Use *U : I->getUses()) {
+                auto *UserI = dynamic_cast<Instruction *>(
+                    U ? U->getUser() : nullptr);
+                if (!UserI || !UserI->getParent() ||
+                    !L->contains(UserI->getParent())) {
+                    return false;
+                }
+            }
+        }
+    }
+    return RemovesStatement;
+}
+
+void LoopDistributionPass::pruneFirstLoopCFG(Loop *L) {
+    if (!L || !L->getHeader()) return;
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) || !PreHeader || !Latch)
+        return;
+    const auto Exits = L->getExitBlocks();
+    if (Exits.size() != 1 || !Exits.front()) return;
+    std::vector<BasicBlock *> Blocks = L->getBlocksInFunctionOrder();
+    if (!PreHeader->replaceTerminator(new BrInst(Exits.front()))) return;
+
+    // 先断开整棵无副作用子循环的 use-def 与 CFG 边，再统一释放块，避免
+    // 逐块删除时其他块仍持有已释放的标签或指令引用。
+    for (BasicBlock *BB : Blocks) {
+        if (!BB) continue;
+        for (Instruction *I : *BB)
+            if (I) I->clearOperands();
+    }
+    for (BasicBlock *BB : Blocks)
+        if (BB) BB->clear();
+    for (BasicBlock *BB : Blocks)
+        if (BB) delete BB;
 }
 
 bool LoopDistributionPass::executeDistribution(
@@ -328,6 +610,9 @@ bool LoopDistributionPass::executeDistribution(
 
     BasicBlock *CloneHeader = Region->getClonedBlock(Shape.Header);
     BasicBlock *CloneExiting = Region->getClonedBlock(Shape.Exiting);
+    BlockSet ClonedBlockSet(Region->ClonedBlocks.begin(),
+                            Region->ClonedBlocks.end());
+    std::vector<Instruction *> MappedProducers;
     std::vector<StoreInst *> ClonedFirstStores;
     ClonedFirstStores.reserve(Plan.FirstStores.size());
     for (StoreInst *Store : Plan.FirstStores) {
@@ -348,9 +633,60 @@ bool LoopDistributionPass::executeDistribution(
         return false;
     }
 
-    // All fallible work is complete.  Install the serial edge first; store
-    // deletion below cannot fail and leaves every side effect in exactly one
-    // of the two loop versions.
+    for (const DistributionPlan::ForwardedValue &Bridge :
+         Plan.ForwardedValues) {
+        auto *MappedStore = dynamic_cast<StoreInst *>(
+            Region->getClonedInstruction(Bridge.Store));
+        auto *MappedProducer = dynamic_cast<Instruction *>(
+            Region->getClonedInstruction(Bridge.Producer));
+        if (!MappedStore || !MappedProducer ||
+            !MappedStore->getPointerOperand()) {
+            destroyClonedBlocks(Region->ClonedBlocks);
+            delete NewPreHeader;
+            return false;
+        }
+        MappedProducers.push_back(MappedProducer);
+
+        std::vector<Use *> ForwardedUses;
+        for (Use *OriginalUse : Bridge.Producer->getUses()) {
+            auto *OriginalUser = dynamic_cast<Instruction *>(
+                OriginalUse ? OriginalUse->getUser() : nullptr);
+            if (!OriginalUser || !Plan.SecondSlice.count(OriginalUser))
+                continue;
+            Instruction *MappedUser =
+                Region->getClonedInstruction(OriginalUser);
+            if (!MappedUser) {
+                destroyClonedBlocks(Region->ClonedBlocks);
+                delete NewPreHeader;
+                return false;
+            }
+            for (std::size_t Index = 0;
+                 Index < MappedUser->getNumOperands(); ++Index) {
+                if (MappedUser->getOperand(Index) == MappedProducer)
+                    ForwardedUses.push_back(
+                        MappedUser->getOperandUse(Index));
+            }
+        }
+        if (ForwardedUses.empty()) {
+            destroyClonedBlocks(Region->ClonedBlocks);
+            delete NewPreHeader;
+            return false;
+        }
+
+        auto *Reload = new LoadInst(MappedStore->getPointerOperand());
+        Reload->setIdent(Bridge.Producer->getIdent() + ".dist.reload");
+        if (!MappedStore->insertBefore(Reload)) {
+            delete Reload;
+            destroyClonedBlocks(Region->ClonedBlocks);
+            delete NewPreHeader;
+            return false;
+        }
+        for (Use *U : ForwardedUses)
+            U->replaceUseeWith(Reload);
+    }
+
+    // 所有可能失败的检查均已完成。先接好串行边，再删除两个分区中各自
+    // 不属于该分区的 store；桥接 reload 只读取第一循环已经提交的值。
     NewPreHeader->genUnCondInst(CloneHeader);
     if (!BasicBlock::redirectBranchTarget(Shape.Exiting, Shape.Exit,
                                           NewPreHeader)) {
@@ -364,6 +700,10 @@ bool LoopDistributionPass::executeDistribution(
         delete Store;
     for (StoreInst *Store : ClonedFirstStores)
         delete Store;
+    for (Instruction *Producer : MappedProducers)
+        deleteDeadClonedSlice(Producer, ClonedBlockSet);
+    for (Loop *DeadLoop : Plan.PrunedFirstLoops)
+        pruneFirstLoopCFG(DeadLoop);
     return true;
 }
 
@@ -374,6 +714,7 @@ PassResult LoopDistributionPass::run(Function &F,
         return PassResult::unchanged();
 
     auto &LI = FAM.getResult<LoopAnalysis>(F);
+    auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &LD = FAM.getResult<LoopDependenceAnalysis>(F);
     std::vector<Loop *> Loops = LI.getLoopsInPostOrder();
@@ -383,7 +724,7 @@ PassResult LoopDistributionPass::run(Function &F,
     for (auto It = Loops.rbegin(); It != Loops.rend(); ++It) {
         Loop *L = *It;
         if (!hasFiniteLoopTree(L, SE)) continue;
-        auto Plan = findDistributionPlan(F, L, LD);
+        auto Plan = findDistributionPlan(F, L, LD, DT, LI, SE);
         if (!Plan) continue;
         if (!executeDistribution(F, *Plan)) continue;
         ++Count;

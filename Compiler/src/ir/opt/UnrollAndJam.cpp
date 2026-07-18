@@ -6,8 +6,10 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
+#include "ir/opt/LoopUnroll.hpp"
 #include "lib/CFG.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 
@@ -348,7 +350,7 @@ bool UnrollAndJamPass::instructionDependsOnLane(
 
 bool UnrollAndJamPass::hasShareableLaneRead(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
-    const std::unordered_map<Value *, Value *> &LaneValues) {
+    const std::unordered_set<Instruction *> &LaneValues) {
     for (BasicBlock *BB : Shape.Blocks) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -379,7 +381,7 @@ bool UnrollAndJamPass::hasShareableLaneRead(
 
 bool UnrollAndJamPass::hasLaneCoalescingBenefit(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
-    const std::unordered_map<Value *, Value *> &LaneValues,
+    const std::unordered_set<Instruction *> &LaneValues,
     const UnrollAndJamConfig &C) {
     if (C.CacheLineBytes <= 0 || C.MinCoalescedAxisTripCount <= 0 ||
         C.MinLaneTraversalBytes <= 0)
@@ -436,9 +438,210 @@ bool UnrollAndJamPass::hasLaneCoalescingBenefit(
     return false;
 }
 
-bool UnrollAndJamPass::collectLaneInstructions(
-    UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
+bool UnrollAndJamPass::hasSlidingWindowBenefit(
+    const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
+    const std::unordered_set<Instruction *> &LaneValues, int Factor,
     const UnrollAndJamConfig &C) {
+    if (!isSupportedFactor(Factor) || C.CacheLineBytes <= 0)
+        return false;
+
+    for (BasicBlock *BB : Shape.Blocks) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            auto *Load = dynamic_cast<LoadInst *>(I);
+            if (!Load || !LaneValues.count(Load) || !Load->getIRType() ||
+                !Load->getIRType()->isScalar()) {
+                continue;
+            }
+            const std::size_t ElementBytes = Load->getIRType()->getSize();
+            if (ElementBytes == 0 ||
+                ElementBytes > static_cast<std::size_t>(
+                                   std::numeric_limits<std::int64_t>::max())) {
+                continue;
+            }
+            auto OuterStride = LA.getByteStride(
+                Load, Shape.Outer, Shape.Outer);
+            if (!OuterStride) continue;
+            const std::int64_t ElementStride =
+                static_cast<std::int64_t>(ElementBytes);
+            if (*OuterStride != ElementStride &&
+                *OuterStride != -ElementStride) {
+                continue;
+            }
+
+            const __int128 Magnitude = *OuterStride < 0
+                ? -static_cast<__int128>(*OuterStride)
+                : static_cast<__int128>(*OuterStride);
+            const __int128 LaneSpan =
+                static_cast<__int128>(Factor - 1) * Magnitude +
+                ElementBytes;
+            if (LaneSpan > C.CacheLineBytes) continue;
+
+            for (Loop *Axis : Shape.SharedLoops) {
+                auto Trip = SE.analyzeLoopTripCount(Axis);
+                auto AxisStride = LA.getByteStride(
+                    Load, Shape.Outer, Axis);
+                if (!Trip || !Trip->Valid || !Trip->ConstantTripCount ||
+                    *Trip->ConstantTripCount <= 1 || !AxisStride ||
+                    *AxisStride != *OuterStride) {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool UnrollAndJamPass::isStrictFPRecurrencePath(
+    Value *Current, PhiInst *Phi, std::unordered_set<Value *> &Active,
+    unsigned Depth) {
+    if (!Current || !Phi || Depth > 16) return false;
+    if (Current == Phi) return true;
+    if (!Active.insert(Current).second) return false;
+
+    bool ReachesPhi = false;
+    if (auto *Binary = dynamic_cast<BinaryInst *>(Current)) {
+        if (Binary->instType == Instruction::FADD ||
+            Binary->instType == Instruction::FSUB) {
+            ReachesPhi = isStrictFPRecurrencePath(
+                Binary->getOperand(0), Phi, Active, Depth + 1) ||
+                isStrictFPRecurrencePath(
+                    Binary->getOperand(1), Phi, Active, Depth + 1);
+        }
+    } else if (auto *ForwardPhi = dynamic_cast<PhiInst *>(Current)) {
+        for (unsigned Index = 0;
+             Index < ForwardPhi->getNumIncomingValues(); ++Index) {
+            if (isStrictFPRecurrencePath(
+                    ForwardPhi->getIncomingValue(Index), Phi,
+                    Active, Depth + 1)) {
+                ReachesPhi = true;
+                break;
+            }
+        }
+    }
+    Active.erase(Current);
+    return ReachesPhi;
+}
+
+unsigned UnrollAndJamPass::countStrictFPReductions(
+    const UnrollAndJamShape &Shape) {
+    unsigned Count = 0;
+    for (Instruction *I : Shape.LaneInstructions) {
+        auto *Phi = dynamic_cast<PhiInst *>(I);
+        if (!Phi || !Phi->getIRType() || !Phi->getIRType()->isFloat())
+            continue;
+
+        bool IsStrictRecurrence = false;
+        for (unsigned Index = 0; Index < Phi->getNumIncomingValues();
+             ++Index) {
+            std::unordered_set<Value *> Active;
+            if (isStrictFPRecurrencePath(
+                    Phi->getIncomingValue(Index), Phi, Active)) {
+                IsStrictRecurrence = true;
+                break;
+            }
+        }
+        if (IsStrictRecurrence) ++Count;
+    }
+    return Count;
+}
+
+bool UnrollAndJamPass::fitsRegisterBudget(
+    const UnrollAndJamShape &Shape, int Factor,
+    const UnrollAndJamConfig &C) {
+    if (!isSupportedFactor(Factor) || C.FPRBudget == 0 ||
+        C.GPRBudget == 0) {
+        return false;
+    }
+    const __int128 Growth =
+        static_cast<__int128>(Factor - 1) *
+        Shape.LaneInstructions.size();
+    if (Growth > C.MaxClonedInstructions) return false;
+
+    unsigned RawLaneFPValues = 0;
+    unsigned LaneAddressDepth = 0;
+    unsigned LaneIntegerPhis = 0;
+    for (Instruction *I : Shape.LaneInstructions) {
+        if (!I || !I->getIRType()) continue;
+        if (I->getIRType()->isFloat() &&
+            (dynamic_cast<PhiInst *>(I) || dynamic_cast<LoadInst *>(I) ||
+             dynamic_cast<BinaryInst *>(I))) {
+            ++RawLaneFPValues;
+        } else if (I->getIRType()->isPointer()) {
+            ++LaneAddressDepth;
+        } else if (I->getIRType()->isInt() &&
+                   dynamic_cast<PhiInst *>(I)) {
+            ++LaneIntegerPhis;
+        }
+    }
+
+    // 地址计算是短生命周期链，只按两级同时活跃临时量估算；浮点
+    // load/mul/add/PHI 全部计入，防止八路归约造成隐蔽的寄存器溢出。
+    const unsigned StrictReductions = countStrictFPReductions(Shape);
+    const unsigned LaneFPValues = StrictReductions == 0
+        ? RawLaneFPValues
+        : StrictReductions + 2;
+    const unsigned GPRPerLane =
+        1 + LaneIntegerPhis + std::min(2u, LaneAddressDepth);
+    const __int128 ProjectedFPR =
+        4 + static_cast<__int128>(Factor) * LaneFPValues;
+    const __int128 ProjectedGPR =
+        4 + static_cast<__int128>(Factor) * GPRPerLane;
+    return ProjectedFPR <= C.FPRBudget && ProjectedGPR <= C.GPRBudget;
+}
+
+bool UnrollAndJamPass::isSupportedFactor(int Factor) {
+    return Factor == 2 || Factor == 4 || Factor == 8;
+}
+
+std::optional<int> UnrollAndJamPass::selectFactor(
+    const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
+    const UnrollAndJamConfig &C) {
+    if (!Shape.OuterTrip.ConstantTripCount || C.MaxFactor < 2)
+        return std::nullopt;
+
+    std::unordered_set<Instruction *> LaneValues(
+        Shape.LaneInstructions.begin(), Shape.LaneInstructions.end());
+    const bool Shareable = hasShareableLaneRead(Shape, LA, LaneValues);
+    if (!Shareable) return std::nullopt;
+    const bool LongTraversal = hasLaneCoalescingBenefit(
+        Shape, LA, SE, LaneValues, C);
+    const unsigned StrictReductions = countStrictFPReductions(Shape);
+
+    auto IsProfitable = [&](int Factor) {
+        if (!isSupportedFactor(Factor) || Factor > C.MaxFactor ||
+            *Shape.OuterTrip.ConstantTripCount < Factor ||
+            !fitsRegisterBudget(Shape, Factor, C)) {
+            return false;
+        }
+        const bool Sliding = StrictReductions != 0 &&
+            hasSlidingWindowBenefit(
+                Shape, LA, SE, LaneValues, Factor, C);
+        return LongTraversal || Sliding;
+    };
+
+    if (C.Factor != 0)
+        return IsProfitable(C.Factor)
+            ? std::optional<int>(C.Factor)
+            : std::nullopt;
+
+    int LatencyFactor = 2;
+    while (LatencyFactor < static_cast<int>(C.EstimatedFPAddLatency) &&
+           LatencyFactor < 8) {
+        LatencyFactor *= 2;
+    }
+    if (StrictReductions != 0) {
+        for (int Factor = LatencyFactor; Factor >= 2; Factor /= 2)
+            if (IsProfitable(Factor)) return Factor;
+    }
+    // 没有严格浮点延迟链时沿用保守的两路选择，避免仅凭复制扩大压力。
+    if (IsProfitable(2)) return 2;
+    return std::nullopt;
+}
+
+bool UnrollAndJamPass::collectLaneInstructions(
+    UnrollAndJamShape &Shape, const UnrollAndJamConfig &C) {
     std::unordered_map<Value *, Value *> LaneValues;
     LaneValues[Shape.OuterInduction.Phi] = Shape.OuterInduction.Phi;
 
@@ -479,24 +682,14 @@ bool UnrollAndJamPass::collectLaneInstructions(
                 return false;
         }
     }
-    if (Shape.LaneInstructions.empty()) return false;
-    // Bind the profitability proof to the actual cloned slice. A read must be
-    // invariant across output lanes, advance in the shared reduction nest and
-    // feed a lane-dependent instruction. In addition, a lane-dependent stream
-    // must advance by one element between lanes, use a cache-line-sized shared
-    // stride and traverse at least MinLaneTraversalBytes. This is the case
-    // where jamming consumes neighboring elements before the long traversal
-    // evicts their line; a small resident convolution kernel alone is
-    // deliberately insufficient.
-    return hasShareableLaneRead(Shape, LA, LaneValues) &&
-           hasLaneCoalescingBenefit(Shape, LA, SE, LaneValues, C);
+    return !Shape.LaneInstructions.empty();
 }
 
 std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
     LoopAccessInfo &LA, DominatorTree &DT, PostDominatorTree &PDT,
     const UnrollAndJamConfig &C) {
-    if (!Outer || !Inner || C.Factor != 2 ||
+    if (!Outer || !Inner ||
         !LA.isRectangularNest(Outer, Inner) ||
         !LA.areIterationsIndependent(Outer, Outer)) {
         return std::nullopt;
@@ -506,23 +699,17 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     auto OuterInduction = SE.getCanonicalInduction(Outer);
     auto InnerInduction = SE.getCanonicalInduction(Inner);
     if (!OuterTrip || !InnerTrip || !OuterInduction || !InnerInduction ||
-        !OuterTrip->ProvenNoWrap || !OuterTrip->ConstantTripCount ||
-        *OuterTrip->ConstantTripCount < C.Factor ||
-        (*OuterTrip->ConstantTripCount % C.Factor) != 0 ||
+        !OuterTrip->ConstantTripCount ||
+        *OuterTrip->ConstantTripCount < 2 ||
         !OuterInduction->ConstantStep ||
         *OuterInduction->ConstantStep <= 0 ||
+        !SE.isKnownNoWrapInductionValue(
+            Outer, OuterInduction->Phi) ||
         !hasOnlyCanonicalHeaderPhi(Outer, OuterInduction->Phi) ||
         !hasControlOnlyHeader(Outer, OuterInduction->Phi, *OuterTrip,
                               /*AllowReductionPhis=*/false)) {
         return std::nullopt;
     }
-    const __int128 NewStep =
-        static_cast<__int128>(*OuterInduction->ConstantStep) * C.Factor;
-    if (NewStep <= 0 ||
-        NewStep > std::numeric_limits<std::int32_t>::max()) {
-        return std::nullopt;
-    }
-
     UnrollAndJamShape Shape;
     Shape.Outer = Outer;
     Shape.Inner = Inner;
@@ -539,35 +726,39 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     Shape.Blocks = Outer->getBlocksInFunctionOrder();
     if (!collectControl(Shape, SE, C) || !analyzeOuterControl(Shape) ||
         !validateShape(Shape, LI, SE, DT, PDT, C) ||
-        !collectLaneInstructions(Shape, LA, SE, C)) {
+        !collectLaneInstructions(Shape, C)) {
         return std::nullopt;
     }
     return Shape;
 }
 
 void UnrollAndJamPass::destroyClonePlan(UnrollAndJamClonePlan &Plan) {
-    for (auto &Pair : Plan.InstructionPairs)
-        if (Pair.second) Pair.second->clearOperands();
-    for (auto &Pair : Plan.InstructionPairs)
-        delete Pair.second;
-    Plan.InstructionPairs.clear();
+    for (auto &Lane : Plan.Lanes) {
+        for (auto &Pair : Lane.InstructionPairs)
+            if (Pair.second) Pair.second->clearOperands();
+        for (auto &Pair : Lane.InstructionPairs)
+            delete Pair.second;
+        Lane.InstructionPairs.clear();
+        if (auto *LaneInstruction =
+                dynamic_cast<Instruction *>(Lane.LaneIV)) {
+            LaneInstruction->clearOperands();
+            delete LaneInstruction;
+        }
+        Lane.LaneIV = nullptr;
+        Lane.ValueMap.clear();
+    }
+    Plan.Lanes.clear();
     if (Plan.NewOuterUpdate) {
         Plan.NewOuterUpdate->clearOperands();
         delete Plan.NewOuterUpdate;
         Plan.NewOuterUpdate = nullptr;
     }
-    if (auto *LaneInstruction =
-            dynamic_cast<Instruction *>(Plan.LaneIV)) {
-        LaneInstruction->clearOperands();
-        delete LaneInstruction;
-    }
-    Plan.LaneIV = nullptr;
-    Plan.ValueMap.clear();
+    Plan.Factor = 1;
 }
 
 bool UnrollAndJamPass::remapClonedOperands(
-    UnrollAndJamClonePlan &Plan) {
-    for (const auto &Pair : Plan.InstructionPairs) {
+    UnrollAndJamLanePlan &Lane) {
+    for (const auto &Pair : Lane.InstructionPairs) {
         Instruction *Source = Pair.first;
         Instruction *Clone = Pair.second;
         if (!Source || !Clone ||
@@ -576,8 +767,8 @@ bool UnrollAndJamPass::remapClonedOperands(
         }
         for (std::size_t Index = 0; Index < Source->getNumOperands(); ++Index) {
             Value *Operand = Source->getOperand(Index);
-            auto It = Plan.ValueMap.find(Operand);
-            Value *Mapped = It == Plan.ValueMap.end() ? Operand : It->second;
+            auto It = Lane.ValueMap.find(Operand);
+            Value *Mapped = It == Lane.ValueMap.end() ? Operand : It->second;
             if (!Mapped || (Clone->getOperand(Index) != Mapped &&
                             !Clone->replaceOperand(Index, Mapped))) {
                 return false;
@@ -587,37 +778,135 @@ bool UnrollAndJamPass::remapClonedOperands(
     return true;
 }
 
+bool UnrollAndJamPass::canonicalizeLaneMemoryAddresses(
+    const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+    UnrollAndJamLanePlan &Lane, int LaneIndex) {
+    if (!Shape.Outer || LaneIndex <= 0) return false;
+    std::unordered_set<Instruction *> LaneValues(
+        Shape.LaneInstructions.begin(), Shape.LaneInstructions.end());
+
+    for (const auto &Pair : Lane.InstructionPairs) {
+        auto *SourceGEP = dynamic_cast<GetElementPtrInst *>(Pair.first);
+        auto *CloneGEP = dynamic_cast<GetElementPtrInst *>(Pair.second);
+        if (!SourceGEP || !CloneGEP) continue;
+
+        int Direction = 0;
+        bool Conflict = false;
+        for (Use *U : SourceGEP->getUses()) {
+            auto *Memory = dynamic_cast<Instruction *>(
+                U ? U->getUser() : nullptr);
+            if (!Memory || !LaneValues.count(Memory)) continue;
+
+            std::shared_ptr<IRType> ElementType;
+            if (auto *Load = dynamic_cast<LoadInst *>(Memory)) {
+                if (Load->getPointerOperand() != SourceGEP) continue;
+                ElementType = Load->getIRType();
+            } else if (auto *Store = dynamic_cast<StoreInst *>(Memory)) {
+                if (Store->getPointerOperand() != SourceGEP ||
+                    !Store->getValueOperand()) {
+                    continue;
+                }
+                ElementType = Store->getValueOperand()->getIRType();
+            } else {
+                continue;
+            }
+            if (!ElementType || !ElementType->isScalar() ||
+                ElementType->getSize() == 0 ||
+                ElementType->getSize() > static_cast<std::size_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
+                continue;
+            }
+            auto Stride = LA.getByteStride(
+                Memory, Shape.Outer, Shape.Outer);
+            const std::int64_t ElementBytes =
+                static_cast<std::int64_t>(ElementType->getSize());
+            int ThisDirection = 0;
+            if (Stride && *Stride == ElementBytes)
+                ThisDirection = 1;
+            else if (Stride && *Stride == -ElementBytes)
+                ThisDirection = -1;
+            else
+                continue;
+            if (Direction != 0 && Direction != ThisDirection) {
+                Conflict = true;
+                break;
+            }
+            Direction = ThisDirection;
+        }
+        if (Conflict || Direction == 0) continue;
+
+        const __int128 WideIndex =
+            static_cast<__int128>(Direction) * LaneIndex;
+        if (WideIndex < std::numeric_limits<std::int32_t>::min() ||
+            WideIndex > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        std::vector<Value *> Indices = {
+            ConstInt::newConstInt(static_cast<int>(WideIndex), 4)};
+        if (!CloneGEP->reset(SourceGEP, Indices)) return false;
+    }
+    return true;
+}
+
 std::optional<UnrollAndJamClonePlan>
 UnrollAndJamPass::buildClonePlan(
-    const UnrollAndJamShape &Shape, const UnrollAndJamConfig &C) {
+    const UnrollAndJamShape &Shape, LoopAccessInfo &LA, int Factor,
+    const UnrollAndJamConfig &C) {
     if (!Shape.OuterInduction.Phi || !Shape.OuterInduction.ConstantStep ||
-        C.Factor != 2) {
+        !isSupportedFactor(Factor) || Factor > C.MaxFactor) {
         return std::nullopt;
     }
     const std::int64_t Step = *Shape.OuterInduction.ConstantStep;
-    const std::int64_t NewStep = Step * C.Factor;
+    const __int128 WideNewStep =
+        static_cast<__int128>(Step) * Factor;
+    if (WideNewStep <= 0 ||
+        WideNewStep > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    const std::int64_t NewStep = static_cast<std::int64_t>(WideNewStep);
     auto Ty = Shape.OuterInduction.Phi->getIRType();
     const std::size_t Size = Ty ? Ty->getSize() : 4;
 
     UnrollAndJamClonePlan Plan;
-    Plan.LaneIV = new BinaryInst(
-        Shape.OuterInduction.Phi, BinaryInst::ADD,
-        ConstInt::newConstInt(static_cast<int>(Step), Size));
-    Plan.ValueMap[Shape.OuterInduction.Phi] = Plan.LaneIV;
-
-    for (Instruction *Source : Shape.LaneInstructions) {
-        Instruction *Clone = Source ? Source->clone(Plan.ValueMap) : nullptr;
-        if (!Clone) {
+    Plan.Factor = Factor;
+    Plan.Lanes.reserve(static_cast<std::size_t>(Factor - 1));
+    for (int LaneIndex = 1; LaneIndex < Factor; ++LaneIndex) {
+        const __int128 WideOffset =
+            static_cast<__int128>(Step) * LaneIndex;
+        if (WideOffset <= 0 ||
+            WideOffset > std::numeric_limits<std::int32_t>::max()) {
             destroyClonePlan(Plan);
             return std::nullopt;
         }
-        Clone->setIdent(Source->getIdent() + ".jam1");
-        Plan.InstructionPairs.emplace_back(Source, Clone);
-        Plan.ValueMap[Source] = Clone;
-    }
-    if (!remapClonedOperands(Plan)) {
-        destroyClonePlan(Plan);
-        return std::nullopt;
+        Plan.Lanes.emplace_back();
+        UnrollAndJamLanePlan &Lane = Plan.Lanes.back();
+        Lane.LaneIV = new BinaryInst(
+            Shape.OuterInduction.Phi, BinaryInst::ADD,
+            ConstInt::newConstInt(static_cast<int>(WideOffset), Size));
+        Lane.ValueMap[Shape.OuterInduction.Phi] = Lane.LaneIV;
+
+        for (Instruction *Source : Shape.LaneInstructions) {
+            Instruction *Clone = Source
+                ? Source->clone(Lane.ValueMap)
+                : nullptr;
+            if (!Clone) {
+                destroyClonePlan(Plan);
+                return std::nullopt;
+            }
+            Clone->setIdent(Source->getIdent() + ".jam" +
+                            std::to_string(LaneIndex));
+            Lane.InstructionPairs.emplace_back(Source, Clone);
+            Lane.ValueMap[Source] = Clone;
+        }
+        if (!remapClonedOperands(Lane)) {
+            destroyClonePlan(Plan);
+            return std::nullopt;
+        }
+        if (!canonicalizeLaneMemoryAddresses(
+                Shape, LA, Lane, LaneIndex)) {
+            destroyClonePlan(Plan);
+            return std::nullopt;
+        }
     }
     Plan.NewOuterUpdate = new BinaryInst(
         Shape.OuterInduction.Phi, BinaryInst::ADD,
@@ -628,8 +917,9 @@ UnrollAndJamPass::buildClonePlan(
 bool UnrollAndJamPass::validatePlanCommit(
     const UnrollAndJamShape &Shape,
     const UnrollAndJamClonePlan &Plan) {
-    auto *LaneIV = dynamic_cast<Instruction *>(Plan.LaneIV);
-    if (!LaneIV || LaneIV->getParent() || !Plan.NewOuterUpdate ||
+    if (!isSupportedFactor(Plan.Factor) ||
+        Plan.Lanes.size() != static_cast<std::size_t>(Plan.Factor - 1) ||
+        !Plan.NewOuterUpdate ||
         Plan.NewOuterUpdate->getParent() || !Shape.Outer ||
         !Shape.Outer->getHeader() || !Shape.OuterLatch ||
         !Shape.OuterLatch->getTerminator() ||
@@ -652,10 +942,18 @@ bool UnrollAndJamPass::validatePlanCommit(
             return false;
         }
     }
-    for (const auto &Pair : Plan.InstructionPairs) {
-        if (!Pair.first || !Pair.first->getParent() || !Pair.second ||
-            Pair.second->getParent() ||
-            !Pair.first->getParent()->getTerminator()) {
+    for (const auto &Lane : Plan.Lanes) {
+        auto *LaneIV = dynamic_cast<Instruction *>(Lane.LaneIV);
+        if (!LaneIV || LaneIV->getParent()) return false;
+        for (const auto &Pair : Lane.InstructionPairs) {
+            if (!Pair.first || !Pair.first->getParent() || !Pair.second ||
+                Pair.second->getParent() ||
+                !Pair.first->getParent()->getTerminator()) {
+                return false;
+            }
+        }
+        if (Lane.InstructionPairs.size() !=
+            Shape.LaneInstructions.size()) {
             return false;
         }
     }
@@ -664,17 +962,21 @@ bool UnrollAndJamPass::validatePlanCommit(
 
 bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
                                    UnrollAndJamClonePlan &Plan) {
-    auto *LaneIV = dynamic_cast<Instruction *>(Plan.LaneIV);
     if (!validatePlanCommit(Shape, Plan)) return false;
 
-    Shape.Outer->getHeader()->insertAfterPhiNodes(LaneIV);
-    Plan.LaneIV = nullptr;
-    for (auto &Pair : Plan.InstructionPairs) {
-        if (dynamic_cast<PhiInst *>(Pair.second))
-            Pair.first->getParent()->insertAfterPhiNodes(Pair.second);
-        else
-            Pair.first->getParent()->insertBeforeTerminator(Pair.second);
-        Pair.second = nullptr;
+    for (auto &Lane : Plan.Lanes) {
+        auto *LaneIV = dynamic_cast<Instruction *>(Lane.LaneIV);
+        Shape.Outer->getHeader()->insertAfterPhiNodes(LaneIV);
+        Lane.LaneIV = nullptr;
+        for (auto &Pair : Lane.InstructionPairs) {
+            if (dynamic_cast<PhiInst *>(Pair.second))
+                Pair.first->getParent()->insertAfterPhiNodes(Pair.second);
+            else
+                Pair.first->getParent()->insertBeforeTerminator(Pair.second);
+            Pair.second = nullptr;
+        }
+        Lane.InstructionPairs.clear();
+        Lane.ValueMap.clear();
     }
 
     if (Shape.OuterExitUsesUpdate &&
@@ -692,8 +994,7 @@ bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
         Shape.OuterTrip.ExitCmp->replaceOperand(
             Shape.OuterExitComparedOperand, NewUpdate);
     }
-    Plan.InstructionPairs.clear();
-    Plan.ValueMap.clear();
+    Plan.Lanes.clear();
     return true;
 }
 
@@ -718,7 +1019,42 @@ PassResult UnrollAndJamPass::run(Function &F,
         }
         auto Shape = buildShape(Outer, Inner, LI, SE, LA, DT, PDT, Config);
         if (!Shape) continue;
-        auto Plan = buildClonePlan(*Shape, Config);
+        auto Factor = selectFactor(*Shape, LA, SE, Config);
+        if (!Factor || !Shape->OuterTrip.ConstantTripCount) continue;
+
+        const std::int64_t Remainder =
+            *Shape->OuterTrip.ConstantTripCount % *Factor;
+        if (Remainder != 0) {
+            if (Remainder < 0 ||
+                Remainder > static_cast<std::int64_t>(
+                                Config.MaxRemainderPeel)) {
+                continue;
+            }
+            auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+            UnrollConfig PeelConfig;
+            PeelConfig.AllowFull = false;
+            PeelConfig.AllowPartial = false;
+            PeelConfig.AllowRuntime = false;
+            PeelConfig.AllowRemainder = false;
+            PeelConfig.AllowPeeling = true;
+            PeelConfig.MaxPeelCount =
+                static_cast<int>(Config.MaxRemainderPeel);
+            LoopUnrollPass Peeler(PeelConfig);
+            UnrollDecision Decision;
+            Decision.Kind = UnrollKind::Peeling;
+            Decision.Count = static_cast<int>(Remainder);
+            Decision.ShouldUnroll = true;
+            Decision.IsPeeling = true;
+            Decision.TripCountIsProven = true;
+            const LoopUnrollResult Result = Peeler.executePeeling(
+                Shape->Outer, Decision, SE, LI, DT, AA);
+            if (Result != LoopUnrollResult::Unmodified) {
+                return PassResult::changed(PreservationStatus::none());
+            }
+            continue;
+        }
+
+        auto Plan = buildClonePlan(*Shape, LA, *Factor, Config);
         if (!Plan) continue;
         if (!executePlan(*Shape, *Plan)) {
             destroyClonePlan(*Plan);

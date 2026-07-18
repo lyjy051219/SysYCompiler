@@ -28,7 +28,8 @@ struct ConstraintElimStackFrame {
 };
 
 struct ConstraintElimFoldCandidate {
-    BinaryInst *cmp = nullptr;
+    BrInst *branch = nullptr;
+    BinaryInst *condition = nullptr;
     bool result = false;
 };
 

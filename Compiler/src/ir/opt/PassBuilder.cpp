@@ -46,6 +46,7 @@
 #include "ir/opt/GlobalInitializerFold.hpp"
 #include "ir/opt/LoopIdiomRecognize.hpp"
 #include "ir/opt/LoopInterchange.hpp"
+#include "ir/opt/LoopDistribution.hpp"
 #include "ir/opt/LoopFusion.hpp"
 #include "ir/opt/UnrollAndJam.hpp"
 #include "ir/analysis/PostDominant.hpp"
@@ -205,10 +206,7 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(PromotePass());
     FPM.addPass(InstSimplifyPass());
 
-    // RangeAnalysis discards its convergence-time path state and rebuilds
-    // transform-visible integer facts once from the current cloned CFG and
-    // final global lattice.  It is therefore safe to consume those facts here
-    // without carrying stale pre-unroll context into the clone.
+
     FPM.addPass(RangeAwareSimplifyPass());
     FPM.addPass(ConstraintEliminationPass());
     FPM.addPass(CFGSimplifyPass());
@@ -251,19 +249,19 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
 
-    // Consume source-level affine coordinates before rotation/LSR obscure
-    // them.  Keep the default schedule limited to transforms with a measured
-    // corpus win: rectangular interchange, proven integer-reduction fusion,
-    // and cache-footprint-gated reduction-aware unroll-and-jam.
-    //
-    // LoopDistribution and LoopTiling remain available as explicit passes,
-    // but their current perfect-nest/two-axis forms do not implement the
-    // imperfect TRSM schedule or three-axis 01_mm working-set tiling.  Running
-    // them here would add analysis work without a demonstrated target gain.
+    // 在旋转和强度削弱改变仿射坐标前完成循环调度。分布先隔离局部性需求
+    // 不同且依赖允许拆分的语句，随后由交换、融合和展开合并继续优化。
     FPM.addPass(IndVarSimplifyPass());
     FPM.addPass(LoopInterchangePass());
+    // 交换可能把不同局部性需求的语句暴露在同一内层循环中；先按依赖
+    // 证明做循环分布，后续交换才能分别为每个分区选择合适的轴顺序。
+    FPM.addPass(LoopDistributionPass());
+    FPM.addPass(LoopInterchangePass());
     FPM.addPass(LoopFusionPass());
-    FPM.addPass(UnrollAndJamPass());
+    // 余数前缀剥离会主动失效循环分析；在普通展开前用同一个 UAJ 实例
+    // 重建分析并收敛，避免下一层候选先被普通展开改变结构。
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        UnrollAndJamPass(), 6));
 
     // 先旋转/规范化，再重新建立 LoopSimplify + LCSSA，让 Unroll 看到更稳定的
     // trip-count 和 latch/header 形态。

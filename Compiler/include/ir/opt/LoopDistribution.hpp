@@ -10,9 +10,11 @@
 #include <vector>
 
 class BasicBlock;
+class DominatorTree;
 class Instruction;
 class Loop;
 class LoopDependenceInfo;
+class LoopInfo;
 class SCEVResult;
 class StoreInst;
 class Value;
@@ -45,11 +47,19 @@ private:
     };
 
     struct DistributionPlan {
+        struct ForwardedValue {
+            StoreInst *Store = nullptr;
+            Instruction *Producer = nullptr;
+        };
+
         DistributionShape Shape;
         std::vector<StoreInst *> FirstStores;
         std::vector<StoreInst *> SecondStores;
         InstructionSet FirstSlice;
         InstructionSet SecondSlice;
+        InstructionSet SecondLegalitySlice;
+        std::vector<ForwardedValue> ForwardedValues;
+        std::vector<Loop *> PrunedFirstLoops;
         unsigned LocalityDistance = 0;
     };
 
@@ -63,6 +73,7 @@ private:
     static bool hasUnsupportedInstruction(Instruction *I);
     static bool valueDependsOnLoad(Value *V,
                                    std::unordered_set<Value *> &Seen,
+                                   const BlockSet &LoopBlocks,
                                    unsigned Depth = 0);
     static bool hasMemoryDependentControl(
         const std::vector<BasicBlock *> &Blocks);
@@ -71,7 +82,8 @@ private:
     static std::optional<DistributionShape> getDistributionShape(
         Function &F, Loop *L);
     static InstructionSet collectBackwardSlice(
-        StoreInst *Root, const BlockSet &LoopBlocks);
+        StoreInst *Root, const BlockSet &LoopBlocks,
+        const InstructionSet *StopValues = nullptr);
     static void mergeSlice(InstructionSet &Into,
                            const InstructionSet &From);
     static unsigned strideBucket(std::int64_t Stride);
@@ -81,9 +93,26 @@ private:
     static unsigned localityDistance(const InstructionSet &First,
                                      const InstructionSet &Second, Loop *L,
                                      LoopDependenceInfo &LD);
+    static unsigned interchangeOpportunity(
+        const InstructionSet &Slice, Loop *L,
+        LoopDependenceInfo &LD);
     static std::optional<DistributionPlan> findDistributionPlan(
-        Function &F, Loop *L, LoopDependenceInfo &LD);
+        Function &F, Loop *L, LoopDependenceInfo &LD,
+        DominatorTree &DT, const LoopInfo &LI, SCEVResult &SE);
+    static bool buildForwardingPlan(DistributionPlan &Plan,
+                                    const BlockSet &Blocks,
+                                    LoopDependenceInfo &LD,
+                                    DominatorTree &DT,
+                                    const LoopInfo &LI);
+    static bool isAnchorOrderedDistributionLegal(
+        const DistributionPlan &Plan, LoopDependenceInfo &LD,
+        DominatorTree &DT);
     static void destroyClonedBlocks(std::vector<BasicBlock *> &Blocks);
+    static void deleteDeadClonedSlice(
+        Instruction *Root, const BlockSet &ClonedBlocks);
+    static bool isPrunableFirstLoop(
+        Loop *L, const DistributionPlan &Plan, SCEVResult &SE);
+    static void pruneFirstLoopCFG(Loop *L);
     static bool executeDistribution(Function &F,
                                     const DistributionPlan &Plan);
 

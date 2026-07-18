@@ -19,14 +19,20 @@ class PhiInst;
 class PostDominatorTree;
 
 struct UnrollAndJamConfig {
-    int Factor = 2;
+    // 0 表示根据目标延迟、局部性和寄存器压力自动选择 2/4/8。
+    int Factor = 0;
+    int MaxFactor = 8;
     unsigned MaxTransformsPerFunction = 2;
     unsigned MaxSharedNestDepth = 3;
+    unsigned EstimatedFPAddLatency = 3;
+    unsigned FPRBudget = 24;
+    unsigned GPRBudget = 18;
+    unsigned MaxRemainderPeel = 7;
     std::int64_t CacheLineBytes = 64;
     std::int64_t MinCoalescedAxisTripCount = 64;
     std::int64_t MinLaneTraversalBytes = 256 * 1024;
     std::size_t MaxNestBlocks = 24;
-    std::size_t MaxClonedInstructions = 24;
+    std::size_t MaxClonedInstructions = 96;
 };
 
 struct UnrollAndJamShape {
@@ -50,20 +56,21 @@ struct UnrollAndJamShape {
     std::vector<Instruction *> LaneInstructions;
 };
 
-struct UnrollAndJamClonePlan {
+struct UnrollAndJamLanePlan {
     Value *LaneIV = nullptr;
-    Instruction *NewOuterUpdate = nullptr;
     std::unordered_map<Value *, Value *> ValueMap;
     std::vector<std::pair<Instruction *, Instruction *>> InstructionPairs;
 };
 
-// Unroll the outer output loop by two while sharing a rectangular inner loop
-// tree. Each lane keeps its own reduction PHIs, so integer and strict-FP
-// reductions retain their original per-output operation order. The transform
-// is admitted only when the two output iterations are independent, a load
-// traversed by the shared nest is consumed by both lanes, and an adjacent
-// lane-varying stream crosses enough cache lines before reuse for jamming to
-// improve spatial locality rather than merely sharing a resident small table.
+struct UnrollAndJamClonePlan {
+    int Factor = 1;
+    Instruction *NewOuterUpdate = nullptr;
+    std::vector<UnrollAndJamLanePlan> Lanes;
+};
+
+// 对外层输出循环做 2/4/8 路展开，并把各路计算合并到同一矩形内层循环树。
+// 每一路保留独立的归约 PHI，严格浮点归约不会跨输出重新结合。收益判定同时
+// 覆盖长距离相邻流和滑动窗口复用，并受代码增长及整数/浮点寄存器预算约束。
 class UnrollAndJamPass : public PassDescriptor<UnrollAndJamPass> {
 public:
     explicit UnrollAndJamPass(
@@ -105,24 +112,54 @@ private:
         const std::unordered_map<Value *, Value *> &ValueMap);
     static bool hasShareableLaneRead(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
-        const std::unordered_map<Value *, Value *> &LaneValues);
+        const std::unordered_set<Instruction *> &LaneValues);
     static bool hasLaneCoalescingBenefit(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
         SCEVResult &SE,
-        const std::unordered_map<Value *, Value *> &LaneValues,
+        const std::unordered_set<Instruction *> &LaneValues,
         const UnrollAndJamConfig &Config);
+    static bool hasSlidingWindowBenefit(
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+        SCEVResult &SE,
+        const std::unordered_set<Instruction *> &LaneValues,
+        int Factor, const UnrollAndJamConfig &Config);
+    static bool isStrictFPRecurrencePath(
+        Value *Current, PhiInst *Phi,
+        std::unordered_set<Value *> &Active, unsigned Depth = 0);
+    static unsigned countStrictFPReductions(
+        const UnrollAndJamShape &Shape);
+    static bool fitsRegisterBudget(const UnrollAndJamShape &Shape,
+                                   int Factor,
+                                   const UnrollAndJamConfig &Config);
+    static bool isSupportedFactor(int Factor);
+    static std::optional<int> selectFactor(
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+        SCEVResult &SE, const UnrollAndJamConfig &Config);
     static bool collectLaneInstructions(UnrollAndJamShape &Shape,
-                                        LoopAccessInfo &LA,
-                                        SCEVResult &SE,
                                         const UnrollAndJamConfig &Config);
     static std::optional<UnrollAndJamShape> buildShape(
         Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
         LoopAccessInfo &LA, DominatorTree &DT, PostDominatorTree &PDT,
         const UnrollAndJamConfig &Config);
     static void destroyClonePlan(UnrollAndJamClonePlan &Plan);
-    static bool remapClonedOperands(UnrollAndJamClonePlan &Plan);
+    static bool remapClonedOperands(UnrollAndJamLanePlan &Lane);
+    static bool canonicalizeLaneMemoryAddresses(
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+        UnrollAndJamLanePlan &Lane, int LaneIndex);
+    static Value *materializeSlidingInitValue(
+        Value *Source, Loop *Axis, PhiInst *AxisIV,
+        Value *AxisStart, BasicBlock *PreHeader,
+        const DominatorTree &DT,
+        std::unordered_map<Value *, Value *> &ValueMap,
+        std::vector<Instruction *> &NewInstructions,
+        std::unordered_set<Value *> &Active);
+    static bool applySlidingWindowForwarding(
+        UnrollAndJamShape &Shape, UnrollAndJamClonePlan &Plan,
+        LoopAccessInfo &LA, SCEVResult &SE,
+        const DominatorTree &DT,
+        const UnrollAndJamConfig &Config);
     static std::optional<UnrollAndJamClonePlan> buildClonePlan(
-        const UnrollAndJamShape &Shape,
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA, int Factor,
         const UnrollAndJamConfig &Config);
     static bool validatePlanCommit(const UnrollAndJamShape &Shape,
                                    const UnrollAndJamClonePlan &Plan);

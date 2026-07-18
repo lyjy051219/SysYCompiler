@@ -366,7 +366,7 @@ bool LoopDependenceInfo::areNoAlias(const LoopMemoryAccess &A,
 bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
                                         const LoopMemoryAccess &B,
                                         Loop *Axis) const {
-    if (!Axis || !A.AddressExact || !B.AddressExact || !A.Root ||
+    if (!Axis || !SE || !A.AddressExact || !B.AddressExact || !A.Root ||
         A.Root != B.Root || !A.Location.Size || !B.Location.Size ||
         *A.Location.Size == 0 || *A.Location.Size != *B.Location.Size ||
         A.ByteStrides.empty() || A.ByteStrides != B.ByteStrides ||
@@ -375,14 +375,17 @@ bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
         return false;
     }
 
-    // The typed bands must form a proper mixed-radix SysY array address and
-    // the access itself must fit in its smallest element.  SysY defines an
-    // execution with an out-of-range array digit as invalid; this digit-bound
-    // premise is stronger than LLVM's `inbounds` flag alone.  It makes every
-    // well-defined typed coordinate unique.  Flattened or partially
-    // overlapping shapes such as an i32 access through an i8 GEP are rejected
-    // and require a byte-range dependence solver instead.  Equal-stride terms
-    // were folded while building the access.
+    auto Induction = SE->getCanonicalInduction(Axis);
+    if (!Induction || !Induction->Valid || !Induction->Phi ||
+        !Induction->UpdateValue ||
+        !SE->isKnownNoWrapInductionValue(Axis, Induction->Phi) ||
+        !SE->isKnownNoWrapInductionValue(
+            Axis, Induction->UpdateValue)) {
+        return false;
+    }
+
+    // 只接受布局完整、元素访问不重叠的混合基数数组地址。展平地址或通过
+    // 较小元素 GEP 进行宽访问的情况需要字节范围求解器，不能在这里推断。
     if (*A.Location.Size >
         static_cast<std::size_t>(A.ByteStrides.back())) {
         return false;
@@ -405,10 +408,27 @@ bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
             !isPureAxisCoordinate(BExpr, Axis, BCoefficient)) {
             continue;
         }
-        if (ACoefficient == BCoefficient &&
-            AExpr.Constant == BExpr.Constant) {
-            return true;
+        // 单位系数在整数位宽上仍是一一映射；任意倍数可能因模回绕把两个
+        // 不同归纳值映射到同一下标。该轴也不得在其他维度再次出现并抵消。
+        if (ACoefficient != BCoefficient ||
+            (ACoefficient != 1 && ACoefficient != -1) ||
+            AExpr.Constant != BExpr.Constant) {
+            continue;
         }
+        bool IsolatedAxis = true;
+        for (std::size_t Other = 0; Other < A.Subscripts.size(); ++Other) {
+            if (Other == AI) continue;
+            auto ACoeff = A.Subscripts[Other].LoopCoefficients.find(Axis);
+            auto BCoeff = B.Subscripts[Other].LoopCoefficients.find(Axis);
+            if ((ACoeff != A.Subscripts[Other].LoopCoefficients.end() &&
+                 ACoeff->second != 0) ||
+                (BCoeff != B.Subscripts[Other].LoopCoefficients.end() &&
+                 BCoeff->second != 0)) {
+                IsolatedAxis = false;
+                break;
+            }
+        }
+        if (IsolatedAxis) return true;
     }
     return false;
 }
@@ -578,6 +598,78 @@ bool LoopDependenceInfo::isDistributionLegal(
         }
     }
     return true;
+}
+
+bool LoopDependenceInfo::isConflictLocalToIteration(
+    Instruction *A, Instruction *B, Loop *L) {
+    if (!A || !B || !L) return false;
+    LoopSummary &Summary = getOrBuildSummary(L);
+    if (Summary.UnknownMemory) return false;
+
+    const LoopMemoryAccess *First = nullptr;
+    const LoopMemoryAccess *Second = nullptr;
+    for (const LoopMemoryAccess &Access : Summary.Accesses) {
+        if (Access.Inst == A) First = &Access;
+        if (Access.Inst == B) Second = &Access;
+    }
+    if (!First || !Second) return false;
+    if (!isWriteConflict(*First, *Second) ||
+        areNoAlias(*First, *Second)) {
+        return true;
+    }
+
+    // 分布只改变不同 L 迭代之间的先后关系。地址相等若能反推出 L
+    // 坐标相等，冲突就局限在同一迭代，原有语句顺序仍可保留。
+    return areForcedEqual(*First, *Second, L);
+}
+
+bool LoopDependenceInfo::isInvariantAccessDisjointFromLoopWrite(
+    Instruction *Invariant, Instruction *Write,
+    Loop *Scope, Loop *VaryingLoop) {
+    if (!Invariant || !Write || !Scope || !VaryingLoop || !SE || !LI ||
+        !AA || VaryingLoop->getParentLoop() != Scope ||
+        !Invariant->getParent() || !Write->getParent() ||
+        !Scope->contains(Invariant->getParent()) ||
+        VaryingLoop->contains(Invariant->getParent()) ||
+        !VaryingLoop->contains(Write->getParent()) ||
+        !SE->isKnownFiniteLoop(VaryingLoop)) {
+        return false;
+    }
+    auto Induction = SE->getCanonicalInduction(VaryingLoop);
+    if (!Induction || !Induction->Valid || !Induction->Phi ||
+        !Induction->UpdateValue ||
+        !SE->isKnownNoWrapInductionValue(VaryingLoop, Induction->Phi) ||
+        !SE->isKnownNoWrapInductionValue(
+            VaryingLoop, Induction->UpdateValue)) {
+        return false;
+    }
+
+    LoopSummary &Summary = getOrBuildSummary(Scope);
+    if (Summary.UnknownMemory) return false;
+
+    const LoopMemoryAccess *First = nullptr;
+    const LoopMemoryAccess *Second = nullptr;
+    for (const LoopMemoryAccess &Access : Summary.Accesses) {
+        if (Access.Inst == Invariant) First = &Access;
+        if (Access.Inst == Write) Second = &Access;
+    }
+    if (!First || !Second || !First->Reads || First->Writes ||
+        !Second->Writes) {
+        return false;
+    }
+    for (const LoopAffineExpr &Subscript : First->Subscripts) {
+        auto It = Subscript.LoopCoefficients.find(VaryingLoop);
+        if (It != Subscript.LoopCoefficients.end() && It->second != 0)
+            return false;
+    }
+
+    // 这个查询只在“外层前缀 load 与内层 write”的结构契约下
+    // 使用。BasicAA 的范围模式会要求变量下标是已证明不回绕的规范
+    // 归纳更新，并以字节访问宽度检查整个内层域。结构门禁避免
+    // 把普通 A[i] / A[i+1] 的点对点结论错用为跨迭代 NoAlias。
+    return AA->aliasWithIndexRange(
+               First->Location, Second->Location, *LI) ==
+           AliasInfo::NoAlias;
 }
 
 std::optional<int64_t>

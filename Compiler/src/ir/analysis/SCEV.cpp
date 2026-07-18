@@ -1047,13 +1047,14 @@ bool SCEVResult::isBackedgeUpdateStartSafe(
 bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     const LoopTripCountInfo &Info, RangeInfo &RI, DominatorTree &DomTree) {
     if (!Info.Valid || !Info.IsRuntime || !Info.L || !Info.PreHeader ||
-        !Info.Header || Info.ExitingBlock != Info.Header || !Info.ExitCmp) {
+        !Info.Header || !Info.Latch || !Info.ExitingBlock || !Info.ExitCmp ||
+        !Info.IndVar) {
         return false;
     }
 
     auto IV = getCanonicalInduction(Info.L);
     if (!IV || !IV->Valid || !IV->Phi || !IV->StartValue ||
-        !IV->ConstantStep ||
+        !IV->UpdateValue || Info.IndVar != IV->Phi || !IV->ConstantStep ||
         (*IV->ConstantStep != 1 && *IV->ConstantStep != -1)) {
         return false;
     }
@@ -1062,7 +1063,10 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
         auto Ty = V ? V->getIRType() : nullptr;
         return Ty && Ty->isInt() && Ty->getIntegerBitWidth(32) == 32;
     };
-    if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
+    if (!IsI32(IV->Phi) || !IsI32(IV->StartValue) ||
+        !IsI32(IV->UpdateValue)) {
+        return false;
+    }
 
     auto *Update = dynamic_cast<BinaryInst *>(IV->UpdateValue);
     if (!Update) return false;
@@ -1080,16 +1084,37 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     }
     if (!DirectStep) return false;
 
+    Value *Compared = nullptr;
+    if (Info.ComparePhase == LoopExitComparePhase::HeaderPhi) {
+        // 单块循环同时也是 latch；即使比较 header PHI，失败的末轮仍会先
+        // 执行 backedge update。这里没有证明那次额外更新，所以不能把它
+        // 当作普通的零次可执行 header-test。
+        if (Info.ExitingBlock != Info.Header ||
+            Info.ExitingBlock == Info.Latch) {
+            return false;
+        }
+        Compared = IV->Phi;
+    } else if (Info.ComparePhase ==
+               LoopExitComparePhase::BackedgeUpdate) {
+        // backedge-update 比较必须发生在唯一 latch。Header == Latch 的
+        // 单块旋转循环也属于这一类。
+        if (Info.ExitingBlock != Info.Latch)
+            return false;
+        Compared = IV->UpdateValue;
+    } else {
+        return false;
+    }
+
     BinaryInst::Operation Pred = Info.ContinueOnTrue
         ? Info.ExitCmp->getOp()
         : BinaryInst::negatePredicate(Info.ExitCmp->getOp());
     Value *LHS = Info.ExitCmp->getOperand(0);
     Value *RHS = Info.ExitCmp->getOperand(1);
-    if (RHS == IV->Phi) {
+    if (RHS == Compared) {
         std::swap(LHS, RHS);
         Pred = BinaryInst::reversePredicate(Pred);
     }
-    if (LHS != IV->Phi || !IsI32(RHS)) return false;
+    if (LHS != Compared || !IsI32(RHS)) return false;
     if ((*IV->ConstantStep == 1 && Pred != BinaryInst::L) ||
         (*IV->ConstantStep == -1 && Pred != BinaryInst::G)) {
         return false;
@@ -1097,22 +1122,79 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
 
     IntRange StartRange = RI.query(IV->StartValue, Info.PreHeader, DomTree);
     IntRange BoundRange = RI.query(RHS, Info.PreHeader, DomTree);
-    if (StartRange.isBottom() || BoundRange.isBottom()) return false;
+    auto FitsI32Range = [](const IntRange &R) {
+        return !R.isBottom() && R.min >= IntRange::I32_MIN &&
+               R.max <= IntRange::I32_MAX;
+    };
+    if (!FitsI32Range(StartRange) || !FitsI32Range(BoundRange))
+        return false;
 
-    // SCEV expands max(0, Bound-Start) for an increasing loop and the
-    // symmetric Start-Bound for a decreasing loop.  Prove that subtraction
-    // in the source integer width, not merely in mathematical integers.
+    // 统一把 ComparedStart 表示为第一次参与退出比较的值。header PHI
+    // 直接从 start 开始；backedge-update 则先做一次严格单位更新。所有
+    // 端点都用 __int128 计算，避免证明代码本身发生有符号溢出。
+    __int128 ComparedMin = StartRange.min;
+    __int128 ComparedMax = StartRange.max;
+    const bool ComparesBackedgeUpdate =
+        Info.ComparePhase == LoopExitComparePhase::BackedgeUpdate;
+    if (ComparesBackedgeUpdate) {
+        ComparedMin += *IV->ConstantStep;
+        ComparedMax += *IV->ConstantStep;
+        if (ComparedMin < IntRange::I32_MIN ||
+            ComparedMax > IntRange::I32_MAX) {
+            return false;
+        }
+    }
+
+    // SCEV 对递增循环展开 Bound-ComparedStart，对递减循环展开对称的
+    // ComparedStart-Bound。必须证明源位宽中的减法精确，不能只依赖数学
+    // 整数上的 trip count。
     __int128 MinDistance = 0;
     __int128 MaxDistance = 0;
     if (*IV->ConstantStep == 1) {
-        MinDistance = static_cast<__int128>(BoundRange.min) - StartRange.max;
-        MaxDistance = static_cast<__int128>(BoundRange.max) - StartRange.min;
+        MinDistance =
+            static_cast<__int128>(BoundRange.min) - ComparedMax;
+        MaxDistance =
+            static_cast<__int128>(BoundRange.max) - ComparedMin;
     } else {
-        MinDistance = static_cast<__int128>(StartRange.min) - BoundRange.max;
-        MaxDistance = static_cast<__int128>(StartRange.max) - BoundRange.min;
+        MinDistance =
+            ComparedMin - static_cast<__int128>(BoundRange.max);
+        MaxDistance =
+            ComparedMax - static_cast<__int128>(BoundRange.min);
     }
-    return MinDistance >= IntRange::I32_MIN &&
-           MaxDistance <= IntRange::I32_MAX;
+    if (MinDistance < IntRange::I32_MIN ||
+        MaxDistance > IntRange::I32_MAX) {
+        return false;
+    }
+
+    if (!ComparesBackedgeUpdate)
+        return true;
+
+    // update-test 至少执行一次，其 trip count 是
+    // max(0, distance) + 1。除了 distance 本身不回绕，还要给最后的 +1
+    // 留出一位；否则 remainder 计算看到的是已经环绕的负数。
+    if (MaxDistance >
+        static_cast<__int128>(IntRange::I32_MAX) - 1) {
+        return false;
+    }
+
+    // 严格单位步下，最后一次实际 update 等于第一次 update 与 bound 中
+    // 更靠退出方向的那个值。显式检查这个包络，使证明不依赖“中间值应当
+    // 单调”这一隐含假设；首值和末值均可表示即可覆盖整条更新序列。
+    __int128 FinalMin = 0;
+    __int128 FinalMax = 0;
+    if (*IV->ConstantStep == 1) {
+        FinalMin = std::max(
+            ComparedMin, static_cast<__int128>(BoundRange.min));
+        FinalMax = std::max(
+            ComparedMax, static_cast<__int128>(BoundRange.max));
+    } else {
+        FinalMin = std::min(
+            ComparedMin, static_cast<__int128>(BoundRange.min));
+        FinalMax = std::min(
+            ComparedMax, static_cast<__int128>(BoundRange.max));
+    }
+    return FinalMin >= IntRange::I32_MIN &&
+           FinalMax <= IntRange::I32_MAX;
 }
 
 bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {

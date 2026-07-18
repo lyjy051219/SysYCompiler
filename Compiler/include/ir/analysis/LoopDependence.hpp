@@ -106,6 +106,17 @@ public:
     bool isDistributionLegal(Loop *L, const InstructionSet &First,
                              const InstructionSet &Second);
 
+    // 判断两个可能冲突的访问是否只能发生在 L 的同一次迭代中。
+    // 无写冲突或已经证明 NoAlias 时也返回 true。
+    bool isConflictLocalToIteration(Instruction *A, Instruction *B,
+                                    Loop *L);
+
+    // 仅供循环调度：在固定同一 Scope 外层实例时，证明不随
+    // VaryingLoop 变化的访问与该内层循环写访问始终不相交。
+    bool isInvariantAccessDisjointFromLoopWrite(
+        Instruction *Invariant, Instruction *Write,
+        Loop *Scope, Loop *VaryingLoop);
+
     // Signed byte displacement of I's pointer for one iteration of L.  Zero
     // means loop-invariant; nullopt means non-affine or arithmetic overflow.
     std::optional<int64_t> getByteStride(Instruction *I, Loop *L);

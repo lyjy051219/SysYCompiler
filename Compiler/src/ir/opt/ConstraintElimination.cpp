@@ -538,9 +538,9 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                             }
 
                             if (isImpliedChained(constraintStack, target)) {
-                                toFold.push_back({cmpInst, true});
+                                toFold.push_back({br, cmpInst, true});
                             } else if (isContradicted(constraintStack, target)) {
-                                toFold.push_back({cmpInst, false});
+                                toFold.push_back({br, cmpInst, false});
                             }
 
                             while (constraintStack.size() > savedSize)
@@ -560,16 +560,22 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             dfsStack.push({*it, curSize});
     }
 
-    // 执行折叠
-    for (auto &fc : toFold) {
-        fc.cmp->replaceAllUsesWith(ConstBool::newConstBool(fc.result));
-        delete fc.cmp;
-        changed = true;
+    // 路径约束只证明当前分支上的条件值，不能把共享的比较指令全局替换。
+    // 循环克隆等变换可能让同一比较同时服务多个分支；逐个改写分支操作数
+    // 既允许各路径得到不同结论，也避免第一次删除比较后再次访问悬空指针。
+    for (const auto &Candidate : toFold) {
+        if (!Candidate.branch || !Candidate.condition ||
+            !Candidate.branch->isConditional() ||
+            Candidate.branch->getCondition() != Candidate.condition) {
+            continue;
+        }
+        changed |= Candidate.branch->replaceOperand(
+            0, ConstBool::newConstBool(Candidate.result));
     }
 
     if (!changed) return PreservationStatus::all();
 
-    // 比较被折叠后，死分支由后续 CFGSimplify 清理
+    // 分支条件被折叠后，死分支和无用比较由后续 CFGSimplify/DCE 清理。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

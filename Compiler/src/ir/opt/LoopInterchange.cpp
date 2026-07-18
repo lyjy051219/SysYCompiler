@@ -21,6 +21,81 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+bool controlSliceContainsUndef(
+    Value *Root, const std::unordered_set<Value *> &CanonicalPhis,
+    std::unordered_set<Value *> &Active,
+    std::unordered_set<Value *> &KnownSafe, unsigned Depth = 0) {
+    if (!Root || Depth >= 64) return true;
+    if (CanonicalPhis.count(Root)) return false;
+    if (Root->isUndef()) return true;
+    if (dynamic_cast<BasicBlock *>(Root)) return false;
+
+    auto *I = dynamic_cast<Instruction *>(Root);
+    if (!I) return false;
+    if (KnownSafe.count(Root)) return false;
+    if (!Active.insert(Root).second) return true;
+
+    bool ContainsUndef = false;
+    for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+        Value *Operand = I->getOperand(Index);
+        if (dynamic_cast<BasicBlock *>(Operand)) continue;
+        if (controlSliceContainsUndef(
+                Operand, CanonicalPhis, Active, KnownSafe, Depth + 1)) {
+            ContainsUndef = true;
+            break;
+        }
+    }
+    Active.erase(Root);
+    if (!ContainsUndef) KnownSafe.insert(Root);
+    return ContainsUndef;
+}
+
+bool loopDomainContainsUndef(Loop *L, SCEVResult &SE) {
+    struct DomainControl {
+        PhiInst *Phi = nullptr;
+        Value *Start = nullptr;
+        Value *Update = nullptr;
+        Value *ExitCmp = nullptr;
+    };
+
+    std::vector<DomainControl> Domains;
+    std::unordered_set<Value *> CanonicalPhis;
+    for (Loop *Current = L; Current; Current = Current->getParentLoop()) {
+        auto Desc = SE.getCanonicalInduction(Current);
+        auto Trip = SE.analyzeLoopTripCount(Current);
+        if (!Desc || !Trip || !Desc->Valid || !Trip->Valid ||
+            !Desc->Phi || !Desc->StartValue || !Desc->UpdateValue ||
+            !Trip->ExitCmp) {
+            return true;
+        }
+        Domains.push_back(
+            {Desc->Phi, Desc->StartValue, Desc->UpdateValue,
+             Trip->ExitCmp});
+        CanonicalPhis.insert(Desc->Phi);
+    }
+
+    // 规范 PHI 作为已单独检查的递归边界；其起点、更新和退出比较仍逐一
+    // 追溯。这样既不会在合法回边上无限递归，也不会让 undef 来源穿过
+    // 循环控制链并在交换后获得不同的动态求值次数。
+    std::unordered_set<Value *> Active;
+    std::unordered_set<Value *> KnownSafe;
+    for (const DomainControl &Domain : Domains) {
+        if (controlSliceContainsUndef(
+                Domain.Start, CanonicalPhis, Active, KnownSafe) ||
+            controlSliceContainsUndef(
+                Domain.Update, CanonicalPhis, Active, KnownSafe) ||
+            controlSliceContainsUndef(
+                Domain.ExitCmp, CanonicalPhis, Active, KnownSafe)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // 匿名命名空间
+
 bool LoopInterchangePass::expressionKeysEqual(
     const SCEVExpr *A, const SCEVExpr *B) {
     return A && B && !A->Key.empty() && A->Key == B->Key;
@@ -80,7 +155,9 @@ bool LoopInterchangePass::sameIterationDomain(
         return false;
     }
     if (!SE.isKnownFiniteLoop(Outer) ||
-        !SE.isKnownFiniteLoop(Inner)) {
+        !SE.isKnownFiniteLoop(Inner) ||
+        loopDomainContainsUndef(Outer, SE) ||
+        loopDomainContainsUndef(Inner, SE)) {
         return false;
     }
 
@@ -112,7 +189,7 @@ bool LoopInterchangePass::hasOnlyCanonicalHeaderPhi(Loop *L, PhiInst *IV) {
     return Phis.size() == 1 && Phis.front() == IV;
 }
 
-bool LoopInterchangePass::hasTriangularDescendant(
+bool LoopInterchangePass::hasUnsupportedDescendantDomain(
     Loop *Inner, SCEVResult &SE) {
     if (!Inner) return true;
     for (Loop *Sub : Inner->getSubLoops()) {
@@ -120,15 +197,14 @@ bool LoopInterchangePass::hasTriangularDescendant(
         auto Desc = SE.getCanonicalInduction(Sub);
         auto Trip = SE.analyzeLoopTripCount(Sub);
         if (!Desc || !Trip || !Desc->Valid || !Trip->Valid ||
-            !Desc->Start || !Trip->TripCount) {
+            !Desc->Start || !Desc->Step || !Trip->TripCount ||
+            !Trip->Bound || loopDomainContainsUndef(Sub, SE)) {
             return true;
         }
-        // A descendant whose start/count changes with the selected inner axis
-        // is triangular or otherwise non-rectangular.  A role permutation of
-        // only the two outer axes would strand that dependent schedule.
-        if (Desc->Start->mentionsLoop(Inner) ||
-            Trip->TripCount->mentionsLoop(Inner) ||
-            hasTriangularDescendant(Sub, SE)) {
+        // 角色交换会改写整个内层子树中的归纳变量使用，后代循环依赖被交换轴
+        // 的起点或上界也会随之改写，因此三角域本身不是拒绝理由。这里只拒绝
+        // 无法由 SCEV 完整描述的后代域，最终合法性仍由循环依赖分析证明。
+        if (hasUnsupportedDescendantDomain(Sub, SE)) {
             return true;
         }
     }
@@ -429,6 +505,551 @@ bool LoopInterchangePass::applyCandidate(Function &F, Candidate &C) {
     return true;
 }
 
+bool LoopInterchangePass::buildRotatedNestCandidate(
+    Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
+    DominatorTree &DT, PostDominatorTree &PDT,
+    LoopDependenceInfo &LD, RotatedNestCandidate &C) {
+    C = RotatedNestCandidate{};
+    if (!Outer || !Inner || Inner->getParentLoop() != Outer ||
+        Outer->getSubLoops().size() != 1 ||
+        Outer->getSubLoops().front() != Inner || !Inner->isInnermost() ||
+        !LCSSAPass::isLCSSAForm(Outer) ||
+        !LCSSAPass::isLCSSAForm(Inner) ||
+        !SE.isKnownFiniteLoop(Outer) ||
+        !SE.isKnownFiniteLoop(Inner)) {
+        return false;
+    }
+
+    BasicBlock *Guard = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    BasicBlock *Prefix = nullptr;
+    BasicBlock *InnerBody = nullptr;
+    // 外循环可能由零次执行保护边直接跳到唯一出口。此时保护块并非经典
+    // 单后继 preheader，出口也会多出保护块前驱，但头块仍必须只有一个
+    // 循环内回边和一个循环外入口；其余边形状在下方逐项核验。
+    auto getGuardedLoopForm = [](Loop *L, BasicBlock *&Entry,
+                                 BasicBlock *&Latch) {
+        Entry = nullptr;
+        Latch = nullptr;
+        if (!L || !L->getHeader()) return false;
+        for (BasicBlock *Pred : L->getHeader()->getPredecessors()) {
+            if (!Pred) continue;
+            BasicBlock *&Slot = L->contains(Pred) ? Latch : Entry;
+            if (Slot) return false;
+            Slot = Pred;
+        }
+        return Entry && Latch &&
+               Entry->countEdgesToSucc(L->getHeader()) == 1 &&
+               Latch->countEdgesToSucc(L->getHeader()) == 1;
+    };
+    if (!getGuardedLoopForm(Outer, Guard, OuterLatch) ||
+        !Inner->getLoopSimplifyForm(Prefix, InnerBody) ||
+        !Guard || !OuterLatch || !Prefix || !InnerBody ||
+        Prefix == Outer->getHeader() ||
+        !Outer->contains(Prefix) || Inner->contains(Prefix)) {
+        return false;
+    }
+
+    BasicBlock *OuterHeader = Outer->getHeader();
+    BasicBlock *InnerHeader = Inner->getHeader();
+    auto OuterDesc = SE.getCanonicalInduction(Outer);
+    auto InnerDesc = SE.getCanonicalInduction(Inner);
+    auto OuterTrip = SE.analyzeLoopTripCount(Outer);
+    auto InnerTrip = SE.analyzeLoopTripCount(Inner);
+    if (!OuterHeader || !InnerHeader ||
+        !OuterDesc || !InnerDesc || !OuterTrip || !InnerTrip ||
+        !OuterDesc->Valid || !InnerDesc->Valid ||
+        !OuterTrip->Valid || !InnerTrip->Valid ||
+        !OuterDesc->Phi || !InnerDesc->Phi ||
+        !OuterDesc->Start || !OuterDesc->Step ||
+        !InnerDesc->Start || !InnerDesc->Step ||
+        !OuterTrip->Bound || !InnerTrip->Bound ||
+        !OuterTrip->ExitCmp || !InnerTrip->ExitCmp ||
+        !OuterDesc->StartValue || !InnerDesc->StartValue ||
+        !OuterDesc->UpdateValue || !InnerDesc->UpdateValue ||
+        OuterTrip->ExitingBlock != OuterHeader ||
+        InnerTrip->ExitingBlock != InnerHeader ||
+        InnerTrip->ExitBlock != OuterLatch ||
+        !OuterTrip->ExitBlock ||
+        loopDomainContainsUndef(Outer, SE) ||
+        loopDomainContainsUndef(Inner, SE)) {
+        return false;
+    }
+    auto *InnerUpdate = dynamic_cast<Instruction *>(
+        InnerDesc->UpdateValue);
+    BasicBlock *Exit = OuterTrip->ExitBlock;
+    if (OuterDesc->Start->mentionsLoop(Inner) ||
+        OuterDesc->Step->mentionsLoop(Inner) ||
+        OuterTrip->Bound->mentionsLoop(Inner) ||
+        InnerDesc->Start->mentionsLoop(Outer) ||
+        InnerDesc->Step->mentionsLoop(Outer) ||
+        InnerTrip->Bound->mentionsLoop(Outer)) {
+        return false;
+    }
+
+    if (!hasOnlyCanonicalHeaderPhi(Outer, OuterDesc->Phi) ||
+        !hasOnlyCanonicalHeaderPhi(Inner, InnerDesc->Phi) ||
+        !Prefix->collectPhiNodes().empty() ||
+        !InnerBody->collectPhiNodes().empty() ||
+        !OuterLatch->collectPhiNodes().empty() ||
+        !Exit->collectPhiNodes().empty()) {
+        return false;
+    }
+
+    const auto OuterExits = Outer->getExitBlocks();
+    const auto InnerExits = Inner->getExitBlocks();
+    if (OuterExits.size() != 1 || OuterExits.front() != Exit ||
+        InnerExits.size() != 1 || InnerExits.front() != OuterLatch) {
+        return false;
+    }
+
+    const auto &OuterDirectBlocks = Outer->getBlocks();
+    const auto InnerBlocks = Inner->getBlocksIncludingSubLoops();
+    if (OuterDirectBlocks.size() != 3 || InnerBlocks.size() != 2)
+        return false;
+    std::unordered_set<BasicBlock *> OuterDirect(
+        OuterDirectBlocks.begin(), OuterDirectBlocks.end());
+    std::unordered_set<BasicBlock *> InnerBlockSet(
+        InnerBlocks.begin(), InnerBlocks.end());
+    if (!OuterDirect.count(OuterHeader) || !OuterDirect.count(Prefix) ||
+        !OuterDirect.count(OuterLatch) ||
+        !InnerBlockSet.count(InnerHeader) ||
+        !InnerBlockSet.count(InnerBody) ||
+        LI.getLoopFor(OuterHeader) != Outer ||
+        LI.getLoopFor(Prefix) != Outer ||
+        LI.getLoopFor(OuterLatch) != Outer ||
+        LI.getLoopFor(InnerHeader) != Inner ||
+        LI.getLoopFor(InnerBody) != Inner) {
+        return false;
+    }
+
+    auto *GuardBr = Guard->getBranchTerminator();
+    auto *OuterHeaderBr = OuterHeader->getBranchTerminator();
+    auto *PrefixBr = Prefix->getBranchTerminator();
+    auto *InnerHeaderBr = InnerHeader->getBranchTerminator();
+    auto *InnerBodyBr = InnerBody->getBranchTerminator();
+    auto *OuterLatchBr = OuterLatch->getBranchTerminator();
+    if ((!BasicBlock::isUncondBr(GuardBr) &&
+         !BasicBlock::isCondBr(GuardBr)) ||
+        !BasicBlock::isCondBr(OuterHeaderBr) ||
+        !BasicBlock::isUncondBr(PrefixBr) ||
+        !BasicBlock::isCondBr(InnerHeaderBr) ||
+        !BasicBlock::isUncondBr(InnerBodyBr) ||
+        !BasicBlock::isUncondBr(OuterLatchBr) ||
+        PrefixBr->getSuccessor(0) != InnerHeader ||
+        InnerBodyBr->getSuccessor(0) != InnerHeader ||
+        OuterLatchBr->getSuccessor(0) != OuterHeader ||
+        Guard->countEdgesToSucc(OuterHeader) != 1 ||
+        OuterHeader->countEdgesToSucc(Prefix) != 1 ||
+        Prefix->countEdgesToSucc(InnerHeader) != 1 ||
+        InnerBody->countEdgesToSucc(InnerHeader) != 1 ||
+        OuterHeaderBr->getCondition() != OuterTrip->ExitCmp ||
+        InnerHeaderBr->getCondition() != InnerTrip->ExitCmp ||
+        !InnerUpdate || InnerUpdate->getParent() != InnerHeader) {
+        return false;
+    }
+    if (GuardBr->isConditional()) {
+        BasicBlock *Other = GuardBr->getSuccessor(0) == OuterHeader
+            ? GuardBr->getSuccessor(1) : GuardBr->getSuccessor(0);
+        if (Other != Exit) return false;
+    } else if (GuardBr->getSuccessor(0) != OuterHeader) {
+        return false;
+    }
+
+    const unsigned OuterContinueIndex =
+        OuterTrip->ContinueOnTrue ? 0U : 1U;
+    const unsigned OuterExitIndex = OuterContinueIndex ^ 1U;
+    const unsigned InnerContinueIndex =
+        InnerTrip->ContinueOnTrue ? 0U : 1U;
+    const unsigned InnerExitIndex = InnerContinueIndex ^ 1U;
+    if (OuterHeaderBr->getSuccessor(OuterContinueIndex) != Prefix ||
+        OuterHeaderBr->getSuccessor(OuterExitIndex) != Exit ||
+        InnerHeaderBr->getSuccessor(InnerContinueIndex) != InnerBody ||
+        InnerHeaderBr->getSuccessor(InnerExitIndex) != OuterLatch ||
+        OuterLatchBr->getSuccessor(0) != OuterHeader) {
+        return false;
+    }
+
+    auto findIncoming = [](PhiInst *Phi, BasicBlock *Pred,
+                           Value *Expected, unsigned &Index) {
+        if (!Phi || !Pred || !Expected ||
+            Phi->countIncomingFromPred(Pred) != 1) {
+            return false;
+        }
+        for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+            if (Phi->getIncomingBlock(I) != Pred) continue;
+            if (Phi->getIncomingValue(I) != Expected) return false;
+            Index = I;
+            return true;
+        }
+        return false;
+    };
+
+    unsigned OuterBackedgeIndex = 0;
+    if (OuterDesc->Phi->getNumIncomingValues() != 2 ||
+        InnerDesc->Phi->getNumIncomingValues() != 2 ||
+        !findIncoming(OuterDesc->Phi, Guard, OuterDesc->StartValue,
+                      C.OuterStartIndex) ||
+        !findIncoming(OuterDesc->Phi, OuterLatch,
+                      OuterDesc->UpdateValue, OuterBackedgeIndex) ||
+        !findIncoming(InnerDesc->Phi, Prefix,
+                      InnerDesc->StartValue, C.InnerStartIndex) ||
+        !findIncoming(InnerDesc->Phi, InnerBody,
+                      InnerDesc->UpdateValue, C.InnerBackedgeIndex)) {
+        return false;
+    }
+
+    auto availableAtGuard = [&](Value *V) {
+        auto *I = dynamic_cast<Instruction *>(V);
+        if (!I || !I->getParent()) return true;
+        BasicBlock *DefBlock = I->getParent();
+        if (DefBlock != Guard) return DT.dominates(DefBlock, Guard);
+        Instruction *Terminator = Guard->getTerminator();
+        return I != Terminator && I->comesBefore(Terminator);
+    };
+
+    // 交换会让旧内层条件先于旧外层头执行，因此无论 SCEV 是否推断零次
+    // 迭代，都精确保留原外层的第一次首部比较。这里只接受直接使用头部
+    // PHI 的比较，避免用数学 trip count 代替固定位宽 IR 的真实谓词。
+    Value *CmpLHS = OuterTrip->ExitCmp->getOperand(0);
+    Value *CmpRHS = OuterTrip->ExitCmp->getOperand(1);
+    const bool PhiOnLHS = CmpLHS == OuterDesc->Phi;
+    const bool PhiOnRHS = CmpRHS == OuterDesc->Phi;
+    Value *FirstBound = PhiOnLHS ? CmpRHS : CmpLHS;
+    if (OuterTrip->ComparePhase != LoopExitComparePhase::HeaderPhi ||
+        OuterTrip->IndVar != OuterDesc->Phi ||
+        !BinaryInst::isCompareOp(OuterTrip->ExitCmp->getOp()) ||
+        PhiOnLHS == PhiOnRHS ||
+        !availableAtGuard(OuterDesc->StartValue) ||
+        !availableAtGuard(FirstBound)) {
+        return false;
+    }
+
+    if (!availableAtGuard(OuterDesc->StartValue) ||
+        !availableAtGuard(InnerDesc->StartValue) ||
+        !DT.dominates(OuterHeader, Prefix) ||
+        !DT.dominates(Prefix, InnerHeader) ||
+        !DT.dominates(OuterHeader, InnerHeader) ||
+        !DT.dominates(InnerHeader, InnerBody) ||
+        !DT.dominates(InnerHeader, OuterLatch) ||
+        !PDT.isReachableToExit(OuterHeader) ||
+        !PDT.isReachableToExit(InnerHeader)) {
+        return false;
+    }
+
+    // 交换后旧内层头会成为新外层头，其中的控制计算从“每个外轴一次”
+    // 变为“每个内轴一次”。只接受无访存、不可观察且不会故障的控制指令，
+    // 并验证所有跨块定义在保护块处已可用，避免 CFG 重排制造 use-before-def。
+    for (Instruction *I : *InnerHeader) {
+        if (!I || dynamic_cast<PhiInst *>(I) ||
+            dynamic_cast<BrInst *>(I)) {
+            continue;
+        }
+        if (!dynamic_cast<BinaryInst *>(I) &&
+            !dynamic_cast<BitCastInst *>(I) &&
+            !dynamic_cast<ZextInst *>(I) &&
+            !dynamic_cast<SextInst *>(I) &&
+            !dynamic_cast<TruncInst *>(I)) {
+            return false;
+        }
+        if (dceInstructionMustBePreserved(I) ||
+            instructionMayFaultOrProducePoison(I)) {
+            return false;
+        }
+        for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+            Value *Operand = I->getOperand(Index);
+            if (Operand == OuterDesc->Phi) return false;
+            auto *Def = dynamic_cast<Instruction *>(Operand);
+            if (!Def || !Def->getParent()) continue;
+            if (Def->getParent() == InnerHeader) {
+                if (Def != InnerDesc->Phi && !Def->comesBefore(I))
+                    return false;
+                continue;
+            }
+            if (!DT.dominates(Def->getParent(), Guard))
+                return false;
+        }
+    }
+
+    // 物理交换会改变循环体的执行次序，动态分配、调用和未知可观察
+    // 指令不能只依靠内存依赖摘要放行。
+    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I || dynamic_cast<AllocaInst *>(I) ||
+                dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<RetInst *>(I)) {
+                return false;
+            }
+            if (!dynamic_cast<LoadInst *>(I) &&
+                !dynamic_cast<StoreInst *>(I) &&
+                !dynamic_cast<PhiInst *>(I) &&
+                !dynamic_cast<BrInst *>(I) &&
+                dceInstructionMustBePreserved(I)) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<Instruction *> PrefixLoads;
+    for (BasicBlock *BB : OuterDirectBlocks) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I || dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<StoreInst *>(I) ||
+                dynamic_cast<AllocaInst *>(I) ||
+                dynamic_cast<RetInst *>(I)) {
+                return false;
+            }
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                if (BB != Prefix) return false;
+                PrefixLoads.push_back(Load);
+                continue;
+            }
+            if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I))
+                continue;
+            if (dceInstructionMustBePreserved(I) ||
+                instructionMayFaultOrProducePoison(I)) {
+                return false;
+            }
+        }
+    }
+    if (PrefixLoads.empty() || LD.hasUnknownMemory(Outer)) return false;
+
+    // Prefix 改为随新内层轴重复执行。它的定义只能供仍被 Prefix
+    // 支配的块使用，且同块定义必须保持先定义后使用。
+    for (Instruction *I : *Prefix) {
+        if (!I || dynamic_cast<BrInst *>(I)) continue;
+        for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+            auto *Def = dynamic_cast<Instruction *>(I->getOperand(Index));
+            if (!Def || !Def->getParent()) continue;
+            if (Def->getParent() == Prefix) {
+                if (!Def->comesBefore(I)) return false;
+                continue;
+            }
+            if (Def == OuterDesc->Phi) continue;
+            if (!DT.dominates(Def->getParent(), Guard)) return false;
+        }
+        for (Use *U : I->getUses()) {
+            auto *User = dynamic_cast<Instruction *>(
+                U ? U->getUser() : nullptr);
+            if (!User || !User->getParent()) return false;
+            if (User->getParent() == Prefix) {
+                if (!I->comesBefore(User)) return false;
+                continue;
+            }
+            if (User->getParent() != InnerBody &&
+                User->getParent() != OuterLatch) {
+                return false;
+            }
+        }
+    }
+
+    const auto &Accesses = LD.getMemoryAccesses(Outer);
+    for (Instruction *Load : PrefixLoads) {
+        for (const LoopMemoryAccess &Access : Accesses) {
+            if (!Access.Writes || !Access.Inst ||
+                !Access.Inst->getParent() ||
+                !Inner->contains(Access.Inst->getParent())) {
+                continue;
+            }
+            if (!LD.isInvariantAccessDisjointFromLoopWrite(
+                    Load, Access.Inst, Outer, Inner)) {
+                return false;
+            }
+        }
+    }
+
+    for (const LoopDependenceRecord &Record : LD.getDependences(Outer)) {
+        if (!Record.Source || !Record.Sink ||
+            !Record.Source->Inst || !Record.Sink->Inst) {
+            return false;
+        }
+
+        bool OuterEqual = false;
+        bool InnerEqual = false;
+        for (std::size_t I = 0;
+             I < Record.Loops.size() && I < Record.DirectionMasks.size();
+             ++I) {
+            if (Record.Loops[I] == Outer)
+                OuterEqual =
+                    Record.DirectionMasks[I] == LoopDepSameIteration;
+            if (Record.Loops[I] == Inner)
+                InnerEqual =
+                    Record.DirectionMasks[I] == LoopDepSameIteration;
+        }
+        // Prefix 的区间不相交证明只说明固定旧外轴时重复读取稳定，
+        // 不能代替跨旧外轴的标准方向向量门禁。
+        if (!OuterEqual && !InnerEqual) return false;
+    }
+
+    long long Benefit = 0;
+    for (const LoopMemoryAccess &Access : Accesses) {
+        if (!Access.Inst || !Access.Inst->getParent() ||
+            !Inner->contains(Access.Inst->getParent())) {
+            continue;
+        }
+        auto OuterStride = LD.getByteStride(Access.Inst, Outer);
+        auto InnerStride = LD.getByteStride(Access.Inst, Inner);
+        if (!OuterStride || !InnerStride) continue;
+        const long long Weight = Access.Writes ? 2 : 1;
+        Benefit += Weight *
+            (static_cast<long long>(stridePenalty(*InnerStride)) -
+             static_cast<long long>(stridePenalty(*OuterStride)));
+    }
+    if (Benefit < MinLocalityBenefit) return false;
+
+    C.Outer = Outer;
+    C.Inner = Inner;
+    C.Guard = Guard;
+    C.OuterHeader = OuterHeader;
+    C.Prefix = Prefix;
+    C.InnerHeader = InnerHeader;
+    C.InnerBody = InnerBody;
+    C.OuterLatch = OuterLatch;
+    C.Exit = Exit;
+    C.OuterIV = OuterDesc->Phi;
+    C.InnerIV = InnerDesc->Phi;
+    C.OuterFirstCmp = OuterTrip->ExitCmp;
+    C.OuterStartValue = OuterDesc->StartValue;
+    C.OuterContinueOnTrue = OuterTrip->ContinueOnTrue;
+    C.InnerContinueOnTrue = InnerTrip->ContinueOnTrue;
+    C.LocalityBenefit = Benefit;
+    return true;
+}
+
+bool LoopInterchangePass::applyRotatedNestCandidate(
+    Function &F, RotatedNestCandidate &C) {
+    if (!C.Guard || !C.OuterHeader || !C.Prefix || !C.InnerHeader ||
+        !C.InnerBody || !C.OuterLatch || !C.Exit ||
+        !C.OuterIV || !C.InnerIV) {
+        return false;
+    }
+
+    if (!C.OuterFirstCmp || !C.OuterStartValue) {
+        return false;
+    }
+
+    auto *GuardBr = C.Guard->getBranchTerminator();
+    auto *OuterHeaderBr = C.OuterHeader->getBranchTerminator();
+    auto *PrefixBr = C.Prefix->getBranchTerminator();
+    auto *InnerHeaderBr = C.InnerHeader->getBranchTerminator();
+    auto *InnerBodyBr = C.InnerBody->getBranchTerminator();
+    auto *OuterLatchBr = C.OuterLatch->getBranchTerminator();
+    auto findSuccessor = [](BrInst *Br, BasicBlock *Target,
+                            unsigned &Index) {
+        if (!Br || !Target) return false;
+        bool Found = false;
+        for (unsigned I = 0; I < Br->getSuccessorCount(); ++I) {
+            if (Br->getSuccessor(I) != Target) continue;
+            if (Found) return false;
+            Found = true;
+            Index = I;
+        }
+        return Found;
+    };
+
+    unsigned GuardToOuter = 0;
+    unsigned OuterToPrefix = 0;
+    unsigned OuterToExit = 0;
+    unsigned PrefixToInner = 0;
+    unsigned InnerBodyToHeader = 0;
+    unsigned OuterLatchToHeader = 0;
+    const unsigned OuterContinue =
+        C.OuterContinueOnTrue ? 0U : 1U;
+    const unsigned OuterExit = OuterContinue ^ 1U;
+    unsigned InnerContinue = C.InnerContinueOnTrue ? 0U : 1U;
+    unsigned InnerExit = InnerContinue ^ 1U;
+    if (!findSuccessor(GuardBr, C.OuterHeader, GuardToOuter) ||
+        !findSuccessor(OuterHeaderBr, C.Prefix, OuterToPrefix) ||
+        !findSuccessor(OuterHeaderBr, C.Exit, OuterToExit) ||
+        !findSuccessor(PrefixBr, C.InnerHeader, PrefixToInner) ||
+        !findSuccessor(InnerBodyBr, C.InnerHeader,
+                       InnerBodyToHeader) ||
+        !findSuccessor(OuterLatchBr, C.OuterHeader,
+                       OuterLatchToHeader) ||
+        !InnerHeaderBr ||
+        OuterToPrefix != OuterContinue || OuterToExit != OuterExit ||
+        InnerHeaderBr->getSuccessor(InnerContinue) != C.InnerBody ||
+        InnerHeaderBr->getSuccessor(InnerExit) != C.OuterLatch ||
+        C.OuterIV->getIncomingBlock(C.OuterStartIndex) != C.Guard ||
+        C.InnerIV->getIncomingBlock(C.InnerStartIndex) != C.Prefix ||
+        C.InnerIV->getIncomingBlock(C.InnerBackedgeIndex) != C.InnerBody) {
+        return false;
+    }
+
+    Value *FirstLHS = C.OuterFirstCmp->getOperand(0);
+    Value *FirstRHS = C.OuterFirstCmp->getOperand(1);
+    const bool PhiOnLHS = FirstLHS == C.OuterIV;
+    const bool PhiOnRHS = FirstRHS == C.OuterIV;
+    if (PhiOnLHS == PhiOnRHS) return false;
+    if (PhiOnLHS) FirstLHS = C.OuterStartValue;
+    else FirstRHS = C.OuterStartValue;
+
+    auto *FirstCheck = new BasicBlock();
+    auto *JPre = new BasicBlock();
+    auto *KPre = new BasicBlock();
+    auto *JLatch = new BasicBlock();
+    JPre->setIdent(F.makeUniqueBlockIdent(
+        C.InnerHeader->getIdent() + ".interchange.preheader"));
+    KPre->setIdent(F.makeUniqueBlockIdent(
+        C.OuterHeader->getIdent() + ".interchange.preheader"));
+    JLatch->setIdent(F.makeUniqueBlockIdent(
+        C.InnerHeader->getIdent() + ".interchange.latch"));
+    FirstCheck->setIdent(F.makeUniqueBlockIdent(
+        C.OuterHeader->getIdent() + ".interchange.firstcheck"));
+    auto *FirstCmp = new BinaryInst(
+        FirstLHS, C.OuterFirstCmp->getOp(), FirstRHS);
+    FirstCheck->pushBack(FirstCmp);
+    if (C.OuterContinueOnTrue)
+        FirstCheck->genCondInst(FirstCmp, JPre, C.Exit);
+    else
+        FirstCheck->genCondInst(FirstCmp, C.Exit, JPre);
+    JPre->genUnCondInst(C.InnerHeader);
+    KPre->genUnCondInst(C.OuterHeader);
+    JLatch->genUnCondInst(C.InnerHeader);
+
+    // 所有可失败的结构与索引检查均在新块挂接前完成。
+    // 提交阶段只替换已存在的边和 PHI 前驱，不重写起点、步长
+    // 或上界，因此两个归纳变量的实际坐标不会偏移。
+    F.pushBlock(FirstCheck);
+    F.pushBlock(JPre);
+    F.pushBlock(KPre);
+    F.pushBlock(JLatch);
+
+    auto rewriteEdge = [](BrInst *Br, unsigned Index,
+                          BasicBlock *Target) {
+        const bool Changed = Br && Br->setSuccessor(Index, Target);
+        assert(Changed && "validated interchange edge rewrite failed");
+        (void)Changed;
+    };
+    rewriteEdge(GuardBr, GuardToOuter, FirstCheck);
+    rewriteEdge(InnerHeaderBr, InnerContinue, KPre);
+    rewriteEdge(InnerHeaderBr, InnerExit, C.Exit);
+    rewriteEdge(OuterHeaderBr, OuterExit, JLatch);
+    rewriteEdge(PrefixBr, PrefixToInner, C.InnerBody);
+    rewriteEdge(InnerBodyBr, InnerBodyToHeader, C.OuterLatch);
+
+    const bool OuterIncomingChanged = C.OuterIV->setIncomingBlock(
+        C.OuterStartIndex, KPre);
+    const bool InnerStartChanged = C.InnerIV->setIncomingBlock(
+        C.InnerStartIndex, JPre);
+    const bool InnerBackedgeChanged = C.InnerIV->setIncomingBlock(
+        C.InnerBackedgeIndex, JLatch);
+    assert(OuterIncomingChanged && InnerStartChanged &&
+           InnerBackedgeChanged &&
+           "validated interchange PHI rewrite failed");
+    (void)OuterIncomingChanged;
+    (void)InnerStartChanged;
+    (void)InnerBackedgeChanged;
+
+    C.Prefix->setIdent(F.makeUniqueBlockIdent(
+        C.Prefix->getIdent() + ".interchange.cfg"));
+    C.InnerBody->setIdent(F.makeUniqueBlockIdent(
+        C.InnerBody->getIdent() + ".interchange.cfg"));
+    return true;
+}
+
 PassResult LoopInterchangePass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
     if (TransformCount[&F] >= MaxInterchangesPerFunction)
@@ -446,6 +1067,17 @@ PassResult LoopInterchangePass::run(
         HeaderPair Key{Outer->getHeader(), Inner->getHeader()};
         if (Transformed.count(Key)) continue;
 
+        RotatedNestCandidate Rotated;
+        if (buildRotatedNestCandidate(
+                Outer, Inner, LI, SE, DT, PDT, LD, Rotated) &&
+            applyRotatedNestCandidate(F, Rotated)) {
+            Transformed.insert(Key);
+            Transformed.insert(
+                HeaderPair{Inner->getHeader(), Outer->getHeader()});
+            ++TransformCount[&F];
+            return PassResult::changed(PreservationStatus::none());
+        }
+
         Candidate C;
         C.Outer = Outer;
         C.Inner = Inner;
@@ -454,7 +1086,7 @@ PassResult LoopInterchangePass::run(
         if (!hasOnlyCanonicalHeaderPhi(Outer, C.OuterIV) ||
             !hasOnlyCanonicalHeaderPhi(Inner, C.InnerIV))
             continue;
-        if (hasTriangularDescendant(Inner, SE))
+        if (hasUnsupportedDescendantDomain(Inner, SE))
             continue;
 
         BasicBlock *InnerLatch = nullptr;
