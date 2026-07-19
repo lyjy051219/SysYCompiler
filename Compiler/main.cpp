@@ -5,6 +5,9 @@
 #ifdef ENABLE_RISCV_BACKEND
 #include "./include/riscv/Target.hpp"
 #endif
+#ifdef ENABLE_AARCH64_BACKEND
+#include "./include/aarch64/Target.hpp"
+#endif
 #include <iostream>
 #include <string>
 #include <memory>
@@ -74,6 +77,18 @@ int main(int argc, const char *argv[]) {
         riscv::emitAssembly(*ModuleIR, asmOut);
     } catch (const riscv::BackendError &error) {
         std::cerr << "RISC-V backend error: " << error.message() << std::endl;
+        return 1;
+    }
+#elif defined(ENABLE_AARCH64_BACKEND)
+    try {
+        std::ofstream asmOut(outputPath);
+        if (!asmOut.is_open()) {
+            std::cerr << "Error: Cannot open output file " << outputPath << std::endl;
+            return 1;
+        }
+        aarch64::emitAssembly(*ModuleIR, asmOut);
+    } catch (const aarch64::BackendError &error) {
+        std::cerr << "ARM64 backend error: " << error.message() << std::endl;
         return 1;
     }
 #else
