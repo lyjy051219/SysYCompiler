@@ -1,7 +1,7 @@
-#include "../../../include/riscv/AsmPrinter.hpp"
+#include "riscv/AsmPrinter.hpp"
 
-#include "../../../include/lib/CFG.hpp"
-#include "../../../include/riscv/Target.hpp"
+#include "lib/CFG.hpp"
+#include "riscv/Target.hpp"
 
 #include <algorithm>
 #include <array>
@@ -499,6 +499,13 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       throw BackendError("malformed FMV_W_X instruction");
     }
     out_ << "    fmv.w.x " << operandReg(instr.defs.front()) << ", "
+         << operandReg(instr.uses.front()) << '\n';
+    return;
+  case Opcode::FMV_X_W:
+    if (instr.defs.empty() || instr.uses.empty()) {
+      throw BackendError("malformed FMV_X_W instruction");
+    }
+    out_ << "    fmv.x.w " << operandReg(instr.defs.front()) << ", "
          << operandReg(instr.uses.front()) << '\n';
     return;
   case Opcode::LI:

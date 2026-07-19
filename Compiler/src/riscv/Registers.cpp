@@ -1,4 +1,4 @@
-#include "../../../include/riscv/Registers.hpp"
+#include "riscv/Registers.hpp"
 
 #include <array>
 #include <cstddef>

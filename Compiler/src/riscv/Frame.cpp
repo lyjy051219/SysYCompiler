@@ -1,6 +1,6 @@
-#include "../../../include/riscv/Frame.hpp"
+#include "riscv/Frame.hpp"
 
-#include "../../../include/lib/TypeSystem.hpp"
+#include "lib/TypeSystem.hpp"
 
 #include <algorithm>
 #include <cstdint>

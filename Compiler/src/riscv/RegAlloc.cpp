@@ -1,7 +1,7 @@
-#include "../../../include/riscv/RegAlloc.hpp"
+#include "riscv/RegAlloc.hpp"
 
-#include "../../../include/riscv/Registers.hpp"
-#include "../../../include/riscv/Target.hpp"
+#include "riscv/Registers.hpp"
+#include "riscv/Target.hpp"
 #include "riscv/opt/MachineAnalysis.hpp"
 
 #include <algorithm>

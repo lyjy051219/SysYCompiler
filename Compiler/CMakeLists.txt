@@ -104,7 +104,7 @@ else()
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/lib)
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/yacc)
     add_subdirectory(${PROJECT_SOURCE_DIR}/src/ir)
-    add_subdirectory(${PROJECT_SOURCE_DIR}/src/backend)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/src/riscv)
 
     add_executable(compiler main.cpp)
     target_compile_definitions(compiler PRIVATE

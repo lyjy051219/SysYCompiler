@@ -1,6 +1,6 @@
-#include "../../../include/riscv/MIR.hpp"
+#include "riscv/MIR.hpp"
 
-#include "../../../include/riscv/Target.hpp"
+#include "riscv/Target.hpp"
 
 #include <ostream>
 #include <string>
@@ -19,6 +19,8 @@ const char *opcodeName(Opcode opcode) {
     return "F_COPY";
   case Opcode::FMV_W_X:
     return "FMV_W_X";
+  case Opcode::FMV_X_W:
+    return "FMV_X_W";
   case Opcode::LI:
     return "LI";
   case Opcode::LA:

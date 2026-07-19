@@ -143,6 +143,7 @@ bool isSpeculatablePreheaderInstruction(const MachineInstr &instr) {
   case Opcode::COPY:
   case Opcode::F_COPY:
   case Opcode::FMV_W_X:
+  case Opcode::FMV_X_W:
   case Opcode::LI:
   case Opcode::ADD:
   case Opcode::ADDW:

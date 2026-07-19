@@ -1,7 +1,7 @@
-#include "../../../include/riscv/ISel.hpp"
+#include "riscv/ISel.hpp"
 
-#include "../../../include/riscv/Frame.hpp"
-#include "../../../include/riscv/Target.hpp"
+#include "riscv/Frame.hpp"
+#include "riscv/Target.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -79,6 +79,22 @@ bool isFloatType(const std::shared_ptr<IRType> &type) {
 
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_POINTER;
+}
+
+std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
+  if (!type) {
+    return "<missing>";
+  }
+  if (type->getEnum() == IR_FLOAT) {
+    return "f32";
+  }
+  if (type->getEnum() == IR_INT) {
+    return "i" + std::to_string(type->getSize() * 8);
+  }
+  if (type->getEnum() == IR_POINTER) {
+    return "pointer";
+  }
+  return "non-scalar";
 }
 
 RegClass regClassForType(const std::shared_ptr<IRType> &type) {
@@ -1253,11 +1269,16 @@ void lowerIntCompare(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg left = valueReg(mf, mbb, lhs);
   MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
   MachineReg tmp;
+  // Equality/inequality compares reduce to XOR followed by a zero test.  The
+  // XOR temporary must stay in the same GPR class as the compared values:
+  // pointers are GPR64 while ordinary SysY integers are GPR32.  The compare
+  // result itself remains a boolean GPR32 regardless of operand width.
+  const RegClass compareClass = left.rc;
 
   int64_t rhsValue = 0;
   if ((inst.getOp() == BinaryInst::E || inst.getOp() == BinaryInst::NE) &&
       intConstant(rhs, rhsValue) && fitsSigned12(rhsValue)) {
-    tmp = mf.createVReg(RegClass::GPR32);
+    tmp = mf.createVReg(compareClass);
     appendImmInstr(mbb, Opcode::XORI, tmp, MachineOperand::reg(left),
                    rhsValue);
     appendRegInstr(mbb, inst.getOp() == BinaryInst::E ? Opcode::SEQZ
@@ -1270,12 +1291,12 @@ void lowerIntCompare(MachineFunction &mf, MachineBasicBlock &mbb,
 
   switch (inst.getOp()) {
   case BinaryInst::E:
-    tmp = mf.createVReg(RegClass::GPR32);
+    tmp = mf.createVReg(compareClass);
     appendRegInstr(mbb, Opcode::XOR, tmp, {left, right});
     appendRegInstr(mbb, Opcode::SEQZ, dst, {tmp});
     break;
   case BinaryInst::NE:
-    tmp = mf.createVReg(RegClass::GPR32);
+    tmp = mf.createVReg(compareClass);
     appendRegInstr(mbb, Opcode::XOR, tmp, {left, right});
     appendRegInstr(mbb, Opcode::SNEZ, dst, {tmp});
     break;
@@ -1527,7 +1548,9 @@ void lowerStore(MachineFunction &mf, MachineBasicBlock &mbb,
 void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
                   LoweringState &state, BitCastInst &inst) {
   Value *srcValue = requiredUseValue(inst, 0, "bitcast instruction");
-  if (isPointerType(srcValue->getIRType()) && isPointerType(inst.getIRType())) {
+  const std::shared_ptr<IRType> srcType = srcValue->getIRType();
+  const std::shared_ptr<IRType> dstType = inst.getIRType();
+  if (isPointerType(srcType) && isPointerType(dstType)) {
     Address address =
         addressForValue(mf, mbb, state, srcValue, "bitcast instruction");
     state.addresses[&inst] = address;
@@ -1537,10 +1560,32 @@ void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
     return;
   }
 
+  const bool srcScalar = srcType && srcType->isScalar();
+  const bool dstScalar = dstType && dstType->isScalar();
+  if (!srcScalar || !dstScalar || sizeOfType(srcType) != sizeOfType(dstType)) {
+    throw BackendError("unsupported bitcast from " + scalarTypeName(srcType) +
+                       " to " + scalarTypeName(dstType));
+  }
+
   MachineReg src = valueReg(mf, mbb, srcValue);
   MachineReg dst =
-      getOrCreateResultReg(mf, inst, regClassForType(inst.getIRType()));
-  appendRegInstr(mbb, Opcode::COPY, dst, {src});
+      getOrCreateResultReg(mf, inst, regClassForType(dstType));
+
+  Opcode opcode;
+  if (src.rc == RegClass::FPR32 && dst.rc == RegClass::GPR32) {
+    opcode = Opcode::FMV_X_W;
+  } else if (src.rc == RegClass::GPR32 && dst.rc == RegClass::FPR32) {
+    opcode = Opcode::FMV_W_X;
+  } else if (src.rc == RegClass::FPR32 && dst.rc == RegClass::FPR32) {
+    opcode = Opcode::F_COPY;
+  } else if (src.rc == RegClass::GPR32 && dst.rc == RegClass::GPR32) {
+    opcode = Opcode::COPY;
+  } else {
+    throw BackendError("unsupported bitcast register classes from " +
+                       scalarTypeName(srcType) + " to " +
+                       scalarTypeName(dstType));
+  }
+  appendRegInstr(mbb, opcode, dst, {src});
 }
 
 void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,

@@ -1,7 +1,7 @@
-#include "../../../include/riscv/Passes.hpp"
+#include "riscv/Passes.hpp"
 
-#include "../../../include/lib/CFG.hpp"
-#include "../../../include/riscv/Target.hpp"
+#include "lib/CFG.hpp"
+#include "riscv/Target.hpp"
 
 #include <algorithm>
 #include <cstdint>

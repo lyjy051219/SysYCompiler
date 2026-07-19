@@ -99,6 +99,7 @@ uint32_t opcodeLatency(Opcode opcode) {
   case Opcode::COPY:
   case Opcode::F_COPY:
   case Opcode::FMV_W_X:
+  case Opcode::FMV_X_W:
   case Opcode::LI:
   case Opcode::LA:
   case Opcode::ADD:
