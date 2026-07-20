@@ -2,6 +2,7 @@
 
 #include "aarch64/AsmPrinter.hpp"
 #include "aarch64/ISel.hpp"
+#include "aarch64/opt/CodeGenPrepare.hpp"
 #include "aarch64/opt/MachinePassBuilder.hpp"
 #include "aarch64/opt/MachinePassManager.hpp"
 
@@ -11,12 +12,13 @@ namespace aarch64 {
 
 void emitAssembly(Module &module, std::ostream &out,
                   const BackendOptions &options) {
-  // ARM64 后端首版以正确性为先：走 O0 流水线并禁用全部可选优化 pass，
-  // 只保留必经的代码生成阶段（控制流整理、SELECT/PHI 下降、寄存器分配、
-  // 栈帧下降）。地址归纳准备等 RISC-V 调优 pass 暂不启用，后续再逐步开启。
+  // 启用与 rv 后端一致的优化流水线来提升性能。
+  // 机器层 pass 语义与 rv 相同，只有 AsmPrinter 做指令翻译，可直接复用。
+  // 需要排查时可用环境变量 BACKEND_DISABLE_PASSES 单独关闭某个 pass。
   BackendOptions codegenOptions = options;
-  codegenOptions.optLevel = CodegenOptLevel::O0;
-  codegenOptions.disabledMachinePasses.emplace_back("all");
+
+  // 指令选择前先做地址计算准备，保留 IR 的 SSA 形式。
+  runCodeGenPrepare(module);
 
   // 指令选择：中端 IR 下降为带虚拟寄存器的 MIR
   IRLowering lowering(module);

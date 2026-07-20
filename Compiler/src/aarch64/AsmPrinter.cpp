@@ -637,6 +637,16 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
         dst = operandReg(instr.defs.front());
         src = operandReg(instr.uses[0]);
       }
+      // 源为零寄存器时该指令等价于加载立即数。
+      // ARM64 加立即数形式里 31 号寄存器表示 sp 而不是零寄存器，
+      // 直接输出 add wd wzr imm 会被汇编器拒绝。
+      // 这里与 LI 一致，用 64 位目标寄存器做 movz 和 movk。
+      if (imm != 0 && instr.uses[0].kind == OperandKind::Reg &&
+          instr.uses[0].regValue.physical &&
+          instr.uses[0].regValue.phys == PhysReg::X0) {
+        emitMoveImm(out_, operandRegWide(instr.defs.front()), imm);
+        return;
+      }
       if (imm == 0) {
         out_ << "    mov " << dst << ", " << src << '\n';
       } else if (imm > 0 && fitsAddImm(imm)) {
