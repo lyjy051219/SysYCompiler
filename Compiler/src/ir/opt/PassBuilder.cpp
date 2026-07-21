@@ -28,7 +28,6 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/UnifyFuncExits.hpp"
 #include "ir/opt/BreakCriticalEdges.hpp"
-#include "ir/opt/Select2Branch.hpp"
 #include "ir/opt/IfConversion.hpp"
 #include "ir/opt/GVNPRE.hpp"
 #include "ir/opt/ADCE.hpp"
@@ -389,7 +388,6 @@ FunctionPassManager PassBuilder::buildLatePipeline() {
     LateFPM.addPass(DCEPass());
     // 大整数常量提升（放在 InstSimplify 和 DCE 之后，免得 add 0,c 被折掉）
     LateFPM.addPass(ConstantHoistPass());
-    // LateFPM.addPass(Select2BranchPass());
     //LateFPM.addPass(CFGSimplifyPass());
     //LateFPM.addPass(BreakCriticalEdgesPass());
     LateFPM.addPass(UnifyFuncExitsPass());
@@ -511,11 +509,6 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 
     // 在主体标量与循环优化完成后，为严格纯净的重叠递归插入有界精确键缓存。
     MPM.addPass(FunctionMemoizationPass(FAM));
-
-    // O2 及以上可以跑更多激进的后端准备优化，目前 O1 和 O2 复用流水线
-    if (Level == OptimizationLevel::O2) {
-        // 保留给未来更加激进的优化 (如 Auto-Vectorization 等)
-    }
 
     // Phase 5: Late CFG / Backend Prep (晚期清理与后端准备)
     // 范围和循环变换已经结束，此时可安全放宽标量 Global2Local：

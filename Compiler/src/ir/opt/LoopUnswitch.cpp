@@ -946,14 +946,6 @@ bool LoopUnswitchPass::hasLoopTransformProvenance(
     return false;
 }
 
-bool LoopUnswitchPass::hasTilingProvenance(
-    const std::vector<BasicBlock *> &Blocks) {
-    for (BasicBlock *BB : Blocks) {
-        if (BB && BB->getIdent().find(".tile.") != std::string::npos)
-            return true;
-    }
-    return false;
-}
 
 unsigned LoopUnswitchPass::invariantScope(Value *Condition, Loop *L,
                         const DominatorTree &DT) {
@@ -1020,10 +1012,6 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
 
         std::vector<BasicBlock *> AllBlocks = L->getBlocksInFunctionOrder();
         if (AllBlocks.empty()) continue;
-        // Tile guards are deliberate strip-mining control.  Versioning one of
-        // them duplicates a remainder path around the tiled loop, increasing
-        // CFG pressure without removing a source-level invariant branch.
-        if (hasTilingProvenance(AllBlocks)) continue;
         for (BasicBlock *BB : AllBlocks) {
             if (!isDirectLoopBlock(LI, L, BB)) continue;
             BrInst *Br = BB->getBranchTerminator();
