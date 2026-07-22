@@ -5,6 +5,9 @@
 #ifdef ENABLE_RISCV_BACKEND
 #include "./include/riscv/Target.hpp"
 #endif
+#ifdef ENABLE_AARCH64_BACKEND
+#include "./include/aarch64/Target.hpp"
+#endif
 #include <iostream>
 #include <string>
 #include <memory>
