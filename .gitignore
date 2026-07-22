@@ -32,3 +32,9 @@ Compiler/analysis_out
 Compiler/tools
 Compiler/midend_eval
 build
+Compiler/build_middle_release
+Compiler/build-riscv-release
+Compiler/build-arm64
+Compiler/build-arm64-release
+Compiler/.backendtest-riscv
+Compiler/backend_test_work_arm64
