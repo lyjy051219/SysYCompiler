@@ -12,6 +12,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(BUILD_FRONTEND_ONLY "只构建编译器前端用于调试" OFF)
 option(BUILD_MIDDLE_END "构建前端和中端(IR)用于调试" ON)
 option(BUILD_FRONTEND_RELEASE "构建前端Release版本(-O2)" OFF)
+# 选择后端目标架构：默认 RISC-V；打开 BUILD_AARCH64_BACKEND 则构建 ARM64 后端。
+option(BUILD_AARCH64_BACKEND "构建 ARM64(AArch64) 后端而非 RISC-V 后端" OFF)
 
 # 用来clang-tidy做代码检查
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -95,6 +97,22 @@ elseif(BUILD_MIDDLE_END)
 
     # 调试选项
     target_compile_options(compiler_middle_end PRIVATE -g -O0 -Wall -Wextra)
+
+elseif(BUILD_AARCH64_BACKEND)
+    message(STATUS "=== 构建完整编译器 (ARM64 后端) ===")
+    set(CMAKE_CXX_CLANG_TIDY "") # 与其他分支一致，关闭代码检查以简化构建
+
+    add_subdirectory(${PROJECT_SOURCE_DIR}/src/lib)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/src/yacc)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/src/ir)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/src/aarch64)
+
+    add_executable(compiler main.cpp)
+    target_compile_definitions(compiler PRIVATE
+        RUNTIME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        ENABLE_AARCH64_BACKEND=1
+    )
+    target_link_libraries(compiler Lib Yacc Opt Analysis BackendA64)
 
 else()
     message(STATUS "=== 构建完整编译器 ===")
