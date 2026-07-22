@@ -110,6 +110,45 @@ PreRACopyPropagationPass::run(MachineFunction &mf,
 }
 
 MachinePreservationStatus
+MulAddFusionPass::run(MachineFunction &mf,
+                      MachineFunctionAnalysisManager &am) {
+  (void)am;
+  // 只改块内指令、不动 CFG，保留块结构相关分析。
+  const bool changed = runMulAddFusion(mf);
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+SelectToCselPass::run(MachineFunction &mf,
+                      MachineFunctionAnalysisManager &am) {
+  (void)am;
+  // 只改块内指令、不动 CFG。
+  const bool changed = runSelectToCsel(mf);
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+RedundantSxtwElimPass::run(MachineFunction &mf,
+                           MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runRedundantSxtwElim(mf);
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+MachinePreservationStatus
+AddressIndexFoldPass::run(MachineFunction &mf,
+                          MachineFunctionAnalysisManager &am) {
+  (void)am;
+  const bool changed = runAddressIndexFold(mf);
+  return changed ? preserveBlockStructureAnalyses()
+                 : MachinePreservationStatus::all();
+}
+
+
+MachinePreservationStatus
 PreRALocalCSEPass::run(MachineFunction &mf,
                        MachineFunctionAnalysisManager &am) {
   (void)am;

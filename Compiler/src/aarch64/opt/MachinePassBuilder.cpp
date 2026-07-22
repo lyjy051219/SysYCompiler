@@ -174,6 +174,14 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   }
   addOptionalPass(MPM, Options, "pre-ra-guarded-loop-preheader",
                   PreRAGuardedLoopPreheaderPass());
+  // 乘加融合放在地址/仿射归一化之后，此时 mul 与相邻 add 已稳定。
+  addOptionalPass(MPM, Options, "mul-add-fusion", MulAddFusionPass());
+  // 乘加融合生成 smaddl 后，其乘数若来自 SXTW 可消除冗余符号扩展。
+  addOptionalPass(MPM, Options, "redundant-sxtw-elim", RedundantSxtwElimPass());
+  // 注：address-index-fold（索引寻址折叠）默认关闭。其收益依赖「地址是否可
+  // 共享/外提」的判断，而复用只有寄存器分配后才可见；分配前逐次折叠会破坏
+  // 循环不变地址的共享，在 qemu 下反而变慢（crypto 家族 -24 分）。保留实现，
+  // 待改造为分配后 pass 再启用。可用 BACKEND_DISABLE_PASSES 反向验证。
   return MPM;
 }
 
@@ -210,8 +218,9 @@ MachinePassBuilder::buildCodegenPipeline(const BackendOptions &Options) {
   addOptionalPass(MPM, Options, "cleanup-cfg", CleanupCFGPass());
   addDebugPasses(MPM, "after isel");
 
-  // 伪指令下降：先尝试保守的无分支整数 SELECT，再把剩余 SELECT 展开成
-  // 分支；branchless-select 可单独关闭以便 A/B。
+  // 伪指令下降：优先把整型 SELECT 转成 ARM64 的 csel（折进产生条件的比较），
+  // 再对剩余的走无分支掩码 / 分支展开。select-to-csel 可单独关闭以便 A/B。
+  addOptionalPass(MPM, Options, "select-to-csel", SelectToCselPass());
   addOptionalPass(MPM, Options, "branchless-select",
                   LowerSelectPass(/*branchlessOnly=*/true));
   MPM.addPass(LowerSelectPass(/*branchlessOnly=*/false));

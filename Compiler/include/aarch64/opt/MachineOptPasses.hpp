@@ -10,6 +10,10 @@ namespace aarch64 {
 bool runBranchCompareFolding(MachineFunction &mf);
 bool runPreRAGlobalAddressReuse(MachineFunction &mf);
 bool runPreRAAffineCombine(MachineFunction &mf);
+bool runMulAddFusion(MachineFunction &mf);
+bool runSelectToCsel(MachineFunction &mf);
+bool runRedundantSxtwElim(MachineFunction &mf);
+bool runAddressIndexFold(MachineFunction &mf);
 bool runPreRAAddressCombine(MachineFunction &mf);
 bool runPreRACopyPropagation(MachineFunction &mf);
 bool runPreRALocalCSE(MachineFunction &mf);

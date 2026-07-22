@@ -131,6 +131,46 @@ void emitMoveImm(std::ostream &out, const std::string &reg, int64_t value) {
   }
 }
 
+// 判断一个立即数能否作为 ARM64 逻辑指令的位掩码立即数直接编码。
+// 规则：在寄存器宽度内，该值必须是「某个 2 4 8 16 32 64 位元素内一段连续
+// 的 1 经旋转后」再周期性复制而成，且不能全 0 或全 1。
+// width 取 32 或 64。能编码返回 true，此时可直接写 and wd wn imm。
+bool isLogicalImmediate(uint64_t imm, unsigned width) {
+  if (width == 32) {
+    imm &= 0xffffffffULL;
+    imm |= imm << 32;
+  }
+  if (imm == 0 || imm == ~0ULL) {
+    return false;
+  }
+  // 递归折半找出最小周期元素大小。
+  unsigned elemSize = 64;
+  for (unsigned sz = 32; sz >= 2; sz /= 2) {
+    const uint64_t mask = (sz == 64) ? ~0ULL : ((1ULL << sz) - 1);
+    if ((imm & mask) == ((imm >> sz) & mask)) {
+      elemSize = sz;
+    } else {
+      break;
+    }
+  }
+  const uint64_t elemMask = (elemSize == 64) ? ~0ULL : ((1ULL << elemSize) - 1);
+  const uint64_t elem = imm & elemMask;
+  const unsigned ones = static_cast<unsigned>(__builtin_popcountll(elem));
+  if (ones == 0 || ones == elemSize) {
+    return false;
+  }
+  // 元素旋转后若能变成低位 ones 个 1 的连续块，则合法。
+  const uint64_t target = (ones == 64) ? ~0ULL : ((1ULL << ones) - 1);
+  for (unsigned r = 0; r < elemSize; ++r) {
+    const uint64_t rot =
+        ((elem >> r) | (elem << (elemSize - r))) & elemMask;
+    if (rot == target) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // 保存/恢复 sp 相对的寄存器（prologue/epilogue）。isFloat 时用 64 位 d 形式。
 void emitSpRelative(std::ostream &out, bool isLoad, PhysReg reg,
                     int64_t offset, bool isFloat) {
@@ -677,10 +717,21 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       const RegClass rc = instr.defs.front().regValue.rc;
       const std::string dst = operandReg(instr.defs.front());
       const std::string src = operandReg(instr.uses[0]);
-      const std::string scratch = widthRegName(kReservedGprScratch, rc);
-      emitMoveImm(out_, regName(kReservedGprScratch), instr.uses[1].immValue);
-      out_ << "    " << mnemonic << ' ' << dst << ", " << src << ", " << scratch
-           << '\n';
+      const int64_t imm = instr.uses[1].immValue;
+      const unsigned width = (rc == RegClass::GPR32) ? 32 : 64;
+      // 立即数可作为位掩码立即数时直接编码，省去 movz/movk 物化。
+      if (isLogicalImmediate(static_cast<uint64_t>(imm), width)) {
+        const uint64_t enc =
+            (width == 32) ? (static_cast<uint64_t>(imm) & 0xffffffffULL)
+                          : static_cast<uint64_t>(imm);
+        out_ << "    " << mnemonic << ' ' << dst << ", " << src << ", #" << enc
+             << '\n';
+      } else {
+        const std::string scratch = widthRegName(kReservedGprScratch, rc);
+        emitMoveImm(out_, regName(kReservedGprScratch), imm);
+        out_ << "    " << mnemonic << ' ' << dst << ", " << src << ", "
+             << scratch << '\n';
+      }
     }
     return;
   case Opcode::SLLI:
@@ -814,6 +865,31 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
            << operandRegAt(instr.uses[1], w) << '\n';
     }
     return;
+  case Opcode::MADD:
+  case Opcode::MSUB:
+    // 32 位乘加/乘减融合：madd/msub wd, wn, wm, wa。
+    if (instr.defs.empty() || instr.uses.size() < 3) {
+      throw BackendError("malformed madd/msub instruction");
+    }
+    out_ << "    " << (instr.opcode == Opcode::MADD ? "madd" : "msub") << ' '
+         << operandRegAt(instr.defs.front(), RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[0], RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[1], RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[2], RegClass::GPR32) << '\n';
+    return;
+  case Opcode::SMADDL:
+  case Opcode::SMSUBL:
+    // 32x32+64 乘加/乘减融合：smaddl/smsubl xd, wn, wm, xa。
+    // 与 64 位 MUL 用 smull 同理：乘数取 w 视图符号扩展，累加数与结果为 x。
+    if (instr.defs.empty() || instr.uses.size() < 3) {
+      throw BackendError("malformed smaddl/smsubl instruction");
+    }
+    out_ << "    " << (instr.opcode == Opcode::SMADDL ? "smaddl" : "smsubl")
+         << ' ' << operandRegAt(instr.defs.front(), RegClass::GPR64) << ", "
+         << operandRegAt(instr.uses[0], RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[1], RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[2], RegClass::GPR64) << '\n';
+    return;
   case Opcode::REM:
   case Opcode::REMW:
   case Opcode::REMUW:
@@ -872,6 +948,48 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     out_ << "    cset " << operandReg(instr.defs.front()) << ", "
          << (instr.opcode == Opcode::SEQZ ? "eq" : "ne") << '\n';
     return;
+  case Opcode::CSEL: {
+    // 条件选择：先按内嵌的比较 Opcode 发射 cmp/fcmp 设标志，再 csel。
+    // uses = {trueVal, falseVal, cmpLhs, cmpRhs, Imm(cmpOpcode)}。
+    if (instr.defs.empty() || instr.uses.size() < 5 ||
+        instr.uses[4].kind != OperandKind::Imm) {
+      throw BackendError("malformed csel instruction");
+    }
+    const Opcode cmpOp = static_cast<Opcode>(instr.uses[4].immValue);
+    const char *cond = "";
+    bool isFloatCmp = false;
+    bool cmpZero = false;
+    switch (cmpOp) {
+    case Opcode::SLT:  cond = "lt"; break;
+    case Opcode::SLTU: cond = "lo"; break;
+    case Opcode::SEQZ: cond = "eq"; cmpZero = true; break;
+    case Opcode::SNEZ: cond = "ne"; cmpZero = true; break;
+    case Opcode::FEQ_S: cond = "eq"; isFloatCmp = true; break;
+    case Opcode::FLT_S: cond = "mi"; isFloatCmp = true; break;
+    case Opcode::FLE_S: cond = "ls"; isFloatCmp = true; break;
+    default:
+      throw BackendError("unsupported compare opcode in csel");
+    }
+    if (cmpZero) {
+      // tst 融合：cmpRhs 为 Imm 掩码时，用 tst reg,#mask 一条指令代替
+      // and+cmp，等价测试 (reg & mask) 与 0 的关系（eq=为零/ne=非零）。
+      if (instr.uses[3].kind == OperandKind::Imm) {
+        out_ << "    tst " << operandReg(instr.uses[2]) << ", #"
+             << static_cast<uint64_t>(instr.uses[3].immValue) << '\n';
+      } else {
+        out_ << "    cmp " << operandReg(instr.uses[2]) << ", #0\n";
+      }
+    } else {
+      out_ << "    " << (isFloatCmp ? "fcmp" : "cmp") << ' '
+           << operandReg(instr.uses[2]) << ", " << operandReg(instr.uses[3])
+           << '\n';
+    }
+    const RegClass rc = instr.defs.front().regValue.rc;
+    out_ << "    csel " << operandRegAt(instr.defs.front(), rc) << ", "
+         << operandRegAt(instr.uses[0], rc) << ", "
+         << operandRegAt(instr.uses[1], rc) << ", " << cond << '\n';
+    return;
+  }
   case Opcode::FCVT_W_S:
   case Opcode::FCVT_S_W:
     // 浮点/整数互转：fcvtzs 向零取整转有符号整数，scvtf 有符号整数转浮点。
@@ -1296,6 +1414,31 @@ void AsmPrinter::emitMemoryInstr(const MachineInstr &instr) {
   }
 
   int64_t offset = instr.uses[offsetIdx].immValue;
+
+  // 索引寻址形式：地址折叠 pass 会在偏移之后追加 {indexReg, scaleImm}，
+  // 表示有效地址 = base + index<<scale。此时偏移恒为 0（ARM64 不能同时带
+  // 立即偏移与寄存器索引）。index 为 32 位则用 sxtw 扩展，64 位则用 lsl。
+  const int indexIdx = offsetIdx + 1;
+  const int scaleIdx = offsetIdx + 2;
+  if (static_cast<int>(instr.uses.size()) > scaleIdx &&
+      instr.uses[indexIdx].kind == OperandKind::Reg &&
+      instr.uses[scaleIdx].kind == OperandKind::Imm && offset == 0) {
+    const std::string valueReg2 =
+        (accessSize == 1) ? widthRegName(regForOperand(valueOperand),
+                                         RegClass::GPR32)
+                          : operandReg(valueOperand);
+    const std::string base2 = operandRegWide(instr.uses[baseIdx]);
+    const MachineOperand &idx = instr.uses[indexIdx];
+    const int64_t scale = instr.uses[scaleIdx].immValue;
+    const bool idx32 = idx.regValue.rc == RegClass::GPR32;
+    const std::string idxReg =
+        idx32 ? operandRegAt(idx, RegClass::GPR32) : operandRegWide(idx);
+    const char *extend = idx32 ? "sxtw" : "lsl";
+    out_ << "    " << mnemonic << ' ' << valueReg2 << ", [" << base2 << ", "
+         << idxReg << ", " << extend << " #" << scale << "]\n";
+    return;
+  }
+
   std::string base = resolveMemoryBase(instr.uses[baseIdx], offset);
   const std::string valueReg =
       (accessSize == 1) ? widthRegName(regForOperand(valueOperand),

@@ -69,6 +69,31 @@ struct PreRAAffineCombinePass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前乘加融合，生成 madd/msub/smaddl/smsubl
+struct MulAddFusionPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 把整型 SELECT 转成 CSEL（尽量折进产生条件的比较）
+struct SelectToCselPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 消除仅作乘数使用的冗余 SXTW
+struct RedundantSxtwElimPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+// 把 base+(index<<scale) 折进 load/store 的索引寻址
+struct AddressIndexFoldPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
+
 // 分配前折叠 common-base 地址临时和 load/store 偏移
 struct PreRAAddressCombinePass {
   MachinePreservationStatus run(MachineFunction &mf,

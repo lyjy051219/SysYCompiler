@@ -36,7 +36,16 @@ enum class Opcode {
   MEMCPY_INLINE, MEMSET_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J,
   PHI, SELECT, PARALLEL_COPY,
   // ARM64 专用：把 32 位有符号整数符号扩展成 64 位（用于 GEP 索引地址计算）。
-  SXTW
+  SXTW,
+  // ARM64 专用乘加融合。均为 defs[0]=uses[0]*uses[1]+uses[2]（MSUB 为减）。
+  // MADD/MSUB 为 32 位（madd/msub wd,wn,wm,wa）；
+  // SMADDL/SMSUBL 为 32x32+64（smaddl/smsubl xd,wn,wm,xa），用于地址累加。
+  MADD, MSUB, SMADDL, SMSUBL,
+  // ARM64 专用条件选择：defs[0] = (比较成立) ? uses[0] : uses[1]。
+  // uses[2]=比较左操作数，uses[3]=比较右操作数（与零比较时为零寄存器），
+  // uses[4]=Imm，值为产生条件的比较 Opcode 编码，AsmPrinter 据此选
+  // cmp/fcmp 与条件码，发射为 [f]cmp + csel 两条指令。
+  CSEL
 };
 
 enum class OperandKind { Reg, Imm, FrameIndex, Global, Block, ValueRef };

@@ -321,6 +321,10 @@ bool isPureCSEOpcode(Opcode opcode) {
   case Opcode::FADD_S:
   case Opcode::FSUB_S:
   case Opcode::FMUL_S:
+  // ARM64 专用符号扩展：纯函数，可参与 CSE。地址计算里 `sext(index)` 常被
+  // 中端为同一索引重复生成，纳入 CSE 后其下游的 SLLI/ADD 地址链也随之合并，
+  // 消除数组访问里成片重复的地址物化（crypto 家族尤其明显）。
+  case Opcode::SXTW:
     return true;
   default:
     return false;
