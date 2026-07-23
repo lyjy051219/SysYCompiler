@@ -56,8 +56,6 @@ private:
     GenerationContext context;
     std::unordered_map<std::string, Function*> functions;
     std::unordered_map<Value*, Binding> bindings;
-    std::unordered_map<std::string, Variable*> stringLiterals;
-    std::size_t nextStringLiteral = 0;
 
     // 将源码类型转换为 IR 类型，并判断表达式或初始化式能否在编译期求值。
     BasicBlock& currentBlock() const;
@@ -126,7 +124,6 @@ private:
 
     // 分别按用户函数签名和 SysY 运行库约定检查、转换调用实参。
     std::vector<Value*> lowerArguments(const FuncRParamList& node);
-    Value* materializeFormatString(const std::string& value);
     Value* emitCall(const FuncCall& node, std::vector<Value*> arguments);
     bool coerceCallArguments(const std::string& callee,
                              std::vector<Value*>& arguments);

@@ -37,7 +37,6 @@ namespace yy {
 %token <int> INTCONST
 %token <float> FLOATCONST
 %token <LocatedIdentifier> IDENT
-%token <std::string> STRING_LITERAL
 %token CONST
 %token INT
 %token FLOAT
@@ -253,8 +252,6 @@ PrimaryExp
  | FLOATCONST{ $$ = (HasOperand*)(new ConValue<float>($1)); }
  | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $1.line));}
  | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = (HasOperand*)(new FuncCall($1.text, $3, $1.line));}
- | IDENT L_SMALL_BRACKET STRING_LITERAL R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $3, $1.line));}
- | IDENT L_SMALL_BRACKET STRING_LITERAL COMMA FuncRParamList R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $3, $5, $1.line));}
   ;
 
 

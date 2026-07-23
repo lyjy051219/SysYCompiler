@@ -1,29 +1,6 @@
 #include "../../include/lib/ASTPrinter.hpp"
 #include <iostream>
 
-namespace {
-
-void printEscapedString(const std::string& value) {
-    std::cout << '"';
-    for (char character : value) {
-        switch (character) {
-        case '\a': std::cout << "\\a"; break;
-        case '\b': std::cout << "\\b"; break;
-        case '\f': std::cout << "\\f"; break;
-        case '\n': std::cout << "\\n"; break;
-        case '\r': std::cout << "\\r"; break;
-        case '\t': std::cout << "\\t"; break;
-        case '\v': std::cout << "\\v"; break;
-        case '\\': std::cout << "\\\\"; break;
-        case '"': std::cout << "\\\""; break;
-        default: std::cout << character; break;
-        }
-    }
-    std::cout << '"';
-}
-
-} // namespace
-
 std::string typeToString(Type type) {
     switch(type) {
         case SY_INT: return "int";
@@ -301,15 +278,7 @@ void ASTPrinter::visit(LVal &node) {
 
 void ASTPrinter::visit(FuncCall &node) {
     std::cout << node.getIdent() << "(";
-    bool hasPreviousArgument = false;
-    if (node.hasFormatString()) {
-        printEscapedString(*node.getFormatString());
-        hasPreviousArgument = true;
-    }
     if (node.hasParams() && node.getParams()) {
-        if (hasPreviousArgument) {
-            std::cout << ", ";
-        }
         node.getParams()->accept(*this);
     }
     std::cout << ")";

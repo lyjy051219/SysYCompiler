@@ -462,40 +462,6 @@ std::vector<Value*> IRGenerator::lowerArguments(const FuncRParamList& node) {
     return arguments;
 }
 
-Value* IRGenerator::materializeFormatString(const std::string& value) {
-    if (context.block == nullptr)
-        return nullptr;
-
-    Variable* storage = nullptr;
-    const auto existing = stringLiterals.find(value);
-    if (existing != stringLiterals.end()) {
-        storage = existing->second;
-    } else {
-        const auto byteType = INTType::NewInt(1);
-        const auto arrayType = ARRAYType::NewArray(
-            byteType, static_cast<int>(value.size() + 1));
-        auto* initializer = new Initializer(arrayType);
-        initializer->reserve(value.size() + 1);
-        for (unsigned char byte : value)
-            initializer->push_back(ConstInt::newConstInt(byte, 1));
-        initializer->push_back(ConstInt::newConstInt(0, 1));
-
-        storage = new Variable(Variable::Constant, arrayType, "");
-        storage->setIdent(".str." + std::to_string(nextStringLiteral++));
-        storage->addUse(initializer);
-        stringLiterals.emplace(value, storage);
-    }
-
-    auto* address = dynamic_cast<GetElementPtrInst*>(
-        currentBlock().genGepInst(storage));
-    if (address == nullptr)
-        return nullptr;
-    address->addUse(ConstInt::newConstInt(0));
-    address->addUse(ConstInt::newConstInt(0));
-    address->updateType();
-    return address;
-}
-
 bool IRGenerator::coerceCallArguments(const std::string& callee,
                                       std::vector<Value*>& arguments) {
     // 用户函数严格匹配形参数量与剩余数组形状，标量实参允许常用算术转换。
@@ -591,33 +557,7 @@ bool IRGenerator::coerceCallArguments(const std::string& callee,
         return true;
     };
 
-    if (callee == "putf") {
-        if (arguments.empty())
-            return false;
-        const auto formatPointer = std::dynamic_pointer_cast<POINTERType>(
-            arguments[0] ? arguments[0]->getIRType() : nullptr);
-        if (formatPointer == nullptr ||
-            !IRType::hasSameShape(formatPointer->getPointerType(),
-                                  INTType::NewInt(1))) {
-            return false;
-        }
-        for (std::size_t index = 1; index < arguments.size(); ++index) {
-            Value* argument = arguments[index];
-            if (argument == nullptr || argument->getIRType() == nullptr)
-                return false;
-            if (argument->getIRType()->getEnum() == IR_FLOAT) {
-                argument = currentBlock().genFPExtInst(argument);
-            } else if (argument->getIRType()->getEnum() == IR_INT) {
-                if (argument->getIRType()->isBool())
-                    argument = coerce(argument, INTType::NewInt(4));
-            } else {
-                return false;
-            }
-            if (argument == nullptr)
-                return false;
-            arguments[index] = argument;
-        }
-    } else if (callee == "putint" || callee == "putch") {
+    if (callee == "putint" || callee == "putch") {
         if (!requireArity(1))
             return false;
         if (!coerceArgument(0, INTType::NewInt(4)))
@@ -695,17 +635,8 @@ Value* IRGenerator::emitCall(const FuncCall& node,
 
 Value* IRGenerator::lowerExpression(const FuncCall& node) {
     std::vector<Value*> arguments;
-    if (node.hasFormatString()) {
-        Value* format = materializeFormatString(*node.getFormatString());
-        if (format == nullptr)
-            return UndefValue::NewUndefValue(INTType::NewInt(4));
-        arguments.push_back(format);
-    }
     if (node.hasParams())
-    {
-        auto remaining = lowerArguments(*node.getParams());
-        arguments.insert(arguments.end(), remaining.begin(), remaining.end());
-    }
+        arguments = lowerArguments(*node.getParams());
     return emitCall(node, std::move(arguments));
 }
 

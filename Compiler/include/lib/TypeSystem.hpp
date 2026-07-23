@@ -9,7 +9,7 @@
 // IR 类型由静态工厂驻留复用；复合类型在构造时缓存嵌套层数和存储大小。
 
 enum TypeSystem{
-    IR_INT,IR_FLOAT,IR_DOUBLE,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
+    IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
 };
 class IRType{
     private:
@@ -97,14 +97,6 @@ class FLOATType : public IRType{
     public:
     static std::shared_ptr<FLOATType> NewFloat();
    void toString() const override;
-};
-
-// double 只用于 putf 可变参数的 ABI 默认提升，不属于 SysY 源语言类型。
-class DOUBLEType : public IRType{
-    DOUBLEType():IRType(IR_DOUBLE){size = 8;}
-    public:
-    static std::shared_ptr<DOUBLEType> NewDouble();
-    void toString() const override;
 };
 
 

@@ -855,14 +855,6 @@ Value* BasicBlock::genFPTOSIInst(Value* x){
     return inst;
 }
 
-Value* BasicBlock::genFPExtInst(Value* x){
-    if (!x || !x->getIRType() || x->getIRType()->getEnum() != IR_FLOAT)
-      return nullptr;
-    auto inst = new FPExtInst(x);
-    pushBack(inst);
-    return inst;
-}
-
 Value* BasicBlock::genZextInst(Value* x){
     auto inst = new ZextInst(x);
     pushBack(inst);
@@ -2113,22 +2105,6 @@ SITOFPInst::SITOFPInst(Value* v):Instruction(FLOATType::NewFloat()){
 
 SITOFPInst::SITOFPInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::SITOFP;}
 
-FPExtInst::FPExtInst(Value* v):Instruction(DOUBLEType::NewDouble()){
-    addUse(v);
-    instType = InstType::FPEXT;
-}
-
-FPExtInst::FPExtInst(std::shared_ptr<IRType> irtype):Instruction(std::move(irtype)){
-    instType = InstType::FPEXT;
-}
-
-void FPExtInst::dumpIR(){
-    Value::dumpIR();
-    std::cout << " = fpext float ";
-    if (Value *operand = getUnaryOperand()) operand->dumpIR();
-    std::cout << " to double\n";
-}
-
 
 ZextInst::ZextInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::ZEXT;}
 ZextInst::ZextInst(Value* v):Instruction(INTType::NewInt(4)){
@@ -2689,11 +2665,6 @@ Instruction* FPTOSIInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 Instruction* SITOFPInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
     return new SITOFPInst(remapVal(userList[0]->getValue(), VMap));
-}
-
-Instruction* FPExtInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
-    if (userList.size() != 1) return nullptr;
-    return new FPExtInst(remapVal(userList[0]->getValue(), VMap));
 }
 
 Instruction* ZextInst::clone(const std::unordered_map<Value*, Value*>& VMap) {

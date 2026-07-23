@@ -15,6 +15,11 @@ int64_t alignTo(int64_t value, int64_t align) {
   return ((value + align - 1) / align) * align;
 }
 
+bool isBoolType(const std::shared_ptr<IRType> &type) {
+  auto intType = std::dynamic_pointer_cast<INTType>(type);
+  return intType && intType->getIsBool();
+}
+
 bool hasCall(const MachineFunction &mf) {
   for (const MachineBasicBlock &block : mf.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -74,11 +79,9 @@ int64_t typeSizeBytes(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
+    return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
     return 4;
-  case IR_DOUBLE:
-    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -98,11 +101,9 @@ int64_t typeAlignBytes(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
+    return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
     return 4;
-  case IR_DOUBLE:
-    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {

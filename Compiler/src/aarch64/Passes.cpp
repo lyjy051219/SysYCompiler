@@ -68,8 +68,6 @@ RegClass regClassForValue(Value *value) {
   switch (value->getIRType()->getEnum()) {
   case IR_FLOAT:
     return RegClass::FPR32;
-  case IR_DOUBLE:
-    return RegClass::GPR64;
   case IR_POINTER:
     return RegClass::GPR64;
   case IR_INT:

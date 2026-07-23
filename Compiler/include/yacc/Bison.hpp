@@ -482,9 +482,6 @@ namespace yy {
 
       // INTCONST
       char dummy30[sizeof (int)];
-
-      // STRING_LITERAL
-      char dummy31[sizeof (std::string)];
     };
 
     /// The size of the largest semantic type.
@@ -531,41 +528,40 @@ namespace yy {
     INTCONST = 258,                // INTCONST
     FLOATCONST = 259,              // FLOATCONST
     IDENT = 260,                   // IDENT
-    STRING_LITERAL = 261,          // STRING_LITERAL
-    CONST = 262,                   // CONST
-    INT = 263,                     // INT
-    FLOAT = 264,                   // FLOAT
-    VOID = 265,                    // VOID
-    OR = 266,                      // OR
-    AND = 267,                     // AND
-    NOT = 268,                     // NOT
-    EQ = 269,                      // EQ
-    NOTEQ = 270,                   // NOTEQ
-    LESS = 271,                    // LESS
-    GREAT = 272,                   // GREAT
-    LESSEQ = 273,                  // LESSEQ
-    GREATEQ = 274,                 // GREATEQ
-    ADD = 275,                     // ADD
-    SUB = 276,                     // SUB
-    MUL = 277,                     // MUL
-    DIV = 278,                     // DIV
-    MOD = 279,                     // MOD
-    ASSIGN = 280,                  // ASSIGN
-    RETURN = 281,                  // RETURN
-    IF = 282,                      // IF
-    ELSE = 283,                    // ELSE
-    WHILE = 284,                   // WHILE
-    BREAK = 285,                   // BREAK
-    CONTINUE = 286,                // CONTINUE
-    L_SMALL_BRACKET = 287,         // L_SMALL_BRACKET
-    R_SMALL_BRACKET = 288,         // R_SMALL_BRACKET
-    L_MIDDLE_BRACKET = 289,        // L_MIDDLE_BRACKET
-    R_MIDDLE_BRACKET = 290,        // R_MIDDLE_BRACKET
-    L_BIG_BRACKET = 291,           // L_BIG_BRACKET
-    R_BIG_BRACKET = 292,           // R_BIG_BRACKET
-    SEMICOLON = 293,               // SEMICOLON
-    COMMA = 294,                   // COMMA
-    END = 295                      // END
+    CONST = 261,                   // CONST
+    INT = 262,                     // INT
+    FLOAT = 263,                   // FLOAT
+    VOID = 264,                    // VOID
+    OR = 265,                      // OR
+    AND = 266,                     // AND
+    NOT = 267,                     // NOT
+    EQ = 268,                      // EQ
+    NOTEQ = 269,                   // NOTEQ
+    LESS = 270,                    // LESS
+    GREAT = 271,                   // GREAT
+    LESSEQ = 272,                  // LESSEQ
+    GREATEQ = 273,                 // GREATEQ
+    ADD = 274,                     // ADD
+    SUB = 275,                     // SUB
+    MUL = 276,                     // MUL
+    DIV = 277,                     // DIV
+    MOD = 278,                     // MOD
+    ASSIGN = 279,                  // ASSIGN
+    RETURN = 280,                  // RETURN
+    IF = 281,                      // IF
+    ELSE = 282,                    // ELSE
+    WHILE = 283,                   // WHILE
+    BREAK = 284,                   // BREAK
+    CONTINUE = 285,                // CONTINUE
+    L_SMALL_BRACKET = 286,         // L_SMALL_BRACKET
+    R_SMALL_BRACKET = 287,         // R_SMALL_BRACKET
+    L_MIDDLE_BRACKET = 288,        // L_MIDDLE_BRACKET
+    R_MIDDLE_BRACKET = 289,        // R_MIDDLE_BRACKET
+    L_BIG_BRACKET = 290,           // L_BIG_BRACKET
+    R_BIG_BRACKET = 291,           // R_BIG_BRACKET
+    SEMICOLON = 292,               // SEMICOLON
+    COMMA = 293,                   // COMMA
+    END = 294                      // END
       };
       /// Backward compatibility alias (Bison 3.6).
       typedef token_kind_type yytokentype;
@@ -582,7 +578,7 @@ namespace yy {
     {
       enum symbol_kind_type
       {
-        YYNTOKENS = 41, ///< Number of tokens.
+        YYNTOKENS = 40, ///< Number of tokens.
         S_YYEMPTY = -2,
         S_YYEOF = 0,                             // "end of file"
         S_YYerror = 1,                           // error
@@ -590,75 +586,74 @@ namespace yy {
         S_INTCONST = 3,                          // INTCONST
         S_FLOATCONST = 4,                        // FLOATCONST
         S_IDENT = 5,                             // IDENT
-        S_STRING_LITERAL = 6,                    // STRING_LITERAL
-        S_CONST = 7,                             // CONST
-        S_INT = 8,                               // INT
-        S_FLOAT = 9,                             // FLOAT
-        S_VOID = 10,                             // VOID
-        S_OR = 11,                               // OR
-        S_AND = 12,                              // AND
-        S_NOT = 13,                              // NOT
-        S_EQ = 14,                               // EQ
-        S_NOTEQ = 15,                            // NOTEQ
-        S_LESS = 16,                             // LESS
-        S_GREAT = 17,                            // GREAT
-        S_LESSEQ = 18,                           // LESSEQ
-        S_GREATEQ = 19,                          // GREATEQ
-        S_ADD = 20,                              // ADD
-        S_SUB = 21,                              // SUB
-        S_MUL = 22,                              // MUL
-        S_DIV = 23,                              // DIV
-        S_MOD = 24,                              // MOD
-        S_ASSIGN = 25,                           // ASSIGN
-        S_RETURN = 26,                           // RETURN
-        S_IF = 27,                               // IF
-        S_ELSE = 28,                             // ELSE
-        S_WHILE = 29,                            // WHILE
-        S_BREAK = 30,                            // BREAK
-        S_CONTINUE = 31,                         // CONTINUE
-        S_L_SMALL_BRACKET = 32,                  // L_SMALL_BRACKET
-        S_R_SMALL_BRACKET = 33,                  // R_SMALL_BRACKET
-        S_L_MIDDLE_BRACKET = 34,                 // L_MIDDLE_BRACKET
-        S_R_MIDDLE_BRACKET = 35,                 // R_MIDDLE_BRACKET
-        S_L_BIG_BRACKET = 36,                    // L_BIG_BRACKET
-        S_R_BIG_BRACKET = 37,                    // R_BIG_BRACKET
-        S_SEMICOLON = 38,                        // SEMICOLON
-        S_COMMA = 39,                            // COMMA
-        S_END = 40,                              // END
-        S_YYACCEPT = 41,                         // $accept
-        S_Start = 42,                            // Start
-        S_CompUnit = 43,                         // CompUnit
-        S_Decl = 44,                             // Decl
-        S_ConstDecl = 45,                        // ConstDecl
-        S_ConstDefList = 46,                     // ConstDefList
-        S_ConstDef = 47,                         // ConstDef
-        S_ConstExpList = 48,                     // ConstExpList
-        S_ConstInitVal = 49,                     // ConstInitVal
-        S_ConstInitValList = 50,                 // ConstInitValList
-        S_VarDecl = 51,                          // VarDecl
-        S_VarDefList = 52,                       // VarDefList
-        S_VarDef = 53,                           // VarDef
-        S_InitVal = 54,                          // InitVal
-        S_InitValList = 55,                      // InitValList
-        S_FuncDef = 56,                          // FuncDef
-        S_FuncFParamList = 57,                   // FuncFParamList
-        S_FuncFParam = 58,                       // FuncFParam
-        S_Block = 59,                            // Block
-        S_BlockItemList = 60,                    // BlockItemList
-        S_BlockItem = 61,                        // BlockItem
-        S_Stmt = 62,                             // Stmt
-        S_LVal = 63,                             // LVal
-        S_ExpList = 64,                          // ExpList
-        S_PrimaryExp = 65,                       // PrimaryExp
-        S_UnaryExp = 66,                         // UnaryExp
-        S_FuncRParamList = 67,                   // FuncRParamList
-        S_MulExp = 68,                           // MulExp
-        S_AddExp = 69,                           // AddExp
-        S_RelExp = 70,                           // RelExp
-        S_EqExp = 71,                            // EqExp
-        S_LAndExp = 72,                          // LAndExp
-        S_LOrExp = 73,                           // LOrExp
-        S_Type = 74                              // Type
+        S_CONST = 6,                             // CONST
+        S_INT = 7,                               // INT
+        S_FLOAT = 8,                             // FLOAT
+        S_VOID = 9,                              // VOID
+        S_OR = 10,                               // OR
+        S_AND = 11,                              // AND
+        S_NOT = 12,                              // NOT
+        S_EQ = 13,                               // EQ
+        S_NOTEQ = 14,                            // NOTEQ
+        S_LESS = 15,                             // LESS
+        S_GREAT = 16,                            // GREAT
+        S_LESSEQ = 17,                           // LESSEQ
+        S_GREATEQ = 18,                          // GREATEQ
+        S_ADD = 19,                              // ADD
+        S_SUB = 20,                              // SUB
+        S_MUL = 21,                              // MUL
+        S_DIV = 22,                              // DIV
+        S_MOD = 23,                              // MOD
+        S_ASSIGN = 24,                           // ASSIGN
+        S_RETURN = 25,                           // RETURN
+        S_IF = 26,                               // IF
+        S_ELSE = 27,                             // ELSE
+        S_WHILE = 28,                            // WHILE
+        S_BREAK = 29,                            // BREAK
+        S_CONTINUE = 30,                         // CONTINUE
+        S_L_SMALL_BRACKET = 31,                  // L_SMALL_BRACKET
+        S_R_SMALL_BRACKET = 32,                  // R_SMALL_BRACKET
+        S_L_MIDDLE_BRACKET = 33,                 // L_MIDDLE_BRACKET
+        S_R_MIDDLE_BRACKET = 34,                 // R_MIDDLE_BRACKET
+        S_L_BIG_BRACKET = 35,                    // L_BIG_BRACKET
+        S_R_BIG_BRACKET = 36,                    // R_BIG_BRACKET
+        S_SEMICOLON = 37,                        // SEMICOLON
+        S_COMMA = 38,                            // COMMA
+        S_END = 39,                              // END
+        S_YYACCEPT = 40,                         // $accept
+        S_Start = 41,                            // Start
+        S_CompUnit = 42,                         // CompUnit
+        S_Decl = 43,                             // Decl
+        S_ConstDecl = 44,                        // ConstDecl
+        S_ConstDefList = 45,                     // ConstDefList
+        S_ConstDef = 46,                         // ConstDef
+        S_ConstExpList = 47,                     // ConstExpList
+        S_ConstInitVal = 48,                     // ConstInitVal
+        S_ConstInitValList = 49,                 // ConstInitValList
+        S_VarDecl = 50,                          // VarDecl
+        S_VarDefList = 51,                       // VarDefList
+        S_VarDef = 52,                           // VarDef
+        S_InitVal = 53,                          // InitVal
+        S_InitValList = 54,                      // InitValList
+        S_FuncDef = 55,                          // FuncDef
+        S_FuncFParamList = 56,                   // FuncFParamList
+        S_FuncFParam = 57,                       // FuncFParam
+        S_Block = 58,                            // Block
+        S_BlockItemList = 59,                    // BlockItemList
+        S_BlockItem = 60,                        // BlockItem
+        S_Stmt = 61,                             // Stmt
+        S_LVal = 62,                             // LVal
+        S_ExpList = 63,                          // ExpList
+        S_PrimaryExp = 64,                       // PrimaryExp
+        S_UnaryExp = 65,                         // UnaryExp
+        S_FuncRParamList = 66,                   // FuncRParamList
+        S_MulExp = 67,                           // MulExp
+        S_AddExp = 68,                           // AddExp
+        S_RelExp = 69,                           // RelExp
+        S_EqExp = 70,                            // EqExp
+        S_LAndExp = 71,                          // LAndExp
+        S_LOrExp = 72,                           // LOrExp
+        S_Type = 73                              // Type
       };
     };
 
@@ -816,10 +811,6 @@ namespace yy {
 
       case symbol_kind::S_INTCONST: // INTCONST
         value.move< int > (std::move (that.value));
-        break;
-
-      case symbol_kind::S_STRING_LITERAL: // STRING_LITERAL
-        value.move< std::string > (std::move (that.value));
         break;
 
       default:
@@ -1203,18 +1194,6 @@ namespace yy {
       {}
 #endif
 
-#if 201103L <= YY_CPLUSPLUS
-      basic_symbol (typename Base::kind_type t, std::string&& v)
-        : Base (t)
-        , value (std::move (v))
-      {}
-#else
-      basic_symbol (typename Base::kind_type t, const std::string& v)
-        : Base (t)
-        , value (v)
-      {}
-#endif
-
       /// Destroy the symbol.
       ~basic_symbol ()
       {
@@ -1364,10 +1343,6 @@ switch (yykind)
         value.template destroy< int > ();
         break;
 
-      case symbol_kind::S_STRING_LITERAL: // STRING_LITERAL
-        value.template destroy< std::string > ();
-        break;
-
       default:
         break;
     }
@@ -1485,14 +1460,6 @@ switch (yykind)
         : super_type (token_kind_type (tok), std::move (v))
 #else
       symbol_type (int tok, const int& v)
-        : super_type (token_kind_type (tok), v)
-#endif
-      {}
-#if 201103L <= YY_CPLUSPLUS
-      symbol_type (int tok, std::string v)
-        : super_type (token_kind_type (tok), std::move (v))
-#else
-      symbol_type (int tok, const std::string& v)
         : super_type (token_kind_type (tok), v)
 #endif
       {}
@@ -1634,21 +1601,6 @@ switch (yykind)
       make_IDENT (const LocatedIdentifier& v)
       {
         return symbol_type (token::IDENT, v);
-      }
-#endif
-#if 201103L <= YY_CPLUSPLUS
-      static
-      symbol_type
-      make_STRING_LITERAL (std::string v)
-      {
-        return symbol_type (token::STRING_LITERAL, std::move (v));
-      }
-#else
-      static
-      symbol_type
-      make_STRING_LITERAL (const std::string& v)
-      {
-        return symbol_type (token::STRING_LITERAL, v);
       }
 #endif
 #if 201103L <= YY_CPLUSPLUS
@@ -2223,7 +2175,7 @@ switch (yykind)
     // number is the opposite.  If YYTABLE_NINF, syntax error.
     static const unsigned char yytable_[];
 
-    static const unsigned char yycheck_[];
+    static const short yycheck_[];
 
     // YYSTOS[STATE-NUM] -- The symbol kind of the accessing symbol of
     // state STATE-NUM.
@@ -2465,7 +2417,7 @@ switch (yykind)
     /// Constants.
     enum
     {
-      yylast_ = 285,     ///< Last index in yytable_.
+      yylast_ = 309,     ///< Last index in yytable_.
       yynnts_ = 34,  ///< Number of nonterminal symbols.
       yyfinal_ = 13 ///< Termination state number.
     };
@@ -2513,10 +2465,10 @@ switch (yykind)
        5,     6,     7,     8,     9,    10,    11,    12,    13,    14,
       15,    16,    17,    18,    19,    20,    21,    22,    23,    24,
       25,    26,    27,    28,    29,    30,    31,    32,    33,    34,
-      35,    36,    37,    38,    39,    40
+      35,    36,    37,    38,    39
     };
     // Last valid token kind.
-    const int code_max = 295;
+    const int code_max = 294;
 
     if (t <= 0)
       return symbol_kind::S_YYEOF;
@@ -2657,10 +2609,6 @@ switch (yykind)
 
       case symbol_kind::S_INTCONST: // INTCONST
         value.copy< int > (YY_MOVE (that.value));
-        break;
-
-      case symbol_kind::S_STRING_LITERAL: // STRING_LITERAL
-        value.copy< std::string > (YY_MOVE (that.value));
         break;
 
       default:
@@ -2819,10 +2767,6 @@ switch (yykind)
         value.move< int > (YY_MOVE (s.value));
         break;
 
-      case symbol_kind::S_STRING_LITERAL: // STRING_LITERAL
-        value.move< std::string > (YY_MOVE (s.value));
-        break;
-
       default:
         break;
     }
@@ -2888,7 +2832,7 @@ switch (yykind)
 
 
 } // yy
-#line 2892 "include/yacc/Bison.hpp"
+#line 2836 "include/yacc/Bison.hpp"
 
 
 

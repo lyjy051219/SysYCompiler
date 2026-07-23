@@ -24,8 +24,7 @@
 //   FA0-FA7  -> s0-s7    浮点实参/返回，caller-saved
 //   FS0-FS7  -> s8-s15   浮点 callee-saved（仅 v8-v15 为 callee-saved）
 //   FS8-FS11 -> s28-s31  超出 8 个名额的部分改为 caller-saved
-//   FT0-FT10 -> s16-s26  浮点临时，caller-saved
-//   FT11     -> s27/d27  保留给 float->double 的显式转换临时寄存器
+//   FT0-FT11 -> s16-s27  浮点临时，caller-saved
 
 namespace aarch64 {
 namespace {
@@ -101,7 +100,7 @@ constexpr std::array<RegisterInfo, kNumRegs> kRegisterInfos{{
     {PhysReg::FT8, "s24", true, true, false, true},
     {PhysReg::FT9, "s25", true, true, false, true},
     {PhysReg::FT10, "s26", true, true, false, true},
-    {PhysReg::FT11, "s27", false, true, false, true},
+    {PhysReg::FT11, "s27", true, true, false, true},
 }};
 
 const std::vector<PhysReg> kGPRAllocatable{
@@ -114,7 +113,7 @@ const std::vector<PhysReg> kGPRAllocatable{
 const std::vector<PhysReg> kFPRAllocatable{
     PhysReg::FT0, PhysReg::FT1, PhysReg::FT2, PhysReg::FT3, PhysReg::FT4,
     PhysReg::FT5, PhysReg::FT6, PhysReg::FT7, PhysReg::FT8, PhysReg::FT9,
-    PhysReg::FT10, PhysReg::FA0, PhysReg::FA1, PhysReg::FA2,
+    PhysReg::FT10, PhysReg::FT11, PhysReg::FA0, PhysReg::FA1, PhysReg::FA2,
     PhysReg::FA3, PhysReg::FA4, PhysReg::FA5, PhysReg::FA6, PhysReg::FA7,
     PhysReg::FS0, PhysReg::FS1, PhysReg::FS2, PhysReg::FS3, PhysReg::FS4,
     PhysReg::FS5, PhysReg::FS6, PhysReg::FS7, PhysReg::FS8, PhysReg::FS9,

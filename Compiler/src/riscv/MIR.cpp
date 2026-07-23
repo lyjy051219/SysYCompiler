@@ -21,10 +21,6 @@ const char *opcodeName(Opcode opcode) {
     return "FMV_W_X";
   case Opcode::FMV_X_W:
     return "FMV_X_W";
-  case Opcode::FCVT_D_S:
-    return "FCVT_D_S";
-  case Opcode::FMV_X_D:
-    return "FMV_X_D";
   case Opcode::LI:
     return "LI";
   case Opcode::LA:

@@ -5,44 +5,6 @@
 #include "Bison.hpp"
 // Flex 生成的扫描器向 Bison 返回强类型令牌。
 #define YY_DECL yy::parser::symbol_type yylex(void)
-
-// 格式串在 AST 中保存为已解码的字节，不包含外层引号和结尾 NUL。
-static std::string decodeStringLiteral(const char* text, int length) {
-    std::string result;
-    if (length < 2) {
-        return result;
-    }
-    result.reserve(static_cast<std::size_t>(length - 2));
-    for (int index = 1; index < length - 1; ++index) {
-        if (text[index] != '\\') {
-            result.push_back(text[index]);
-            continue;
-        }
-
-        if (++index >= length - 1) {
-            break;
-        }
-        switch (text[index]) {
-        case 'a': result.push_back('\a'); break;
-        case 'b': result.push_back('\b'); break;
-        case 'f': result.push_back('\f'); break;
-        case 'n': result.push_back('\n'); break;
-        case 'r': result.push_back('\r'); break;
-        case 't': result.push_back('\t'); break;
-        case 'v': result.push_back('\v'); break;
-        case '\\': result.push_back('\\'); break;
-        case '\'': result.push_back('\''); break;
-        case '"': result.push_back('"'); break;
-        case '?': result.push_back('?'); break;
-        default:
-            // SysY 文档没有单独定义其他字符串转义；未知序列按原样保留。
-            result.push_back('\\');
-            result.push_back(text[index]);
-            break;
-        }
-    }
-    return result;
-}
 %}
 
 Identifier          ([a-zA-Z]|_)([a-zA-Z]|[0-9]|_)*
@@ -66,7 +28,6 @@ HEX_FLOAT {HEX_FLOAT_FORM1}|{HEX_FLOAT_FORM2}|{HEX_FLOAT_FORM3}
 DEC_FLOAT {DEC_FLOAT_FORM1}|{DEC_FLOAT_FORM2}|{DEC_FLOAT_FORM3}
 
 Float {DEC_FLOAT}|{HEX_FLOAT}
-StringLiteral \"([^\"\\\n]|\\.)*\"
 %x COMMENT
 
 %%
@@ -105,7 +66,6 @@ StringLiteral \"([^\"\\\n]|\\.)*\"
 "%"                 { return yy::parser::make_MOD();}
 "="                 { return yy::parser::make_ASSIGN();}
 
-{StringLiteral}     {return yy::parser::make_STRING_LITERAL(decodeStringLiteral(yytext, yyleng));}
 {Identifier}        {return yy::parser::make_IDENT(LocatedIdentifier{std::string(yytext), yylineno});}
 {Float}             {return yy::parser::make_FLOATCONST(std::stof(yytext));}
 {Hex}               {return yy::parser::make_INTCONST(std::stoi(yytext,nullptr,16));}

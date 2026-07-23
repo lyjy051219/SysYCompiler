@@ -723,12 +723,11 @@ std::optional<int64_t> codegenTypeSize(const std::shared_ptr<IRType> &Type) {
     return std::nullopt;
   switch (Type->getEnum()) {
   case IR_INT: {
-    return std::max<int64_t>(1, static_cast<int64_t>(Type->getSize()));
+    auto IntTy = std::dynamic_pointer_cast<INTType>(Type);
+    return IntTy && IntTy->getIsBool() ? 1 : 4;
   }
   case IR_FLOAT:
     return 4;
-  case IR_DOUBLE:
-    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {

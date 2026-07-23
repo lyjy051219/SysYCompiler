@@ -50,7 +50,7 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
         ICMP,FCMP,
         SHL,LSHR,ASHR,
         SELECT,PHI,CALL,
-        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,FPEXT,BITCAST
+        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,BITCAST
     };
     InstType instType;
     public:
@@ -323,7 +323,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     // 生成标量转换、函数调用和选择指令。
     Value* genSITOFPInst(Value* x);
     Value* genFPTOSIInst(Value* x);
-    Value* genFPExtInst(Value* x);
     Value* genCallInst(std::string ident,std::vector<Value*> params);
     Value* genZextInst(Value* x);
     Value* genTruncInst(Value* x);
@@ -513,15 +512,6 @@ class SITOFPInst : public Instruction{
     public:
     SITOFPInst(Value* v);
     SITOFPInst(std::shared_ptr<IRType> irtype);
-    void dumpIR() override;
-    Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
-};
-
-// float 扩展为 double，仅用于满足 putf 可变参数的 C ABI 默认提升。
-class FPExtInst : public Instruction{
-    public:
-    explicit FPExtInst(Value* v);
-    explicit FPExtInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };

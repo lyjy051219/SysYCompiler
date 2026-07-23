@@ -58,9 +58,190 @@ Compiler/
 
 ### 前端
 
+#### SysY2022及Runtime分析
+
+> 这一部分是本人在阅读完相关文档的一些总结，目的为了便于后续开发前中端查阅需要
+
+**Sysy2022**：
+
+- .sy文件结构：全局变量声明，全局常量声明，函数定义，唯一的main函数定义
+
+- 注释：单行和多行（遇到第一个*/就结束）
+
+- 数值类型：int/float类型和元素为int/float类型且按**行优先存储**的多维数组类型
+
+  隐式类型转换：编译器在需要是可自动转换float/int，不支持程序员 `(int)`、`(float)` 主动指定转换
+
+  > 混合运算时，int先转float，再进行计算
+  >
+  > float隐式转换成int时，小数部分直接丢弃，float超出int范围，进行转换为未定义行为
+  >
+  > int隐式转换成float时，转换后值保持不变
+
+- 函数：
+
+  参数为 int/float 时，按值传递
+
+  参数为数组类型时，实际传递的是数组的起始地址，并且**形参第一维的长度必须空缺**。
+
+  ```c
+  //示例1：
+  //在如下例子传入的就是a[0]，并且实际修改的就是main中的data[0]
+  void process(int a[]) {
+      a[0] = 100;
+  }
+  int main() {
+      int data[3] = {1, 2, 3};
+      process(data);
+  }
+  //示例2：
+  void process(int a[][3]) {
+  }
+  
+  //示例3：支持多维数组降维传递
+  //下图传递了data[1]这个[3][4]的二维数组
+  void process_matrix(int a[][4]) {
+      a[0][0] = 100;
+  }
+  
+  int main() {
+      int data[2][3][4];
+      process_matrix(data[1]);
+      return 0;
+  }
+  ```
+
+- 数值常量：**忽略所有后缀**
+
+  - 整数常量：
+
+    - 十进制
+    - 八进制：以0开头
+    - 十六进制：以0x或0X开头
+
+  - 浮点常量：均存在整数+小数/省略整数/省略小数三种形式，**忽略所有后缀**
+
+    - 十进制：
+
+      普通形式：3.14 / .5 / 1.
+
+      十进制指数：
+
+      **注意指数的底数为10**
+
+      ```
+      1e3      = 1 × 10³    = 1000
+      2.E2     = 2. × 10²  = 200
+      .14e-2   = 0.14 × 10⁻² = 0.0014
+      ```
+
+    - 十六进制：
+
+      0x 十六进制数字 '.' 十六进制数字 p 十进制指数：
+
+      **注意指数的底数为2**
+
+      ```
+      0x1.2p3 = 1.125 × 8 = 9
+      	0x1.2 = 1 + 2 × 16⁻¹
+          = 1 + 2/16
+          = 1.125
+      	2³ = 8
+      ```
+
+- 一些规则：
+
+  - 常量必须初始化且不能再次赋值
+  - 数组每一维定义必须显式给出
+  - 未初始化局部变量值不确定
+  - 未初始化全局变量/数组初始值为0
+  - 初始化全局变量/数组初始值为常量表达式
+  - 数组只能逐维赋值，不能整个赋值
+
+- sysy其他未提到的参考C语言即可
+
+**Runtime**：
+
+> 由于putf在测试用例中并未出现，所以本人没有重点关注这一runtime函数在前中端的处理
+
+读取函数：
+
+- int getint()：从**标准输入**读取一个整数，并返回对应的 `int` 值
+
+- float getfloat()：从**标准输入**读取一个浮点数，返回 32 位单精度浮点值
+
+- int getch()：从**标准输入**中读取一个字符（将整数视为字符），并返回该字符的 ASCII 码值
+
+  ```c
+  12 34
+  |
+  |
+  '1' → 49
+  '2' → 50
+  ' ' → 32
+  '3' → 51
+  '4' → 52
+  '\n' → 10    
+  ```
+
+- int getarray(int[])：输入一串整数，第 1 个整数代表后续要输入的整数个数，该个数通过返回值返回；后续的整数通过传入的数组参数返回
+
+  ```c
+  4 10 20 30 40
+  
+  int main() {
+      int a[10];
+      int n = getarray(a);
+  }
+  
+  /*
+  n = 4
+  a[0] = 10
+  a[1] = 20
+  a[2] = 30
+  a[3] = 40
+  */
+  ```
+
+- int getfarray(float[])：同上
+
+输出函数：
+
+- void putint(int)：向**标准输出**打印一个整数
+
+- void putfloat(float)：向**标准输出**打印一个单精度浮点数
+
+- void putch(int)：将整数参数解释成 ASCII 码，并输出对应字符
+
+  ```c
+  putch(65); -> A
+  ```
+
+- void putarray(int, int[])：第 1 个参数表示要输出的整数个数(假设为 N)，后面应该跟上要输出的 N个整数的数组。putarray 在输出时会在整数之间安插空格
+
+  ```c
+  示例：int n=2; inta[]={2,3}; putarray(n, a);
+  输出：2:2 3
+  ```
+
+- void putfarray(int,float[])：同上
+
+计时函数：
+
+> 输出格式：
+>
+> Timer#编号@开启行号-停止行号: 时-分-秒-微秒
+>
+> TOTAL: 时-分-秒-微秒
+>
+> Timer#001@0010-0012: 0H-0M-3S-3860us
+
+- void starttime()
+- void stoptime()
+
 #### 词法分析+语法分析
 
-采用业界主流的Flex+Bison工具进行构建，采用Bison的C++ API，实现从词法到语法的全链路类型安全解析，并直接驱动构建出抽象语法树（AST）
+采用业界主流的Flex+Bison工具进行构建，由人工写好.l和.y文件之后通过Flex+Bison自行构建出相关hpp/cpp文件
 
 #### AST
 
@@ -79,7 +260,7 @@ Compiler/
 
    ```mermaid
    graph TD
-
+   
    	N1[CompUnit] --> N3[FuncDef]
    	N1[CompUnit] --> N4[ConstDecl]
    	N1[CompUnit] --> N5[VarDecl]
@@ -98,7 +279,7 @@ Compiler/
    	N9[VarDef] --> N15[InitVal]
    	N3[FuncDef] --> N16[ident]
    	N3[FuncDef] --> N17[Type]
-
+   
    	N12[FuncParam] --> N18[Type]
    	N12[FuncParam] --> N19[ident]
    	N12[FuncParam] --> N20[ArrayList]
@@ -129,7 +310,7 @@ Compiler/
    	N3[Stmt] --> N16[ContinueStmt]
    	N3[Stmt] --> N17[ReturnStmt]
    	N17[ReturnStmt] --> n18[AddExp]
-
+   
    ```
 
 
@@ -145,14 +326,14 @@ Compiler/
        N5[AddExp] --> N6[MulExp]
        N6[MulExp] --> N7[UnaryExp]
        N7[UnaryExp] --> N8[HasOperand]
-
+   
        N8[HasOperand] --> N9[LVal]
        N8[HasOperand] --> N10[FuncCall]
        N8[HasOperand] --> N11[ConValue]
-
+   
        N9[LVal] --> N12[ArrayList]
        N10[FuncCall] --> N13[FuncRParamList]
-
+   
        N12[ArrayList] --> N5[AddExp]
        N13[FuncRParamList] --> N5[AddExp]
    ```
@@ -2418,7 +2599,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
      // ================= 转换后 =================
      preHeader:
          Mergephi [ 1, pre, 2, pre ]
-
+    
      Header:
          phi [ Mergephi, preHeader, 3, x, 4, y ]
      ```
@@ -2453,29 +2634,29 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       O1[Outside 1]
       O2[Outside 2]
       O3[Outside 3]
-
+  
       %% 循环内部
       subgraph LoopArea [Loop]
           direction TB
           H[Header]
           B1[Body 1]
           B2[Body 2]
-
+  
           H --> B1
           H --> B2
           B1 -->|回边 1| H
           B2 -->|回边 2| H
       end
-
+  
       %% 出口区域
       E[ExitingBlock]
-
+  
       %% 跨区域连线
       O1 --> H
       O2 --> H
       B1 --> E
       O3 --> E
-
+  
       %% 样式调整匹配你的手绘布局
       classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
       classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
@@ -2490,7 +2671,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       O1[Outside 1]
       O2[Outside 2]
       O3[Outside 3]
-
+  
       %% 循环内部
       subgraph LoopArea [Loop]
           direction TB
@@ -2499,7 +2680,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
           B1[Body 1]
           B2[Body 2]
           L["新块: Latch"]
-
+  
           PH -->|① 唯一入口| H
           H --> B1
           H --> B2
@@ -2507,19 +2688,19 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
           B2 --> L
           L -->|③ 唯一回边| H
       end
-
+  
       %% 出口区域
       DE["新块: Dedicated Exit"]
       E[ExitingBlock]
-
+  
       %% 跨区域连线
       O1 --> PH
       O2 --> PH
-
+  
       B1 -->|② 拦截内部跳出| DE
       DE --> E
       O3 -->|外部连线保持原样| E
-
+  
       %% 样式标注
       classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
       classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
@@ -2608,10 +2789,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
       %% 定义节点样式类，保持清晰度
       classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
       classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-
+  
       %% 外部节点
       PreHeader[PreHeader]
-
+  
       %% 循环内部结构
       subgraph Loop
           direction TB
@@ -2620,21 +2801,21 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
           Body["Body<br/>define: val"]
           Latch[Latch]
       end
-
+  
       %% 控制流
       PreHeader --> Header
       Header --> Body
       Body --> Latch
       Latch --> Header
-
+  
       %% 外部节点
       %% 在 Exiting Block 节点中明确标注文本内容
       ExitingBlock["Exiting Block<br/>Use: val"]
-
+  
       %% 指向退出块的连线
       %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
       Body --> ExitingBlock
-
+  
       %% 应用样式类
       class Header,Body,Latch loopBlock;
       class ExitingBlock exitBlock;
@@ -2649,10 +2830,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
       %% 定义节点样式类，保持清晰度
       classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
       classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-
+  
       %% 外部节点
       PreHeader[PreHeader]
-
+  
       %% 循环内部结构
       subgraph Loop
           direction TB
@@ -2661,21 +2842,21 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
           Body["Body<br/>define: val"]
           Latch[Latch]
       end
-
+  
       %% 控制流
       PreHeader --> Header
       Header --> Body
       Body --> Latch
       Latch --> Header
-
+  
       %% 外部节点
       %% 在 Exiting Block 节点中明确标注文本内容
       ExitingBlock["Exiting Block<br/>%val.lcssa = phi i32 [ %val, %Body ]<br/>Use：val.lcssa"]
-
+  
       %% 指向退出块的连线
       %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
       Body --> ExitingBlock
-
+  
       %% 应用样式类
       class Header,Body,Latch loopBlock;
       class ExitingBlock exitBlock;
@@ -3128,7 +3309,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
            NewBB = cloneBasicBlock(BB)
            将 NewBB 插入到函数中
            记录 BMap[BB][i] = NewBB
-
+     
            for Inst in BB:
                NewInst = cloneInstruction(Inst)
                将 NewInst 插入 NewBB
@@ -3244,10 +3425,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        如果当前复制的是 Header:
            Headers.push_back(NewBB)
-
+     
        如果当前复制的是 Latch:
            Latches.push_back(NewBB)
-
+     
        如果当前复制的是 ExitingBlock:
            ExitingBlocks.push_back(NewBB)
        ```
@@ -3283,7 +3464,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        原来：
        i = phi [0, preheader], [i.next, latch]
-
+     
        展开 4 倍后：
        i = phi [0, preheader], [i.next.3, latch.3]
        ```
@@ -3824,13 +4005,13 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
   for GEP in F.instructions:
       base = GEP.operand[0]
       numIndices = GEP.operands.size - 1
-
+  
       if numIndices == 0:
           GEP.replaceAllUsesWith(base); delete GEP; continue
-
+  
       if base is UndefValue:
           GEP.replaceAllUsesWith(Undef(GEP.type)); delete GEP; continue
-
+  
       // 扫描非零索引
       nonZeroCount = 0
       splitPoint = 0
@@ -3840,13 +4021,13 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
               nonZeroCount += 1
               if nonZeroCount == 2:
                   splitPoint = i; break
-
+  
       if splitPoint > 0:
           frontIndices = UL[1 .. splitPoint-1]
           frontGEP = new GetElementPtrInst(base, frontIndices)
           frontGEP.updateType()
           insertBefore(GEP, frontGEP)
-
+  
           backIndices = [const(0)] + UL[splitPoint .. end]
           GEP.operands.clear()
           GEP.addUse(frontGEP)

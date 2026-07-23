@@ -30,11 +30,9 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
+    return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
     return 4;
-  case IR_DOUBLE:
-    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -355,12 +353,7 @@ void emitDataValue(std::ostream &out, Value *value,
   }
 
   if (auto intValue = dynamic_cast<ConstInt *>(value)) {
-    if (type && type->getEnum() == IR_INT && type->getSize() == 1) {
-      out << "    .byte "
-          << (static_cast<uint32_t>(intValue->getVal()) & 0xffU) << '\n';
-    } else {
-      out << "    .word " << intValue->getVal() << '\n';
-    }
+    out << "    .word " << intValue->getVal() << '\n';
     return;
   }
   if (auto boolValue = dynamic_cast<ConstBool *>(value)) {
@@ -513,20 +506,6 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       throw BackendError("malformed FMV_X_W instruction");
     }
     out_ << "    fmv.x.w " << operandReg(instr.defs.front()) << ", "
-         << operandReg(instr.uses.front()) << '\n';
-    return;
-  case Opcode::FCVT_D_S:
-    if (instr.defs.empty() || instr.uses.empty()) {
-      throw BackendError("malformed FCVT_D_S instruction");
-    }
-    out_ << "    fcvt.d.s " << operandReg(instr.defs.front()) << ", "
-         << operandReg(instr.uses.front()) << '\n';
-    return;
-  case Opcode::FMV_X_D:
-    if (instr.defs.empty() || instr.uses.empty()) {
-      throw BackendError("malformed FMV_X_D instruction");
-    }
-    out_ << "    fmv.x.d " << operandReg(instr.defs.front()) << ", "
          << operandReg(instr.uses.front()) << '\n';
     return;
   case Opcode::LI:
