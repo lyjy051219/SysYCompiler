@@ -40,11 +40,11 @@ bool LoopIdiomRecognizePass::matchLinearAccess(
     }
     if (DynamicCount != 1) return false;
 
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(GEP->getIRType());
-    auto ElementTy = PtrTy ? PtrTy->getPointerType() : nullptr;
+    auto ElementTy = IRType::getPointeeType(GEP->getIRType());
     // The current RISC-V lowering emits aligned word stores for small memset
     // calls.  Restrict the idiom to SysY's naturally aligned i32/f32 elements.
-    if (!ElementTy || !ElementTy->isScalar() || ElementTy->getSize() != 4)
+    if (!ElementTy ||
+        (!ElementTy->hasIntegerBitWidth(32) && !ElementTy->isFloat()))
         return false;
 
     std::vector<int64_t> Strides;
@@ -225,9 +225,8 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
             Bound = TCI->ExitCmp->getOperand(0);
             Pred = BinaryInst::reversePredicate(Pred);
         }
-        if (!Bound || Pred != BinaryInst::L || !Bound->getIRType() ||
-            !Bound->getIRType()->isInt() ||
-            Bound->getIRType()->getIntegerBitWidth(32) != 32)
+        if (!Bound || Pred != BinaryInst::L ||
+            !IRType::hasIntegerBitWidth(Bound->getIRType(), 32))
             return false;
         Match.IsRuntime = true;
         Match.RuntimeBound = Bound;
@@ -646,9 +645,8 @@ bool LoopIdiomRecognizePass::transformLoop(
             Bound = TCI->ExitCmp->getOperand(0);
             Pred = BinaryInst::reversePredicate(Pred);
         }
-        if (!Bound || Pred != BinaryInst::L || !Bound->getIRType() ||
-            !Bound->getIRType()->isInt() ||
-            Bound->getIRType()->getIntegerBitWidth(32) != 32) {
+        if (!Bound || Pred != BinaryInst::L ||
+            !IRType::hasIntegerBitWidth(Bound->getIRType(), 32)) {
             delete SourceStart;
             delete DestStart;
             return false;

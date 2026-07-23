@@ -346,12 +346,6 @@ Compiler/
 
   为了保证Visitor接口的简洁性，我们将跨节点需要传递的信息统一用栈管理，基于这一实现，我们可以轻松解决遍历AST之中出现的递归传递参数的相关逻辑
 
-#### ASTPrinter
-
-基于上述的Visitor设计模式，我们针对同一套AST接口，实现了ASTPrinter的调试打印功能，目的是在开发过程中，能够提前排除AST生成的相关错误，为后续IR生成打下基础
-
-- 功能：将内存中解析好的AST结构，反向还原并打印为结构化的类SYSY语言源代码，便于直接和SYSY源代码进行比较，从而高效的排除错误
-
 #### 符号表
 
 基于《编译器设计》一书中对符号表的解析上修改，设计而来
@@ -404,14 +398,6 @@ Compiler/
 
       av5 -- "指向 'y' 的栈 (同名遮蔽)" --> dictB
   ```
-
-- 结构解析：
-
-  - `sym_dict`：一个 `unordered_map`，键为变量，值为数组。这个数组实际上充当了一个栈。当发生同名变量遮蔽时，新作用域的值被压入栈顶；查找变量时，永远读取栈顶元素，天然保证了取到的是当前最内层作用域的有效值。
-
-  - `active_vars` ：一个扁平的指针数组。它记录了当前所有活跃作用域内被声明的变量的“值栈的指针”。每当注册一个新变量，就将其值栈的指针追加到此数组中。
-
-    `scope_markers` ：一个记录索引的数组。当进入新作用域时，它只记录当时 `active_vars` 的长度作为“书签”。退出作用域时，只需查阅这个书签，就能知道当前作用域内新增了哪些变量指针。
 
 - 时间复杂度：
 
@@ -509,20 +495,22 @@ graph TD
 
 ##### TypeSystem类型系统
 
+> 目前初赛阶段，根据SysY2026的信息会引入向量类型，所以IR类型系统提前给出向量类型的架构
+
 - 设计模式：采用单例static设计模式，并且使用shared_ptr包装裸指针进行内存管理
 
 
-- 目的：用来支持IR的强类型语言的特性，为IR中每个量都精确描述一种数据类型
+- 目的：用来支持IR的强类型语言的特性
 
 - 支持类型：
 
   ```c++
   enum TypeSystem{
-      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
+      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_VECTOR,IR_UNDEF
   };
   ```
 
-  `IR_UNDEF` 仅用于表示前端源类型转换失败，不对应可实例化的 IR 类型。
+  `IR_UNDEF` 仅用于表示前端源类型转换失败，不对应可实例化的 IR 类型
 
 - 结构：
 
@@ -537,6 +525,8 @@ graph TD
   	N14[POINTERType] --> N15[pointerType]
   	N1[IRType] --> N16[ARRAYType]
   	N16[ARRAYType] --> N17[elementType]
+  	N1[IRType] --> N18[VECTORType]
+  	N18[VECTORType] --> N19[elementType]
   ```
 
 ##### CFG
@@ -629,9 +619,7 @@ graph TD
 
   好处：
 
-  秀肌肉（bushi，其实最开始了解这项技术仅仅是为了好奇，并且也是为了更好的学习C++特性
-
-  用来统一管理整个AnalysisPass，增加项目的可扩展性（也许有机会能做到几十个AnalysisPas呢）
+  用来统一管理整个AnalysisPass，增加项目的可扩展性
 
 #### NewPassManager
 
@@ -3309,7 +3297,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
            NewBB = cloneBasicBlock(BB)
            将 NewBB 插入到函数中
            记录 BMap[BB][i] = NewBB
-     
+        
            for Inst in BB:
                NewInst = cloneInstruction(Inst)
                将 NewInst 插入 NewBB
@@ -3425,10 +3413,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        如果当前复制的是 Header:
            Headers.push_back(NewBB)
-     
+        
        如果当前复制的是 Latch:
            Latches.push_back(NewBB)
-     
+        
        如果当前复制的是 ExitingBlock:
            ExitingBlocks.push_back(NewBB)
        ```
@@ -3464,7 +3452,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        原来：
        i = phi [0, preheader], [i.next, latch]
-     
+        
        展开 4 倍后：
        i = phi [0, preheader], [i.next.3, latch.3]
        ```
@@ -4200,7 +4188,7 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
 
   扫所有比较操作（L/LE/G/GE/E/NE），双通道：IntRange 端点判定 + KnownBits 位级互斥判 eq/ne。
 
-  **类型守卫（必须）**：我们 IR 的 `BinaryInst::Operation` 里 L/LE/G/GE/E/NE 是整数浮点共用的，只能靠操作数类型区分（`fcmp ueq` 和 `icmp eq` 在 dumpIR 里看 LHS 是 IR_INT 还是 IR_FLOAT 分支）。进入 phase 前必须 guard `lhs->getIRType()->getEnum() == IR_INT` 和 `rhs->getIRType()->getEnum() == IR_INT`，浮点直接跳过。否则把 fcmp 当 icmp 推理会在 FFT / 浮点密集用例全线 WA。
+  **类型守卫（必须）**：我们 IR 的 `BinaryInst::Operation` 里 L/LE/G/GE/E/NE 是整数浮点共用的，只能靠操作数类型区分（`fcmp ueq` 和 `icmp eq` 在 dumpIR 里看 LHS 是 IR_INT 还是 IR_FLOAT 分支）。进入 phase 前必须 guard `lhs->getIRType()->getTypeSystem() == IR_INT` 和 `rhs->getIRType()->getTypeSystem() == IR_INT`，浮点直接跳过。否则把 fcmp 当 icmp 推理会在 FFT / 浮点密集用例全线 WA。
 
   **IntRange 端点判定表**：
 

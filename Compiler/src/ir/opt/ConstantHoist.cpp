@@ -118,6 +118,11 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
                 if (!u) return;
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
                     if (isLiteralSensitiveUse(I, OperandIndex)) return;
+                    // 当前重组成本模型和候选键均按 i32 设计；其他位宽
+                    // 保持原常量，避免生成类型不匹配的辅助加法。
+                    if (!IRType::hasIntegerBitWidth(
+                            ci->getIRType(), 32))
+                        return;
                     const int32_t val = static_cast<int32_t>(ci->getVal());
                     // 先拓宽再取绝对值，避免 abs(INT_MIN) 的 C++ UB。
                     const int64_t wideVal = static_cast<int64_t>(val);

@@ -191,8 +191,10 @@ void SCCPSolver::visitInstruction(Instruction* I) {
                I->instType == Instruction::SEXT ||
                I->instType == Instruction::TRUNC) {
         visitCastInst(I);
-    } else if (I->instType == Instruction::BITCAST) {
-        // BitCast 是类型重解释，结果不可预测
+    } else if (I->instType == Instruction::BITCAST ||
+               I->instType == Instruction::PTRTOINT ||
+               I->instType == Instruction::INTTOPTR) {
+        // 位模式和地址转换不在 SCCP 中推断具体目标值。
         mergeInValue(I, LatticeValue::getBottom());
     } else if (I->instType == Instruction::SELECT) {
         visitSelectInst(I);
@@ -437,7 +439,7 @@ void SCCPSolver::visitStoreInst(StoreInst*) {
 
 void SCCPSolver::visitCallInst(CallInst* CI) {
     // 保守处理：Call 返回值标为 Bottom
-    if (CI->getIRType() && CI->getIRType()->getEnum() != IR_VOID) {
+    if (CI->getIRType() && !CI->getIRType()->isVoid()) {
         mergeInValue(CI, LatticeValue::getBottom());
     }
 }
@@ -465,7 +467,7 @@ void SCCPSolver::visitCastInst(Instruction* I) {
 
     // 操作数是常量，尝试常量折叠
     Value* result = Instruction::foldConstantCast(
-        I->instType, opLV.getConstantValue());
+        I->instType, opLV.getConstantValue(), I->getIRType());
     if (result) {
         mergeInValue(I, LatticeValue::getConstant(result));
     } else {
@@ -544,7 +546,7 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
 
         for (Instruction* I : insts) {
             // 跳过无结果类型（void）、终止指令、有副作用的指令
-            if (I->getIRType()->getEnum() == IR_VOID) continue;
+            if (I->getIRType()->isVoid()) continue;
             if (dynamic_cast<RetInst*>(I)) continue;
             if (dynamic_cast<BrInst*>(I)) continue;
             if (dynamic_cast<StoreInst*>(I)) continue;

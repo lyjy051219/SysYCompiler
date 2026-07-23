@@ -2,6 +2,7 @@
 #include "lib/IRUtils.hpp"
 #include "lib/TraverseTools.hpp"
 #include <algorithm>
+#include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <sstream>
@@ -130,7 +131,7 @@ std::string SCEVResult::typeKey(std::shared_ptr<IRType> Ty) const {
 }
 
 const SCEVExpr *SCEVResult::makeConstant(int64_t V, std::shared_ptr<IRType> Ty) {
-    if (!Ty) Ty = INTType::NewInt(4);
+    if (!Ty) Ty = INTType::getInt32Ty();
     auto E = std::make_unique<SCEVExpr>();
     E->Kind = SCEVExprKind::Constant;
     E->ConstValue = V;
@@ -187,11 +188,16 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
         Op->Ty->isInt() && Ty->isInt()) {
         const int SourceBits = Op->Ty->getIntegerBitWidth(32);
         const int TargetBits = Ty->getIntegerBitWidth(32);
-        if (SourceBits > 0 && SourceBits <= 32 && TargetBits > 0 &&
-            TargetBits <= 32) {
+        if (SourceBits > 0 && SourceBits <= 64 && TargetBits > 0 &&
+            TargetBits <= 64) {
             auto Mask = [](int Bits) -> uint64_t {
                 return Bits == 64 ? ~uint64_t{0}
                                   : ((uint64_t{1} << Bits) - 1);
+            };
+            auto SignedFromRaw = [](uint64_t Raw) {
+                int64_t Result = 0;
+                std::memcpy(&Result, &Raw, sizeof(Result));
+                return Result;
             };
             const uint64_t SourceRaw =
                 static_cast<uint64_t>(Op->ConstValue) & Mask(SourceBits);
@@ -199,34 +205,31 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
             bool Folded = true;
             switch (K) {
             case SCEVCastKind::Trunc: {
+                if (TargetBits >= SourceBits) {
+                    Folded = false;
+                    break;
+                }
                 const uint64_t Raw = SourceRaw & Mask(TargetBits);
-                V = TargetBits == 32
-                        ? static_cast<int32_t>(static_cast<uint32_t>(Raw))
-                        : static_cast<int64_t>(Raw);
+                V = IRMath::normalizeSignedToWidth(
+                    SignedFromRaw(Raw), TargetBits);
                 break;
             }
             case SCEVCastKind::ZExt:
-                if (TargetBits < SourceBits) Folded = false;
-                else V = static_cast<int64_t>(SourceRaw);
+                if (TargetBits <= SourceBits) Folded = false;
+                else V = SignedFromRaw(SourceRaw);
                 break;
             case SCEVCastKind::SExt:
-                if (TargetBits < SourceBits) {
+                if (TargetBits <= SourceBits) {
                     Folded = false;
                 } else {
-                    const uint64_t Sign = uint64_t{1} << (SourceBits - 1);
-                    V = (SourceRaw & Sign)
-                            ? static_cast<int64_t>(SourceRaw) -
-                                  static_cast<int64_t>(uint64_t{1}
-                                                       << SourceBits)
-                            : static_cast<int64_t>(SourceRaw);
+                    V = IRMath::normalizeSignedToWidth(
+                        SignedFromRaw(SourceRaw), SourceBits);
                 }
                 break;
             case SCEVCastKind::BitCast:
                 if (TargetBits != SourceBits) Folded = false;
-                else V = TargetBits == 32
-                             ? static_cast<int32_t>(
-                                   static_cast<uint32_t>(SourceRaw))
-                             : static_cast<int64_t>(SourceRaw);
+                else V = IRMath::normalizeSignedToWidth(
+                         SignedFromRaw(SourceRaw), TargetBits);
                 break;
             }
             if (Folded) return makeConstant(V, Ty);
@@ -272,13 +275,13 @@ const SCEVExpr *SCEVResult::makeCompare(BinaryInst::Operation Pred,
             case BinaryInst::G:  Res = *LC >  *RC; break;
             default: break;
             }
-            return makeConstant(Res ? 1 : 0, INTType::NewBool());
+            return makeConstant(Res ? 1 : 0, INTType::getBoolTy());
         }
     }
     auto E = std::make_unique<SCEVExpr>();
     E->Kind = SCEVExprKind::Compare;
     E->Predicate = Pred;
-    E->Ty = INTType::NewBool();
+    E->Ty = INTType::getBoolTy();
     E->Operands = {L, R};
     E->Key = std::string("cmp:") + SCEVExpr::predicateName(Pred) + "(" + L->Key + "," +
              R->Key + ")";
@@ -758,18 +761,9 @@ const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
     int64_t ConstantOffset = 0;
 
     for (size_t I = 0; I < GEP->getNumIndices(); ++I) {
-        std::size_t Stride = 0;
-        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurType)) {
-            CurType = PtrTy->getPointerType();
-            if (!CurType) return makeUnknown(GEP);
-            Stride = CurType->getSize();
-        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurType)) {
-            CurType = ArrTy->getElementType();
-            if (!CurType) return makeUnknown(GEP);
-            Stride = CurType->getSize();
-        } else {
-            return makeUnknown(GEP);
-        }
+        CurType = CurType ? CurType->getIndexableElementType() : nullptr;
+        if (!CurType) return makeUnknown(GEP);
+        std::size_t Stride = CurType->getSize();
 
         Value *Idx = GEP->getIndex(I);
         if (!Idx) return makeUnknown(GEP);
@@ -785,7 +779,8 @@ const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
     }
 
     if (ConstantOffset != 0)
-        Result = add(Result, makeConstant(ConstantOffset, INTType::NewInt(4)));
+        Result = add(
+            Result, makeConstant(ConstantOffset, INTType::getInt32Ty()));
     return Result ? Result : makeUnknown(GEP);
 }
 
@@ -968,8 +963,7 @@ bool SCEVResult::hasStrictUnitStepExit(
         Trip.IndVar != Induction.Phi || !Induction.Phi ||
         !Induction.UpdateValue || !Induction.ConstantStep ||
         Trip.ComparePhase == LoopExitComparePhase::Unknown ||
-        !InductionType || !InductionType->isInt() ||
-        InductionType->getIntegerBitWidth(32) != 32) {
+        !IRType::hasIntegerBitWidth(InductionType, 32)) {
         return false;
     }
 
@@ -1061,7 +1055,7 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
 
     auto IsI32 = [](Value *V) {
         auto Ty = V ? V->getIRType() : nullptr;
-        return Ty && Ty->isInt() && Ty->getIntegerBitWidth(32) == 32;
+        return IRType::hasIntegerBitWidth(Ty, 32);
     };
     if (!IsI32(IV->Phi) || !IsI32(IV->StartValue) ||
         !IsI32(IV->UpdateValue)) {
@@ -1449,8 +1443,8 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
 
         auto *DirectBound = dynamic_cast<ConstInt *>(RHSVal);
         if (ExactStart && DirectBound && DirectStep && StepConst &&
-            *DirectStep == *StepConst && Ty && Ty->getEnum() == IR_INT &&
-            Ty->getIntegerBitWidth(32) == 32) {
+            *DirectStep == *StepConst &&
+            IRType::hasIntegerBitWidth(Ty, 32)) {
             const int64_t StartValue = *ExactStart;
             const __int128 ExitValue = static_cast<__int128>(StartValue) +
                 static_cast<__int128>(*StepConst) *

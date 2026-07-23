@@ -48,10 +48,8 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 	if (!EntryBB) return PreservationStatus::all();
 
 	for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
-		auto PtrTy = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
-		if (!PtrTy) continue;
-
-		std::shared_ptr<IRType> ElemTy = PtrTy->getPointerType();
+		std::shared_ptr<IRType> ElemTy =
+			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
 
 		if (ElemTy->getSize() > RISCVThreshold) {

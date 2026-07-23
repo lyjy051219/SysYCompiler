@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -239,6 +240,22 @@ bool Value::tryGetBoolConst(bool &Out) const {
 
 bool Value::tryGetIntConst(int32_t &Out) const {
     if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
+        const int64_t Value = CI->getVal();
+        if (Value < std::numeric_limits<int32_t>::min() ||
+            Value > std::numeric_limits<int32_t>::max())
+            return false;
+        Out = static_cast<int32_t>(Value);
+        return true;
+    }
+    if (auto *CB = dynamic_cast<const ConstBool *>(this)) {
+        Out = CB->getVal() ? 1 : 0;
+        return true;
+    }
+    return false;
+}
+
+bool Value::tryGetInt64Const(int64_t &Out) const {
+    if (auto *CI = dynamic_cast<const ConstInt *>(this)) {
         Out = CI->getVal();
         return true;
     }
@@ -250,8 +267,18 @@ bool Value::tryGetIntConst(int32_t &Out) const {
 }
 
 bool Value::tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const {
-    int32_t Raw = 0;
-    if (!tryGetIntConst(Raw)) return false;
+    int64_t Normalized = 0;
+    if (!tryGetInt64ConstAtWidth(Bits, Normalized) ||
+        Normalized < std::numeric_limits<int32_t>::min() ||
+        Normalized > std::numeric_limits<int32_t>::max())
+        return false;
+    Out = static_cast<int32_t>(Normalized);
+    return true;
+}
+
+bool Value::tryGetInt64ConstAtWidth(unsigned Bits, int64_t &Out) const {
+    int64_t Raw = 0;
+    if (!tryGetInt64Const(Raw)) return false;
     Out = IRMath::normalizeSignedToWidth(Raw, Bits);
     return true;
 }
@@ -266,8 +293,8 @@ bool Value::tryGetFloatConst(float &Out) const {
 
 bool Value::tryGetNumericFloatConst(float &Out) const {
     if (tryGetFloatConst(Out)) return true;
-    int32_t IntValue = 0;
-    if (!tryGetIntConst(IntValue)) return false;
+    int64_t IntValue = 0;
+    if (!tryGetInt64Const(IntValue)) return false;
     Out = static_cast<float>(IntValue);
     return true;
 }
@@ -300,9 +327,9 @@ Value *Value::stripBooleanExtension(Value *V,
 }
 
 std::optional<int64_t> Value::getIntConstant() const {
-    int32_t Result = 0;
-    if (!tryGetIntConst(Result)) return std::nullopt;
-    return static_cast<int64_t>(Result);
+    int64_t Result = 0;
+    if (!tryGetInt64Const(Result)) return std::nullopt;
+    return Result;
 }
 
 int Value::integerBitWidth(int DefaultBits) const {
@@ -433,6 +460,10 @@ bool Value::tryGetIntConst(const Value *V, int32_t &Out) {
     return V && V->tryGetIntConst(Out);
 }
 
+bool Value::tryGetInt64Const(const Value *V, int64_t &Out) {
+    return V && V->tryGetInt64Const(Out);
+}
+
 bool Value::tryGetFloatConst(const Value *V, float &Out) {
     return V && V->tryGetFloatConst(Out);
 }
@@ -497,7 +528,9 @@ Value *Value::makeZeroForType(const std::shared_ptr<IRType> &Ty) {
     if (!Ty) return ConstInt::newConstInt(0);
     if (Ty->isFloat()) return ConstFloat::newConstFloat(0.0f);
     if (Ty->isBool()) return ConstBool::newConstBool(false);
-    if (Ty->isInt()) return ConstInt::newConstInt(0, Ty->getSize());
+    if (Ty->isInt())
+        return ConstInt::newConstIntForType(
+            0, std::dynamic_pointer_cast<INTType>(Ty));
     return ConstInt::newConstInt(0);
 }
 
@@ -505,7 +538,9 @@ Value *Value::makeOneForType(const std::shared_ptr<IRType> &Ty) {
     if (!Ty) return ConstInt::newConstInt(1);
     if (Ty->isFloat()) return ConstFloat::newConstFloat(1.0f);
     if (Ty->isBool()) return ConstBool::newConstBool(true);
-    if (Ty->isInt()) return ConstInt::newConstInt(1, Ty->getSize());
+    if (Ty->isInt())
+        return ConstInt::newConstIntForType(
+            1, std::dynamic_pointer_cast<INTType>(Ty));
     return ConstInt::newConstInt(1);
 }
 
@@ -513,25 +548,28 @@ Value *Value::makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
     if (!Ty) return ConstInt::newConstInt(-1);
     if (Ty->isFloat()) return ConstFloat::newConstFloat(-1.0f);
     if (Ty->isBool()) return ConstBool::newConstBool(true);
-    if (Ty->isInt()) return ConstInt::newConstInt(-1, Ty->getSize());
+    if (Ty->isInt())
+        return ConstInt::newConstIntForType(
+            -1, std::dynamic_pointer_cast<INTType>(Ty));
     return ConstInt::newConstInt(-1);
 }
 
 Value *Value::makeUndefForType(const std::shared_ptr<IRType> &Ty) {
-    return UndefValue::NewUndefValue(Ty ? Ty : INTType::NewInt(4));
+    return UndefValue::NewUndefValue(Ty ? Ty : INTType::getInt32Ty());
 }
 
-Value *Value::makeIntegerForType(int32_t Val,
+Value *Value::makeIntegerForType(int64_t Val,
                                  const std::shared_ptr<IRType> &Ty) {
     if (!Ty || !Ty->isInt()) return nullptr;
     if (Ty->isBool()) {
         if (Val != 0 && Val != 1) return nullptr;
         return ConstBool::newConstBool(Val != 0);
     }
-    return ConstInt::newConstInt(Val, Ty->getSize());
+    return ConstInt::newConstIntForType(
+        Val, std::dynamic_pointer_cast<INTType>(Ty));
 }
 
-Value *Value::makeIntegerLike(const Value *Model, int32_t Val) {
+Value *Value::makeIntegerLike(const Value *Model, int64_t Val) {
     return Model ? makeIntegerForType(Val, Model->getIRType()) : nullptr;
 }
 

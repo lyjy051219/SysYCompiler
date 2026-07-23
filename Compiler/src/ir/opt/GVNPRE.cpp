@@ -248,7 +248,7 @@ void GVNPRESolver::clearIterationState() {
 }
 
 bool GVNPRESolver::hasResultValue(Instruction *I) {
-    return I && I->getIRType() && I->getIRType()->getEnum() != IR_VOID;
+    return I && I->getIRType() && !I->getIRType()->isVoid();
 }
 
 void GVNPRESolver::rebuildRPOAndReachability() {
@@ -1380,7 +1380,7 @@ std::size_t LocalGVNPass::LocalExprKeyHash::operator()(
 }
 
 bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
-    if (!I || !I->getIRType() || I->getIRType()->getEnum() == IR_VOID)
+    if (!I || !I->getIRType() || I->getIRType()->isVoid())
         return false;
 
     K = LocalExprKey{};

@@ -81,7 +81,7 @@ public:
     Value *Base = Ops[0]->getValue();
     auto BaseType = Base->getIRType();
     std::shared_ptr<IRType> ElementType = BaseType;
-    if (BaseType && BaseType->getEnum() == IR_POINTER) {
+    if (BaseType && BaseType->getTypeSystem() == IR_POINTER) {
       ElementType =
           std::dynamic_pointer_cast<POINTERType>(BaseType)->getPointerType();
     }
@@ -124,7 +124,7 @@ bool dominatesPreheader(Value *V, BasicBlock *PreHeader,
 }
 
 bool isSupportedIndexValue(Value *V) {
-  return V && V->getIRType() && V->getIRType()->getEnum() == IR_INT &&
+  return V && V->getIRType() && V->getIRType()->getTypeSystem() == IR_INT &&
          (V->getIRType()->getSize() == 4 || V->getIRType()->getSize() == 8);
 }
 
@@ -637,7 +637,7 @@ computeNoWrapRange(Value *V, const InductionRangeMap &InductionRanges,
     Cache[V] = Result;
     return Result;
   };
-  if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT ||
+  if (!V || !V->getIRType() || V->getIRType()->getTypeSystem() != IR_INT ||
       V->getIRType()->getSize() != 4) {
     return Remember(std::nullopt);
   }
@@ -721,7 +721,7 @@ bool indexDoesNotWrap(Value *V, const InductionRangeMap &InductionRanges) {
 std::optional<int64_t> codegenTypeSize(const std::shared_ptr<IRType> &Type) {
   if (!Type)
     return std::nullopt;
-  switch (Type->getEnum()) {
+  switch (Type->getTypeSystem()) {
   case IR_INT: {
     auto IntTy = std::dynamic_pointer_cast<INTType>(Type);
     return IntTy && IntTy->getIsBool() ? 1 : 4;

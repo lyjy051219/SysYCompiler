@@ -240,7 +240,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                             for (unsigned k = 0; k < CI->getArgCount(); k++) {
                                 Value *arg = CI->getArg(k);
                                 if (!arg || !arg->getIRType()) continue;
-                                if (arg->getIRType()->getEnum() != IR_POINTER) continue;
+                                if (!arg->getIRType()->isPointer()) continue;
                                 std::unordered_set<Value*> bases;
                                 std::unordered_set<Value*> visited;
                                 bool escape = false;
@@ -358,12 +358,9 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         if (!G || !G->isGlobal()) continue;
 
         // 类型：必须是 pointer-to-scalar (i32 / float)
-        auto ptrTy = std::dynamic_pointer_cast<POINTERType>(G->getIRType());
-        if (!ptrTy) continue;
-        auto inner = ptrTy->getPointerType();
+        auto inner = IRType::getPointeeType(G->getIRType());
         if (!inner) continue;
-        auto innerEnum = inner->getEnum();
-        if (innerEnum != IR_INT && innerEnum != IR_FLOAT) continue;
+        if (!inner->isScalar()) continue;
 
         // Scan the whole module for any instruction that may modify G.  Looking
         // only for syntactically direct stores is unsound: a store through a
@@ -417,8 +414,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             // 若 init 是 Initializer（数组）则不是标量，略
         } else {
             // zero-initializer
-            if (innerEnum == IR_INT)        constRepl = ConstInt::newConstInt(0);
-            else if (innerEnum == IR_FLOAT) constRepl = ConstFloat::newConstFloat(0);
+            constRepl = Value::makeZeroForType(inner);
         }
         if (!constRepl) continue;
 

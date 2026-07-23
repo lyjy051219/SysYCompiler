@@ -23,7 +23,7 @@ bool FunctionMemoizationPass::isSupportedScalarType(
     const std::shared_ptr<IRType> &Type) {
     if (!Type) return false;
     if (Type->isFloat()) return Type->getSize() == 4;
-    return Type->isInt() && Type->getSize() == 4 && !Type->isBool();
+    return Type->hasIntegerBitWidth(32);
 }
 
 bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
@@ -38,9 +38,10 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     if (Inst->instType == Instruction::FPTOSI) return true;
     if (Inst->instType == Instruction::BITCAST) {
         Value *Source = Inst->getUnaryOperand();
-        return !Source || !Source->getIRType() || !Inst->getIRType() ||
-               Source->getIRType()->getSize() !=
-                   Inst->getIRType()->getSize();
+        // 记忆化缓存只编码精确的32位标量，不能用存储字节数代替真实类型。
+        return !Source ||
+               !isSupportedScalarType(Source->getIRType()) ||
+               !isSupportedScalarType(Inst->getIRType());
     }
 
     auto *Binary = dynamic_cast<BinaryInst *>(Inst);
@@ -210,7 +211,7 @@ Value *FunctionMemoizationPass::appendKeyBits(
     if (!Argument->getIRType()->isFloat()) return nullptr;
 
     // 浮点键按位解释，避免把正负零或不同的 NaN 位型合并。
-    auto *Bits = new BitCastInst(Argument, INTType::NewInt(4));
+    auto *Bits = new BitCastInst(Argument, INTType::getInt32Ty());
     Block.pushBack(Bits);
     return Bits;
 }
@@ -269,9 +270,9 @@ bool FunctionMemoizationPass::transformCandidate(
     std::string Prefix =
         ".__sysy_memo." + std::to_string(CacheOrdinal);
     auto ValidType = ARRAYType::NewArray(
-        INTType::NewInt(4), static_cast<int>(CacheEntries));
+        INTType::getInt32Ty(), static_cast<int>(CacheEntries));
     auto KeyType = ARRAYType::NewArray(
-        INTType::NewInt(4), static_cast<int>(CacheEntries));
+        INTType::getInt32Ty(), static_cast<int>(CacheEntries));
     auto ResultType = ARRAYType::NewArray(
         F->getIRType(), static_cast<int>(CacheEntries));
 

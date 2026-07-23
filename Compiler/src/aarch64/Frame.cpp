@@ -77,7 +77,7 @@ int64_t typeSizeBytes(const std::shared_ptr<IRType> &type) {
     return 0;
   }
 
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_INT:
     return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
@@ -99,7 +99,7 @@ int64_t typeAlignBytes(const std::shared_ptr<IRType> &type) {
     return 1;
   }
 
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_INT:
     return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:

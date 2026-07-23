@@ -591,7 +591,8 @@ Value *InstSimplifier::simplifyMul(
 			uint32_t U = static_cast<uint32_t>(C);
 			if (IRMath::isUnsignedPowerOf2(U)) {
 				return new BinaryInst(LHS, BinaryInst::SHL,
-					ConstInt::newConstInt(IRMath::log2u(U)));
+					Value::makeIntegerLike(
+						LHS, IRMath::log2u(U)));
 			}
 		}
 	}
@@ -986,7 +987,9 @@ Value *InstSimplifier::simplifyCmp(
 			}
 			if (!Safe) return nullptr;
 
-			auto *And = new BinaryInst(X, BinaryInst::AND, ConstInt::newConstInt(Mask));
+			auto *And = new BinaryInst(
+				X, BinaryInst::AND,
+				Value::makeIntegerLike(X, Mask));
 			if (!Instruction::insertBefore(BI, And)) {
 				delete And;
 				return nullptr;
@@ -1115,8 +1118,8 @@ Value *InstSimplifier::simplifySelect(SelectInst *SI) {
 
 	if (IRType::isBool(Cond->getIRType()) && IRType::isInt(ResTy) && !IRType::isBool(ResTy) &&
 		Value::isConstOne(TV) && Value::isConstZero(FV)) {
-		auto *ZI = new ZextInst(ResTy);
-		ZI->addUse(Cond);
+		auto *ZI = new ZextInst(
+			Cond, std::dynamic_pointer_cast<INTType>(ResTy));
 		return ZI;
 	}
 

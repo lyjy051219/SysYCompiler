@@ -298,10 +298,10 @@ bool LoopFusionPass::isUnitStrideAccess(Value *Pointer,
     }
     if (InductionCount != 1) return false;
 
-    auto PointerType = std::dynamic_pointer_cast<POINTERType>(GEP->getIRType());
-    auto ElementType = PointerType ? PointerType->getPointerType() : nullptr;
-    if (!ElementType || !ElementType->isScalar() ||
-        ElementType->getSize() != 4) {
+    auto ElementType = IRType::getPointeeType(GEP->getIRType());
+    if (!ElementType ||
+        (!ElementType->hasIntegerBitWidth(32) &&
+         !ElementType->isFloat())) {
         return false;
     }
 

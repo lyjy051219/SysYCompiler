@@ -12,8 +12,86 @@
 #include <unordered_set>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 
 extern std::unique_ptr<Module> ModuleIR;
+
+namespace {
+
+Value *coerceValueToType(BasicBlock *Block, Value *Input,
+                         const std::shared_ptr<IRType> &TargetType) {
+  if (!Block || !Input || !Input->getIRType() || !TargetType)
+    return nullptr;
+  const auto SourceType = Input->getIRType();
+  if (SourceType->hasSameShape(*TargetType))
+    return Input;
+
+  if (auto DestinationInteger =
+          std::dynamic_pointer_cast<INTType>(TargetType)) {
+    if (DestinationInteger->getIsBool()) {
+      if (auto *Boolean = dynamic_cast<ConstBool *>(Input))
+        return Boolean;
+      if (auto *Integer = dynamic_cast<ConstInt *>(Input))
+        return ConstBool::newConstBool(Integer->getVal() != 0);
+      if (auto *Floating = dynamic_cast<ConstFloat *>(Input))
+        return ConstBool::newConstBool(Floating->getVal() != 0.0f);
+      Value *Zero = Value::makeZeroForType(SourceType);
+      return Zero ? BasicBlock::genBinaryInst(
+                        Block, Input, BinaryInst::NE, Zero)
+                  : nullptr;
+    }
+
+    if (auto *Boolean = dynamic_cast<ConstBool *>(Input))
+      return ConstInt::newConstIntForType(Boolean->getVal() ? 1 : 0,
+                                          DestinationInteger);
+    if (auto *Integer = dynamic_cast<ConstInt *>(Input))
+      return ConstInt::newConstIntForType(Integer->getVal(),
+                                          DestinationInteger);
+    if (auto *Floating = dynamic_cast<ConstFloat *>(Input))
+      return Instruction::foldConstantCast(
+          Instruction::FPTOSI, Floating, DestinationInteger);
+
+    if (auto SourceInteger =
+            std::dynamic_pointer_cast<INTType>(SourceType)) {
+      if (SourceInteger->getBitWidth() <
+          DestinationInteger->getBitWidth()) {
+        if (SourceInteger->getIsBool())
+          return Block->genZextInst(Input, DestinationInteger);
+        return Block->genSextInst(Input, DestinationInteger);
+      }
+      if (SourceInteger->getBitWidth() >
+          DestinationInteger->getBitWidth())
+        return Block->genTruncInst(Input, DestinationInteger);
+      return Input;
+    }
+    if (SourceType->isFloat())
+      return Block->genFPTOSIInst(Input, DestinationInteger);
+    return nullptr;
+  }
+
+  if (TargetType->isFloat() && SourceType->isInt()) {
+    if (auto *Boolean = dynamic_cast<ConstBool *>(Input))
+      return ConstFloat::newConstFloat(Boolean->getVal() ? 1.0f : 0.0f);
+    if (auto *Integer = dynamic_cast<ConstInt *>(Input))
+      return ConstFloat::newConstFloat(
+          static_cast<float>(Integer->getVal()));
+    auto SourceInteger =
+        std::dynamic_pointer_cast<INTType>(SourceType);
+    if (SourceInteger && SourceInteger->getIsBool())
+      Input = Block->genZextInst(Input, INTType::getInt32Ty());
+    return Block->genSITOFPInst(Input);
+  }
+
+  if (TargetType->isPointer() && SourceType->isPointer()) {
+    auto *Cast = new BitCastInst(Input, TargetType);
+    Block->pushBack(Cast);
+    return Cast;
+  }
+
+  return nullptr;
+}
+
+} // 匿名命名空间
 
 bool BinaryInst::isIntegerOnlyOp(BinaryInst::Operation op) {
   switch (op) {
@@ -72,16 +150,21 @@ Instruction::InstType BinaryInst::getInstType(BinaryInst::Operation op,
   }
 }
 
-Function& Module::newFunction(TypeSystem ts,std::string ident){
-    auto func = new Function(ts,ident);
-    this->getSymbolTable().registerSymbolTable(ident,func);
-    this->functions.push_back(std::unique_ptr<Function>(func));
-    return *(this->functions.back());
+Function& Module::newFunction(TypeSystem returnType, std::string functionName) {
+    return newFunction(IRType::NewTypeByTypeSystem(returnType),
+                       std::move(functionName));
 }
 
-void Module::pushFunction(Function* func){
-    this->symbolTable.registerSymbolTable(func->getIdent(),func);
-    functions.push_back(std::unique_ptr<Function>(func));
+Function& Module::newFunction(std::shared_ptr<IRType> returnType,
+                              std::string functionName) {
+    auto *function =
+        new Function(std::move(returnType), std::move(functionName));
+    functions.emplace_back(function);
+    return *function;
+}
+
+void Module::pushFunction(Function *function) {
+    functions.emplace_back(function);
 }
 
 
@@ -104,6 +187,15 @@ Function* Module::getMainFunction(){
         if(i->getIdent() == "main") return i.get();
     }
     return nullptr;
+}
+
+Function *Module::findFunctionByName(const std::string &functionName) const {
+  // 每次基于模块当前拥有的函数查找，删除函数后无需同步额外索引。
+  for (const auto &function : functions) {
+    if (function && function->getIdent() == functionName)
+      return function.get();
+  }
+  return nullptr;
 }
 
 Module* Module::getActiveModule() {
@@ -151,14 +243,12 @@ std::unordered_set<Function *> Module::collectReachableFunctions(
   return Reachable;
 }
 
-void Module::pushGlobalVar(Variable* ptr){
-    globalvars.emplace_back(ptr);
+void Module::pushGlobalVar(Variable* globalVariable) {
+    globalvars.emplace_back(globalVariable);
 }
 
 
 std::vector<std::unique_ptr<Variable>>& Module::getGlobalVar(){return globalvars;}
-
-SymbolTable& Module::getSymbolTable(){return symbolTable;}
 
 void Module::dumpIR() {
     for(auto& i : globalvars) i->dumpIR();
@@ -178,7 +268,14 @@ for (int i = 0;; i++) {
   }
 }
 
-Function::Function(TypeSystem ts,std::string ident) : Value(IRType::NewTypeByTypeSystem(ts),ident){
+Function::Function(TypeSystem ts,std::string ident)
+    : Function(IRType::NewTypeByTypeSystem(ts), std::move(ident)) {}
+
+Function::Function(std::shared_ptr<IRType> returnType,
+                   std::string ident)
+    : Value(std::move(returnType), std::move(ident)) {
+    if (!getIRType() || getIRType()->isArray())
+      throw std::invalid_argument("函数返回类型不能为空或数组类型");
     // 每个函数至少拥有一个入口基本块。
     pushBack(new BasicBlock());
 }
@@ -197,16 +294,22 @@ void Function::insertBlock(BasicBlock* curr,BasicBlock* insert){
     this->pushBlock(insert);
 }
 
-void Function::pushParam(Variable* v){ params.emplace_back(v); }
+void Function::pushParam(Variable *parameterValue) {
+  params.emplace_back(parameterValue);
+}
 
-void Function::pushParam(std::string ident,Variable* v){
-    // 形参值保存在函数签名中，入口块中另建槽位以便按普通局部变量访问。
-    auto alloca = new AllocaInst(POINTERType::NewPointer(v->getIRType()));
-    auto store = new StoreInst(v,alloca);
-    front()->pushFront(alloca);
-    front()->pushBack(store);
-    ModuleIR->getSymbolTable().registerSymbolTable(ident,alloca);
-    params.emplace_back(std::unique_ptr<Variable>(v));
+AllocaInst *Function::pushParamWithStackSlot(Variable *parameterValue) {
+    if (!parameterValue || !front())
+        return nullptr;
+
+    // 形参归函数签名所有，入口槽位直接返回给 IRGenerator 建立源码绑定。
+    auto *parameterSlot =
+        new AllocaInst(POINTERType::NewPointer(parameterValue->getIRType()));
+    auto *initialStore = new StoreInst(parameterValue, parameterSlot);
+    front()->pushFront(parameterSlot);
+    front()->pushBack(initialStore);
+    params.emplace_back(parameterValue);
+    return parameterSlot;
 }
 
 std::vector<std::unique_ptr<Value>>& Function::getParams(){return params;}
@@ -346,42 +449,140 @@ BuildInFunction::BuildInFunction(std::shared_ptr<IRType> t,std::string ident):Va
     this->ident = "_sysy_" + this->ident;
 }
 
+std::optional<BuildInFunction::Signature>
+BuildInFunction::getSignature(const std::string &Name) {
+  const auto Void = VOIDType::NewVoid();
+  const auto I1 = INTType::getBoolTy();
+  const auto I8 = INTType::getInt8Ty();
+  const auto I32 = INTType::getInt32Ty();
+  const auto I64 = INTType::getInt64Ty();
+  const auto Float = FLOATType::NewFloat();
+  const auto I8Pointer = POINTERType::NewPointer(I8);
+  const auto I32Pointer = POINTERType::NewPointer(I32);
+  const auto FloatPointer = POINTERType::NewPointer(Float);
+
+  auto makeSignature =
+      [](std::shared_ptr<IRType> ReturnType,
+         std::vector<std::shared_ptr<IRType>> ParameterTypes,
+         bool Variadic = false,
+         std::vector<bool> OpaquePointerParameters = {}) {
+        Signature Result;
+        Result.returnType = std::move(ReturnType);
+        Result.parameterTypes = std::move(ParameterTypes);
+        Result.variadic = Variadic;
+        Result.opaquePointerParameters =
+            std::move(OpaquePointerParameters);
+        Result.opaquePointerParameters.resize(
+            Result.parameterTypes.size(), false);
+        return Result;
+      };
+
+  if (Name == "getint" || Name == "getch")
+    return makeSignature(I32, {});
+  if (Name == "getfloat")
+    return makeSignature(Float, {});
+  if (Name == "getarray")
+    return makeSignature(I32, {I32Pointer});
+  if (Name == "getfarray")
+    return makeSignature(I32, {FloatPointer});
+  if (Name == "putint" || Name == "putch")
+    return makeSignature(Void, {I32});
+  if (Name == "putfloat")
+    return makeSignature(Void, {Float});
+  if (Name == "putarray")
+    return makeSignature(Void, {I32, I32Pointer});
+  if (Name == "putfarray")
+    return makeSignature(Void, {I32, FloatPointer});
+  if (Name == "putf")
+    return makeSignature(Void, {I8Pointer}, true);
+  if (Name == "starttime" || Name == "stoptime" ||
+      Name == "_sysy_starttime" || Name == "_sysy_stoptime")
+    return makeSignature(Void, {I32});
+
+  const bool IsMemcpy = isMemcpyName(Name);
+  const bool IsMemmove = isMemmoveName(Name);
+  const bool IsMemset = isMemsetName(Name);
+  if (IsMemcpy || IsMemmove || IsMemset) {
+    const bool HasI64Length =
+        Name.size() >= 4 &&
+        Name.compare(Name.size() - 4, 4, ".i64") == 0;
+    const bool HasI32Length =
+        Name.size() >= 4 &&
+        Name.compare(Name.size() - 4, 4, ".i32") == 0;
+    if (!HasI32Length && !HasI64Length)
+      return std::nullopt;
+    const auto LengthType = HasI64Length ? I64 : I32;
+    if (IsMemset)
+      return makeSignature(
+          Void, {I8Pointer, I8, LengthType, I1}, false,
+          {true, false, false, false});
+    return makeSignature(
+        Void, {I8Pointer, I8Pointer, LengthType, I1}, false,
+        {true, true, false, false});
+  }
+
+  return std::nullopt;
+}
+
+bool BuildInFunction::dumpDeclaration(const std::string &Name) {
+  auto Signature = getSignature(Name);
+  if (!Signature || !Signature->returnType)
+    return false;
+
+  Signature->returnType->toString();
+  const std::string PrintedName =
+      Name == "starttime" || Name == "stoptime"
+          ? "_sysy_" + Name
+          : Name;
+  std::cout << " @" << PrintedName << "(";
+  for (std::size_t Index = 0;
+       Index < Signature->parameterTypes.size(); ++Index) {
+    if (Index != 0)
+      std::cout << ", ";
+    if (Index < Signature->opaquePointerParameters.size() &&
+        Signature->opaquePointerParameters[Index]) {
+      std::cout << "ptr";
+    } else {
+      Signature->parameterTypes[Index]->toString();
+    }
+  }
+  if (Signature->variadic) {
+    if (!Signature->parameterTypes.empty())
+      std::cout << ", ";
+    std::cout << "...";
+  }
+  std::cout << ")\n";
+  return true;
+}
+
+void BuildInFunction::dumpDefaultDeclarations() {
+  static const std::vector<std::string> RuntimeNames = {
+      "getint", "getch", "getfloat", "getarray", "getfarray",
+      "putint", "putch", "putfloat", "putarray", "putfarray",
+      "putf", "starttime", "stoptime"};
+  static const std::vector<std::string> MemoryIntrinsicNames = {
+      "llvm.memcpy.p0.p0.i32", "llvm.memmove.p0.p0.i32",
+      "llvm.memset.p0.i32", "llvm.memcpy.p0.p0.i64",
+      "llvm.memmove.p0.p0.i64", "llvm.memset.p0.i64"};
+
+  for (const std::string &Name : RuntimeNames) {
+    std::cout << "declare ";
+    dumpDeclaration(Name);
+  }
+  std::cout << "\n";
+  for (const std::string &Name : MemoryIntrinsicNames) {
+    std::cout << "declare ";
+    dumpDeclaration(Name);
+  }
+  std::cout << "\n";
+}
+
 BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
   // 内建函数按名称驻留，返回类型由 SysY 运行库或 LLVM 内建签名决定。
   static std::map<std::string, BuildInFunction *> mp;
   auto gt = [&ident]() -> std::shared_ptr<IRType> {
-    if (ident == "getint")
-      return INTType::NewInt(4);
-    if (ident == "getfloat")
-      return FLOATType::NewFloat();
-    if (ident == "getch")
-      return INTType::NewInt(4);
-    if (ident == "getarray")
-      return INTType::NewInt(4);
-    if (ident == "getfarray")
-      return INTType::NewInt(4);
-    if (ident == "putint")
-      return VOIDType::NewVoid();
-    if (ident == "putch")
-      return VOIDType::NewVoid();
-    if (ident == "putarray")
-      return VOIDType::NewVoid();
-    if (ident == "putfloat")
-      return VOIDType::NewVoid();
-    if (ident == "putfarray")
-     return VOIDType::NewVoid();
-    if (ident == "starttime")
-      return VOIDType::NewVoid();
-    if (ident == "stoptime")
-      return VOIDType::NewVoid();
-    if (ident == "putf")
-      return VOIDType::NewVoid();
-    if (ident == "llvm.memcpy.p0i8.p0i8.i32" ||
-        ident == "llvm.memcpy.p0.p0.i32" ||
-        ident == "llvm.memmove.p0.p0.i32" ||
-        ident == "llvm.memset.p0i8.i32" ||
-        ident == "llvm.memset.p0.i32")
-        return VOIDType::NewVoid();
+    if (auto Signature = getSignature(ident))
+      return Signature->returnType;
     if (ident == "memcpy@plt")
       return VOIDType::NewVoid();
     if (ident == "buildin_NotifyWorkerLE")
@@ -407,14 +608,7 @@ BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
 }
 
 bool BuildInFunction::isSupportedName(const std::string &Name) {
-  static const std::unordered_set<std::string> SupportedNames = {
-      "getint", "getch", "getfloat", "getarray", "getfarray",
-      "putint", "putch", "putfloat", "putarray", "putfarray", "putf",
-      "starttime", "stoptime", "llvm.memcpy.p0i8.p0i8.i32",
-      "llvm.memcpy.p0.p0.i32", "llvm.memmove.p0.p0.i32",
-      "llvm.memset.p0i8.i32",
-      "llvm.memset.p0.i32"};
-  return SupportedNames.count(Name) != 0;
+  return getSignature(Name).has_value();
 }
 
 bool BuildInFunction::isMemcpyName(const std::string &Name) {
@@ -702,10 +896,11 @@ BasicBlock *BasicBlock::splitEdge(Function &F, const CFGEdge &Edge) {
 }
 
 void BasicBlock::genRetInst(Value* retVal){
-    if(getParent()->getIRType()->getEnum() != retVal->getIRType()->getEnum()){
-        if(retVal->getIRType()->getEnum() == IR_INT) retVal = genSITOFPInst(retVal);
-        else retVal = genFPTOSIInst(retVal);
-    }
+    if (!retVal || !getParent() || !getParent()->getIRType())
+      return;
+    retVal = coerceValueToType(this, retVal, getParent()->getIRType());
+    if (!retVal)
+      return;
     auto inst = new RetInst(retVal);
     pushBack(inst);
 }
@@ -725,12 +920,13 @@ void BasicBlock::genUnCondInst(BasicBlock *block) {
   pushBack(inst);
 }
 
-AllocaInst* BasicBlock::genAllocaInst(std::shared_ptr<IRType> irtype,std::string ident){
-    auto tp = POINTERType::NewPointer(irtype);
-    auto alloca = new AllocaInst(tp);
-    ModuleIR->getSymbolTable().registerSymbolTable(ident,alloca);
-    getParent()->front()->pushFront(alloca);
-    return alloca;
+AllocaInst *
+BasicBlock::genAllocaInst(std::shared_ptr<IRType> allocatedType) {
+    auto pointerType = POINTERType::NewPointer(std::move(allocatedType));
+    auto *allocation = new AllocaInst(std::move(pointerType));
+    // 栈对象统一放入函数入口块，源码符号登记由 IRGenerator 独立完成。
+    getParent()->front()->pushFront(allocation);
+    return allocation;
 }
 
 Value* BasicBlock::genLoadInst(Value* v){
@@ -743,10 +939,8 @@ void BasicBlock::genStoreInst(Value* val,Value* ptr){
     if (!val || !ptr) return;
     auto point = std::dynamic_pointer_cast<POINTERType>(ptr->getIRType());
     if (!point || !point->getPointerType() || !val->getIRType()) return;
-    if(point->getPointerType()->getEnum() != val->getIRType()->getEnum()){
-        if(point->getPointerType()->getEnum()  == IR_INT) val = this->genFPTOSIInst(val);
-        else val = this->genSITOFPInst(val);
-    }
+    val = coerceValueToType(this, val, point->getPointerType());
+    if (!val) return;
     auto inst = new StoreInst(val,ptr);
     this->pushBack(inst);
 }
@@ -758,54 +952,69 @@ Value* BasicBlock::genGepInst(Value* ptr){
 }
 
 Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
-  bool a = (A->getIRType()->getEnum() == IR_INT);
-  bool b = (B->getIRType()->getEnum() == IR_INT);
-    BinaryInst* inst;
+  if (!A || !B || !A->getIRType() || !B->getIRType())
+    return nullptr;
+  if (A->getIRType()->isVector() || B->getIRType()->isVector())
+    return nullptr;
 
-  // 只允许整数的操作先把浮点数转为整数，再把 i1 和普通整数统一到同一位宽。
+  bool AIsInteger = A->getIRType()->isInt();
+  bool BIsInteger = B->getIRType()->isInt();
+  bool AIsFloat = A->getIRType()->isFloat();
+  bool BIsFloat = B->getIRType()->isFloat();
+
+  // 只允许整数的操作先把浮点值转换为 SysY 的 i32。
   if (BinaryInst::isIntegerOnlyOp(op)) {
-    if (!a) {
-      A = genFPTOSIInst(A);
-      a = true;
+    if (AIsFloat) {
+      A = genFPTOSIInst(A, INTType::getInt32Ty());
+      AIsInteger = true;
+      AIsFloat = false;
     }
-    if (!b) {
-      B = genFPTOSIInst(B);
-      b = true;
+    if (BIsFloat) {
+      B = genFPTOSIInst(B, INTType::getInt32Ty());
+      BIsInteger = true;
+      BIsFloat = false;
     }
-
-    bool aa = A->getIRType() == INTType::NewInt(4);
-    bool bb = B->getIRType() == INTType::NewInt(4);
-    if (aa ^ bb) {
-      if (!aa) A = genZextInst(A);
-      else B = genZextInst(B);
-    }
-
-    inst = new BinaryInst(A, op, B);
-    pushBack(inst);
-    return inst;
+    if (!AIsInteger || !BIsInteger)
+      return nullptr;
+  } else if ((AIsInteger && BIsFloat) ||
+             (AIsFloat && BIsInteger)) {
+    if (AIsInteger)
+      A = genSITOFPInst(A);
+    else
+      B = genSITOFPInst(B);
+    AIsInteger = BIsInteger = false;
+    AIsFloat = BIsFloat = true;
   }
 
-    if(a ^ b) {
-        if(a) {
-            A = genSITOFPInst(A);
-        } else {
-            B = genSITOFPInst(B);
-        }
-        inst = new BinaryInst(A, op, B);
-    }
-    else {
-        if(a){
-            bool aa = A->getIRType() == INTType::NewInt(4);
-            bool bb = B->getIRType() == INTType::NewInt(4);
-            if(aa ^ bb){
-                if(!aa) A = genZextInst(A); // 将 i1 零扩展为 i32。
-                else B = genZextInst(B);    // 将 i1 零扩展为 i32。
-            }
-        }
-        inst = new BinaryInst(A, op, B);
-    }
-    pushBack(inst);
-    return inst;
+  if (AIsInteger && BIsInteger) {
+    auto AType = std::dynamic_pointer_cast<INTType>(A->getIRType());
+    auto BType = std::dynamic_pointer_cast<INTType>(B->getIRType());
+    if (!AType || !BType)
+      return nullptr;
+    const unsigned CommonWidth =
+        std::max(AType->getBitWidth(), BType->getBitWidth());
+    auto CommonType = INTType::get(CommonWidth);
+    auto extendToCommon = [this, &CommonType](Value *Input) -> Value * {
+      auto InputType =
+          std::dynamic_pointer_cast<INTType>(Input->getIRType());
+      if (!InputType ||
+          InputType->getBitWidth() == CommonType->getBitWidth())
+        return Input;
+      if (InputType->getIsBool())
+        return genZextInst(Input, CommonType);
+      return genSextInst(Input, CommonType);
+    };
+    A = extendToCommon(A);
+    B = extendToCommon(B);
+  }
+
+  if (!A || !B || !A->getIRType() || !B->getIRType() ||
+      !A->getIRType()->hasSameShape(*B->getIRType()))
+    return nullptr;
+
+  auto *inst = new BinaryInst(A, op, B);
+  pushBack(inst);
+  return inst;
 }
 
 Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
@@ -850,25 +1059,53 @@ Value* BasicBlock::genSITOFPInst(Value* x){
 }
 
 Value* BasicBlock::genFPTOSIInst(Value* x){
-    auto inst = new FPTOSIInst(x);
+    auto inst = new FPTOSIInst(x, INTType::getInt32Ty());
+    pushBack(inst);
+    return inst;
+}
+
+Value* BasicBlock::genFPTOSIInst(
+    Value* x, std::shared_ptr<INTType> targetType) {
+    auto *inst = new FPTOSIInst(x, std::move(targetType));
     pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genZextInst(Value* x){
-    auto inst = new ZextInst(x);
+    auto inst = new ZextInst(x, INTType::getInt32Ty());
     pushBack(inst);
     return inst;
 }
 
+Value* BasicBlock::genZextInst(
+    Value* x, std::shared_ptr<INTType> targetType) {
+  auto *inst = new ZextInst(x, std::move(targetType));
+  pushBack(inst);
+  return inst;
+}
+
 Value* BasicBlock::genTruncInst(Value* x){
-  auto inst = new TruncInst(x);
+  auto inst = new TruncInst(x, INTType::getBoolTy());
+  pushBack(inst);
+  return inst;
+}
+
+Value* BasicBlock::genTruncInst(
+    Value* x, std::shared_ptr<INTType> targetType) {
+  auto *inst = new TruncInst(x, std::move(targetType));
   pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genSextInst(Value* x){
-  auto inst = new SextInst(x);
+  auto inst = new SextInst(x, INTType::getInt32Ty());
+  pushBack(inst);
+  return inst;
+}
+
+Value* BasicBlock::genSextInst(
+    Value* x, std::shared_ptr<INTType> targetType) {
+  auto *inst = new SextInst(x, std::move(targetType));
   pushBack(inst);
   return inst;
 }
@@ -930,23 +1167,43 @@ BasicBlock *BasicBlock::splitBlockAfter(Instruction *Position) {
 Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
   // 运行库调用按固定签名转换标量实参，然后注册并生成内建调用。
   if (BuildInFunction::isSupportedName(ident)) {
-    ModuleIR->registerBuiltin(ident);
-    if (ident == "putint" || ident == "putch" || ident == "putarray" ||
-        ident == "putfarray") {
-      if (args[0]->getIRType()->getEnum() == IR_FLOAT)
-        args[0] = genFPTOSIInst(args[0]);
+    auto Signature = BuildInFunction::getSignature(ident);
+    if (!Signature ||
+        args.size() < Signature->parameterTypes.size() ||
+        (!Signature->variadic &&
+         args.size() != Signature->parameterTypes.size())) {
+      return nullptr;
     }
-    if (ident == "putfloat") {
-      if (args[0]->getIRType()->getEnum() == IR_INT)
-        args[0] = genSITOFPInst(args[0]);
+
+    for (std::size_t Index = 0;
+         Index < Signature->parameterTypes.size(); ++Index) {
+      if (!args[Index] || !args[Index]->getIRType())
+        return nullptr;
+      const bool IsOpaquePointer =
+          Index < Signature->opaquePointerParameters.size() &&
+          Signature->opaquePointerParameters[Index];
+      if (IsOpaquePointer) {
+        if (!args[Index]->getIRType()->isPointer())
+          return nullptr;
+        continue;
+      }
+      Value *Converted = coerceValueToType(
+          this, args[Index], Signature->parameterTypes[Index]);
+      if (!Converted)
+        return nullptr;
+      args[Index] = Converted;
     }
-    auto tmp = new CallInst(BuildInFunction::genBuildInFunction(ident), args);
+
+    if (ModuleIR)
+      ModuleIR->registerBuiltin(ident);
+    auto *tmp =
+        new CallInst(BuildInFunction::genBuildInFunction(ident), args);
     pushBack(tmp);
     return tmp;
   }
 
   // 用户函数要求实参数量一致；指针和数组保留原类型，仅标量整数与浮点数相互转换。
-  if (auto func = dynamic_cast<Function*>(ModuleIR->getSymbolTable().getValueByName(ident))) {
+  if (auto *func = ModuleIR->findFunctionByName(ident)) {
     auto &params = func->getParams();
     if (args.size() != params.size()) return nullptr;
     auto i = args.begin();
@@ -955,7 +1212,7 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
       auto jj = j->get();
       if (!ii || !jj || !ii->getIRType() || !jj->getIRType()) return nullptr;
       if (jj->getIRType() != ii->getIRType()) {
-        auto a = ii->getIRType()->getEnum(), b = jj->getIRType()->getEnum();
+        auto a = ii->getIRType()->getTypeSystem(), b = jj->getIRType()->getTypeSystem();
         // 指针和数组由调用边界保证形状兼容，此处不猜测复合类型转换。
         if (b == IR_POINTER || a == IR_POINTER || a == IR_ARRAY) {
           continue;
@@ -1092,37 +1349,105 @@ Value *Instruction::getUnaryOperand(const Instruction *I) {
   return I ? I->getUnaryOperand() : nullptr;
 }
 
-Value *Instruction::foldConstantCast(InstType CastType, Value *Operand) {
+Value *Instruction::foldConstantCast(
+    InstType CastType, Value *Operand,
+    const std::shared_ptr<IRType> &ResultType) {
   if (!Operand) return nullptr;
 
-  int32_t IntValue = 0;
+  int64_t IntValue = 0;
   float FloatValue = 0.0f;
+  auto SourceInteger =
+      std::dynamic_pointer_cast<INTType>(Operand->getIRType());
+  auto DestinationInteger =
+      std::dynamic_pointer_cast<INTType>(ResultType);
+
+  auto makeIntegerResult = [](int64_t RawValue,
+                              const std::shared_ptr<INTType> &Type)
+      -> Value * {
+    if (!Type) return nullptr;
+    if (Type->getIsBool())
+      return ConstBool::newConstBool((RawValue & 1) != 0);
+    return ConstInt::newConstIntForType(RawValue, Type);
+  };
+
+  auto getLowBits = [](int64_t Value, unsigned Bits) {
+    uint64_t Raw = static_cast<uint64_t>(Value);
+    if (Bits < 64)
+      Raw &= (uint64_t{1} << Bits) - 1U;
+    return Raw;
+  };
+
+  auto signedFromBits = [](uint64_t Raw) {
+    int64_t Result = 0;
+    std::memcpy(&Result, &Raw, sizeof(Result));
+    return Result;
+  };
+
   switch (CastType) {
   case SITOFP:
-    return Operand->tryGetIntConst(IntValue)
+    return Operand->tryGetInt64Const(IntValue)
                ? static_cast<Value *>(
                      ConstFloat::newConstFloat(static_cast<float>(IntValue)))
                : nullptr;
-  case FPTOSI:
-    return Operand->tryGetFloatConst(FloatValue)
-               ? static_cast<Value *>(
-                     ConstInt::newConstInt(static_cast<int>(FloatValue)))
-               : nullptr;
-  case ZEXT:
-    return Operand->tryGetIntConst(IntValue)
-               ? static_cast<Value *>(ConstInt::newConstInt(IntValue))
-               : nullptr;
-  case SEXT:
-    if (auto *CB = dynamic_cast<ConstBool *>(Operand))
-      return ConstInt::newConstInt(CB->getVal() ? -1 : 0);
-    return Operand->tryGetIntConst(IntValue)
-               ? static_cast<Value *>(ConstInt::newConstInt(IntValue))
-               : nullptr;
-  case TRUNC:
-    return Operand->tryGetIntConst(IntValue)
-               ? static_cast<Value *>(
-                     ConstBool::newConstBool((IntValue & 1) != 0))
-               : nullptr;
+  case FPTOSI: {
+    if (!Operand->tryGetFloatConst(FloatValue))
+      return nullptr;
+    if (!DestinationInteger)
+      DestinationInteger = INTType::getInt32Ty();
+    if (!std::isfinite(FloatValue))
+      return nullptr;
+    const long double Value = static_cast<long double>(FloatValue);
+    const unsigned Bits = DestinationInteger->getBitWidth();
+    const long double Minimum =
+        Bits >= 64
+            ? static_cast<long double>(std::numeric_limits<int64_t>::min())
+            : -static_cast<long double>(uint64_t{1} << (Bits - 1U));
+    const long double Maximum =
+        Bits >= 64
+            ? static_cast<long double>(std::numeric_limits<int64_t>::max())
+            : static_cast<long double>((uint64_t{1} << (Bits - 1U)) - 1U);
+    if (Value < Minimum || Value > Maximum)
+      return nullptr;
+    return makeIntegerResult(static_cast<int64_t>(FloatValue),
+                             DestinationInteger);
+  }
+  case ZEXT: {
+    if (!SourceInteger || !Operand->tryGetInt64Const(IntValue))
+      return nullptr;
+    if (!DestinationInteger)
+      DestinationInteger = INTType::getInt32Ty();
+    if (DestinationInteger->getBitWidth() <=
+        SourceInteger->getBitWidth())
+      return nullptr;
+    const uint64_t Raw =
+        getLowBits(IntValue, SourceInteger->getBitWidth());
+    return makeIntegerResult(signedFromBits(Raw), DestinationInteger);
+  }
+  case SEXT: {
+    if (!SourceInteger || !Operand->tryGetInt64Const(IntValue))
+      return nullptr;
+    if (!DestinationInteger)
+      DestinationInteger = INTType::getInt32Ty();
+    if (DestinationInteger->getBitWidth() <=
+        SourceInteger->getBitWidth())
+      return nullptr;
+    const int64_t Extended = IRMath::normalizeSignedToWidth(
+        IntValue, SourceInteger->getBitWidth());
+    return makeIntegerResult(Extended, DestinationInteger);
+  }
+  case TRUNC: {
+    if (!SourceInteger || !Operand->tryGetInt64Const(IntValue))
+      return nullptr;
+    if (!DestinationInteger)
+      DestinationInteger = INTType::getBoolTy();
+    if (DestinationInteger->getBitWidth() >=
+        SourceInteger->getBitWidth())
+      return nullptr;
+    return makeIntegerResult(
+        IRMath::normalizeSignedToWidth(
+            IntValue, DestinationInteger->getBitWidth()),
+        DestinationInteger);
+  }
   default:
     return nullptr;
   }
@@ -1333,7 +1658,7 @@ void GetElementPtrInst::dumpIR() {
 
     // GEP 文本中的首个类型是基指针所指向的聚合或元素类型。
     std::shared_ptr<IRType> elementType;
-    if (baseType->getEnum() == IR_POINTER) {
+    if (baseType->getTypeSystem() == IR_POINTER) {
         auto ptrType = std::dynamic_pointer_cast<POINTERType>(baseType);
         elementType = ptrType->getPointerType();
     } else {
@@ -1364,15 +1689,10 @@ void GetElementPtrInst::updateType() {
 
     // 从基指针类型出发，每个索引剥离一层指针或数组。
     for (size_t i = 1; i < userList.size(); i++) {
-        if (auto ptr = std::dynamic_pointer_cast<POINTERType>(currentType)) {
-            currentType = ptr->getPointerType();
-        }
-        else if (auto arr = std::dynamic_pointer_cast<ARRAYType>(currentType)) {
-            currentType = arr->getElementType();
-        }
-        else {
-            return;
-        }
+        currentType = currentType
+                          ? currentType->getIndexableElementType()
+                          : nullptr;
+        if (!currentType) return;
     }
 
     // 最终元素类型重新包装为 GEP 的结果指针类型。
@@ -1451,14 +1771,8 @@ std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
     int64_t LastStride = 0;
     // 按索引逐层剖解指针或数组，最后一层元素大小即末索引步长。
     for (size_t I = 1; I < getNumOperands(); ++I) {
-        std::shared_ptr<IRType> ElementTy;
-        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
-            ElementTy = PtrTy->getPointerType();
-        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurrentTy)) {
-            ElementTy = ArrTy->getElementType();
-        } else {
-            return std::nullopt;
-        }
+        std::shared_ptr<IRType> ElementTy =
+            CurrentTy ? CurrentTy->getIndexableElementType() : nullptr;
         if (!ElementTy ||
             ElementTy->getSize() >
                 static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
@@ -1526,14 +1840,8 @@ bool GetElementPtrInst::getIndexStrides(Value *Base,
     std::shared_ptr<IRType> CurrentTy = Base->getIRType();
     for (Value *Idx : Indices) {
         (void)Idx;
-        std::shared_ptr<IRType> ElementTy;
-        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurrentTy)) {
-            ElementTy = PtrTy->getPointerType();
-        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurrentTy)) {
-            ElementTy = ArrTy->getElementType();
-        } else {
-            return false;
-        }
+        std::shared_ptr<IRType> ElementTy =
+            CurrentTy ? CurrentTy->getIndexableElementType() : nullptr;
         if (!ElementTy ||
             ElementTy->getSize() >
                 static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
@@ -1553,10 +1861,23 @@ BinaryInst::BinaryInst(std::shared_ptr<IRType> irtype):Instruction(irtype){
 
 BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
     :Instruction(x->getIRType()),op(op){
+    if (!x || !y || !x->getIRType() || !y->getIRType() ||
+        !x->getIRType()->hasSameShape(*y->getIRType()))
+      throw std::invalid_argument("二元指令要求两个操作数类型完全一致");
+    if (x->getIRType()->isVector())
+      throw std::invalid_argument("当前标量二元指令不接受向量类型");
+    const bool IsScalar = x->getIRType()->isScalar();
+    const bool IsPointerCompare =
+        x->getIRType()->isPointer() && BinaryInst::isCompareOp(op);
+    if (!IsScalar && !IsPointerCompare)
+      throw std::invalid_argument("二元指令的操作数类型不受支持");
+    if (BinaryInst::isIntegerOnlyOp(op) &&
+        !x->getIRType()->isInt())
+      throw std::invalid_argument("该二元操作只接受整数类型");
     if (BinaryInst::isCompareOp(op)) {
-      this->irtype = INTType::NewBool();
+      this->irtype = INTType::getBoolTy();
     }
-    this->instType = getInstType(op, x->getIRType()->getEnum());
+    this->instType = getInstType(op, x->getIRType()->getTypeSystem());
     this->addUse(x);
     this->addUse(y);
 }
@@ -1646,45 +1967,19 @@ BinaryInst *BinaryInst::createBooleanNot(Value *Operand) {
 Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
                                  bool NormalizeIntegerWidth) {
   if (!LHS || !RHS) return nullptr;
+  (void)NormalizeIntegerWidth;
   const auto Ty = LHS->getIRType();
+  const auto RHSType = RHS->getIRType();
+  if (!Ty || !RHSType || !Ty->hasSameScalarType(*RHSType))
+    return nullptr;
 
-  if (NormalizeIntegerWidth) {
-    // 规整模式先按 IR 位宽解释整数，再进行比较或算术折叠。
-    auto *IntTy = dynamic_cast<INTType *>(Ty.get());
-
-    // 整数除零或余零产生未定义值；浮点运算按 IEEE 规则生成 Inf 或 NaN。
-    if (IntTy && (Op == DIV || Op == UDIV) && RHS->isConstZero())
-      return Value::makeUndefForType(Ty);
-    if (IntTy && (Op == MOD || Op == UREM) && RHS->isConstZero())
-      return Value::makeUndefForType(Ty);
-
+  if (Ty->isFloat()) {
+    float LV = 0.0f;
+    float RV = 0.0f;
+    if (!LHS->tryGetFloatConst(LV) || !RHS->tryGetFloatConst(RV))
+      return nullptr;
     if (isCompareOp(Op)) {
-      if (IntTy) {
-        const unsigned Bits = IntTy->getIsBool()
-                                  ? 1u
-                                  : static_cast<unsigned>(IntTy->getSize() * 8);
-        int32_t LV = 0;
-        int32_t RV = 0;
-        if (!LHS->tryGetIntConstAtWidth(Bits, LV) ||
-            !RHS->tryGetIntConstAtWidth(Bits, RV))
-          return nullptr;
-        switch (Op) {
-        case E:  return ConstBool::newConstBool(LV == RV);
-        case NE: return ConstBool::newConstBool(LV != RV);
-        case G:  return ConstBool::newConstBool(LV > RV);
-        case GE: return ConstBool::newConstBool(LV >= RV);
-        case L:  return ConstBool::newConstBool(LV < RV);
-        case LE: return ConstBool::newConstBool(LV <= RV);
-        default: return nullptr;
-        }
-      }
-
-      float LV = 0.0f;
-      float RV = 0.0f;
-      if (!LHS->tryGetNumericFloatConst(LV) ||
-          !RHS->tryGetNumericFloatConst(RV))
-        return nullptr;
-      // SysY 遵循 C/IEEE 有序比较：NaN 使关系比较和相等为假，仅不等为真。
+      // SysY 使用有序浮点比较；任一操作数为 NaN 时仅“不等”成立。
       if (std::isnan(LV) || std::isnan(RV))
         return ConstBool::newConstBool(Op == NE);
       switch (Op) {
@@ -1697,113 +1992,39 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
       default: return nullptr;
       }
     }
-
-    if (IntTy) {
-      // 所有整数算术均检查非法除法与移位，并将结果截回声明位宽。
-      const unsigned Bits = IntTy->getIsBool()
-                                ? 1u
-                                : static_cast<unsigned>(IntTy->getSize() * 8);
-      int32_t LV = 0;
-      int32_t RV = 0;
-      if (!LHS->tryGetIntConstAtWidth(Bits, LV) ||
-          !RHS->tryGetIntConstAtWidth(Bits, RV))
-        return nullptr;
-
-      int64_t Raw = 0;
-      const int64_t SignedMin = -(int64_t{1} << (Bits - 1));
-      switch (Op) {
-      case ADD: Raw = static_cast<int64_t>(LV) + RV; break;
-      case SUB: Raw = static_cast<int64_t>(LV) - RV; break;
-      case MUL: Raw = static_cast<int64_t>(LV) * RV; break;
-      case DIV:
-        if (RV == 0 || (LV == SignedMin && RV == -1))
-          return Value::makeUndefForType(Ty);
-        Raw = LV / RV;
-        break;
-      case UDIV:
-        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) /
-                                   static_cast<uint32_t>(RV));
-        break;
-      case MOD:
-        if (RV == 0 || (LV == SignedMin && RV == -1))
-          return Value::makeUndefForType(Ty);
-        Raw = LV % RV;
-        break;
-      case UREM:
-        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) %
-                                   static_cast<uint32_t>(RV));
-        break;
-      case AND: Raw = LV & RV; break;
-      case OR:  Raw = LV | RV; break;
-      case XOR: Raw = LV ^ RV; break;
-      case SHL:
-        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
-          return Value::makeUndefForType(Ty);
-        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) << RV);
-        break;
-      case LSHR:
-        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
-          return Value::makeUndefForType(Ty);
-        Raw = static_cast<int64_t>(static_cast<uint32_t>(LV) >> RV);
-        break;
-      case ASHR:
-        if (RV < 0 || RV >= static_cast<int32_t>(Bits))
-          return Value::makeUndefForType(Ty);
-        Raw = LV >> RV;
-        break;
-      default: return nullptr;
-      }
-
-      const int32_t Normalized =
-          IRMath::normalizeSignedToWidth(Raw, Bits);
-      if (IntTy->getIsBool())
-        return ConstBool::newConstBool((Normalized & 1) != 0);
-      return ConstInt::newConstInt(Normalized, IntTy->getSize());
-    }
-
-    float LV = 0.0f;
-    float RV = 0.0f;
-    if (!LHS->tryGetNumericFloatConst(LV) ||
-        !RHS->tryGetNumericFloatConst(RV))
-      return nullptr;
     switch (Op) {
     case ADD: return ConstFloat::newConstFloat(LV + RV);
     case SUB: return ConstFloat::newConstFloat(LV - RV);
     case MUL: return ConstFloat::newConstFloat(LV * RV);
     case DIV: return ConstFloat::newConstFloat(LV / RV);
+    case MOD: return ConstFloat::newConstFloat(std::fmod(LV, RV));
     default: return nullptr;
     }
   }
 
-  // 非规整模式按操作数的现有类型分别折叠比较、浮点算术和整数算术。
-  if (isCompareOp(Op)) {
-    if (IRType::isFloat(Ty)) {
-      float LV = 0.0f;
-      float RV = 0.0f;
-      if (!Value::tryGetFloatConst(LHS, LV) ||
-          !Value::tryGetFloatConst(RHS, RV))
-        return nullptr;
-      if (std::isnan(LV) || std::isnan(RV))
-        return ConstBool::newConstBool(Op == NE);
-      switch (Op) {
-      case E:  return ConstBool::newConstBool(LV == RV);
-      case NE: return ConstBool::newConstBool(LV != RV);
-      case G:  return ConstBool::newConstBool(LV > RV);
-      case GE: return ConstBool::newConstBool(LV >= RV);
-      case L:  return ConstBool::newConstBool(LV < RV);
-      case LE: return ConstBool::newConstBool(LV <= RV);
-      default: return nullptr;
-      }
-    }
+  auto IntTy = std::dynamic_pointer_cast<INTType>(Ty);
+  if (!IntTy)
+    return nullptr;
+  const unsigned Bits = IntTy->getBitWidth();
+  if (Bits == 0 || Bits > 64)
+    return nullptr;
 
-    int32_t LV = 0;
-    int32_t RV = 0;
-    if (!Value::tryGetIntConst(LHS, LV) ||
-        !Value::tryGetIntConst(RHS, RV))
-      return nullptr;
+  int64_t LV = 0;
+  int64_t RV = 0;
+  if (!LHS->tryGetInt64ConstAtWidth(Bits, LV) ||
+      !RHS->tryGetInt64ConstAtWidth(Bits, RV))
+    return nullptr;
+
+  const uint64_t WidthMask =
+      Bits == 64 ? std::numeric_limits<uint64_t>::max()
+                 : (uint64_t{1} << Bits) - 1U;
+  const uint64_t LRaw = static_cast<uint64_t>(LV) & WidthMask;
+  const uint64_t RRaw = static_cast<uint64_t>(RV) & WidthMask;
+
+  if (isCompareOp(Op)) {
     switch (Op) {
-    case E:  return ConstBool::newConstBool(LV == RV);
-    case NE: return ConstBool::newConstBool(LV != RV);
+    case E:  return ConstBool::newConstBool(LRaw == RRaw);
+    case NE: return ConstBool::newConstBool(LRaw != RRaw);
     case G:  return ConstBool::newConstBool(LV > RV);
     case GE: return ConstBool::newConstBool(LV >= RV);
     case L:  return ConstBool::newConstBool(LV < RV);
@@ -1812,71 +2033,58 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
     }
   }
 
-  if (IRType::isFloat(Ty)) {
-    float LV = 0.0f;
-    float RV = 0.0f;
-    if (!Value::tryGetFloatConst(LHS, LV) ||
-        !Value::tryGetFloatConst(RHS, RV))
-      return nullptr;
-    switch (Op) {
-    case ADD: return ConstFloat::newConstFloat(LV + RV);
-    case SUB: return ConstFloat::newConstFloat(LV - RV);
-    case MUL: return ConstFloat::newConstFloat(LV * RV);
-    case DIV:
-      return ConstFloat::newConstFloat(LV / RV);
-    case MOD:
-      return ConstFloat::newConstFloat(std::fmod(LV, RV));
-    default: return nullptr;
-    }
-  }
+  if ((Op == DIV || Op == UDIV || Op == MOD || Op == UREM) &&
+      RRaw == 0)
+    return Value::makeUndefForType(Ty);
 
-  int32_t LV = 0;
-  int32_t RV = 0;
-  if (!Value::tryGetIntConst(LHS, LV) ||
-      !Value::tryGetIntConst(RHS, RV))
-    return nullptr;
-  const unsigned Bits = Ty ? static_cast<unsigned>(Ty->getIntegerBitWidth(32)) : 32u;
-  const int64_t SignedMin = -(int64_t{1} << (Bits - 1));
+  const int64_t SignedMinimum =
+      Bits == 64 ? std::numeric_limits<int64_t>::min()
+                 : -static_cast<int64_t>(uint64_t{1} << (Bits - 1U));
+  if ((Op == DIV || Op == MOD) && LV == SignedMinimum && RV == -1)
+    return Value::makeUndefForType(Ty);
+
+  uint64_t ResultRaw = 0;
   switch (Op) {
-  case ADD:
-    return ConstInt::newConstInt(
-        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) + RV, Bits));
-  case SUB:
-    return ConstInt::newConstInt(
-        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) - RV, Bits));
-  case MUL:
-    return ConstInt::newConstInt(
-        IRMath::normalizeSignedToWidth(static_cast<int64_t>(LV) * RV, Bits));
-  case DIV:
-    return (RV == 0 || (LV == SignedMin && RV == -1))
-               ? Value::makeUndefForType(Ty)
-               : static_cast<Value *>(ConstInt::newConstInt(LV / RV));
-  case UDIV:
-    return RV == 0
-               ? Value::makeUndefForType(Ty)
-               : static_cast<Value *>(ConstInt::newConstInt(
-                     static_cast<int32_t>(static_cast<uint32_t>(LV) /
-                                          static_cast<uint32_t>(RV))));
-  case MOD:
-    return (RV == 0 || (LV == SignedMin && RV == -1))
-               ? Value::makeUndefForType(Ty)
-               : static_cast<Value *>(ConstInt::newConstInt(LV % RV));
-  case UREM:
-    return RV == 0
-               ? Value::makeUndefForType(Ty)
-               : static_cast<Value *>(ConstInt::newConstInt(
-                     static_cast<int32_t>(static_cast<uint32_t>(LV) %
-                                          static_cast<uint32_t>(RV))));
-  case AND: return ConstInt::newConstInt(LV & RV);
-  case OR:  return ConstInt::newConstInt(LV | RV);
-  case XOR: return ConstInt::newConstInt(LV ^ RV);
-  default: return nullptr;
+  case ADD: ResultRaw = LRaw + RRaw; break;
+  case SUB: ResultRaw = LRaw - RRaw; break;
+  case MUL: ResultRaw = LRaw * RRaw; break;
+  case DIV: ResultRaw = static_cast<uint64_t>(LV / RV); break;
+  case UDIV: ResultRaw = LRaw / RRaw; break;
+  case MOD: ResultRaw = static_cast<uint64_t>(LV % RV); break;
+  case UREM: ResultRaw = LRaw % RRaw; break;
+  case AND: ResultRaw = LRaw & RRaw; break;
+  case OR: ResultRaw = LRaw | RRaw; break;
+  case XOR: ResultRaw = LRaw ^ RRaw; break;
+  case SHL:
+    if (RRaw >= Bits) return Value::makeUndefForType(Ty);
+    ResultRaw = LRaw << RRaw;
+    break;
+  case LSHR:
+    if (RRaw >= Bits) return Value::makeUndefForType(Ty);
+    ResultRaw = LRaw >> RRaw;
+    break;
+  case ASHR:
+    if (RRaw >= Bits) return Value::makeUndefForType(Ty);
+    ResultRaw = LRaw >> RRaw;
+    if (LV < 0 && RRaw != 0) {
+      const unsigned RemainingBits = Bits - static_cast<unsigned>(RRaw);
+      ResultRaw |= ~uint64_t{0} << RemainingBits;
+    }
+    break;
+  default:
+    return nullptr;
   }
+  ResultRaw &= WidthMask;
+
+  int64_t Result = 0;
+  std::memcpy(&Result, &ResultRaw, sizeof(Result));
+  Result = IRMath::normalizeSignedToWidth(Result, Bits);
+  return Value::makeIntegerForType(Result, Ty);
 }
 
 void BinaryInst::dumpIR(){
   Value::dumpIR();
-  TypeSystem tp = userList[0]->getValue()->getIRType()->getEnum();
+  TypeSystem tp = userList[0]->getValue()->getIRType()->getTypeSystem();
   std::cout << " = ";
   switch (op) {
   case BinaryInst::ADD:
@@ -2066,7 +2274,14 @@ bool CallInst::isNonVolatileMemcpy(const CallInst *CI) {
 }
 
 FPTOSIInst::FPTOSIInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::FPTOSI;}
-FPTOSIInst::FPTOSIInst(Value* v):Instruction(INTType::NewInt(4)){
+FPTOSIInst::FPTOSIInst(Value* v)
+    : FPTOSIInst(v, INTType::getInt32Ty()) {}
+FPTOSIInst::FPTOSIInst(
+    Value* v, std::shared_ptr<INTType> targetType)
+    : Instruction(std::move(targetType)) {
+    if (!v || !v->getIRType() || !v->getIRType()->isFloat() ||
+        !getIRType() || !getIRType()->isInt())
+      throw std::invalid_argument("fptosi 要求浮点源值和整数目标类型");
     addUse(v);
     instType = InstType::FPTOSI;
 }
@@ -2107,21 +2322,45 @@ SITOFPInst::SITOFPInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instT
 
 
 ZextInst::ZextInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::ZEXT;}
-ZextInst::ZextInst(Value* v):Instruction(INTType::NewInt(4)){
+ZextInst::ZextInst(Value* v)
+    : ZextInst(v, INTType::getInt32Ty()) {}
+ZextInst::ZextInst(Value* v, std::shared_ptr<INTType> targetType)
+    : Instruction(std::move(targetType)) {
+    auto sourceType =
+        v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+    auto destinationType =
+        std::dynamic_pointer_cast<INTType>(getIRType());
+    if (!sourceType || !destinationType ||
+        destinationType->getBitWidth() <= sourceType->getBitWidth())
+      throw std::invalid_argument("zext 要求目标整数位宽大于源位宽");
     addUse(v);
     instType = InstType::ZEXT;
 }
 void ZextInst::dumpIR(){
     Value::dumpIR();
-    std::cout << " = zext i1 ";
+    std::cout << " = zext ";
+    userList[0]->getValue()->getIRType()->toString();
+    std::cout << " ";
     userList[0]->getValue()->dumpIR();
-    std::cout << " to i32\n";
+    std::cout << " to ";
+    irtype->toString();
+    std::cout << "\n";
 
 }
 
 TruncInst::TruncInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::TRUNC;}
 
-TruncInst::TruncInst(Value* v):Instruction(INTType::NewBool()){
+TruncInst::TruncInst(Value* v)
+    : TruncInst(v, INTType::getBoolTy()) {}
+TruncInst::TruncInst(Value* v, std::shared_ptr<INTType> targetType)
+    : Instruction(std::move(targetType)) {
+  auto sourceType =
+      v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+  auto destinationType =
+      std::dynamic_pointer_cast<INTType>(getIRType());
+  if (!sourceType || !destinationType ||
+      destinationType->getBitWidth() >= sourceType->getBitWidth())
+    throw std::invalid_argument("trunc 要求目标整数位宽小于源位宽");
   addUse(v);
   instType = InstType::TRUNC;
 }
@@ -2139,7 +2378,17 @@ void TruncInst::dumpIR(){
 
 SextInst::SextInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::SEXT;}
 
-SextInst::SextInst(Value* v):Instruction(INTType::NewInt(4)){
+SextInst::SextInst(Value* v)
+    : SextInst(v, INTType::getInt32Ty()) {}
+SextInst::SextInst(Value* v, std::shared_ptr<INTType> targetType)
+    : Instruction(std::move(targetType)) {
+  auto sourceType =
+      v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+  auto destinationType =
+      std::dynamic_pointer_cast<INTType>(getIRType());
+  if (!sourceType || !destinationType ||
+      destinationType->getBitWidth() <= sourceType->getBitWidth())
+    throw std::invalid_argument("sext 要求目标整数位宽大于源位宽");
   addUse(v);
   instType = InstType::SEXT;
 }
@@ -2157,6 +2406,15 @@ void SextInst::dumpIR(){
 
 SelectInst::SelectInst(Value* cond,Value* isTrue,Value* isFalse)
   : Instruction(isTrue->getIRType()) {
+  auto ConditionType =
+      cond ? std::dynamic_pointer_cast<INTType>(cond->getIRType())
+           : nullptr;
+  if (!ConditionType || !ConditionType->getIsBool())
+    throw std::invalid_argument("select 条件必须是 i1");
+  if (!isTrue || !isFalse || !isTrue->getIRType() ||
+      !isFalse->getIRType() ||
+      !isTrue->getIRType()->hasSameShape(*isFalse->getIRType()))
+    throw std::invalid_argument("select 的两个候选值必须类型完全一致");
   instType = InstType::SELECT;
   addUse(cond);
   addUse(isTrue);
@@ -2195,11 +2453,16 @@ Instruction* SelectInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 }
 
 Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
+  if (!cond || !isTrue || !isFalse || !cond->getIRType() ||
+      !isTrue->getIRType() || !isFalse->getIRType())
+    return nullptr;
   // select 条件统一转换为 i1，非零整数、非零浮点数和非空指针均表示真。
-  if (cond->getIRType()->getEnum() != IR_INT || cond->getIRType() != INTType::NewBool()) {
-    switch (cond->getIRType()->getEnum()) {
+  if (!cond->getIRType()->isBool()) {
+    switch (cond->getIRType()->getTypeSystem()) {
     case IR_INT:
-      cond = genBinaryInst(cond, BinaryInst::NE, ConstInt::newConstInt(0));
+      cond = BasicBlock::genBinaryInst(
+          this, cond, BinaryInst::NE,
+          Value::makeZeroForType(cond->getIRType()));
       break;
     case IR_FLOAT:
       cond = genBinaryInst(cond, BinaryInst::NE, ConstFloat::newConstFloat(0.0f));
@@ -2212,19 +2475,40 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
       return nullptr;
     }
   }
+  if (!cond)
+    return nullptr;
 
-  // 两个候选值必须同型，整数与浮点数混用时将整数提升为浮点数。
-  if (isTrue->getIRType() != isFalse->getIRType()) {
-    auto tTy = isTrue->getIRType()->getEnum();
-    auto fTy = isFalse->getIRType()->getEnum();
+  // 两个候选值先做公共类型转换，再由构造器执行严格验证。
+  if (!isTrue->getIRType()->hasSameShape(*isFalse->getIRType())) {
+    auto tTy = isTrue->getIRType()->getTypeSystem();
+    auto fTy = isFalse->getIRType()->getTypeSystem();
     if (tTy == IR_INT && fTy == IR_FLOAT) {
-      isTrue = genSITOFPInst(isTrue);
+      isTrue = coerceValueToType(
+          this, isTrue, FLOATType::NewFloat());
     } else if (tTy == IR_FLOAT && fTy == IR_INT) {
-      isFalse = genSITOFPInst(isFalse);
+      isFalse = coerceValueToType(
+          this, isFalse, FLOATType::NewFloat());
+    } else if (tTy == IR_INT && fTy == IR_INT) {
+      auto TrueInteger =
+          std::dynamic_pointer_cast<INTType>(isTrue->getIRType());
+      auto FalseInteger =
+          std::dynamic_pointer_cast<INTType>(isFalse->getIRType());
+      if (!TrueInteger || !FalseInteger)
+        return nullptr;
+      auto CommonType = INTType::get(
+          std::max(TrueInteger->getBitWidth(),
+                   FalseInteger->getBitWidth()));
+      isTrue = coerceValueToType(this, isTrue, CommonType);
+      isFalse = coerceValueToType(this, isFalse, CommonType);
+    } else if (tTy == IR_POINTER && fTy == IR_POINTER) {
+      isFalse =
+          coerceValueToType(this, isFalse, isTrue->getIRType());
     } else {
       return nullptr;
     }
   }
+  if (!isTrue || !isFalse)
+    return nullptr;
 
   auto *inst = new SelectInst(cond, isTrue, isFalse);
   pushBack(inst);
@@ -2237,18 +2521,24 @@ bool Variable::isGlobal(){
     else return true;
 }
 
-Variable::Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident):User(vt == Param ? irtype : POINTERType::NewPointer(irtype)),vartag(vt){
+Variable::Variable(VarTag variableTag,
+                   std::shared_ptr<IRType> objectType,
+                   std::string sourceName)
+    : User(variableTag == Param
+               ? objectType
+               : POINTERType::NewPointer(std::move(objectType))),
+      vartag(variableTag) {
     // 形参按值表示；全局变量和常量以指针类型表示其存储对象。
-    // 非形参对象在构造时登记到模块，全局变量同时注册源级名称。
-    if(vt == Param) return;
-    else if(vt == GlobalVariable){
-        this->ident =  ".G." + ident;
-        ModuleIR->getSymbolTable().registerSymbolTable(ident,this);
+    // 非形参对象只移交模块所有权，不再修改 IRGenerator 的源码符号环境。
+    if (variableTag == Param)
+        return;
+    if (variableTag == GlobalVariable) {
+        this->ident = ".G." + sourceName;
+    } else {
+        // 匿名常量保留 Value 已分配的唯一编号；具名常量随后由 IRGenerator 改名。
+        this->ident = ".C." + this->ident;
     }
-    else{
-        this->ident = ".C."+ this->ident;
-    }
-    ModuleIR->getGlobalVar().emplace_back(std::unique_ptr<Variable>(this));
+    ModuleIR->getGlobalVar().emplace_back(this);
 }
 
 bool Variable::isParam(){
@@ -2320,37 +2610,40 @@ Value *Variable::getConstantElement(Variable *Source,
 
 Initializer::Initializer(std::shared_ptr<IRType> irtype):Value(irtype){}
 
-void Initializer::var2Store(BasicBlock *bb, const std::string &name, std::vector<int> &gepData) {
-    // 深度优先遍历聚合初始值，gepData 始终保存当前叶元素的完整索引路径。
-    for (int i = 0; i < this->size(); i++) {
-        auto &handle = (*this)[i];
-        gepData.push_back(i);
+void Initializer::var2Store(BasicBlock *basicBlock, Value *destination,
+                            std::vector<int> &elementIndices) {
+    if (!basicBlock || !destination)
+        return;
 
-        if (auto inits = dynamic_cast<Initializer *>(handle)) {
-            inits->var2Store(bb, name, gepData);
+    // 深度优先遍历聚合值，elementIndices 始终保存当前叶元素的完整路径。
+    for (std::size_t elementIndex = 0; elementIndex < size();
+         ++elementIndex) {
+        Value *&element = (*this)[elementIndex];
+        elementIndices.push_back(static_cast<int>(elementIndex));
+
+        if (auto *nestedInitializer = dynamic_cast<Initializer *>(element)) {
+            nestedInitializer->var2Store(
+                basicBlock, destination, elementIndices);
         } else {
-            if (!handle->isConst()) {
+            if (element && !element->isConst()) {
                 // 对动态叶元素构造完整 GEP 路径，重算结果类型后再生成 Store。
-                auto gep = dynamic_cast<GetElementPtrInst *>(
-                    bb->genGepInst(ModuleIR->getSymbolTable().getValueByName(name)));
+                auto *elementAddress = dynamic_cast<GetElementPtrInst *>(
+                    basicBlock->genGepInst(destination));
 
-                gep->addUse(ConstInt::newConstInt(0));
+                elementAddress->addUse(ConstInt::newConstInt(0));
 
-                for (auto &j : gepData)
-                    gep->addUse(ConstInt::newConstInt(j));
+                for (int index : elementIndices)
+                    elementAddress->addUse(ConstInt::newConstInt(index));
 
-                gep->updateType();
+                elementAddress->updateType();
 
-                bb->genStoreInst(handle, gep);
+                basicBlock->genStoreInst(element, elementAddress);
 
                 // 动态值写回后，用同类型零值替换常量模板中的占位。
-                if (handle->getIRType()->getEnum() == IR_INT)
-                    handle = ConstInt::newConstInt();
-                else
-                    handle = ConstFloat::newConstFloat();
+                element = Value::makeZeroForType(element->getIRType());
             }
         }
-        gepData.pop_back();
+        elementIndices.pop_back();
     }
 }
 
@@ -2405,7 +2698,7 @@ void Initializer::dumpIR(){
 ConstantSystem::ConstantSystem(std::shared_ptr<IRType> irtype):Value(irtype){}
 
 
-ConstBool::ConstBool(bool val):ConstantSystem(INTType::NewBool()),val(val){
+ConstBool::ConstBool(bool val):ConstantSystem(INTType::getBoolTy()),val(val){
     if (val)
     ident = "true";
     else
@@ -2423,21 +2716,32 @@ ConstBool* ConstBool::newConstBool(bool val){
     return &falseConst;
 }
 
-ConstInt::ConstInt(int val):ConstantSystem(INTType::NewInt(4)),val(val){
-    ident = std::to_string(val);
-}
-ConstInt::ConstInt(int val, size_t size):ConstantSystem(INTType::NewInt(size)),val(val){
+ConstInt::ConstInt(int64_t val, std::shared_ptr<INTType> type)
+    : ConstantSystem(std::move(type)), val(val) {
     ident = std::to_string(val);
 }
 
-int ConstInt::getVal() const {return val;}
+int64_t ConstInt::getVal() const {return val;}
 
-ConstInt* ConstInt::newConstInt(int val, size_t size){
-  static std::map<std::pair<int, size_t>, ConstInt*> intConstMap;
-  auto key = std::make_pair(val, size);
-  if (intConstMap.find(key) == intConstMap.end())
-    intConstMap[key] = (size == 4) ? new ConstInt(val) : new ConstInt(val, size);
-  return intConstMap[key];
+ConstInt* ConstInt::newConstInt(int64_t val, size_t size){
+  if (size == 0 || size > static_cast<size_t>(UINT32_MAX / 8U))
+    throw std::invalid_argument("invalid integer storage size");
+  return newConstIntForType(
+      val, INTType::get(static_cast<unsigned>(size * 8U)));
+}
+
+ConstInt* ConstInt::newConstIntForType(
+    int64_t val, const std::shared_ptr<INTType> &type) {
+  if (!type || type->getIsBool())
+    throw std::invalid_argument("ConstInt 需要非 i1 整数类型");
+  val = IRMath::normalizeSignedToWidth(val, type->getBitWidth());
+  using Key = std::pair<int64_t, unsigned>;
+  static std::map<Key, ConstInt*> intConstMap;
+  const Key key{val, type->getBitWidth()};
+  auto &constant = intConstMap[key];
+  if (!constant)
+    constant = new ConstInt(val, type);
+  return constant;
 }
 
 ConstFloat::ConstFloat(float val):ConstantSystem(FLOATType::NewFloat()),val(val){
@@ -2468,8 +2772,13 @@ float ConstFloat::getVal() const {return val;}
  ConstPtr::ConstPtr(std::shared_ptr<IRType> irtype):ConstantSystem(irtype){}
 
 ConstPtr* ConstPtr::newConstPtr(std::shared_ptr<IRType> irtype){
-    static ConstPtr *constPtr = new ConstPtr(irtype);
-    return constPtr;
+    if (!irtype || !irtype->isPointer())
+      throw std::invalid_argument("空指针常量需要指针类型");
+    static std::map<std::shared_ptr<IRType>, ConstPtr *> NullPointers;
+    auto &Constant = NullPointers[irtype];
+    if (!Constant)
+      Constant = new ConstPtr(std::move(irtype));
+    return Constant;
 }
 
 UndefValue::UndefValue(std::shared_ptr<IRType> irtype):ConstantSystem(irtype){ident="undef";}
@@ -2499,6 +2808,48 @@ void BitCastInst::dumpIR() {
     std::cout << "\n";
 }
 
+PtrToIntInst::PtrToIntInst(
+    Value *v, std::shared_ptr<INTType> targetType)
+    : Instruction(std::move(targetType)) {
+    if (!v || !v->getIRType() || !v->getIRType()->isPointer() ||
+        !getIRType() || !getIRType()->isInt())
+      throw std::invalid_argument("ptrtoint 要求指针源值和整数目标类型");
+    instType = InstType::PTRTOINT;
+    addUse(v);
+}
+
+void PtrToIntInst::dumpIR() {
+    Value::dumpIR();
+    std::cout << " = ptrtoint ";
+    getOperand(0)->getIRType()->toString();
+    std::cout << " ";
+    getOperand(0)->dumpIR();
+    std::cout << " to ";
+    getIRType()->toString();
+    std::cout << "\n";
+}
+
+IntToPtrInst::IntToPtrInst(
+    Value *v, std::shared_ptr<POINTERType> targetType)
+    : Instruction(std::move(targetType)) {
+    if (!v || !v->getIRType() || !v->getIRType()->isInt() ||
+        !getIRType() || !getIRType()->isPointer())
+      throw std::invalid_argument("inttoptr 要求整数源值和指针目标类型");
+    instType = InstType::INTTOPTR;
+    addUse(v);
+}
+
+void IntToPtrInst::dumpIR() {
+    Value::dumpIR();
+    std::cout << " = inttoptr ";
+    getOperand(0)->getIRType()->toString();
+    std::cout << " ";
+    getOperand(0)->dumpIR();
+    std::cout << " to ";
+    getIRType()->toString();
+    std::cout << "\n";
+}
+
 // 创建位转换指令并追加到当前基本块。
 Value* BasicBlock::genBitCastInst(Value* v, std::shared_ptr<IRType> targetType) {
     auto inst = new BitCastInst(v, targetType);
@@ -2506,11 +2857,28 @@ Value* BasicBlock::genBitCastInst(Value* v, std::shared_ptr<IRType> targetType) 
     return inst;
 }
 
+Value* BasicBlock::genPtrToIntInst(
+    Value* v, std::shared_ptr<INTType> targetType) {
+    auto *Inst = new PtrToIntInst(v, std::move(targetType));
+    pushBack(Inst);
+    return Inst;
+}
+
+Value* BasicBlock::genIntToPtrInst(
+    Value* v, std::shared_ptr<POINTERType> targetType) {
+    auto *Inst = new IntToPtrInst(v, std::move(targetType));
+    pushBack(Inst);
+    return Inst;
+}
+
 PhiInst::PhiInst(std::shared_ptr<IRType> irtype) : Instruction(irtype) {
     instType = InstType::PHI;
 }
 
 void PhiInst::addIncoming(Value* val, BasicBlock* bb) {
+    if (!val || !bb || !val->getIRType() || !getIRType() ||
+        !val->getIRType()->hasSameShape(*getIRType()))
+      throw std::invalid_argument("phi 输入值必须与结果类型完全一致");
     addUse(val);
     addUse(bb);
 }
@@ -2530,6 +2898,9 @@ BasicBlock *PhiInst::getIncomingBlock(unsigned i) const {
 
 void PhiInst::setIncomingValue(unsigned i, Value* val) {
     if (!val || i >= getNumIncomingValues()) return;
+    if (!val->getIRType() || !getIRType() ||
+        !val->getIRType()->hasSameShape(*getIRType()))
+      throw std::invalid_argument("phi 替换值必须与结果类型完全一致");
     replaceOperand(i * 2, val);
 }
 
@@ -2659,7 +3030,9 @@ Instruction* CallInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 
 Instruction* FPTOSIInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
-    return new FPTOSIInst(remapVal(userList[0]->getValue(), VMap));
+    return new FPTOSIInst(
+        remapVal(userList[0]->getValue(), VMap),
+        std::dynamic_pointer_cast<INTType>(getIRType()));
 }
 
 Instruction* SITOFPInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
@@ -2669,26 +3042,44 @@ Instruction* SITOFPInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 
 Instruction* ZextInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
-    return new ZextInst(remapVal(userList[0]->getValue(), VMap));
+    return new ZextInst(
+        remapVal(userList[0]->getValue(), VMap),
+        std::dynamic_pointer_cast<INTType>(getIRType()));
 }
 
 Instruction* TruncInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
   if (userList.size() != 1) return nullptr;
-  auto *NewTrunc = new TruncInst(this->getIRType());
-  NewTrunc->addUse(remapVal(userList[0]->getValue(), VMap));
-  return NewTrunc;
+  return new TruncInst(
+      remapVal(userList[0]->getValue(), VMap),
+      std::dynamic_pointer_cast<INTType>(getIRType()));
 }
 
 Instruction* SextInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
   if (userList.size() != 1) return nullptr;
-  auto *NewSext = new SextInst(this->getIRType());
-  NewSext->addUse(remapVal(userList[0]->getValue(), VMap));
-  return NewSext;
+  return new SextInst(
+      remapVal(userList[0]->getValue(), VMap),
+      std::dynamic_pointer_cast<INTType>(getIRType()));
 }
 
 Instruction* BitCastInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
     return new BitCastInst(remapVal(userList[0]->getValue(), VMap), this->getIRType());
+}
+
+Instruction* PtrToIntInst::clone(
+    const std::unordered_map<Value*, Value*>& VMap) {
+    if (userList.size() != 1) return nullptr;
+    return new PtrToIntInst(
+        remapVal(userList[0]->getValue(), VMap),
+        std::dynamic_pointer_cast<INTType>(getIRType()));
+}
+
+Instruction* IntToPtrInst::clone(
+    const std::unordered_map<Value*, Value*>& VMap) {
+    if (userList.size() != 1) return nullptr;
+    return new IntToPtrInst(
+        remapVal(userList[0]->getValue(), VMap),
+        std::dynamic_pointer_cast<POINTERType>(getIRType()));
 }
 
 Instruction* PhiInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
@@ -2748,6 +3139,12 @@ std::vector<PhiInst::IncomingEdge> PhiInst::collectIncomingEdges() {
 
 bool PhiInst::rebuildFromIncoming(PhiInst *Phi, const std::vector<IncomingEdge> &Incoming) {
   if (!Phi) return false;
+  for (const auto &Entry : Incoming) {
+    if (!Entry.V || !Entry.Pred || !Entry.V->getIRType() ||
+        !Phi->getIRType() ||
+        !Entry.V->getIRType()->hasSameShape(*Phi->getIRType()))
+      return false;
+  }
 
   // 无入边时折叠为未定义值，单入边时折叠为唯一输入，多入边时重建 PHI。
   if (Incoming.empty()) {
@@ -2919,7 +3316,7 @@ void BasicBlock::eraseBlockSafely() {
   // 删块前先用同类型未定义值承接外部引用，再清空指令和块对象。
   for (Instruction *I : *this) {
     if (!I) continue;
-    if (!I->getIRType() || I->getIRType()->getEnum() == IR_VOID) continue;
+    if (!I->getIRType() || I->getIRType()->getTypeSystem() == IR_VOID) continue;
     if (I->hasUses()) {
       I->replaceAllUsesWith(UndefValue::NewUndefValue(I->getIRType()));
     }

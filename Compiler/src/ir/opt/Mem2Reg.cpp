@@ -37,16 +37,12 @@ unsigned BlockInfo::getInstIndex(const Instruction* I){
 void BlockInfo::deleteIndex(const Instruction* I){InstNum.erase(I);}
 
 bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
-    auto ptrType = std::dynamic_pointer_cast<POINTERType>(
-        const_cast<AllocaInst*>(AI)->getIRType());
-    if (!ptrType) return false;
-
-    auto pointeeType = ptrType->getPointerType();
+    auto pointeeType =
+        IRType::getPointeeType(AI ? AI->getIRType() : nullptr);
     if (!pointeeType) return false;
 
     // 只提升标量局部对象；数组和 void 对象不进入 Mem2Reg。
-    auto pointeeEnum = pointeeType->getEnum();
-    if (pointeeEnum == IR_ARRAY || pointeeEnum == IR_VOID) {
+    if (pointeeType->isArray() || pointeeType->isVoid()) {
         return false;
     }
 
@@ -400,8 +396,8 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 
     for (unsigned i = 0; i < Allocas.size(); ++i) {
         AllocaInst* AI = Allocas[i];
-        auto ptrType = std::dynamic_pointer_cast<POINTERType>(AI->getIRType());
-        std::shared_ptr<IRType> allocType = ptrType->getPointerType();
+        std::shared_ptr<IRType> allocType =
+            IRType::getPointeeType(AI->getIRType());
 
         // 计算 live-in blocks
         std::set<BasicBlock*> LiveInBlocks;
@@ -423,8 +419,9 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     std::vector<std::stack<Value*>> IncomingVals(numAllocas);
 
     for(unsigned i = 0; i < numAllocas; ++i){
-        auto ptrType = std::dynamic_pointer_cast<POINTERType>(Allocas[i]->getIRType());
-        IncomingVals[i].push(UndefValue::NewUndefValue(ptrType->getPointerType()));
+        auto AllocType =
+            IRType::getPointeeType(Allocas[i]->getIRType());
+        IncomingVals[i].push(UndefValue::NewUndefValue(AllocType));
     }
 
     std::stack<Mem2RegRenameFrame> renameStack;

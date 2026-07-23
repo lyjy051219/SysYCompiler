@@ -1,6 +1,5 @@
 #pragma once
 #include "Tool.hpp"
-#include "SymbolTable.hpp"
 #include <memory>
 #include <vector>
 #include <string>
@@ -50,7 +49,7 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
         ICMP,FCMP,
         SHL,LSHR,ASHR,
         SELECT,PHI,CALL,
-        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,BITCAST
+        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,BITCAST,PTRTOINT,INTTOPTR
     };
     InstType instType;
     public:
@@ -75,7 +74,9 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     Value *getUnaryOperand() const;
     static Value *getUnaryOperand(const Instruction *I);
     // 对支持的常量类型转换直接折叠，操作数或转换不受支持时返回空指针。
-    static Value *foldConstantCast(InstType CastType, Value *Operand);
+    static Value *foldConstantCast(
+        InstType CastType, Value *Operand,
+        const std::shared_ptr<IRType> &ResultType = nullptr);
 
     // 按值映射复制指令；无法构造合法副本时返回空指针。
     virtual Instruction* clone(const std::unordered_map<Value*, Value*>&) { return nullptr; }
@@ -123,23 +124,26 @@ class BinaryInst : public Instruction{
 };
 
 
-// 模块对应 AST 中的编译单元，统一拥有函数、全局变量和符号表。
+// 模块对应 AST 中的编译单元，只负责拥有和组织 IR 对象。
 class Module final{
     private:
     std::vector<std::unique_ptr<Function>> functions;
     std::vector<std::unique_ptr<Variable>> globalvars;
-    SymbolTable symbolTable;
     std::set<std::string> declaredBuiltins;
     public:
     Module()=default;
-    // 创建函数并同时完成符号注册和模块所有权接管。
-    Function& newFunction(TypeSystem ts,std::string ident);
-    // 接管已创建函数的所有权并注册其符号。
-    void pushFunction(Function* func);
+    // 创建函数并由模块接管其所有权。
+    Function& newFunction(TypeSystem returnType, std::string functionName);
+    Function& newFunction(std::shared_ptr<IRType> returnType,
+                          std::string functionName);
+    // 接管已创建函数的所有权。
+    void pushFunction(Function* function);
     std::vector<std::unique_ptr<Function>>& getFunctions();
     // 从模块中删除指定函数及其所有内容。
     void deleteFunction(Function*ptr);
     Function* getMainFunction();
+    // 扫描当前函数所有权容器，避免函数删除后留下悬空名称索引。
+    Function* findFunctionByName(const std::string &functionName) const;
     static Module* getActiveModule();
     // 构建仅包含直接调用的函数调用图，重复调用保留重复边。
     FunctionCallGraph buildDirectCallGraph() const;
@@ -147,9 +151,8 @@ class Module final{
     static std::unordered_set<Function *> collectReachableFunctions(
         Function *Entry, const FunctionCallGraph &CallGraph);
     // 将全局变量加入模块并接管所有权。
-    void pushGlobalVar(Variable* ptr);
+    void pushGlobalVar(Variable* globalVariable);
     std::vector<std::unique_ptr<Variable>>& getGlobalVar();
-    SymbolTable& getSymbolTable();
     // 按全局变量、函数的顺序输出整个模块的 LLVM IR。
     void dumpIR();
     // 生成当前模块中未被占用的函数名后缀。
@@ -167,7 +170,8 @@ class Initializer : public Value,public std::vector<Value*>{
     Initializer(std::shared_ptr<IRType> irtype);
     void dumpIR();
     // 递归找出动态元素，按索引路径生成 GEP 和 Store，并将常量模板中的对应元素置零。
-    void var2Store(BasicBlock *bb, const std::string &name,std::vector<int> &gepData);
+    void var2Store(BasicBlock *basicBlock, Value *destination,
+                   std::vector<int> &elementIndices);
 };
 
 class Variable : public User{
@@ -188,26 +192,28 @@ class Variable : public User{
     static Value *getConstantElement(Variable *Source,
                                      const std::vector<int> &Path);
 
-    Variable(VarTag vt,std::shared_ptr<IRType> irtype,std::string ident);
+    Variable(VarTag variableTag, std::shared_ptr<IRType> objectType,
+             std::string sourceName);
     void dumpIR();
     Value* getUsee();
 };
 
 class Function : public Value, public ChainList<Function,BasicBlock>{
     private:
-    // 保存 IR 形参值；函数入口块中的形参槽位由 pushParam 同步建立。
+    // 保存 IR 形参值；需要地址语义的形参由 pushParamWithStackSlot 建立入口槽位。
     std::vector<std::unique_ptr<Value>> params;
     public:
     int blockNum =0;
     // 按返回类型和名称创建函数，并自动建立入口基本块。
     Function(TypeSystem ts,std::string ident);
+    Function(std::shared_ptr<IRType> returnType, std::string ident);
     // 将基本块加入函数的侵入式块链表。
     void pushBlock(BasicBlock*);
     // 使新块无条件跳向 curr，再将新块加入函数。
     void insertBlock(BasicBlock* curr,BasicBlock* insert);
-    // 接管形参，并在需要时于入口块建立槽位和 Store。
-    void pushParam(std::string ident,Variable* v);
-    void pushParam(Variable* v);
+    // 接管形参，在入口块建立槽位和 Store，并将槽位返回给 IRGenerator。
+    AllocaInst* pushParamWithStackSlot(Variable* parameterValue);
+    void pushParam(Variable* parameterValue);
     std::vector<std::unique_ptr<Value>>& getParams();
     const std::vector<std::unique_ptr<Value>>& getParams() const;
     size_t getParamCount() const;
@@ -235,8 +241,21 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
 class BuildInFunction : public Value{
     BuildInFunction(std::shared_ptr<IRType>,std::string ident);
     public:
+    struct Signature {
+        std::shared_ptr<IRType> returnType;
+        std::vector<std::shared_ptr<IRType>> parameterTypes;
+        std::vector<bool> opaquePointerParameters;
+        bool variadic = false;
+    };
+
     // 按名称返回已驻留的内建函数对象。
     static BuildInFunction* genBuildInFunction(std::string);
+    // 内建签名全部由真实 IR 类型对象构造；空结果表示名称不受支持。
+    static std::optional<Signature>
+    getSignature(const std::string &Name);
+    // 输出单个或整套默认运行库声明。
+    static bool dumpDeclaration(const std::string &Name);
+    static void dumpDefaultDeclarations();
     static bool isSupportedName(const std::string &Name);
     static bool isKnownRuntimeName(const std::string &Name);
     static bool isMemcpyName(const std::string &Name);
@@ -308,7 +327,7 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     void genUnCondInst(BasicBlock* block);
 
     // 在函数入口块生成栈分配：%x = alloca i32。
-    AllocaInst* genAllocaInst(std::shared_ptr<IRType> irtype,std::string ident);
+    AllocaInst* genAllocaInst(std::shared_ptr<IRType> allocatedType);
     // 生成内存读取：%val = load i32, i32* %ptr。
     Value* genLoadInst(Value* v);
     // 生成内存写入：store i32 20, i32* %ptr。
@@ -323,11 +342,19 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     // 生成标量转换、函数调用和选择指令。
     Value* genSITOFPInst(Value* x);
     Value* genFPTOSIInst(Value* x);
+    Value* genFPTOSIInst(Value* x, std::shared_ptr<INTType> targetType);
     Value* genCallInst(std::string ident,std::vector<Value*> params);
     Value* genZextInst(Value* x);
+    Value* genZextInst(Value* x, std::shared_ptr<INTType> targetType);
     Value* genTruncInst(Value* x);
+    Value* genTruncInst(Value* x, std::shared_ptr<INTType> targetType);
     Value* genSextInst(Value* x);
+    Value* genSextInst(Value* x, std::shared_ptr<INTType> targetType);
     Value* genBitCastInst(Value* v, std::shared_ptr<IRType> targetType);
+    Value* genPtrToIntInst(Value* v,
+                           std::shared_ptr<INTType> targetType);
+    Value* genIntToPtrInst(Value* v,
+                           std::shared_ptr<POINTERType> targetType);
     Value* genSelectInst(Value* cond, Value* isTrue, Value* isFalse);
     // 在同一函数中创建新基本块并维护指令插入位置。
     BasicBlock* genBlock();
@@ -502,6 +529,7 @@ class CallInst : public Instruction{
 class FPTOSIInst : public Instruction{
     public:
     FPTOSIInst(Value* v);
+    FPTOSIInst(Value* v, std::shared_ptr<INTType> targetType);
     FPTOSIInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -521,6 +549,7 @@ class SITOFPInst : public Instruction{
 class ZextInst : public Instruction{
     public:
     ZextInst(Value* v);
+    ZextInst(Value* v, std::shared_ptr<INTType> targetType);
     ZextInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -530,6 +559,7 @@ class ZextInst : public Instruction{
 class TruncInst : public Instruction{
     public:
     TruncInst(Value* v);
+    TruncInst(Value* v, std::shared_ptr<INTType> targetType);
     TruncInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -539,6 +569,7 @@ class TruncInst : public Instruction{
 class SextInst : public Instruction{
     public:
     SextInst(Value* v);
+    SextInst(Value* v, std::shared_ptr<INTType> targetType);
     SextInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
@@ -602,6 +633,24 @@ public:
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
+// 指针到整数转换保留地址位模式，整数位宽由调用方显式指定。
+class PtrToIntInst : public Instruction {
+public:
+    PtrToIntInst(Value *v, std::shared_ptr<INTType> targetType);
+    void dumpIR() override;
+    Instruction *clone(
+        const std::unordered_map<Value *, Value *> &VMap) override;
+};
+
+// 整数到指针转换按目标指针类型重新解释地址位模式。
+class IntToPtrInst : public Instruction {
+public:
+    IntToPtrInst(Value *v, std::shared_ptr<POINTERType> targetType);
+    void dumpIR() override;
+    Instruction *clone(
+        const std::unordered_map<Value *, Value *> &VMap) override;
+};
+
 
 // 常量对象通过各子类工厂创建，并在实现允许时复用已有实例。
 class ConstantSystem : public Value{
@@ -625,13 +674,15 @@ class ConstBool : public ConstantSystem{
 
  class ConstInt : public ConstantSystem{
     private:
-    int val;
-    ConstInt(int val);
-    ConstInt(int val, size_t size);
+    int64_t val;
+    ConstInt(int64_t val, std::shared_ptr<INTType> type);
     public:
-    int getVal() const;
+    int64_t getVal() const;
     // 按整数值和存储字节数返回驻留常量。
-     static ConstInt* newConstInt(int val = 0, size_t size = 4);
+    static ConstInt* newConstInt(int64_t val = 0, size_t size = 4);
+    // 新代码使用显式整数类型，避免把字节数误当成位宽。
+    static ConstInt* newConstIntForType(
+        int64_t val, const std::shared_ptr<INTType> &type);
  };
 
  class ConstFloat : public ConstantSystem{

@@ -24,7 +24,7 @@ PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassMana
 	auto *UnifiedExit = new BasicBlock();
 	F.pushBlock(UnifiedExit);
 
-	const bool isVoidRet = (F.getIRType()->getEnum() == IR_VOID);
+	const bool isVoidRet = F.getIRType()->isVoid();
 	PhiInst *retPhi = nullptr;
 
 	if (isVoidRet) {

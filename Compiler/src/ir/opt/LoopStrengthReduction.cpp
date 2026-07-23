@@ -70,20 +70,16 @@ int LoopStrengthReductionPass::estimateMaterializeCost(const SCEVExpr *E, const 
 }
 
 Value *LoopStrengthReductionPass::makeSCEVConstant(int64_t V, const SCEVExpr *E) {
-    if (V < std::numeric_limits<int>::min() ||
-        V > std::numeric_limits<int>::max()) {
+    auto IntegerType =
+        E && E->Ty
+            ? std::dynamic_pointer_cast<INTType>(E->Ty)
+            : INTType::getInt32Ty();
+    if (IntegerType && IntegerType->getIsBool()) {
+        return ConstBool::newConstBool(V != 0);
+    }
+    if (!IntegerType || IntegerType->getBitWidth() > 64)
         return nullptr;
-    }
-
-    int IntValue = static_cast<int>(V);
-    if (E && E->Ty && E->Ty->getEnum() == IR_INT &&
-        E->Ty == INTType::NewBool()) {
-        return ConstBool::newConstBool(IntValue != 0);
-    }
-
-    size_t Size = 4;
-    if (E && E->Ty && E->Ty->getEnum() == IR_INT) Size = E->Ty->getSize();
-    return ConstInt::newConstInt(IntValue, Size);
+    return ConstInt::newConstIntForType(V, IntegerType);
 }
 
 Value *LoopStrengthReductionPass::materializeSCEVAtPreheader(const SCEVExpr *E, const Loop *L,
@@ -223,9 +219,8 @@ bool LoopStrengthReductionPass::collectAddressGEPFamily(
 
 bool LoopStrengthReductionPass::isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
     if (NumIndices != 1 || !Base) return false;
-    auto PtrTy = std::dynamic_pointer_cast<POINTERType>(Base->getIRType());
-    return PtrTy && PtrTy->getPointerType() &&
-           PtrTy->getPointerType()->getEnum() == IR_ARRAY;
+    auto PointeeTy = IRType::getPointeeType(Base->getIRType());
+    return PointeeTy && PointeeTy->isArray();
 }
 
 bool LoopStrengthReductionPass::matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVResult &SE,

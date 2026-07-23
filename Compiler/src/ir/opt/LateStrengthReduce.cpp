@@ -148,6 +148,11 @@ bool LateStrengthReducePass::reduceFunction(Function &F) {
         if (!LHS->getIRType() || !LHS->getIRType()->isInt() ||
             !RHS->getIRType() || !RHS->getIRType()->isInt())
             continue;
+        // 该强度削弱的符号位判断和立即数成本模型仍是 i32 专用。
+        // i8/i64 保留原除余指令，由对应后端直接合法化。
+        if (LHS->integerBitWidth(0) != 32 ||
+            RHS->integerBitWidth(0) != 32)
+            continue;
 
         int32_t Divisor = 0;
         if (!RHS->tryGetIntConst(Divisor)) continue;

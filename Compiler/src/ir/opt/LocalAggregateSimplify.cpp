@@ -90,17 +90,16 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
             PointerIndex != 0)
             return false;
 
+        std::vector<int> RelativePath;
         for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
             int Index = 0;
             if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
                 return false;
-            auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-            if (!ArrayTy || Index < 0 ||
-                Index >= ArrayTy->getElementCount())
-                return false;
-            Path.push_back(Index);
-            Ty = ArrayTy->getElementType();
+            RelativePath.push_back(Index);
         }
+        Ty = IRType::resolveArrayElementType(Ty, RelativePath);
+        if (!Ty) return false;
+        Path.insert(Path.end(), RelativePath.begin(), RelativePath.end());
     }
     PointeeTy = Ty;
     return !Path.empty() && PointeeTy && IRType::isScalar(PointeeTy);
@@ -141,7 +140,9 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
                                        isWholeProgramReadOnlyVariable(Root));
             if (!ReadOnly) continue;
             Value *Constant = Root->getConstantElement(Path);
-            if (Constant && Value::hasSameStorageType(Load, Constant))
+            if (Constant &&
+                IRType::hasSameShape(Load->getIRType(),
+                                     Constant->getIRType()))
                 Replacements.push_back({Load, Constant});
             continue;
         }
@@ -195,7 +196,10 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
             IndexRange.max >= Count)
             continue;
         Value *One = Value::makeIntegerLike(Index, 1);
-        if (!One || !Value::hasSameStorageType(Load, One)) continue;
+        if (!One ||
+            !IRType::hasSameShape(Load->getIRType(),
+                                  One->getIRType()))
+            continue;
         auto *Shift = new BinaryInst(One, BinaryInst::SHL, Index);
         if (!Load->insertBefore(Shift)) {
             delete Shift;
@@ -285,15 +289,11 @@ bool LocalAggregateSimplifyPass::getDirectConstantPath(
         int Index = 0;
         if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
             return false;
-        auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-        if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
-            return false;
         Path.push_back(Index);
-        Ty = ArrTy->getElementType();
     }
 
     if (Path.empty()) return false;
-    PointeeTy = Ty;
+    PointeeTy = IRType::resolveArrayElementType(Ty, Path);
     return PointeeTy != nullptr;
 }
 
@@ -321,23 +321,20 @@ bool LocalAggregateSimplifyPass::appendConstantAggregateGEPPath(
         FirstIndex != 0)
         return false;
 
-    std::shared_ptr<IRType> Ty = Value::getPointeeType(Base);
-    if (!Ty || Ty->getEnum() != IR_ARRAY) return false;
-
-    NewPath = BasePath;
+    std::vector<int> RelativePath;
     for (size_t I = 1; I < GEP->getNumIndices(); ++I) {
         int Index = 0;
         if (!Value::tryGetIntIndex(GEP->getIndex(I), Index))
             return false;
-        auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(Ty);
-        if (!ArrTy || Index < 0 || Index >= ArrTy->getElementCount())
-            return false;
-        NewPath.push_back(Index);
-        Ty = ArrTy->getElementType();
+        RelativePath.push_back(Index);
     }
 
-    PointeeTy = Ty;
-    return PointeeTy != nullptr;
+    PointeeTy = IRType::resolveArrayElementType(
+        Value::getPointeeType(Base), RelativePath);
+    if (!PointeeTy) return false;
+    NewPath = BasePath;
+    NewPath.insert(NewPath.end(), RelativePath.begin(), RelativePath.end());
+    return true;
 }
 
 bool LocalAggregateSimplifyPass::getDirectOneDimElementIndex(
@@ -357,7 +354,7 @@ bool LocalAggregateSimplifyPass::getDirectOneDimElementIndex(
 
     Index = GEP->getIndex(1);
     return Index && Index->getIRType() &&
-           Index->getIRType()->getEnum() == IR_INT;
+           Index->getIRType()->isInt();
 }
 
 bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
@@ -370,14 +367,10 @@ bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
     if (!Value::tryGetIntIndex(GEP->getIndex(0), Offset))
         return false;
 
-    auto BasePtr = std::dynamic_pointer_cast<POINTERType>(Base->getIRType());
-    auto GEPPtr = std::dynamic_pointer_cast<POINTERType>(GEP->getIRType());
-    return BasePtr && GEPPtr && BasePtr->getPointerType() &&
-           GEPPtr->getPointerType() &&
-           IRType::isScalar(BasePtr->getPointerType()) &&
-           IRType::isScalar(GEPPtr->getPointerType()) &&
-           BasePtr->getPointerType()->hasSameScalarType(
-               *GEPPtr->getPointerType());
+    auto BaseTy = IRType::getPointeeType(Base->getIRType());
+    auto GEPTy = IRType::getPointeeType(GEP->getIRType());
+    return IRType::isScalar(BaseTy) && IRType::isScalar(GEPTy) &&
+           IRType::hasSameScalarType(BaseTy, GEPTy);
 }
 
 bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
@@ -406,14 +399,9 @@ bool LocalAggregateSimplifyPass::isWholeConstantCopy(
         return false;
 
     auto *ByteCount = dynamic_cast<ConstInt *>(CI->getArg(2));
-    auto DestPtr =
-        std::dynamic_pointer_cast<POINTERType>(Destination->getIRType());
-    auto SourcePtr =
-        std::dynamic_pointer_cast<POINTERType>(Source->getIRType());
-    if (!ByteCount || !DestPtr || !SourcePtr) return false;
-
-    auto DestTy = DestPtr->getPointerType();
-    auto SourceTy = SourcePtr->getPointerType();
+    auto DestTy = IRType::getPointeeType(Destination->getIRType());
+    auto SourceTy = IRType::getPointeeType(Source->getIRType());
+    if (!ByteCount || !DestTy || !SourceTy) return false;
     return ByteCount->getVal() >= 0 &&
            static_cast<size_t>(ByteCount->getVal()) == DestTy->getSize() &&
            IRType::hasSameShape(DestTy, SourceTy);
@@ -519,7 +507,10 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
             Replacement = Variable::getConstantElement(InitialValue,
                                              SourcePath.Indices);
 
-        if (!Value::hasSameStorageType(LI, Replacement)) continue;
+        if (!Replacement ||
+            !IRType::hasSameShape(LI->getIRType(),
+                                  Replacement->getIRType()))
+            continue;
         LI->replaceAllUsesWith(Replacement);
         DeadLoads.push_back(LI);
         Changed = true;
@@ -540,10 +531,9 @@ int LocalAggregateSimplifyPass::getOneDimScalarArrayCount(AllocaInst *AI) {
 bool LocalAggregateSimplifyPass::indexTypeCanSelectAll(
     Value *Index, int Count) {
     if (!Index || !Index->getIRType() ||
-        Index->getIRType()->getEnum() != IR_INT)
+        !Index->getIRType()->isInt())
         return false;
-    auto IntTy = std::dynamic_pointer_cast<INTType>(Index->getIRType());
-    return !IntTy || !IntTy->getIsBool() || Count <= 2;
+    return !Index->getIRType()->isBool() || Count <= 2;
 }
 
 bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
@@ -681,7 +671,9 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
 
     bool HasDynamicIndex = false;
     for (LoadInst *LI : Plan.Loads) {
-        if (!Value::hasSameStorageType(LI, FirstElement)) return false;
+        if (!IRType::hasSameShape(LI->getIRType(),
+                                  FirstElement->getIRType()))
+            return false;
         auto *GEP = dynamic_cast<GetElementPtrInst *>(LI->getPointerOperand());
         Value *Index = nullptr;
         if (!getDirectOneDimElementIndex(AI, GEP, Index) ||
@@ -713,7 +705,10 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
 
         Value *Replacement =
             buildConstantArrayLookup(Plan.Source, Count, Index, LI);
-        if (!Value::hasSameStorageType(LI, Replacement)) return false;
+        if (!Replacement ||
+            !IRType::hasSameShape(LI->getIRType(),
+                                  Replacement->getIRType()))
+            return false;
         Replacements.push_back({LI, Replacement});
     }
 
@@ -821,7 +816,7 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
                                MaxScalarizedElements))
                 return false;
             if (!IRType::isScalar(NewPointeeTy) &&
-                NewPointeeTy->getEnum() != IR_ARRAY)
+                !NewPointeeTy->isArray())
                 return false;
 
             auto ExistingPath = TransparentPath.find(GEP);
@@ -888,7 +883,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         if (!getDirectConstantPath(AI, GEP, Path, PointeeTy))
             return false;
 
-        if (!IRType::isScalar(PointeeTy) && PointeeTy->getEnum() != IR_ARRAY)
+        if (!IRType::isScalar(PointeeTy) && !PointeeTy->isArray())
             return false;
         if (IRType::isScalar(PointeeTy) &&
             !addScalarSlot(SlotTypes, Path, PointeeTy,
@@ -932,9 +927,10 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     if (InitSource) {
         for (auto &Entry : SlotTypes) {
             Value *Init = Variable::getConstantElement(InitSource, Entry.first);
-            if (!Init || !Init->getIRType() || !Entry.second ||
-                Init->getIRType()->getEnum() != Entry.second->getEnum() ||
-                Init->getIRType()->getSize() != Entry.second->getSize())
+            // 标量槽位按真实标量类型匹配，区分存储大小相同的不同整数位宽。
+            if (!Init ||
+                !IRType::hasSameScalarType(Init->getIRType(),
+                                           Entry.second))
                 return false;
             InitialValues[Entry.first] = Init;
         }

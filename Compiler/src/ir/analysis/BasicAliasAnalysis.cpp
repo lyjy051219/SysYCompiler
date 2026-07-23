@@ -293,22 +293,9 @@ bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr
 
     std::shared_ptr<IRType> CurType = BasePtr->getIRType();
     for (size_t i = 0; i < GEP->getNumIndices(); ++i) {
-        std::size_t Stride = 0;
-        if (auto PtrTy = std::dynamic_pointer_cast<POINTERType>(CurType)) {
-            CurType = PtrTy->getPointerType();
-            if (!CurType) {
-                return false;
-            }
-            Stride = CurType->getSize();
-        } else if (auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(CurType)) {
-            CurType = ArrTy->getElementType();
-            if (!CurType) {
-                return false;
-            }
-            Stride = CurType->getSize();
-        } else {
-            return false;
-        }
+        CurType = CurType ? CurType->getIndexableElementType() : nullptr;
+        if (!CurType) return false;
+        std::size_t Stride = CurType->getSize();
 
         Value* Idx = GEP->getIndex(i);
         if (auto *CI = dynamic_cast<ConstInt*>(Idx)) {
@@ -575,9 +562,8 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
 
             auto Ty = A ? A->getIRType() : nullptr;
             auto BTy = B ? B->getIRType() : nullptr;
-            if (Offset && Ty && BTy && Ty->isInt() &&
-                BTy->isInt() && Ty->getIntegerBitWidth(32) == 32 &&
-                BTy->getIntegerBitWidth(32) == 32) {
+            if (Offset && IRType::hasIntegerBitWidth(Ty, 32) &&
+                IRType::hasIntegerBitWidth(BTy, 32)) {
                 // A chain of i32 additions can accumulate more than one full
                 // modulus in the mathematical decomposition.  Normalize it
                 // first; the signed difference of the two final i32 values

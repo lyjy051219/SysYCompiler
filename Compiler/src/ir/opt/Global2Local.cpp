@@ -72,13 +72,10 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		if (GV->vartag != Variable::GlobalVariable) continue;
 		if (!GV->hasUses()) continue;
 
-		auto PtrTy = std::dynamic_pointer_cast<POINTERType>(GV->getIRType());
-		if (!PtrTy) continue;
-
-		auto ElemTy = PtrTy->getPointerType();
+		auto ElemTy = IRType::getPointeeType(GV->getIRType());
 		if (!ElemTy) continue;
 		if (ElemTy->getSize() > RISCVThreshold) continue;
-		const bool IsArray = ElemTy->getEnum() == IR_ARRAY;
+		const bool IsArray = ElemTy->isArray();
 
 		bool CanPromote = true;
 		std::vector<Use *> MainUses;
@@ -187,7 +184,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		Value *Init = C.GV->getUsee();
 		Instruction *LastInitInst = InsertPos;
 
-		if (C.ElemTy->getEnum() == IR_ARRAY) {
+		if (C.ElemTy->isArray()) {
 			const int ByteSize = static_cast<int>(C.ElemTy->getSize());
 			std::vector<Value *> Args;
 			Args.push_back(Alloca);
@@ -204,10 +201,8 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			LastInitInst = MemcpyCall;
 		} else {
 			if (!Init) {
-				if (C.ElemTy->getEnum() == IR_INT) {
-					Init = ConstInt::newConstInt();
-				} else if (C.ElemTy->getEnum() == IR_FLOAT) {
-					Init = ConstFloat::newConstFloat();
+				if (C.ElemTy->isScalar()) {
+					Init = Value::makeZeroForType(C.ElemTy);
 				} else {
 					Init = UndefValue::NewUndefValue(C.ElemTy);
 				}

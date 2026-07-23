@@ -1,6 +1,6 @@
 #include "./include/yacc/Bison.hpp"
-#include "./include/lib/ASTPrinter.hpp"
 #include "./include/lib/IRGenerator.hpp"
+#include "./include/lib/Target.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
 #ifdef ENABLE_RISCV_BACKEND
 #include "./include/riscv/Target.hpp"
@@ -27,6 +27,13 @@ int main(int argc, const char *argv[]) {
      *   compiler testcase.sysy -S -o testcase.s -O1
      */
 
+    // 在解析和生成 IR 前确定目标，使指针、索引及聚合类型布局全程一致。
+#ifdef ENABLE_AARCH64_BACKEND
+    TargetInfo::get().setArch(TargetArch::AArch64);
+#else
+    TargetInfo::get().setArch(TargetArch::RISCV64);
+#endif
+
     // 参数位置固定，可以直接读取输入、输出文件路径。
     std::string inputPath = argv[1];
     std::string outputPath = argv[4];
@@ -39,10 +46,6 @@ int main(int argc, const char *argv[]) {
     yy::parser parser;
     parser.parse();
     fclose(yyin);
-
-    //调试AST时使用
-    //ASTPrinter astPrinter;
-    //astPrinter.visit(*ASTRoot);
 
     //IR生成
     IRGenerator irGenerator;
@@ -84,28 +87,12 @@ int main(int argc, const char *argv[]) {
     }
 #else
     freopen(outputPath.c_str(), "w", stdout);
-    std::cout << "declare i32 @getint()\n";
-    std::cout << "declare i32 @getch()\n";
-    std::cout << "declare float @getfloat()\n";
-    std::cout << "declare i32 @getarray(i32*)\n";
-    std::cout << "declare i32 @getfarray(float*)\n";
-    std::cout << "declare void @putint(i32)\n";
-    std::cout << "declare void @putch(i32)\n";
-    std::cout << "declare void @putfloat(float)\n";
-    std::cout << "declare void @putarray(i32, i32*)\n";
-    std::cout << "declare void @putfarray(i32, float*)\n";
-    std::cout << "declare void @putf(i8*, ...)\n";
-    std::cout << "declare void @_sysy_starttime(i32)\n";
-    std::cout << "declare void @_sysy_stoptime(i32)\n\n";
-    std::cout
-        << "declare void @llvm.memcpy.p0.p0.i32"
-        << "(ptr, ptr, i32, i1)\n\n";
-    std::cout
-        << "declare void @llvm.memmove.p0.p0.i32"
-        << "(ptr, ptr, i32, i1)\n\n";
-    std::cout
-        << "declare void @llvm.memset.p0.i32"
-        << "(ptr, i8, i32, i1)\n\n";
+    const TargetInfo &Target = TargetInfo::get();
+    std::cout << "target datalayout = \""
+              << Target.getLLVMDataLayoutString() << "\"\n";
+    std::cout << "target triple = \""
+              << Target.getLLVMTargetTriple() << "\"\n\n";
+    BuildInFunction::dumpDefaultDeclarations();
     ModuleIR->dumpIR();
     fclose(stdout);
 #endif

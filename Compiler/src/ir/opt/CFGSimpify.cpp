@@ -289,8 +289,8 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 			const bool IsBoolPhi =
 				Phi && IRType::isBool(Phi->getIRType());
 			if (!Phi || Phi->getParent() != BB ||
-				!IRType::isInt(Phi->getIRType()) ||
-				(!IsBoolPhi && Phi->getIRType()->getSize() != 4)) {
+				(!IsBoolPhi &&
+				 !IRType::hasIntegerBitWidth(Phi->getIRType(), 32))) {
 				continue;
 			}
 
@@ -402,7 +402,7 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 
 			PhiInst *BoolPhi = nullptr;
 			if (!BooleanValue) {
-				BoolPhi = new PhiInst(INTType::NewBool());
+				BoolPhi = new PhiInst(INTType::getBoolTy());
 				forEachPhiIncoming(
 					Phi, [&](unsigned I, Value *, BasicBlock *IncomingBlock) {
 					BoolPhi->addIncoming(ConstBool::newConstBool(Bits[I]),
@@ -412,8 +412,9 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 				BooleanValue = BoolPhi;
 			}
 
-			auto *Ext = new ZextInst(Phi->getIRType());
-			Ext->addUse(BooleanValue);
+			auto *Ext = new ZextInst(
+				BooleanValue,
+				std::dynamic_pointer_cast<INTType>(Phi->getIRType()));
 			bool Inserted = InsertedNot
 				? Instruction::insertAfter(InsertedNot, Ext)
 				: BB->insertAfterPhiNodes(Ext);

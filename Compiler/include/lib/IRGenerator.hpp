@@ -2,12 +2,12 @@
 
 #include "AST.hpp"
 #include "CFG.hpp"
+#include "SymbolTable.hpp"
 #include "TypeSystem.hpp"
 
 #include <cstddef>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // 顶层节点通过 ASTVisitor 动态分派；产生值的子树由显式返回值接口递归生成 IR。
@@ -26,22 +26,9 @@ private:
         bool inFunction() const noexcept { return function != nullptr; }
     };
 
-    enum class BindingKind {
-        ConstantValue,
-        ObjectAddress,
-        ArrayParameter,
-    };
-
     enum class InitializerRole {
         CompleteObject,
         ArrayElement,
-    };
-
-    struct Binding {
-        BindingKind kind = BindingKind::ObjectAddress;
-        std::shared_ptr<IRType> objectType;
-        bool isMutable = true;
-        Initializer* constantInitializer = nullptr;
     };
 
     // value 可表示常量、退化后的指针或对象地址，objectType 描述源码对象类型。
@@ -54,8 +41,8 @@ private:
     };
 
     GenerationContext context;
-    std::unordered_map<std::string, Function*> functions;
-    std::unordered_map<Value*, Binding> bindings;
+    // 源码符号只在 IR 生成期间存活，不随 Module 进入后续优化阶段。
+    SymbolTable symbols;
 
     // 将源码类型转换为 IR 类型，并判断表达式或初始化式能否在编译期求值。
     BasicBlock& currentBlock() const;
@@ -103,7 +90,8 @@ private:
     Value* lowerRValue(const LVal& node);
     Value* decayArrayPointer(Value* pointer);
     Value* tryLowerConstantArrayElement(
-        const Binding& binding, const std::vector<Value*>& indices);
+        const SymbolTable::ObjectBinding& binding,
+        const std::vector<Value*>& indices);
 
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
     Value* lowerPrimary(const HasOperand& node);

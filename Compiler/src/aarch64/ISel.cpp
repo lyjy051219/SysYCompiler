@@ -31,7 +31,7 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
     return 0;
   }
 
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_INT:
     return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
@@ -53,7 +53,7 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
     return 1;
   }
 
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_INT:
     return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:
@@ -70,28 +70,28 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
 }
 
 bool isVoidType(const std::shared_ptr<IRType> &type) {
-  return !type || type->getEnum() == IR_VOID;
+  return !type || type->getTypeSystem() == IR_VOID;
 }
 
 bool isFloatType(const std::shared_ptr<IRType> &type) {
-  return type && type->getEnum() == IR_FLOAT;
+  return type && type->getTypeSystem() == IR_FLOAT;
 }
 
 bool isPointerType(const std::shared_ptr<IRType> &type) {
-  return type && type->getEnum() == IR_POINTER;
+  return type && type->getTypeSystem() == IR_POINTER;
 }
 
 std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return "<missing>";
   }
-  if (type->getEnum() == IR_FLOAT) {
+  if (type->getTypeSystem() == IR_FLOAT) {
     return "f32";
   }
-  if (type->getEnum() == IR_INT) {
+  if (type->getTypeSystem() == IR_INT) {
     return "i" + std::to_string(type->getSize() * 8);
   }
-  if (type->getEnum() == IR_POINTER) {
+  if (type->getTypeSystem() == IR_POINTER) {
     return "pointer";
   }
   return "non-scalar";
@@ -101,7 +101,7 @@ RegClass regClassForType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     throw BackendError("missing IR type for register class selection");
   }
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_FLOAT:
     return RegClass::FPR32;
   case IR_POINTER:
@@ -225,8 +225,8 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     return true;
   }
   if (dynamic_cast<UndefValue *>(value) && value->getIRType() &&
-      (value->getIRType()->getEnum() == IR_INT ||
-       value->getIRType()->getEnum() == IR_POINTER)) {
+      (value->getIRType()->getTypeSystem() == IR_INT ||
+       value->getIRType()->getTypeSystem() == IR_POINTER)) {
     out = 0;
     return true;
   }
@@ -238,7 +238,7 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
   // instruction is still lowered normally; this helper only observes it.
   auto *binary = dynamic_cast<BinaryInst *>(value);
   if (!binary || depth >= 4 || !value->getIRType() ||
-      value->getIRType()->getEnum() != IR_INT) {
+      value->getIRType()->getTypeSystem() != IR_INT) {
     return false;
   }
 
@@ -829,7 +829,7 @@ bool lowerIntegerImmediateOp(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
-  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT);
+  return type && (type->getTypeSystem() == IR_INT || type->getTypeSystem() == IR_FLOAT);
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
@@ -880,7 +880,7 @@ MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
     detail = "<unnamed>";
   }
   if (value->getIRType()) {
-    detail += " type=" + std::to_string(value->getIRType()->getEnum());
+    detail += " type=" + std::to_string(value->getIRType()->getTypeSystem());
   }
   if (auto *instruction = dynamic_cast<Instruction *>(value)) {
     detail += " inst=" + std::string(instTypeName(instruction->instType));
@@ -1003,7 +1003,7 @@ Opcode loadOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isPointerType(type)) {
     return Opcode::LD;
   }
-  if (type && type->getEnum() == IR_INT) {
+  if (type && type->getTypeSystem() == IR_INT) {
     if (isBoolType(type)) {
       return Opcode::LBU;
     }
@@ -1019,7 +1019,7 @@ Opcode storeOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isPointerType(type)) {
     return Opcode::SD;
   }
-  if (type && type->getEnum() == IR_INT) {
+  if (type && type->getTypeSystem() == IR_INT) {
     if (isBoolType(type)) {
       return Opcode::SB;
     }
@@ -1699,7 +1699,7 @@ bool hasAllZeroBytes(Value *value, const std::shared_ptr<IRType> &type) {
     }
     return false;
   }
-  if (type->getEnum() == IR_INT) {
+  if (type->getTypeSystem() == IR_INT) {
     if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
       return intValue->getVal() == 0;
     }
@@ -1887,7 +1887,7 @@ void lowerLibcMemoryCall(MachineFunction &mf, MachineBasicBlock &mbb,
           mf, mbb, addressForValue(mf, mbb, state, argument, intrinsicName)));
     } else if (argumentIndex == 2) {
       if (!argument->getIRType() ||
-          argument->getIRType()->getEnum() != IR_INT) {
+          argument->getIRType()->getTypeSystem() != IR_INT) {
         throw BackendError("malformed " + intrinsicName +
                            "; memory size must be an integer");
       }

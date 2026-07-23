@@ -240,7 +240,7 @@ bool LICMPass::cacheLoopInvariantCall(
 	BasicBlock *Header = L.getHeader();
 	if (!BB || !Header || BB == Header) return false;
 	if (!L.contains(BB) || !DT.dominates(BB, Latch)) return false;
-	if (!CI->getIRType() || CI->getIRType()->getEnum() == IR_VOID)
+	if (!CI->getIRType() || CI->getIRType()->isVoid())
 		return false;
 	if (!CI->hasUses()) return false;
 

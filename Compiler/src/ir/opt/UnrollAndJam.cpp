@@ -865,7 +865,8 @@ UnrollAndJamPass::buildClonePlan(
     }
     const std::int64_t NewStep = static_cast<std::int64_t>(WideNewStep);
     auto Ty = Shape.OuterInduction.Phi->getIRType();
-    const std::size_t Size = Ty ? Ty->getSize() : 4;
+    if (!Ty || !Ty->isInt() || Ty->isBool())
+        return std::nullopt;
 
     UnrollAndJamClonePlan Plan;
     Plan.Factor = Factor;
@@ -880,9 +881,15 @@ UnrollAndJamPass::buildClonePlan(
         }
         Plan.Lanes.emplace_back();
         UnrollAndJamLanePlan &Lane = Plan.Lanes.back();
+        // 归纳常量沿用PHI的真实整数位宽，不能用存储字节数推导类型。
+        Value *LaneOffset = Value::makeIntegerForType(
+            static_cast<std::int64_t>(WideOffset), Ty);
+        if (!LaneOffset) {
+            destroyClonePlan(Plan);
+            return std::nullopt;
+        }
         Lane.LaneIV = new BinaryInst(
-            Shape.OuterInduction.Phi, BinaryInst::ADD,
-            ConstInt::newConstInt(static_cast<int>(WideOffset), Size));
+            Shape.OuterInduction.Phi, BinaryInst::ADD, LaneOffset);
         Lane.ValueMap[Shape.OuterInduction.Phi] = Lane.LaneIV;
 
         for (Instruction *Source : Shape.LaneInstructions) {
@@ -908,9 +915,13 @@ UnrollAndJamPass::buildClonePlan(
             return std::nullopt;
         }
     }
+    Value *NewStepValue = Value::makeIntegerForType(NewStep, Ty);
+    if (!NewStepValue) {
+        destroyClonePlan(Plan);
+        return std::nullopt;
+    }
     Plan.NewOuterUpdate = new BinaryInst(
-        Shape.OuterInduction.Phi, BinaryInst::ADD,
-        ConstInt::newConstInt(static_cast<int>(NewStep), Size));
+        Shape.OuterInduction.Phi, BinaryInst::ADD, NewStepValue);
     return Plan;
 }
 

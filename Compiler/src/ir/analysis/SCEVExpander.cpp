@@ -94,18 +94,19 @@ bool SCEVExpander::canExpand(const SCEVExpr *E) const {
 }
 
 Value *SCEVExpander::makeConstant(const SCEVExpr *E) const {
-    if (!E || E->Kind != SCEVExprKind::Constant ||
-        E->ConstValue < std::numeric_limits<int>::min() ||
-        E->ConstValue > std::numeric_limits<int>::max()) {
+    if (!E || E->Kind != SCEVExprKind::Constant) {
         return nullptr;
     }
-    if (E->Ty && E->Ty->getEnum() == IR_INT &&
-        E->Ty == INTType::NewBool()) {
+    auto IntegerType =
+        E->Ty ? std::dynamic_pointer_cast<INTType>(E->Ty) : nullptr;
+    if (IntegerType && IntegerType->getIsBool()) {
         return ConstBool::newConstBool(E->ConstValue != 0);
     }
-    size_t Size = 4;
-    if (E->Ty && E->Ty->getEnum() == IR_INT) Size = E->Ty->getSize();
-    return ConstInt::newConstInt(static_cast<int>(E->ConstValue), Size);
+    if (!IntegerType)
+        IntegerType = INTType::getInt32Ty();
+    if (IntegerType->getBitWidth() > 64)
+        return nullptr;
+    return ConstInt::newConstIntForType(E->ConstValue, IntegerType);
 }
 
 Instruction *SCEVExpander::insert(Instruction *I) {
@@ -136,18 +137,20 @@ Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
         Value *Operand = expandImpl(E->Operands[0]);
         if (!Operand) return nullptr;
         Instruction *Cast = nullptr;
+        auto IntegerType =
+            std::dynamic_pointer_cast<INTType>(E->Ty);
         switch (E->CastKind) {
         case SCEVCastKind::Trunc:
-            Cast = new TruncInst(E->Ty);
-            Cast->addUse(Operand);
+            if (!IntegerType) return nullptr;
+            Cast = new TruncInst(Operand, IntegerType);
             break;
         case SCEVCastKind::ZExt:
-            Cast = new ZextInst(E->Ty);
-            Cast->addUse(Operand);
+            if (!IntegerType) return nullptr;
+            Cast = new ZextInst(Operand, IntegerType);
             break;
         case SCEVCastKind::SExt:
-            Cast = new SextInst(E->Ty);
-            Cast->addUse(Operand);
+            if (!IntegerType) return nullptr;
+            Cast = new SextInst(Operand, IntegerType);
             break;
         case SCEVCastKind::BitCast:
             Cast = new BitCastInst(Operand, E->Ty);

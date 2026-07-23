@@ -198,9 +198,9 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
         if (hasEscapingLocalPtr) continue;
         if (CI->isTailCall()) continue;
         //3.检查Ret返回值与call必须匹配
-        bool isVoid = (F.getIRType()->getEnum() == IR_VOID);
+        bool isVoid = F.getIRType()->isVoid();
         if (isVoid) {
-            if (CI->getIRType()->getEnum() == IR_VOID) {
+            if (CI->getIRType()->isVoid()) {
                 CI->setTailCall(true);
                 changed = true;
             }
@@ -394,13 +394,11 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
             // 初始值: ADD→0, MUL→1
             Value *Identity = nullptr;
             if (accOp == BinaryInst::ADD) {
-                Identity = (AccInst->getIRType()->getEnum() == IR_FLOAT)
-                    ? static_cast<Value *>(ConstFloat::newConstFloat(0.0f))
-                    : static_cast<Value *>(ConstInt::newConstInt(0));
+                Identity = Value::makeZeroForType(
+                    AccInst->getIRType());
             } else {
-                Identity = (AccInst->getIRType()->getEnum() == IR_FLOAT)
-                    ? static_cast<Value *>(ConstFloat::newConstFloat(1.0f))
-                    : static_cast<Value *>(ConstInt::newConstInt(1));
+                Identity = Value::makeOneForType(
+                    AccInst->getIRType());
             }
             AccPhi->addIncoming(Identity, F.front()); // 来自 NewEntry
         }

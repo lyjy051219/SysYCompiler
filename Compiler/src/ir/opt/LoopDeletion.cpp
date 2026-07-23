@@ -73,7 +73,7 @@ bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
 
     auto IsI32 = [](Value *V) {
         auto Ty = V ? V->getIRType() : nullptr;
-        return Ty && Ty->isInt() && Ty->getIntegerBitWidth(32) == 32;
+        return IRType::hasIntegerBitWidth(Ty, 32);
     };
     if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
 
@@ -141,12 +141,10 @@ bool LoopDeletionPass::planZeroTripPhiReplacements(
         std::unordered_set<Value *> Active;
         Value *Replacement =
             resolveZeroTripValue(OnExit, L, TCI.PreHeader, Active);
-        if (!Replacement || !Replacement->getIRType() ||
-            !Phi->getIRType() ||
-            Replacement->getIRType()->getEnum() !=
-                Phi->getIRType()->getEnum() ||
-            Replacement->getIRType()->getSize() !=
-                Phi->getIRType()->getSize()) {
+        // PHI替换必须保持完整类型形状，不能只凭相同存储字节数放行。
+        if (!Replacement ||
+            !IRType::hasSameShape(Replacement->getIRType(),
+                                  Phi->getIRType())) {
             return false;
         }
         Plan[Phi] = Replacement;
@@ -233,7 +231,7 @@ bool LoopDeletionPass::deleteLoopCFG(
         if (!BB || BB->getParent() != &F) continue;
         for (Instruction *I : *BB) {
             if (!I || !I->getIRType() ||
-                I->getIRType()->getEnum() == IR_VOID) {
+                I->getIRType()->isVoid()) {
                 continue;
             }
             if (I->hasUses())

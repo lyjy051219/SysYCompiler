@@ -23,7 +23,7 @@
 bool LoopUnswitchPass::isBooleanNonConstant(Value *V) {
     if (!V || Value::isUndef(V) || V->isConst() || !V->getIRType())
         return false;
-    return V->getIRType() == INTType::NewBool();
+    return V->getIRType()->isBool();
 }
 
 bool LoopUnswitchPass::isAvailableAt(Value *V, Instruction *UsePoint, const Loop &L,
@@ -472,7 +472,7 @@ Value *LoopUnswitchPass::stripBooleanNot(Value *V, bool &Inverted) {
     for (unsigned Depth = 0; V && Depth != 8; ++Depth) {
         auto *BI = dynamic_cast<BinaryInst *>(V);
         if (!BI || BI->getOp() != BinaryInst::XOR ||
-            BI->getIRType() != INTType::NewBool()) {
+            !IRType::isBool(BI->getIRType())) {
             break;
         }
         Value *L = BI->getOperand(0);
@@ -579,10 +579,8 @@ LoopUnswitchPass::normalizeIntegerBound(Value *V) {
         Variable = R;
         Predicate = BinaryInst::reversePredicate(Predicate);
     }
-    auto *Ty = Variable
-                   ? dynamic_cast<INTType *>(Variable->getIRType().get())
-                   : nullptr;
-    if (!Bound || !Ty || Ty->getIsBool() || Ty->getSize() != 4)
+    auto Ty = Variable ? Variable->getIRType() : nullptr;
+    if (!Bound || !IRType::hasIntegerBitWidth(Ty, 32))
         return std::nullopt;
     return IntegerBoundPredicate{
         Variable, Predicate, static_cast<std::int32_t>(Bound->getVal())};
@@ -614,8 +612,8 @@ std::optional<bool> LoopUnswitchPass::proveBaseConditionFromGuard(Value *Target,
 
     const bool IntegerOperands = TL && TR && TL->getIRType() &&
                                  TR->getIRType() &&
-                                 TL->getIRType()->getEnum() == IR_INT &&
-                                 TR->getIRType()->getEnum() == IR_INT;
+                                 TL->getIRType()->isInt() &&
+                                 TR->getIRType()->isInt();
     if (TL == GL && TR == GR) {
         if (!IntegerOperands) {
             if (TargetCmp->getOp() == GuardOp) return GuardKnown;

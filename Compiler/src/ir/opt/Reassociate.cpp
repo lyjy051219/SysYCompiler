@@ -350,7 +350,9 @@ Value *ReassociateEngine::buildMulPowProduct(
 		OuterProduct.push_back(SquareRoot);
 	}
 
-	if (OuterProduct.empty()) return ConstInt::newConstInt(1);
+	if (OuterProduct.empty())
+		return Value::makeOneForType(
+			Root ? Root->getIRType() : nullptr);
 
 	Value *Out = nullptr;
 	if (!buildBalancedProduct(Root, OuterProduct, Out)) return nullptr;
@@ -457,7 +459,8 @@ Value *ReassociateEngine::optExp(
 				}
 
 				Instruction *MulI = createBinaryBefore(
-					Root, BinaryInst::MUL, ConstInt::newConstInt(K), V);
+					Root, BinaryInst::MUL,
+					Value::makeIntegerLike(V, K), V);
 				if (!MulI) {
 					NewOps.push_back(V);
 					continue;
@@ -552,7 +555,9 @@ Value *ReassociateEngine::optExp(
 					}
 					Factors.erase(Fit);
 					if (Factors.empty()) {
-						RemainingTerms.push_back(ConstInt::newConstInt(1));
+						RemainingTerms.push_back(
+							Value::makeOneForType(
+								Ops[i]->getIRType()));
 					} else if (Factors.size() == 1) {
 						RemainingTerms.push_back(Factors[0]);
 					} else {

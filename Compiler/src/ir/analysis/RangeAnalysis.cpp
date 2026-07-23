@@ -32,6 +32,26 @@ IntRange::IntRange(int64_t val)
 IntRange::IntRange(int64_t lo, int64_t hi)
     : min(lo), max(hi), knownTrailingZeros(0) {}
 
+namespace {
+
+bool isModeledIntegerRangeType(const Value *V) {
+    auto Ty = V ? V->getIRType() : nullptr;
+    return IRType::hasIntegerBitWidth(Ty, 1) ||
+           IRType::hasIntegerBitWidth(Ty, 32);
+}
+
+IntRange conservativeIntegerRangeForValue(const Value *V) {
+    if (!V || !V->getIRType() || !V->getIRType()->isInt())
+        return IntRange();
+    if (V->getIRType()->hasIntegerBitWidth(1))
+        return IntRange(0, 1);
+    // IntRange/KnownBits 当前仍是 i32 专用格。对 i8/i64 使用 Top
+    // 哨兵，确保下游不会把完整值域误认为可用于变换的窄区间。
+    return IntRange();
+}
+
+} // 匿名命名空间
+
 bool IntRange::isTop() const {
     return min == I32_MIN && max == I32_MAX;
 }
@@ -707,9 +727,11 @@ IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
     // 常量直接返回精确范围
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return IntRange(CI->getVal());
+    if (!isModeledIntegerRangeType(val))
+        return conservativeIntegerRangeForValue(val);
 
     // 全局范围
-    IntRange range;
+    IntRange range = conservativeIntegerRangeForValue(val);
     auto gIt = GlobalRanges.find(val);
     if (gIt != GlobalRanges.end())
         range = gIt->second;
@@ -780,6 +802,8 @@ IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
                                  BasicBlock *succBB,
                                  const DominatorTree &DT) const {
     if (auto *CI = dynamic_cast<ConstInt *>(val)) return IntRange(CI->getVal());
+    if (!isModeledIntegerRangeType(val))
+        return conservativeIntegerRangeForValue(val);
     IntRange R = query(val, predBB, DT);
     if (!predBB || !succBB) return R;
     auto VIt = EdgeRanges.find(val);
@@ -798,6 +822,9 @@ IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
 // KnownBits 查询 API（和 IntRange 的 query 对齐）
 // =====================================================================
 KnownBits RangeInfo::queryBits(Value *val) const {
+    if (!val ||
+        !IRType::hasIntegerBitWidth(val->getIRType(), 32))
+        return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return KnownBits::fromConst(CI->getVal());
     auto it = GlobalBits.find(val);
@@ -807,6 +834,9 @@ KnownBits RangeInfo::queryBits(Value *val) const {
 
 KnownBits RangeInfo::queryBits(Value *val, BasicBlock *ctxBlock,
                                 const DominatorTree &DT) const {
+    if (!val ||
+        !IRType::hasIntegerBitWidth(val->getIRType(), 32))
+        return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return KnownBits::fromConst(CI->getVal());
 
@@ -834,6 +864,9 @@ KnownBits RangeInfo::queryBits(Value *val, BasicBlock *ctxBlock,
 KnownBits RangeInfo::queryBitsOnEdge(Value *val, BasicBlock *predBB,
                                       BasicBlock *succBB,
                                       const DominatorTree &DT) const {
+    if (!val ||
+        !IRType::hasIntegerBitWidth(val->getIRType(), 32))
+        return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return KnownBits::fromConst(CI->getVal());
     KnownBits KB = queryBits(val, predBB, DT);
@@ -884,11 +917,18 @@ bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
 IntRange &RangeSolver::getRange(Value *V) {
     // 全局范围默认初始化为 Top（全范围）。
     // 每条指令首次 visit 时会被 visitXxx 赋予计算出的范围。
-    return ValueRanges[V];
+    auto It = ValueRanges.find(V);
+    if (It == ValueRanges.end())
+        It = ValueRanges.emplace(
+            V, conservativeIntegerRangeForValue(V)).first;
+    return It->second;
 }
 
 // KnownBits 取值：常量直接返回精确 KB，其他值查表
 KnownBits RangeSolver::getBits(Value *V) {
+    if (!V ||
+        !IRType::hasIntegerBitWidth(V->getIRType(), 32))
+        return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return KnownBits::fromConst(CI->getVal());
     return ValueBits[V]; // 缺省 Top
@@ -905,6 +945,8 @@ KnownBits RangeSolver::getBits(Value *V) {
 //   而 per-block 就已经能吃到"直接前驱对 V 的收窄"这个最高频的场景。
 //   更深层的由 forward worklist 迭代自然带上来。
 IntRange RangeSolver::getRangeInBlock(Value *V, BasicBlock *BB) {
+    if (!isModeledIntegerRangeType(V))
+        return conservativeIntegerRangeForValue(V);
     IntRange r = getRange(V);
     if (!BB) return r;
     auto it = ContextualRanges.find(V);
@@ -916,6 +958,9 @@ IntRange RangeSolver::getRangeInBlock(Value *V, BasicBlock *BB) {
 }
 
 KnownBits RangeSolver::getBitsInBlock(Value *V, BasicBlock *BB) {
+    if (!V ||
+        !IRType::hasIntegerBitWidth(V->getIRType(), 32))
+        return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return KnownBits::fromConst(CI->getVal());
     KnownBits kb = ValueBits[V];
@@ -939,6 +984,9 @@ void RangeSolver::enqueueInstructionUsers(Value *V) {
 // 任何一方 bit 变化都把 users 放回 worklist，让 IntRange 有机会通过
 // KB.toIntRange() 被重新拉紧。
 bool RangeSolver::updateBits(Value *V, const KnownBits &newBits) {
+    if (!V ||
+        !IRType::hasIntegerBitWidth(V->getIRType(), 32))
+        return false;
     auto &cur = ValueBits[V];
     KnownBits merged = NarrowingMode ? cur.intersectWith(newBits) : newBits;
     if (merged.isConflict()) return false; // 不可达路径保守忽略
@@ -981,9 +1029,17 @@ IntRange RangeSolver::tightenWithBits(Value *V, const IntRange &newRange) {
 //   这是 backward constraint propagation 的核心：让 widening 到 Top 的值
 //   在约束回推时被收回
 bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
+    if (!isModeledIntegerRangeType(V)) {
+        IntRange Full = conservativeIntegerRangeForValue(V);
+        auto It = ValueRanges.find(V);
+        if (It != ValueRanges.end() && It->second == Full)
+            return false;
+        ValueRanges[V] = Full;
+        return true;
+    }
     // ---- Narrowing 路径 ----
     if (NarrowingMode) {
-        auto &cur = ValueRanges[V];
+        auto &cur = getRange(V);
         IntRange intersected = cur.intersectWith(newRange);
         // 不引入 bottom（空区间意味着不可达，narrowing 阶段保守忽略）
         if (intersected.isBottom()) return false;
@@ -996,7 +1052,7 @@ bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
     // ---- Forward 路径 ----
     if (Widened.count(V)) return false;
 
-    auto &cur = ValueRanges[V];
+    auto &cur = getRange(V);
     if (newRange == cur) return false;
 
     int &vCount = EnqueueCount[V];
@@ -1133,7 +1189,7 @@ void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
         const LoopInductionInfo &info = entry.second;
         if (!V || !info.RecLoop) continue;
         if (!info.noWrap) continue;
-        if (!V->getIRType() || V->getIRType()->getEnum() != IR_INT) continue;
+        if (!V->getIRType() || !V->getIRType()->isInt()) continue;
 
         IntRange activeRange = rangeFromInduction(info);
         if (activeRange.isTop() || activeRange.isBottom()) continue;
@@ -1166,7 +1222,7 @@ void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
 void RangeSolver::visitPhi(PhiInst *Phi) {
     // 浮点 PHI
     auto phiTy = Phi->getIRType();
-    if (phiTy && phiTy->getEnum() == IR_FLOAT) {
+    if (phiTy && phiTy->isFloat()) {
         FloatRange fresult = FloatRange::bottom();
         BasicBlock *phiBB = Phi->getParent();
         forEachPhiIncoming(
@@ -1182,6 +1238,12 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
             });
         // 浮点 PHI 范围更新（统一走 updateFloatRange）
         updateFloatRange(Phi, fresult);
+        return;
+    }
+    if (phiTy && phiTy->isInt() &&
+        !isModeledIntegerRangeType(Phi)) {
+        updateBits(Phi, KnownBits::top());
+        updateRange(Phi, conservativeIntegerRangeForValue(Phi));
         return;
     }
 
@@ -1233,7 +1295,7 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
 
     // 浮点二元运算
     auto resultTy = BI->getIRType();
-    if (resultTy && resultTy->getEnum() == IR_FLOAT) {
+    if (resultTy && resultTy->isFloat()) {
         FloatRange lf = dynamic_cast<ConstFloat *>(lhs) ?
             FloatRange((double)dynamic_cast<ConstFloat *>(lhs)->getVal()) :
             FloatValueRanges[lhs];
@@ -1257,6 +1319,18 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         return;
     }
 
+    if (BinaryInst::isCompareOp(BI->getOp())) {
+        updateBits(BI, KnownBits::top());
+        updateRange(BI, IntRange(0, 1));
+        return;
+    }
+    if (resultTy && resultTy->isInt() &&
+        !isModeledIntegerRangeType(BI)) {
+        updateBits(BI, KnownBits::top());
+        updateRange(BI, conservativeIntegerRangeForValue(BI));
+        return;
+    }
+
     // 整数二元运算
     //   操作数走 global range —— 不能用 BB-sensitive contextual：narrowBinaryBackward
     //   会把结果 range.sub(otherOperandRange) 写回操作数的 GLOBAL range，如果
@@ -1270,7 +1344,7 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         IntRange(dynamic_cast<ConstInt *>(rhs)->getVal()) : getRange(rhs);
 
     const int ResultBitWidth = resultTy && resultTy->isInt()
-        ? (resultTy->isBool() ? 1 : resultTy->getIntegerBitWidth(0))
+        ? resultTy->getIntegerBitWidth(0)
         : 0;
     const bool IsModeledI32 = ResultBitWidth == 32;
     auto HasModeledShiftAmount = [&]() {
@@ -1364,7 +1438,7 @@ const IntRange &rRange) {
     if (!ty) return;
 
     // 整数路径
-    if (ty->getEnum() == IR_INT) {
+    if (ty->isInt()) {
         IntRange zR = getRange(BI);
         switch (BI->getOp()) {
             case BinaryInst::ADD: {
@@ -1435,7 +1509,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
             auto lhsTy = lhs->getIRType();
             auto rhsTy = rhs->getIRType();
             if (lhsTy && rhsTy &&
-                lhsTy->getEnum() == IR_FLOAT && rhsTy->getEnum() == IR_FLOAT) {
+                lhsTy->isFloat() && rhsTy->isFloat()) {
                 FloatRange lF = dynamic_cast<ConstFloat *>(lhs) ?
                     FloatRange((double)dynamic_cast<ConstFloat *>(lhs)->getVal()) :
                     FloatValueRanges[lhs];
@@ -1667,8 +1741,8 @@ void RangeSolver::visitCall(CallInst *CI) {
     auto SetTopForResultType = [&]() {
         auto Ty = CI->getIRType();
         if (!Ty) return;
-        if (Ty->getEnum() == IR_INT) updateRange(CI, IntRange());
-        else if (Ty->getEnum() == IR_FLOAT)
+        if (Ty->isInt()) updateRange(CI, IntRange());
+        else if (Ty->isFloat())
             updateFloatRange(CI, FloatRange());
     };
 
@@ -1717,13 +1791,18 @@ void RangeSolver::visitSelect(SelectInst *SI) {
     auto ty = SI->getIRType();
     if (!ty) return;
 
-    if (ty->getEnum() == IR_INT) {
+    if (ty->isInt()) {
+        if (!isModeledIntegerRangeType(SI)) {
+            updateRange(SI, conservativeIntegerRangeForValue(SI));
+            updateBits(SI, KnownBits::top());
+            return;
+        }
         IntRange tr = dynamic_cast<ConstInt *>(tv) ?
             IntRange(dynamic_cast<ConstInt *>(tv)->getVal()) : getRange(tv);
         IntRange fr = dynamic_cast<ConstInt *>(fv) ?
             IntRange(dynamic_cast<ConstInt *>(fv)->getVal()) : getRange(fv);
         updateRange(SI, tr.unionWith(fr));
-    } else if (ty->getEnum() == IR_FLOAT) {
+    } else if (ty->isFloat()) {
         FloatRange tr = dynamic_cast<ConstFloat *>(tv) ?
             FloatRange((double)dynamic_cast<ConstFloat *>(tv)->getVal()) :
             FloatValueRanges[tv];
@@ -1746,30 +1825,45 @@ void RangeSolver::visitSelect(SelectInst *SI) {
 void RangeSolver::visitCast(Instruction *I) {
     Value *src = I->getUnaryOperand();
     if (!src || !src->getIRType() || !I->getIRType()) return;
-    auto srcTy = src->getIRType()->getEnum();
-    auto dstTy = I->getIRType()->getEnum();
+    auto srcTy = src->getIRType()->getTypeSystem();
+    auto dstTy = I->getIRType()->getTypeSystem();
+    const int SourceBits = src->getIRType()->isInt()
+                               ? src->getIRType()->getIntegerBitWidth(0)
+                               : 0;
+    const int DestinationBits = I->getIRType()->isInt()
+                                    ? I->getIRType()
+                                          ->getIntegerBitWidth(0)
+                                    : 0;
 
     if (dynamic_cast<ZextInst *>(I)) {
-        // 源是 i1：[0, 1]；若源是 i32 当成身份用（SysY 一般不会走这条）
-        if (srcTy == IR_INT) {
+        // 当前仅精确建模 i1 到 i32，其余整数位宽保守返回完整值域。
+        if (srcTy == IR_INT && SourceBits == 1 &&
+            DestinationBits == 32) {
             updateRange(I, IntRange(0, 1));
             // KB：高 31 位都是 0，最低位未知（取决于 bool）
             updateBits(I, KnownBits(0xFFFFFFFEu, 0));
+        } else if (dstTy == IR_INT) {
+            updateRange(I, conservativeIntegerRangeForValue(I));
+            updateBits(I, KnownBits::top());
         }
         return;
     }
     if (dynamic_cast<SextInst *>(I)) {
-        // i1 → i32：1 会被符号扩展到 -1，0 保持 0
-        if (srcTy == IR_INT) {
+        // 当前仅精确建模 i1 到 i32，其余整数位宽保守返回完整值域。
+        if (srcTy == IR_INT && SourceBits == 1 &&
+            DestinationBits == 32) {
             updateRange(I, IntRange(-1, 0));
             // KB：值只能是 0x00000000 或 0xFFFFFFFF；位型未知都归 Top
             // （因为高位取决于最低位，没法用单一 KB 刻画）
+        } else if (dstTy == IR_INT) {
+            updateRange(I, conservativeIntegerRangeForValue(I));
+            updateBits(I, KnownBits::top());
         }
         return;
     }
     if (dynamic_cast<TruncInst *>(I)) {
-        // i32 → i1：结果只看最低位，直接归为 [0, 1]
-        if (dstTy == IR_INT) {
+        // 截断到 i1 时只看最低位；其他目标宽度暂不做位级推导。
+        if (dstTy == IR_INT && DestinationBits == 1) {
             updateRange(I, IntRange(0, 1));
             // KB：高 31 位都是 0；bit0 继承源的 bit0
             KnownBits srcKB = getBits(src);
@@ -1778,6 +1872,9 @@ void RangeSolver::visitCast(Instruction *I) {
             if (srcKB.zero & 1u) z |= 1u;
             if (srcKB.one  & 1u) o |= 1u;
             updateBits(I, KnownBits(z, o));
+        } else if (dstTy == IR_INT) {
+            updateRange(I, conservativeIntegerRangeForValue(I));
+            updateBits(I, KnownBits::top());
         }
         return;
     }
@@ -1799,6 +1896,11 @@ void RangeSolver::visitCast(Instruction *I) {
         return;
     }
     if (dynamic_cast<FPTOSIInst *>(I)) {
+        if (DestinationBits != 32) {
+            updateRange(I, conservativeIntegerRangeForValue(I));
+            updateBits(I, KnownBits::top());
+            return;
+        }
         // float → int：端点向零截断；±inf / NaN 保守退 Top。
         // 越界行为：一旦端点超过 i32 可表示范围，fptosi 的结果按 IR 语义
         // 未定义（poison / undef）。这里不能 clamp 到 I32_MIN/I32_MAX，
@@ -2019,8 +2121,8 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
         Value *RHS = nullptr;
         if (!Cmp->getOperands(LHS, RHS) || !LHS || !RHS ||
             !LHS->getIRType() || !RHS->getIRType() ||
-            LHS->getIRType()->getEnum() != IR_INT ||
-            RHS->getIRType()->getEnum() != IR_INT)
+            !LHS->getIRType()->isInt() ||
+            !RHS->getIRType()->isInt())
             continue;
 
         IntRange L = FinalRange(LHS);

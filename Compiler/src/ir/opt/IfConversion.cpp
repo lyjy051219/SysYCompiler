@@ -223,7 +223,7 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	BasicBlock *OtherArmBB = HasElse ? ElseBB : Pred;
 	for (PhiInst *Phi : SuccPhis) {
 		if (!Phi || Phi->getNumIncomingValues() != 2 ||
-			!Phi->getIRType() || Phi->getIRType()->getEnum() == IR_VOID)
+			!Phi->getIRType() || Phi->getIRType()->isVoid())
 			return false;
 		Value *TrueIncoming = Phi->getIncomingFromPred(TrueBB);
 		Value *OtherIncoming = Phi->getIncomingFromPred(OtherArmBB);

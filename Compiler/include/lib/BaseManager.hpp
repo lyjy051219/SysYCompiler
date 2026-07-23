@@ -140,7 +140,9 @@ class Value{
    bool isUndef() const;
    bool tryGetBoolConst(bool &Out) const;
    bool tryGetIntConst(int32_t &Out) const;
+   bool tryGetInt64Const(int64_t &Out) const;
    bool tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const;
+   bool tryGetInt64ConstAtWidth(unsigned Bits, int64_t &Out) const;
    bool tryGetFloatConst(float &Out) const;
    bool tryGetNumericFloatConst(float &Out) const;
    std::optional<int64_t> getIntConstant() const;
@@ -166,6 +168,7 @@ class Value{
    static bool isUndef(const Value *V);
    static bool tryGetBoolConst(const Value *V, bool &Out);
    static bool tryGetIntConst(const Value *V, int32_t &Out);
+   static bool tryGetInt64Const(const Value *V, int64_t &Out);
    static bool tryGetFloatConst(const Value *V, float &Out);
    static bool areEqualConstants(const Value *A, const Value *B);
    static bool tryGetIntIndex(const Value *V, int &Out);
@@ -179,9 +182,9 @@ class Value{
    static Value *makeOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty);
-   static Value *makeIntegerForType(int32_t Val,
+   static Value *makeIntegerForType(int64_t Val,
                                     const std::shared_ptr<IRType> &Ty);
-   static Value *makeIntegerLike(const Value *Model, int32_t Val);
+   static Value *makeIntegerLike(const Value *Model, int64_t Val);
    // 将所有现有 Use 换绑到目标值，保持每个 User 的操作数位置不变。
    void replaceAllUsesWith(Value* Val);
    // 输出当前值在 LLVM IR 中的引用形式。

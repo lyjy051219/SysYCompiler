@@ -54,7 +54,7 @@ public:
     static bool addI32(int64_t A, int64_t B, int64_t &Out);
     static bool addNoOverflow(int64_t A, int64_t B, int64_t &Out);
     static int64_t ceilDivPositive(int64_t Num, int64_t Den);
-    static int32_t normalizeSignedToWidth(int64_t Val, unsigned Bits);
+    static int64_t normalizeSignedToWidth(int64_t Val, unsigned Bits);
 };
 
 // 为分析缓存构造进程内稳定键；结果只在本次编译进程中有效。

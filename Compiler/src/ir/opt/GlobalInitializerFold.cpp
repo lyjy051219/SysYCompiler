@@ -54,8 +54,7 @@ bool GlobalInitializerFoldPass::isFullGlobalCopy(
 
     auto DestTy = Destination->getPointeeType();
     auto SourceTy = Source->getPointeeType();
-    if (!DestTy || !SourceTy || !DestTy->hasSameShape(*SourceTy) ||
-        DestTy->getSize() != SourceTy->getSize())
+    if (!DestTy || !SourceTy || !DestTy->hasSameShape(*SourceTy))
         return false;
     if (DestTy->getSize() >
         static_cast<size_t>(std::numeric_limits<int32_t>::max()))

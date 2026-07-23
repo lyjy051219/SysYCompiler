@@ -54,18 +54,18 @@ bool blockCanFallThrough(const MachineBasicBlock &block) {
 }
 
 bool isFloatType(const std::shared_ptr<IRType> &type) {
-  return type && type->getEnum() == IR_FLOAT;
+  return type && type->getTypeSystem() == IR_FLOAT;
 }
 
 bool isPointerType(const std::shared_ptr<IRType> &type) {
-  return type && type->getEnum() == IR_POINTER;
+  return type && type->getTypeSystem() == IR_POINTER;
 }
 
 RegClass regClassForValue(Value *value) {
   if (!value || !value->getIRType()) {
     throw BackendError("missing value type while running machine pass");
   }
-  switch (value->getIRType()->getEnum()) {
+  switch (value->getIRType()->getTypeSystem()) {
   case IR_FLOAT:
     return RegClass::FPR32;
   case IR_POINTER:
@@ -140,8 +140,8 @@ MachineReg materializeConstant(MachineFunction &mf,
     intValue = 0;
     hasInt = true;
   } else if (dynamic_cast<UndefValue *>(value) && value->getIRType() &&
-             (value->getIRType()->getEnum() == IR_INT ||
-              value->getIRType()->getEnum() == IR_POINTER)) {
+             (value->getIRType()->getTypeSystem() == IR_INT ||
+              value->getIRType()->getTypeSystem() == IR_POINTER)) {
     intValue = 0;
     hasInt = true;
   }
@@ -202,7 +202,7 @@ MachineReg materializeConstant(MachineFunction &mf,
     detail = "<unnamed>";
   }
   if (value && value->getIRType()) {
-    detail += " type=" + std::to_string(value->getIRType()->getEnum());
+    detail += " type=" + std::to_string(value->getIRType()->getTypeSystem());
   }
   if (auto *instruction = dynamic_cast<Instruction *>(value)) {
     detail +=
@@ -252,7 +252,7 @@ MachineReg valueRegInBlock(MachineFunction &mf, MachineBasicBlock &block,
     return mapped->second;
   }
   if (value && value->getIRType() &&
-      value->getIRType()->getEnum() == IR_POINTER) {
+      value->getIRType()->getTypeSystem() == IR_POINTER) {
     return materializePointerValue(mf, instrs, value);
   }
   return materializeConstant(mf, instrs, value);

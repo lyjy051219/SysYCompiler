@@ -183,7 +183,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			RetEdges.push_back({RB, RV});
 		}
 
-		if (CallHasInstUsers && CI->getIRType() && CI->getIRType()->getEnum() != IR_VOID) {
+		if (CallHasInstUsers && CI->getIRType() && !CI->getIRType()->isVoid()) {
 			if (RetEdges.size() == 1 && RetEdges[0].second) {
 				CI->replaceAllUsesWith(RetEdges[0].second);
 			} else {

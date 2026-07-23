@@ -61,7 +61,7 @@ IntRange RangeAwareSimplifyPass::queryIntExprImpl(
     int depth, std::unordered_set<Value *> &visiting) {
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return IntRange(CI->getVal());
-    if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
+    if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return IntRange();
 
     IntRange base = RI.query(V, BB, DT);
@@ -80,8 +80,8 @@ IntRange RangeAwareSimplifyPass::queryIntExprImpl(
     Value *rhs = nullptr;
     if (!BI->getOperands(lhs, rhs)) return base;
     if (!lhs || !rhs) return base;
-    if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return base;
-    if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return base;
+    if (!lhs->getIRType() || !lhs->getIRType()->isInt()) return base;
+    if (!rhs->getIRType() || !rhs->getIRType()->isInt()) return base;
 
     ScopedActiveMark VisitingMark(visiting, V);
     IntRange l = queryIntExprImpl(lhs, BB, RI, DT, depth - 1, visiting);
@@ -130,7 +130,7 @@ int RangeAwareSimplifyPass::evalTruth(
     bool ConstantTruth = false;
     if (V && V->tryGetBoolConst(ConstantTruth))
         return ConstantTruth ? 1 : 0;
-    if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
+    if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return -1;
 
     IntRange R = queryIntExpr(V, BB, RI, DT);
@@ -166,8 +166,8 @@ bool RangeAwareSimplifyPass::strengthReduce(
 
         // 只处理整数除法/取模（BinaryInst::DIV/MOD 也用于 fdiv/frem，
         // 对浮点做移位/位与是致命的语义错误）
-        if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) continue;
-        if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) continue;
+        if (!lhs->getIRType() || !lhs->getIRType()->isInt()) continue;
+        if (!rhs->getIRType() || !rhs->getIRType()->isInt()) continue;
 
         // 右操作数必须是 2 的幂常量
         auto *rhsConst = dynamic_cast<ConstInt *>(rhs);
@@ -240,8 +240,8 @@ bool RangeAwareSimplifyPass::foldConstants(
         BasicBlock *block = I->getParent();
         if (!block) continue;
 
-        auto ty = I->getIRType()->getEnum();
-        if (ty == IR_INT) {
+        auto Ty = I->getIRType();
+        if (Ty->isInt()) {
             if (dynamic_cast<ConstInt *>(I)) continue;
             IntRange range = RI.query(I, block, DT);
             // 先看 IntRange 是不是单值；再退一步看 KB 是不是 32 位全锁定
@@ -257,7 +257,7 @@ bool RangeAwareSimplifyPass::foldConstants(
             if (singleInt) {
                 intToFold.push_back(I);
             }
-        } else if (ty == IR_FLOAT) {
+        } else if (Ty->isFloat()) {
             if (dynamic_cast<ConstFloat *>(I)) continue;
             FloatRange range = RI.queryFloat(I, block, DT);
             // isSingleValue 已经排除了 ±inf（不是合法的 float 常量）
@@ -271,9 +271,9 @@ bool RangeAwareSimplifyPass::foldConstants(
         BasicBlock *block = I->getParent();
         if (!block) continue;
         IntRange range = RI.query(I, block, DT);
-        int cval;
+        int64_t cval;
         if (range.isSingleValue()) {
-            cval = (int)range.min;
+            cval = range.min;
         } else {
             KnownBits kb = RI.queryBits(I, block, DT);
             if (!kb.isFullyKnown()) continue;
@@ -283,7 +283,8 @@ bool RangeAwareSimplifyPass::foldConstants(
         if (!Ty || !Ty->isInt()) continue;
         Value *Folded = Ty->isBool()
             ? static_cast<Value *>(ConstBool::newConstBool((cval & 1) != 0))
-            : static_cast<Value *>(ConstInt::newConstInt(cval, Ty->getSize()));
+            : static_cast<Value *>(ConstInt::newConstIntForType(
+                  cval, std::dynamic_pointer_cast<INTType>(Ty)));
         I->replaceAllUsesWith(Folded);
         delete I;
         changed = true;
@@ -336,11 +337,11 @@ bool RangeAwareSimplifyPass::foldComparisons(
         BasicBlock *BB = cmp->getParent();
         if (!BB) continue;
 
-        auto opTy = lhs->getIRType()->getEnum();
+        auto OpTy = lhs->getIRType();
 
         // 整数比较：BinaryInst 的 L/LE/G/GE/E/NE 整数浮点共用，靠操作数类型区分。
         // 整数路径走 IntRange，浮点路径走 FloatRange。
-        if (opTy == IR_INT && rhs->getIRType()->getEnum() == IR_INT) {
+        if (OpTy->isInt() && rhs->getIRType()->isInt()) {
             IntRange lRange = queryIntExpr(lhs, BB, RI, DT);
             IntRange rRange = queryIntExpr(rhs, BB, RI, DT);
 
@@ -415,7 +416,7 @@ bool RangeAwareSimplifyPass::foldComparisons(
         // 都明确排除 NaN 时，才能统一用下面的数值端点规则证明结果。
         // 有界区间也仍可能含 NaN，不能再用 "!isTop" 代替
         // nnan 证明。
-        if (opTy == IR_FLOAT && rhs->getIRType()->getEnum() == IR_FLOAT) {
+        if (OpTy->isFloat() && rhs->getIRType()->isFloat()) {
             FloatRange lRange = RI.queryFloat(lhs, BB, DT);
             FloatRange rRange = RI.queryFloat(rhs, BB, DT);
 
@@ -537,8 +538,8 @@ bool RangeAwareSimplifyPass::foldIcmpOfSelect(
         Value *rhs = nullptr;
         if (!cmp->getOperands(lhs, rhs)) continue;
         if (!lhs->getIRType() || !rhs->getIRType()) continue;
-        if (lhs->getIRType()->getEnum() != IR_INT) continue;
-        if (rhs->getIRType()->getEnum() != IR_INT) continue;
+        if (!lhs->getIRType()->isInt()) continue;
+        if (!rhs->getIRType()->isInt()) continue;
 
         BasicBlock *BB = cmp->getParent();
         if (!BB) continue;
@@ -548,8 +549,8 @@ bool RangeAwareSimplifyPass::foldIcmpOfSelect(
         if (!sel) continue;
         Value *tv = sel->getTrueValue();
         Value *fv = sel->getFalseValue();
-        if (!tv->getIRType() || tv->getIRType()->getEnum() != IR_INT) continue;
-        if (!fv->getIRType() || fv->getIRType()->getEnum() != IR_INT) continue;
+        if (!tv->getIRType() || !tv->getIRType()->isInt()) continue;
+        if (!fv->getIRType() || !fv->getIRType()->isInt()) continue;
 
         IntRange tr = dynamic_cast<ConstInt *>(tv) ?
             IntRange(dynamic_cast<ConstInt *>(tv)->getVal()) : queryIntExpr(tv, BB, RI, DT);
@@ -629,7 +630,7 @@ bool RangeAwareSimplifyPass::foldAbsViaSelect(
 
     std::vector<SelectInst *> candidates;
     for (SelectInst *SI : collectInstructions<SelectInst>(F))
-        if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
+        if (SI->getIRType() && SI->getIRType()->isInt())
             candidates.push_back(SI);
 
     auto matchNeg = [](Value *v) -> Value * {
@@ -711,7 +712,7 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
 
     std::vector<SelectInst *> candidates;
     for (SelectInst *SI : collectInstructions<SelectInst>(F))
-        if (SI->getIRType() && SI->getIRType()->getEnum() == IR_INT)
+        if (SI->getIRType() && SI->getIRType()->isInt())
             candidates.push_back(SI);
 
     for (SelectInst *SI : candidates) {

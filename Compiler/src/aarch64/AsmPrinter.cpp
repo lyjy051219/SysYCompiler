@@ -20,7 +20,7 @@ bool isBoolType(const std::shared_ptr<IRType> &type) {
 }
 
 bool isPointerType(const std::shared_ptr<IRType> &type) {
-  return type && type->getEnum() == IR_POINTER;
+  return type && type->getTypeSystem() == IR_POINTER;
 }
 
 int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
@@ -28,7 +28,7 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
     return 0;
   }
 
-  switch (type->getEnum()) {
+  switch (type->getTypeSystem()) {
   case IR_INT:
     return isBoolType(type) ? 1 : 4;
   case IR_FLOAT:

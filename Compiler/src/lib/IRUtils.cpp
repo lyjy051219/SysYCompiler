@@ -3,6 +3,7 @@
 #include "TypeSystem.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -185,13 +186,17 @@ int64_t IRMath::ceilDivPositive(int64_t Num, int64_t Den) {
     return (Num + Den - 1) / Den;
 }
 
-int32_t IRMath::normalizeSignedToWidth(int64_t Val, unsigned Bits) {
-    if (Bits == 0 || Bits >= 32) return static_cast<int32_t>(Val);
-    const uint32_t Mask = (uint32_t{1} << Bits) - 1;
-    uint32_t Truncated = static_cast<uint32_t>(Val) & Mask;
-    const uint32_t Sign = uint32_t{1} << (Bits - 1);
-    if (Truncated & Sign) Truncated |= ~Mask;
-    return static_cast<int32_t>(Truncated);
+int64_t IRMath::normalizeSignedToWidth(int64_t Val, unsigned Bits) {
+    if (Bits == 0 || Bits >= 64)
+        return Val;
+    const uint64_t Mask = (uint64_t{1} << Bits) - 1U;
+    uint64_t Truncated = static_cast<uint64_t>(Val) & Mask;
+    const uint64_t Sign = uint64_t{1} << (Bits - 1U);
+    if (Truncated & Sign)
+        Truncated |= ~Mask;
+    int64_t Result = 0;
+    std::memcpy(&Result, &Truncated, sizeof(Result));
+    return Result;
 }
 
 std::string IRKey::pointer(const void *Ptr) {
@@ -203,7 +208,39 @@ std::string IRKey::pointer(const void *Ptr) {
 std::string IRKey::type(const std::shared_ptr<IRType> &Ty) {
     if (!Ty) return "noty";
     std::ostringstream OS;
-    OS << static_cast<int>(Ty->getEnum()) << ':' << Ty->getSize() << ':'
-       << Ty.get();
+    switch (Ty->getTypeSystem()) {
+    case IR_INT: {
+        auto Integer = std::dynamic_pointer_cast<INTType>(Ty);
+        OS << 'i' << (Integer ? Integer->getBitWidth() : 0);
+        break;
+    }
+    case IR_FLOAT:
+        OS << "f32";
+        break;
+    case IR_VOID:
+        OS << "void";
+        break;
+    case IR_POINTER: {
+        auto Pointer = std::dynamic_pointer_cast<POINTERType>(Ty);
+        OS << "ptr(" << type(Pointer ? Pointer->getPointerType() : nullptr)
+           << ')';
+        break;
+    }
+    case IR_ARRAY: {
+        auto Array = std::dynamic_pointer_cast<ARRAYType>(Ty);
+        OS << "arr" << (Array ? Array->getElementCount() : 0) << '('
+           << type(Array ? Array->getElementType() : nullptr) << ')';
+        break;
+    }
+    case IR_VECTOR: {
+        auto Vector = std::dynamic_pointer_cast<VECTORType>(Ty);
+        OS << "vec" << (Vector ? Vector->getElementCount() : 0) << '('
+           << type(Vector ? Vector->getElementType() : nullptr) << ')';
+        break;
+    }
+    case IR_UNDEF:
+        OS << "undef";
+        break;
+    }
     return OS.str();
 }

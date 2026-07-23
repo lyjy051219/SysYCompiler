@@ -75,7 +75,7 @@ bool IndVarSimplifyPass::mergeExactRecurrences(Loop *L, SCEVResult &SE) {
     std::vector<PhiInst *> Phis = Header->collectPhiNodes();
     for (PhiInst *Phi : Phis) {
         if (!Phi || !Phi->getParent() || !Phi->getIRType() ||
-            Phi->getIRType()->getEnum() != IR_INT) {
+            !Phi->getIRType()->isInt()) {
             continue;
         }
         const SCEVExpr *E = SE.getSCEV(Phi);
@@ -109,7 +109,7 @@ bool IndVarSimplifyPass::orientExitComparison(Loop *L, SCEVResult &SE) {
     Value *LHS = Cmp->getOperand(0);
     Value *RHS = Cmp->getOperand(1);
     if (!LHS || !RHS || !BinaryInst::isCompareOp(Cmp->getOp()) ||
-        !LHS->getIRType() || LHS->getIRType()->getEnum() != IR_INT) {
+        !LHS->getIRType() || !LHS->getIRType()->isInt()) {
         return false;
     }
 

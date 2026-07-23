@@ -373,7 +373,7 @@ bool LoopUnrollPass::isKnownReadonlyInvariantCall(
     if (!CI || !Outer || !StableInner || !OuterLatch || !CallBB ||
         CallBB == Outer->getHeader() || !Outer->contains(CallBB) ||
         !DT.dominates(CallBB, OuterLatch) || CI->isTailCall() ||
-        !CI->getIRType() || CI->getIRType()->getEnum() == IR_VOID ||
+        !CI->getIRType() || CI->getIRType()->isVoid() ||
         !CI->hasUses()) {
         return false;
     }
@@ -517,7 +517,7 @@ LoopUnrollPass::findProvenStablePeelState(
     }
     for (PhiInst *StatePhi : Outer->getHeader()->collectPhiNodes()) {
         if (!StatePhi || !StatePhi->getIRType() ||
-            StatePhi->getIRType()->getEnum() != IR_INT) {
+            !StatePhi->getIRType()->isInt()) {
             continue;
         }
         Value *Initial = StatePhi->getIncomingFromPred(OuterPreHeader);
@@ -537,7 +537,7 @@ LoopUnrollPass::findProvenStablePeelState(
 
             Value *Bound = getStrictIncreasingHeaderBound(*TCI, *IV);
             if (!Bound || !Bound->getIRType() ||
-                Bound->getIRType()->getEnum() != IR_INT ||
+                !Bound->getIRType()->isInt() ||
                 !isExactInnerExitIV(Backedge, *TCI, IV->Phi) ||
                 !TCI->ExitBlock ||
                 !DT.dominates(TCI->ExitBlock, OuterLatch) ||
@@ -591,7 +591,7 @@ void LoopUnrollPass::discardUncommittedPeelClones(PeeledBodyCore &Core) {
     for (BasicBlock *BB : Blocks) {
         for (Instruction *I : *BB) {
             if (!I || !I->getIRType() ||
-                I->getIRType()->getEnum() == IR_VOID) {
+                I->getIRType()->isVoid()) {
                 continue;
             }
             if (I->hasUses())
@@ -859,19 +859,13 @@ bool LoopUnrollPass::isDataValue(Value *V) {
 
 bool LoopUnrollPass::isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
     if (!Phi || !isDataValue(V)) return false;
-    auto Ty = Phi->getIRType();
-    auto VTy = V->getIRType();
-    if (!Ty || !VTy) return false;
-    return Ty->getEnum() == VTy->getEnum() &&
-           Ty->getSize() == VTy->getSize();
+    // 展开后的PHI输入需要完整类型一致，避免等大小的异形类型混入SSA。
+    return IRType::hasSameShape(Phi->getIRType(), V->getIRType());
 }
 
 bool LoopUnrollPass::isValueCompatibleWithType(Value *V, std::shared_ptr<IRType> Ty) {
     if (!isDataValue(V) || !Ty) return false;
-    auto VTy = V->getIRType();
-    if (!VTy) return false;
-    return Ty->getEnum() == VTy->getEnum() &&
-           Ty->getSize() == VTy->getSize();
+    return IRType::hasSameShape(Ty, V->getIRType());
 }
 
 Value *LoopUnrollPass::mapDataValueAtIteration(Value *V,
@@ -1631,13 +1625,12 @@ bool LoopUnrollPass::makeStraightLineMain(UnrolledBodyCore &Core, int MainCount,
 }
 
 Value *LoopUnrollPass::makeTypedIntConstant(int64_t V, std::shared_ptr<IRType> Ty) {
-    if (V < std::numeric_limits<int>::min() ||
-        V > std::numeric_limits<int>::max()) {
+    auto IntegerType = std::dynamic_pointer_cast<INTType>(Ty);
+    if (!IntegerType || IntegerType->getBitWidth() > 64)
         return nullptr;
-    }
-    size_t Size = 4;
-    if (Ty && Ty->getEnum() == IR_INT) Size = Ty->getSize();
-    return ConstInt::newConstInt(static_cast<int>(V), Size);
+    if (IntegerType->getIsBool())
+        return ConstBool::newConstBool(V != 0);
+    return ConstInt::newConstIntForType(V, IntegerType);
 }
 
 bool LoopUnrollPass::isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *PreHeader,
@@ -1702,18 +1695,20 @@ Value *LoopUnrollPass::materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *P
         if (!Op) return nullptr;
 
         Instruction *Cast = nullptr;
+        auto IntegerType =
+            std::dynamic_pointer_cast<INTType>(E->Ty);
         switch (E->CastKind) {
         case SCEVCastKind::Trunc:
-            Cast = new TruncInst(E->Ty);
-            Cast->addUse(Op);
+            if (!IntegerType) return nullptr;
+            Cast = new TruncInst(Op, IntegerType);
             break;
         case SCEVCastKind::ZExt:
-            Cast = new ZextInst(E->Ty);
-            Cast->addUse(Op);
+            if (!IntegerType) return nullptr;
+            Cast = new ZextInst(Op, IntegerType);
             break;
         case SCEVCastKind::SExt:
-            Cast = new SextInst(E->Ty);
-            Cast->addUse(Op);
+            if (!IntegerType) return nullptr;
+            Cast = new SextInst(Op, IntegerType);
             break;
         case SCEVCastKind::BitCast:
             Cast = new BitCastInst(Op, E->Ty);

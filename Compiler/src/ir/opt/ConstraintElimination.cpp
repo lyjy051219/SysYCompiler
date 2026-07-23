@@ -42,7 +42,7 @@
 
 ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
     Value *V, int depth) {
-    if (!V || !V->getIRType() || V->getIRType()->getEnum() != IR_INT)
+    if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return {};
     if (depth <= 0)
         return {V, 0, true};
@@ -149,8 +149,10 @@ bool ConstraintEliminationPass::extractConstraint(
     if (!cmp->getOperands(lhs, rhs)) return false;
 
     // 仅整数比较
-    if (!lhs->getIRType() || lhs->getIRType()->getEnum() != IR_INT) return false;
-    if (!rhs->getIRType() || rhs->getIRType()->getEnum() != IR_INT) return false;
+    // 当前约束格与溢出证明均按 i32 构造；其他位宽保守跳过。
+    if (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
+        !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
+        return false;
 
     BinaryInst::Operation op = negate ? BinaryInst::negatePredicate(cmp->getOp()) : cmp->getOp();
     Value *val = lhs;
@@ -514,7 +516,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                             // 不影响子树的 frame.constraintsBefore 记账
                             size_t savedSize = constraintStack.size();
                             if (target.val->getIRType() &&
-                                target.val->getIRType()->getEnum() == IR_INT) {
+                                target.val->getIRType()->isInt()) {
                                 IntRange vr = RI.query(target.val, BB, DT);
                                 if (!vr.isTop() && !vr.isBottom()) {
                                     // 用 interned ConstInt 当 bound，避免 bound=nullptr
