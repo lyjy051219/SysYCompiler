@@ -13,13 +13,18 @@
   #include "../lib/AST.hpp"
   #include <memory>
   #include <iostream>
+
+  // 调用行号必须在词法器识别函数名时锁定，不能在右括号归约时读取。
+  struct LocatedIdentifier {
+      std::string text;
+      int line;
+  };
 }
 
 // 以下实现写入生成的 Bison.cpp。
 %code{
 extern yy::parser::symbol_type yylex();
 extern std::unique_ptr<CompUnit> ASTRoot;
-extern int yylineno;
 namespace yy {
     void parser::error(const std::string &err)
     {
@@ -31,7 +36,8 @@ namespace yy {
 // 终结符定义。
 %token <int> INTCONST
 %token <float> FLOATCONST
-%token <std::string> IDENT
+%token <LocatedIdentifier> IDENT
+%token <std::string> STRING_LITERAL
 %token CONST
 %token INT
 %token FLOAT
@@ -135,8 +141,8 @@ ConstDefList
   ;
 
 ConstDef
-  : IDENT ASSIGN ConstInitVal{ $$ = new ConstDef($1,nullptr,$3); }
-  | IDENT ConstExpList ASSIGN ConstInitVal{ $$ = new ConstDef($1,$2,$4); }
+  : IDENT ASSIGN ConstInitVal{ $$ = new ConstDef($1.text,nullptr,$3); }
+  | IDENT ConstExpList ASSIGN ConstInitVal{ $$ = new ConstDef($1.text,$2,$4); }
   ;
 
 ConstExpList
@@ -165,10 +171,10 @@ VarDefList
  ;
 
 VarDef
- : IDENT { $$ = new VarDef($1); }
- | IDENT ASSIGN InitVal{ $$ = new VarDef($1,nullptr,$3); }
- | IDENT ConstExpList { $$ = new VarDef($1,$2,nullptr); }
- | IDENT ConstExpList ASSIGN InitVal { $$ = new VarDef($1,$2,$4); }
+ : IDENT { $$ = new VarDef($1.text); }
+ | IDENT ASSIGN InitVal{ $$ = new VarDef($1.text,nullptr,$3); }
+ | IDENT ConstExpList { $$ = new VarDef($1.text,$2,nullptr); }
+ | IDENT ConstExpList ASSIGN InitVal { $$ = new VarDef($1.text,$2,$4); }
  ;
 
 InitVal
@@ -183,8 +189,8 @@ InitValList
  ;
 
 FuncDef
- : Type IDENT L_SMALL_BRACKET R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2, nullptr, $5); }
- | Type IDENT L_SMALL_BRACKET FuncFParamList R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2, $4, $6); }
+ : Type IDENT L_SMALL_BRACKET R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2.text, nullptr, $5); }
+ | Type IDENT L_SMALL_BRACKET FuncFParamList R_SMALL_BRACKET Block{ $$ = new FuncDef($1, $2.text, $4, $6); }
   ;
 
 FuncFParamList
@@ -193,10 +199,10 @@ FuncFParamList
  ;
 
 FuncFParam
- : Type IDENT { $$ = new FuncParam($1,$2); }
- | Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET { $$ = new FuncParam($1,$2,true); }
- | Type IDENT ExpList { $$ = new FuncParam($1,$2,false,$3); }
- | Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET ExpList { $$ = new FuncParam($1,$2,true,$5); }
+ : Type IDENT { $$ = new FuncParam($1,$2.text); }
+ | Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET { $$ = new FuncParam($1,$2.text,true); }
+ | Type IDENT ExpList { $$ = new FuncParam($1,$2.text,false,$3); }
+ | Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET ExpList { $$ = new FuncParam($1,$2.text,true,$5); }
  ;
 
 Block
@@ -231,8 +237,8 @@ Stmt
 
 
 LVal
- : IDENT{ $$ = new LVal($1); }
- | IDENT ExpList { $$ = new LVal($1,$2); }
+ : IDENT{ $$ = new LVal($1.text); }
+ | IDENT ExpList { $$ = new LVal($1.text,$2); }
  ;
 
 ExpList
@@ -245,8 +251,10 @@ PrimaryExp
  | LVal { $$ = (HasOperand*)$1; }
  | INTCONST{ $$ = (HasOperand*)(new ConValue<int>($1)); }
  | FLOATCONST{ $$ = (HasOperand*)(new ConValue<float>($1)); }
- | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1, yylineno));}
- | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = (HasOperand*)(new FuncCall($1, $3, yylineno));}
+ | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $1.line));}
+ | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = (HasOperand*)(new FuncCall($1.text, $3, $1.line));}
+ | IDENT L_SMALL_BRACKET STRING_LITERAL R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $3, $1.line));}
+ | IDENT L_SMALL_BRACKET STRING_LITERAL COMMA FuncRParamList R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $3, $5, $1.line));}
   ;
 
 

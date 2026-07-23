@@ -33,9 +33,11 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return isBoolType(type) ? 1 : 4;
+    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
   case IR_FLOAT:
     return 4;
+  case IR_DOUBLE:
+    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -55,9 +57,11 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return isBoolType(type) ? 1 : 4;
+    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
   case IR_FLOAT:
     return 4;
+  case IR_DOUBLE:
+    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -77,6 +81,10 @@ bool isFloatType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_FLOAT;
 }
 
+bool isDoubleType(const std::shared_ptr<IRType> &type) {
+  return type && type->getEnum() == IR_DOUBLE;
+}
+
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_POINTER;
 }
@@ -87,6 +95,9 @@ std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   }
   if (type->getEnum() == IR_FLOAT) {
     return "f32";
+  }
+  if (type->getEnum() == IR_DOUBLE) {
+    return "f64";
   }
   if (type->getEnum() == IR_INT) {
     return "i" + std::to_string(type->getSize() * 8);
@@ -104,6 +115,11 @@ RegClass regClassForType(const std::shared_ptr<IRType> &type) {
   switch (type->getEnum()) {
   case IR_FLOAT:
     return RegClass::FPR32;
+  // SysY has no source-level double.  The only f64 values are C default
+  // argument promotions for putf.  Keep their raw IEEE-754 bits in a GPR64;
+  // RV64 variadic floating arguments use the integer calling convention.
+  case IR_DOUBLE:
+    return RegClass::GPR64;
   case IR_POINTER:
     return RegClass::GPR64;
   case IR_INT:
@@ -829,7 +845,8 @@ bool lowerIntegerImmediateOp(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
-  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT);
+  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT ||
+                  type->getEnum() == IR_DOUBLE);
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
@@ -1003,8 +1020,11 @@ Opcode loadOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isPointerType(type)) {
     return Opcode::LD;
   }
+  if (isDoubleType(type)) {
+    return Opcode::LD;
+  }
   if (type && type->getEnum() == IR_INT) {
-    if (isBoolType(type)) {
+    if (type->getSize() == 1) {
       return Opcode::LBU;
     }
     return Opcode::LW;
@@ -1019,8 +1039,11 @@ Opcode storeOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isPointerType(type)) {
     return Opcode::SD;
   }
+  if (isDoubleType(type)) {
+    return Opcode::SD;
+  }
   if (type && type->getEnum() == IR_INT) {
-    if (isBoolType(type)) {
+    if (type->getSize() == 1) {
       return Opcode::SB;
     }
     return Opcode::SW;
@@ -1244,6 +1267,8 @@ const char *instTypeName(Instruction::InstType type) {
     return "FPTOSI";
   case Instruction::SITOFP:
     return "SITOFP";
+  case Instruction::FPEXT:
+    return "FPEXT";
   case Instruction::BITCAST:
     return "BITCAST";
   }
@@ -1498,6 +1523,18 @@ void lowerCast(MachineFunction &mf, MachineBasicBlock &mbb, Instruction &inst) {
   case Instruction::SITOFP:
     appendRegInstr(mbb, Opcode::FCVT_S_W, dst, {src});
     break;
+  case Instruction::FPEXT: {
+    if (!isFloatType(srcValue->getIRType()) ||
+        !isDoubleType(inst.getIRType())) {
+      throw BackendError("unsupported fpext types");
+    }
+    // Use an explicit physical scratch so register allocation sees the
+    // clobber and prevents any live f32 value from being assigned to ft11.
+    MachineReg scratch = MachineReg::preg(PhysReg::FT11, RegClass::FPR32);
+    appendRegInstr(mbb, Opcode::FCVT_D_S, scratch, {src});
+    appendRegInstr(mbb, Opcode::FMV_X_D, dst, {scratch});
+    break;
+  }
   case Instruction::TRUNC:
   case Instruction::ZEXT: {
     MachineReg one = materializeInt(mf, mbb, 1, RegClass::GPR32);
@@ -2168,7 +2205,7 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
     Opcode storeOpcode = Opcode::SW;
     if (move.rc == RegClass::FPR32) {
       storeOpcode = Opcode::FSW;
-    } else if (isPointerType(move.value->getIRType())) {
+    } else if (move.rc == RegClass::GPR64) {
       storeOpcode = Opcode::SD;
     }
     appendStore(mbb, storeOpcode, argRegs[i], stackSlot);
@@ -2332,6 +2369,7 @@ void lowerInstruction(MachineFunction &mf, MachineBasicBlock &mbb,
   case Instruction::SEXT:
   case Instruction::FPTOSI:
   case Instruction::SITOFP:
+  case Instruction::FPEXT:
     lowerCast(mf, mbb, inst);
     return;
   default:

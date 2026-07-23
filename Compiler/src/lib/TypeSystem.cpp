@@ -160,6 +160,8 @@ std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){
             return std::static_pointer_cast<IRType>(INTType::NewInt(4));
         case IR_FLOAT:
             return std::static_pointer_cast<IRType>(FLOATType::NewFloat());
+        case IR_DOUBLE:
+            return std::static_pointer_cast<IRType>(DOUBLEType::NewDouble());
         case IR_VOID:
             return std::static_pointer_cast<IRType>(VOIDType::NewVoid());
         case IR_POINTER:
@@ -205,6 +207,13 @@ std::shared_ptr<FLOATType> FLOATType::NewFloat(){
     return single;
 }
 void FLOATType::toString() const { std::cout << "float"; }
+
+// double 仅作为运行库可变参数边界上的中间类型。
+std::shared_ptr<DOUBLEType> DOUBLEType::NewDouble(){
+    static std::shared_ptr<DOUBLEType> single(new DOUBLEType());
+    return single;
+}
+void DOUBLEType::toString() const { std::cout << "double"; }
 
 // 指针类型按被指向类型作为键驻留，并递归输出基础类型。
 std::shared_ptr<POINTERType> POINTERType::NewPointer(std::shared_ptr<IRType> pointerType){

@@ -26,6 +26,10 @@ bool isBoolType(const std::shared_ptr<IRType> &type) {
   return intType && intType->getIsBool();
 }
 
+bool isByteIntType(const std::shared_ptr<IRType> &type) {
+  return type && type->getEnum() == IR_INT && type->getSize() == 1;
+}
+
 int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return 0;
@@ -33,9 +37,11 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return isBoolType(type) ? 1 : 4;
+    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
   case IR_FLOAT:
     return 4;
+  case IR_DOUBLE:
+    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -55,9 +61,11 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return isBoolType(type) ? 1 : 4;
+    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
   case IR_FLOAT:
     return 4;
+  case IR_DOUBLE:
+    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -77,6 +85,10 @@ bool isFloatType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_FLOAT;
 }
 
+bool isDoubleType(const std::shared_ptr<IRType> &type) {
+  return type && type->getEnum() == IR_DOUBLE;
+}
+
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_POINTER;
 }
@@ -87,6 +99,9 @@ std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   }
   if (type->getEnum() == IR_FLOAT) {
     return "f32";
+  }
+  if (type->getEnum() == IR_DOUBLE) {
+    return "f64";
   }
   if (type->getEnum() == IR_INT) {
     return "i" + std::to_string(type->getSize() * 8);
@@ -104,6 +119,10 @@ RegClass regClassForType(const std::shared_ptr<IRType> &type) {
   switch (type->getEnum()) {
   case IR_FLOAT:
     return RegClass::FPR32;
+  // double 仅作为 putf 可变参数的 ABI 中间类型；后端用
+  // GPR64 保存它的 64 位位型，到调用边界再搬入 d0-d7。
+  case IR_DOUBLE:
+    return RegClass::GPR64;
   case IR_POINTER:
     return RegClass::GPR64;
   case IR_INT:
@@ -829,7 +848,8 @@ bool lowerIntegerImmediateOp(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 bool isScalarResultType(const std::shared_ptr<IRType> &type) {
-  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT);
+  return type && (type->getEnum() == IR_INT || type->getEnum() == IR_FLOAT ||
+                  type->getEnum() == IR_DOUBLE);
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
@@ -1000,11 +1020,14 @@ Opcode loadOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isFloatType(type)) {
     return Opcode::FLW;
   }
+  if (isDoubleType(type)) {
+    return Opcode::LD;
+  }
   if (isPointerType(type)) {
     return Opcode::LD;
   }
   if (type && type->getEnum() == IR_INT) {
-    if (isBoolType(type)) {
+    if (isByteIntType(type)) {
       return Opcode::LBU;
     }
     return Opcode::LW;
@@ -1016,11 +1039,14 @@ Opcode storeOpcodeForType(const std::shared_ptr<IRType> &type) {
   if (isFloatType(type)) {
     return Opcode::FSW;
   }
+  if (isDoubleType(type)) {
+    return Opcode::SD;
+  }
   if (isPointerType(type)) {
     return Opcode::SD;
   }
   if (type && type->getEnum() == IR_INT) {
-    if (isBoolType(type)) {
+    if (isByteIntType(type)) {
       return Opcode::SB;
     }
     return Opcode::SW;
@@ -1251,6 +1277,8 @@ const char *instTypeName(Instruction::InstType type) {
     return "FPTOSI";
   case Instruction::SITOFP:
     return "SITOFP";
+  case Instruction::FPEXT:
+    return "FPEXT";
   case Instruction::BITCAST:
     return "BITCAST";
   }
@@ -1505,6 +1533,15 @@ void lowerCast(MachineFunction &mf, MachineBasicBlock &mbb, Instruction &inst) {
   case Instruction::SITOFP:
     appendRegInstr(mbb, Opcode::FCVT_S_W, dst, {src});
     break;
+  case Instruction::FPEXT: {
+    // MIR 不引入可分配的 FPR64 类。先在保留的 d27 中完成
+    // fcvt d27, sN，再把 double 的 64 位位型搬到 GPR64。
+    const MachineReg fpScratch =
+        MachineReg::preg(PhysReg::FT11, RegClass::FPR32);
+    appendRegInstr(mbb, Opcode::FCVT_D_S, fpScratch, {src});
+    appendRegInstr(mbb, Opcode::FMV_X_D, dst, {fpScratch});
+    break;
+  }
   case Instruction::TRUNC:
   case Instruction::ZEXT: {
     MachineReg one = materializeInt(mf, mbb, 1, RegClass::GPR32);
@@ -2103,6 +2140,7 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   struct ArgMove {
     Value *value = nullptr;
     RegClass rc = RegClass::GPR32;
+    bool doubleBits = false;
     bool stack = false;
     int64_t stackOffset = 0;
     PhysReg phys = PhysReg::NoReg;
@@ -2112,13 +2150,17 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   std::size_t nextGpr = 0;
   std::size_t nextFpr = 0;
   int64_t stackBytes = 0;
+  const bool isPutfCall = name == "putf";
   auto &uses = inst.getUserList();
   for (std::size_t i = 1; i < uses.size(); ++i) {
     Value *arg = uses[i]->getValue();
     ArgMove move;
     move.value = arg;
     move.rc = regClassForType(arg->getIRType());
-    if (move.rc == RegClass::FPR32) {
+    move.doubleBits = isPutfCall && isDoubleType(arg->getIRType());
+    if (move.doubleBits || move.rc == RegClass::FPR32) {
+      // AAPCS64 的 FP/SIMD 参数寄存器拥有独立游标。putf 中
+      // fpext 后的 double 占用 d0-d7，不消耗 x0-x7 游标。
       if (nextFpr < std::size(fprArgs)) {
         move.phys = fprArgs[nextFpr++];
       } else {
@@ -2160,6 +2202,12 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   for (std::size_t i = 0; i < argMoves.size(); ++i) {
     const ArgMove &move = argMoves[i];
     if (!move.stack) {
+      if (move.doubleBits) {
+        appendRegInstr(
+            mbb, Opcode::FMV_D_X,
+            MachineReg::preg(move.phys, RegClass::FPR32), {argRegs[i]});
+        continue;
+      }
       MachineReg dst =
           MachineReg::preg(move.phys, move.rc == RegClass::FPR32
                                           ? RegClass::FPR32
@@ -2173,7 +2221,10 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
     Address stackSlot = Address::regBase(
         MachineReg::preg(PhysReg::SP, RegClass::GPR64), move.stackOffset);
     Opcode storeOpcode = Opcode::SW;
-    if (move.rc == RegClass::FPR32) {
+    if (move.doubleBits) {
+      // double 在 MIR 中是 GPR64 位型；栈传参直接写入 8 字节。
+      storeOpcode = Opcode::SD;
+    } else if (move.rc == RegClass::FPR32) {
       storeOpcode = Opcode::FSW;
     } else if (isPointerType(move.value->getIRType())) {
       storeOpcode = Opcode::SD;
@@ -2339,6 +2390,7 @@ void lowerInstruction(MachineFunction &mf, MachineBasicBlock &mbb,
   case Instruction::SEXT:
   case Instruction::FPTOSI:
   case Instruction::SITOFP:
+  case Instruction::FPEXT:
     lowerCast(mf, mbb, inst);
     return;
   default:

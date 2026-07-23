@@ -170,6 +170,7 @@ bool dceInstructionMustBePreserved(Instruction *I) {
 		case Instruction::SEXT:
 		case Instruction::FPTOSI:
 		case Instruction::SITOFP:
+		case Instruction::FPEXT:
 		case Instruction::BITCAST:
 			return false;
 		case Instruction::BinaryUnknown:

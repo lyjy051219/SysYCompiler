@@ -1,6 +1,8 @@
 #pragma once
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 #include <list>
 
@@ -476,20 +478,29 @@ public:
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 };
 
-// 函数调用记录被调函数、可选实参列表和源码行号。
+// 函数调用记录被调函数、可选 putf 格式串、可选实参列表和源码行号。
 class FuncCall : public HasOperand{
   private:
   std::string ident;
   std::unique_ptr<FuncRParamList> fp;
+  std::optional<std::string> formatString;
   int lineno;
   public:
-  FuncCall(std::string id, FuncRParamList* fp, int line) : ident(id), fp(std::unique_ptr<FuncRParamList>(fp)), lineno(line) {}
-  FuncCall(std::string id, int line) : ident(id), fp(nullptr), lineno(line) {}
+  FuncCall(std::string id, FuncRParamList* fp, int line)
+      : ident(std::move(id)), fp(fp), formatString(std::nullopt), lineno(line) {}
+  FuncCall(std::string id, int line)
+      : ident(std::move(id)), fp(nullptr), formatString(std::nullopt), lineno(line) {}
+  FuncCall(std::string id, std::string format, FuncRParamList* fp, int line)
+      : ident(std::move(id)), fp(fp), formatString(std::move(format)), lineno(line) {}
+  FuncCall(std::string id, std::string format, int line)
+      : ident(std::move(id)), fp(nullptr), formatString(std::move(format)), lineno(line) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
   const std::string& getIdent() const { return ident; }
   bool hasParams() const { return fp != nullptr; }
   const std::unique_ptr<FuncRParamList>& getParams() const { return fp; }
+  bool hasFormatString() const { return formatString.has_value(); }
+  const std::optional<std::string>& getFormatString() const { return formatString; }
   int getLineNo() const { return lineno; }
 };
 // 数组维度或索引表达式列表，对应语法规则中的 ExpList。

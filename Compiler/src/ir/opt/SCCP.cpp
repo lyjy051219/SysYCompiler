@@ -187,10 +187,14 @@ void SCCPSolver::visitInstruction(Instruction* I) {
         visitGEPInst(GEP);
     } else if (I->instType == Instruction::SITOFP ||
                I->instType == Instruction::FPTOSI ||
+               I->instType == Instruction::FPEXT ||
                I->instType == Instruction::ZEXT ||
                I->instType == Instruction::SEXT ||
                I->instType == Instruction::TRUNC) {
-        visitCastInst(I);
+        if (I->instType == Instruction::FPEXT)
+            mergeInValue(I, LatticeValue::getBottom());
+        else
+            visitCastInst(I);
     } else if (I->instType == Instruction::BITCAST) {
         // BitCast 是类型重解释，结果不可预测
         mergeInValue(I, LatticeValue::getBottom());

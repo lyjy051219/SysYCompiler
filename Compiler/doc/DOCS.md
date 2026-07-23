@@ -37,22 +37,23 @@ Compiler/
 │   ├── lib/                          # 编译器前端文件及中端基础结构文件
 │   ├── ir/                           # 中端优化框架
 │   │   ├── analysis/                 # 中端分析 Pass
-│   │   ├── transform/                # 中端变换与优化 Pass
+│   │   └── opt/                	  # 中端变换与优化 Pass
 │   ├── riscv/                        # RISC-V 后端
 │   └── aarch64/                      # ARM 后端
+│
 ├── src/                              # .cpp文件
 │   ├── yacc/                         # 词法、语法分析相关文件
 │   ├── lib/                          # 编译器前端文件及中端基础结构文件
 │   ├── ir/                           # 中端优化框架
 │   │   ├── analysis/                 # 中端分析 Pass
-│   │   ├── transform/                # 中端变换与优化 Pass
+│   │   └── opt/                      # 中端变换与优化 Pass
 │   ├── riscv/                        # RISC-V 后端
 │   └── aarch64/                      # ARM 后端
 │
 ├── runtime/                          # SysY 运行时库
 ├── main.cpp                          # 编译器入口
 ├── CMakeLists.txt                    # CMake 项目构建配置
-└── README.md                         # 项目输入参数说明
+└── README.md                         # 项目说明
 ```
 
 ### 前端
@@ -78,7 +79,7 @@ Compiler/
 
    ```mermaid
    graph TD
-   
+
    	N1[CompUnit] --> N3[FuncDef]
    	N1[CompUnit] --> N4[ConstDecl]
    	N1[CompUnit] --> N5[VarDecl]
@@ -97,7 +98,7 @@ Compiler/
    	N9[VarDef] --> N15[InitVal]
    	N3[FuncDef] --> N16[ident]
    	N3[FuncDef] --> N17[Type]
-   
+
    	N12[FuncParam] --> N18[Type]
    	N12[FuncParam] --> N19[ident]
    	N12[FuncParam] --> N20[ArrayList]
@@ -128,7 +129,7 @@ Compiler/
    	N3[Stmt] --> N16[ContinueStmt]
    	N3[Stmt] --> N17[ReturnStmt]
    	N17[ReturnStmt] --> n18[AddExp]
-   
+
    ```
 
 
@@ -144,14 +145,14 @@ Compiler/
        N5[AddExp] --> N6[MulExp]
        N6[MulExp] --> N7[UnaryExp]
        N7[UnaryExp] --> N8[HasOperand]
-   
+
        N8[HasOperand] --> N9[LVal]
        N8[HasOperand] --> N10[FuncCall]
        N8[HasOperand] --> N11[ConValue]
-   
+
        N9[LVal] --> N12[ArrayList]
        N10[FuncCall] --> N13[FuncRParamList]
-   
+
        N12[ArrayList] --> N5[AddExp]
        N13[FuncRParamList] --> N5[AddExp]
    ```
@@ -2417,7 +2418,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
      // ================= 转换后 =================
      preHeader:
          Mergephi [ 1, pre, 2, pre ]
-    
+
      Header:
          phi [ Mergephi, preHeader, 3, x, 4, y ]
      ```
@@ -2452,29 +2453,29 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       O1[Outside 1]
       O2[Outside 2]
       O3[Outside 3]
-  
+
       %% 循环内部
       subgraph LoopArea [Loop]
           direction TB
           H[Header]
           B1[Body 1]
           B2[Body 2]
-  
+
           H --> B1
           H --> B2
           B1 -->|回边 1| H
           B2 -->|回边 2| H
       end
-  
+
       %% 出口区域
       E[ExitingBlock]
-  
+
       %% 跨区域连线
       O1 --> H
       O2 --> H
       B1 --> E
       O3 --> E
-  
+
       %% 样式调整匹配你的手绘布局
       classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
       classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
@@ -2489,7 +2490,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       O1[Outside 1]
       O2[Outside 2]
       O3[Outside 3]
-  
+
       %% 循环内部
       subgraph LoopArea [Loop]
           direction TB
@@ -2498,7 +2499,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
           B1[Body 1]
           B2[Body 2]
           L["新块: Latch"]
-  
+
           PH -->|① 唯一入口| H
           H --> B1
           H --> B2
@@ -2506,19 +2507,19 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
           B2 --> L
           L -->|③ 唯一回边| H
       end
-  
+
       %% 出口区域
       DE["新块: Dedicated Exit"]
       E[ExitingBlock]
-  
+
       %% 跨区域连线
       O1 --> PH
       O2 --> PH
-  
+
       B1 -->|② 拦截内部跳出| DE
       DE --> E
       O3 -->|外部连线保持原样| E
-  
+
       %% 样式标注
       classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
       classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
@@ -2607,10 +2608,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
       %% 定义节点样式类，保持清晰度
       classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
       classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-  
+
       %% 外部节点
       PreHeader[PreHeader]
-  
+
       %% 循环内部结构
       subgraph Loop
           direction TB
@@ -2619,21 +2620,21 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
           Body["Body<br/>define: val"]
           Latch[Latch]
       end
-  
+
       %% 控制流
       PreHeader --> Header
       Header --> Body
       Body --> Latch
       Latch --> Header
-  
+
       %% 外部节点
       %% 在 Exiting Block 节点中明确标注文本内容
       ExitingBlock["Exiting Block<br/>Use: val"]
-  
+
       %% 指向退出块的连线
       %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
       Body --> ExitingBlock
-  
+
       %% 应用样式类
       class Header,Body,Latch loopBlock;
       class ExitingBlock exitBlock;
@@ -2648,10 +2649,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
       %% 定义节点样式类，保持清晰度
       classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
       classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-  
+
       %% 外部节点
       PreHeader[PreHeader]
-  
+
       %% 循环内部结构
       subgraph Loop
           direction TB
@@ -2660,21 +2661,21 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
           Body["Body<br/>define: val"]
           Latch[Latch]
       end
-  
+
       %% 控制流
       PreHeader --> Header
       Header --> Body
       Body --> Latch
       Latch --> Header
-  
+
       %% 外部节点
       %% 在 Exiting Block 节点中明确标注文本内容
       ExitingBlock["Exiting Block<br/>%val.lcssa = phi i32 [ %val, %Body ]<br/>Use：val.lcssa"]
-  
+
       %% 指向退出块的连线
       %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
       Body --> ExitingBlock
-  
+
       %% 应用样式类
       class Header,Body,Latch loopBlock;
       class ExitingBlock exitBlock;
@@ -2998,64 +2999,64 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
      检查离开分支的ExitBB中的PHI中的incoming value，这个incoming value必须也是循环不变量（不能在循环内被计算），否则不能被执行
 
      然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader
-  
+
      如果ExitBB只有当前分支块 ParentBB这一个前驱，那么出口直接复用，如果ExitBB还有其他前驱，那么进行切分，旧的ExitBB保留全部PHI，并新增跳到NewBB的Br无条件分支指令，NewBB保留原来旧ExitBB所有其他指令
-  
+
      然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor（退出方向   -> ExitBB 或切分得到的 NewBB，继续方向   -> NewPreHeader）
-  
+
      然后创建ParentBB的新分支指令Br无条件跳转到继续循环的那个块上
-  
+
      对出口 PHI 进行修复：
-  
+
      - 如果直接复用原来的 `ExitBB`，则将 PHI 中来自 `ParentBB` 的 incoming block 修改为来自 `OldPreHeader`，incoming value 保持不变。
      - 如果对ExitBB进行了切分，则不能简单地把原 PHI 的 incoming block 修改为OldPreHeader。需要在切分得到的NewBB中创建新的合流 PHI，用来合并：
        - 从 `OldPreHeader` 直接退出时使用的循环不变量值；
        - 从原 `ExitBB` 正常退出时得到的原 PHI 结果。
-  
+
      最后替换循环内所有使用循环不变量的Use为确定的True/False常量
-  
+
      变换完成后重新获取当前ParentBB的 terminator：
-  
+
      - 如果当前terminator已经变成无条件 branch，则根据其唯一successor更新下一个必经基本块，并继续扫描。
      - 如果successor已经离开当前循环，或者该基本块已经被访问过，则停止扫描。
-  
+
      ![image-20260714200129403](assets/image-20260714200129403.png)
-  
+
   4. Full Non-trivial Unswitch：
-  
+
      获取当前块ParentBB，以及对应的分支指令。要求整个分支条件都是循环不变量，并且该分支属于当前循环本身，而不是位于某个内层子循环中。
-  
+
      根据目前的分支指令确定两个分支的successor，根据支配树，确定我们每个分支具体需要clone的支配子树（如果某些基本块被其中一个 successor 支配，并且只能通过该 successor 到达，那么这些基本块只属于对应的专门化路径。在克隆某个循环版本时，由另一个 successor 独占支配的基本块不需要复制；这些块在当前专门化版本中不可达。）
-  
+
      然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader--**这一部分和刚才Trivial Unswitch一样**
-  
+
      克隆循环：克隆当前循环所需要的全部基本块，并且为克隆循环新建一个 ClonedPreHeader。在clone过程中建立原值到clone值的映射，clone每条指令的时候必须重新映射其操作数，然后克隆循环 Header 中的 PHI,并根据其映射修改相关的incoming，克隆循环内其他 PHI 时，也必须同时映射 incoming value 和 incoming block，如果根据支配子树裁剪了部分基本块，那么必须删除由未克隆基本块产生的 PHI incoming，并在 PHI 只剩一个 incoming value 时进一步简化 PHI，对于循环出口和 LCSSA PHI，需要为克隆循环建立对应的退出值。原循环退出产生的值和克隆循环退出产生的值，最终需要在循环外合流
-  
+
      然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor
-  
+
      然后对原循环进行专门化，由于原循环负责 `Cond = false` 的版本，所以原循环中的 `ParentBB` 不再需要保留原条件分支，而是创建新的无条件 branch，删除原循环之中不需要保留的那条分支的CFG边，必须删除 `CloneSucc` 中所有来自 `ParentBB` 的 PHI incoming，
-  
+
      然后对clone循环进行专门化，根据映射将克隆循环中的原条件 branch 替换为无条件 branch，同时删除克隆循环中指向另一个 successor 的 CFG 边，并删除对应 successor PHI 中来自 `ClonedParentBB` 的 incoming
-  
+
      然后进行循环不变量的常量替换，并替换该循环内所有对该循环不变量的Use
-  
+
      对于每个原循环 ExitBB：
-  
+
      1. 保留原循环版本的退出 incoming。
      2. 增加克隆循环版本对应的退出 incoming。
      3. 如果原 ExitBB 不能直接同时承接两个循环版本，则切分或新建 ExitMergeBB。
      4. 在 ExitMergeBB 中建立合流 PHI。
      5. 所有循环外 Use 改为使用合流 PHI 的结果。
-     
+
      ![image-20260714205026714](assets/image-20260714205026714.png)
-  
-     
-  
-     
-  
-     
-  
-     
+
+
+
+
+
+
+
+
 
 
 
@@ -3127,7 +3128,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
            NewBB = cloneBasicBlock(BB)
            将 NewBB 插入到函数中
            记录 BMap[BB][i] = NewBB
-       
+
            for Inst in BB:
                NewInst = cloneInstruction(Inst)
                将 NewInst 插入 NewBB
@@ -3243,10 +3244,10 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        如果当前复制的是 Header:
            Headers.push_back(NewBB)
-       
+
        如果当前复制的是 Latch:
            Latches.push_back(NewBB)
-       
+
        如果当前复制的是 ExitingBlock:
            ExitingBlocks.push_back(NewBB)
        ```
@@ -3282,7 +3283,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
        ```
        原来：
        i = phi [0, preheader], [i.next, latch]
-       
+
        展开 4 倍后：
        i = phi [0, preheader], [i.next.3, latch.3]
        ```
@@ -3356,7 +3357,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
   ```
   原来：
   i = phi [0, preheader], [i.next, latch]
-  
+
   展开 4 倍后：
   i = phi [0, preheader], [i.next.3, latch.3]
   ```
@@ -3442,17 +3443,17 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
   executeFullUnroll
       -> cloneUnrolledBodyCore
       -> full CFG 收尾
-  
+
   executePartialUnroll
       -> cloneUnrolledBodyCore
       -> partial CFG 收尾
-  
+
   executePartialWithRemainder
       -> 修改主循环边界
       -> cloneUnrolledBodyCore
       -> 生成 remainder loop
       -> 修复 PHI
-  
+
   executeRuntimeUnroll
       -> 物化 runtime TripCount
       -> 生成 runtime guard
@@ -3823,13 +3824,13 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
   for GEP in F.instructions:
       base = GEP.operand[0]
       numIndices = GEP.operands.size - 1
-  
+
       if numIndices == 0:
           GEP.replaceAllUsesWith(base); delete GEP; continue
-  
+
       if base is UndefValue:
           GEP.replaceAllUsesWith(Undef(GEP.type)); delete GEP; continue
-  
+
       // 扫描非零索引
       nonZeroCount = 0
       splitPoint = 0
@@ -3839,13 +3840,13 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
               nonZeroCount += 1
               if nonZeroCount == 2:
                   splitPoint = i; break
-  
+
       if splitPoint > 0:
           frontIndices = UL[1 .. splitPoint-1]
           frontGEP = new GetElementPtrInst(base, frontIndices)
           frontGEP.updateType()
           insertBefore(GEP, frontGEP)
-  
+
           backIndices = [const(0)] + UL[splitPoint .. end]
           GEP.operands.clear()
           GEP.addUse(frontGEP)
@@ -3880,7 +3881,7 @@ Mark-Sweep 算法，数据依赖用 worklist 反向传播活性，控制依赖�
   ```
   for GEP in F.geps:    if GEP in deleted: continue    base = GEP.operand[0]    if base not GetElementPt找出SCEV一共实现了几种rInst: continue    if base in deleted: continue    if countUses(base) > 1: continue        // 单 use 检查    firstIdx     = GEP.operand[1]    baseLastIdx  = base.operands.back()    if firstIdx is const(0):        newIndices = base.indices + GEP.indices[1:]        replaceGEPOperands(GEP, base.baseOp, newIndices)        toDelete.append(base); deleted.insert(base)    elif baseLastIdx is const(0):        newIndices = base.indices[:-1] + GEP.indices        replaceGEPOperands(...)    elif firstIdx is const(c1) and baseLastIdx is const(c2):        combined = base.indices[:-1] + [const(c1+c2)] + GEP.indices[1:]        if nonZeroCount(combined) <= 1:            replaceGEPOperands(...)
   ```
-  
+
 - **Part 2: PHI 中 GEP 提取**
 
   如果 PHI 的所有 incoming value 都是结构相同的 GEP（共享同一个 base，只在一个索引位置不同），把 GEP 提到 merge 块，不同的索引位置换成新 PHI：

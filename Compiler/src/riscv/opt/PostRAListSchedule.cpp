@@ -100,6 +100,7 @@ uint32_t opcodeLatency(Opcode opcode) {
   case Opcode::F_COPY:
   case Opcode::FMV_W_X:
   case Opcode::FMV_X_W:
+  case Opcode::FMV_X_D:
   case Opcode::LI:
   case Opcode::LA:
   case Opcode::ADD:
@@ -151,6 +152,7 @@ uint32_t opcodeLatency(Opcode opcode) {
     return 12;
   case Opcode::FCVT_W_S:
   case Opcode::FCVT_S_W:
+  case Opcode::FCVT_D_S:
   case Opcode::FEQ_S:
   case Opcode::FLT_S:
   case Opcode::FLE_S:

@@ -19,6 +19,10 @@ bool isBoolType(const std::shared_ptr<IRType> &type) {
   return intType && intType->getIsBool();
 }
 
+bool isByteIntType(const std::shared_ptr<IRType> &type) {
+  return type && type->getEnum() == IR_INT && type->getSize() == 1;
+}
+
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getEnum() == IR_POINTER;
 }
@@ -30,9 +34,11 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
 
   switch (type->getEnum()) {
   case IR_INT:
-    return isBoolType(type) ? 1 : 4;
+    return std::max<int64_t>(1, static_cast<int64_t>(type->getSize()));
   case IR_FLOAT:
     return 4;
+  case IR_DOUBLE:
+    return 8;
   case IR_POINTER:
     return 8;
   case IR_ARRAY: {
@@ -441,13 +447,16 @@ void emitDataValue(std::ostream &out, Value *value,
     throw BackendError("unsupported pointer global initializer");
   }
 
-  if (isBoolType(type)) {
+  if (isByteIntType(type)) {
     if (auto boolValue = dynamic_cast<ConstBool *>(value)) {
       out << "    .byte " << (boolValue->getVal() ? 1 : 0) << '\n';
       return;
     }
     if (auto intValue = dynamic_cast<ConstInt *>(value)) {
-      out << "    .byte " << (intValue->getVal() != 0 ? 1 : 0) << '\n';
+      const int64_t byte = isBoolType(type)
+                               ? (intValue->getVal() != 0 ? 1 : 0)
+                               : static_cast<uint8_t>(intValue->getVal());
+      out << "    .byte " << byte << '\n';
       return;
     }
     emitZeroForType(out, type);
@@ -636,6 +645,24 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     }
     out_ << "    fmov " << operandRegAt(instr.defs.front(), RegClass::GPR32)
          << ", " << operandReg(instr.uses.front()) << '\n';
+    return;
+  case Opcode::FMV_X_D:
+    // double 的位型从 dN 搬到 64 位整数寄存器。
+    if (instr.defs.empty() || instr.uses.empty()) {
+      throw BackendError("malformed FMV_X_D instruction");
+    }
+    out_ << "    fmov "
+         << operandRegAt(instr.defs.front(), RegClass::GPR64) << ", "
+         << doubleRegName(regForOperand(instr.uses.front())) << '\n';
+    return;
+  case Opcode::FMV_D_X:
+    // putf 调用边界：把 GPR64 中的 double 位型搬入 d0-d7。
+    if (instr.defs.empty() || instr.uses.empty()) {
+      throw BackendError("malformed FMV_D_X instruction");
+    }
+    out_ << "    fmov " << doubleRegName(regForOperand(instr.defs.front()))
+         << ", " << operandRegAt(instr.uses.front(), RegClass::GPR64)
+         << '\n';
     return;
   case Opcode::LI:
     // 物化立即数：一律用目标寄存器的 64 位形式做 movz/movk，
@@ -1003,6 +1030,14 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       out_ << "    scvtf " << operandReg(instr.defs.front()) << ", "
            << operandReg(instr.uses.front()) << '\n';
     }
+    return;
+  case Opcode::FCVT_D_S:
+    if (instr.defs.empty() || instr.uses.empty()) {
+      throw BackendError("malformed FCVT_D_S instruction");
+    }
+    out_ << "    fcvt " << doubleRegName(regForOperand(instr.defs.front()))
+         << ", " << operandRegAt(instr.uses.front(), RegClass::FPR32)
+         << '\n';
     return;
   case Opcode::LBU:
   case Opcode::SB:
