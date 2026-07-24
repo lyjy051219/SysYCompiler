@@ -115,8 +115,7 @@ bool DominatorTree::dominatesValue(Value* DefVal, Value* UseVal) const {
     if (DefVal->isConst()) return true;
 
     // 情况 2：如果 DefVal 是形参，认为它支配一切
-    Variable* DefVar = DefVal->as<Variable>();
-    if (DefVar && DefVar->isParam()) return true;
+    if (DefVal->isParam()) return true;
 
     // 情况 3：将两个 Value 转换为 Instruction
     Instruction* DefInst = DefVal->as<Instruction>();

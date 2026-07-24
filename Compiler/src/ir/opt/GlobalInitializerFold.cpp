@@ -49,7 +49,7 @@ bool GlobalInitializerFoldPass::isFullGlobalCopy(
     if (Destination->vartag != Variable::GlobalVariable)
         return false;
     if (Source->vartag != Variable::GlobalVariable &&
-        Source->vartag != Variable::Constant)
+        Source->vartag != Variable::GlobalConstant)
         return false;
 
     auto DestTy = Destination->getPointeeType();

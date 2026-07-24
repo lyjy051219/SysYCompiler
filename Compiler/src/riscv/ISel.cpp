@@ -1734,7 +1734,7 @@ bool traceConstantPointer(Value *value, Variable *&base, int64_t &offset,
     return false;
   }
   if (auto *variable = dynamic_cast<Variable *>(value)) {
-    if (variable->vartag != Variable::Constant) {
+    if (variable->vartag != Variable::GlobalConstant) {
       return false;
     }
     base = variable;
@@ -2370,7 +2370,7 @@ void IRLowering::lowerGlobals(MachineModule &mm) {
     GlobalObject object;
     object.name = var->getIdent();
     object.ir = var.get();
-    object.constant = (var->vartag == Variable::Constant);
+    object.constant = (var->vartag == Variable::GlobalConstant);
     object.size = typeSizeBytes(objectType);
     object.align = typeAlignBytes(objectType);
     mm.globals.push_back(std::move(object));

@@ -22,7 +22,7 @@ bool LoopUnrollPass::isStructurallyLoopInvariant(
     std::unordered_set<Value *> UndefActive;
     if (containsUndef(V, UndefActive, 0)) return false;
     if (dynamic_cast<ConstantSystem *>(V) ||
-        dynamic_cast<Variable *>(V) ||
+        V->isParam() || V->isGlobal() ||
         dynamic_cast<Function *>(V) ||
         dynamic_cast<BuildInFunction *>(V)) {
         return true;
@@ -418,13 +418,12 @@ bool LoopUnrollPass::isKnownReadonlyInvariantCall(
     // constant-bound restriction.
     std::vector<Value *> ReadPointers;
     for (Value *ReadValue : SEI.RefSet) {
-        auto *Var = dynamic_cast<Variable *>(ReadValue);
-        if (!Var) continue;
-        if (Var->isGlobal()) {
+        if (!ReadValue) continue;
+        if (ReadValue->isGlobal()) {
             ReadPointers.push_back(ReadValue);
             continue;
         }
-        if (!Var->isParam()) continue;
+        if (!ReadValue->isParam()) continue;
 
         int ParamIndex = Callee->getParamIndex(ReadValue);
         if (ParamIndex < 0) return false;
@@ -1636,9 +1635,7 @@ bool LoopUnrollPass::isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *
                                  const DominatorTree &DT) {
     if (!V || !L || !PreHeader) return false;
     if (V->isConst()) return true;
-    if (auto *Var = dynamic_cast<Variable *>(V)) {
-        return Var->isParam() || Var->isGlobal();
-    }
+    if (V->isParam() || V->isGlobal()) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I || !I->getParent() || L->contains(I->getParent())) return false;
     return I->getParent() == PreHeader ||

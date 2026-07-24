@@ -43,10 +43,7 @@ bool LoopStrengthReductionPass::canUseInPreheader(Value *V, BasicBlock *PreHeade
                               const DominatorTree &DT) {
     if (!V || !PreHeader) return false;
     if (V->isConst()) return true;
-
-    if (auto *Var = dynamic_cast<Variable *>(V)) {
-        if (Var->isParam() || Var->isGlobal()) return true;
-    }
+    if (V->isParam() || V->isGlobal()) return true;
 
     auto *Inst = dynamic_cast<Instruction *>(V);
     if (!Inst || !Inst->getParent()) return false;

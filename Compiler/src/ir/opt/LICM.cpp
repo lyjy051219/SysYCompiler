@@ -115,7 +115,7 @@ bool LICMPass::isSpeculatableDivisionOrRemainder(Instruction *I) {
 bool LICMPass::isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
 	if (!Ptr || !StoredValue || !StoredValue->getIRType()) return false;
 	auto IsOwnedRoot = [](Value *V) {
-		if (auto *Var = dynamic_cast<Variable *>(V)) return Var->isGlobal();
+		if (V && V->isGlobal()) return true;
 		return dynamic_cast<AllocaInst *>(V) != nullptr;
 	};
 
@@ -182,13 +182,12 @@ bool LICMPass::isReusableLoopInvariantCall(
 
 	std::vector<Value *> ReadPtrs;
 	for (Value *RV : SEI.RefSet) {
-		auto *Var = dynamic_cast<Variable *>(RV);
-		if (!Var) continue;
-		if (Var->isGlobal()) {
+		if (!RV) continue;
+		if (RV->isGlobal()) {
 			ReadPtrs.push_back(RV);
 			continue;
 		}
-		if (!Var->isParam()) continue;
+		if (!RV->isParam()) continue;
 
 		int ParamIndex = CalleeFunc->getParamIndex(RV);
 		if (ParamIndex < 0) continue;
@@ -349,7 +348,7 @@ bool LICMPass::isInvariant(
 			dynamic_cast<Function *>(V) ||
 			dynamic_cast<BuildInFunction *>(V) ||
 			dynamic_cast<BasicBlock *>(V) ||
-			dynamic_cast<Variable *>(V)) {
+			V->isParam() || V->isGlobal()) {
 			return true;
 		}
 

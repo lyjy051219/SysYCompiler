@@ -47,9 +47,8 @@ bool BaseAddressInfo::isEmpty() const {
 
 void SideEffectAnalysis::ensureInitialized(Value* V, BaseAddressInfoMap& Map) {
     if (!V || Map.count(V)) return;
-    if (auto* Var = dynamic_cast<Variable*>(V))
-        if (Var->isGlobal() || Var->isParam())
-            Map[V].bases.insert(V);
+    if (V->isGlobal() || V->isParam())
+        Map[V].bases.insert(V);
 }
 
 
@@ -375,10 +374,9 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                 const bool CalleeHasBuiltin = CalleeInfo.hasBuiltin;
                 auto mapEntry = [&](Value *V,
                                     std::unordered_set<Value*> &Dest) {
-                    auto *Var = dynamic_cast<Variable*>(V);
-                    if (!Var) return false;
-                    if (Var->isGlobal()) return Dest.insert(V).second;
-                    if (!Var->isParam()) return false;
+                    if (!V) return false;
+                    if (V->isGlobal()) return Dest.insert(V).second;
+                    if (!V->isParam()) return false;
 
                     int Index = Call.Callee->getParamIndex(V);
                     if (Index < 0 ||
@@ -576,13 +574,11 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
 
             // 遍历 ModSet
             for (Value* MV : SEI.ModSet) {
-                auto* Var = dynamic_cast<Variable*>(MV);
-                if (!Var) continue;
-
-                if (Var->isGlobal()) {
+                if (!MV) continue;
+                if (MV->isGlobal()) {
                     if (overlaps(MV))
                         Result = unionModRef(Result, ModRefInfo::Mod);
-                } else if (Var->isParam()) {
+                } else if (MV->isParam()) {
                     int Index = CalleeFunc->getParamIndex(MV);
                     if (Index >= 0 && static_cast<size_t>(Index) < Args.size() &&
                         Args[static_cast<size_t>(Index)] &&
@@ -594,13 +590,11 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
 
             // 遍历 RefSet
             for (Value* RV : SEI.RefSet) {
-                auto* Var = dynamic_cast<Variable*>(RV);
-                if (!Var) continue;
-
-                if (Var->isGlobal()) {
+                if (!RV) continue;
+                if (RV->isGlobal()) {
                     if (overlaps(RV))
                         Result = unionModRef(Result, ModRefInfo::Ref);
-                } else if (Var->isParam()) {
+                } else if (RV->isParam()) {
                     int Index = CalleeFunc->getParamIndex(RV);
                     if (Index >= 0 && static_cast<size_t>(Index) < Args.size() &&
                         Args[static_cast<size_t>(Index)] &&
@@ -700,11 +694,10 @@ bool BasicBlockSideEffect(BasicBlock* BB,
             Value* Base = Value::stripPointerCastsAndGEP(Ptr);
 
             // 按需求：只允许写局部变量（alloca）
-            if (auto* Var = dynamic_cast<Variable*>(Base)) {
-                if (Var->isGlobal() || Var->isParam()) {
-                    return true;
-                }
-            } else if (!dynamic_cast<AllocaInst*>(Base)) {
+            if (Base && (Base->isGlobal() || Base->isParam())) {
+                return true;
+            }
+            if (!dynamic_cast<AllocaInst*>(Base)) {
                 return true;
             }
 

@@ -37,7 +37,7 @@ std::optional<std::size_t> Use::getOperandIndex() const {
 
 bool Use::replaceUseeWith(Value *ValueToUse) {
     if (!ValueToUse || usee == ValueToUse) return false;
-    // 先从旧值解链，再挂入新值，确保两侧计数和入口指针始终一致。
+    // 先从旧值解链，再挂入新值
     removeFromUseList();
     usee = ValueToUse;
     ValueToUse->getUseList().addUseNode(this);
@@ -127,6 +127,10 @@ bool Value::isGlobal() {
     return false;
 }
 
+bool Value::isParam() {
+    return false;
+}
+
 std::shared_ptr<IRType> Value::getIRType() const {
     return irtype;
 }
@@ -149,7 +153,6 @@ const UseList &Value::getUseList() const {
 
 void Value::replaceAllUsesWith(Value *ValueToUse) {
     if (!ValueToUse || ValueToUse == this) return;
-    // 先整体摘下旧使用链，避免逐项换绑时反复改写正在遍历的链头。
     useList.size = 0;
     Use *Head = useList.getHead();
     useList.getHead() = nullptr;
@@ -286,7 +289,6 @@ bool Value::tryGetNumericFloatConst(float &Out) const {
 
 Value *Value::stripBooleanExtension(Value *V,
                                     BooleanExtensionKind &Kind) {
-    // 依次识别原始 i1、零扩展和符号扩展，供比较与布尔化逻辑恢复真实条件值。
     Kind = BooleanExtensionKind::None;
     if (!V) return nullptr;
     if (IRType::isBool(V->getIRType())) {
@@ -329,7 +331,6 @@ int Value::countUses() const {
 int Value::countInstructionUses(Instruction **SingleUser) const {
     if (SingleUser) *SingleUser = nullptr;
 
-    // 使用链还可能包含非指令 User，这里只统计真正的指令使用者。
     int Count = 0;
     Instruction *OnlyInstUser = nullptr;
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
@@ -403,8 +404,8 @@ std::shared_ptr<IRType> Value::getPointeeType(const Value *V) {
 
 bool Value::isExternalVariable() const {
     auto *Var = dynamic_cast<const Variable *>(this);
-    return Var && (Var->vartag == Variable::GlobalVariable ||
-                   Var->vartag == Variable::Param);
+    return (Var && Var->vartag == Variable::GlobalVariable) ||
+           dynamic_cast<const Param *>(this);
 }
 
 bool Value::isConstZero(const Value *V) {
@@ -436,7 +437,6 @@ bool Value::tryGetFloatConst(const Value *V, float &Out) {
 }
 
 bool Value::areEqualConstants(const Value *A, const Value *B) {
-    // 先要求完整类型形状一致，再按常量种类比较；浮点值按位比较以区分正负零和 NaN 表示。
     if (A == B) return true;
     if (!A || !B || !A->getIRType() || !B->getIRType() ||
         !A->getIRType()->hasSameShape(*B->getIRType()))
@@ -471,7 +471,6 @@ bool Value::tryGetIntIndex(const Value *V, int &Out) {
 }
 
 Value *Value::stripPointerCastsAndGEP(Value *V) {
-    // 访问集合既防止异常自环，也允许连续剥离任意层 GEP 和位转换。
     std::unordered_set<Value *> Visited;
     while (V && Visited.insert(V).second) {
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {

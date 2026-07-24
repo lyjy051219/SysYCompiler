@@ -718,7 +718,7 @@ void IRGenerator::lowerParameter(FuncParam& node) {
     }
 
     AllocaInst* parameterSlot = context.function->pushParamWithStackSlot(
-        new Variable(Variable::Param, parameterType, parameterName));
+        new Param(parameterType, parameterName));
     if (parameterSlot == nullptr)
         return;
 
@@ -919,7 +919,8 @@ void IRGenerator::emitLocalArrayInitialization(
     if (aggregate == nullptr)
         return;
 
-    auto* constantStorage = new Variable(Variable::Constant, arrayType, "");
+    auto* constantStorage =
+        new Variable(Variable::GlobalConstant, arrayType, "");
     constantStorage->addUse(initializer);
 
     std::vector<Value*> arguments = {
@@ -970,7 +971,7 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
                 return;
         } else {
             const auto storageKind = isConstant
-                                         ? Variable::Constant
+                                         ? Variable::GlobalConstant
                                          : Variable::GlobalVariable;
             auto* global = new Variable(storageKind, objectType, name);
             if (isConstant)
@@ -1024,7 +1025,8 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             return;
 
         if (!context.inFunction()) {
-            auto* global = new Variable(Variable::Constant, objectType, name);
+            auto* global =
+                new Variable(Variable::GlobalConstant, objectType, name);
             global->setIdent(".C." + name);
             global->addUse(initializer);
         }

@@ -16,88 +16,16 @@
 
 extern std::unique_ptr<Module> ModuleIR;
 
-static std::shared_ptr<VECTORType>
-getVectorType(const std::shared_ptr<IRType> &Type) {
-  return std::dynamic_pointer_cast<VECTORType>(Type);
-}
-
-static std::shared_ptr<IRType>
-getScalarOrVectorElementType(const std::shared_ptr<IRType> &Type) {
-  if (auto VectorType = getVectorType(Type))
-    return VectorType->getElementType();
-  return Type;
-}
-
-static std::shared_ptr<INTType>
-getScalarOrVectorIntegerType(const std::shared_ptr<IRType> &Type) {
-  return std::dynamic_pointer_cast<INTType>(
-      getScalarOrVectorElementType(Type));
-}
-
-static bool isBooleanVectorType(const std::shared_ptr<IRType> &Type) {
-  auto VectorType = getVectorType(Type);
-  return VectorType && VectorType->getElementType() &&
-         VectorType->getElementType()->isBool();
-}
-
-static std::shared_ptr<IRType> getLanePreservingCastResultType(
-    Value *Source, const std::shared_ptr<IRType> &RequestedType) {
-  if (!Source || !Source->getIRType() || !RequestedType)
-    throw std::invalid_argument(
-        "向量转换要求有效的源值和目标类型");
-
-  auto SourceVector = getVectorType(Source->getIRType());
-  auto DestinationVector = getVectorType(RequestedType);
-  if (!SourceVector) {
-    if (DestinationVector)
-      throw std::invalid_argument(
-          "标量转换的目标不能是向量类型");
-    return RequestedType;
-  }
-
-  if (DestinationVector) {
-    if (SourceVector->getElementCount() !=
-        DestinationVector->getElementCount())
-      throw std::invalid_argument(
-          "向量转换的源和目标必须具有相同 lane 数");
-    return RequestedType;
-  }
-
-  if (!RequestedType->isScalar())
-    throw std::invalid_argument(
-        "向量转换的目标元素必须是整数或浮点类型");
-  return VECTORType::NewVector(
-      RequestedType, SourceVector->getElementCount());
-}
-
-static bool isFirstClassInstructionType(
-    const std::shared_ptr<IRType> &Type, bool AllowVoid = false) {
-  if (!Type) return false;
-  if (AllowVoid && Type->isVoid()) return true;
-  return Type->isScalar() || Type->isPointer() || Type->isVector();
-}
-
-static std::shared_ptr<IRType>
-getRetInstructionType(Value *ReturnValue) {
+std::shared_ptr<IRType> RetInst::validateAndGetResultType(
+    Value *ReturnValue) {
   if (!ReturnValue ||
-      !isFirstClassInstructionType(ReturnValue->getIRType()))
+      !IRType::isFirstClassValueType(ReturnValue->getIRType()))
     throw std::invalid_argument(
         "ret 返回值必须是标量、指针或固定长度向量");
   return VOIDType::NewVoid();
 }
 
-static std::shared_ptr<IRType> getAllocaResultType(
-    const std::shared_ptr<IRType> &ResultType) {
-  auto PointerType =
-      std::dynamic_pointer_cast<POINTERType>(ResultType);
-  if (!PointerType || !PointerType->getPointerType() ||
-      PointerType->getPointerType()->isVoid())
-    throw std::invalid_argument(
-        "alloca 结果必须是指向非 void 对象的指针");
-  return ResultType;
-}
-
-static std::shared_ptr<IRType> makeAllocaResultType(
+std::shared_ptr<IRType> AllocaInst::makeResultType(
     const std::shared_ptr<IRType> &AllocatedType) {
   if (!AllocatedType || AllocatedType->isVoid())
     throw std::invalid_argument(
@@ -105,10 +33,12 @@ static std::shared_ptr<IRType> makeAllocaResultType(
   return POINTERType::NewPointer(AllocatedType);
 }
 
-static std::shared_ptr<IRType> getCallResultType(
+std::shared_ptr<IRType> CallInst::validateAndGetResultType(
     Value *Callee, const std::vector<Value *> &Arguments) {
   if (!Callee ||
-      !isFirstClassInstructionType(Callee->getIRType(), true))
+      (!Callee->getIRType() ||
+       (!Callee->getIRType()->isVoid() &&
+        !Callee->getIRType()->isFirstClassValueType())))
     throw std::invalid_argument(
         "call 要求具有合法返回类型的被调函数");
   if (!dynamic_cast<Function *>(Callee) &&
@@ -118,7 +48,7 @@ static std::shared_ptr<IRType> getCallResultType(
 
   for (Value *Argument : Arguments) {
     if (!Argument ||
-        !isFirstClassInstructionType(Argument->getIRType()))
+        !IRType::isFirstClassValueType(Argument->getIRType()))
       throw std::invalid_argument(
           "call 实参必须是标量、指针或固定长度向量");
   }
@@ -150,9 +80,7 @@ static std::shared_ptr<IRType> getCallResultType(
 
       const std::size_t FixedArgumentCount =
           Signature->parameterTypes.size();
-      if (Arguments.size() < FixedArgumentCount ||
-          (!Signature->variadic &&
-           Arguments.size() != FixedArgumentCount))
+      if (Arguments.size() != FixedArgumentCount)
         throw std::invalid_argument(
             "call 实参数量必须符合内建函数签名");
 
@@ -177,38 +105,19 @@ static std::shared_ptr<IRType> getCallResultType(
   return Callee->getIRType();
 }
 
-static std::shared_ptr<IRType>
-getGEPAggregateElementType(const std::shared_ptr<IRType> &Type) {
+std::shared_ptr<IRType> GetElementPtrInst::getAggregateElementType(
+    const std::shared_ptr<IRType> &Type) {
   if (auto ArrayType = std::dynamic_pointer_cast<ARRAYType>(Type))
     return ArrayType->getElementType();
-  if (auto VectorType = getVectorType(Type))
+  if (auto VectorType = IRType::asVector(Type))
     return VectorType->getElementType();
   return nullptr;
 }
 
-static std::shared_ptr<IRType>
-getGEPBasePointerType(Value *Base) {
-  auto PointerType =
-      Base && Base->getIRType()
-          ? std::dynamic_pointer_cast<POINTERType>(
-                Base->getIRType())
-          : nullptr;
-  if (!PointerType || !PointerType->getPointerType() ||
-      PointerType->getPointerType()->isVoid())
-    throw std::invalid_argument(
-        "getelementptr 的基地址必须是标量指针");
-  return Base->getIRType();
-}
-
-static bool isScalarIntegerIndex(Value *Index) {
-  return Index && Index->getIRType() &&
-         Index->getIRType()->isInt();
-}
-
-static bool deriveGEPResultType(
+bool GetElementPtrInst::tryDeriveResultType(
     Value *Base, const std::vector<Value *> &Indices,
     std::shared_ptr<IRType> &ResultType,
-    std::vector<int64_t> *Strides = nullptr) {
+    std::vector<int64_t> *Strides) {
   ResultType = nullptr;
   if (Strides) Strides->clear();
 
@@ -229,12 +138,15 @@ static bool deriveGEPResultType(
   std::shared_ptr<IRType> CurrentType =
       BasePointer->getPointerType();
   for (std::size_t I = 0; I < Indices.size(); ++I) {
-    if (!isScalarIntegerIndex(Indices[I])) return false;
+    Value *Index = Indices[I];
+    if (!Index || !Index->getIRType() ||
+        !Index->getIRType()->isInt())
+      return false;
 
     // 首个索引在基指针所指对象序列中移动，不剥离 pointee；
     // 后续索引才进入数组或固定长度向量的元素。
     if (I != 0) {
-      CurrentType = getGEPAggregateElementType(CurrentType);
+      CurrentType = getAggregateElementType(CurrentType);
       if (!CurrentType) return false;
     }
 
@@ -253,43 +165,16 @@ static bool deriveGEPResultType(
   return true;
 }
 
-static std::shared_ptr<IRType> getGEPResultType(
+std::shared_ptr<IRType> GetElementPtrInst::requireResultType(
     Value *Base, const std::vector<Value *> &Indices) {
   std::shared_ptr<IRType> ResultType;
-  if (!deriveGEPResultType(Base, Indices, ResultType))
+  if (!tryDeriveResultType(Base, Indices, ResultType))
     throw std::invalid_argument(
         "getelementptr 的标量索引与基地址类型不匹配");
   return ResultType;
 }
 
-static bool getLogicalBitWidth(
-    const std::shared_ptr<IRType> &Type, std::size_t &BitWidth) {
-  BitWidth = 0;
-  if (!Type) return false;
-
-  auto ElementType = getScalarOrVectorElementType(Type);
-  std::size_t ElementBits = 0;
-  if (auto IntegerType =
-          std::dynamic_pointer_cast<INTType>(ElementType)) {
-    ElementBits = IntegerType->getBitWidth();
-  } else if (ElementType && ElementType->isFloat()) {
-    ElementBits = 32;
-  } else {
-    return false;
-  }
-
-  std::size_t ElementCount = 1;
-  if (auto VectorType = getVectorType(Type))
-    ElementCount = VectorType->getElementCount();
-  if (ElementBits == 0 ||
-      ElementCount >
-          std::numeric_limits<std::size_t>::max() / ElementBits)
-    return false;
-  BitWidth = ElementBits * ElementCount;
-  return true;
-}
-
-static std::shared_ptr<IRType> getBitCastResultType(
+std::shared_ptr<IRType> BitCastInst::validateAndGetResultType(
     Value *Source, const std::shared_ptr<IRType> &TargetType) {
   if (!Source || !Source->getIRType() || !TargetType)
     throw std::invalid_argument(
@@ -305,8 +190,8 @@ static std::shared_ptr<IRType> getBitCastResultType(
 
   std::size_t SourceBits = 0;
   std::size_t TargetBits = 0;
-  if (!getLogicalBitWidth(SourceType, SourceBits) ||
-      !getLogicalBitWidth(TargetType, TargetBits))
+  if (!IRType::getLogicalBitWidth(SourceType, SourceBits) ||
+      !IRType::getLogicalBitWidth(TargetType, TargetBits))
     throw std::invalid_argument(
         "bitcast 只支持非聚合标量、固定长度向量或指针");
   if (SourceBits != TargetBits)
@@ -315,8 +200,8 @@ static std::shared_ptr<IRType> getBitCastResultType(
   return TargetType;
 }
 
-static std::shared_ptr<IRType>
-getLoadResultType(Value *Pointer) {
+std::shared_ptr<IRType> LoadInst::validateAndGetResultType(
+    Value *Pointer) {
   auto PointerType =
       Pointer && Pointer->getIRType()
           ? std::dynamic_pointer_cast<POINTERType>(
@@ -328,7 +213,7 @@ getLoadResultType(Value *Pointer) {
   return PointerType->getPointerType();
 }
 
-static void validateStoreOperands(Value *StoredValue, Value *Pointer) {
+void StoreInst::validateOperands(Value *StoredValue, Value *Pointer) {
   auto PointerType =
       Pointer && Pointer->getIRType()
           ? std::dynamic_pointer_cast<POINTERType>(
@@ -344,11 +229,11 @@ static void validateStoreOperands(Value *StoredValue, Value *Pointer) {
         "store 的值类型必须与指针指向类型完全一致");
 }
 
-static std::shared_ptr<IRType>
-getExtractElementResultType(Value *Vector, Value *Index) {
+std::shared_ptr<IRType> ExtractElementInst::validateAndGetResultType(
+    Value *Vector, Value *Index) {
   auto VectorType =
       Vector && Vector->getIRType()
-          ? getVectorType(Vector->getIRType())
+          ? IRType::asVector(Vector->getIRType())
           : nullptr;
   if (!VectorType || !VectorType->getElementType())
     throw std::invalid_argument(
@@ -359,11 +244,11 @@ getExtractElementResultType(Value *Vector, Value *Index) {
   return VectorType->getElementType();
 }
 
-static std::shared_ptr<IRType>
-getInsertElementResultType(Value *Vector, Value *Element, Value *Index) {
+std::shared_ptr<IRType> InsertElementInst::validateAndGetResultType(
+    Value *Vector, Value *Element, Value *Index) {
   auto VectorType =
       Vector && Vector->getIRType()
-          ? getVectorType(Vector->getIRType())
+          ? IRType::asVector(Vector->getIRType())
           : nullptr;
   if (!VectorType || !VectorType->getElementType())
     throw std::invalid_argument(
@@ -379,16 +264,15 @@ getInsertElementResultType(Value *Vector, Value *Element, Value *Index) {
   return Vector->getIRType();
 }
 
-static std::shared_ptr<IRType>
-getShuffleVectorResultType(Value *First, Value *Second,
-                           const std::vector<int> &Mask) {
+std::shared_ptr<IRType> ShuffleVectorInst::validateAndGetResultType(
+    Value *First, Value *Second, const std::vector<int> &Mask) {
   auto FirstType =
       First && First->getIRType()
-          ? getVectorType(First->getIRType())
+          ? IRType::asVector(First->getIRType())
           : nullptr;
   auto SecondType =
       Second && Second->getIRType()
-          ? getVectorType(Second->getIRType())
+          ? IRType::asVector(Second->getIRType())
           : nullptr;
   if (!FirstType || !SecondType || !FirstType->getElementType())
     throw std::invalid_argument(
@@ -416,10 +300,10 @@ getShuffleVectorResultType(Value *First, Value *Second,
                                Mask.size());
 }
 
-static Value *coerceValueToType(
-    BasicBlock *Block, Value *Input,
+Value *BasicBlock::coerceValueToType(
+    Value *Input,
     const std::shared_ptr<IRType> &TargetType) {
-  if (!Block || !Input || !Input->getIRType() || !TargetType)
+  if (!Input || !Input->getIRType() || !TargetType)
     return nullptr;
   const auto SourceType = Input->getIRType();
   if (SourceType->hasSameShape(*TargetType))
@@ -436,7 +320,7 @@ static Value *coerceValueToType(
         return ConstBool::newConstBool(Floating->getVal() != 0.0f);
       Value *Zero = Value::makeZeroForType(SourceType);
       return Zero ? BasicBlock::genBinaryInst(
-                        Block, Input, BinaryInst::NE, Zero)
+                        this, Input, BinaryInst::NE, Zero)
                   : nullptr;
     }
 
@@ -455,16 +339,16 @@ static Value *coerceValueToType(
       if (SourceInteger->getBitWidth() <
           DestinationInteger->getBitWidth()) {
         if (SourceInteger->getIsBool())
-          return Block->genZextInst(Input, DestinationInteger);
-        return Block->genSextInst(Input, DestinationInteger);
+          return genZextInst(Input, DestinationInteger);
+        return genSextInst(Input, DestinationInteger);
       }
       if (SourceInteger->getBitWidth() >
           DestinationInteger->getBitWidth())
-        return Block->genTruncInst(Input, DestinationInteger);
+        return genTruncInst(Input, DestinationInteger);
       return Input;
     }
     if (SourceType->isFloat())
-      return Block->genFPTOSIInst(Input, DestinationInteger);
+      return genFPTOSIInst(Input, DestinationInteger);
     return nullptr;
   }
 
@@ -477,13 +361,13 @@ static Value *coerceValueToType(
     auto SourceInteger =
         std::dynamic_pointer_cast<INTType>(SourceType);
     if (SourceInteger && SourceInteger->getIsBool())
-      Input = Block->genZextInst(Input, INTType::getInt32Ty());
-    return Block->genSITOFPInst(Input);
+      Input = genZextInst(Input, INTType::getInt32Ty());
+    return genSITOFPInst(Input);
   }
 
   if (TargetType->isPointer() && SourceType->isPointer()) {
     auto *Cast = new BitCastInst(Input, TargetType);
-    Block->pushBack(Cast);
+    pushBack(Cast);
     return Cast;
   }
 
@@ -554,29 +438,13 @@ Function& Module::newFunction(TypeSystem returnType, std::string functionName) {
 
 Function& Module::newFunction(std::shared_ptr<IRType> returnType,
                               std::string functionName) {
-    auto *function =
-        new Function(std::move(returnType), std::move(functionName));
+    auto *function = new Function(std::move(returnType), std::move(functionName));
     functions.emplace_back(function);
     return *function;
 }
 
-void Module::pushFunction(Function *function) {
-    functions.emplace_back(function);
-}
-
-
 std::vector<std::unique_ptr<Function>>& Module::getFunctions(){
     return functions;
-}
-
-void Module::deleteFunction(Function*ptr){
-    for(auto it = functions.begin();it != functions.end();it++){
-        auto func = (*it).get();
-        if(func == ptr){
-            functions.erase(it);
-            break;
-        }
-    }
 }
 
 Function* Module::getMainFunction(){
@@ -600,7 +468,7 @@ Module* Module::getActiveModule() {
 }
 
 FunctionCallGraph Module::buildDirectCallGraph() const {
-  // 遍历所有调用指令，只记录可静态确定的用户函数目标。
+  // 遍历该函数中所有Call指令，记录对应的函数
   FunctionCallGraph Graph;
   for (const auto &FunctionPtr : functions) {
     Function *F = FunctionPtr.get();
@@ -620,10 +488,11 @@ FunctionCallGraph Module::buildDirectCallGraph() const {
 
 std::unordered_set<Function *> Module::collectReachableFunctions(
     Function *Entry, const FunctionCallGraph &CallGraph) {
+  //从传入函数开始，在其调用图上执行BFS广搜，记录可达的函数集
   std::unordered_set<Function *> Reachable;
   if (!Entry) return Reachable;
 
-  // 从入口函数广度遍历调用边，去重集合同时充当访问标记。
+  // 从入口函数广度遍历调用边，去重集合同时充当访问标记
   std::queue<Function *> WorkList;
   Reachable.insert(Entry);
   WorkList.push(Entry);
@@ -640,33 +509,12 @@ std::unordered_set<Function *> Module::collectReachableFunctions(
   return Reachable;
 }
 
-void Module::pushGlobalVar(Variable* globalVariable) {
-    globalvars.emplace_back(globalVariable);
-}
-
-
 std::vector<std::unique_ptr<Variable>>& Module::getGlobalVar(){return globalvars;}
 
 void Module::dumpIR() {
     for(auto& i : globalvars) i->dumpIR();
     for(auto& i : functions) i->dumpIR();
 }
-std::string Module::genFuncNameNum(std::string ident){
-for (int i = 0;; i++) {
-    bool HaveSameName = false;
-    for (auto &func : functions) {
-      if (func->getIdent() == (ident + "_" + std::to_string(i))) {
-        HaveSameName = true;
-        break;
-      }
-    }
-    if (!HaveSameName)
-      return (ident + "_" + std::to_string(i));
-  }
-}
-
-Function::Function(TypeSystem ts,std::string ident)
-    : Function(IRType::NewTypeByTypeSystem(ts), std::move(ident)) {}
 
 Function::Function(std::shared_ptr<IRType> returnType,
                    std::string ident)
@@ -677,31 +525,16 @@ Function::Function(std::shared_ptr<IRType> returnType,
     pushBack(new BasicBlock());
 }
 
-
-
 void Function::pushBlock(BasicBlock* bb){
     pushBack(bb);
 }
 
-
-
-void Function::insertBlock(BasicBlock* curr,BasicBlock* insert){
-    insert->genUnCondInst(curr);
-    insert->num = this->blockNum++;
-    this->pushBlock(insert);
-}
-
-void Function::pushParam(Variable *parameterValue) {
-  params.emplace_back(parameterValue);
-}
-
-AllocaInst *Function::pushParamWithStackSlot(Variable *parameterValue) {
+AllocaInst *Function::pushParamWithStackSlot(Param *parameterValue) {
     if (!parameterValue || !front())
         return nullptr;
 
     // 形参归函数签名所有，入口槽位直接返回给 IRGenerator 建立源码绑定。
-    auto *parameterSlot =
-        new AllocaInst(POINTERType::NewPointer(parameterValue->getIRType()));
+    auto *parameterSlot = new AllocaInst(parameterValue->getIRType());
     auto *initialStore = new StoreInst(parameterValue, parameterSlot);
     front()->pushFront(parameterSlot);
     front()->pushBack(initialStore);
@@ -709,14 +542,14 @@ AllocaInst *Function::pushParamWithStackSlot(Variable *parameterValue) {
     return parameterSlot;
 }
 
-std::vector<std::unique_ptr<Value>>& Function::getParams(){return params;}
-const std::vector<std::unique_ptr<Value>>& Function::getParams() const {
+std::vector<std::unique_ptr<Param>>& Function::getParams(){return params;}
+const std::vector<std::unique_ptr<Param>>& Function::getParams() const {
   return params;
 }
 
 size_t Function::getParamCount() const { return params.size(); }
 
-Value *Function::getParam(size_t Index) const {
+Param *Function::getParam(size_t Index) const {
   return Index < params.size() ? params[Index].get() : nullptr;
 }
 
@@ -767,16 +600,6 @@ std::string Function::makeUniqueBlockIdent(const std::string &Base) const {
   }
 }
 
-void Function::InsertAlloca(AllocaInst* ptr){front()->pushBack(ptr);}
-
-bool Function::isReachable(BasicBlock* BB) {
-  if (!BB) return false;
-
-  std::unordered_set<BasicBlock *> Reachable;
-  collectReachableBlocks(Reachable);
-  return Reachable.count(BB) != 0;
-}
-
 void Function::collectReachableBlocks(
     std::unordered_set<BasicBlock *> &Reachable) {
   Reachable.clear();
@@ -801,20 +624,8 @@ void Function::collectReachableBlocks(
   }
 }
 
-std::vector<BasicBlock *> Function::getReachableBlocks() {
-  std::unordered_set<BasicBlock *> ReachableSet;
-  collectReachableBlocks(ReachableSet);
-
-  std::vector<BasicBlock *> Blocks;
-  Blocks.reserve(ReachableSet.size());
-  for (BasicBlock *BB : *this) {
-    if (BB && ReachableSet.count(BB)) Blocks.push_back(BB);
-  }
-  return Blocks;
-}
-
 void Function::dropAllReferences() {
-  // 先解除指令间的操作数关系，避免后续批量销毁时递归影响其他指令。
+  // 先解除指令间的操作数关系，避免后续批量销毁时递归影响其他指令
   for (BasicBlock *BB : *this) {
     if (!BB) continue;
     for (Instruction *I : *BB) {
@@ -861,12 +672,10 @@ BuildInFunction::getSignature(const std::string &Name) {
   auto makeSignature =
       [](std::shared_ptr<IRType> ReturnType,
          std::vector<std::shared_ptr<IRType>> ParameterTypes,
-         bool Variadic = false,
          std::vector<bool> OpaquePointerParameters = {}) {
         Signature Result;
         Result.returnType = std::move(ReturnType);
         Result.parameterTypes = std::move(ParameterTypes);
-        Result.variadic = Variadic;
         Result.opaquePointerParameters =
             std::move(OpaquePointerParameters);
         Result.opaquePointerParameters.resize(
@@ -890,8 +699,6 @@ BuildInFunction::getSignature(const std::string &Name) {
     return makeSignature(Void, {I32, I32Pointer});
   if (Name == "putfarray")
     return makeSignature(Void, {I32, FloatPointer});
-  if (Name == "putf")
-    return makeSignature(Void, {I8Pointer}, true);
   if (Name == "starttime" || Name == "stoptime" ||
       Name == "_sysy_starttime" || Name == "_sysy_stoptime")
     return makeSignature(Void, {I32});
@@ -911,10 +718,10 @@ BuildInFunction::getSignature(const std::string &Name) {
     const auto LengthType = HasI64Length ? I64 : I32;
     if (IsMemset)
       return makeSignature(
-          Void, {I8Pointer, I8, LengthType, I1}, false,
+          Void, {I8Pointer, I8, LengthType, I1},
           {true, false, false, false});
     return makeSignature(
-        Void, {I8Pointer, I8Pointer, LengthType, I1}, false,
+        Void, {I8Pointer, I8Pointer, LengthType, I1},
         {true, true, false, false});
   }
 
@@ -943,11 +750,6 @@ bool BuildInFunction::dumpDeclaration(const std::string &Name) {
       Signature->parameterTypes[Index]->toString();
     }
   }
-  if (Signature->variadic) {
-    if (!Signature->parameterTypes.empty())
-      std::cout << ", ";
-    std::cout << "...";
-  }
   std::cout << ")\n";
   return true;
 }
@@ -956,7 +758,7 @@ void BuildInFunction::dumpDefaultDeclarations() {
   static const std::vector<std::string> RuntimeNames = {
       "getint", "getch", "getfloat", "getarray", "getfarray",
       "putint", "putch", "putfloat", "putarray", "putfarray",
-      "putf", "starttime", "stoptime"};
+      "starttime", "stoptime"};
   static const std::vector<std::string> MemoryIntrinsicNames = {
       "llvm.memcpy.p0.p0.i32", "llvm.memmove.p0.p0.i32",
       "llvm.memset.p0.i32", "llvm.memcpy.p0.p0.i64",
@@ -975,25 +777,10 @@ void BuildInFunction::dumpDefaultDeclarations() {
 }
 
 BuildInFunction *BuildInFunction::genBuildInFunction(std::string ident) {
-  // 内建函数按名称驻留，返回类型由 SysY 运行库或 LLVM 内建签名决定。
   static std::map<std::string, BuildInFunction *> mp;
   auto gt = [&ident]() -> std::shared_ptr<IRType> {
     if (auto Signature = getSignature(ident))
       return Signature->returnType;
-    if (ident == "memcpy@plt")
-      return VOIDType::NewVoid();
-    if (ident == "buildin_NotifyWorkerLE")
-      return VOIDType::NewVoid();
-    if (ident == "buildin_NotifyWorkerLT")
-      return VOIDType::NewVoid();
-    if (ident == "buildin_FenceArgLoaded")
-      return VOIDType::NewVoid();
-    if (ident == "buildin_AtomicF32add")
-      return VOIDType::NewVoid();
-    if(ident == "CacheLookUp")
-     return VOIDType::NewVoid();
-    if(ident == "CacheLookUp4")
-      return VOIDType::NewVoid();
     return nullptr;
   };
   if (mp.find(ident) == mp.end()) {
@@ -1076,8 +863,6 @@ bool BuildInFunction::isKnownRuntimeName(const std::string &Name) {
   return false;
 }
 
-
-
 BasicBlock::BasicBlock():Value(VOIDType::NewVoid()){};
 
 void BasicBlock::dumpIR(){
@@ -1125,12 +910,10 @@ CFGSnapshot::CFGSnapshot(Function &F) {
     if (!BB) continue;
     auto Successors = BB->getSuccessors();
     SuccessorEdges.emplace(BB, Successors);
-    PredecessorEdges.try_emplace(BB);
     DistinctPredecessors.try_emplace(BB);
 
     for (BasicBlock *Succ : Successors) {
       if (!Succ) continue;
-      PredecessorEdges[Succ].push_back(BB);
       if (SeenPreds[Succ].insert(BB).second)
         DistinctPredecessors[Succ].push_back(BB);
     }
@@ -1142,13 +925,6 @@ CFGSnapshot::successorEdges(BasicBlock *BB) const {
   static const std::vector<BasicBlock *> Empty;
   auto It = SuccessorEdges.find(BB);
   return It == SuccessorEdges.end() ? Empty : It->second;
-}
-
-const std::vector<BasicBlock *> &
-CFGSnapshot::predecessorEdges(BasicBlock *BB) const {
-  static const std::vector<BasicBlock *> Empty;
-  auto It = PredecessorEdges.find(BB);
-  return It == PredecessorEdges.end() ? Empty : It->second;
 }
 
 const std::vector<BasicBlock *> &
@@ -1193,7 +969,6 @@ bool BasicBlock::isCriticalEdge(const CFGEdge &Edge) {
 
 bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
                               CFGEdgePhiPolicy PhiPolicy) {
-  // 校验边句柄、新目标及所属函数，确保改写不跨越 CFG。
   BasicBlock *From = Edge.From;
   BasicBlock *OldSucc = getEdgeSuccessor(Edge);
   if (!From || !OldSucc || !NewSucc || OldSucc == NewSucc) return false;
@@ -1204,7 +979,6 @@ bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
   BrInst *Br = From->getBranchTerminator();
   if (!Br) return false;
 
-  // 把后继下标换算成同目标边中的出现次序，以精确定位平行边的 PHI 入边项。
   unsigned Occurrence = 0;
   for (unsigned I = 0; I < Edge.SuccessorIndex; ++I) {
     if (Br->getSuccessor(I) == OldSucc) ++Occurrence;
@@ -1241,38 +1015,6 @@ bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
   return true;
 }
 
-bool BasicBlock::foldConditionalBranch(BasicBlock *BB,
-                                       unsigned TakenSuccessorIndex) {
-  if (!BB) return false;
-  BrInst *OldBr = BB->getBranchTerminator();
-  if (!OldBr || !OldBr->isConditional() ||
-      OldBr->getSuccessorCount() != 2 || TakenSuccessorIndex >= 2) {
-    return false;
-  }
-
-  unsigned RemovedSuccessorIndex = TakenSuccessorIndex == 0 ? 1 : 0;
-  BasicBlock *Taken = OldBr->getSuccessor(TakenSuccessorIndex);
-  BasicBlock *Removed = OldBr->getSuccessor(RemovedSuccessorIndex);
-  if (!Taken || !Removed) return false;
-
-  // 两条边目标相同时，根据选中的后继下标精确删除另一个 PHI 入边项。
-  unsigned RemovedOccurrence = 0;
-  for (unsigned I = 0; I < RemovedSuccessorIndex; ++I) {
-    if (OldBr->getSuccessor(I) == Removed) ++RemovedOccurrence;
-  }
-
-  auto RemovedPhis = Removed->collectPhiNodes();
-  for (PhiInst *Phi : RemovedPhis) {
-    if (!Phi || Phi->countIncomingFromPred(BB) <= RemovedOccurrence)
-      return false;
-  }
-
-  if (!BB->replaceTerminator(new BrInst(Taken))) return false;
-  for (PhiInst *Phi : RemovedPhis)
-    PhiInst::removeIncomingEdge(Phi, BB, RemovedOccurrence);
-  return true;
-}
-
 BasicBlock *BasicBlock::splitEdge(Function &F, const CFGEdge &Edge) {
   BasicBlock *OldSucc = getEdgeSuccessor(Edge);
   if (!Edge.From || Edge.From->getParent() != &F || !OldSucc ||
@@ -1297,7 +1039,8 @@ void BasicBlock::genRetInst(Value* retVal){
       return;
     if (getParent()->getIRType()->isVoid())
       return;
-    retVal = coerceValueToType(this, retVal, getParent()->getIRType());
+    //这一步是为了确保返回值类型与函数返回类型一致，即用sitofp、fptosi进行隐式类型转换（float<->int）
+    retVal = coerceValueToType(retVal, getParent()->getIRType());
     if (!retVal)
       return;
     auto inst = new RetInst(retVal);
@@ -1322,11 +1065,8 @@ void BasicBlock::genUnCondInst(BasicBlock *block) {
   pushBack(inst);
 }
 
-AllocaInst *
-BasicBlock::genAllocaInst(std::shared_ptr<IRType> allocatedType) {
-    auto pointerType = makeAllocaResultType(allocatedType);
-    auto *allocation = new AllocaInst(std::move(pointerType));
-    // 栈对象统一放入函数入口块，源码符号登记由 IRGenerator 独立完成。
+AllocaInst* BasicBlock::genAllocaInst(std::shared_ptr<IRType> allocatedType) {
+    auto *allocation = new AllocaInst(std::move(allocatedType));
     getParent()->front()->pushFront(allocation);
     return allocation;
 }
@@ -1341,7 +1081,8 @@ void BasicBlock::genStoreInst(Value* val,Value* ptr){
     if (!val || !ptr) return;
     auto point = std::dynamic_pointer_cast<POINTERType>(ptr->getIRType());
     if (!point || !point->getPointerType() || !val->getIRType()) return;
-    val = coerceValueToType(this, val, point->getPointerType());
+    //依旧包括了类型转换
+    val = coerceValueToType(val, point->getPointerType());
     if (!val) return;
     auto inst = new StoreInst(val,ptr);
     this->pushBack(inst);
@@ -1376,9 +1117,7 @@ Value* BasicBlock::genShuffleVectorInst(
 Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
   if (!A || !B || !A->getIRType() || !B->getIRType())
     return nullptr;
-
-  // LLVM 普通算术、位运算和比较指令直接接受同类型向量。基础框架
-  // 暂不隐式广播标量，也不在这里做向量元素类型转换。
+  // 处理向量类型的二元操作，要求两个操作数都是向量且形状相同
   if (A->getIRType()->isVector() || B->getIRType()->isVector()) {
     if (!A->getIRType()->isVector() || !B->getIRType()->isVector() ||
         !A->getIRType()->hasSameShape(*B->getIRType()))
@@ -1393,7 +1132,7 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
   bool AIsFloat = A->getIRType()->isFloat();
   bool BIsFloat = B->getIRType()->isFloat();
 
-  // 只允许整数的操作先把浮点值转换为 SysY 的 i32。
+  // 只允许整数的操作先把浮点值转换为 SysY 的 i32
   if (BinaryInst::isIntegerOnlyOp(op)) {
     if (AIsFloat) {
       A = genFPTOSIInst(A, INTType::getInt32Ty());
@@ -1451,8 +1190,6 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
 Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
                                  BinaryInst::Operation op, Value* right){
   if (!left || !right) return nullptr;
-  // 当前没有独立的向量常量折叠器；即使操作数是 undef 等常量向量，
-  // 也应保留为合法的逐 lane LLVM 指令。
   if ((left->getIRType() && left->getIRType()->isVector()) ||
       (right->getIRType() && right->getIRType()->isVector())) {
     return bb ? bb->genBinaryInst(left, op, right) : nullptr;
@@ -1461,8 +1198,6 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
     Value *A = left;
     Value *B = right;
 
-    // 常量路径与非常量路径使用相同的算术转换，从而区分整数除零的未定义值和浮点除零的 IEEE 结果。
-    // 定宽折叠还会避免在 C++ 层直接执行溢出除法或非法移位。
     if (!BinaryInst::isIntegerOnlyOp(op) &&
         (IRType::isFloat(A->getIRType()) ||
          IRType::isFloat(B->getIRType()))) {
@@ -1477,7 +1212,6 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
 
     if (Value *Folded = BinaryInst::foldConstants(op, A, B, true))
       return Folded;
-    // 首轮位宽规整只处理整数余数；浮点 frem 留给第二轮 IEEE 折叠。
     if (IRType::isFloat(A->getIRType()))
       if (Value *Folded = BinaryInst::foldConstants(op, A, B, false))
         return Folded;
@@ -1613,9 +1347,7 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
   if (BuildInFunction::isSupportedName(ident)) {
     auto Signature = BuildInFunction::getSignature(ident);
     if (!Signature ||
-        args.size() < Signature->parameterTypes.size() ||
-        (!Signature->variadic &&
-         args.size() != Signature->parameterTypes.size())) {
+        args.size() != Signature->parameterTypes.size()) {
       return nullptr;
     }
 
@@ -1632,7 +1364,7 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
         continue;
       }
       Value *Converted = coerceValueToType(
-          this, args[Index], Signature->parameterTypes[Index]);
+          args[Index], Signature->parameterTypes[Index]);
       if (!Converted)
         return nullptr;
       args[Index] = Converted;
@@ -1902,7 +1634,7 @@ Value *Instruction::foldConstantCast(
 }
 
 RetInst::RetInst(Value* retVal)
-    : Instruction(getRetInstructionType(retVal)) {
+    : Instruction(validateAndGetResultType(retVal)) {
     addUse(retVal);
     instType = InstType::RET;
 }
@@ -1938,11 +1670,6 @@ BrInst::BrInst(BasicBlock* bb):Instruction(VOIDType::NewVoid(),InstType::BR){
     addUse(bb);
     isCond = false;
 }
-BrInst::BrInst(std::shared_ptr<IRType> irtype,bool isCond):Instruction(irtype){
-    instType = InstType::BR;
-    this->isCond = isCond;
-}
-
 bool BrInst::isConditional() const {
   return isCond;
 }
@@ -2002,13 +1729,13 @@ void BrInst::dumpIR(){
     }
 }
 
-AllocaInst::AllocaInst(std::shared_ptr<IRType> irtype)
-    : Instruction(getAllocaResultType(irtype)) {
+AllocaInst::AllocaInst(std::shared_ptr<IRType> allocatedType)
+    : Instruction(makeResultType(allocatedType)) {
     instType = InstType::ALLOCA;
 }
 AllocaInst::AllocaInst(
-    std::string ident, std::shared_ptr<IRType> irtype)
-    : Instruction(makeAllocaResultType(irtype)) {
+    std::string ident, std::shared_ptr<IRType> allocatedType)
+    : Instruction(makeResultType(allocatedType)) {
     this->ident = std::move(ident);
     instType = InstType::ALLOCA;
 }
@@ -2038,7 +1765,7 @@ bool AllocaInst::isArrayAllocation(const AllocaInst *AI) {
 StoreInst::StoreInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::STORE;}
 StoreInst::StoreInst(Value* val,Value* ptr)
     : Instruction(VOIDType::NewVoid()) {
-    validateStoreOperands(val, ptr);
+    validateOperands(val, ptr);
     addUse(val);
     addUse(ptr);
     ident = "StoreInst";
@@ -2067,7 +1794,8 @@ void StoreInst::dumpIR(){
 
 LoadInst::LoadInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::LOAD;}
 // 结果类型取自指针指向的类型，操作数关系在类型确定后建立。
-LoadInst::LoadInst(Value* v) : Instruction(getLoadResultType(v)) {
+LoadInst::LoadInst(Value* v)
+    : Instruction(validateAndGetResultType(v)) {
     instType = InstType::LOAD;
     addUse(v);
 }
@@ -2092,13 +1820,13 @@ void LoadInst::dumpIR(){
 }
 
 GetElementPtrInst::GetElementPtrInst(Value* v)
-    : Instruction(getGEPBasePointerType(v)) {
+    : Instruction(requireResultType(v, {})) {
     addUse(v);
     instType = InstType::GEP;
 }
 GetElementPtrInst::GetElementPtrInst(
     Value* v, std::vector<Value*>& vv)
-    : Instruction(getGEPResultType(v, vv)) {
+    : Instruction(requireResultType(v, vv)) {
     addUse(v);
     for (Value *Index : vv) addUse(Index);
     instType = InstType::GEP;
@@ -2147,7 +1875,7 @@ void GetElementPtrInst::updateType() {
         Indices.push_back(userList[I]->getValue());
 
     std::shared_ptr<IRType> ResultType;
-    if (deriveGEPResultType(Base, Indices, ResultType))
+    if (tryDeriveResultType(Base, Indices, ResultType))
         this->irtype = std::move(ResultType);
 }
 
@@ -2203,7 +1931,7 @@ bool GetElementPtrInst::getBaseAndIndices(
 bool GetElementPtrInst::reset(Value *Base,
                               const std::vector<Value *> &Indices) {
     std::shared_ptr<IRType> ResultType;
-    if (!deriveGEPResultType(Base, Indices, ResultType))
+    if (!tryDeriveResultType(Base, Indices, ResultType))
         return false;
 
     clearOperands();
@@ -2221,7 +1949,7 @@ std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
 
     std::vector<int64_t> Strides;
     std::shared_ptr<IRType> ResultType;
-    if (!deriveGEPResultType(Base, Indices, ResultType, &Strides) ||
+    if (!tryDeriveResultType(Base, Indices, ResultType, &Strides) ||
         Strides.empty())
         return std::nullopt;
     return Strides.back();
@@ -2280,7 +2008,7 @@ bool GetElementPtrInst::getIndexStrides(Value *Base,
     if (Indices.empty()) return false;
 
     std::shared_ptr<IRType> ResultType;
-    if (!deriveGEPResultType(Base, Indices, ResultType, &Strides) ||
+    if (!tryDeriveResultType(Base, Indices, ResultType, &Strides) ||
         Strides.empty())
         return false;
     FinalPointeeStride = Strides.back();
@@ -2288,7 +2016,7 @@ bool GetElementPtrInst::getIndexStrides(Value *Base,
 }
 
 ExtractElementInst::ExtractElementInst(Value* vector, Value* index)
-    : Instruction(getExtractElementResultType(vector, index)) {
+    : Instruction(validateAndGetResultType(vector, index)) {
     instType = InstType::EXTRACTELEMENT;
     addUse(vector);
     addUse(index);
@@ -2318,7 +2046,7 @@ void ExtractElementInst::dumpIR() {
 InsertElementInst::InsertElementInst(
     Value* vector, Value* element, Value* index)
     : Instruction(
-          getInsertElementResultType(vector, element, index)) {
+          validateAndGetResultType(vector, element, index)) {
     instType = InstType::INSERTELEMENT;
     addUse(vector);
     addUse(element);
@@ -2357,7 +2085,7 @@ void InsertElementInst::dumpIR() {
 ShuffleVectorInst::ShuffleVectorInst(
     Value* first, Value* second, std::vector<int> mask)
     : Instruction(
-          getShuffleVectorResultType(first, second, mask)),
+          validateAndGetResultType(first, second, mask)),
       mask(std::move(mask)) {
     instType = InstType::SHUFFLEVECTOR;
     addUse(first);
@@ -2408,7 +2136,7 @@ BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
         !x->getIRType()->hasSameShape(*y->getIRType()))
       throw std::invalid_argument("二元指令要求两个操作数类型完全一致");
     const auto ScalarType =
-        getScalarOrVectorElementType(x->getIRType());
+        IRType::getScalarElementType(x->getIRType());
     const bool IsScalarOrVector =
         ScalarType && ScalarType->isScalar();
     const bool IsPointerCompare =
@@ -2419,7 +2147,7 @@ BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
         (!ScalarType || !ScalarType->isInt()))
       throw std::invalid_argument("该二元操作只接受整数类型");
     if (BinaryInst::isCompareOp(op)) {
-      if (auto VectorType = getVectorType(x->getIRType())) {
+      if (auto VectorType = IRType::asVector(x->getIRType())) {
         this->irtype = VECTORType::NewVector(
             INTType::getBoolTy(), VectorType->getElementCount());
       } else {
@@ -2635,7 +2363,7 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
 void BinaryInst::dumpIR(){
   Value::dumpIR();
   auto OperandType = userList[0]->getValue()->getIRType();
-  auto ScalarType = getScalarOrVectorElementType(OperandType);
+  auto ScalarType = IRType::getScalarElementType(OperandType);
   TypeSystem tp = ScalarType->getTypeSystem();
   std::cout << " = ";
   switch (op) {
@@ -2733,7 +2461,7 @@ void BinaryInst::dumpIR(){
 CallInst::CallInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::CALL;}
 CallInst::CallInst(Value *func, std::vector<Value*> &args,
                    std::string appendix)
-    : Instruction(getCallResultType(func, args)) {
+    : Instruction(validateAndGetResultType(func, args)) {
   ident += appendix;
   addUse(func);
   for (auto &i : args)
@@ -2831,11 +2559,12 @@ FPTOSIInst::FPTOSIInst(Value* v)
 FPTOSIInst::FPTOSIInst(
     Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(
-          getLanePreservingCastResultType(v, targetType)) {
+          IRType::deriveLanePreservingType(
+              v ? v->getIRType() : nullptr, targetType)) {
     auto SourceElement =
-        getScalarOrVectorElementType(v->getIRType());
+        IRType::getScalarElementType(v->getIRType());
     auto DestinationElement =
-        getScalarOrVectorIntegerType(getIRType());
+        IRType::getScalarIntegerType(getIRType());
     if (!SourceElement || !SourceElement->isFloat() ||
         !DestinationElement)
       throw std::invalid_argument("fptosi 要求浮点源值和整数目标类型");
@@ -2876,11 +2605,12 @@ SITOFPInst::SITOFPInst(Value* v)
 SITOFPInst::SITOFPInst(
     Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(
-          getLanePreservingCastResultType(v, targetType)) {
+          IRType::deriveLanePreservingType(
+              v ? v->getIRType() : nullptr, targetType)) {
     auto SourceElement =
-        getScalarOrVectorIntegerType(v->getIRType());
+        IRType::getScalarIntegerType(v->getIRType());
     auto DestinationElement =
-        getScalarOrVectorElementType(getIRType());
+        IRType::getScalarElementType(getIRType());
     if (!SourceElement || !DestinationElement ||
         !DestinationElement->isFloat())
       throw std::invalid_argument("sitofp 要求整数源值和浮点目标类型");
@@ -2896,11 +2626,12 @@ ZextInst::ZextInst(Value* v)
     : ZextInst(v, INTType::getInt32Ty()) {}
 ZextInst::ZextInst(Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(
-          getLanePreservingCastResultType(v, targetType)) {
+          IRType::deriveLanePreservingType(
+              v ? v->getIRType() : nullptr, targetType)) {
     auto sourceType =
-        getScalarOrVectorIntegerType(v->getIRType());
+        IRType::getScalarIntegerType(v->getIRType());
     auto destinationType =
-        getScalarOrVectorIntegerType(getIRType());
+        IRType::getScalarIntegerType(getIRType());
     if (!sourceType || !destinationType ||
         destinationType->getBitWidth() <= sourceType->getBitWidth())
       throw std::invalid_argument("zext 要求目标整数位宽大于源位宽");
@@ -2925,11 +2656,12 @@ TruncInst::TruncInst(Value* v)
     : TruncInst(v, INTType::getBoolTy()) {}
 TruncInst::TruncInst(Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(
-          getLanePreservingCastResultType(v, targetType)) {
+          IRType::deriveLanePreservingType(
+              v ? v->getIRType() : nullptr, targetType)) {
   auto sourceType =
-      getScalarOrVectorIntegerType(v->getIRType());
+      IRType::getScalarIntegerType(v->getIRType());
   auto destinationType =
-      getScalarOrVectorIntegerType(getIRType());
+      IRType::getScalarIntegerType(getIRType());
   if (!sourceType || !destinationType ||
       destinationType->getBitWidth() >= sourceType->getBitWidth())
     throw std::invalid_argument("trunc 要求目标整数位宽小于源位宽");
@@ -2954,11 +2686,12 @@ SextInst::SextInst(Value* v)
     : SextInst(v, INTType::getInt32Ty()) {}
 SextInst::SextInst(Value* v, std::shared_ptr<IRType> targetType)
     : Instruction(
-          getLanePreservingCastResultType(v, targetType)) {
+          IRType::deriveLanePreservingType(
+              v ? v->getIRType() : nullptr, targetType)) {
   auto sourceType =
-      getScalarOrVectorIntegerType(v->getIRType());
+      IRType::getScalarIntegerType(v->getIRType());
   auto destinationType =
-      getScalarOrVectorIntegerType(getIRType());
+      IRType::getScalarIntegerType(getIRType());
   if (!sourceType || !destinationType ||
       destinationType->getBitWidth() <= sourceType->getBitWidth())
     throw std::invalid_argument("sext 要求目标整数位宽大于源位宽");
@@ -2989,13 +2722,13 @@ SelectInst::SelectInst(Value* cond,Value* isTrue,Value* isFalse)
       cond && cond->getIRType() && cond->getIRType()->isBool();
   const bool IsVectorCondition =
       cond && cond->getIRType() &&
-      isBooleanVectorType(cond->getIRType());
+      cond->getIRType()->isBooleanVector();
   if (!IsScalarCondition && !IsVectorCondition)
     throw std::invalid_argument(
         "select 条件必须是 i1 或 <N x i1>");
   if (IsVectorCondition) {
-    auto ConditionVector = getVectorType(cond->getIRType());
-    auto ValueVector = getVectorType(isTrue->getIRType());
+    auto ConditionVector = IRType::asVector(cond->getIRType());
+    auto ValueVector = IRType::asVector(isTrue->getIRType());
     if (!ValueVector ||
         ConditionVector->getElementCount() !=
             ValueVector->getElementCount())
@@ -3045,7 +2778,7 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
     return nullptr;
   // 标量条件统一转换为 i1；<N x i1> 直接作为逐 lane mask 使用。
   if (!cond->getIRType()->isBool() &&
-      !isBooleanVectorType(cond->getIRType())) {
+      !cond->getIRType()->isBooleanVector()) {
     switch (cond->getIRType()->getTypeSystem()) {
     case IR_INT:
       cond = BasicBlock::genBinaryInst(
@@ -3072,10 +2805,10 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
     auto fTy = isFalse->getIRType()->getTypeSystem();
     if (tTy == IR_INT && fTy == IR_FLOAT) {
       isTrue = coerceValueToType(
-          this, isTrue, FLOATType::NewFloat());
+          isTrue, FLOATType::NewFloat());
     } else if (tTy == IR_FLOAT && fTy == IR_INT) {
       isFalse = coerceValueToType(
-          this, isFalse, FLOATType::NewFloat());
+          isFalse, FLOATType::NewFloat());
     } else if (tTy == IR_INT && fTy == IR_INT) {
       auto TrueInteger =
           std::dynamic_pointer_cast<INTType>(isTrue->getIRType());
@@ -3086,11 +2819,11 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
       auto CommonType = INTType::get(
           std::max(TrueInteger->getBitWidth(),
                    FalseInteger->getBitWidth()));
-      isTrue = coerceValueToType(this, isTrue, CommonType);
-      isFalse = coerceValueToType(this, isFalse, CommonType);
+      isTrue = coerceValueToType(isTrue, CommonType);
+      isFalse = coerceValueToType(isFalse, CommonType);
     } else if (tTy == IR_POINTER && fTy == IR_POINTER) {
       isFalse =
-          coerceValueToType(this, isFalse, isTrue->getIRType());
+          coerceValueToType(isFalse, isTrue->getIRType());
     } else {
       return nullptr;
     }
@@ -3104,22 +2837,23 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
 }
 
 
+Param::Param(std::shared_ptr<IRType> parameterType,
+             std::string sourceName)
+    : Value(std::move(parameterType), std::move(sourceName)) {}
+
+bool Param::isParam() {
+    return true;
+}
+
 bool Variable::isGlobal(){
-    if(vartag == Param) return false;
-    else return true;
+    return true;
 }
 
 Variable::Variable(VarTag variableTag,
                    std::shared_ptr<IRType> objectType,
                    std::string sourceName)
-    : User(variableTag == Param
-               ? objectType
-               : POINTERType::NewPointer(std::move(objectType))),
+    : User(POINTERType::NewPointer(std::move(objectType))),
       vartag(variableTag) {
-    // 形参按值表示；全局变量和常量以指针类型表示其存储对象。
-    // 非形参对象只移交模块所有权，不再修改 IRGenerator 的源码符号环境。
-    if (variableTag == Param)
-        return;
     if (variableTag == GlobalVariable) {
         this->ident = ".G." + sourceName;
     } else {
@@ -3127,11 +2861,6 @@ Variable::Variable(VarTag variableTag,
         this->ident = ".C." + this->ident;
     }
     ModuleIR->getGlobalVar().emplace_back(this);
-}
-
-bool Variable::isParam(){
-    if(vartag == Param) return true;
-    else return false;
 }
 
 bool Variable::isScalarGlobal() {
@@ -3147,10 +2876,8 @@ void Variable::dumpIR(){
     Value::dumpIR();
     if (vartag == GlobalVariable)
     std::cout << " = global ";
-    else if (vartag == Constant)
+    else if (vartag == GlobalConstant)
     std::cout << " = constant ";
-    else
-    return;
     auto type = std::dynamic_pointer_cast<POINTERType>(getIRType());
     type->getPointerType()->toString();
     std::cout<<" ";
@@ -3197,43 +2924,6 @@ Value *Variable::getConstantElement(Variable *Source,
 }
 
 Initializer::Initializer(std::shared_ptr<IRType> irtype):Value(irtype){}
-
-void Initializer::var2Store(BasicBlock *basicBlock, Value *destination,
-                            std::vector<int> &elementIndices) {
-    if (!basicBlock || !destination)
-        return;
-
-    // 深度优先遍历聚合值，elementIndices 始终保存当前叶元素的完整路径。
-    for (std::size_t elementIndex = 0; elementIndex < size();
-         ++elementIndex) {
-        Value *&element = (*this)[elementIndex];
-        elementIndices.push_back(static_cast<int>(elementIndex));
-
-        if (auto *nestedInitializer = dynamic_cast<Initializer *>(element)) {
-            nestedInitializer->var2Store(
-                basicBlock, destination, elementIndices);
-        } else {
-            if (element && !element->isConst()) {
-                // 对动态叶元素构造完整 GEP 路径，重算结果类型后再生成 Store。
-                auto *elementAddress = dynamic_cast<GetElementPtrInst *>(
-                    basicBlock->genGepInst(destination));
-
-                elementAddress->addUse(ConstInt::newConstInt(0));
-
-                for (int index : elementIndices)
-                    elementAddress->addUse(ConstInt::newConstInt(index));
-
-                elementAddress->updateType();
-
-                basicBlock->genStoreInst(element, elementAddress);
-
-                // 动态值写回后，用同类型零值替换常量模板中的占位。
-                element = Value::makeZeroForType(element->getIRType());
-            }
-        }
-        elementIndices.pop_back();
-    }
-}
 
 bool Initializer::isAllZero(Value *value) {
     if (auto *init = dynamic_cast<Initializer *>(value)) {
@@ -3380,7 +3070,7 @@ UndefValue *UndefValue::NewUndefValue(std::shared_ptr<IRType> it) {
 }
 
 BitCastInst::BitCastInst(Value* v, std::shared_ptr<IRType> targetType)
-    : Instruction(getBitCastResultType(v, targetType)) {
+    : Instruction(validateAndGetResultType(v, targetType)) {
     instType = InstType::BITCAST;
     addUse(v);
 }
@@ -3476,22 +3166,6 @@ void PhiInst::dumpIR() {
     return phis;
   }
 
-  bool BasicBlock::simplifySinglePredPhis() {
-    auto preds = getPredecessors();
-    if (preds.size() != 1) return false;
-
-    bool changed = false;
-    auto phis = collectPhiNodes();
-    for (PhiInst *phi : phis) {
-      if (!phi) continue;
-      if (phi->getNumIncomingValues() != 1) continue;
-      phi->replaceAllUsesWith(phi->getIncomingValue(0));
-      delete phi;
-      changed = true;
-    }
-    return changed;
-  }
-
 // 各指令副本先按映射替换操作数，映射区域外的引用保持指向原值。
 Instruction* RetInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.empty()) return new RetInst();
@@ -3518,7 +3192,7 @@ Instruction* BrInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 }
 
 Instruction* AllocaInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
-    return new AllocaInst(this->getIRType());
+    return new AllocaInst(getAllocatedType());
 }
 
 Instruction* StoreInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
@@ -3843,16 +3517,6 @@ bool BasicBlock::onlyPhiAndTerminator() {
   for (Instruction *I : *this) {
     if (I == Term) continue;
     if (!dynamic_cast<PhiInst *>(I)) return false;
-  }
-  return true;
-}
-
-bool BasicBlock::hasOnlyBlockLocalInstructionUsers(Instruction *I, BasicBlock *BB) {
-  if (!I || !BB) return false;
-  for (Use *U : I->getUses()) {
-    auto *UserI = dynamic_cast<Instruction *>(U->getUser());
-    if (!UserI) return false;
-    if (UserI->getParent() != BB) return false;
   }
   return true;
 }

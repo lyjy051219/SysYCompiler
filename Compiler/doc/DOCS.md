@@ -62,7 +62,7 @@ Compiler/
 
 > 这一部分是本人在阅读完相关文档的一些总结，目的为了便于后续开发前中端查阅需要
 
-**Sysy2022**：
+**Sysy2022**
 
 - .sy文件结构：全局变量声明，全局常量声明，函数定义，唯一的main函数定义
 
@@ -160,9 +160,9 @@ Compiler/
 
 - sysy其他未提到的参考C语言即可
 
-**Runtime**：
+**Runtime**
 
-> 由于putf在测试用例中并未出现，所以本人没有重点关注这一runtime函数在前中端的处理
+> 由于putf在测试用例中并未出现，所以本人没有实现这一runtime函数在前中端的处理
 
 读取函数：
 
@@ -238,6 +238,21 @@ Compiler/
 
 - void starttime()
 - void stoptime()
+
+**llvm intrinsic  **
+
+在中端还引入了llvm.memcpy / llvm.memset / llvm.memmove，引入主要为了便于优化，在后端生成asm前已经替换掉
+
+```
+memcpy：从源地址 src 开始，复制 len 个字节到目标地址 dest。（不允许重叠）
+@llvm.memcpy.p0.p0.i32(ptr %dest, ptr %src, i32 %len, i1 %isvolatile)
+
+memmove：从源地址 src 开始，复制 len 个字节到目标地址 dest。（允许重叠）
+@llvm.memmove.p0.p0.i32(ptr %dest, ptr %src, i32 %len, i1 %isvolatile)
+
+memset：从目标地址 dest 开始，将连续 len 个字节全部设置为同一个字节值 value。
+@llvm.memset.p0.i32(ptr %dest, i8 %value, i32 %len, i1 %isvolatile)
+```
 
 #### 词法分析+语法分析
 
@@ -417,7 +432,7 @@ Compiler/
 
 采用与LLVM IR兼容的IR，便于使用LLVM工具链LLI/LLC进行测试
 
-##### 支持指令：为LLVM IR的子集，目前一共35条指令
+##### 支持指令：为LLVM IR的子集，目前一共38条指令
 
 ```
 终止与控制流指令：
@@ -636,39 +651,37 @@ graph TD
 
 ##### CFG
 
-同样参考LLVM实现，但是对本项目做了精简与适配
+参考LLVM实现，但是对本项目做了精简与适配
 
 采用侵入式链表进行组织
-
-结构
-
-```mermaid
-graph TD
-	N1[Value] -.- N7[ident]
-	N1[Value] -.- N2[TypeSystem]
-	N1[Value] -.- N3[UseList]
-	N3[UseList] -.- N4[Use]
-	N1[Value] --> N5[User]
-	N5[User] -.- N6[UserList]
-	N5[User] --> N8[Variable]
-	N5[User] --> N9[Instruction]
-	N1[Value] --> N10[Function]
-	N1[Value] --> N11[BasicBlock]
-	N1[Value] --> N12[ConstSystem]
-
-
-```
 
 ```mermaid
 graph TD
 	N1[Module] -.- N2[Function]
-	N1[Module] -.- N3[Variable]
-	N1[Module] -.- N4[SymbolTable]
-	N2[Function] -.- N5[Params]
+	N1[Module] -.- N3[GlobalVariable
+	全局变量+全局常量]
+	N1[Module] -.- N4[BuiltinFunction
+	Runtime库函数+LLVMIntrinsic]
+	N2[Function] -.- N5[Params
+	函数形参]
 	N2[Function] -.- N6[BasicBlocks]
-	N6[BasicBlocks] -.- N7[Instruction]
+	N6[BasicBlock] -.- N7[Instruction]
 	N7[Instruction] -.- N8[InstType]
-	N7[Instruction] --> N9[17个Inst]
+	N7[Instruction] --> N9[具体Inst]
+```
+
+初始化相关
+
+```mermaid
+graph TD
+	N1[Value] --> N2[ConstantSystem]
+	N2[ConstantSystem] --> N3[ConstBool]
+	N2[ConstantSystem] --> N4[ConstInt]
+	N2[ConstantSystem] --> N5[ConstFloat]
+	N2[ConstantSystem] --> N6[ConstPtr]
+	N2[ConstantSystem] --> N7[UndefValue]
+	N1[Value] --> N8[Initializer]
+	N9["vector< Value* >"] --> N8[Initializer]
 ```
 
 #### PassBuilder
@@ -1056,9 +1069,9 @@ https://zhuanlan.zhihu.com/p/1955319335347290919
   在sysy之中，指针仅来源于数组作为参数传递，所以我们的指针的基址只能来自**Alloca/Param/GlobalVariable中的数组类型**
 
   - Alloca：在函数体中定义的局部数组/局部变量
-  - Variable::Param：函数形参，传入的数组指针
+  - Param：函数形参，传入的数组指针
   - Variable::GlobalVariable:全局变量/数组
-  - Variable::Constant:全局常量
+  - Variable::GlobalConstant：全局常量
 
 - 即时计算别名分析：
 
@@ -1116,7 +1129,7 @@ https://zhuanlan.zhihu.com/p/1955319335347290919
 
         如果二者都是Variable::GlobalVariable，那么NoAlias
 
-        如果一个是Variable::Param（函数参数）一个是Alloca（局部数组），那么NoAlias
+        如果一个是Param（函数参数）一个是Alloca（局部数组），那么NoAlias
 
         如果一个是Alloca一个是Variable::GlobalVariable，那么NoAlias
 

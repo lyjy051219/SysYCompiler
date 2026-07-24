@@ -678,8 +678,7 @@ const SCEVExpr *SCEVResult::trySimpleMulDivRec(PhiInst *Self, Value *Update,
 bool SCEVResult::isLoopInvariant(Value *V, const Loop *L) const {
     if (!V || !L) return true;
     if (V->isConst()) return true;
-    if (auto *Var = dynamic_cast<Variable *>(V))
-        if (Var->isParam() || Var->isGlobal()) return true;
+    if (V->isParam() || V->isGlobal()) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return true;
     BasicBlock *BB = I->getParent();

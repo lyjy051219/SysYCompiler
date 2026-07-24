@@ -33,9 +33,7 @@ bool LoopUnswitchPass::isAvailableAt(Value *V, Instruction *UsePoint, const Loop
         dynamic_cast<BuildInFunction *>(V)) {
         return true;
     }
-    if (auto *Var = dynamic_cast<Variable *>(V)) {
-        return Var->isParam() || Var->isGlobal();
-    }
+    if (V->isParam() || V->isGlobal()) return true;
 
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I || !I->getParent() || L.contains(I->getParent())) return false;

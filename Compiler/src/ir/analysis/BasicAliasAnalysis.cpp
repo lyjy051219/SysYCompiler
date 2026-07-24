@@ -240,12 +240,12 @@ bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
     auto *Var2 = dynamic_cast<Variable*>(O2);
     bool IsAlloca1 = dynamic_cast<AllocaInst*>(O1) != nullptr;
     bool IsAlloca2 = dynamic_cast<AllocaInst*>(O2) != nullptr;
-    bool IsParam1 = Var1 && Var1->vartag == Variable::Param;
-    bool IsParam2 = Var2 && Var2->vartag == Variable::Param;
+    bool IsParam1 = O1->isParam();
+    bool IsParam2 = O2->isParam();
     bool IsGlobal1 = Var1 && Var1->vartag == Variable::GlobalVariable;
     bool IsGlobal2 = Var2 && Var2->vartag == Variable::GlobalVariable;
-    bool IsConst1 = Var1 && Var1->vartag == Variable::Constant;
-    bool IsConst2 = Var2 && Var2->vartag == Variable::Constant;
+    bool IsConst1 = Var1 && Var1->vartag == Variable::GlobalConstant;
+    bool IsConst2 = Var2 && Var2->vartag == Variable::GlobalConstant;
 
     if (IsAlloca1 && IsAlloca2)
         return true;
@@ -445,9 +445,7 @@ bool BasicAAResult::isLoopInvariant(Value* V, const Loop* L) const {
     if (V->isConst()) {
         return true;
     }
-    if (auto *Var = dynamic_cast<Variable*>(V)) {
-        return Var->isParam() || Var->isGlobal();
-    }
+    if (V->isParam() || V->isGlobal()) return true;
     auto *I = dynamic_cast<Instruction*>(V);
     if (!I) {
         return true;

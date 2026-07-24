@@ -14,7 +14,7 @@
 
 bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
     Variable *Source) {
-    if (!Source || (Source->vartag != Variable::Constant &&
+    if (!Source || (Source->vartag != Variable::GlobalConstant &&
                     Source->vartag != Variable::GlobalVariable))
         return false;
 
@@ -77,7 +77,7 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
         Root = dynamic_cast<Variable *>(Current);
         break;
     }
-    if (!Root || (Root->vartag != Variable::Constant &&
+    if (!Root || (Root->vartag != Variable::GlobalConstant &&
                   Root->vartag != Variable::GlobalVariable))
         return false;
 
@@ -375,7 +375,7 @@ bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
 
 bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
     if (!Source) return false;
-    if (Source->vartag == Variable::Constant) return true;
+    if (Source->vartag == Variable::GlobalConstant) return true;
     if (Source->vartag != Variable::GlobalVariable) return false;
 
     // Global2Local may retain the original synthesized global as the memcpy
@@ -938,8 +938,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
 
     std::map<std::vector<int>, AllocaInst *> Slots;
     for (auto &Entry : SlotTypes) {
-        auto *Slot =
-            new AllocaInst(POINTERType::NewPointer(Entry.second));
+        auto *Slot = new AllocaInst(Entry.second);
         if (!AI->insertBefore(Slot)) {
             delete Slot;
             return false;

@@ -79,7 +79,7 @@ Value *LoopIdiomRecognizePass::getDisjointObjectRoot(Value *V) {
     }
     if (auto *Var = dynamic_cast<Variable *>(V)) {
         return (Var->vartag == Variable::GlobalVariable ||
-                Var->vartag == Variable::Constant)
+                Var->vartag == Variable::GlobalConstant)
                    ? V
                    : nullptr;
     }

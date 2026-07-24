@@ -22,6 +22,14 @@ bool IRType::isBool() const {
     return IT && IT->getIsBool();
 }
 bool IRType::isScalar() const { return isInt() || isFloat(); }
+bool IRType::isBooleanVector() const {
+    const auto *Vector = dynamic_cast<const VECTORType *>(this);
+    return Vector && Vector->getElementType() &&
+           Vector->getElementType()->isBool();
+}
+bool IRType::isFirstClassValueType() const {
+    return isScalar() || isPointer() || isVector();
+}
 bool IRType::hasSameScalarType(const IRType &Other) const {
     if (!isScalar() || !Other.isScalar() || getTypeSystem() != Other.getTypeSystem())
         return false;
@@ -207,6 +215,94 @@ bool IRType::isVector(const std::shared_ptr<IRType> &Ty) {
 }
 bool IRType::isScalar(const std::shared_ptr<IRType> &Ty) {
     return Ty && Ty->isScalar();
+}
+bool IRType::isBooleanVector(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isBooleanVector();
+}
+bool IRType::isFirstClassValueType(const std::shared_ptr<IRType> &Ty) {
+    return Ty && Ty->isFirstClassValueType();
+}
+std::shared_ptr<VECTORType> IRType::asVector(
+    const std::shared_ptr<IRType> &Ty) {
+    return std::dynamic_pointer_cast<VECTORType>(Ty);
+}
+std::shared_ptr<IRType> IRType::getScalarElementType(
+    const std::shared_ptr<IRType> &Ty) {
+    if (auto Vector = asVector(Ty))
+        return Vector->getElementType();
+    return Ty;
+}
+std::shared_ptr<INTType> IRType::getScalarIntegerType(
+    const std::shared_ptr<IRType> &Ty) {
+    return std::dynamic_pointer_cast<INTType>(getScalarElementType(Ty));
+}
+std::shared_ptr<IRType> IRType::deriveLanePreservingType(
+    const std::shared_ptr<IRType> &SourceType,
+    const std::shared_ptr<IRType> &RequestedType) {
+    if (!SourceType || !RequestedType)
+        throw std::invalid_argument(
+            "向量转换要求有效的源值和目标类型");
+
+    auto SourceVector = asVector(SourceType);
+    auto DestinationVector = asVector(RequestedType);
+    if (!SourceVector) {
+        if (DestinationVector)
+            throw std::invalid_argument(
+                "标量转换的目标不能是向量类型");
+        return RequestedType;
+    }
+
+    if (DestinationVector) {
+        if (SourceVector->getElementCount() !=
+            DestinationVector->getElementCount())
+            throw std::invalid_argument(
+                "向量转换的源和目标必须具有相同 lane 数");
+        return RequestedType;
+    }
+
+    if (!RequestedType->isScalar())
+        throw std::invalid_argument(
+            "向量转换的目标元素必须是整数或浮点类型");
+    return VECTORType::NewVector(
+        RequestedType, SourceVector->getElementCount());
+}
+bool IRType::getLogicalBitWidth(std::size_t &BitWidth) const {
+    BitWidth = 0;
+
+    const IRType *ElementType = this;
+    std::size_t ElementCount = 1;
+    if (const auto *Vector =
+            dynamic_cast<const VECTORType *>(this)) {
+        if (!Vector->getElementType())
+            return false;
+        ElementType = Vector->getElementType().get();
+        ElementCount = Vector->getElementCount();
+    }
+
+    std::size_t ElementBits = 0;
+    if (const auto *Integer =
+            dynamic_cast<const INTType *>(ElementType)) {
+        ElementBits = Integer->getBitWidth();
+    } else if (ElementType && ElementType->isFloat()) {
+        ElementBits = 32;
+    } else {
+        return false;
+    }
+
+    if (ElementBits == 0 ||
+        ElementCount >
+            std::numeric_limits<std::size_t>::max() / ElementBits)
+        return false;
+    BitWidth = ElementBits * ElementCount;
+    return true;
+}
+bool IRType::getLogicalBitWidth(
+    const std::shared_ptr<IRType> &Ty, std::size_t &BitWidth) {
+    if (!Ty) {
+        BitWidth = 0;
+        return false;
+    }
+    return Ty->getLogicalBitWidth(BitWidth);
 }
 bool IRType::hasIntegerBitWidth(const std::shared_ptr<IRType> &Ty,
                                 unsigned BitWidth) {

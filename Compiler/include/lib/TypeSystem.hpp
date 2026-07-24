@@ -13,6 +13,10 @@
 enum TypeSystem{
     IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_VECTOR,IR_UNDEF
 };
+
+class INTType;
+class VECTORType;
+
 /*
  * IR类型与对应的IR类型语法：
  * IR_INT：
@@ -85,6 +89,10 @@ class IRType{
     bool isArray() const;
     bool isVector() const;
     bool isScalar() const; //检查是否是标量（整数或浮点数）
+    //判断当前类型是否为元素类型是 i1 的固定长度向量
+    bool isBooleanVector() const;
+    //first-class value 类型仅包括标量、指针和固定长度向量，严格排除 void
+    bool isFirstClassValueType() const;
     //静态类型判断接口：
     static bool isInt(const std::shared_ptr<IRType> &Ty);
     static bool isFloat(const std::shared_ptr<IRType> &Ty);
@@ -93,6 +101,25 @@ class IRType{
     static bool isArray(const std::shared_ptr<IRType> &Ty);
     static bool isVector(const std::shared_ptr<IRType> &Ty);
     static bool isScalar(const std::shared_ptr<IRType> &Ty);
+    static bool isBooleanVector(const std::shared_ptr<IRType> &Ty);
+    static bool isFirstClassValueType(const std::shared_ptr<IRType> &Ty);
+    //空指针安全地尝试向下转换为固定长度向量类型
+    static std::shared_ptr<VECTORType> asVector(
+        const std::shared_ptr<IRType> &Ty);
+    //标量保持原类型，固定长度向量返回其元素类型
+    static std::shared_ptr<IRType> getScalarElementType(
+        const std::shared_ptr<IRType> &Ty);
+    //尝试取得标量或固定长度向量的整数元素类型
+    static std::shared_ptr<INTType> getScalarIntegerType(
+        const std::shared_ptr<IRType> &Ty);
+    //根据源类型是标量还是向量，把调用者给出的目标类型整理成一个与源类型lane数保持一致的最终目标类型
+    static std::shared_ptr<IRType> deriveLanePreservingType(
+        const std::shared_ptr<IRType> &SourceType,
+        const std::shared_ptr<IRType> &RequestedType);
+    //取得整数、浮点或其固定长度向量的逻辑总位宽
+    bool getLogicalBitWidth(std::size_t &BitWidth) const;
+    static bool getLogicalBitWidth(const std::shared_ptr<IRType> &Ty,
+                                   std::size_t &BitWidth);
     //空指针安全地检查整数类型位宽
     static bool hasIntegerBitWidth(const std::shared_ptr<IRType> &Ty,
                                    unsigned BitWidth);

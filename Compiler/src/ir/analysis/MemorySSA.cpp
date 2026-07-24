@@ -68,8 +68,7 @@ std::size_t MemorySSAResult::size() const {
 bool MemorySSAResult::isInvariantInLoop(Value *V, const Loop *L) {
     if (!V || !L) return true;
     if (V->isConst()) return true;
-    if (auto *Var = dynamic_cast<Variable *>(V))
-        return Var->isParam() || Var->isGlobal();
+    if (V->isParam() || V->isGlobal()) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     BasicBlock *BB = I ? I->getParent() : nullptr;
     return !BB || !L->contains(BB);

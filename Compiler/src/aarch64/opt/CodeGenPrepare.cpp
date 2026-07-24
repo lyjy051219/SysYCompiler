@@ -107,8 +107,11 @@ bool fitsInt32(int64_t value) {
 }
 
 bool isParamOrGlobal(Value *V) {
+  if (dynamic_cast<Param *>(V)) {
+    return true;
+  }
   auto *Var = dynamic_cast<Variable *>(V);
-  return Var && (Var->isParam() || Var->isGlobal());
+  return Var && Var->isGlobal();
 }
 
 bool dominatesPreheader(Value *V, BasicBlock *PreHeader,

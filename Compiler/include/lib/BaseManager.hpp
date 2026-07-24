@@ -34,6 +34,7 @@ class FPTOSIInst;
 class SITOFPInst;
 class ZextInst;
 class Variable;
+class Param;
 class PhiInst;
 
 // Use 同时记录使用者和被使用值，并作为被使用值的使用链节点。
@@ -131,6 +132,7 @@ class Value{
 
    virtual bool isConst();
    virtual bool isGlobal();
+   virtual bool isParam();
    std::shared_ptr<IRType> getIRType() const;
    void setIdent(std::string Ident);
    std::string getIdent() const;

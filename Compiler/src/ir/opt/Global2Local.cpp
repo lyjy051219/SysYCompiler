@@ -163,7 +163,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	Instruction *AllocaInsertTail = nullptr;
 
 	for (auto &C : WorkList) {
-		auto *Alloca = new AllocaInst(POINTERType::NewPointer(C.ElemTy));
+		auto *Alloca = new AllocaInst(C.ElemTy);
 		Alloca->setIdent(C.GV->getIdent() + ".l2g");
 
 		Instruction *InsertPos = nullptr;

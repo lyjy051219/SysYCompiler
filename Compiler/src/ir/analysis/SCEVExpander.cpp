@@ -14,8 +14,7 @@ const std::vector<Instruction *> &SCEVExpander::createdInstructions() const {
 bool SCEVExpander::isAvailable(Value *V) const {
     if (!V || Value::isUndef(V) || !InsertBlock) return false;
     if (V->isConst()) return true;
-    if (auto *Var = dynamic_cast<Variable *>(V))
-        return Var->isParam() || Var->isGlobal();
+    if (V->isParam() || V->isGlobal()) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     return I && I->getParent() && DT.dominates(I->getParent(), InsertBlock);
 }

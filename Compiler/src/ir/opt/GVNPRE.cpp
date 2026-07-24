@@ -619,15 +619,13 @@ std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
         const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
 
         for (Value *RV : SEI.RefSet) {
-            auto *Var = dynamic_cast<Variable *>(RV);
-            if (!Var) continue;
-
-            if (Var->isGlobal()) {
+            if (!RV) continue;
+            if (RV->isGlobal()) {
                 pushUnique(RV);
                 continue;
             }
 
-            if (!Var->isParam()) continue;
+            if (!RV->isParam()) continue;
             int Index = CalleeFunc->getParamIndex(RV);
             if (Index >= 0 && static_cast<size_t>(Index) < Args.size() &&
                 Args[static_cast<size_t>(Index)] &&
