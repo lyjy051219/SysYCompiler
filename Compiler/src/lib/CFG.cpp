@@ -16,10 +16,409 @@
 
 extern std::unique_ptr<Module> ModuleIR;
 
-namespace {
+static std::shared_ptr<VECTORType>
+getVectorType(const std::shared_ptr<IRType> &Type) {
+  return std::dynamic_pointer_cast<VECTORType>(Type);
+}
 
-Value *coerceValueToType(BasicBlock *Block, Value *Input,
-                         const std::shared_ptr<IRType> &TargetType) {
+static std::shared_ptr<IRType>
+getScalarOrVectorElementType(const std::shared_ptr<IRType> &Type) {
+  if (auto VectorType = getVectorType(Type))
+    return VectorType->getElementType();
+  return Type;
+}
+
+static std::shared_ptr<INTType>
+getScalarOrVectorIntegerType(const std::shared_ptr<IRType> &Type) {
+  return std::dynamic_pointer_cast<INTType>(
+      getScalarOrVectorElementType(Type));
+}
+
+static bool isBooleanVectorType(const std::shared_ptr<IRType> &Type) {
+  auto VectorType = getVectorType(Type);
+  return VectorType && VectorType->getElementType() &&
+         VectorType->getElementType()->isBool();
+}
+
+static std::shared_ptr<IRType> getLanePreservingCastResultType(
+    Value *Source, const std::shared_ptr<IRType> &RequestedType) {
+  if (!Source || !Source->getIRType() || !RequestedType)
+    throw std::invalid_argument(
+        "向量转换要求有效的源值和目标类型");
+
+  auto SourceVector = getVectorType(Source->getIRType());
+  auto DestinationVector = getVectorType(RequestedType);
+  if (!SourceVector) {
+    if (DestinationVector)
+      throw std::invalid_argument(
+          "标量转换的目标不能是向量类型");
+    return RequestedType;
+  }
+
+  if (DestinationVector) {
+    if (SourceVector->getElementCount() !=
+        DestinationVector->getElementCount())
+      throw std::invalid_argument(
+          "向量转换的源和目标必须具有相同 lane 数");
+    return RequestedType;
+  }
+
+  if (!RequestedType->isScalar())
+    throw std::invalid_argument(
+        "向量转换的目标元素必须是整数或浮点类型");
+  return VECTORType::NewVector(
+      RequestedType, SourceVector->getElementCount());
+}
+
+static bool isFirstClassInstructionType(
+    const std::shared_ptr<IRType> &Type, bool AllowVoid = false) {
+  if (!Type) return false;
+  if (AllowVoid && Type->isVoid()) return true;
+  return Type->isScalar() || Type->isPointer() || Type->isVector();
+}
+
+static std::shared_ptr<IRType>
+getRetInstructionType(Value *ReturnValue) {
+  if (!ReturnValue ||
+      !isFirstClassInstructionType(ReturnValue->getIRType()))
+    throw std::invalid_argument(
+        "ret 返回值必须是标量、指针或固定长度向量");
+  return VOIDType::NewVoid();
+}
+
+static std::shared_ptr<IRType> getAllocaResultType(
+    const std::shared_ptr<IRType> &ResultType) {
+  auto PointerType =
+      std::dynamic_pointer_cast<POINTERType>(ResultType);
+  if (!PointerType || !PointerType->getPointerType() ||
+      PointerType->getPointerType()->isVoid())
+    throw std::invalid_argument(
+        "alloca 结果必须是指向非 void 对象的指针");
+  return ResultType;
+}
+
+static std::shared_ptr<IRType> makeAllocaResultType(
+    const std::shared_ptr<IRType> &AllocatedType) {
+  if (!AllocatedType || AllocatedType->isVoid())
+    throw std::invalid_argument(
+        "alloca 不能分配空类型或 void 类型");
+  return POINTERType::NewPointer(AllocatedType);
+}
+
+static std::shared_ptr<IRType> getCallResultType(
+    Value *Callee, const std::vector<Value *> &Arguments) {
+  if (!Callee ||
+      !isFirstClassInstructionType(Callee->getIRType(), true))
+    throw std::invalid_argument(
+        "call 要求具有合法返回类型的被调函数");
+  if (!dynamic_cast<Function *>(Callee) &&
+      !dynamic_cast<BuildInFunction *>(Callee))
+    throw std::invalid_argument(
+        "call 的第一个操作数必须是函数");
+
+  for (Value *Argument : Arguments) {
+    if (!Argument ||
+        !isFirstClassInstructionType(Argument->getIRType()))
+      throw std::invalid_argument(
+          "call 实参必须是标量、指针或固定长度向量");
+  }
+
+  if (auto *DirectCallee = dynamic_cast<Function *>(Callee)) {
+    const auto &Parameters = DirectCallee->getParams();
+    if (Arguments.size() != Parameters.size())
+      throw std::invalid_argument(
+          "call 实参数量必须与函数形参数量一致");
+    for (std::size_t I = 0; I < Arguments.size(); ++I) {
+      if (!Parameters[I] || !Parameters[I]->getIRType() ||
+          !Arguments[I]->getIRType()->hasSameShape(
+              *Parameters[I]->getIRType()))
+        throw std::invalid_argument(
+            "call 实参类型必须与函数形参类型完全一致");
+    }
+  } else if (auto *BuiltinCallee =
+                 dynamic_cast<BuildInFunction *>(Callee)) {
+    auto Signature =
+        BuildInFunction::getSignature(BuiltinCallee->getIdent());
+    // 有显式签名的运行库/LLVM 内建必须精确匹配；少数历史伪内建
+    // 没有参数元数据，只保留上面的 first-class 操作数约束。
+    if (Signature) {
+      if (!Signature->returnType ||
+          !Callee->getIRType()->hasSameShape(
+              *Signature->returnType))
+        throw std::invalid_argument(
+            "call 的内建函数签名无效");
+
+      const std::size_t FixedArgumentCount =
+          Signature->parameterTypes.size();
+      if (Arguments.size() < FixedArgumentCount ||
+          (!Signature->variadic &&
+           Arguments.size() != FixedArgumentCount))
+        throw std::invalid_argument(
+            "call 实参数量必须符合内建函数签名");
+
+      for (std::size_t I = 0; I < FixedArgumentCount; ++I) {
+        const bool IsOpaquePointer =
+            I < Signature->opaquePointerParameters.size() &&
+            Signature->opaquePointerParameters[I];
+        if (IsOpaquePointer) {
+          if (!Arguments[I]->getIRType()->isPointer())
+            throw std::invalid_argument(
+                "call 的内建函数指针实参类型无效");
+          continue;
+        }
+        if (!Signature->parameterTypes[I] ||
+            !Arguments[I]->getIRType()->hasSameShape(
+                *Signature->parameterTypes[I]))
+          throw std::invalid_argument(
+              "call 实参类型必须与内建函数形参类型完全一致");
+      }
+    }
+  }
+  return Callee->getIRType();
+}
+
+static std::shared_ptr<IRType>
+getGEPAggregateElementType(const std::shared_ptr<IRType> &Type) {
+  if (auto ArrayType = std::dynamic_pointer_cast<ARRAYType>(Type))
+    return ArrayType->getElementType();
+  if (auto VectorType = getVectorType(Type))
+    return VectorType->getElementType();
+  return nullptr;
+}
+
+static std::shared_ptr<IRType>
+getGEPBasePointerType(Value *Base) {
+  auto PointerType =
+      Base && Base->getIRType()
+          ? std::dynamic_pointer_cast<POINTERType>(
+                Base->getIRType())
+          : nullptr;
+  if (!PointerType || !PointerType->getPointerType() ||
+      PointerType->getPointerType()->isVoid())
+    throw std::invalid_argument(
+        "getelementptr 的基地址必须是标量指针");
+  return Base->getIRType();
+}
+
+static bool isScalarIntegerIndex(Value *Index) {
+  return Index && Index->getIRType() &&
+         Index->getIRType()->isInt();
+}
+
+static bool deriveGEPResultType(
+    Value *Base, const std::vector<Value *> &Indices,
+    std::shared_ptr<IRType> &ResultType,
+    std::vector<int64_t> *Strides = nullptr) {
+  ResultType = nullptr;
+  if (Strides) Strides->clear();
+
+  auto BasePointer =
+      Base && Base->getIRType()
+          ? std::dynamic_pointer_cast<POINTERType>(
+                Base->getIRType())
+          : nullptr;
+  if (!BasePointer || !BasePointer->getPointerType() ||
+      BasePointer->getPointerType()->isVoid())
+    return false;
+
+  if (Indices.empty()) {
+    ResultType = Base->getIRType();
+    return true;
+  }
+
+  std::shared_ptr<IRType> CurrentType =
+      BasePointer->getPointerType();
+  for (std::size_t I = 0; I < Indices.size(); ++I) {
+    if (!isScalarIntegerIndex(Indices[I])) return false;
+
+    // 首个索引在基指针所指对象序列中移动，不剥离 pointee；
+    // 后续索引才进入数组或固定长度向量的元素。
+    if (I != 0) {
+      CurrentType = getGEPAggregateElementType(CurrentType);
+      if (!CurrentType) return false;
+    }
+
+    if (Strides) {
+      const std::size_t Size = CurrentType->getSize();
+      if (Size == 0 ||
+          Size >
+              static_cast<std::size_t>(
+                  std::numeric_limits<int64_t>::max()))
+        return false;
+      Strides->push_back(static_cast<int64_t>(Size));
+    }
+  }
+
+  ResultType = POINTERType::NewPointer(CurrentType);
+  return true;
+}
+
+static std::shared_ptr<IRType> getGEPResultType(
+    Value *Base, const std::vector<Value *> &Indices) {
+  std::shared_ptr<IRType> ResultType;
+  if (!deriveGEPResultType(Base, Indices, ResultType))
+    throw std::invalid_argument(
+        "getelementptr 的标量索引与基地址类型不匹配");
+  return ResultType;
+}
+
+static bool getLogicalBitWidth(
+    const std::shared_ptr<IRType> &Type, std::size_t &BitWidth) {
+  BitWidth = 0;
+  if (!Type) return false;
+
+  auto ElementType = getScalarOrVectorElementType(Type);
+  std::size_t ElementBits = 0;
+  if (auto IntegerType =
+          std::dynamic_pointer_cast<INTType>(ElementType)) {
+    ElementBits = IntegerType->getBitWidth();
+  } else if (ElementType && ElementType->isFloat()) {
+    ElementBits = 32;
+  } else {
+    return false;
+  }
+
+  std::size_t ElementCount = 1;
+  if (auto VectorType = getVectorType(Type))
+    ElementCount = VectorType->getElementCount();
+  if (ElementBits == 0 ||
+      ElementCount >
+          std::numeric_limits<std::size_t>::max() / ElementBits)
+    return false;
+  BitWidth = ElementBits * ElementCount;
+  return true;
+}
+
+static std::shared_ptr<IRType> getBitCastResultType(
+    Value *Source, const std::shared_ptr<IRType> &TargetType) {
+  if (!Source || !Source->getIRType() || !TargetType)
+    throw std::invalid_argument(
+        "bitcast 要求有效的源值和目标类型");
+
+  auto SourceType = Source->getIRType();
+  if (SourceType->isPointer() || TargetType->isPointer()) {
+    if (!SourceType->isPointer() || !TargetType->isPointer())
+      throw std::invalid_argument(
+          "bitcast 的指针源和目标必须同时为指针类型");
+    return TargetType;
+  }
+
+  std::size_t SourceBits = 0;
+  std::size_t TargetBits = 0;
+  if (!getLogicalBitWidth(SourceType, SourceBits) ||
+      !getLogicalBitWidth(TargetType, TargetBits))
+    throw std::invalid_argument(
+        "bitcast 只支持非聚合标量、固定长度向量或指针");
+  if (SourceBits != TargetBits)
+    throw std::invalid_argument(
+        "bitcast 的源和目标逻辑总位数必须相同");
+  return TargetType;
+}
+
+static std::shared_ptr<IRType>
+getLoadResultType(Value *Pointer) {
+  auto PointerType =
+      Pointer && Pointer->getIRType()
+          ? std::dynamic_pointer_cast<POINTERType>(
+                Pointer->getIRType())
+          : nullptr;
+  if (!PointerType || !PointerType->getPointerType())
+    throw std::invalid_argument(
+        "load 的地址操作数必须是标量指针");
+  return PointerType->getPointerType();
+}
+
+static void validateStoreOperands(Value *StoredValue, Value *Pointer) {
+  auto PointerType =
+      Pointer && Pointer->getIRType()
+          ? std::dynamic_pointer_cast<POINTERType>(
+                Pointer->getIRType())
+          : nullptr;
+  if (!StoredValue || !StoredValue->getIRType() ||
+      !PointerType || !PointerType->getPointerType())
+    throw std::invalid_argument(
+        "store 要求有效的值和标量指针");
+  if (!StoredValue->getIRType()->hasSameShape(
+          *PointerType->getPointerType()))
+    throw std::invalid_argument(
+        "store 的值类型必须与指针指向类型完全一致");
+}
+
+static std::shared_ptr<IRType>
+getExtractElementResultType(Value *Vector, Value *Index) {
+  auto VectorType =
+      Vector && Vector->getIRType()
+          ? getVectorType(Vector->getIRType())
+          : nullptr;
+  if (!VectorType || !VectorType->getElementType())
+    throw std::invalid_argument(
+        "extractelement 的第一个操作数必须是向量");
+  if (!Index || !Index->getIRType() || !Index->getIRType()->isInt())
+    throw std::invalid_argument(
+        "extractelement 的索引必须是标量整数");
+  return VectorType->getElementType();
+}
+
+static std::shared_ptr<IRType>
+getInsertElementResultType(Value *Vector, Value *Element, Value *Index) {
+  auto VectorType =
+      Vector && Vector->getIRType()
+          ? getVectorType(Vector->getIRType())
+          : nullptr;
+  if (!VectorType || !VectorType->getElementType())
+    throw std::invalid_argument(
+        "insertelement 的第一个操作数必须是向量");
+  if (!Element || !Element->getIRType() ||
+      !Element->getIRType()->hasSameShape(
+          *VectorType->getElementType()))
+    throw std::invalid_argument(
+        "insertelement 的元素类型必须匹配向量元素类型");
+  if (!Index || !Index->getIRType() || !Index->getIRType()->isInt())
+    throw std::invalid_argument(
+        "insertelement 的索引必须是标量整数");
+  return Vector->getIRType();
+}
+
+static std::shared_ptr<IRType>
+getShuffleVectorResultType(Value *First, Value *Second,
+                           const std::vector<int> &Mask) {
+  auto FirstType =
+      First && First->getIRType()
+          ? getVectorType(First->getIRType())
+          : nullptr;
+  auto SecondType =
+      Second && Second->getIRType()
+          ? getVectorType(Second->getIRType())
+          : nullptr;
+  if (!FirstType || !SecondType || !FirstType->getElementType())
+    throw std::invalid_argument(
+        "shufflevector 的前两个操作数必须是向量");
+  if (!First->getIRType()->hasSameShape(*Second->getIRType()))
+    throw std::invalid_argument(
+        "shufflevector 的两个输入向量必须类型完全一致");
+  if (Mask.empty())
+    throw std::invalid_argument("shufflevector 的 mask 不能为空");
+
+  const std::size_t SourceLanes = FirstType->getElementCount();
+  for (int Lane : Mask) {
+    if (Lane < -1)
+      throw std::invalid_argument(
+          "shufflevector 的 mask 只允许非负索引或 -1");
+    if (Lane < 0)
+      continue;
+    const std::size_t LaneIndex = static_cast<std::size_t>(Lane);
+    if (LaneIndex >= SourceLanes &&
+        LaneIndex - SourceLanes >= SourceLanes)
+      throw std::out_of_range("shufflevector 的 mask 索引越界");
+  }
+
+  return VECTORType::NewVector(FirstType->getElementType(),
+                               Mask.size());
+}
+
+static Value *coerceValueToType(
+    BasicBlock *Block, Value *Input,
+    const std::shared_ptr<IRType> &TargetType) {
   if (!Block || !Input || !Input->getIRType() || !TargetType)
     return nullptr;
   const auto SourceType = Input->getIRType();
@@ -90,8 +489,6 @@ Value *coerceValueToType(BasicBlock *Block, Value *Input,
 
   return nullptr;
 }
-
-} // 匿名命名空间
 
 bool BinaryInst::isIntegerOnlyOp(BinaryInst::Operation op) {
   switch (op) {
@@ -898,6 +1295,8 @@ BasicBlock *BasicBlock::splitEdge(Function &F, const CFGEdge &Edge) {
 void BasicBlock::genRetInst(Value* retVal){
     if (!retVal || !getParent() || !getParent()->getIRType())
       return;
+    if (getParent()->getIRType()->isVoid())
+      return;
     retVal = coerceValueToType(this, retVal, getParent()->getIRType());
     if (!retVal)
       return;
@@ -906,6 +1305,9 @@ void BasicBlock::genRetInst(Value* retVal){
 }
 
 void BasicBlock::genRetInst(){
+    if (!getParent() || !getParent()->getIRType() ||
+        !getParent()->getIRType()->isVoid())
+      return;
     auto inst = new RetInst();
     pushBack(inst);
 }
@@ -922,7 +1324,7 @@ void BasicBlock::genUnCondInst(BasicBlock *block) {
 
 AllocaInst *
 BasicBlock::genAllocaInst(std::shared_ptr<IRType> allocatedType) {
-    auto pointerType = POINTERType::NewPointer(std::move(allocatedType));
+    auto pointerType = makeAllocaResultType(allocatedType);
     auto *allocation = new AllocaInst(std::move(pointerType));
     // 栈对象统一放入函数入口块，源码符号登记由 IRGenerator 独立完成。
     getParent()->front()->pushFront(allocation);
@@ -951,11 +1353,40 @@ Value* BasicBlock::genGepInst(Value* ptr){
     return inst;
 }
 
+Value* BasicBlock::genExtractElementInst(Value* vector, Value* index) {
+    auto *inst = new ExtractElementInst(vector, index);
+    pushBack(inst);
+    return inst;
+}
+
+Value* BasicBlock::genInsertElementInst(
+    Value* vector, Value* element, Value* index) {
+    auto *inst = new InsertElementInst(vector, element, index);
+    pushBack(inst);
+    return inst;
+}
+
+Value* BasicBlock::genShuffleVectorInst(
+    Value* first, Value* second, const std::vector<int>& mask) {
+    auto *inst = new ShuffleVectorInst(first, second, mask);
+    pushBack(inst);
+    return inst;
+}
+
 Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
   if (!A || !B || !A->getIRType() || !B->getIRType())
     return nullptr;
-  if (A->getIRType()->isVector() || B->getIRType()->isVector())
-    return nullptr;
+
+  // LLVM 普通算术、位运算和比较指令直接接受同类型向量。基础框架
+  // 暂不隐式广播标量，也不在这里做向量元素类型转换。
+  if (A->getIRType()->isVector() || B->getIRType()->isVector()) {
+    if (!A->getIRType()->isVector() || !B->getIRType()->isVector() ||
+        !A->getIRType()->hasSameShape(*B->getIRType()))
+      return nullptr;
+    auto *inst = new BinaryInst(A, op, B);
+    pushBack(inst);
+    return inst;
+  }
 
   bool AIsInteger = A->getIRType()->isInt();
   bool BIsInteger = B->getIRType()->isInt();
@@ -1020,6 +1451,12 @@ Value* BasicBlock::genBinaryInst(Value* A, BinaryInst::Operation op, Value* B){
 Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
                                  BinaryInst::Operation op, Value* right){
   if (!left || !right) return nullptr;
+  // 当前没有独立的向量常量折叠器；即使操作数是 undef 等常量向量，
+  // 也应保留为合法的逐 lane LLVM 指令。
+  if ((left->getIRType() && left->getIRType()->isVector()) ||
+      (right->getIRType() && right->getIRType()->isVector())) {
+    return bb ? bb->genBinaryInst(left, op, right) : nullptr;
+  }
   if (left->isConst() && right->isConst()) {
     Value *A = left;
     Value *B = right;
@@ -1058,53 +1495,60 @@ Value* BasicBlock::genSITOFPInst(Value* x){
     return inst;
 }
 
+Value* BasicBlock::genSITOFPInst(
+    Value* x, std::shared_ptr<IRType> targetType) {
+    auto *inst = new SITOFPInst(x, std::move(targetType));
+    pushBack(inst);
+    return inst;
+}
+
 Value* BasicBlock::genFPTOSIInst(Value* x){
-    auto inst = new FPTOSIInst(x, INTType::getInt32Ty());
+    auto inst = new FPTOSIInst(x);
     pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genFPTOSIInst(
-    Value* x, std::shared_ptr<INTType> targetType) {
+    Value* x, std::shared_ptr<IRType> targetType) {
     auto *inst = new FPTOSIInst(x, std::move(targetType));
     pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genZextInst(Value* x){
-    auto inst = new ZextInst(x, INTType::getInt32Ty());
+    auto inst = new ZextInst(x);
     pushBack(inst);
     return inst;
 }
 
 Value* BasicBlock::genZextInst(
-    Value* x, std::shared_ptr<INTType> targetType) {
+    Value* x, std::shared_ptr<IRType> targetType) {
   auto *inst = new ZextInst(x, std::move(targetType));
   pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genTruncInst(Value* x){
-  auto inst = new TruncInst(x, INTType::getBoolTy());
+  auto inst = new TruncInst(x);
   pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genTruncInst(
-    Value* x, std::shared_ptr<INTType> targetType) {
+    Value* x, std::shared_ptr<IRType> targetType) {
   auto *inst = new TruncInst(x, std::move(targetType));
   pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genSextInst(Value* x){
-  auto inst = new SextInst(x, INTType::getInt32Ty());
+  auto inst = new SextInst(x);
   pushBack(inst);
   return inst;
 }
 
 Value* BasicBlock::genSextInst(
-    Value* x, std::shared_ptr<INTType> targetType) {
+    Value* x, std::shared_ptr<IRType> targetType) {
   auto *inst = new SextInst(x, std::move(targetType));
   pushBack(inst);
   return inst;
@@ -1211,12 +1655,16 @@ Value* BasicBlock::genCallInst(std::string ident, std::vector<Value*> args) {
       auto &ii = *i;
       auto jj = j->get();
       if (!ii || !jj || !ii->getIRType() || !jj->getIRType()) return nullptr;
-      if (jj->getIRType() != ii->getIRType()) {
-        auto a = ii->getIRType()->getTypeSystem(), b = jj->getIRType()->getTypeSystem();
-        // 指针和数组由调用边界保证形状兼容，此处不猜测复合类型转换。
-        if (b == IR_POINTER || a == IR_POINTER || a == IR_ARRAY) {
-          continue;
-        }
+      if (!jj->getIRType()->hasSameShape(*ii->getIRType())) {
+        auto a = ii->getIRType()->getTypeSystem();
+        auto b = jj->getIRType()->getTypeSystem();
+        // 向量调用边界不做广播、lane 变化或隐式元素转换。
+        if (a == IR_VECTOR || b == IR_VECTOR)
+          return nullptr;
+        // 复合类型必须在调用边界完全同形。
+        if (b == IR_POINTER || a == IR_POINTER ||
+            a == IR_ARRAY || b == IR_ARRAY)
+          return nullptr;
         // 标量实参按形参类型在整数和浮点数之间转换。
         if ((a != IR_INT && a != IR_FLOAT) ||
             (b != IR_INT && b != IR_FLOAT))
@@ -1453,11 +1901,14 @@ Value *Instruction::foldConstantCast(
   }
 }
 
-RetInst::RetInst(Value* retVal){
+RetInst::RetInst(Value* retVal)
+    : Instruction(getRetInstructionType(retVal)) {
     addUse(retVal);
     instType = InstType::RET;
 }
-RetInst::RetInst(){instType = InstType::RET;}
+RetInst::RetInst() : Instruction(VOIDType::NewVoid()) {
+    instType = InstType::RET;
+}
 RetInst::RetInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::RET;}
 Value *RetInst::getReturnValue() const {
   return getNumOperands() == 1 ? getOperand(0) : nullptr;
@@ -1551,8 +2002,14 @@ void BrInst::dumpIR(){
     }
 }
 
-AllocaInst::AllocaInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::ALLOCA;}
-AllocaInst::AllocaInst(std::string ident,std::shared_ptr<IRType> irtype):Instruction(POINTERType::NewPointer(irtype)){
+AllocaInst::AllocaInst(std::shared_ptr<IRType> irtype)
+    : Instruction(getAllocaResultType(irtype)) {
+    instType = InstType::ALLOCA;
+}
+AllocaInst::AllocaInst(
+    std::string ident, std::shared_ptr<IRType> irtype)
+    : Instruction(makeAllocaResultType(irtype)) {
+    this->ident = std::move(ident);
     instType = InstType::ALLOCA;
 }
 void AllocaInst::dumpIR(){
@@ -1579,7 +2036,9 @@ bool AllocaInst::isArrayAllocation(const AllocaInst *AI) {
 }
 
 StoreInst::StoreInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::STORE;}
-StoreInst::StoreInst(Value* val,Value* ptr){
+StoreInst::StoreInst(Value* val,Value* ptr)
+    : Instruction(VOIDType::NewVoid()) {
+    validateStoreOperands(val, ptr);
     addUse(val);
     addUse(ptr);
     ident = "StoreInst";
@@ -1608,14 +2067,8 @@ void StoreInst::dumpIR(){
 
 LoadInst::LoadInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::LOAD;}
 // 结果类型取自指针指向的类型，操作数关系在类型确定后建立。
-LoadInst::LoadInst(Value* v) : Instruction(VOIDType::NewVoid()) {
+LoadInst::LoadInst(Value* v) : Instruction(getLoadResultType(v)) {
     instType = InstType::LOAD;
-    if (!v || !v->getIRType()) return;
-    auto ptrType = std::dynamic_pointer_cast<POINTERType>(v->getIRType());
-    if (!ptrType || !ptrType->getPointerType()) return;
-
-    this->irtype = ptrType->getPointerType();
-
     addUse(v);
 }
 
@@ -1638,13 +2091,16 @@ void LoadInst::dumpIR(){
   std::cout << '\n';
 }
 
-GetElementPtrInst::GetElementPtrInst(Value* v) : Instruction(v->getIRType()) {
+GetElementPtrInst::GetElementPtrInst(Value* v)
+    : Instruction(getGEPBasePointerType(v)) {
     addUse(v);
     instType = InstType::GEP;
 }
-GetElementPtrInst::GetElementPtrInst(Value* v, std::vector<Value*>& vv) : Instruction(v->getIRType()) {
+GetElementPtrInst::GetElementPtrInst(
+    Value* v, std::vector<Value*>& vv)
+    : Instruction(getGEPResultType(v, vv)) {
     addUse(v);
-    for(auto &&i : vv) addUse(i);
+    for (Value *Index : vv) addUse(Index);
     instType = InstType::GEP;
 }
 GetElementPtrInst::GetElementPtrInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::GEP;}
@@ -1684,19 +2140,15 @@ void GetElementPtrInst::dumpIR() {
 void GetElementPtrInst::updateType() {
     if (userList.empty()) return;
 
-    Value* basePtr = userList[0]->getValue();
-    auto currentType = basePtr->getIRType();
+    Value *Base = userList[0]->getValue();
+    std::vector<Value *> Indices;
+    Indices.reserve(userList.size() - 1);
+    for (size_t I = 1; I < userList.size(); ++I)
+        Indices.push_back(userList[I]->getValue());
 
-    // 从基指针类型出发，每个索引剥离一层指针或数组。
-    for (size_t i = 1; i < userList.size(); i++) {
-        currentType = currentType
-                          ? currentType->getIndexableElementType()
-                          : nullptr;
-        if (!currentType) return;
-    }
-
-    // 最终元素类型重新包装为 GEP 的结果指针类型。
-    this->irtype = POINTERType::NewPointer(currentType);
+    std::shared_ptr<IRType> ResultType;
+    if (deriveGEPResultType(Base, Indices, ResultType))
+        this->irtype = std::move(ResultType);
 }
 
 Value *GetElementPtrInst::getBasePointer() const {
@@ -1750,38 +2202,29 @@ bool GetElementPtrInst::getBaseAndIndices(
 
 bool GetElementPtrInst::reset(Value *Base,
                               const std::vector<Value *> &Indices) {
-    if (!Base) return false;
-    for (Value *Index : Indices) {
-        if (!Index) return false;
-    }
+    std::shared_ptr<IRType> ResultType;
+    if (!deriveGEPResultType(Base, Indices, ResultType))
+        return false;
+
     clearOperands();
     addUse(Base);
     for (Value *Index : Indices) addUse(Index);
-    updateType();
+    this->irtype = std::move(ResultType);
     return true;
 }
 
 std::optional<int64_t> GetElementPtrInst::getLastIndexStride() {
-    if (getNumOperands() < 2) return std::nullopt;
+    Value *Base = nullptr;
+    std::vector<Value *> Indices;
+    if (!getBaseAndIndices(Base, Indices) || Indices.empty())
+        return std::nullopt;
 
-    Value *Base = getOperand(0);
-    if (!Base || !Base->getIRType()) return std::nullopt;
-
-    std::shared_ptr<IRType> CurrentTy = Base->getIRType();
-    int64_t LastStride = 0;
-    // 按索引逐层剖解指针或数组，最后一层元素大小即末索引步长。
-    for (size_t I = 1; I < getNumOperands(); ++I) {
-        std::shared_ptr<IRType> ElementTy =
-            CurrentTy ? CurrentTy->getIndexableElementType() : nullptr;
-        if (!ElementTy ||
-            ElementTy->getSize() >
-                static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-            return std::nullopt;
-        }
-        LastStride = static_cast<int64_t>(ElementTy->getSize());
-        CurrentTy = ElementTy;
-    }
-    return LastStride;
+    std::vector<int64_t> Strides;
+    std::shared_ptr<IRType> ResultType;
+    if (!deriveGEPResultType(Base, Indices, ResultType, &Strides) ||
+        Strides.empty())
+        return std::nullopt;
+    return Strides.back();
 }
 
 bool GetElementPtrInst::flattenZeroBasedChain(Value *&Base,
@@ -1834,25 +2277,122 @@ bool GetElementPtrInst::getIndexStrides(Value *Base,
                                         int64_t &FinalPointeeStride) {
     Strides.clear();
     FinalPointeeStride = 0;
-    if (!Base || !Base->getIRType()) return false;
+    if (Indices.empty()) return false;
 
-    // 每个索引的字节步长等于该层被索引元素的大小。
-    std::shared_ptr<IRType> CurrentTy = Base->getIRType();
-    for (Value *Idx : Indices) {
-        (void)Idx;
-        std::shared_ptr<IRType> ElementTy =
-            CurrentTy ? CurrentTy->getIndexableElementType() : nullptr;
-        if (!ElementTy ||
-            ElementTy->getSize() >
-                static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-            return false;
-        }
-        int64_t Stride = static_cast<int64_t>(ElementTy->getSize());
-        Strides.push_back(Stride);
-        FinalPointeeStride = Stride;
-        CurrentTy = ElementTy;
+    std::shared_ptr<IRType> ResultType;
+    if (!deriveGEPResultType(Base, Indices, ResultType, &Strides) ||
+        Strides.empty())
+        return false;
+    FinalPointeeStride = Strides.back();
+    return true;
+}
+
+ExtractElementInst::ExtractElementInst(Value* vector, Value* index)
+    : Instruction(getExtractElementResultType(vector, index)) {
+    instType = InstType::EXTRACTELEMENT;
+    addUse(vector);
+    addUse(index);
+}
+
+Value* ExtractElementInst::getVectorOperand() const {
+    return getOperand(0);
+}
+
+Value* ExtractElementInst::getIndexOperand() const {
+    return getOperand(1);
+}
+
+void ExtractElementInst::dumpIR() {
+    Value::dumpIR();
+    std::cout << " = extractelement ";
+    getVectorOperand()->getIRType()->toString();
+    std::cout << " ";
+    getVectorOperand()->dumpIR();
+    std::cout << ", ";
+    getIndexOperand()->getIRType()->toString();
+    std::cout << " ";
+    getIndexOperand()->dumpIR();
+    std::cout << "\n";
+}
+
+InsertElementInst::InsertElementInst(
+    Value* vector, Value* element, Value* index)
+    : Instruction(
+          getInsertElementResultType(vector, element, index)) {
+    instType = InstType::INSERTELEMENT;
+    addUse(vector);
+    addUse(element);
+    addUse(index);
+}
+
+Value* InsertElementInst::getVectorOperand() const {
+    return getOperand(0);
+}
+
+Value* InsertElementInst::getElementOperand() const {
+    return getOperand(1);
+}
+
+Value* InsertElementInst::getIndexOperand() const {
+    return getOperand(2);
+}
+
+void InsertElementInst::dumpIR() {
+    Value::dumpIR();
+    std::cout << " = insertelement ";
+    getVectorOperand()->getIRType()->toString();
+    std::cout << " ";
+    getVectorOperand()->dumpIR();
+    std::cout << ", ";
+    getElementOperand()->getIRType()->toString();
+    std::cout << " ";
+    getElementOperand()->dumpIR();
+    std::cout << ", ";
+    getIndexOperand()->getIRType()->toString();
+    std::cout << " ";
+    getIndexOperand()->dumpIR();
+    std::cout << "\n";
+}
+
+ShuffleVectorInst::ShuffleVectorInst(
+    Value* first, Value* second, std::vector<int> mask)
+    : Instruction(
+          getShuffleVectorResultType(first, second, mask)),
+      mask(std::move(mask)) {
+    instType = InstType::SHUFFLEVECTOR;
+    addUse(first);
+    addUse(second);
+}
+
+Value* ShuffleVectorInst::getFirstVectorOperand() const {
+    return getOperand(0);
+}
+
+Value* ShuffleVectorInst::getSecondVectorOperand() const {
+    return getOperand(1);
+}
+
+void ShuffleVectorInst::dumpIR() {
+    Value::dumpIR();
+    std::cout << " = shufflevector ";
+    getFirstVectorOperand()->getIRType()->toString();
+    std::cout << " ";
+    getFirstVectorOperand()->dumpIR();
+    std::cout << ", ";
+    getSecondVectorOperand()->getIRType()->toString();
+    std::cout << " ";
+    getSecondVectorOperand()->dumpIR();
+    std::cout << ", <" << mask.size() << " x i32> <";
+    for (std::size_t I = 0; I < mask.size(); ++I) {
+        if (I != 0)
+            std::cout << ", ";
+        std::cout << "i32 ";
+        if (mask[I] < 0)
+            std::cout << "poison";
+        else
+            std::cout << mask[I];
     }
-    return FinalPointeeStride > 0 && Strides.size() == Indices.size();
+    std::cout << ">\n";
 }
 
 BinaryInst::BinaryInst(std::shared_ptr<IRType> irtype):Instruction(irtype){
@@ -1860,24 +2400,34 @@ BinaryInst::BinaryInst(std::shared_ptr<IRType> irtype):Instruction(irtype){
 }
 
 BinaryInst::BinaryInst(Value* x,Operation op,Value* y)
-    :Instruction(x->getIRType()),op(op){
+    : Instruction(x && x->getIRType()
+                      ? x->getIRType()
+                      : VOIDType::NewVoid()),
+      op(op) {
     if (!x || !y || !x->getIRType() || !y->getIRType() ||
         !x->getIRType()->hasSameShape(*y->getIRType()))
       throw std::invalid_argument("二元指令要求两个操作数类型完全一致");
-    if (x->getIRType()->isVector())
-      throw std::invalid_argument("当前标量二元指令不接受向量类型");
-    const bool IsScalar = x->getIRType()->isScalar();
+    const auto ScalarType =
+        getScalarOrVectorElementType(x->getIRType());
+    const bool IsScalarOrVector =
+        ScalarType && ScalarType->isScalar();
     const bool IsPointerCompare =
         x->getIRType()->isPointer() && BinaryInst::isCompareOp(op);
-    if (!IsScalar && !IsPointerCompare)
+    if (!IsScalarOrVector && !IsPointerCompare)
       throw std::invalid_argument("二元指令的操作数类型不受支持");
     if (BinaryInst::isIntegerOnlyOp(op) &&
-        !x->getIRType()->isInt())
+        (!ScalarType || !ScalarType->isInt()))
       throw std::invalid_argument("该二元操作只接受整数类型");
     if (BinaryInst::isCompareOp(op)) {
-      this->irtype = INTType::getBoolTy();
+      if (auto VectorType = getVectorType(x->getIRType())) {
+        this->irtype = VECTORType::NewVector(
+            INTType::getBoolTy(), VectorType->getElementCount());
+      } else {
+        this->irtype = INTType::getBoolTy();
+      }
     }
-    this->instType = getInstType(op, x->getIRType()->getTypeSystem());
+    this->instType =
+        getInstType(op, ScalarType->getTypeSystem());
     this->addUse(x);
     this->addUse(y);
 }
@@ -2084,7 +2634,9 @@ Value *BinaryInst::foldConstants(Operation Op, Value *LHS, Value *RHS,
 
 void BinaryInst::dumpIR(){
   Value::dumpIR();
-  TypeSystem tp = userList[0]->getValue()->getIRType()->getTypeSystem();
+  auto OperandType = userList[0]->getValue()->getIRType();
+  auto ScalarType = getScalarOrVectorElementType(OperandType);
+  TypeSystem tp = ScalarType->getTypeSystem();
   std::cout << " = ";
   switch (op) {
   case BinaryInst::ADD:
@@ -2181,7 +2733,7 @@ void BinaryInst::dumpIR(){
 CallInst::CallInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::CALL;}
 CallInst::CallInst(Value *func, std::vector<Value*> &args,
                    std::string appendix)
-    : Instruction(func->getIRType()) {
+    : Instruction(getCallResultType(func, args)) {
   ident += appendix;
   addUse(func);
   for (auto &i : args)
@@ -2277,10 +2829,15 @@ FPTOSIInst::FPTOSIInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instT
 FPTOSIInst::FPTOSIInst(Value* v)
     : FPTOSIInst(v, INTType::getInt32Ty()) {}
 FPTOSIInst::FPTOSIInst(
-    Value* v, std::shared_ptr<INTType> targetType)
-    : Instruction(std::move(targetType)) {
-    if (!v || !v->getIRType() || !v->getIRType()->isFloat() ||
-        !getIRType() || !getIRType()->isInt())
+    Value* v, std::shared_ptr<IRType> targetType)
+    : Instruction(
+          getLanePreservingCastResultType(v, targetType)) {
+    auto SourceElement =
+        getScalarOrVectorElementType(v->getIRType());
+    auto DestinationElement =
+        getScalarOrVectorIntegerType(getIRType());
+    if (!SourceElement || !SourceElement->isFloat() ||
+        !DestinationElement)
       throw std::invalid_argument("fptosi 要求浮点源值和整数目标类型");
     addUse(v);
     instType = InstType::FPTOSI;
@@ -2313,7 +2870,20 @@ void SITOFPInst::dumpIR(){
   std::cout << '\n';
 }
 
-SITOFPInst::SITOFPInst(Value* v):Instruction(FLOATType::NewFloat()){
+SITOFPInst::SITOFPInst(Value* v)
+    : SITOFPInst(v, FLOATType::NewFloat()) {}
+
+SITOFPInst::SITOFPInst(
+    Value* v, std::shared_ptr<IRType> targetType)
+    : Instruction(
+          getLanePreservingCastResultType(v, targetType)) {
+    auto SourceElement =
+        getScalarOrVectorIntegerType(v->getIRType());
+    auto DestinationElement =
+        getScalarOrVectorElementType(getIRType());
+    if (!SourceElement || !DestinationElement ||
+        !DestinationElement->isFloat())
+      throw std::invalid_argument("sitofp 要求整数源值和浮点目标类型");
     addUse(v);
     instType = InstType::SITOFP;
 }
@@ -2324,12 +2894,13 @@ SITOFPInst::SITOFPInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instT
 ZextInst::ZextInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType = InstType::ZEXT;}
 ZextInst::ZextInst(Value* v)
     : ZextInst(v, INTType::getInt32Ty()) {}
-ZextInst::ZextInst(Value* v, std::shared_ptr<INTType> targetType)
-    : Instruction(std::move(targetType)) {
+ZextInst::ZextInst(Value* v, std::shared_ptr<IRType> targetType)
+    : Instruction(
+          getLanePreservingCastResultType(v, targetType)) {
     auto sourceType =
-        v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+        getScalarOrVectorIntegerType(v->getIRType());
     auto destinationType =
-        std::dynamic_pointer_cast<INTType>(getIRType());
+        getScalarOrVectorIntegerType(getIRType());
     if (!sourceType || !destinationType ||
         destinationType->getBitWidth() <= sourceType->getBitWidth())
       throw std::invalid_argument("zext 要求目标整数位宽大于源位宽");
@@ -2352,12 +2923,13 @@ TruncInst::TruncInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instTyp
 
 TruncInst::TruncInst(Value* v)
     : TruncInst(v, INTType::getBoolTy()) {}
-TruncInst::TruncInst(Value* v, std::shared_ptr<INTType> targetType)
-    : Instruction(std::move(targetType)) {
+TruncInst::TruncInst(Value* v, std::shared_ptr<IRType> targetType)
+    : Instruction(
+          getLanePreservingCastResultType(v, targetType)) {
   auto sourceType =
-      v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+      getScalarOrVectorIntegerType(v->getIRType());
   auto destinationType =
-      std::dynamic_pointer_cast<INTType>(getIRType());
+      getScalarOrVectorIntegerType(getIRType());
   if (!sourceType || !destinationType ||
       destinationType->getBitWidth() >= sourceType->getBitWidth())
     throw std::invalid_argument("trunc 要求目标整数位宽小于源位宽");
@@ -2380,12 +2952,13 @@ SextInst::SextInst(std::shared_ptr<IRType> irtype):Instruction(irtype){instType 
 
 SextInst::SextInst(Value* v)
     : SextInst(v, INTType::getInt32Ty()) {}
-SextInst::SextInst(Value* v, std::shared_ptr<INTType> targetType)
-    : Instruction(std::move(targetType)) {
+SextInst::SextInst(Value* v, std::shared_ptr<IRType> targetType)
+    : Instruction(
+          getLanePreservingCastResultType(v, targetType)) {
   auto sourceType =
-      v ? std::dynamic_pointer_cast<INTType>(v->getIRType()) : nullptr;
+      getScalarOrVectorIntegerType(v->getIRType());
   auto destinationType =
-      std::dynamic_pointer_cast<INTType>(getIRType());
+      getScalarOrVectorIntegerType(getIRType());
   if (!sourceType || !destinationType ||
       destinationType->getBitWidth() <= sourceType->getBitWidth())
     throw std::invalid_argument("sext 要求目标整数位宽大于源位宽");
@@ -2405,16 +2978,30 @@ void SextInst::dumpIR(){
 }
 
 SelectInst::SelectInst(Value* cond,Value* isTrue,Value* isFalse)
-  : Instruction(isTrue->getIRType()) {
-  auto ConditionType =
-      cond ? std::dynamic_pointer_cast<INTType>(cond->getIRType())
-           : nullptr;
-  if (!ConditionType || !ConditionType->getIsBool())
-    throw std::invalid_argument("select 条件必须是 i1");
+  : Instruction(isTrue && isTrue->getIRType()
+                    ? isTrue->getIRType()
+                    : VOIDType::NewVoid()) {
   if (!isTrue || !isFalse || !isTrue->getIRType() ||
       !isFalse->getIRType() ||
       !isTrue->getIRType()->hasSameShape(*isFalse->getIRType()))
     throw std::invalid_argument("select 的两个候选值必须类型完全一致");
+  const bool IsScalarCondition =
+      cond && cond->getIRType() && cond->getIRType()->isBool();
+  const bool IsVectorCondition =
+      cond && cond->getIRType() &&
+      isBooleanVectorType(cond->getIRType());
+  if (!IsScalarCondition && !IsVectorCondition)
+    throw std::invalid_argument(
+        "select 条件必须是 i1 或 <N x i1>");
+  if (IsVectorCondition) {
+    auto ConditionVector = getVectorType(cond->getIRType());
+    auto ValueVector = getVectorType(isTrue->getIRType());
+    if (!ValueVector ||
+        ConditionVector->getElementCount() !=
+            ValueVector->getElementCount())
+      throw std::invalid_argument(
+          "向量 select 的条件和值必须具有相同 lane 数");
+  }
   instType = InstType::SELECT;
   addUse(cond);
   addUse(isTrue);
@@ -2456,8 +3043,9 @@ Value* BasicBlock::genSelectInst(Value* cond, Value* isTrue, Value* isFalse) {
   if (!cond || !isTrue || !isFalse || !cond->getIRType() ||
       !isTrue->getIRType() || !isFalse->getIRType())
     return nullptr;
-  // select 条件统一转换为 i1，非零整数、非零浮点数和非空指针均表示真。
-  if (!cond->getIRType()->isBool()) {
+  // 标量条件统一转换为 i1；<N x i1> 直接作为逐 lane mask 使用。
+  if (!cond->getIRType()->isBool() &&
+      !isBooleanVectorType(cond->getIRType())) {
     switch (cond->getIRType()->getTypeSystem()) {
     case IR_INT:
       cond = BasicBlock::genBinaryInst(
@@ -2792,7 +3380,7 @@ UndefValue *UndefValue::NewUndefValue(std::shared_ptr<IRType> it) {
 }
 
 BitCastInst::BitCastInst(Value* v, std::shared_ptr<IRType> targetType)
-    : Instruction(targetType) {
+    : Instruction(getBitCastResultType(v, targetType)) {
     instType = InstType::BITCAST;
     addUse(v);
 }
@@ -2808,67 +3396,11 @@ void BitCastInst::dumpIR() {
     std::cout << "\n";
 }
 
-PtrToIntInst::PtrToIntInst(
-    Value *v, std::shared_ptr<INTType> targetType)
-    : Instruction(std::move(targetType)) {
-    if (!v || !v->getIRType() || !v->getIRType()->isPointer() ||
-        !getIRType() || !getIRType()->isInt())
-      throw std::invalid_argument("ptrtoint 要求指针源值和整数目标类型");
-    instType = InstType::PTRTOINT;
-    addUse(v);
-}
-
-void PtrToIntInst::dumpIR() {
-    Value::dumpIR();
-    std::cout << " = ptrtoint ";
-    getOperand(0)->getIRType()->toString();
-    std::cout << " ";
-    getOperand(0)->dumpIR();
-    std::cout << " to ";
-    getIRType()->toString();
-    std::cout << "\n";
-}
-
-IntToPtrInst::IntToPtrInst(
-    Value *v, std::shared_ptr<POINTERType> targetType)
-    : Instruction(std::move(targetType)) {
-    if (!v || !v->getIRType() || !v->getIRType()->isInt() ||
-        !getIRType() || !getIRType()->isPointer())
-      throw std::invalid_argument("inttoptr 要求整数源值和指针目标类型");
-    instType = InstType::INTTOPTR;
-    addUse(v);
-}
-
-void IntToPtrInst::dumpIR() {
-    Value::dumpIR();
-    std::cout << " = inttoptr ";
-    getOperand(0)->getIRType()->toString();
-    std::cout << " ";
-    getOperand(0)->dumpIR();
-    std::cout << " to ";
-    getIRType()->toString();
-    std::cout << "\n";
-}
-
 // 创建位转换指令并追加到当前基本块。
 Value* BasicBlock::genBitCastInst(Value* v, std::shared_ptr<IRType> targetType) {
     auto inst = new BitCastInst(v, targetType);
     pushBack(inst);
     return inst;
-}
-
-Value* BasicBlock::genPtrToIntInst(
-    Value* v, std::shared_ptr<INTType> targetType) {
-    auto *Inst = new PtrToIntInst(v, std::move(targetType));
-    pushBack(Inst);
-    return Inst;
-}
-
-Value* BasicBlock::genIntToPtrInst(
-    Value* v, std::shared_ptr<POINTERType> targetType) {
-    auto *Inst = new IntToPtrInst(v, std::move(targetType));
-    pushBack(Inst);
-    return Inst;
 }
 
 PhiInst::PhiInst(std::shared_ptr<IRType> irtype) : Instruction(irtype) {
@@ -3001,12 +3533,39 @@ Instruction* LoadInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 }
 
 Instruction* GetElementPtrInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
-    auto *NewGEP = new GetElementPtrInst(this->getIRType());
-    for (auto &U : userList) {
-        NewGEP->addUse(remapVal(U->getValue(), VMap));
-    }
-    NewGEP->updateType();
-    return NewGEP;
+    if (userList.empty()) return nullptr;
+    Value *Base = remapVal(getBasePointer(), VMap);
+    std::vector<Value *> Indices;
+    Indices.reserve(getNumIndices());
+    for (size_t I = 0; I < getNumIndices(); ++I)
+        Indices.push_back(remapVal(getIndex(I), VMap));
+    return new GetElementPtrInst(Base, Indices);
+}
+
+Instruction* ExtractElementInst::clone(
+    const std::unordered_map<Value*, Value*>& VMap) {
+    if (userList.size() != 2) return nullptr;
+    return new ExtractElementInst(
+        remapVal(getVectorOperand(), VMap),
+        remapVal(getIndexOperand(), VMap));
+}
+
+Instruction* InsertElementInst::clone(
+    const std::unordered_map<Value*, Value*>& VMap) {
+    if (userList.size() != 3) return nullptr;
+    return new InsertElementInst(
+        remapVal(getVectorOperand(), VMap),
+        remapVal(getElementOperand(), VMap),
+        remapVal(getIndexOperand(), VMap));
+}
+
+Instruction* ShuffleVectorInst::clone(
+    const std::unordered_map<Value*, Value*>& VMap) {
+    if (userList.size() != 2) return nullptr;
+    return new ShuffleVectorInst(
+        remapVal(getFirstVectorOperand(), VMap),
+        remapVal(getSecondVectorOperand(), VMap),
+        mask);
 }
 
 Instruction* BinaryInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
@@ -3032,54 +3591,40 @@ Instruction* FPTOSIInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
     return new FPTOSIInst(
         remapVal(userList[0]->getValue(), VMap),
-        std::dynamic_pointer_cast<INTType>(getIRType()));
+        getIRType());
 }
 
 Instruction* SITOFPInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
-    return new SITOFPInst(remapVal(userList[0]->getValue(), VMap));
+    return new SITOFPInst(
+        remapVal(userList[0]->getValue(), VMap),
+        getIRType());
 }
 
 Instruction* ZextInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
     return new ZextInst(
         remapVal(userList[0]->getValue(), VMap),
-        std::dynamic_pointer_cast<INTType>(getIRType()));
+        getIRType());
 }
 
 Instruction* TruncInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
   if (userList.size() != 1) return nullptr;
   return new TruncInst(
       remapVal(userList[0]->getValue(), VMap),
-      std::dynamic_pointer_cast<INTType>(getIRType()));
+      getIRType());
 }
 
 Instruction* SextInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
   if (userList.size() != 1) return nullptr;
   return new SextInst(
       remapVal(userList[0]->getValue(), VMap),
-      std::dynamic_pointer_cast<INTType>(getIRType()));
+      getIRType());
 }
 
 Instruction* BitCastInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
     if (userList.size() != 1) return nullptr;
     return new BitCastInst(remapVal(userList[0]->getValue(), VMap), this->getIRType());
-}
-
-Instruction* PtrToIntInst::clone(
-    const std::unordered_map<Value*, Value*>& VMap) {
-    if (userList.size() != 1) return nullptr;
-    return new PtrToIntInst(
-        remapVal(userList[0]->getValue(), VMap),
-        std::dynamic_pointer_cast<INTType>(getIRType()));
-}
-
-Instruction* IntToPtrInst::clone(
-    const std::unordered_map<Value*, Value*>& VMap) {
-    if (userList.size() != 1) return nullptr;
-    return new IntToPtrInst(
-        remapVal(userList[0]->getValue(), VMap),
-        std::dynamic_pointer_cast<POINTERType>(getIRType()));
 }
 
 Instruction* PhiInst::clone(const std::unordered_map<Value*, Value*>& VMap) {

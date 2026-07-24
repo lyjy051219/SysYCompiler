@@ -1,6 +1,6 @@
 #include "ir/opt/GVNPRE.hpp"
 #include "ir/analysis/PostDominant.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <tuple>

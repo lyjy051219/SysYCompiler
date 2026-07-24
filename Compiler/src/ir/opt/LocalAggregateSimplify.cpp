@@ -2,7 +2,7 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "lib/CFG.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <cstdint>

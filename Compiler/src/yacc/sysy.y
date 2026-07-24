@@ -75,7 +75,7 @@ namespace yy {
 
 // 非终结符及其语义值类型。
 %nterm <CompUnit*> CompUnit
-%nterm <Stmt*> Decl
+%nterm <BaseAST*> Decl
 %nterm <ConstDecl*> ConstDecl
 %nterm <ConstDefList*> ConstDefList
 %nterm <ConstDef*> ConstDef
@@ -91,8 +91,8 @@ namespace yy {
 %nterm <FuncParam*> FuncFParam
 %nterm <Block*> Block
 %nterm <BlockItemList*> BlockItemList
-%nterm <Stmt*> BlockItem
-%nterm <Stmt*> Stmt
+%nterm <BaseAST*> BlockItem
+%nterm <BaseAST*> Stmt
 // 常量维度与运行时下标分别使用不同的列表产生式。
 %nterm <ArrayList*> ConstExpList
 %nterm <ArrayList*> ExpList
@@ -100,7 +100,7 @@ namespace yy {
 %nterm <FuncRParamList*> FuncRParamList
 
 %nterm <LVal*> LVal
-%nterm <HasOperand*> PrimaryExp
+%nterm <BaseAST*> PrimaryExp
 %nterm <AddExp*> AddExp
 %nterm <LOrExp*> LOrExp
 %nterm <UnaryExp*> UnaryExp
@@ -117,16 +117,16 @@ Start: CompUnit { ASTRoot = std::unique_ptr<CompUnit>($1); }
 
 // 编译单元使用左递归产生式，并按源码顺序在列表尾部追加节点。
 CompUnit
-  : CompUnit Decl{$$ = $1; $$->pushBack((BaseAST*)$2);}
-  | CompUnit FuncDef{$$ = $1; $$->pushBack((BaseAST*)$2);}
-  | Decl{$$ = new CompUnit((BaseAST*)$1);}
-  | FuncDef {$$ = new CompUnit((BaseAST*)$1);}
+  : CompUnit Decl{$$ = $1; $$->pushBack($2);}
+  | CompUnit FuncDef{$$ = $1; $$->pushBack($2);}
+  | Decl{$$ = new CompUnit($1);}
+  | FuncDef {$$ = new CompUnit($1);}
   ;
 
-// 常量声明与变量声明统一转换为语句节点。
+// 常量声明与变量声明统一转换为 AST 节点。
 Decl
-  : ConstDecl { $$ = (Stmt*)$1; }
-  | VarDecl { $$ = (Stmt*)$1; }
+  : ConstDecl { $$ = $1; }
+  | VarDecl { $$ = $1; }
   ;
 
 // 常量声明由基础类型和同类型定义列表组成。
@@ -150,9 +150,9 @@ ConstExpList
  ;
 
 ConstInitVal
- : AddExp{ $$ = new InitVal((BaseAST*)$1); }
+ : AddExp{ $$ = new InitVal($1); }
  | L_BIG_BRACKET R_BIG_BRACKET{ $$ = new InitVal(); }
- | L_BIG_BRACKET ConstInitValList R_BIG_BRACKET{ $$ = new InitVal((BaseAST*)$2); }
+ | L_BIG_BRACKET ConstInitValList R_BIG_BRACKET{ $$ = new InitVal($2); }
  ;
 
 ConstInitValList
@@ -177,9 +177,9 @@ VarDef
  ;
 
 InitVal
- : AddExp { $$ = new InitVal((BaseAST*)$1); }
+ : AddExp { $$ = new InitVal($1); }
  | L_BIG_BRACKET R_BIG_BRACKET { $$ = new InitVal(nullptr); }
- | L_BIG_BRACKET InitValList R_BIG_BRACKET { $$ = new InitVal((BaseAST*)$2); }
+ | L_BIG_BRACKET InitValList R_BIG_BRACKET { $$ = new InitVal($2); }
  ;
 
 InitValList
@@ -215,8 +215,8 @@ BlockItemList
  ;
 
 BlockItem
- : Decl{ $$ = (Stmt*)$1; }
- | Stmt{ $$ = (Stmt*)$1; }
+ : Decl{ $$ = $1; }
+ | Stmt{ $$ = $1; }
   ;
 
 // 语句产生式覆盖赋值、分支、循环、跳转和返回。
@@ -246,12 +246,12 @@ ExpList
  ;
 
 PrimaryExp
- : L_SMALL_BRACKET AddExp R_SMALL_BRACKET { $$ = (HasOperand*)$2; }
- | LVal { $$ = (HasOperand*)$1; }
- | INTCONST{ $$ = (HasOperand*)(new ConValue<int>($1)); }
- | FLOATCONST{ $$ = (HasOperand*)(new ConValue<float>($1)); }
- | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = (HasOperand*)(new FuncCall($1.text, $1.line));}
- | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = (HasOperand*)(new FuncCall($1.text, $3, $1.line));}
+ : L_SMALL_BRACKET AddExp R_SMALL_BRACKET { $$ = $2; }
+ | LVal { $$ = $1; }
+ | INTCONST{ $$ = new ConValue<int>($1); }
+ | FLOATCONST{ $$ = new ConValue<float>($1); }
+ | IDENT L_SMALL_BRACKET R_SMALL_BRACKET {$$ = new FuncCall($1.text, $1.line);}
+ | IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET{$$ = new FuncCall($1.text, $3, $1.line);}
   ;
 
 

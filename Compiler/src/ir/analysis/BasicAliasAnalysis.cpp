@@ -1,7 +1,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <cmath>

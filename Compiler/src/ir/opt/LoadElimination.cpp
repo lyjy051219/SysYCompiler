@@ -5,7 +5,7 @@
 #include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/PostDominant.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <unordered_map>
 #include <unordered_set>

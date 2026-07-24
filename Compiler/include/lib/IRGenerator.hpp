@@ -48,7 +48,7 @@ private:
     BasicBlock& currentBlock() const;
     TypeSystem lowerSourceType(Type type, bool allowVoid = false) const;
     std::shared_ptr<IRType> lowerScalarType(Type type) const;
-    bool isConstantPrimary(const HasOperand& node) const;
+    bool isConstantPrimary(const BaseAST& node) const;
     bool isConstantExpression(const UnaryExp& node) const;
     bool isConstantExpression(const MulExp& node) const;
     bool isConstantExpression(const AddExp& node) const;
@@ -94,7 +94,7 @@ private:
         const std::vector<Value*>& indices);
 
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
-    Value* lowerPrimary(const HasOperand& node);
+    Value* lowerPrimary(const BaseAST& node);
     Value* lowerExpression(const UnaryExp& node);
     Value* lowerExpression(const MulExp& node);
     Value* lowerExpression(const AddExp& node);

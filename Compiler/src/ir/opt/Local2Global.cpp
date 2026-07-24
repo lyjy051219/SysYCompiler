@@ -1,7 +1,7 @@
 #include "ir/opt/Local2Global.hpp"
 
 #include "lib/CFG.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 #include "lib/TypeSystem.hpp"
 
 #include <memory>

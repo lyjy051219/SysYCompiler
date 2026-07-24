@@ -245,7 +245,7 @@ Compiler/
 
 #### AST
 
-整个AST体系以 `BaseAST` 为根结点，派生出 `Stmt`（语句类型）和 `Expression`（表达式类型）
+整个 AST 体系以 `BaseAST` 为唯一多态根节点。具体节点直接继承`BaseAST`（表达式链节点经 `BaseExp<T>` 间接继承）
 
 - 编译单元：`CompUnit`
 - 声明与定义：`ConstDecl`,`VarDecl`,`ConstDefList`,`VarDefList`,`ConstDef`,`VarDef`
@@ -294,21 +294,23 @@ Compiler/
    ```mermaid
    graph TD
    	N1[Block] --> N2[BlockItemList]
-   	N2[BlockItemList] --> N3[Stmt]
-   	N3[Stmt] --> N4[AssignStmt]
+       N2[BlockItemList] --> N3[BlockItem（文法分类）]
+       N3 --> N19[ConstDecl]
+       N3 --> N20[VarDecl]
+       N3 --> N4[AssignStmt]
    	N4[AssignStmt] --> N5[LVal]
    	N4[AssignStmt] --> N6[AddExp]
-   	N3[Stmt] --> N7[ExpStmt]
+       N3 --> N7[ExpStmt]
    	N7[ExpStmt] --> N8[AddExp]
-   	N3[Stmt] --> N9[IfStmt]
+       N3 --> N9[IfStmt]
    	N9[IfStmt] --> N10[LOrExp]
-   	N9[IfStmt] --> N11[Stmt]
-   	N3[Stmt] --> N12[WhileStmt]
+       N9[IfStmt] --> N11[then/else 分支]
+       N3 --> N12[WhileStmt]
    	N12[WhileStmt] --> N13[LOrExp]
-   	N12[WhileStmt] --> N14[Stmt]
-   	N3[Stmt] --> N15[BreakStmt]
-   	N3[Stmt] --> N16[ContinueStmt]
-   	N3[Stmt] --> N17[ReturnStmt]
+       N12[WhileStmt] --> N14[循环体]
+       N3 --> N15[BreakStmt]
+       N3 --> N16[ContinueStmt]
+       N3 --> N17[ReturnStmt]
    	N17[ReturnStmt] --> n18[AddExp]
    
    ```
@@ -325,11 +327,12 @@ Compiler/
        N4[RelExp] --> N5[AddExp]
        N5[AddExp] --> N6[MulExp]
        N6[MulExp] --> N7[UnaryExp]
-       N7[UnaryExp] --> N8[HasOperand]
+       N7[UnaryExp] --> N8[PrimaryExp（文法分类）]
    
-       N8[HasOperand] --> N9[LVal]
-       N8[HasOperand] --> N10[FuncCall]
-       N8[HasOperand] --> N11[ConValue]
+       N8 --> N9[LVal]
+       N8 --> N10[FuncCall]
+       N8 --> N11[ConValue]
+       N8 --> N5
    
        N9[LVal] --> N12[ArrayList]
        N10[FuncCall] --> N13[FuncRParamList]
@@ -410,11 +413,11 @@ Compiler/
 
 #### IR
 
-采用与LLVM IR兼容的IR，便于使用LLVM工具链LLI进行测试
+> 为方便决赛拓展向量优化，IR提前拓展向量指令
 
-##### 支持指令：
+采用与LLVM IR兼容的IR，便于使用LLVM工具链LLI/LLC进行测试
 
-为LLVM IR的子集
+##### 支持指令：为LLVM IR的子集，目前一共35条指令
 
 ```
 终止与控制流指令：
@@ -423,29 +426,131 @@ Br
 Call
 
 内存操作指令：
-Alloca
+Alloca(分配局部变量的内存，返回地址指针)
 Store
 Load
-GetElementPtr (GEP)
+GetElementPtr (GEP)（根据类型和下标计算地址）
 
-二元与逻辑运算指令：
-算术运算: Add, Fadd, Sub, Fsub, Mul, Fmul, Sdiv, Fdiv, Srem, Frem,Udiv,Urem
-逻辑运算: And, Or, Xor
+二元运算指令：
+算术运算: Add, Fadd, Sub, Fsub, Mul, Fmul
+Sdiv, Fdiv,Udiv -- Udiv目前仍未使用
+Srem, Frem,Urem -- Frem目前仍未使用,Urem中端优化引入
+逻辑运算: And, Or, Xor --中端优化时引入（这里是按位运算指令，前端逻辑判断IR生成为基本块级）
+移位运算: Shl逻辑左移, Lshr逻辑右移, Ashr算术右移 -- 中端优化时引入
 比较运算: Icmp, Fcmp
-移位运算: Shl, Lshr, Ashr
+/*
+icmp eq    // 整数相等：lhs == rhs
+icmp ne    // 整数不等：lhs != rhs
+icmp sgt   // 有符号大于：signed(lhs) > signed(rhs)
+icmp sge   // 有符号大于等于：signed(lhs) >= signed(rhs)
+icmp slt   // 有符号小于：signed(lhs) < signed(rhs)
+icmp sle   // 有符号小于等于：signed(lhs) <= signed(rhs)
+fcmp oeq   // 有序相等：两者都不是 NaN，并且 lhs == rhs
+fcmp une   // 无序不等：至少一个是 NaN，或者 lhs != rhs
+fcmp ogt   // 有序大于：两者都不是 NaN，并且 lhs > rhs
+fcmp oge   // 有序大于等于：两者都不是 NaN，并且 lhs >= rhs
+fcmp olt   // 有序小于：两者都不是 NaN，并且 lhs < rhs
+fcmp ole   // 有序小于等于：两者都不是 NaN，并且 lhs <= rhs
+无序指的是NaN，只要NaN存在就无法进行比较（除了不等之外）
+*/
+
 
 类型转换指令：
 FPTOSI
-SITOFP
-Zext
-BitCast
-Trunc
-Sext
+SITOFP //用于隐式类型转换
+Zext零扩展
+Sext符号扩展
+Trunc整数截断
+BitCast将指针解释成另一种类型 -- 中端优化引入
+
 
 静态单赋值 (SSA) 与选择指令：
 Phi
-Select
+Select -- 中端优化引入
+
+向量运算指令：
+extractelement 从固定长度向量中提取一个标量元素
+insertelement  把一个标量元素插入到固定长度向量
+shufflevector  按照常量mask将两个输入向量进行重排
 ```
+
+> IR格式：
+>
+> ret：`ret i32 %result` / `ret void`
+>
+> br：`br label %destination` / `br i1 %condition, label %true_block, label %false_block`
+>
+> call：`%result = call i32 @function(i32 %arg1, float %arg2)` / `call void @function(i32 %arg)` / `%result = tail call i32 @function(i32 %arg)`
+>
+> alloca：`%ptr = alloca i32` / `%array = alloca [10 x i32]`
+>
+> store：`store i32 %value, i32* %ptr` / `store float %value, float* %ptr`
+>
+> load：`%value = load i32, i32* %ptr` / `%value = load float, float* %ptr`
+>
+> getelementptr（GEP）：`%element_ptr = getelementptr inbounds [10 x i32], [10 x i32]* %array, i64 0, i64 3`（**跨过0个数组长度，访问数组中第3号（第四个）元素array[3]**）
+>
+> add：`%result = add i32 %lhs, %rhs`
+>
+> fadd：`%result = fadd float %lhs, %rhs`
+>
+> sub：`%result = sub i32 %lhs, %rhs`
+>
+> fsub：`%result = fsub float %lhs, %rhs`
+>
+> mul：`%result = mul i32 %lhs, %rhs`
+>
+> fmul：`%result = fmul float %lhs, %rhs`
+>
+> and：`%result = and i32 %lhs, %rhs` / `%result = and i1 %condition1, %condition2`
+>
+> or：`%result = or i32 %lhs, %rhs` / `%result = or i1 %condition1, %condition2`
+>
+> xor：`%result = xor i32 %lhs, %rhs` / `%not = xor i1 %condition, true`
+>
+> icmp：`%result = icmp slt i32 %lhs, %rhs` / `%result = icmp eq i32 %lhs, %rhs`
+>
+> fcmp：`%result = fcmp olt float %lhs, %rhs` / `%result = fcmp oeq float %lhs, %rhs`
+>
+> sdiv：`%result = sdiv i32 %lhs, %rhs`
+>
+> fdiv：`%result = fdiv float %lhs, %rhs`
+>
+> srem：`%result = srem i32 %lhs, %rhs`
+>
+> frem：`%result = frem float %lhs, %rhs`
+>
+> udiv：`%result = udiv i32 %lhs, %rhs`
+>
+> urem：`%result = urem i32 %lhs, %rhs`
+>
+> shl：`%result = shl i32 %value, %shift` / `%result = shl i32 %value, 3`
+>
+> lshr：`%result = lshr i32 %value, %shift` / `%result = lshr i32 %value, 3`
+>
+> ashr：`%result = ashr i32 %value, %shift` / `%result = ashr i32 %value, 3`
+>
+> fptosi：`%result = fptosi float %value to i32`
+>
+> sitofp：`%result = sitofp i32 %value to float`
+>
+> zext：`%result = zext i1 %value to i32` / `%result = zext i8 %value to i32`
+>
+> bitcast：`%result = bitcast i32* %ptr to float*`
+>
+> trunc：`%result = trunc i32 %value to i1` / `%result = trunc i32 %value to i8`
+>
+> sext：`%result = sext i8 %value to i32` / `%result = sext i1 %value to i32`
+>
+> phi：`%result = phi i32 [ %value1, %block1 ], [ %value2, %block2 ]`
+>
+> select：`%result = select i1 %condition, i32 %true_value, i32 %false_value`
+>
+> extractelement：`%x = extractelement <4 x i32> %v, i32 %index`
+>
+> insertelement：`%r = insertelement <4 x i32> %v, i32 %x, i32 %index`
+>
+> shufflevector：`%result = shufflevector <4 x i32> %v1,<4 x i32> %v2,<4 x i32> <i32 0, i32 4, i32 1, i32 5>`
 
 ##### Value/User/Use
 
@@ -495,9 +600,9 @@ graph TD
 
 ##### TypeSystem类型系统
 
-> 目前初赛阶段，根据SysY2026的信息会引入向量类型，所以IR类型系统提前给出向量类型的架构
+> 为了便于决赛向量优化，IR类型系统提前支持向量类型
 
-- 设计模式：采用单例static设计模式，并且使用shared_ptr包装裸指针进行内存管理
+设计模式：采用单例static设计模式，并且使用shared_ptr包装裸指针进行内存管理
 
 
 - 目的：用来支持IR的强类型语言的特性

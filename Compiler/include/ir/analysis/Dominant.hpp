@@ -1,7 +1,7 @@
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-#include "lib/Tool.hpp"
+#include "lib/IRUtils.hpp"
 #include <vector>
 #include <unordered_map>
 #include <memory>

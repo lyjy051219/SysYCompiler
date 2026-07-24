@@ -4,7 +4,7 @@
 #include <vector>
 #include <list>
 
-// 定义 SysY 抽象语法树；IR 生成等后续阶段通过访问器与节点结构解耦。
+//SysY类型
 enum Type{
     SY_INT,
     SY_FLOAT,
@@ -122,14 +122,6 @@ public:
     virtual ~BaseAST() = default;
     virtual void accept(ASTVisitor &visitor) = 0;
 };
-// 所有声明与语句节点的共同基类。
-class Stmt : public BaseAST{
-public:
-};
-// 所有可作为表达式操作数的节点共同基类。
-class HasOperand : public BaseAST{
-public:
-};
 
 // 编译单元按源码顺序持有声明和函数定义，并独占各子节点的生命周期。
 class CompUnit : public BaseAST{
@@ -143,8 +135,8 @@ public:
   const std::vector<std::unique_ptr<BaseAST>>& getItems() const {return items;}
 };
 
-// 常量声明也是块内语句，因此继承 Stmt。
-class ConstDecl : public Stmt{
+// 常量声明可作为编译单元或块项。
+class ConstDecl : public BaseAST{
   private:
     Type type;
     std::unique_ptr<ConstDefList> defList;
@@ -155,7 +147,7 @@ class ConstDecl : public Stmt{
     const std::unique_ptr<ConstDefList>& getConstDefList() const{ return defList; }
 };
 // 变量声明持有同一基础类型下的全部变量定义。
-class VarDecl : public Stmt{
+class VarDecl : public BaseAST{
   private:
     Type type;
     std::unique_ptr<VarDefList>defList;
@@ -167,7 +159,7 @@ class VarDecl : public Stmt{
 
 };
 // 常量定义列表保持文法归约得到的源码顺序。
-class ConstDefList : public Stmt{
+class ConstDefList : public BaseAST{
 private:
   std::vector<std::unique_ptr<ConstDef>> cdl;
 public:
@@ -178,7 +170,7 @@ public:
 
 };
 // 变量定义列表保持文法归约得到的源码顺序。
-class VarDefList : public Stmt{
+class VarDefList : public BaseAST{
   private:
     std::vector<std::unique_ptr<VarDef>> vdl;
   public:
@@ -189,7 +181,7 @@ class VarDefList : public Stmt{
 };
 
 // 变量定义可选带数组维度和初始化值。
-class VarDef : public Stmt{
+class VarDef : public BaseAST{
   private:
     std::string ident;
     std::unique_ptr<ArrayList> expList;
@@ -205,7 +197,7 @@ class VarDef : public Stmt{
     InitVal* getInitVal() const { return initVal.get(); }
 };
 // 常量定义必须由语义阶段校验其初始化式为常量表达式。
-class ConstDef : public Stmt{
+class ConstDef : public BaseAST{
 private:
     std::string ident;
     std::unique_ptr<ArrayList> expList;
@@ -302,7 +294,7 @@ class InitVal : public BaseAST{
 
 
 // 代码块可为空；非空时独占块项列表。
-class Block : public Stmt{
+class Block : public BaseAST{
   private:
   std::unique_ptr<BlockItemList> items;
   public:
@@ -312,18 +304,18 @@ class Block : public Stmt{
   const std::unique_ptr<BlockItemList>& getItems() const { return items; }
 };
 // 块项列表按源码顺序混合保存声明与语句。
-class BlockItemList : public Stmt{
+class BlockItemList : public BaseAST{
   private:
-  std::vector<std::unique_ptr<Stmt>> st;
+  std::vector<std::unique_ptr<BaseAST>> items;
   public:
-  BlockItemList(Stmt* s){ st.push_back(std::unique_ptr<Stmt>(s)); }
-  void pushBack(Stmt* s){ st.push_back(std::unique_ptr<Stmt>(s)); }
+  BlockItemList(BaseAST* item){ items.push_back(std::unique_ptr<BaseAST>(item)); }
+  void pushBack(BaseAST* item){ items.push_back(std::unique_ptr<BaseAST>(item)); }
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  const std::vector<std::unique_ptr<Stmt>>& getStmts() const { return st; }
+  const std::vector<std::unique_ptr<BaseAST>>& getItems() const { return items; }
 };
 // 赋值语句保存目标左值与右侧表达式。
-class AssignStmt : public Stmt{
+class AssignStmt : public BaseAST{
   private:
   std::unique_ptr<LVal> lv;
   std::unique_ptr<AddExp> ae;
@@ -335,7 +327,7 @@ class AssignStmt : public Stmt{
   const std::unique_ptr<AddExp>& getExp() const { return ae; }
 };
 // 表达式语句允许空表达式。
-class ExpStmt : public Stmt{
+class ExpStmt : public BaseAST{
   private:
   std::unique_ptr<AddExp> ae;
   public:
@@ -345,45 +337,52 @@ class ExpStmt : public Stmt{
   const std::unique_ptr<AddExp>& getExp() const { return ae; }
 };
 // 条件语句可选带否分支。
-class IfStmt : public Stmt{
+class IfStmt : public BaseAST{
   private:
   std::unique_ptr<LOrExp> condition;
-  std::unique_ptr<Stmt> ifStmt,elseStmt;
+  std::unique_ptr<BaseAST> thenBranch, elseBranch;
   public:
-  IfStmt(LOrExp* condition,Stmt* ifStmt):condition(std::unique_ptr<LOrExp>(condition)),ifStmt(std::unique_ptr<Stmt>(ifStmt)),elseStmt(nullptr){}
-  IfStmt(LOrExp* condition,Stmt* ifStmt,Stmt* elseStmt):condition(std::unique_ptr<LOrExp>(condition)),ifStmt(std::unique_ptr<Stmt>(ifStmt)),elseStmt(std::unique_ptr<Stmt>(elseStmt)){}
+  IfStmt(LOrExp* condition, BaseAST* thenBranch):
+      condition(std::unique_ptr<LOrExp>(condition)),
+      thenBranch(std::unique_ptr<BaseAST>(thenBranch)), elseBranch(nullptr) {}
+  IfStmt(LOrExp* condition, BaseAST* thenBranch, BaseAST* elseBranch):
+      condition(std::unique_ptr<LOrExp>(condition)),
+      thenBranch(std::unique_ptr<BaseAST>(thenBranch)),
+      elseBranch(std::unique_ptr<BaseAST>(elseBranch)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
   const std::unique_ptr<LOrExp>& getCondition() const { return condition; }
-  const std::unique_ptr<Stmt>& getIfStmt() const { return ifStmt; }
-  bool hasElse() const { return elseStmt != nullptr; }
-  const std::unique_ptr<Stmt>& getElseStmt() const { return elseStmt; }
+  const std::unique_ptr<BaseAST>& getThenBranch() const { return thenBranch; }
+  bool hasElse() const { return elseBranch != nullptr; }
+  const std::unique_ptr<BaseAST>& getElseBranch() const { return elseBranch; }
 };
 // 循环语句保存条件和循环体。
-class WhileStmt : public Stmt{
+class WhileStmt : public BaseAST{
   private:
   std::unique_ptr<LOrExp> condition;
-  std::unique_ptr<Stmt> whileStmt;
+  std::unique_ptr<BaseAST> body;
   public:
-  WhileStmt(LOrExp* condition,Stmt* whileStmt):condition(std::unique_ptr<LOrExp>(condition)),whileStmt(std::unique_ptr<Stmt> (whileStmt)){}
+  WhileStmt(LOrExp* condition, BaseAST* body):
+      condition(std::unique_ptr<LOrExp>(condition)),
+      body(std::unique_ptr<BaseAST>(body)) {}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
   const std::unique_ptr<LOrExp>& getCondition() const { return condition; }
-  const std::unique_ptr<Stmt>& getWhileStmt() const { return whileStmt; }
+  const std::unique_ptr<BaseAST>& getBody() const { return body; }
 };
 // 退出当前循环的语句节点。
-class BreakStmt : public Stmt{
+class BreakStmt : public BaseAST{
   public:
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
 };
 // 继续当前循环下一次迭代的语句节点。
-class ContinueStmt : public Stmt{
+class ContinueStmt : public BaseAST{
   public:
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 };
 // 返回语句可选带返回值表达式。
-class ReturnStmt : public Stmt{
+class ReturnStmt : public BaseAST{
   private:
   std::unique_ptr<AddExp> retVal;
   public:
@@ -398,7 +397,7 @@ class ReturnStmt : public Stmt{
 
 
 // 左值表达式表示变量或数组元素，可出现在赋值号左侧。
-class LVal : public HasOperand{
+class LVal : public BaseAST{
   private:
   std::string ident;
   std::unique_ptr<ArrayList> arr;
@@ -416,7 +415,7 @@ class LVal : public HasOperand{
 
 // 同一优先级的表达式链；始终满足操作数数量比操作符数量多一。
 template <typename T>
-class BaseExp : public HasOperand{
+class BaseExp : public BaseAST{
   protected:
   std::list<Type> op;
   std::list<std::unique_ptr<T>> operand;
@@ -434,9 +433,9 @@ class BaseExp : public HasOperand{
   size_t getOpCount() const { return op.size(); }
 };
 // 表达式层级从高到低依次为一元、乘除、加减、关系、相等、逻辑与、逻辑或。
-class UnaryExp : public BaseExp<HasOperand> {
+class UnaryExp : public BaseExp<BaseAST> {
 public:
-    using BaseExp<HasOperand>::BaseExp;
+    using BaseExp<BaseAST>::BaseExp;
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 };
 
@@ -477,7 +476,7 @@ public:
 };
 
 // 函数调用记录被调函数、可选实参列表和源码行号。
-class FuncCall : public HasOperand{
+class FuncCall : public BaseAST{
   private:
   std::string ident;
   std::unique_ptr<FuncRParamList> fp;
@@ -517,7 +516,7 @@ class FuncRParamList : public BaseAST{
 
 // 整数或浮点数字面量，对应 Number 文法节点。
 template<typename T>
-class ConValue : public HasOperand{
+class ConValue : public BaseAST{
   private:
   T t;
   public:

@@ -4,7 +4,7 @@
 #include "ir/analysis/SCEV.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <unordered_map>
 #include <unordered_set>

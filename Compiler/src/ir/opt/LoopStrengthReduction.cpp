@@ -9,7 +9,6 @@
 #include "ir/analysis/SCEVExpander.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <cstdint>

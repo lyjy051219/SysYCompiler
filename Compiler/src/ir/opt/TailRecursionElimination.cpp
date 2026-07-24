@@ -6,7 +6,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/CFG.hpp"
 #include "lib/BaseManager.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 #include <cassert>
 #include <unordered_map>
 #include <unordered_set>

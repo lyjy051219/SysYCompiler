@@ -1,6 +1,6 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/LoopInfo.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 #include <cstdlib>
 #include <queue>
 

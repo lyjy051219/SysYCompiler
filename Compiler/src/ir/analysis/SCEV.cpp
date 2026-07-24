@@ -1,6 +1,5 @@
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>

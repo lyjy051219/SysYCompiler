@@ -7,7 +7,6 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 
 #include <cstdint>
 #include <unordered_set>

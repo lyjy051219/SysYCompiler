@@ -6,7 +6,6 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 
 #include <cmath>
 #include <cstdint>

@@ -202,6 +202,13 @@ namespace yy {
         value.YY_MOVE_OR_COPY< ArrayList* > (YY_MOVE (that.value));
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.YY_MOVE_OR_COPY< BaseAST* > (YY_MOVE (that.value));
+        break;
+
       case symbol_kind::S_Block: // Block
         value.YY_MOVE_OR_COPY< Block* > (YY_MOVE (that.value));
         break;
@@ -246,10 +253,6 @@ namespace yy {
         value.YY_MOVE_OR_COPY< FuncRParamList* > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.YY_MOVE_OR_COPY< HasOperand* > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.YY_MOVE_OR_COPY< InitVal* > (YY_MOVE (that.value));
@@ -282,12 +285,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         value.YY_MOVE_OR_COPY< RelExp* > (YY_MOVE (that.value));
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.YY_MOVE_OR_COPY< Stmt* > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_Type: // Type
@@ -342,6 +339,13 @@ namespace yy {
         value.move< ArrayList* > (YY_MOVE (that.value));
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.move< BaseAST* > (YY_MOVE (that.value));
+        break;
+
       case symbol_kind::S_Block: // Block
         value.move< Block* > (YY_MOVE (that.value));
         break;
@@ -386,10 +390,6 @@ namespace yy {
         value.move< FuncRParamList* > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.move< HasOperand* > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.move< InitVal* > (YY_MOVE (that.value));
@@ -422,12 +422,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         value.move< RelExp* > (YY_MOVE (that.value));
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.move< Stmt* > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_Type: // Type
@@ -482,6 +476,13 @@ namespace yy {
         value.copy< ArrayList* > (that.value);
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.copy< BaseAST* > (that.value);
+        break;
+
       case symbol_kind::S_Block: // Block
         value.copy< Block* > (that.value);
         break;
@@ -526,10 +527,6 @@ namespace yy {
         value.copy< FuncRParamList* > (that.value);
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.copy< HasOperand* > (that.value);
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.copy< InitVal* > (that.value);
@@ -562,12 +559,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         value.copy< RelExp* > (that.value);
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.copy< Stmt* > (that.value);
         break;
 
       case symbol_kind::S_Type: // Type
@@ -620,6 +611,13 @@ namespace yy {
         value.move< ArrayList* > (that.value);
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.move< BaseAST* > (that.value);
+        break;
+
       case symbol_kind::S_Block: // Block
         value.move< Block* > (that.value);
         break;
@@ -664,10 +662,6 @@ namespace yy {
         value.move< FuncRParamList* > (that.value);
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.move< HasOperand* > (that.value);
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.move< InitVal* > (that.value);
@@ -700,12 +694,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         value.move< RelExp* > (that.value);
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.move< Stmt* > (that.value);
         break;
 
       case symbol_kind::S_Type: // Type
@@ -999,6 +987,13 @@ namespace yy {
         yylhs.value.emplace< ArrayList* > ();
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        yylhs.value.emplace< BaseAST* > ();
+        break;
+
       case symbol_kind::S_Block: // Block
         yylhs.value.emplace< Block* > ();
         break;
@@ -1043,10 +1038,6 @@ namespace yy {
         yylhs.value.emplace< FuncRParamList* > ();
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        yylhs.value.emplace< HasOperand* > ();
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         yylhs.value.emplace< InitVal* > ();
@@ -1079,12 +1070,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         yylhs.value.emplace< RelExp* > ();
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        yylhs.value.emplace< Stmt* > ();
         break;
 
       case symbol_kind::S_Type: // Type
@@ -1132,569 +1117,569 @@ namespace yy {
   case 2: // Start: CompUnit
 #line 116 "src/yacc/sysy.y"
                 { ASTRoot = std::unique_ptr<CompUnit>(yystack_[0].value.as < CompUnit* > ()); }
-#line 1136 "src/yacc/Bison.cpp"
+#line 1121 "src/yacc/Bison.cpp"
     break;
 
   case 3: // CompUnit: CompUnit Decl
 #line 120 "src/yacc/sysy.y"
-                 {yylhs.value.as < CompUnit* > () = yystack_[1].value.as < CompUnit* > (); yylhs.value.as < CompUnit* > ()->pushBack((BaseAST*)yystack_[0].value.as < Stmt* > ());}
-#line 1142 "src/yacc/Bison.cpp"
+                 {yylhs.value.as < CompUnit* > () = yystack_[1].value.as < CompUnit* > (); yylhs.value.as < CompUnit* > ()->pushBack(yystack_[0].value.as < BaseAST* > ());}
+#line 1127 "src/yacc/Bison.cpp"
     break;
 
   case 4: // CompUnit: CompUnit FuncDef
 #line 121 "src/yacc/sysy.y"
-                    {yylhs.value.as < CompUnit* > () = yystack_[1].value.as < CompUnit* > (); yylhs.value.as < CompUnit* > ()->pushBack((BaseAST*)yystack_[0].value.as < FuncDef* > ());}
-#line 1148 "src/yacc/Bison.cpp"
+                    {yylhs.value.as < CompUnit* > () = yystack_[1].value.as < CompUnit* > (); yylhs.value.as < CompUnit* > ()->pushBack(yystack_[0].value.as < FuncDef* > ());}
+#line 1133 "src/yacc/Bison.cpp"
     break;
 
   case 5: // CompUnit: Decl
 #line 122 "src/yacc/sysy.y"
-        {yylhs.value.as < CompUnit* > () = new CompUnit((BaseAST*)yystack_[0].value.as < Stmt* > ());}
-#line 1154 "src/yacc/Bison.cpp"
+        {yylhs.value.as < CompUnit* > () = new CompUnit(yystack_[0].value.as < BaseAST* > ());}
+#line 1139 "src/yacc/Bison.cpp"
     break;
 
   case 6: // CompUnit: FuncDef
 #line 123 "src/yacc/sysy.y"
-            {yylhs.value.as < CompUnit* > () = new CompUnit((BaseAST*)yystack_[0].value.as < FuncDef* > ());}
-#line 1160 "src/yacc/Bison.cpp"
+            {yylhs.value.as < CompUnit* > () = new CompUnit(yystack_[0].value.as < FuncDef* > ());}
+#line 1145 "src/yacc/Bison.cpp"
     break;
 
   case 7: // Decl: ConstDecl
 #line 128 "src/yacc/sysy.y"
-              { yylhs.value.as < Stmt* > () = (Stmt*)yystack_[0].value.as < ConstDecl* > (); }
-#line 1166 "src/yacc/Bison.cpp"
+              { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < ConstDecl* > (); }
+#line 1151 "src/yacc/Bison.cpp"
     break;
 
   case 8: // Decl: VarDecl
 #line 129 "src/yacc/sysy.y"
-            { yylhs.value.as < Stmt* > () = (Stmt*)yystack_[0].value.as < VarDecl* > (); }
-#line 1172 "src/yacc/Bison.cpp"
+            { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < VarDecl* > (); }
+#line 1157 "src/yacc/Bison.cpp"
     break;
 
   case 9: // ConstDecl: CONST Type ConstDefList SEMICOLON
 #line 134 "src/yacc/sysy.y"
                                      { yylhs.value.as < ConstDecl* > () = new ConstDecl(yystack_[2].value.as < Type > (),yystack_[1].value.as < ConstDefList* > ()); }
-#line 1178 "src/yacc/Bison.cpp"
+#line 1163 "src/yacc/Bison.cpp"
     break;
 
   case 10: // ConstDefList: ConstDefList COMMA ConstDef
 #line 138 "src/yacc/sysy.y"
                                { yylhs.value.as < ConstDefList* > () = yystack_[2].value.as < ConstDefList* > (); yystack_[2].value.as < ConstDefList* > ()->pushBack(yystack_[0].value.as < ConstDef* > ()); }
-#line 1184 "src/yacc/Bison.cpp"
+#line 1169 "src/yacc/Bison.cpp"
     break;
 
   case 11: // ConstDefList: ConstDef
 #line 139 "src/yacc/sysy.y"
             { yylhs.value.as < ConstDefList* > () = new ConstDefList(yystack_[0].value.as < ConstDef* > ()); }
-#line 1190 "src/yacc/Bison.cpp"
+#line 1175 "src/yacc/Bison.cpp"
     break;
 
   case 12: // ConstDef: IDENT ASSIGN ConstInitVal
 #line 143 "src/yacc/sysy.y"
                              { yylhs.value.as < ConstDef* > () = new ConstDef(yystack_[2].value.as < LocatedIdentifier > ().text,nullptr,yystack_[0].value.as < InitVal* > ()); }
-#line 1196 "src/yacc/Bison.cpp"
+#line 1181 "src/yacc/Bison.cpp"
     break;
 
   case 13: // ConstDef: IDENT ConstExpList ASSIGN ConstInitVal
 #line 144 "src/yacc/sysy.y"
                                           { yylhs.value.as < ConstDef* > () = new ConstDef(yystack_[3].value.as < LocatedIdentifier > ().text,yystack_[2].value.as < ArrayList* > (),yystack_[0].value.as < InitVal* > ()); }
-#line 1202 "src/yacc/Bison.cpp"
+#line 1187 "src/yacc/Bison.cpp"
     break;
 
   case 14: // ConstExpList: ConstExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET
 #line 148 "src/yacc/sysy.y"
                                                         { yylhs.value.as < ArrayList* > () = yystack_[3].value.as < ArrayList* > (); yylhs.value.as < ArrayList* > ()->pushBack(yystack_[1].value.as < AddExp* > ()); }
-#line 1208 "src/yacc/Bison.cpp"
+#line 1193 "src/yacc/Bison.cpp"
     break;
 
   case 15: // ConstExpList: L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET
 #line 149 "src/yacc/sysy.y"
                                             { yylhs.value.as < ArrayList* > () = new ArrayList(yystack_[1].value.as < AddExp* > ()); }
-#line 1214 "src/yacc/Bison.cpp"
+#line 1199 "src/yacc/Bison.cpp"
     break;
 
   case 16: // ConstInitVal: AddExp
 #line 153 "src/yacc/sysy.y"
-         { yylhs.value.as < InitVal* > () = new InitVal((BaseAST*)yystack_[0].value.as < AddExp* > ()); }
-#line 1220 "src/yacc/Bison.cpp"
+         { yylhs.value.as < InitVal* > () = new InitVal(yystack_[0].value.as < AddExp* > ()); }
+#line 1205 "src/yacc/Bison.cpp"
     break;
 
   case 17: // ConstInitVal: L_BIG_BRACKET R_BIG_BRACKET
 #line 154 "src/yacc/sysy.y"
                               { yylhs.value.as < InitVal* > () = new InitVal(); }
-#line 1226 "src/yacc/Bison.cpp"
+#line 1211 "src/yacc/Bison.cpp"
     break;
 
   case 18: // ConstInitVal: L_BIG_BRACKET ConstInitValList R_BIG_BRACKET
 #line 155 "src/yacc/sysy.y"
-                                               { yylhs.value.as < InitVal* > () = new InitVal((BaseAST*)yystack_[1].value.as < InitValList* > ()); }
-#line 1232 "src/yacc/Bison.cpp"
+                                               { yylhs.value.as < InitVal* > () = new InitVal(yystack_[1].value.as < InitValList* > ()); }
+#line 1217 "src/yacc/Bison.cpp"
     break;
 
   case 19: // ConstInitValList: ConstInitVal
 #line 159 "src/yacc/sysy.y"
                { yylhs.value.as < InitValList* > () = new InitValList(yystack_[0].value.as < InitVal* > ()); }
-#line 1238 "src/yacc/Bison.cpp"
+#line 1223 "src/yacc/Bison.cpp"
     break;
 
   case 20: // ConstInitValList: ConstInitValList COMMA ConstInitVal
 #line 160 "src/yacc/sysy.y"
                                       { yylhs.value.as < InitValList* > () = yystack_[2].value.as < InitValList* > (); yylhs.value.as < InitValList* > ()->pushBack(yystack_[0].value.as < InitVal* > ()); }
-#line 1244 "src/yacc/Bison.cpp"
+#line 1229 "src/yacc/Bison.cpp"
     break;
 
   case 21: // VarDecl: Type VarDefList SEMICOLON
 #line 164 "src/yacc/sysy.y"
                             { yylhs.value.as < VarDecl* > () = new VarDecl(yystack_[2].value.as < Type > (),yystack_[1].value.as < VarDefList* > ()); }
-#line 1250 "src/yacc/Bison.cpp"
+#line 1235 "src/yacc/Bison.cpp"
     break;
 
   case 22: // VarDefList: VarDef
 #line 168 "src/yacc/sysy.y"
          { yylhs.value.as < VarDefList* > () = new VarDefList(yystack_[0].value.as < VarDef* > ()); }
-#line 1256 "src/yacc/Bison.cpp"
+#line 1241 "src/yacc/Bison.cpp"
     break;
 
   case 23: // VarDefList: VarDefList COMMA VarDef
 #line 169 "src/yacc/sysy.y"
                           { yylhs.value.as < VarDefList* > () = yystack_[2].value.as < VarDefList* > (); yylhs.value.as < VarDefList* > ()->pushBack(yystack_[0].value.as < VarDef* > ()); }
-#line 1262 "src/yacc/Bison.cpp"
+#line 1247 "src/yacc/Bison.cpp"
     break;
 
   case 24: // VarDef: IDENT
 #line 173 "src/yacc/sysy.y"
          { yylhs.value.as < VarDef* > () = new VarDef(yystack_[0].value.as < LocatedIdentifier > ().text); }
-#line 1268 "src/yacc/Bison.cpp"
+#line 1253 "src/yacc/Bison.cpp"
     break;
 
   case 25: // VarDef: IDENT ASSIGN InitVal
 #line 174 "src/yacc/sysy.y"
                        { yylhs.value.as < VarDef* > () = new VarDef(yystack_[2].value.as < LocatedIdentifier > ().text,nullptr,yystack_[0].value.as < InitVal* > ()); }
-#line 1274 "src/yacc/Bison.cpp"
+#line 1259 "src/yacc/Bison.cpp"
     break;
 
   case 26: // VarDef: IDENT ConstExpList
 #line 175 "src/yacc/sysy.y"
                       { yylhs.value.as < VarDef* > () = new VarDef(yystack_[1].value.as < LocatedIdentifier > ().text,yystack_[0].value.as < ArrayList* > (),nullptr); }
-#line 1280 "src/yacc/Bison.cpp"
+#line 1265 "src/yacc/Bison.cpp"
     break;
 
   case 27: // VarDef: IDENT ConstExpList ASSIGN InitVal
 #line 176 "src/yacc/sysy.y"
                                      { yylhs.value.as < VarDef* > () = new VarDef(yystack_[3].value.as < LocatedIdentifier > ().text,yystack_[2].value.as < ArrayList* > (),yystack_[0].value.as < InitVal* > ()); }
-#line 1286 "src/yacc/Bison.cpp"
+#line 1271 "src/yacc/Bison.cpp"
     break;
 
   case 28: // InitVal: AddExp
 #line 180 "src/yacc/sysy.y"
-          { yylhs.value.as < InitVal* > () = new InitVal((BaseAST*)yystack_[0].value.as < AddExp* > ()); }
-#line 1292 "src/yacc/Bison.cpp"
+          { yylhs.value.as < InitVal* > () = new InitVal(yystack_[0].value.as < AddExp* > ()); }
+#line 1277 "src/yacc/Bison.cpp"
     break;
 
   case 29: // InitVal: L_BIG_BRACKET R_BIG_BRACKET
 #line 181 "src/yacc/sysy.y"
                                { yylhs.value.as < InitVal* > () = new InitVal(nullptr); }
-#line 1298 "src/yacc/Bison.cpp"
+#line 1283 "src/yacc/Bison.cpp"
     break;
 
   case 30: // InitVal: L_BIG_BRACKET InitValList R_BIG_BRACKET
 #line 182 "src/yacc/sysy.y"
-                                           { yylhs.value.as < InitVal* > () = new InitVal((BaseAST*)yystack_[1].value.as < InitValList* > ()); }
-#line 1304 "src/yacc/Bison.cpp"
+                                           { yylhs.value.as < InitVal* > () = new InitVal(yystack_[1].value.as < InitValList* > ()); }
+#line 1289 "src/yacc/Bison.cpp"
     break;
 
   case 31: // InitValList: InitVal
 #line 186 "src/yacc/sysy.y"
            { yylhs.value.as < InitValList* > () = new InitValList(yystack_[0].value.as < InitVal* > ()); }
-#line 1310 "src/yacc/Bison.cpp"
+#line 1295 "src/yacc/Bison.cpp"
     break;
 
   case 32: // InitValList: InitValList COMMA InitVal
 #line 187 "src/yacc/sysy.y"
                              { yylhs.value.as < InitValList* > () = yystack_[2].value.as < InitValList* > (); yylhs.value.as < InitValList* > ()->pushBack(yystack_[0].value.as < InitVal* > ()); }
-#line 1316 "src/yacc/Bison.cpp"
+#line 1301 "src/yacc/Bison.cpp"
     break;
 
   case 33: // FuncDef: Type IDENT L_SMALL_BRACKET R_SMALL_BRACKET Block
 #line 191 "src/yacc/sysy.y"
                                                    { yylhs.value.as < FuncDef* > () = new FuncDef(yystack_[4].value.as < Type > (), yystack_[3].value.as < LocatedIdentifier > ().text, nullptr, yystack_[0].value.as < Block* > ()); }
-#line 1322 "src/yacc/Bison.cpp"
+#line 1307 "src/yacc/Bison.cpp"
     break;
 
   case 34: // FuncDef: Type IDENT L_SMALL_BRACKET FuncFParamList R_SMALL_BRACKET Block
 #line 192 "src/yacc/sysy.y"
                                                                   { yylhs.value.as < FuncDef* > () = new FuncDef(yystack_[5].value.as < Type > (), yystack_[4].value.as < LocatedIdentifier > ().text, yystack_[2].value.as < FuncParamList* > (), yystack_[0].value.as < Block* > ()); }
-#line 1328 "src/yacc/Bison.cpp"
+#line 1313 "src/yacc/Bison.cpp"
     break;
 
   case 35: // FuncFParamList: FuncFParam
 #line 196 "src/yacc/sysy.y"
               { yylhs.value.as < FuncParamList* > () = new FuncParamList(yystack_[0].value.as < FuncParam* > ()); }
-#line 1334 "src/yacc/Bison.cpp"
+#line 1319 "src/yacc/Bison.cpp"
     break;
 
   case 36: // FuncFParamList: FuncFParamList COMMA FuncFParam
 #line 197 "src/yacc/sysy.y"
                                    { yylhs.value.as < FuncParamList* > () = yystack_[2].value.as < FuncParamList* > (); yylhs.value.as < FuncParamList* > ()->pushBack(yystack_[0].value.as < FuncParam* > ()); }
-#line 1340 "src/yacc/Bison.cpp"
+#line 1325 "src/yacc/Bison.cpp"
     break;
 
   case 37: // FuncFParam: Type IDENT
 #line 201 "src/yacc/sysy.y"
               { yylhs.value.as < FuncParam* > () = new FuncParam(yystack_[1].value.as < Type > (),yystack_[0].value.as < LocatedIdentifier > ().text); }
-#line 1346 "src/yacc/Bison.cpp"
+#line 1331 "src/yacc/Bison.cpp"
     break;
 
   case 38: // FuncFParam: Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET
 #line 202 "src/yacc/sysy.y"
                                                 { yylhs.value.as < FuncParam* > () = new FuncParam(yystack_[3].value.as < Type > (),yystack_[2].value.as < LocatedIdentifier > ().text,true); }
-#line 1352 "src/yacc/Bison.cpp"
+#line 1337 "src/yacc/Bison.cpp"
     break;
 
   case 39: // FuncFParam: Type IDENT ExpList
 #line 203 "src/yacc/sysy.y"
                       { yylhs.value.as < FuncParam* > () = new FuncParam(yystack_[2].value.as < Type > (),yystack_[1].value.as < LocatedIdentifier > ().text,false,yystack_[0].value.as < ArrayList* > ()); }
-#line 1358 "src/yacc/Bison.cpp"
+#line 1343 "src/yacc/Bison.cpp"
     break;
 
   case 40: // FuncFParam: Type IDENT L_MIDDLE_BRACKET R_MIDDLE_BRACKET ExpList
 #line 204 "src/yacc/sysy.y"
                                                         { yylhs.value.as < FuncParam* > () = new FuncParam(yystack_[4].value.as < Type > (),yystack_[3].value.as < LocatedIdentifier > ().text,true,yystack_[0].value.as < ArrayList* > ()); }
-#line 1364 "src/yacc/Bison.cpp"
+#line 1349 "src/yacc/Bison.cpp"
     break;
 
   case 41: // Block: L_BIG_BRACKET R_BIG_BRACKET
 #line 208 "src/yacc/sysy.y"
                               { yylhs.value.as < Block* > () = new Block(nullptr); }
-#line 1370 "src/yacc/Bison.cpp"
+#line 1355 "src/yacc/Bison.cpp"
     break;
 
   case 42: // Block: L_BIG_BRACKET BlockItemList R_BIG_BRACKET
 #line 209 "src/yacc/sysy.y"
                                              { yylhs.value.as < Block* > () = new Block(yystack_[1].value.as < BlockItemList* > ()); }
-#line 1376 "src/yacc/Bison.cpp"
+#line 1361 "src/yacc/Bison.cpp"
     break;
 
   case 43: // BlockItemList: BlockItem
 #line 213 "src/yacc/sysy.y"
-             { yylhs.value.as < BlockItemList* > () = new BlockItemList(yystack_[0].value.as < Stmt* > ()); }
-#line 1382 "src/yacc/Bison.cpp"
+             { yylhs.value.as < BlockItemList* > () = new BlockItemList(yystack_[0].value.as < BaseAST* > ()); }
+#line 1367 "src/yacc/Bison.cpp"
     break;
 
   case 44: // BlockItemList: BlockItemList BlockItem
 #line 214 "src/yacc/sysy.y"
-                           { yylhs.value.as < BlockItemList* > () = yystack_[1].value.as < BlockItemList* > (); yylhs.value.as < BlockItemList* > ()->pushBack(yystack_[0].value.as < Stmt* > ()); }
-#line 1388 "src/yacc/Bison.cpp"
+                           { yylhs.value.as < BlockItemList* > () = yystack_[1].value.as < BlockItemList* > (); yylhs.value.as < BlockItemList* > ()->pushBack(yystack_[0].value.as < BaseAST* > ()); }
+#line 1373 "src/yacc/Bison.cpp"
     break;
 
   case 45: // BlockItem: Decl
 #line 218 "src/yacc/sysy.y"
-       { yylhs.value.as < Stmt* > () = (Stmt*)yystack_[0].value.as < Stmt* > (); }
-#line 1394 "src/yacc/Bison.cpp"
+       { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < BaseAST* > (); }
+#line 1379 "src/yacc/Bison.cpp"
     break;
 
   case 46: // BlockItem: Stmt
 #line 219 "src/yacc/sysy.y"
-       { yylhs.value.as < Stmt* > () = (Stmt*)yystack_[0].value.as < Stmt* > (); }
-#line 1400 "src/yacc/Bison.cpp"
+       { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < BaseAST* > (); }
+#line 1385 "src/yacc/Bison.cpp"
     break;
 
   case 47: // Stmt: LVal ASSIGN AddExp SEMICOLON
 #line 224 "src/yacc/sysy.y"
-                               { yylhs.value.as < Stmt* > () = new AssignStmt(yystack_[3].value.as < LVal* > (),yystack_[1].value.as < AddExp* > ()); }
-#line 1406 "src/yacc/Bison.cpp"
+                               { yylhs.value.as < BaseAST* > () = new AssignStmt(yystack_[3].value.as < LVal* > (),yystack_[1].value.as < AddExp* > ()); }
+#line 1391 "src/yacc/Bison.cpp"
     break;
 
   case 48: // Stmt: SEMICOLON
 #line 225 "src/yacc/sysy.y"
-             { yylhs.value.as < Stmt* > () = new ExpStmt(nullptr); }
-#line 1412 "src/yacc/Bison.cpp"
+             { yylhs.value.as < BaseAST* > () = new ExpStmt(nullptr); }
+#line 1397 "src/yacc/Bison.cpp"
     break;
 
   case 49: // Stmt: AddExp SEMICOLON
 #line 226 "src/yacc/sysy.y"
-                    { yylhs.value.as < Stmt* > () = new ExpStmt(yystack_[1].value.as < AddExp* > ()); }
-#line 1418 "src/yacc/Bison.cpp"
+                    { yylhs.value.as < BaseAST* > () = new ExpStmt(yystack_[1].value.as < AddExp* > ()); }
+#line 1403 "src/yacc/Bison.cpp"
     break;
 
   case 50: // Stmt: Block
 #line 227 "src/yacc/sysy.y"
-         { yylhs.value.as < Stmt* > () = yystack_[0].value.as < Block* > (); }
-#line 1424 "src/yacc/Bison.cpp"
+         { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < Block* > (); }
+#line 1409 "src/yacc/Bison.cpp"
     break;
 
   case 51: // Stmt: IF L_SMALL_BRACKET LOrExp R_SMALL_BRACKET Stmt ELSE Stmt
 #line 228 "src/yacc/sysy.y"
-                                                            { yylhs.value.as < Stmt* > () = new IfStmt(yystack_[4].value.as < LOrExp* > (),yystack_[2].value.as < Stmt* > (),yystack_[0].value.as < Stmt* > ()); }
-#line 1430 "src/yacc/Bison.cpp"
+                                                            { yylhs.value.as < BaseAST* > () = new IfStmt(yystack_[4].value.as < LOrExp* > (),yystack_[2].value.as < BaseAST* > (),yystack_[0].value.as < BaseAST* > ()); }
+#line 1415 "src/yacc/Bison.cpp"
     break;
 
   case 52: // Stmt: IF L_SMALL_BRACKET LOrExp R_SMALL_BRACKET Stmt
 #line 229 "src/yacc/sysy.y"
-                                                  { yylhs.value.as < Stmt* > () = new IfStmt(yystack_[2].value.as < LOrExp* > (),yystack_[0].value.as < Stmt* > ()); }
-#line 1436 "src/yacc/Bison.cpp"
+                                                  { yylhs.value.as < BaseAST* > () = new IfStmt(yystack_[2].value.as < LOrExp* > (),yystack_[0].value.as < BaseAST* > ()); }
+#line 1421 "src/yacc/Bison.cpp"
     break;
 
   case 53: // Stmt: WHILE L_SMALL_BRACKET LOrExp R_SMALL_BRACKET Stmt
 #line 230 "src/yacc/sysy.y"
-                                                     { yylhs.value.as < Stmt* > () = new WhileStmt(yystack_[2].value.as < LOrExp* > (),yystack_[0].value.as < Stmt* > ()); }
-#line 1442 "src/yacc/Bison.cpp"
+                                                     { yylhs.value.as < BaseAST* > () = new WhileStmt(yystack_[2].value.as < LOrExp* > (),yystack_[0].value.as < BaseAST* > ()); }
+#line 1427 "src/yacc/Bison.cpp"
     break;
 
   case 54: // Stmt: BREAK SEMICOLON
 #line 231 "src/yacc/sysy.y"
-                   { yylhs.value.as < Stmt* > () = new BreakStmt(); }
-#line 1448 "src/yacc/Bison.cpp"
+                   { yylhs.value.as < BaseAST* > () = new BreakStmt(); }
+#line 1433 "src/yacc/Bison.cpp"
     break;
 
   case 55: // Stmt: CONTINUE SEMICOLON
 #line 232 "src/yacc/sysy.y"
-                      { yylhs.value.as < Stmt* > () = new ContinueStmt(); }
-#line 1454 "src/yacc/Bison.cpp"
+                      { yylhs.value.as < BaseAST* > () = new ContinueStmt(); }
+#line 1439 "src/yacc/Bison.cpp"
     break;
 
   case 56: // Stmt: RETURN SEMICOLON
 #line 233 "src/yacc/sysy.y"
-                    { yylhs.value.as < Stmt* > () = new ReturnStmt(); }
-#line 1460 "src/yacc/Bison.cpp"
+                    { yylhs.value.as < BaseAST* > () = new ReturnStmt(); }
+#line 1445 "src/yacc/Bison.cpp"
     break;
 
   case 57: // Stmt: RETURN AddExp SEMICOLON
 #line 234 "src/yacc/sysy.y"
-                           { yylhs.value.as < Stmt* > () = new ReturnStmt(yystack_[1].value.as < AddExp* > ()); }
-#line 1466 "src/yacc/Bison.cpp"
+                           { yylhs.value.as < BaseAST* > () = new ReturnStmt(yystack_[1].value.as < AddExp* > ()); }
+#line 1451 "src/yacc/Bison.cpp"
     break;
 
   case 58: // LVal: IDENT
 #line 239 "src/yacc/sysy.y"
         { yylhs.value.as < LVal* > () = new LVal(yystack_[0].value.as < LocatedIdentifier > ().text); }
-#line 1472 "src/yacc/Bison.cpp"
+#line 1457 "src/yacc/Bison.cpp"
     break;
 
   case 59: // LVal: IDENT ExpList
 #line 240 "src/yacc/sysy.y"
                  { yylhs.value.as < LVal* > () = new LVal(yystack_[1].value.as < LocatedIdentifier > ().text,yystack_[0].value.as < ArrayList* > ()); }
-#line 1478 "src/yacc/Bison.cpp"
+#line 1463 "src/yacc/Bison.cpp"
     break;
 
   case 60: // ExpList: L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET
 #line 244 "src/yacc/sysy.y"
                                            { yylhs.value.as < ArrayList* > () = new ArrayList(yystack_[1].value.as < AddExp* > ()); }
-#line 1484 "src/yacc/Bison.cpp"
+#line 1469 "src/yacc/Bison.cpp"
     break;
 
   case 61: // ExpList: ExpList L_MIDDLE_BRACKET AddExp R_MIDDLE_BRACKET
 #line 245 "src/yacc/sysy.y"
                                                    { yylhs.value.as < ArrayList* > () = yystack_[3].value.as < ArrayList* > (); yylhs.value.as < ArrayList* > ()->pushBack(yystack_[1].value.as < AddExp* > ()); }
-#line 1490 "src/yacc/Bison.cpp"
+#line 1475 "src/yacc/Bison.cpp"
     break;
 
   case 62: // PrimaryExp: L_SMALL_BRACKET AddExp R_SMALL_BRACKET
 #line 249 "src/yacc/sysy.y"
-                                          { yylhs.value.as < HasOperand* > () = (HasOperand*)yystack_[1].value.as < AddExp* > (); }
-#line 1496 "src/yacc/Bison.cpp"
+                                          { yylhs.value.as < BaseAST* > () = yystack_[1].value.as < AddExp* > (); }
+#line 1481 "src/yacc/Bison.cpp"
     break;
 
   case 63: // PrimaryExp: LVal
 #line 250 "src/yacc/sysy.y"
-        { yylhs.value.as < HasOperand* > () = (HasOperand*)yystack_[0].value.as < LVal* > (); }
-#line 1502 "src/yacc/Bison.cpp"
+        { yylhs.value.as < BaseAST* > () = yystack_[0].value.as < LVal* > (); }
+#line 1487 "src/yacc/Bison.cpp"
     break;
 
   case 64: // PrimaryExp: INTCONST
 #line 251 "src/yacc/sysy.y"
-           { yylhs.value.as < HasOperand* > () = (HasOperand*)(new ConValue<int>(yystack_[0].value.as < int > ())); }
-#line 1508 "src/yacc/Bison.cpp"
+           { yylhs.value.as < BaseAST* > () = new ConValue<int>(yystack_[0].value.as < int > ()); }
+#line 1493 "src/yacc/Bison.cpp"
     break;
 
   case 65: // PrimaryExp: FLOATCONST
 #line 252 "src/yacc/sysy.y"
-             { yylhs.value.as < HasOperand* > () = (HasOperand*)(new ConValue<float>(yystack_[0].value.as < float > ())); }
-#line 1514 "src/yacc/Bison.cpp"
+             { yylhs.value.as < BaseAST* > () = new ConValue<float>(yystack_[0].value.as < float > ()); }
+#line 1499 "src/yacc/Bison.cpp"
     break;
 
   case 66: // PrimaryExp: IDENT L_SMALL_BRACKET R_SMALL_BRACKET
 #line 253 "src/yacc/sysy.y"
-                                         {yylhs.value.as < HasOperand* > () = (HasOperand*)(new FuncCall(yystack_[2].value.as < LocatedIdentifier > ().text, yystack_[2].value.as < LocatedIdentifier > ().line));}
-#line 1520 "src/yacc/Bison.cpp"
+                                         {yylhs.value.as < BaseAST* > () = new FuncCall(yystack_[2].value.as < LocatedIdentifier > ().text, yystack_[2].value.as < LocatedIdentifier > ().line);}
+#line 1505 "src/yacc/Bison.cpp"
     break;
 
   case 67: // PrimaryExp: IDENT L_SMALL_BRACKET FuncRParamList R_SMALL_BRACKET
 #line 254 "src/yacc/sysy.y"
-                                                       {yylhs.value.as < HasOperand* > () = (HasOperand*)(new FuncCall(yystack_[3].value.as < LocatedIdentifier > ().text, yystack_[1].value.as < FuncRParamList* > (), yystack_[3].value.as < LocatedIdentifier > ().line));}
-#line 1526 "src/yacc/Bison.cpp"
+                                                       {yylhs.value.as < BaseAST* > () = new FuncCall(yystack_[3].value.as < LocatedIdentifier > ().text, yystack_[1].value.as < FuncRParamList* > (), yystack_[3].value.as < LocatedIdentifier > ().line);}
+#line 1511 "src/yacc/Bison.cpp"
     break;
 
   case 68: // UnaryExp: PrimaryExp
 #line 260 "src/yacc/sysy.y"
-             { yylhs.value.as < UnaryExp* > () = new UnaryExp(yystack_[0].value.as < HasOperand* > ()); }
-#line 1532 "src/yacc/Bison.cpp"
+             { yylhs.value.as < UnaryExp* > () = new UnaryExp(yystack_[0].value.as < BaseAST* > ()); }
+#line 1517 "src/yacc/Bison.cpp"
     break;
 
   case 69: // UnaryExp: ADD UnaryExp
 #line 261 "src/yacc/sysy.y"
                { yylhs.value.as < UnaryExp* > () = yystack_[0].value.as < UnaryExp* > (); yylhs.value.as < UnaryExp* > ()->pushFront(SY_ADD); }
-#line 1538 "src/yacc/Bison.cpp"
+#line 1523 "src/yacc/Bison.cpp"
     break;
 
   case 70: // UnaryExp: SUB UnaryExp
 #line 262 "src/yacc/sysy.y"
                { yylhs.value.as < UnaryExp* > () = yystack_[0].value.as < UnaryExp* > (); yylhs.value.as < UnaryExp* > ()->pushFront(SY_SUB); }
-#line 1544 "src/yacc/Bison.cpp"
+#line 1529 "src/yacc/Bison.cpp"
     break;
 
   case 71: // UnaryExp: NOT UnaryExp
 #line 263 "src/yacc/sysy.y"
                { yylhs.value.as < UnaryExp* > () = yystack_[0].value.as < UnaryExp* > (); yylhs.value.as < UnaryExp* > ()->pushFront(SY_NOT); }
-#line 1550 "src/yacc/Bison.cpp"
+#line 1535 "src/yacc/Bison.cpp"
     break;
 
   case 72: // FuncRParamList: AddExp
 #line 268 "src/yacc/sysy.y"
           { yylhs.value.as < FuncRParamList* > () = new FuncRParamList(yystack_[0].value.as < AddExp* > ()); }
-#line 1556 "src/yacc/Bison.cpp"
+#line 1541 "src/yacc/Bison.cpp"
     break;
 
   case 73: // FuncRParamList: FuncRParamList COMMA AddExp
 #line 269 "src/yacc/sysy.y"
                               { yylhs.value.as < FuncRParamList* > () = yystack_[2].value.as < FuncRParamList* > (); yylhs.value.as < FuncRParamList* > ()->pushBack(yystack_[0].value.as < AddExp* > ()); }
-#line 1562 "src/yacc/Bison.cpp"
+#line 1547 "src/yacc/Bison.cpp"
     break;
 
   case 74: // MulExp: UnaryExp
 #line 273 "src/yacc/sysy.y"
             { yylhs.value.as < MulExp* > () = new MulExp(yystack_[0].value.as < UnaryExp* > ()); }
-#line 1568 "src/yacc/Bison.cpp"
+#line 1553 "src/yacc/Bison.cpp"
     break;
 
   case 75: // MulExp: MulExp MUL UnaryExp
 #line 274 "src/yacc/sysy.y"
                        { yylhs.value.as < MulExp* > () = yystack_[2].value.as < MulExp* > (); yylhs.value.as < MulExp* > ()->pushBack(SY_MUL); yylhs.value.as < MulExp* > ()->pushBack(yystack_[0].value.as < UnaryExp* > ()); }
-#line 1574 "src/yacc/Bison.cpp"
+#line 1559 "src/yacc/Bison.cpp"
     break;
 
   case 76: // MulExp: MulExp DIV UnaryExp
 #line 275 "src/yacc/sysy.y"
                        { yylhs.value.as < MulExp* > () = yystack_[2].value.as < MulExp* > (); yylhs.value.as < MulExp* > ()->pushBack(SY_DIV); yylhs.value.as < MulExp* > ()->pushBack(yystack_[0].value.as < UnaryExp* > ()); }
-#line 1580 "src/yacc/Bison.cpp"
+#line 1565 "src/yacc/Bison.cpp"
     break;
 
   case 77: // MulExp: MulExp MOD UnaryExp
 #line 276 "src/yacc/sysy.y"
                        { yylhs.value.as < MulExp* > () = yystack_[2].value.as < MulExp* > (); yylhs.value.as < MulExp* > ()->pushBack(SY_MOD); yylhs.value.as < MulExp* > ()->pushBack(yystack_[0].value.as < UnaryExp* > ()); }
-#line 1586 "src/yacc/Bison.cpp"
+#line 1571 "src/yacc/Bison.cpp"
     break;
 
   case 78: // AddExp: MulExp
 #line 280 "src/yacc/sysy.y"
          { yylhs.value.as < AddExp* > () = new AddExp(yystack_[0].value.as < MulExp* > ()); }
-#line 1592 "src/yacc/Bison.cpp"
+#line 1577 "src/yacc/Bison.cpp"
     break;
 
   case 79: // AddExp: AddExp ADD MulExp
 #line 281 "src/yacc/sysy.y"
                     { yylhs.value.as < AddExp* > () = yystack_[2].value.as < AddExp* > (); yylhs.value.as < AddExp* > ()->pushBack(SY_ADD); yylhs.value.as < AddExp* > ()->pushBack(yystack_[0].value.as < MulExp* > ()); }
-#line 1598 "src/yacc/Bison.cpp"
+#line 1583 "src/yacc/Bison.cpp"
     break;
 
   case 80: // AddExp: AddExp SUB MulExp
 #line 282 "src/yacc/sysy.y"
                     { yylhs.value.as < AddExp* > () = yystack_[2].value.as < AddExp* > (); yylhs.value.as < AddExp* > ()->pushBack(SY_SUB); yylhs.value.as < AddExp* > ()->pushBack(yystack_[0].value.as < MulExp* > ()); }
-#line 1604 "src/yacc/Bison.cpp"
+#line 1589 "src/yacc/Bison.cpp"
     break;
 
   case 81: // RelExp: AddExp
 #line 286 "src/yacc/sysy.y"
           {yylhs.value.as < RelExp* > () = new RelExp(yystack_[0].value.as < AddExp* > ());}
-#line 1610 "src/yacc/Bison.cpp"
+#line 1595 "src/yacc/Bison.cpp"
     break;
 
   case 82: // RelExp: RelExp LESS AddExp
 #line 287 "src/yacc/sysy.y"
                      { yylhs.value.as < RelExp* > () = yystack_[2].value.as < RelExp* > (); yylhs.value.as < RelExp* > ()->pushBack(SY_LESS); yylhs.value.as < RelExp* > ()->pushBack(yystack_[0].value.as < AddExp* > ()); }
-#line 1616 "src/yacc/Bison.cpp"
+#line 1601 "src/yacc/Bison.cpp"
     break;
 
   case 83: // RelExp: RelExp GREAT AddExp
 #line 288 "src/yacc/sysy.y"
                       { yylhs.value.as < RelExp* > () = yystack_[2].value.as < RelExp* > (); yylhs.value.as < RelExp* > ()->pushBack(SY_GREAT); yylhs.value.as < RelExp* > ()->pushBack(yystack_[0].value.as < AddExp* > ()); }
-#line 1622 "src/yacc/Bison.cpp"
+#line 1607 "src/yacc/Bison.cpp"
     break;
 
   case 84: // RelExp: RelExp LESSEQ AddExp
 #line 289 "src/yacc/sysy.y"
                        { yylhs.value.as < RelExp* > () = yystack_[2].value.as < RelExp* > (); yylhs.value.as < RelExp* > ()->pushBack(SY_LESSEQ); yylhs.value.as < RelExp* > ()->pushBack(yystack_[0].value.as < AddExp* > ()); }
-#line 1628 "src/yacc/Bison.cpp"
+#line 1613 "src/yacc/Bison.cpp"
     break;
 
   case 85: // RelExp: RelExp GREATEQ AddExp
 #line 290 "src/yacc/sysy.y"
                         { yylhs.value.as < RelExp* > () = yystack_[2].value.as < RelExp* > (); yylhs.value.as < RelExp* > ()->pushBack(SY_GREATEQ); yylhs.value.as < RelExp* > ()->pushBack(yystack_[0].value.as < AddExp* > ()); }
-#line 1634 "src/yacc/Bison.cpp"
+#line 1619 "src/yacc/Bison.cpp"
     break;
 
   case 86: // EqExp: RelExp
 #line 294 "src/yacc/sysy.y"
          { yylhs.value.as < EqExp* > () = new EqExp(yystack_[0].value.as < RelExp* > ()); }
-#line 1640 "src/yacc/Bison.cpp"
+#line 1625 "src/yacc/Bison.cpp"
     break;
 
   case 87: // EqExp: EqExp EQ RelExp
 #line 295 "src/yacc/sysy.y"
                   { yylhs.value.as < EqExp* > () = yystack_[2].value.as < EqExp* > (); yylhs.value.as < EqExp* > ()->pushBack(SY_EQ); yylhs.value.as < EqExp* > ()->pushBack(yystack_[0].value.as < RelExp* > ()); }
-#line 1646 "src/yacc/Bison.cpp"
+#line 1631 "src/yacc/Bison.cpp"
     break;
 
   case 88: // EqExp: EqExp NOTEQ RelExp
 #line 296 "src/yacc/sysy.y"
                      { yylhs.value.as < EqExp* > () = yystack_[2].value.as < EqExp* > (); yylhs.value.as < EqExp* > ()->pushBack(SY_NOTEQ); yylhs.value.as < EqExp* > ()->pushBack(yystack_[0].value.as < RelExp* > ()); }
-#line 1652 "src/yacc/Bison.cpp"
+#line 1637 "src/yacc/Bison.cpp"
     break;
 
   case 89: // LAndExp: EqExp
 #line 300 "src/yacc/sysy.y"
          { yylhs.value.as < LAndExp* > () = new LAndExp(yystack_[0].value.as < EqExp* > ()); }
-#line 1658 "src/yacc/Bison.cpp"
+#line 1643 "src/yacc/Bison.cpp"
     break;
 
   case 90: // LAndExp: LAndExp AND EqExp
 #line 301 "src/yacc/sysy.y"
                     { yylhs.value.as < LAndExp* > () = yystack_[2].value.as < LAndExp* > (); yylhs.value.as < LAndExp* > ()->pushBack(SY_AND); yylhs.value.as < LAndExp* > ()->pushBack(yystack_[0].value.as < EqExp* > ()); }
-#line 1664 "src/yacc/Bison.cpp"
+#line 1649 "src/yacc/Bison.cpp"
     break;
 
   case 91: // LOrExp: LAndExp
 #line 305 "src/yacc/sysy.y"
           { yylhs.value.as < LOrExp* > () = new LOrExp(yystack_[0].value.as < LAndExp* > ()); }
-#line 1670 "src/yacc/Bison.cpp"
+#line 1655 "src/yacc/Bison.cpp"
     break;
 
   case 92: // LOrExp: LOrExp OR LAndExp
 #line 306 "src/yacc/sysy.y"
                     { yylhs.value.as < LOrExp* > () = yystack_[2].value.as < LOrExp* > (); yylhs.value.as < LOrExp* > ()->pushBack(SY_OR); yylhs.value.as < LOrExp* > ()->pushBack(yystack_[0].value.as < LAndExp* > ()); }
-#line 1676 "src/yacc/Bison.cpp"
+#line 1661 "src/yacc/Bison.cpp"
     break;
 
   case 93: // Type: VOID
 #line 311 "src/yacc/sysy.y"
        {yylhs.value.as < Type > ()=SY_VOID;}
-#line 1682 "src/yacc/Bison.cpp"
+#line 1667 "src/yacc/Bison.cpp"
     break;
 
   case 94: // Type: INT
 #line 312 "src/yacc/sysy.y"
        {yylhs.value.as < Type > ()=SY_INT;}
-#line 1688 "src/yacc/Bison.cpp"
+#line 1673 "src/yacc/Bison.cpp"
     break;
 
   case 95: // Type: FLOAT
 #line 313 "src/yacc/sysy.y"
          {yylhs.value.as < Type > ()=SY_FLOAT;}
-#line 1694 "src/yacc/Bison.cpp"
+#line 1679 "src/yacc/Bison.cpp"
     break;
 
 
-#line 1698 "src/yacc/Bison.cpp"
+#line 1683 "src/yacc/Bison.cpp"
 
             default:
               break;
@@ -2145,6 +2130,6 @@ namespace yy {
 
 
 } // yy
-#line 2149 "src/yacc/Bison.cpp"
+#line 2134 "src/yacc/Bison.cpp"
 
 #line 316 "src/yacc/sysy.y"

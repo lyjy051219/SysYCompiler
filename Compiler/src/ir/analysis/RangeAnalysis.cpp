@@ -1,7 +1,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/SCEV.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <queue>
 #include <algorithm>

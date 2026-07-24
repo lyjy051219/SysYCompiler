@@ -1,5 +1,11 @@
 #pragma once
-#include "Tool.hpp"
+
+// IRUtils 同时承载 CFG 所需的侵入式链表和依赖完整 CFG 的遍历工具。
+// 此处只引入基础部分，避免在 CFG 类型定义完成前展开遍历模板。
+#define COMPILER_LIB_IRUTILS_BASE_ONLY
+#include "IRUtils.hpp"
+#undef COMPILER_LIB_IRUTILS_BASE_ONLY
+
 #include <memory>
 #include <vector>
 #include <string>
@@ -43,13 +49,14 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     enum InstType{
         RET,BR,
         ALLOCA,STORE,LOAD,GEP,
+        EXTRACTELEMENT,INSERTELEMENT,SHUFFLEVECTOR,
         ADD,FADD,SUB,FSUB,MUL,FMUL,SDIV,UDIV,FDIV,SREM,UREM,FREM,
         AND,OR,XOR,
         BinaryUnknown,
         ICMP,FCMP,
         SHL,LSHR,ASHR,
         SELECT,PHI,CALL,
-        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,BITCAST,PTRTOINT,INTTOPTR
+        TRUNC,ZEXT,SEXT,FPTOSI,SITOFP,BITCAST
     };
     InstType instType;
     public:
@@ -87,8 +94,9 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     static BasicBlock* remapBB(Value* v, const std::unordered_map<Value*, Value*>& vmap);
 };
 
-// 二元指令统一表示算术、位运算和比较，再根据操作数类型选择整数或浮点操作码。
-// IR 结构：%r = add i32 %a, %b；%c = icmp slt i32 %a, %b。
+// 二元指令统一表示标量/向量算术、位运算和比较，再根据元素类型
+// 选择整数或浮点操作码。
+// IR 结构：%r = add i32 %a, %b；%v = fadd <4 x float> %x, %y。
 class BinaryInst : public Instruction{
     public:
     enum Operation{
@@ -317,7 +325,7 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     std::vector<PhiInst*> collectPhiNodes();
     // 若本块只有唯一前驱，则折叠仅有一个入边项的 PHI。
     bool simplifySinglePredPhis();
-    // 生成带返回值的终结指令：ret i32 %value。
+    // 生成带标量、指针或固定长度向量返回值的终结指令。
     void genRetInst(Value* retVal);
     // 生成空返回终结指令：ret void。
     void genRetInst();
@@ -326,7 +334,7 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     // 生成无条件分支：br label %dest。
     void genUnCondInst(BasicBlock* block);
 
-    // 在函数入口块生成栈分配：%x = alloca i32。
+    // 在函数入口块生成标量、聚合或固定长度向量栈分配。
     AllocaInst* genAllocaInst(std::shared_ptr<IRType> allocatedType);
     // 生成内存读取：%val = load i32, i32* %ptr。
     Value* genLoadInst(Value* v);
@@ -334,27 +342,31 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     void genStoreInst(Value* val,Value* ptr);
     // 创建仅含基指针的 GEP，调用方添加索引后需更新结果类型。
     Value* genGepInst(Value* ptr);
-    // 统一标量类型后生成二元指令：%r = add i32 %a, %b。
+    // 从向量 SSA 值中读取一个标量 lane。
+    Value* genExtractElementInst(Value* vector, Value* index);
+    // 向向量 SSA 值写入一个标量 lane，并返回新的向量值。
+    Value* genInsertElementInst(Value* vector, Value* element, Value* index);
+    // 按常量 mask 从两个同类型向量中重排 lane；-1 表示 poison lane。
+    Value* genShuffleVectorInst(Value* first, Value* second,
+                                const std::vector<int>& mask);
+    // 统一标量类型或校验同类型向量后生成二元指令。
     Value* genBinaryInst(Value* A,BinaryInst::Operation op,Value* B);
-    // 操作数全为常量时直接折叠，否则将指令插入给定基本块。
+    // 标量操作数全为常量时直接折叠；向量及非常量路径插入给定基本块。
     static Value* genBinaryInst(BasicBlock*,Value*,BinaryInst::Operation,Value*);
 
-    // 生成标量转换、函数调用和选择指令。
+    // 生成标量或固定长度向量转换、函数调用和选择指令。
     Value* genSITOFPInst(Value* x);
+    Value* genSITOFPInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genFPTOSIInst(Value* x);
-    Value* genFPTOSIInst(Value* x, std::shared_ptr<INTType> targetType);
+    Value* genFPTOSIInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genCallInst(std::string ident,std::vector<Value*> params);
     Value* genZextInst(Value* x);
-    Value* genZextInst(Value* x, std::shared_ptr<INTType> targetType);
+    Value* genZextInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genTruncInst(Value* x);
-    Value* genTruncInst(Value* x, std::shared_ptr<INTType> targetType);
+    Value* genTruncInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genSextInst(Value* x);
-    Value* genSextInst(Value* x, std::shared_ptr<INTType> targetType);
+    Value* genSextInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genBitCastInst(Value* v, std::shared_ptr<IRType> targetType);
-    Value* genPtrToIntInst(Value* v,
-                           std::shared_ptr<INTType> targetType);
-    Value* genIntToPtrInst(Value* v,
-                           std::shared_ptr<POINTERType> targetType);
     Value* genSelectInst(Value* cond, Value* isTrue, Value* isFalse);
     // 在同一函数中创建新基本块并维护指令插入位置。
     BasicBlock* genBlock();
@@ -388,8 +400,8 @@ public:
 
 
 
-// 返回指令结束当前函数执行。
-// IR 结构：ret i32 %val；ret void。
+// 返回指令结束当前函数执行，返回值可以是标量、指针或固定长度向量。
+// IR 结构：ret i32 %val；ret <4 x i32> %vec；ret void。
 class RetInst : public Instruction{
     public:
     RetInst();
@@ -420,8 +432,8 @@ class BrInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 栈分配指令在当前函数栈帧中创建对象。
-// IR 结构：%a = alloca i32。
+// 栈分配指令在当前函数栈帧中创建标量、聚合或固定长度向量对象。
+// IR 结构：%a = alloca i32；%v = alloca <4 x i32>。
 class AllocaInst : public Instruction{
     public:
     AllocaInst(std::shared_ptr<IRType> irtype);
@@ -435,8 +447,9 @@ class AllocaInst : public Instruction{
 
 };
 
-// 内存写入指令的第一个操作数是值，第二个操作数是目标指针。
-// IR 结构：store i32 3, i32* %a。
+// 内存写入指令的第一个操作数是值，第二个操作数是目标指针；
+// 值可以是标量或固定长度向量。
+// IR 结构：store i32 3, i32* %a；store <4 x i32> %v, <4 x i32>* %p。
 class StoreInst : public Instruction{
     public:
     StoreInst(Value* val,Value* ptr);
@@ -448,8 +461,8 @@ class StoreInst : public Instruction{
 
 };
 
-// 内存读取指令从指针操作数指向的对象中取值。
-// IR 结构：%x = load i32, i32* %a。
+// 内存读取指令从标量指针指向的对象中取值，结果可以是固定长度向量。
+// IR 结构：%x = load i32, i32* %a；%v = load <4 x i32>, <4 x i32>* %p。
 class LoadInst : public Instruction{
     public:
     LoadInst(Value* v);
@@ -459,7 +472,8 @@ class LoadInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 元素地址指令根据基指针和逐层索引计算子对象地址。
+// 元素地址指令根据基指针和逐层标量索引计算子对象地址，也可从
+// 指向固定长度向量的指针中取得某个 lane 的地址。
 // IR 结构：%p = getelementptr inbounds [10 x i32], [10 x i32]* %arr, i64 0, i64 3。
 class GetElementPtrInst : public Instruction{
     public:
@@ -493,11 +507,53 @@ class GetElementPtrInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
+// 从固定长度向量中提取一个标量元素。
+// IR 结构：%x = extractelement <4 x i32> %v, i32 %index。
+class ExtractElementInst : public Instruction {
+public:
+    ExtractElementInst(Value* vector, Value* index);
+    Value* getVectorOperand() const;
+    Value* getIndexOperand() const;
+    void dumpIR() override;
+    Instruction* clone(
+        const std::unordered_map<Value*, Value*>& VMap) override;
+};
+
+// 把标量元素插入固定长度向量，并产生一个新的向量 SSA 值。
+// IR 结构：%r = insertelement <4 x i32> %v, i32 %x, i32 %index。
+class InsertElementInst : public Instruction {
+public:
+    InsertElementInst(Value* vector, Value* element, Value* index);
+    Value* getVectorOperand() const;
+    Value* getElementOperand() const;
+    Value* getIndexOperand() const;
+    void dumpIR() override;
+    Instruction* clone(
+        const std::unordered_map<Value*, Value*>& VMap) override;
+};
+
+// 按编译期常量 mask 从两个同类型向量中选择并重排元素。
+// mask 中 [0,N) 引用 first，[N,2N) 引用 second，-1 输出 poison。
+class ShuffleVectorInst : public Instruction {
+    std::vector<int> mask;
+
+public:
+    ShuffleVectorInst(Value* first, Value* second,
+                      std::vector<int> mask);
+    Value* getFirstVectorOperand() const;
+    Value* getSecondVectorOperand() const;
+    const std::vector<int>& getMask() const { return mask; }
+    void dumpIR() override;
+    Instruction* clone(
+        const std::unordered_map<Value*, Value*>& VMap) override;
+};
 
 
 
-// 函数调用指令把第一个操作数作为被调函数，其余操作数作为实参。
-// IR 结构：%r = call i32 @foo(i32 %a)；%r = tail call i32 @foo(i32 %a)。
+
+// 函数调用指令把第一个操作数作为被调函数，其余操作数作为实参；
+// 返回值和实参均可使用固定长度向量。
+// IR 结构：%r = call <4 x i32> @foo(<4 x i32> %v)。
 class CallInst : public Instruction{
     bool tailCall = false;
     public:
@@ -525,57 +581,68 @@ class CallInst : public Instruction{
 
 
 
-// 浮点转有符号整数指令：%i = fptosi float %f to i32。
+// 浮点转有符号整数指令，标量/向量两端必须保持相同 lane 数。
+// IR 结构：%i = fptosi float %f to i32；
+//          %iv = fptosi <4 x float> %fv to <4 x i32>。
 class FPTOSIInst : public Instruction{
     public:
     FPTOSIInst(Value* v);
-    FPTOSIInst(Value* v, std::shared_ptr<INTType> targetType);
+    FPTOSIInst(Value* v, std::shared_ptr<IRType> targetType);
     FPTOSIInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 有符号整数转浮点指令：%f = sitofp i32 %i to float。
+// 有符号整数转浮点指令，标量/向量两端必须保持相同 lane 数。
+// IR 结构：%f = sitofp i32 %i to float；
+//          %fv = sitofp <4 x i32> %iv to <4 x float>。
 class SITOFPInst : public Instruction{
     public:
     SITOFPInst(Value* v);
+    SITOFPInst(Value* v, std::shared_ptr<IRType> targetType);
     SITOFPInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
 
-// 零扩展指令：%x32 = zext i1 %b to i32。
+// 零扩展指令支持整数标量以及 lane 数相同的整数向量。
+// IR 结构：%x32 = zext i1 %b to i32；
+//          %v32 = zext <4 x i8> %v8 to <4 x i32>。
 class ZextInst : public Instruction{
     public:
     ZextInst(Value* v);
-    ZextInst(Value* v, std::shared_ptr<INTType> targetType);
+    ZextInst(Value* v, std::shared_ptr<IRType> targetType);
     ZextInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 整数截断指令：%b = trunc i32 %x to i1。
+// 整数截断指令支持整数标量以及 lane 数相同的整数向量。
+// IR 结构：%b = trunc i32 %x to i1；
+//          %v8 = trunc <4 x i32> %v32 to <4 x i8>。
 class TruncInst : public Instruction{
     public:
     TruncInst(Value* v);
-    TruncInst(Value* v, std::shared_ptr<INTType> targetType);
+    TruncInst(Value* v, std::shared_ptr<IRType> targetType);
     TruncInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 符号扩展指令：%x32 = sext i1 %b to i32。
+// 符号扩展指令支持整数标量以及 lane 数相同的整数向量。
+// IR 结构：%x32 = sext i1 %b to i32；
+//          %v32 = sext <4 x i8> %v8 to <4 x i32>。
 class SextInst : public Instruction{
     public:
     SextInst(Value* v);
-    SextInst(Value* v, std::shared_ptr<INTType> targetType);
+    SextInst(Value* v, std::shared_ptr<IRType> targetType);
     SextInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 条件选择指令根据 i1 条件在两个同类型值之间选择。
+// 条件选择指令支持 i1 整体选择，以及 <N x i1> 逐 lane 选择。
 // IR 结构：%r = select i1 %c, i32 %a, i32 %b。
 class SelectInst : public Instruction{
     public:
@@ -588,7 +655,7 @@ class SelectInst : public Instruction{
     void dumpIR() override;
 };
 
-// PHI 指令按实际到达的前驱边选择一个输入值。
+// PHI 指令按实际到达的前驱边选择一个同类型标量或向量输入值。
 // IR 结构：%x = phi i32 [ %v1, %bb1 ], [ %v2, %bb2 ]。
 class PhiInst : public Instruction{
     public:
@@ -624,33 +691,16 @@ class PhiInst : public Instruction{
 
 
 
-// 位转换指令仅改变值的静态类型，不改变其位模式。
-// IR 结构：%q = bitcast i32* %p to float*。
+// 位转换指令仅改变值的静态类型，不改变其位模式；非指针标量与
+// 固定长度向量之间只要求逻辑总位数一致。
+// IR 结构：%q = bitcast i32* %p to float*；
+//          %v = bitcast <4 x i32> %x to <2 x i64>。
 class BitCastInst : public Instruction {
 public:
     BitCastInst(Value* v, std::shared_ptr<IRType> targetType);
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
-
-// 指针到整数转换保留地址位模式，整数位宽由调用方显式指定。
-class PtrToIntInst : public Instruction {
-public:
-    PtrToIntInst(Value *v, std::shared_ptr<INTType> targetType);
-    void dumpIR() override;
-    Instruction *clone(
-        const std::unordered_map<Value *, Value *> &VMap) override;
-};
-
-// 整数到指针转换按目标指针类型重新解释地址位模式。
-class IntToPtrInst : public Instruction {
-public:
-    IntToPtrInst(Value *v, std::shared_ptr<POINTERType> targetType);
-    void dumpIR() override;
-    Instruction *clone(
-        const std::unordered_map<Value *, Value *> &VMap) override;
-};
-
 
 // 常量对象通过各子类工厂创建，并在实现允许时复用已有实例。
 class ConstantSystem : public Value{

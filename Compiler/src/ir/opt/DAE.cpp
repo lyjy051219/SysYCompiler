@@ -1,5 +1,5 @@
 #include "ir/opt/DAE.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 

@@ -46,7 +46,6 @@ bool Use::replaceUseeWith(Value *ValueToUse) {
 
 void Use::removeFromUseList() {
     if (!usee || !prev) return;
-    // prev 指向当前节点的入口槽位，因此头节点和普通节点共享同一套 O(1) 解链逻辑。
     --usee->getUseList().size;
     *prev = next;
     if (next) next->prev = prev;
@@ -130,10 +129,6 @@ bool Value::isGlobal() {
 
 std::shared_ptr<IRType> Value::getIRType() const {
     return irtype;
-}
-
-void Value::setIRType(std::shared_ptr<IRType> Type) {
-    irtype = std::move(Type);
 }
 
 void Value::setIdent(std::string Ident) {
@@ -266,16 +261,6 @@ bool Value::tryGetInt64Const(int64_t &Out) const {
     return false;
 }
 
-bool Value::tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const {
-    int64_t Normalized = 0;
-    if (!tryGetInt64ConstAtWidth(Bits, Normalized) ||
-        Normalized < std::numeric_limits<int32_t>::min() ||
-        Normalized > std::numeric_limits<int32_t>::max())
-        return false;
-    Out = static_cast<int32_t>(Normalized);
-    return true;
-}
-
 bool Value::tryGetInt64ConstAtWidth(unsigned Bits, int64_t &Out) const {
     int64_t Raw = 0;
     if (!tryGetInt64Const(Raw)) return false;
@@ -365,7 +350,6 @@ int Value::countInstructionUses(Instruction **SingleUser) const {
 }
 
 std::vector<Use *> Value::getUses() const {
-    // 快照与原链解耦，调用方可在遍历快照期间执行批量替换。
     std::vector<Use *> Uses;
     Uses.reserve(static_cast<std::size_t>(useList.size));
     for (auto It = getUseList().begin(); It != getUseList().end(); ++It) {
@@ -413,17 +397,8 @@ std::shared_ptr<IRType> Value::getPointeeType() const {
     return getIRType() ? getIRType()->getPointeeType() : nullptr;
 }
 
-bool Value::hasSameStorageType(const Value *Other) const {
-    return Other && getIRType() && Other->getIRType() &&
-           getIRType()->hasSameStorageType(*Other->getIRType());
-}
-
 std::shared_ptr<IRType> Value::getPointeeType(const Value *V) {
     return V ? V->getPointeeType() : nullptr;
-}
-
-bool Value::hasSameStorageType(const Value *A, const Value *B) {
-    return A && A->hasSameStorageType(B);
 }
 
 bool Value::isExternalVariable() const {
@@ -434,10 +409,6 @@ bool Value::isExternalVariable() const {
 
 bool Value::isConstZero(const Value *V) {
     return V && V->isConstZero();
-}
-
-bool Value::isConstIntZero(const Value *V) {
-    return V && V->isConstIntZero();
 }
 
 bool Value::isConstOne(const Value *V) {
@@ -458,10 +429,6 @@ bool Value::tryGetBoolConst(const Value *V, bool &Out) {
 
 bool Value::tryGetIntConst(const Value *V, int32_t &Out) {
     return V && V->tryGetIntConst(Out);
-}
-
-bool Value::tryGetInt64Const(const Value *V, int64_t &Out) {
-    return V && V->tryGetInt64Const(Out);
 }
 
 bool Value::tryGetFloatConst(const Value *V, float &Out) {
@@ -518,10 +485,6 @@ Value *Value::stripPointerCastsAndGEP(Value *V) {
         break;
     }
     return V;
-}
-
-bool Value::isLocalStackPointer(Value *V) {
-    return dynamic_cast<AllocaInst *>(stripPointerCastsAndGEP(V)) != nullptr;
 }
 
 Value *Value::makeZeroForType(const std::shared_ptr<IRType> &Ty) {

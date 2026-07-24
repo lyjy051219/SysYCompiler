@@ -3,7 +3,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/LoopSimplify.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 #include <algorithm>
 
 bool LoopRotatePass::isLCSSAPhi(PhiInst *Phi) {

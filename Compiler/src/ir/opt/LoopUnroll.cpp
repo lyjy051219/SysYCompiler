@@ -3,7 +3,6 @@
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 
 #include <algorithm>
 #include <limits>

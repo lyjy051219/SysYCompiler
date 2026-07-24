@@ -7,7 +7,8 @@
 #include "TypeSystem.hpp"
 
 
-// IR 值、使用者和使用关系的基础设施。
+//仿照LLVM实现Value/User/Use
+
 class IRType;
 class VOIDType;
 class ConstInt;
@@ -106,12 +107,14 @@ class UseList final{
 class Value{
    private:
    UseList useList;     // 保存所有以当前值为操作数的使用关系。
-   static int generateNum(const std::string& s); // 为同名前缀生成递增编号。
+   //为IR生成唯一编号
+   static int generateNum(const std::string& s);
    protected:
-    std::shared_ptr<IRType> irtype;
+   std::shared_ptr<IRType> irtype;
    std::string ident;
    int num;
    public:
+   //描述该值是bool还是bool的零扩展/符号扩展，或其他类型
    enum class BooleanExtensionKind {
        None,
        PlainBool,
@@ -119,20 +122,21 @@ class Value{
        SignExt,
    };
 
-   // 析构值时删除仍引用它的使用者，保证使用链不悬空。
+   // 析构值时删除仍引用它的使用者，保证使用链不悬空
    virtual ~Value();
    Value() = delete;
-   // 所有值必须携带 IR 类型，可选携带显式标识符。
+   // 所有值必须携带 IR 类型，可选携带显式标识符
    Value(std::shared_ptr<IRType> irtype);
    Value(std::shared_ptr<IRType> irtype,std::string ident);
+
    virtual bool isConst();
    virtual bool isGlobal();
    std::shared_ptr<IRType> getIRType() const;
-   void setIRType(std::shared_ptr<IRType> Type);
    void setIdent(std::string Ident);
    std::string getIdent() const;
    UseList& getUseList();
    const UseList& getUseList() const;
+
    bool isConstZero() const;
    bool isConstIntZero() const;
    bool isConstOne() const;
@@ -141,7 +145,6 @@ class Value{
    bool tryGetBoolConst(bool &Out) const;
    bool tryGetIntConst(int32_t &Out) const;
    bool tryGetInt64Const(int64_t &Out) const;
-   bool tryGetIntConstAtWidth(unsigned Bits, int32_t &Out) const;
    bool tryGetInt64ConstAtWidth(unsigned Bits, int64_t &Out) const;
    bool tryGetFloatConst(float &Out) const;
    bool tryGetNumericFloatConst(float &Out) const;
@@ -149,7 +152,6 @@ class Value{
    int integerBitWidth(int DefaultBits = 32) const;
    int countUses() const;
    int countInstructionUses(Instruction **SingleUser = nullptr) const;
-   // 返回可跨批量替换和 CFG 换边使用的 Use 指针快照；删除所属 User 后指针失效。
    std::vector<Use *> getUses() const;
    Use *getSingleUse() const;
    std::vector<Instruction *> getInstructionUsers() const;
@@ -157,51 +159,48 @@ class Value{
    bool hasExactlyOneUse() const;
    bool isPointerValue() const;
    std::shared_ptr<IRType> getPointeeType() const;
-   bool hasSameStorageType(const Value *Other) const;
    static std::shared_ptr<IRType> getPointeeType(const Value *V);
-   static bool hasSameStorageType(const Value *A, const Value *B);
+   //判断当前值是否是外部变量（全局变量或函数参数）
    bool isExternalVariable() const;
    static bool isConstZero(const Value *V);
-   static bool isConstIntZero(const Value *V);
    static bool isConstOne(const Value *V);
    static bool isConstMinusOne(const Value *V);
    static bool isUndef(const Value *V);
    static bool tryGetBoolConst(const Value *V, bool &Out);
    static bool tryGetIntConst(const Value *V, int32_t &Out);
-   static bool tryGetInt64Const(const Value *V, int64_t &Out);
    static bool tryGetFloatConst(const Value *V, float &Out);
+   //比较两个常量值是否相等
    static bool areEqualConstants(const Value *A, const Value *B);
+
+   //识别IR Value中的常量Value，如果是常量将其提取为int
    static bool tryGetIntIndex(const Value *V, int &Out);
+
    // 识别布尔值及其零扩展或符号扩展形式，并返回扩展前的值。
    static Value *stripBooleanExtension(Value *V,
                                        BooleanExtensionKind &Kind);
-   // 反复剥离指针转换和 GEP；遇到环时停止并返回当前值。
+   // 反复剥离BitCast和 GEP；遇到环时停止并返回当前值。
    static Value *stripPointerCastsAndGEP(Value *V);
-   static bool isLocalStackPointer(Value *V);
    static Value *makeZeroForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeMinusOneForType(const std::shared_ptr<IRType> &Ty);
    static Value *makeUndefForType(const std::shared_ptr<IRType> &Ty);
-   static Value *makeIntegerForType(int64_t Val,
-                                    const std::shared_ptr<IRType> &Ty);
+   static Value *makeIntegerForType(int64_t Val,const std::shared_ptr<IRType> &Ty);
    static Value *makeIntegerLike(const Value *Model, int64_t Val);
-   // 将所有现有 Use 换绑到目标值，保持每个 User 的操作数位置不变。
-   void replaceAllUsesWith(Value* Val);
-   // 输出当前值在 LLVM IR 中的引用形式。
-   void dumpIR();
-   // 运行期检查并转换为指定派生类型，类型不匹配时返回空指针。
-   template<typename T>
 
-    T* as(){return dynamic_cast<T*>(this);}
+   // 将所有现有 Use 换绑到目标值，保持每个 User 的操作数位置不变
+   void replaceAllUsesWith(Value* Val);
+   // 输出当前值在 LLVM IR 中的引用形式
+   void dumpIR();
+   //相当于dynamic_cas，只是写法更简洁
+   template<typename T>
+   T* as(){return dynamic_cast<T*>(this);}
    template<typename T>
     const T* as() const {return dynamic_cast<const T*>(this);}
 };
 
 
-// User 是持有操作数 Use 的 Value 基类，供指令和变量等节点复用。
 class User : public Value{
    protected:
-   // 下标即操作数位置，每个元素负责维护对应值的反向使用链。
    std::vector<std::unique_ptr<Use>> userList;
 
    public:
@@ -215,11 +214,10 @@ class User : public Value{
     Use *getOperandUse(size_t Index) const;
     bool replaceOperand(size_t Index, Value *V);
     bool eraseOperand(size_t Index);
-    // 删除全部操作数，同时让各 Use 从被使用值的使用链解链。
+    // 删除全部操作数，同时让各 Use 从被使用值的使用链解链
     void clearOperands();
-    // 返回给定 Use 的操作数下标，不属于当前 User 时返回 -1。
+    // 返回给定 Use 的操作数下标，不属于当前 User 时返回 -1
     int getUserIndex(const Use* u) const;
-
-   // 追加操作数，并在目标值的使用链中注册对应 Use。
+   // 追加操作数，并在目标值的使用链中注册对应 Use
    void addUse(Value* v);
 };

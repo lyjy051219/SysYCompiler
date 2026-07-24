@@ -4,7 +4,6 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 
 #include <vector>
 #include <cmath>

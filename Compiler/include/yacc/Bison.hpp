@@ -395,41 +395,44 @@ namespace yy {
       // ExpList
       char dummy2[sizeof (ArrayList*)];
 
+      // Decl
+      // BlockItem
+      // Stmt
+      // PrimaryExp
+      char dummy3[sizeof (BaseAST*)];
+
       // Block
-      char dummy3[sizeof (Block*)];
+      char dummy4[sizeof (Block*)];
 
       // BlockItemList
-      char dummy4[sizeof (BlockItemList*)];
+      char dummy5[sizeof (BlockItemList*)];
 
       // CompUnit
-      char dummy5[sizeof (CompUnit*)];
+      char dummy6[sizeof (CompUnit*)];
 
       // ConstDecl
-      char dummy6[sizeof (ConstDecl*)];
+      char dummy7[sizeof (ConstDecl*)];
 
       // ConstDef
-      char dummy7[sizeof (ConstDef*)];
+      char dummy8[sizeof (ConstDef*)];
 
       // ConstDefList
-      char dummy8[sizeof (ConstDefList*)];
+      char dummy9[sizeof (ConstDefList*)];
 
       // EqExp
-      char dummy9[sizeof (EqExp*)];
+      char dummy10[sizeof (EqExp*)];
 
       // FuncDef
-      char dummy10[sizeof (FuncDef*)];
+      char dummy11[sizeof (FuncDef*)];
 
       // FuncFParam
-      char dummy11[sizeof (FuncParam*)];
+      char dummy12[sizeof (FuncParam*)];
 
       // FuncFParamList
-      char dummy12[sizeof (FuncParamList*)];
+      char dummy13[sizeof (FuncParamList*)];
 
       // FuncRParamList
-      char dummy13[sizeof (FuncRParamList*)];
-
-      // PrimaryExp
-      char dummy14[sizeof (HasOperand*)];
+      char dummy14[sizeof (FuncRParamList*)];
 
       // ConstInitVal
       // InitVal
@@ -457,31 +460,26 @@ namespace yy {
       // RelExp
       char dummy22[sizeof (RelExp*)];
 
-      // Decl
-      // BlockItem
-      // Stmt
-      char dummy23[sizeof (Stmt*)];
-
       // Type
-      char dummy24[sizeof (Type)];
+      char dummy23[sizeof (Type)];
 
       // UnaryExp
-      char dummy25[sizeof (UnaryExp*)];
+      char dummy24[sizeof (UnaryExp*)];
 
       // VarDecl
-      char dummy26[sizeof (VarDecl*)];
+      char dummy25[sizeof (VarDecl*)];
 
       // VarDef
-      char dummy27[sizeof (VarDef*)];
+      char dummy26[sizeof (VarDef*)];
 
       // VarDefList
-      char dummy28[sizeof (VarDefList*)];
+      char dummy27[sizeof (VarDefList*)];
 
       // FLOATCONST
-      char dummy29[sizeof (float)];
+      char dummy28[sizeof (float)];
 
       // INTCONST
-      char dummy30[sizeof (int)];
+      char dummy29[sizeof (int)];
     };
 
     /// The size of the largest semantic type.
@@ -697,6 +695,13 @@ namespace yy {
         value.move< ArrayList* > (std::move (that.value));
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.move< BaseAST* > (std::move (that.value));
+        break;
+
       case symbol_kind::S_Block: // Block
         value.move< Block* > (std::move (that.value));
         break;
@@ -741,10 +746,6 @@ namespace yy {
         value.move< FuncRParamList* > (std::move (that.value));
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.move< HasOperand* > (std::move (that.value));
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.move< InitVal* > (std::move (that.value));
@@ -777,12 +778,6 @@ namespace yy {
 
       case symbol_kind::S_RelExp: // RelExp
         value.move< RelExp* > (std::move (that.value));
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.move< Stmt* > (std::move (that.value));
         break;
 
       case symbol_kind::S_Type: // Type
@@ -853,6 +848,18 @@ namespace yy {
       {}
 #else
       basic_symbol (typename Base::kind_type t, const ArrayList*& v)
+        : Base (t)
+        , value (v)
+      {}
+#endif
+
+#if 201103L <= YY_CPLUSPLUS
+      basic_symbol (typename Base::kind_type t, BaseAST*&& v)
+        : Base (t)
+        , value (std::move (v))
+      {}
+#else
+      basic_symbol (typename Base::kind_type t, const BaseAST*& v)
         : Base (t)
         , value (v)
       {}
@@ -991,18 +998,6 @@ namespace yy {
 #endif
 
 #if 201103L <= YY_CPLUSPLUS
-      basic_symbol (typename Base::kind_type t, HasOperand*&& v)
-        : Base (t)
-        , value (std::move (v))
-      {}
-#else
-      basic_symbol (typename Base::kind_type t, const HasOperand*& v)
-        : Base (t)
-        , value (v)
-      {}
-#endif
-
-#if 201103L <= YY_CPLUSPLUS
       basic_symbol (typename Base::kind_type t, InitVal*&& v)
         : Base (t)
         , value (std::move (v))
@@ -1093,18 +1088,6 @@ namespace yy {
       {}
 #else
       basic_symbol (typename Base::kind_type t, const RelExp*& v)
-        : Base (t)
-        , value (v)
-      {}
-#endif
-
-#if 201103L <= YY_CPLUSPLUS
-      basic_symbol (typename Base::kind_type t, Stmt*&& v)
-        : Base (t)
-        , value (std::move (v))
-      {}
-#else
-      basic_symbol (typename Base::kind_type t, const Stmt*& v)
         : Base (t)
         , value (v)
       {}
@@ -1227,6 +1210,13 @@ switch (yykind)
         value.template destroy< ArrayList* > ();
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.template destroy< BaseAST* > ();
+        break;
+
       case symbol_kind::S_Block: // Block
         value.template destroy< Block* > ();
         break;
@@ -1271,10 +1261,6 @@ switch (yykind)
         value.template destroy< FuncRParamList* > ();
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.template destroy< HasOperand* > ();
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.template destroy< InitVal* > ();
@@ -1307,12 +1293,6 @@ switch (yykind)
 
       case symbol_kind::S_RelExp: // RelExp
         value.template destroy< RelExp* > ();
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.template destroy< Stmt* > ();
         break;
 
       case symbol_kind::S_Type: // Type
@@ -2495,6 +2475,13 @@ switch (yykind)
         value.copy< ArrayList* > (YY_MOVE (that.value));
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.copy< BaseAST* > (YY_MOVE (that.value));
+        break;
+
       case symbol_kind::S_Block: // Block
         value.copy< Block* > (YY_MOVE (that.value));
         break;
@@ -2539,10 +2526,6 @@ switch (yykind)
         value.copy< FuncRParamList* > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.copy< HasOperand* > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.copy< InitVal* > (YY_MOVE (that.value));
@@ -2575,12 +2558,6 @@ switch (yykind)
 
       case symbol_kind::S_RelExp: // RelExp
         value.copy< RelExp* > (YY_MOVE (that.value));
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.copy< Stmt* > (YY_MOVE (that.value));
         break;
 
       case symbol_kind::S_Type: // Type
@@ -2651,6 +2628,13 @@ switch (yykind)
         value.move< ArrayList* > (YY_MOVE (s.value));
         break;
 
+      case symbol_kind::S_Decl: // Decl
+      case symbol_kind::S_BlockItem: // BlockItem
+      case symbol_kind::S_Stmt: // Stmt
+      case symbol_kind::S_PrimaryExp: // PrimaryExp
+        value.move< BaseAST* > (YY_MOVE (s.value));
+        break;
+
       case symbol_kind::S_Block: // Block
         value.move< Block* > (YY_MOVE (s.value));
         break;
@@ -2695,10 +2679,6 @@ switch (yykind)
         value.move< FuncRParamList* > (YY_MOVE (s.value));
         break;
 
-      case symbol_kind::S_PrimaryExp: // PrimaryExp
-        value.move< HasOperand* > (YY_MOVE (s.value));
-        break;
-
       case symbol_kind::S_ConstInitVal: // ConstInitVal
       case symbol_kind::S_InitVal: // InitVal
         value.move< InitVal* > (YY_MOVE (s.value));
@@ -2731,12 +2711,6 @@ switch (yykind)
 
       case symbol_kind::S_RelExp: // RelExp
         value.move< RelExp* > (YY_MOVE (s.value));
-        break;
-
-      case symbol_kind::S_Decl: // Decl
-      case symbol_kind::S_BlockItem: // BlockItem
-      case symbol_kind::S_Stmt: // Stmt
-        value.move< Stmt* > (YY_MOVE (s.value));
         break;
 
       case symbol_kind::S_Type: // Type
@@ -2832,7 +2806,7 @@ switch (yykind)
 
 
 } // yy
-#line 2836 "include/yacc/Bison.hpp"
+#line 2810 "include/yacc/Bison.hpp"
 
 
 

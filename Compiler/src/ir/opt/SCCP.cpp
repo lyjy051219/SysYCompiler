@@ -4,7 +4,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cmath>
 
@@ -191,10 +191,8 @@ void SCCPSolver::visitInstruction(Instruction* I) {
                I->instType == Instruction::SEXT ||
                I->instType == Instruction::TRUNC) {
         visitCastInst(I);
-    } else if (I->instType == Instruction::BITCAST ||
-               I->instType == Instruction::PTRTOINT ||
-               I->instType == Instruction::INTTOPTR) {
-        // 位模式和地址转换不在 SCCP 中推断具体目标值。
+    } else if (I->instType == Instruction::BITCAST) {
+        // 位模式转换不在 SCCP 中推断具体目标值。
         mergeInValue(I, LatticeValue::getBottom());
     } else if (I->instType == Instruction::SELECT) {
         visitSelectInst(I);

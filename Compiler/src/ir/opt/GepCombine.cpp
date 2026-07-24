@@ -1,7 +1,7 @@
 #include "ir/opt/GepOpt.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <vector>
 #include <unordered_map>

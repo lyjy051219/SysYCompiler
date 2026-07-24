@@ -4,7 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "lib/CFG.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 #include "lib/TypeSystem.hpp"
 
 #include <algorithm>

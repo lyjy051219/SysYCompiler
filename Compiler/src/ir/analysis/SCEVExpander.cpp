@@ -1,5 +1,5 @@
 #include "ir/analysis/SCEVExpander.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <limits>
 

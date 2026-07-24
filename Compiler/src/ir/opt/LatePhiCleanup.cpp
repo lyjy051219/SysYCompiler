@@ -5,7 +5,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <unordered_set>
 #include <vector>

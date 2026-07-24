@@ -4,7 +4,6 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/TraverseTools.hpp"
 #include <algorithm>
 #include <unordered_set>
 #include <vector>

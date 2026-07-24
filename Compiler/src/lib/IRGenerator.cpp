@@ -62,7 +62,7 @@ std::shared_ptr<IRType> IRGenerator::lowerScalarType(Type type) const {
     return IRType::NewTypeByTypeSystem(lowerSourceType(type));
 }
 
-bool IRGenerator::isConstantPrimary(const HasOperand& node) const {
+bool IRGenerator::isConstantPrimary(const BaseAST& node) const {
     if (auto expression = dynamic_cast<const AddExp*>(&node))
         return isConstantExpression(*expression);
     if (dynamic_cast<const ConValue<int>*>(&node) != nullptr ||
@@ -399,7 +399,7 @@ Value* IRGenerator::lowerBinaryChain(const BaseExp<OperandT>& node) {
     return result;
 }
 
-Value* IRGenerator::lowerPrimary(const HasOperand& node) {
+Value* IRGenerator::lowerPrimary(const BaseAST& node) {
     if (auto expression = dynamic_cast<const AddExp*>(&node))
         return lowerExpression(*expression);
     if (auto lvalue = dynamic_cast<const LVal*>(&node))
@@ -1442,10 +1442,10 @@ void IRGenerator::visit(Block& node) {
 void IRGenerator::visit(BlockItemList& node) {
     if (context.block == nullptr)
         return;
-    for (const auto& statement : node.getStmts()) {
+    for (const auto& item : node.getItems()) {
         if (currentBlock().hasTerminator())
             return;
-        statement->accept(*this);
+        item->accept(*this);
     }
 }
 
@@ -1475,7 +1475,7 @@ void IRGenerator::visit(IfStmt& node) {
     // 条件先分流到真/假块，两个未终结分支再按需创建并连接同一继续块。
     BasicBlock* conditionBlock = context.block;
     if (conditionBlock == nullptr || node.getCondition() == nullptr ||
-        node.getIfStmt() == nullptr) {
+        node.getThenBranch() == nullptr) {
         return;
     }
     BasicBlock* trueBlock = conditionBlock->genBlock();
@@ -1499,7 +1499,7 @@ void IRGenerator::visit(IfStmt& node) {
     }
 
     context.block = trueBlock;
-    node.getIfStmt()->accept(*this);
+    node.getThenBranch()->accept(*this);
     if (!currentBlock().hasTerminator()) {
         if (continuation == nullptr)
             continuation = currentBlock().genBlock();
@@ -1509,8 +1509,8 @@ void IRGenerator::visit(IfStmt& node) {
 
     if (falseBlock != nullptr) {
         context.block = falseBlock;
-        if (node.getElseStmt() != nullptr)
-            node.getElseStmt()->accept(*this);
+        if (node.getElseBranch() != nullptr)
+            node.getElseBranch()->accept(*this);
         if (!currentBlock().hasTerminator()) {
             if (continuation == nullptr)
                 continuation = currentBlock().genBlock();
@@ -1527,7 +1527,7 @@ void IRGenerator::visit(WhileStmt& node) {
     // 循环由前驱、条件、循环体和继续块组成，循环目标栈为 break/continue 提供落点。
     BasicBlock* predecessor = context.block;
     if (predecessor == nullptr || node.getCondition() == nullptr ||
-        node.getWhileStmt() == nullptr) {
+        node.getBody() == nullptr) {
         return;
     }
     BasicBlock* conditionBlock = predecessor->genBlock("wc");
@@ -1545,7 +1545,7 @@ void IRGenerator::visit(WhileStmt& node) {
     IRGeneratorScopedPush<LoopTargets> loop(
         context.loops, LoopTargets{conditionBlock, continuation});
     context.block = bodyBlock;
-    node.getWhileStmt()->accept(*this);
+    node.getBody()->accept(*this);
     if (!currentBlock().hasTerminator())
         currentBlock().genUnCondInst(conditionBlock);
 

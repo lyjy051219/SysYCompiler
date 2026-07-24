@@ -5,7 +5,7 @@
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/CFG.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <algorithm>
 #include <cstdint>

@@ -6,7 +6,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cstring>
 #include <limits>
@@ -178,6 +178,8 @@ GetElementPtrInst *LoopIdiomRecognizePass::materializeStartPointer(
     Indices[Access.InductionIndex] = StartValue;
 
     auto *StartGEP = new GetElementPtrInst(Access.Base, Indices);
+    // 完整索引已经确定，必须立即刷新元素指针类型，避免严格 PHI 校验误用基指针类型。
+    StartGEP->updateType();
     if (!PreHeader->insertBeforeTerminator(StartGEP)) {
         delete StartGEP;
         return nullptr;

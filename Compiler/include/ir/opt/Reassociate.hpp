@@ -2,7 +2,7 @@
 
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cstdint>
 #include <unordered_map>

@@ -1,5 +1,5 @@
 #include "ir/opt/DeadFunctionElimination.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <unordered_set>
 #include <vector>

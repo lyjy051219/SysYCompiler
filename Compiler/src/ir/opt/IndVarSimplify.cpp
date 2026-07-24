@@ -6,7 +6,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
-#include "lib/TraverseTools.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
