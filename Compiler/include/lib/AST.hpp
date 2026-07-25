@@ -123,7 +123,7 @@ public:
     virtual void accept(ASTVisitor &visitor) = 0;
 };
 
-// 编译单元按源码顺序持有声明和函数定义，并独占各子节点的生命周期。
+// 编译单元
 class CompUnit : public BaseAST{
 private:
   std::vector<std::unique_ptr<BaseAST>> items;
@@ -491,7 +491,7 @@ class FuncCall : public BaseAST{
   const std::unique_ptr<FuncRParamList>& getParams() const { return fp; }
   int getLineNo() const { return lineno; }
 };
-// 数组维度或索引表达式列表，对应语法规则中的 ExpList。
+// 数组维度或索引表达式列表
 class ArrayList : public BaseAST{
   private:
   std::vector<std::unique_ptr<AddExp>> al;

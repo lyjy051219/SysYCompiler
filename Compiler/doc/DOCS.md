@@ -360,69 +360,12 @@ memset：从目标地址 dest 开始，将连续 len 个字节全部设置为同
 
 使用Visitor设计模式，将IR生成相关逻辑与AST结构，IR结构解耦，实现了将AST转化为无SSA形式的，兼容LLVM格式的中间代码IR
 
-- 纯栈驱动的上下文管理机制：
-
-  为了保证Visitor接口的简洁性，我们将跨节点需要传递的信息统一用栈管理，基于这一实现，我们可以轻松解决遍历AST之中出现的递归传递参数的相关逻辑
-
 #### 符号表
 
 基于《编译器设计》一书中对符号表的解析上修改，设计而来
 
 - 功能：主要用于IR生成阶段，便于建立中端Value与前端AST Ident映射的桥梁
   - 变量遮蔽：允许在内层作用域声明与外层同名的变量。在进入新作用域的时候能够及时屏蔽外层同名变量
-  - 零内存碎片化：进入和退出作用域的时候，无任何new，delete操作
-  - 时间复杂度低
-
-- 结构：
-
-  ```mermaid
-  graph LR
-      subgraph ScopeMarkers ["scope_markers (记录作用域边界的索引集合)"]
-          direction TB
-          sm0["[0]: 0 (第1层起点)"]
-          sm1["[1]: 2 (第2层起点)"]
-          sm2["[2]: 5 (第3层起点)"]
-      end
-
-      subgraph ActiveVars ["active_vars (按声明顺序记录变量栈的指针集合)"]
-          direction TB
-          av0["[0]: 指针"]
-          av1["[1]: 指针"]
-          av2["[2]: 指针"]
-          av3["[3]: 指针"]
-          av4["[4]: 指针"]
-          av5["[5]: 指针"]
-      end
-
-      subgraph SymDict ["sym_dict (全局唯一的哈希字典与同名变量栈)"]
-          direction TB
-          dictA["Key: 'x' | vector: [Value_x1, Value_x2]"]
-          dictB["Key: 'y' | vector: [Value_y1, Value_y2]"]
-          dictC["Key: 'z' | vector: [Value_z1]"]
-      end
-
-      %% scope_markers 到 active_vars 的索引映射关系
-      sm0 -. "索引 0" .-> av0
-      sm1 -. "索引 2" .-> av2
-      sm2 -. "索引 5" .-> av5
-
-      %% active_vars 到 sym_dict 的指针映射关系
-      av0 -- "指向 'x' 的栈" --> dictA
-      av1 -- "指向 'y' 的栈" --> dictB
-
-      av2 -- "指向 'x' 的栈 (同名遮蔽)" --> dictA
-      av3 -- "指向 'z' 的栈" --> dictC
-      av4 -- "指向 'x' 的栈 (同名遮蔽)" --> dictA
-
-      av5 -- "指向 'y' 的栈 (同名遮蔽)" --> dictB
-  ```
-
-- 时间复杂度：
-
-  - 查询：O(1)
-  - 注册变量：O(1)
-  - 进入作用域:O(1)
-  - 退出作用域:O(K)
 
 ### 中端
 
@@ -451,7 +394,7 @@ GetElementPtr (GEP)（根据类型和下标计算地址）
 Sdiv, Fdiv,Udiv -- Udiv目前仍未使用
 Srem, Frem,Urem -- Frem目前仍未使用,Urem中端优化引入
 逻辑运算: And, Or, Xor --中端优化时引入（这里是按位运算指令，前端逻辑判断IR生成为基本块级）
-移位运算: Shl逻辑左移, Lshr逻辑右移, Ashr算术右移 -- 中端优化时引入
+移位运算: Shl逻辑左移, Lshr逻辑右移, Ashr算术右移 -- 中端优化引入
 比较运算: Icmp, Fcmp
 /*
 icmp eq    // 整数相等：lhs == rhs
@@ -476,11 +419,11 @@ SITOFP //用于隐式类型转换
 Zext零扩展
 Sext符号扩展
 Trunc整数截断
-BitCast将指针解释成另一种类型 -- 中端优化引入
+BitCast将指针解释成另一种类型指针 -- 中端优化引入
 
 
 静态单赋值 (SSA) 与选择指令：
-Phi
+Phi    -- 中端优化引入
 Select -- 中端优化引入
 
 向量运算指令：

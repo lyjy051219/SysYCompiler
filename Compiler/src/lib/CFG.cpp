@@ -374,6 +374,150 @@ Value *BasicBlock::coerceValueToType(
   return nullptr;
 }
 
+Value *BasicBlock::coerceValueToTypeWithoutBitCast(
+    BasicBlock *InsertionBlock, Value *Input,
+    const std::shared_ptr<IRType> &TargetType) {
+  if (Input == nullptr || TargetType == nullptr)
+    return nullptr;
+  //1.获得源类型
+  const auto SourceType = Input->getIRType();
+  if (SourceType == nullptr)
+    return nullptr;
+
+  if (SourceType == TargetType)
+    return Input;
+  if (Input->isUndef())
+    return UndefValue::NewUndefValue(TargetType);
+
+  //2.如果目标类型是整数
+  if (TargetType->getTypeSystem() == IR_INT) {
+    const auto TargetInteger =
+        std::dynamic_pointer_cast<INTType>(TargetType);
+    if (TargetInteger == nullptr)
+      return nullptr;
+    //2.1普通浮点常量/整数常量转bool，先按照语义判断是否为0,然后再生成icmp/fcmp生成cond
+    if (TargetInteger->getIsBool()) {
+      if (auto SourceInteger =
+              std::dynamic_pointer_cast<INTType>(SourceType);
+          SourceInteger && SourceInteger->getIsBool()) {
+        return Input;
+      }
+      if (auto Constant = dynamic_cast<ConstInt *>(Input))
+        return ConstBool::newConstBool(Constant->getVal() != 0);
+      if (auto Constant = dynamic_cast<ConstFloat *>(Input))
+        return ConstBool::newConstBool(Constant->getVal() != 0.0F);
+      if (dynamic_cast<ConstPtr *>(Input) != nullptr)
+        return ConstBool::newConstBool(false);
+
+      Value *Zero = nullptr;
+      switch (SourceType->getTypeSystem()) {
+      case IR_INT:
+        if (auto IntegerType =
+                std::dynamic_pointer_cast<INTType>(SourceType);
+            IntegerType && IntegerType->getIsBool()) {
+          Zero = ConstBool::newConstBool(false);
+        } else {
+          Zero = ConstInt::newConstIntForType(
+              0, std::dynamic_pointer_cast<INTType>(SourceType));
+        }
+        break;
+      case IR_FLOAT:
+        Zero = ConstFloat::newConstFloat(0.0F);
+        break;
+      case IR_POINTER:
+        Zero = ConstPtr::newConstPtr(SourceType);
+        break;
+      case IR_ARRAY:
+        Zero = new Initializer(SourceType);
+        break;
+      default:
+        return nullptr;
+      }
+      return BasicBlock::genBinaryInst(
+          InsertionBlock, Input, BinaryInst::NE, Zero);
+    }
+
+    //2.2bool常量转普通整数，普通整数常量转普通整数，直接转
+    if (auto Constant = dynamic_cast<ConstBool *>(Input))
+      return ConstInt::newConstIntForType(
+          Constant->getVal() ? 1 : 0, TargetInteger);
+    if (auto Constant = dynamic_cast<ConstInt *>(Input))
+      return ConstInt::newConstIntForType(
+          Constant->getVal(), TargetInteger);
+    //2.3浮点常量转整数，因为是常量，所以直接转，不会生成FPTOSI指令
+    if (auto Constant = dynamic_cast<ConstFloat *>(Input)) {
+      Value *Folded = Instruction::foldConstantCast(
+          Instruction::FPTOSI, Constant, TargetInteger);
+      return Folded;
+    }
+
+    //2.4运行期浮点转整数：生成FPTOSI指令
+    if (SourceType->getTypeSystem() == IR_FLOAT) {
+      if (InsertionBlock == nullptr)
+        return nullptr;
+      return InsertionBlock->genFPTOSIInst(Input, TargetInteger);
+    }
+    //2.5运行期整数之间互转
+    if (SourceType->getTypeSystem() == IR_INT) {
+      const auto SourceInteger =
+          std::dynamic_pointer_cast<INTType>(SourceType);
+      if (!SourceInteger)
+        return nullptr;
+      if (InsertionBlock == nullptr)
+        return nullptr;
+      //源位宽<目标位宽
+      if (SourceInteger->getBitWidth() <
+          TargetInteger->getBitWidth()) {
+        //源位宽为bool，目标位宽为普通整数，生成zext零扩展
+        if (SourceInteger->getIsBool())
+          return InsertionBlock->genZextInst(Input, TargetInteger);
+        //源位宽为普通整数，目标位宽为普通整数，生成sext符号扩展
+        return InsertionBlock->genSextInst(Input, TargetInteger);
+      }
+      //源位宽>目标位宽，生成trunc截断
+      if (SourceInteger->getBitWidth() >
+          TargetInteger->getBitWidth())
+        return InsertionBlock->genTruncInst(Input, TargetInteger);
+      return Input;
+    }
+  }
+  //3.如果目标类型是浮点数
+  if (TargetType->getTypeSystem() == IR_FLOAT) {
+    //3.1常量之间的互转依然不生成任何指令
+    if (auto Constant = dynamic_cast<ConstBool *>(Input))
+      return ConstFloat::newConstFloat(
+          Constant->getVal() ? 1.0F : 0.0F);
+    if (auto Constant = dynamic_cast<ConstInt *>(Input))
+      return ConstFloat::newConstFloat(
+          static_cast<float>(Constant->getVal()));
+    if (auto Constant = dynamic_cast<ConstFloat *>(Input))
+      return Constant;
+
+    //3.2运行期整数转浮点数，生成SITOFP指令
+    if (SourceType->getTypeSystem() == IR_INT) {
+      const auto SourceInteger =
+          std::dynamic_pointer_cast<INTType>(SourceType);
+      if (InsertionBlock == nullptr)
+        return nullptr;
+      //源位宽为bool，生成zext零扩展到i32，再生成SITOFP指令
+      if (SourceInteger && SourceInteger->getIsBool())
+        Input = InsertionBlock->genZextInst(
+            Input, INTType::getInt32Ty());
+      return InsertionBlock->genSITOFPInst(Input);
+    }
+    if (SourceType->getTypeSystem() == IR_FLOAT)
+      return Input;
+  }
+
+  //指针与指针互转这里不接受
+  if (TargetType->getTypeSystem() == IR_POINTER &&
+      SourceType->getTypeSystem() == IR_POINTER) {
+    return Input;
+  }
+
+  return nullptr;
+}
+
 bool BinaryInst::isIntegerOnlyOp(BinaryInst::Operation op) {
   switch (op) {
   case BinaryInst::UDIV:

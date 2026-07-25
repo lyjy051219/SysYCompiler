@@ -410,6 +410,13 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     Value* genSextInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genBitCastInst(Value* v, std::shared_ptr<IRType> targetType);
     Value* genSelectInst(Value* cond, Value* isTrue, Value* isFalse);
+    //核心函数：将值转换为目标类型；必要时会在当前基本块中插入转换指令。
+    Value *coerceValueToType(
+        Value *Input, const std::shared_ptr<IRType> &TargetType);
+    // 不生成 bitcast 的标量类型转换；无插入块时仍可完成常量折叠和 undef 传播。
+    static Value *coerceValueToTypeWithoutBitCast(
+        BasicBlock *InsertionBlock, Value *Input,
+        const std::shared_ptr<IRType> &TargetType);
 //基本块生成接口：
     //在当前基本块所属函数中创建新基本块，但没连接到CFG上（即没有生成终结指令）
     BasicBlock* genBlock();
@@ -423,11 +430,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     bool moveInstructionsAfter(Instruction *Position, BasicBlock *Destination);
     // 在 Position 之后切分基本块，新块自动加入同一函数并接管后半段指令。
     BasicBlock *splitBlockAfter(Instruction *Position);
-
-    private:
-    //核心函数：将值转换为目标类型；必要时会在当前基本块中插入转换指令。
-    Value *coerceValueToType(
-        Value *Input, const std::shared_ptr<IRType> &TargetType);
 };
 
 // CFG 只读快照同时保存边序列和去重前驱；CFG 改写后必须重新构造。

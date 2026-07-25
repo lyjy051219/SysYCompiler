@@ -1,16 +1,14 @@
 #pragma once
-
 #include "AST.hpp"
 #include "CFG.hpp"
 #include "SymbolTable.hpp"
 #include "TypeSystem.hpp"
-
 #include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
 
-// 顶层节点通过 ASTVisitor 动态分派；产生值的子树由显式返回值接口递归生成 IR。
+// IRGenerator将AST降低为非SSA IR
 class IRGenerator final : public ASTVisitor {
 private:
     struct LoopTargets {
@@ -18,44 +16,35 @@ private:
         BasicBlock* breakTarget = nullptr;
     };
 
-    struct GenerationContext {
-        Function* function = nullptr;
-        BasicBlock* block = nullptr;
-        std::vector<LoopTargets> loops;
+    //IR生成的核心状态：
+    //当前函数和基本块
+    Function* currentFunction = nullptr;
+    BasicBlock* currentBlock = nullptr;
+    //嵌套循环使用：每一层循环保存continue和break目标块，遇到嵌套循环时压栈，退出循环时弹栈
+    std::vector<LoopTargets> loopStack;
 
-        bool inFunction() const noexcept { return function != nullptr; }
-    };
+    //符号表
+    SymbolTable symbols;
 
     enum class InitializerRole {
         CompleteObject,
         ArrayElement,
     };
 
-    // value 可表示常量、退化后的指针或对象地址，objectType 描述源码对象类型。
-    // isAddress 指示读取右值时是否需要生成内存读取指令。
-    struct LValueRef {
+    // 左值解析后统一返回值或地址 + 源码对象类型
+    // isAddress 为 true 时，读取标量右值需要生成 load；数组地址则需要退化
+    struct ResolvedLValue {
         Value* value = nullptr;
-        std::shared_ptr<IRType> objectType;
+        std::shared_ptr<IRType> type;
         bool isAddress = false;
         bool isMutable = false;
     };
 
-    GenerationContext context;
-    // 源码符号只在 IR 生成期间存活，不随 Module 进入后续优化阶段。
-    SymbolTable symbols;
-
-    // 将源码类型转换为 IR 类型，并判断表达式或初始化式能否在编译期求值。
-    BasicBlock& currentBlock() const;
     TypeSystem lowerSourceType(Type type, bool allowVoid = false) const;
-    std::shared_ptr<IRType> lowerScalarType(Type type) const;
     bool isConstantPrimary(const BaseAST& node) const;
     bool isConstantExpression(const UnaryExp& node) const;
-    bool isConstantExpression(const MulExp& node) const;
-    bool isConstantExpression(const AddExp& node) const;
-    bool isConstantExpression(const RelExp& node) const;
-    bool isConstantExpression(const EqExp& node) const;
     template <typename OperandT>
-    bool hasConstantOperands(const BaseExp<OperandT>& node) const;
+    bool isConstantExpression(const BaseExp<OperandT>& node) const;
     bool isConstantInitializerSyntax(const InitVal& node) const;
 
     // 根据声明所处位置、常量属性和数组形状生成对象及其初始化指令。
@@ -86,7 +75,7 @@ private:
                                       std::vector<int>& indices);
 
     // 解析符号绑定和下标，区分常量值、普通对象地址与数组形参地址。
-    LValueRef lowerLValue(const LVal& node);
+    ResolvedLValue lowerLValue(const LVal& node);
     Value* lowerRValue(const LVal& node);
     Value* decayArrayPointer(Value* pointer);
     Value* tryLowerConstantArrayElement(
@@ -96,27 +85,18 @@ private:
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
     Value* lowerPrimary(const BaseAST& node);
     Value* lowerExpression(const UnaryExp& node);
-    Value* lowerExpression(const MulExp& node);
-    Value* lowerExpression(const AddExp& node);
-    Value* lowerExpression(const RelExp& node);
-    Value* lowerExpression(const EqExp& node);
-    Value* lowerExpression(const FuncCall& node);
-    Value* lowerExpression(const ConValue<int>& node);
-    Value* lowerExpression(const ConValue<float>& node);
-
     template <typename OperandT>
-    Value* lowerBinaryChain(const BaseExp<OperandT>& node);
+    Value* lowerExpression(const BaseExp<OperandT>& node);
+    Value* lowerExpression(const FuncCall& node);
+
     BinaryInst::Operation lowerBinaryOperator(Type type) const;
     Value* emitBinary(Value* left, BinaryInst::Operation operation,
                       Value* right);
 
     // 分别按用户函数签名和 SysY 运行库约定检查、转换调用实参。
-    std::vector<Value*> lowerArguments(const FuncRParamList& node);
-    Value* emitCall(const FuncCall& node, std::vector<Value*> arguments);
     bool coerceCallArguments(const std::string& callee,
                              std::vector<Value*>& arguments);
 
-    Value* coerce(Value* value, const std::shared_ptr<IRType>& targetType);
     Value* toCondition(Value* value);
     Value* logicalNot(Value* value);
     Value* zeroValue(const std::shared_ptr<IRType>& type) const;
@@ -161,7 +141,7 @@ public:
     void visit(ContinueStmt& node) override;
     void visit(ReturnStmt& node) override;
 
-    // 这些入口仅兼容通用访问器；生成器内部通过显式返回值接口取得表达式结果。
+    // 表达式
     void visit(LVal& node) override;
     void visit(FuncCall& node) override;
     void visit(ArrayList& node) override;
@@ -176,3 +156,76 @@ public:
     void visit(ConValue<int>& node) override;
     void visit(ConValue<float>& node) override;
 };
+/*
+IR生成主干图：
+CompUnit
+│
+├── ConstDecl
+│   └── ConstDefList
+│       └── ConstDef
+│           ├── ArrayList?
+│           │   └── AddExp*
+│           └── InitVal
+│               ├── AddExp
+│               └── InitValList
+│                   └── InitVal*
+│
+├── VarDecl
+│   └── VarDefList
+│       └── VarDef
+│           ├── ArrayList?
+│           │   └── AddExp*
+│           └── InitVal?
+│               ├── AddExp
+│               └── InitValList
+│                   └── InitVal*
+│
+└── FuncDef
+    ├── FuncParamList?
+    │   └── FuncParam*
+    │       └── ArrayList?
+    │           └── AddExp*
+    │
+    └── Block
+        └── BlockItemList?
+            ├── ConstDecl
+            ├── VarDecl
+            ├── Block
+            ├── AssignStmt
+            │   ├── LVal
+            │   │   └── ArrayList?
+            │   │       └── AddExp*
+            │   └── AddExp
+            ├── ExpStmt
+            │   └── AddExp?
+            ├── IfStmt
+            │   ├── LOrExp
+            │   ├── thenBranch
+            │   └── elseBranch?
+            ├── WhileStmt
+            │   ├── LOrExp
+            │   └── body
+            ├── BreakStmt
+            ├── ContinueStmt
+            └── ReturnStmt
+                └── AddExp?
+
+表达式：
+LOrExp
+└── LAndExp*
+    └── EqExp*
+        └── RelExp*
+            └── AddExp*
+                └── MulExp*
+                    └── UnaryExp*
+                        └── Primary
+                            ├── AddExp
+                            ├── LVal
+                            │   └── ArrayList?
+                            │       └── AddExp*
+                            ├── FuncCall
+                            │   └── FuncRParamList?
+                            │       └── AddExp*
+                            ├── ConValue<int>
+                            └── ConValue<float>
+*/
