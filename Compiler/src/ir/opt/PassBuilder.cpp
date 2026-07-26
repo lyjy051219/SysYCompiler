@@ -399,13 +399,6 @@ FunctionPassManager PassBuilder::buildLatePipeline() {
 
 
 // PassBuilder 核心实现
-void PassBuilder::registerModuleAnalyses(ModuleAnalysisPassManager &MAM){
-    #define MODULE_ANALYSIS(NAME,CREATE_PASS)\
-        MAM.registerPass([&] {return CREATE_PASS;});
-    #include "./ModuleAnalysisPass.def"
-    #undef MODULE_ANALYSIS
-}
-
 void PassBuilder::registerFunctionAnalyses(FunctionAnalysisPassManager &FAM){
     #define FUNCTION_ANALYSIS(NAME,CREATE_PASS)\
         FAM.registerPass([&] {return CREATE_PASS;});

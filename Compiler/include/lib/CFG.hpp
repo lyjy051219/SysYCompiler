@@ -24,25 +24,6 @@ class BinaryInst;
 class PhiInst;
 class BrInst;
 
-//CFGEdge：表示CFG中的一条边
-struct CFGEdge {
-    //该CFGEdge的起点基本块
-    BasicBlock *From = nullptr;
-    //这条边是源基本块终结指令中的第几个后继
-    unsigned SuccessorIndex = 0;
-    //预期的目标基本块
-    BasicBlock *ExpectedSuccessor = nullptr;
-};
-
-//用来表示当一条CFG边被重定向时，旧后继基本块中的PHI入边应该删除还是转移给新块
-enum class CFGEdgePhiPolicy {
-    //删除
-    RemoveOldIncoming,
-    //转移
-    PreserveIncomingThroughNewBlock,
-};
-//上面两个类用于中端优化中CFG层级优化
-
 //调用图：维护<函数，该函数调用的函数>
 using FunctionCallGraph = std::unordered_map<Function *, std::vector<Function *>>;
 
@@ -340,17 +321,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     //清除基本块中的所有指令
     void clear();
 
-//CFG精确查询和改写接口：
-    //获得目前CFG边指向的后继，检验该后继是否和预期的后继一致，若不一致则返回空指针（为了防止过期）
-    static BasicBlock *getEdgeSuccessor(const CFGEdge &Edge);
-    //判断是否为关键边：源块有多个后继，目标块有多个前驱
-    static bool isCriticalEdge(const CFGEdge &Edge);
-    //核心函数：精确重定向一条边，并按策略同步更新旧后继的 PHI 入边项。
-    static bool redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
-                             CFGEdgePhiPolicy PhiPolicy);
-    //核心函数：在指定边中插入新块，并调用redirectEdge更新边与PHI
-    static BasicBlock *splitEdge(Function &F, const CFGEdge &Edge);
-
 //低层CFG改写接口：
 //以下低层接口只改终结指令，不自动维护 PHI
     //将 Pred 中所有指向 OldSucc 的边全部改为 NewSucc
@@ -430,18 +400,6 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     bool moveInstructionsAfter(Instruction *Position, BasicBlock *Destination);
     // 在 Position 之后切分基本块，新块自动加入同一函数并接管后半段指令。
     BasicBlock *splitBlockAfter(Instruction *Position);
-};
-
-// CFG 只读快照同时保存边序列和去重前驱；CFG 改写后必须重新构造。
-class CFGSnapshot final {
-    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> SuccessorEdges;
-    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> DistinctPredecessors;
-
-public:
-    explicit CFGSnapshot(Function &F);
-    // 后继边保留平行边，去重前驱每个源块仅保留一次。
-    const std::vector<BasicBlock *> &successorEdges(BasicBlock *BB) const;
-    const std::vector<BasicBlock *> &distinctPredecessors(BasicBlock *BB) const;
 };
 
 // 返回指令

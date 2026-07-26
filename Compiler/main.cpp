@@ -55,7 +55,6 @@ int main(int argc, const char *argv[]) {
     ModuleAnalysisPassManager MAM;
     FunctionAnalysisPassManager FAM;
     PassBuilder PB;
-    PB.registerModuleAnalyses(MAM);
     PB.registerFunctionAnalyses(FAM);
     //构建优化流水线并运行
     ModulePassManager MPM = PB.buildModulePipeline(OptLevel, FAM);

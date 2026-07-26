@@ -2281,27 +2281,6 @@ graph TD
 
 
 
-##### BreakCriticalEdges打破关键边
-
-GVN-PRE前置Pass，放置在LoopSimplify之前
-
-关键边：一条边 `A -> B` 被称为**关键边（Critical Edge）**，当且仅当它**同时满足**以下两个条件：
-
-1. 源基本块 A 有多个后继。 这通常意味着 A 的末尾是一个条件分支指令
-2. 目标基本块 B 有多个前驱。 这通常意味着 B 是一个控制流的汇聚点
-
-打破关键边：在关键边的位置插入新的块
-
-- 算法流程：
-
-  1. 找到关键边：
-
-     源块A多个后继，目标基本块多个前驱
-
-  2. 创建新基本块，插入到函数之中，并创建新的Br无条件分支指令，指向目标块，修改源基本块A中的分支指令，让其指向新基本块，修复目标块B中的PHI节点，将来源为A的全部换成来源为新基本块
-
-
-
 ##### GVNPRE
 
 依赖AnalysisPass：Dominant，AliasAnalysis，SideEffect
@@ -2471,14 +2450,6 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
   3. 清空哈希表等数据结构
 
 
-
-##### Select2Branch
-
-在退出中端之前将Select退出（RISCV不支持Select指令）
-
-- 算法流程：
-  1. 遍历该函数中所有指令，收集Select指令
-  2. 提取操作数，定位当前基本块，把当前基本块在Select的位置切分，后半段基本块作为MergeBlock，创建一个TrueBlock，创建无条件跳转指令，跳转到MergeBlock，并插入到TrueBlock之中，在前半段基本块之中插入新条件分支指令，为真跳入TrueBlock，为假跳入MergeBlock，在MergeBlock中插入新PHI，将外部使用Select的地方替换成PHI，分别将来自Select的两个值和新创建的两个块作为输入值加入PHI之中，销毁Select
 
 
 
@@ -2748,7 +2719,7 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       class PH,L,DE newBlock;
   ```
 
-##### LcSSA--闭环SSA形式
+##### LCSSA--闭环SSA形式
 
 依赖Dominant和LoopInfo两个AnalysisPass
 
@@ -4707,17 +4678,34 @@ https://gemini.google.com/app/2937246d3292e3d5
 
 
 
-#### IR结构规范化类Pass
+#### CFG规范化Pass
 
 
 
+##### BreakCriticalEdges打破关键边
 
+GVN-PRE前置Pass，放置在LoopSimplify之前
+
+关键边：一条边 `A -> B` 被称为**关键边（Critical Edge）**，当且仅当它**同时满足**以下两个条件：
+
+1. 源基本块 A 有多个后继（SysY编译器只支持条件分支指令，所以只能是2个
+2. 目标基本块 B 有多个前驱
+
+打破关键边：在关键边的位置插入新的块
+
+- 算法流程：
+
+  1. 找到关键边：源块A两个后继，目标基本块多个前驱
+
+  2. 创建新基本块，插入到函数之中，并创建新的Br无条件分支指令，指向目标块，修改源基本块A中的分支指令，让其指向新基本块，修复目标块B中的PHI节点，将来源为A的全部换成来源为新基本块
+
+![image-20260726183628890](assets/image-20260726183628890.png)
 
 
 
 ##### UnifyFuncExits统一函数出口
 
-用在中端转入后端时
+用在中端转入后端前PassPipeline收尾阶段
 
 - 算法流程：将该函数中所有含Ret的基本块中的Ret换成无条件跳转Br，无条件跳转到新插入的UnifiedExit基本块，根据返回值类型创建PHI以及新的Ret指令
 
@@ -4732,6 +4720,10 @@ https://gemini.google.com/app/2937246d3292e3d5
 - 算法逻辑：main函数一定Live ，从main函数开始，收集函数中可达基本块中的Call指令，将被Call指令调用的函数标记为Live，然后删除剩下的死函数即可 -- **可达调用图遍历**
 
 效果显著，把全部死函数都消除掉了
+
+
+
+
 
 
 

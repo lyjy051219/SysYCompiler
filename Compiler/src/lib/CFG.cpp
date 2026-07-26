@@ -1017,7 +1017,7 @@ void BasicBlock::dumpIR(){
   }
 
 }
-
+//获取当前基本块的所有后继基本块
 std::vector<BasicBlock*> BasicBlock::getSuccessors() {
     std::vector<BasicBlock*> succs;
     if (this->size() == 0) return succs;
@@ -1028,7 +1028,7 @@ std::vector<BasicBlock*> BasicBlock::getSuccessors() {
     }
     return succs;
 }
-
+//获取当前基本块的所有前驱基本块
 std::vector<BasicBlock*> BasicBlock::getPredecessors() {
     std::vector<BasicBlock*> preds;
     Function* F = this->ChainNode<Function, BasicBlock>::getParent();
@@ -1046,38 +1046,6 @@ std::vector<BasicBlock*> BasicBlock::getPredecessors() {
     return preds;
 }
 
-CFGSnapshot::CFGSnapshot(Function &F) {
-  std::unordered_map<BasicBlock *, std::unordered_set<BasicBlock *>> SeenPreds;
-
-  // 先按终结指令顺序记录完整边集，再单独构建去重前驱视图。
-  for (BasicBlock *BB : F) {
-    if (!BB) continue;
-    auto Successors = BB->getSuccessors();
-    SuccessorEdges.emplace(BB, Successors);
-    DistinctPredecessors.try_emplace(BB);
-
-    for (BasicBlock *Succ : Successors) {
-      if (!Succ) continue;
-      if (SeenPreds[Succ].insert(BB).second)
-        DistinctPredecessors[Succ].push_back(BB);
-    }
-  }
-}
-
-const std::vector<BasicBlock *> &
-CFGSnapshot::successorEdges(BasicBlock *BB) const {
-  static const std::vector<BasicBlock *> Empty;
-  auto It = SuccessorEdges.find(BB);
-  return It == SuccessorEdges.end() ? Empty : It->second;
-}
-
-const std::vector<BasicBlock *> &
-CFGSnapshot::distinctPredecessors(BasicBlock *BB) const {
-  static const std::vector<BasicBlock *> Empty;
-  auto It = DistinctPredecessors.find(BB);
-  return It == DistinctPredecessors.end() ? Empty : It->second;
-}
-
 Instruction *BasicBlock::getTerminator() {
     if (size() == 0) return nullptr;
     Instruction *Term = back();
@@ -1093,89 +1061,6 @@ bool BasicBlock::hasMultipleDistinctSuccessors() {
         if (Successors[I] != Successors[0]) return true;
     }
     return false;
-}
-
-BasicBlock *BasicBlock::getEdgeSuccessor(const CFGEdge &Edge) {
-  if (!Edge.From) return nullptr;
-  BrInst *Br = Edge.From->getBranchTerminator();
-  if (!Br || Edge.SuccessorIndex >= Br->getSuccessorCount()) return nullptr;
-  BasicBlock *Successor = Br->getSuccessor(Edge.SuccessorIndex);
-  if (Edge.ExpectedSuccessor && Successor != Edge.ExpectedSuccessor)
-    return nullptr;
-  return Successor;
-}
-
-bool BasicBlock::isCriticalEdge(const CFGEdge &Edge) {
-  BasicBlock *To = getEdgeSuccessor(Edge);
-  if (!To || !Edge.From->hasMultipleDistinctSuccessors()) return false;
-  return To->getPredecessors().size() > 1;
-}
-
-bool BasicBlock::redirectEdge(const CFGEdge &Edge, BasicBlock *NewSucc,
-                              CFGEdgePhiPolicy PhiPolicy) {
-  BasicBlock *From = Edge.From;
-  BasicBlock *OldSucc = getEdgeSuccessor(Edge);
-  if (!From || !OldSucc || !NewSucc || OldSucc == NewSucc) return false;
-
-  Function *F = From->getParent();
-  if (!F || NewSucc->getParent() != F) return false;
-
-  BrInst *Br = From->getBranchTerminator();
-  if (!Br) return false;
-
-  unsigned Occurrence = 0;
-  for (unsigned I = 0; I < Edge.SuccessorIndex; ++I) {
-    if (Br->getSuccessor(I) == OldSucc) ++Occurrence;
-  }
-
-  // 改写前先验证旧后继的每个 PHI 都有可对应的入边项。
-  auto OldPhis = OldSucc->collectPhiNodes();
-  for (PhiInst *Phi : OldPhis) {
-    if (!Phi || Phi->countIncomingFromPred(From) <= Occurrence) return false;
-  }
-
-  if (PhiPolicy == CFGEdgePhiPolicy::RemoveOldIncoming) {
-    // 无法为新目标中的已有 PHI 凭空构造输入值，因此该策略只允许新目标不含 PHI。
-    if (!NewSucc->collectPhiNodes().empty()) return false;
-  } else {
-    BrInst *ForwardBr = NewSucc->getBranchTerminator();
-    if (!NewSucc->collectPhiNodes().empty() ||
-        !NewSucc->getPredecessors().empty() || !isUncondBr(ForwardBr) ||
-        ForwardBr->getSuccessor(0) != OldSucc) {
-      return false;
-    }
-  }
-
-  // 终结边改写成功后，再按策略删除或转移旧后继的入边项。
-  if (!Br->setSuccessor(Edge.SuccessorIndex, NewSucc)) return false;
-
-  for (PhiInst *Phi : OldPhis) {
-    if (PhiPolicy == CFGEdgePhiPolicy::RemoveOldIncoming) {
-      PhiInst::removeIncomingEdge(Phi, From, Occurrence);
-    } else {
-      PhiInst::replaceIncomingPredEdge(Phi, From, NewSucc, Occurrence);
-    }
-  }
-  return true;
-}
-
-BasicBlock *BasicBlock::splitEdge(Function &F, const CFGEdge &Edge) {
-  BasicBlock *OldSucc = getEdgeSuccessor(Edge);
-  if (!Edge.From || Edge.From->getParent() != &F || !OldSucc ||
-      OldSucc->getParent() != &F) {
-    return nullptr;
-  }
-
-  auto *SplitBB = new BasicBlock();
-  F.pushBlock(SplitBB);
-  SplitBB->genUnCondInst(OldSucc);
-
-  if (!redirectEdge(Edge, SplitBB,
-                    CFGEdgePhiPolicy::PreserveIncomingThroughNewBlock)) {
-    delete SplitBB;
-    return nullptr;
-  }
-  return SplitBB;
 }
 
 void BasicBlock::genRetInst(Value* retVal){

@@ -14,7 +14,6 @@ class PassBuilder{
     public:
     explicit PassBuilder();
     //AnalysisPass注册相关函数
-    void registerModuleAnalyses(ModuleAnalysisPassManager &MAM);
     void registerFunctionAnalyses(FunctionAnalysisPassManager &FAM);
     //Pipeline Building
     ModulePassManager buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM);
