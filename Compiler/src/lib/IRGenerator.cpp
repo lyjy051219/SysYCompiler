@@ -773,6 +773,13 @@ void IRGenerator::emitLocalArrayInitialization(
 }
 
 //核心IR生成逻辑函数1：全局/局部+标量常量/标量变量/数组常量/数组变量的IR生成（共8种情况）
+/*
+                  全局              局部
+标量常量       全局 constant       直接绑定常量值
+标量变量       global             alloca + 可选 store
+数组常量       constant array     alloca + 初始化
+数组变量       global array       alloca + 初始化
+ */
 template <typename DefinitionT>
 void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
                                   bool isConstant) {

@@ -22,10 +22,6 @@ struct alignas(8) PassID {};
 class PreservationStatus {
 private:
     bool PreservedAll = false;
-    // Module pipelines use this bit to distinguish an arbitrary module
-    // mutation (which must conservatively clear FAM) from a
-    // ModuleFunctionBridge mutation whose per-function invalidation has
-    // already been performed.
     bool CrossUnitInvalidationHandled = false;
     std::set<PassID*> PreservedIDs;
     std::set<PassID*> AbandonedIDs;
@@ -53,15 +49,6 @@ public:
     void merge(const PreservationStatus &Arg);
 };
 
-// A transform has two independent answers:
-//   1. whether it changed the IR;
-//   2. which cached analyses are still valid afterwards.
-//
-// Keeping the two facts separate is important.  A pass can mutate metadata or
-// an IR property that none of the registered analyses observe, and therefore
-// legitimately report Changed=true while preserving every analysis.  The old
-// API encoded "changed" as "not all analyses were preserved", which made
-// fixed-point convergence and invalidation accidentally depend on one another.
 class PassResult {
 private:
     bool IRChanged = false;
@@ -76,11 +63,6 @@ public:
 
     static PassResult changed(
         PreservationStatus PA = PreservationStatus::none());
-
-    // Compatibility adapter for transforms that have not migrated yet.
-    // The legacy convention was: all() means unchanged, every other status
-    // means changed.  New and corrected transforms should return PassResult
-    // directly so they are not constrained by that convention.
     static PassResult fromLegacy(PreservationStatus PA);
 
     bool changedIR() const;
@@ -110,13 +92,6 @@ struct AnalysisDescriptor : PassDescriptor<DerivedT> {
 
 template <typename IRUnitT> class AnalysisPassManager;
 template <typename IRUnitT> using AnalysisManager = AnalysisPassManager<IRUnitT>;
-
-// Most analyses only depend on the IR unit used as their cache key.  A small
-// number of analyses (for example a call-graph based function analysis) also
-// depend on other IR units managed by the same analysis manager.  Such an
-// analysis must invalidate all of its cached results when any one unit stops
-// preserving it, otherwise a cached caller summary can outlive a changed
-// callee.
 template <typename AnalysisT, typename = void>
 struct AnalysisInvalidationScope {
     static constexpr bool AcrossIRUnits = false;
@@ -252,17 +227,12 @@ public:
         return static_cast<WrapperT &>(*ResultCache[Key]).Result;
     }
 
-    // Batch/interprocedural analyses may compute results for several IR units
-    // in one fixed-point solve.  Let them publish those companion results so a
-    // later query does not repeat the entire call-graph traversal.
     template <typename PassT>
     void setCachedResult(IRUnitT &IR, typename PassT::Result Result) {
         assert(AnalysisPasses.count(PassT::ID()) && "Pass not registered");
         using WrapperT =
             AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
         auto Key = CacheKey{PassT::ID(), &IR};
-        // Never replace a live cache entry: clients are allowed to retain a
-        // reference returned by getResult() while querying another IR unit.
         if (ResultCache.count(Key)) return;
         ResultCache.emplace(
             Key, std::make_unique<WrapperT>(std::move(Result)));

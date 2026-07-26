@@ -3,9 +3,9 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
-// 死函数消除（模块级 GlobalDCE 的函数子集）。
-// 只保留从 main / 外部 ABI 根可达的函数，以及在可达代码中被直接调用或地址逃逸的函数。
-// 未被标记的用户函数会在 sweep 阶段从 Module 函数表中删除。
+// 死函数消除：保留 main，以及从 main 通过 CallInst 可达的函数。
+// 当前编译器生成的 IR 中，Function 只作为 CallInst 的直接被调目标出现，
+// 因此无需处理间接调用或函数地址逃逸。
 class DeadFunctionEliminationPass : public PassDescriptor<DeadFunctionEliminationPass> {
 public:
 	explicit DeadFunctionEliminationPass(FunctionAnalysisPassManager &FAM);
