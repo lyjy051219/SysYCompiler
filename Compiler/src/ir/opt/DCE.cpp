@@ -11,7 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
-bool DCEPass::hasAcyclicReturningCFG(Function &F) {
+bool hasAcyclicReturningCFG(Function &F) {
 	auto *Entry = F.front();
 	if (!Entry) return false;
 	std::unordered_map<BasicBlock *, unsigned> Color;

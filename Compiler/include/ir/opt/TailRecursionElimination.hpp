@@ -25,6 +25,14 @@ private:
         std::vector<Instruction *> &ClonedInsts);
     static bool isReadonlyLikeCallInst(
         Instruction *I, FunctionAnalysisPassManager &FAM, Function &F);
+    static bool canMoveReadonlyCallBeforeSelfCall(
+        CallInst *MovedCall, CallInst *SelfCall,
+        FunctionAnalysisPassManager &FAM, Function &F);
+    static bool isCallGuaranteedToReturnWithoutFault(
+        CallInst *CI, std::unordered_set<Function *> &ActiveFunctions);
+    static bool isFunctionGuaranteedToReturnWithoutFault(
+        Function &Callee, std::unordered_set<Function *> &ActiveFunctions);
+    static bool isSafelyDereferenceableLoad(LoadInst *LI);
     static bool hasInterferingEarlierSelfCallInBlock(
         BasicBlock *BB, CallInst *StopCI, Function &F,
         FunctionAnalysisPassManager &FAM);
@@ -59,5 +67,6 @@ private:
                                 FunctionAnalysisPassManager &FAM,
                                 BasicBlock *&LoopHeader,
                                 std::vector<PhiInst *> &ArgPhis,
-                                PhiInst *&AccPhi);
+                                PhiInst *&AccPhi,
+                                std::vector<BasicBlock *> &TailBackedgeBlocks);
 };

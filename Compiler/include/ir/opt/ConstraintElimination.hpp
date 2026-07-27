@@ -6,6 +6,8 @@
 #include <vector>
 
 class DominatorNode;
+class DominatorTree;
+class RangeInfo;
 
 struct ConstraintElimConstraint {
     Value *val = nullptr;
@@ -39,12 +41,19 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    static ConstraintElimOffsetExpr decomposeOffset(Value *V, int Depth = 2);
+    static bool isKnownNoWrapAddSub(
+        BinaryInst *Inst, BasicBlock *ContextBlock, RangeInfo &RI,
+        const DominatorTree &DT);
+    static ConstraintElimOffsetExpr decomposeOffset(
+        Value *V, BasicBlock *ContextBlock, RangeInfo &RI,
+        const DominatorTree &DT, int Depth = 2);
     static bool rewriteOffsetConstraint(
         Value *LHS, Value *RHS, BinaryInst::Operation Op,
+        BasicBlock *ContextBlock, RangeInfo &RI, const DominatorTree &DT,
         ConstraintElimConstraint &Out);
     static bool extractConstraint(
-        BinaryInst *Cmp, bool Negate, ConstraintElimConstraint &Out);
+        BinaryInst *Cmp, bool Negate, RangeInfo &RI,
+        const DominatorTree &DT, ConstraintElimConstraint &Out);
     static bool comparableBoundValues(
         const ConstraintElimConstraint &A,
         const ConstraintElimConstraint &B, int64_t &AV, int64_t &BV);

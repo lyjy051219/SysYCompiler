@@ -4,9 +4,11 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/CFG.hpp"
 #include "lib/BaseManager.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/TypeSystem.hpp"
 #include <cassert>
 #include <unordered_map>
 #include <unordered_set>
@@ -108,6 +110,133 @@ bool TailRecursionEliminationPass::isReadonlyLikeCallInst(Instruction *I,
         return Attr == FuncAttr::NoModRef || Attr == FuncAttr::MemReadOnly;
     }
     return false;
+}
+
+// 当前 IR 没有显式 dereferenceable 属性。只有直接指向模块全局对象的
+// 普通 load 可以在不依赖运行时路径的情况下证明地址始终有效；参数、
+// GEP、PHI、select 与调用返回的指针都保守拒绝。
+bool TailRecursionEliminationPass::isSafelyDereferenceableLoad(LoadInst *LI) {
+    if (!LI) return false;
+    Value *Pointer = LI->getPointerOperand();
+    return Pointer && Pointer->isGlobal();
+}
+
+// 递归检查用户函数调用是否一定返回且执行过程中不产生 fault/poison。
+// CFG 的“无环且所有路径返回”部分复用 DCE 的共享证明；指令部分复用
+// DCE 的未知指令和投机安全判定。ActiveFunctions 用于拒绝直接或间接递归。
+bool TailRecursionEliminationPass::isFunctionGuaranteedToReturnWithoutFault(
+        Function &Callee,
+        std::unordered_set<Function *> &ActiveFunctions) {
+    ScopedActiveMark ActiveMark(ActiveFunctions, &Callee);
+    if (!ActiveMark.inserted()) return false;
+    if (!Callee.front() || !hasAcyclicReturningCFG(Callee)) return false;
+
+    for (BasicBlock *BB : Callee) {
+        for (Instruction *I : *BB) {
+            if (!I) return false;
+
+            // 写内存具有可观察效果，不能从 self-call 之后提前。
+            if (dynamic_cast<StoreInst *>(I)) return false;
+
+            if (auto *LI = dynamic_cast<LoadInst *>(I)) {
+                if (!isSafelyDereferenceableLoad(LI)) return false;
+                continue;
+            }
+
+            if (auto *NestedCall = dynamic_cast<CallInst *>(I)) {
+                if (!isCallGuaranteedToReturnWithoutFault(
+                        NestedCall, ActiveFunctions)) {
+                    return false;
+                }
+                continue;
+            }
+
+            // 未知指令以及除法、取模、动态移位、FPTOSI 等都不能作为
+            // “提前执行一定安全”的依据。
+            if (dceInstructionMustBePreserved(I) ||
+                instructionMayFaultOrProducePoison(I)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool TailRecursionEliminationPass::isCallGuaranteedToReturnWithoutFault(
+        CallInst *CI,
+        std::unordered_set<Function *> &ActiveFunctions) {
+    if (!CI) return false;
+
+    // 运行库和间接调用没有函数体可供本 pass 证明 will-return/fault-free。
+    // 即使其内存属性是 NoModRef，也不能据此猜测控制流与异常行为。
+    if (CI->getBuiltinCallee()) return false;
+    Function *Callee = CI->getDirectCallee();
+    if (!Callee) return false;
+    return isFunctionGuaranteedToReturnWithoutFault(
+        *Callee, ActiveFunctions);
+}
+
+// 证明后置只读调用可以越过 self-call：
+// 对用户函数，把 SideEffectAnalysis 中的 RefSet 映射到当前调用实参；
+// 对每个实际读取位置，再用统一的 ModRef 接口检查 self-call 不会修改它。
+// 任何未知来源、未跟踪指针或可观察的运行库调用都保守拒绝移动。
+bool TailRecursionEliminationPass::canMoveReadonlyCallBeforeSelfCall(
+        CallInst *MovedCall, CallInst *SelfCall,
+        FunctionAnalysisPassManager &FAM, Function &F) {
+    if (!MovedCall || !SelfCall) return false;
+
+    std::unordered_set<Function *> ActiveFunctions;
+    if (!isCallGuaranteedToReturnWithoutFault(
+            MovedCall, ActiveFunctions)) {
+        return false;
+    }
+
+    auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+    auto *CalleeFunc = MovedCall->getDirectCallee();
+    if (!CalleeFunc) return false;
+    const SideEffectInfo &SEI =
+        FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
+
+    // 含运行库调用或未跟踪指针时，摘要不足以证明跨调用重排安全。
+    if (SEI.hasBuiltin) return false;
+    for (const auto &Entry : SEI.ptrMap) {
+        if (Entry.second.untracked) return false;
+    }
+
+    ModRefInfo FMRI = getFunctionModRefInfo(SEI);
+    if (FMRI == ModRefInfo::NoModRef) return true;
+    if (FMRI != ModRefInfo::Ref || !SEI.ModSet.empty()) return false;
+
+    for (Value *ReadValue : SEI.RefSet) {
+        if (!ReadValue) return false;
+
+        Value *ReadPointer = nullptr;
+        if (ReadValue->isGlobal()) {
+            ReadPointer = ReadValue;
+        } else if (ReadValue->isParam()) {
+            int ParamIndex = CalleeFunc->getParamIndex(ReadValue);
+            if (ParamIndex < 0 ||
+                static_cast<unsigned>(ParamIndex) >=
+                    MovedCall->getArgCount()) {
+                return false;
+            }
+            ReadPointer =
+                MovedCall->getArg(static_cast<unsigned>(ParamIndex));
+        } else {
+            // RefSet 中出现无法映射到调用点的地址，不能猜测其来源。
+            return false;
+        }
+
+        if (!ReadPointer || !ReadPointer->isPointerValue()) return false;
+        ModRefInfo MRI =
+            getInstModRefInfo(ReadPointer, SelfCall, AA, LI, FAM);
+        if (isModSet(MRI)) return false;
+    }
+
+    return true;
 }
 
 // 更精细的“前置 self-call 干扰”判定：
@@ -247,8 +376,13 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         // ----- 识别累加器模式 -----
         if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
             auto op = BI->getOp();
-            // 只放行 ADD 和 MUL (满足交换律+结合律)
-            if (op == BinaryInst::ADD || op == BinaryInst::MUL) {
+            // 严格浮点加法/乘法不满足结合律，改变递归结合顺序会影响
+            // 舍入、NaN、无穷和有符号零；当前 IR 没有 fast-math 标记，
+            // 因而累加器只允许使用 TypeSystem 中的整数类型。
+            bool IsIntegerAccumulator =
+                BI->getIRType() && BI->getIRType()->isInt();
+            if ((op == BinaryInst::ADD || op == BinaryInst::MUL) &&
+                IsIntegerAccumulator) {
                 // 不支持多条累加指令
                 if (AccInst) return false;
 
@@ -279,41 +413,25 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
 
         // ----- 检查指令能否移到 call 之前 -----
 
+        // 这里发生的是跨 self-call 的代码移动，而不是死代码删除。
+        // 即使别名分析证明递归调用不修改某个地址，也不能把原本只在
+        // 递归返回后执行的 load、除法、非法/动态移位或 FPTOSI 提前到
+        // 可能不返回的路径上。统一复用 DCE.hpp 的未知指令与投机
+        // 安全判定，避免新增 IR 指令后默认被当作可移动，也避免各 pass
+        // 对 poison/fault 语义给出不一致结论。
+        if (dceInstructionMustBePreserved(I) ||
+            instructionMayFaultOrProducePoison(I)) {
+            return false;
+        }
+
         // STORE 不行
         if (I->instType == Instruction::STORE) return false;
 
         // CALL: 被调函数必须只读
         if (I->instType == Instruction::CALL) {
             auto *Call = dynamic_cast<CallInst *>(I);
-            Value *Callee = Call ? Call->getCallee() : nullptr;
-            if (!Callee) return false;
-            if (auto *CalleeFunc = dynamic_cast<Function *>(Callee)) {
-                const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
-                ModRefInfo FMRI = getFunctionModRefInfo(SEI);
-                if (FMRI != ModRefInfo::NoModRef && FMRI != ModRefInfo::Ref)
-                    return false;
-            } else if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
-                FuncAttr Attr = classifyBuiltin(BIF);
-                // Sylib 中包含 putint/putch/getint 等可观察 I/O，
-                // 不能当作可移动的“只读调用”。
-                if (Attr != FuncAttr::NoModRef && Attr != FuncAttr::MemReadOnly)
-                    return false;
-            } else {
+            if (!canMoveReadonlyCallBeforeSelfCall(Call, CI, FAM, F))
                 return false;
-            }
-        }
-
-        // LOAD: call 不能 Mod 这块地址
-        if (I->instType == Instruction::LOAD) {
-            auto *LIInst = dynamic_cast<LoadInst *>(I);
-            if (LIInst) {
-                Value *Ptr = LIInst->getPointerOperand();
-                auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
-                auto &LI = FAM.getResult<LoopAnalysis>(F);
-                ModRefInfo MRI = getInstModRefInfo(
-                    MemoryLocation::get(LIInst), CI, AA, LI, FAM);
-                if (isModSet(MRI)) return false;
-            }
         }
 
         // 操作数不能依赖 call 的返回值
@@ -325,7 +443,17 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         }
     }
 
-    return true;
+    // 非 void 返回必须精确返回 self-call，或返回上面完整验证过的
+    // 整数累加器；不能仅凭块内存在一个递归调用就删除任意返回值。
+    Value *RetValue = RI->getReturnValue();
+    if (!F.getIRType() || F.getIRType()->isVoid()) {
+        // void 情况只接受 call 紧邻 ret 的真正尾位置，不把原本位于
+        // 递归返回之后的计算提前到可能不返回的 self-call 之前。
+        return !RetValue && CI->getNext() == RI;
+    }
+    if (!RetValue) return false;
+    if (AccInst) return RetValue == static_cast<Value *>(AccInst);
+    return RetValue == static_cast<Value *>(CI);
 }
 
 // 执行单个尾递归 → 循环 变换
@@ -335,7 +463,8 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         FunctionAnalysisPassManager &FAM,
         BasicBlock *&LoopHeader,
         std::vector<PhiInst *> &ArgPhis,
-        PhiInst *&AccPhi) {
+        PhiInst *&AccPhi,
+        std::vector<BasicBlock *> &TailBackedgeBlocks) {
 
     // ===== 3.1 创建循环头 (仅首次调用时执行) =====
     if (!LoopHeader) {
@@ -401,6 +530,14 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
                     AccInst->getIRType());
             }
             AccPhi->addIncoming(Identity, F.front()); // 来自 NewEntry
+
+            // 可能已有不带累加器的尾递归点先被改成回边。新建 AccPhi
+            // 时必须为这些既有前驱补齐 incoming，语义是原样传递当前
+            // 累加值；否则会产生缺边的非法 PHI。
+            for (BasicBlock *Backedge : TailBackedgeBlocks) {
+                if (Backedge)
+                    AccPhi->addIncoming(AccPhi, Backedge);
+            }
         }
 
         // 找累加器中非 call 的操作数
@@ -467,6 +604,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
     delete RI;
     delete CI;
 
+    TailBackedgeBlocks.push_back(BB);
     return true;
 }
 
@@ -500,6 +638,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
     BinaryInst::Operation accOp = BinaryInst::ADD; // 记录累加器操作类型
     bool accOpInitialized = false;
     std::unordered_set<BasicBlock *> transformedBlocks;
+    std::vector<BasicBlock *> TailBackedgeBlocks;
 
     // 逐站点迭代处理：每次仅应用一个变换并重新扫描，避免收集阶段缓存悬垂指针。
     bool progress = false;
@@ -646,10 +785,16 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 continue;
 
             if (eliminateTailRecursion(bb, CI, WorkRI, AccInst, F, FAM,
-                                       LoopHeader, ArgPhis, AccPhi)) {
+                                       LoopHeader, ArgPhis, AccPhi,
+                                       TailBackedgeBlocks)) {
                 changed = true;
                 progress = true;
                 transformedBlocks.insert(bb);
+
+                // 下一轮还会继续查询别名、循环和跨函数副作用信息。
+                // 当前站点已经改写 CFG，必须先通过现有 FAM 接口失效
+                // 缓存，避免后续站点使用变换前的分析结果作合法性证明。
+                FAM.invalidate(F, PreservationStatus::none());
                 break;
             }
         }

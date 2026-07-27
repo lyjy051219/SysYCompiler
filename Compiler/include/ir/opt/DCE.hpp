@@ -17,7 +17,6 @@ private:
 		Failed,
 	};
 
-	static bool hasAcyclicReturningCFG(Function &F);
 	static bool isGuaranteedRemovableFunction(
 		Function &F, FunctionAnalysisPassManager &FAM,
 		std::unordered_map<Function *, ReturnProofState> &Memo);
@@ -31,6 +30,11 @@ private:
 
 // Reusable helper: classify whether a call has observable side effects.
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM);
+
+// 共享的“无环且所有 CFG 路径都返回”结构证明。
+// 该接口只回答控制流一定到达 ret，不隐含无副作用或无 fault；
+// 调用方仍需分别检查指令与内存行为。
+bool hasAcyclicReturningCFG(Function &F);
 
 // Return true only when I is an integer shift whose constant amount is in the
 // half-open range [0, bitwidth(lhs)).  A dynamic, ill-typed or out-of-range

@@ -37,11 +37,45 @@
 //   a) 控制流：唯一前驱的条件分支（true 分支 push op，false push negateOp）
 //   b) RangeAnalysis seed：对函数入口块的每个值注入 [min, max] 两条约束
 //      作为根基事实，帮助靠"范围+控制流"联合推理的场景
-//      （如 if (getch() < 100) 里，getch 范围 [0,127]，控制流再加 <100 的约束）
+//      （如 if (getch() < 100) 里，getch 范围 [-128,127]，控制流再加 <100 的约束）
 // =====================================================================
 
+bool ConstraintEliminationPass::isKnownNoWrapAddSub(
+    BinaryInst *inst, BasicBlock *contextBlock, RangeInfo &RI,
+    const DominatorTree &DT) {
+    if (!inst || !contextBlock) return false;
+    if (inst->getOp() != BinaryInst::ADD &&
+        inst->getOp() != BinaryInst::SUB)
+        return false;
+
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!inst->getOperands(lhs, rhs) || !lhs || !rhs) return false;
+    if (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
+        !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
+        return false;
+
+    // 必须使用比较所在块的上下文范围，而不是只检查常量或最终总偏移。
+    // 例如 (x + 1) - 1 的总偏移为 0，但第一层 x + 1 仍可能回绕。
+    IntRange lhsRange = RI.query(lhs, contextBlock, DT);
+    IntRange rhsRange = RI.query(rhs, contextBlock, DT);
+    if (lhsRange.isBottom() || rhsRange.isBottom()) return false;
+
+    int64_t resultMin = 0;
+    int64_t resultMax = 0;
+    if (inst->getOp() == BinaryInst::ADD) {
+        return IRMath::addI32(lhsRange.min, rhsRange.min, resultMin) &&
+               IRMath::addI32(lhsRange.max, rhsRange.max, resultMax);
+    }
+
+    // SUB 的最小值来自 lhs.min-rhs.max，最大值来自 lhs.max-rhs.min。
+    return IRMath::addI32(lhsRange.min, -rhsRange.max, resultMin) &&
+           IRMath::addI32(lhsRange.max, -rhsRange.min, resultMax);
+}
+
 ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
-    Value *V, int depth) {
+    Value *V, BasicBlock *contextBlock, RangeInfo &RI,
+    const DominatorTree &DT, int depth) {
     if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return {};
     if (depth <= 0)
@@ -58,20 +92,31 @@ ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
 
     if (BI->getOp() == BinaryInst::ADD) {
         if (auto *C = dynamic_cast<ConstInt *>(lhs)) {
-            ConstraintElimOffsetExpr E = decomposeOffset(rhs, depth - 1);
+            // 当前 ADD 必须先有逐层无回绕证明；失败时把整条指令视为
+            // 不透明 base，保留原始比较，不利用源程序整数溢出。
+            if (!isKnownNoWrapAddSub(BI, contextBlock, RI, DT))
+                return {V, 0, true};
+            ConstraintElimOffsetExpr E =
+                decomposeOffset(rhs, contextBlock, RI, DT, depth - 1);
             int64_t NewOffset = 0;
             if (E.Valid && IRMath::addI32(E.Offset, C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
         }
         if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
-            ConstraintElimOffsetExpr E = decomposeOffset(lhs, depth - 1);
+            if (!isKnownNoWrapAddSub(BI, contextBlock, RI, DT))
+                return {V, 0, true};
+            ConstraintElimOffsetExpr E =
+                decomposeOffset(lhs, contextBlock, RI, DT, depth - 1);
             int64_t NewOffset = 0;
             if (E.Valid && IRMath::addI32(E.Offset, C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
         }
     } else if (BI->getOp() == BinaryInst::SUB) {
         if (auto *C = dynamic_cast<ConstInt *>(rhs)) {
-            ConstraintElimOffsetExpr E = decomposeOffset(lhs, depth - 1);
+            if (!isKnownNoWrapAddSub(BI, contextBlock, RI, DT))
+                return {V, 0, true};
+            ConstraintElimOffsetExpr E =
+                decomposeOffset(lhs, contextBlock, RI, DT, depth - 1);
             int64_t NewOffset = 0;
             if (E.Valid && IRMath::addI32(E.Offset, -(int64_t)C->getVal(), NewOffset))
                 return {E.Base, NewOffset, true};
@@ -83,9 +128,12 @@ ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
 
 bool ConstraintEliminationPass::rewriteOffsetConstraint(
     Value *lhs, Value *rhs, BinaryInst::Operation op,
+    BasicBlock *contextBlock, RangeInfo &RI, const DominatorTree &DT,
     ConstraintElimConstraint &out) {
-    ConstraintElimOffsetExpr L = decomposeOffset(lhs);
-    ConstraintElimOffsetExpr R = decomposeOffset(rhs);
+    ConstraintElimOffsetExpr L =
+        decomposeOffset(lhs, contextBlock, RI, DT);
+    ConstraintElimOffsetExpr R =
+        decomposeOffset(rhs, contextBlock, RI, DT);
     if (!L.Valid || !R.Valid || !L.Base || !R.Base) return false;
 
     int64_t Delta = R.Offset - L.Offset;
@@ -140,9 +188,11 @@ bool ConstraintEliminationPass::rewriteOffsetConstraint(
 //   (x - c1) op c2  →  x op (c2 + c1)
 //   (c1 - x) op c2  →  x (反向 op) (c1 - c2)      —— x 搬到一侧要翻号
 //   x op (y + c)    →  (x - y) op c               —— 这步风险大先不做
-// 前三种只要 RHS 是常量就能做；溢出检查走 int64，溢出时退回原始形式。
+// 前三种除了要求常量结果必须落在 i32 范围内，还要求 RangeAnalysis
+// 在比较所在块证明实际 ADD/SUB 不会回绕；证据不足时退回原始形式。
 bool ConstraintEliminationPass::extractConstraint(
-    BinaryInst *cmp, bool negate, ConstraintElimConstraint &out) {
+    BinaryInst *cmp, bool negate, RangeInfo &RI, const DominatorTree &DT,
+    ConstraintElimConstraint &out) {
     if (!cmp || !BinaryInst::isCompareOp(cmp->getOp())) return false;
     Value *lhs = nullptr;
     Value *rhs = nullptr;
@@ -157,14 +207,17 @@ bool ConstraintEliminationPass::extractConstraint(
     BinaryInst::Operation op = negate ? BinaryInst::negatePredicate(cmp->getOp()) : cmp->getOp();
     Value *val = lhs;
     Value *bound = rhs;
+    BasicBlock *contextBlock = cmp->getParent();
 
     // —— 仿射归一化：仅当 RHS 是常量 + LHS 是 add/sub 且另一侧常量时生效 ——
-    // 避免了把非常量搬到 bound 侧引入新值。溢出一律退回原式。
+    // 避免了把非常量搬到 bound 侧引入新值。每一条实际算术指令都必须
+    // 先由 RangeAnalysis 证明无回绕，证据不足时保留原约束。
     if (auto *rConst = dynamic_cast<ConstInt *>(rhs)) {
         if (auto *lBI = dynamic_cast<BinaryInst *>(lhs)) {
             Value *la = nullptr;
             Value *lb = nullptr;
-            if (lBI->getOperands(la, lb)) {
+            if (lBI->getOperands(la, lb) &&
+                isKnownNoWrapAddSub(lBI, contextBlock, RI, DT)) {
                 int64_t c2 = rConst->getVal();
 
                 auto inI32 = [](int64_t v) {
@@ -231,7 +284,8 @@ bool ConstraintEliminationPass::extractConstraint(
         }
     }
 
-    if (rewriteOffsetConstraint(lhs, rhs, op, out))
+    if (rewriteOffsetConstraint(
+            lhs, rhs, op, contextBlock, RI, DT, out))
         return true;
 
     out.val = val;
@@ -492,7 +546,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
                         ConstraintElimConstraint c;
                         bool negate = (BB == falseBB);
-                        if (extractConstraint(cmpInst, negate, c)) {
+                        if (extractConstraint(cmpInst, negate, RI, DT, c)) {
                             constraintStack.push_back(c);
                         }
                     }
@@ -510,7 +564,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                     Value *cond = br->getCondition();
                     if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
                         ConstraintElimConstraint target;
-                        if (extractConstraint(cmpInst, false, target)) {
+                        if (extractConstraint(
+                                cmpInst, false, RI, DT, target)) {
                             // 把 target.val 的 RangeAnalysis 结果当成一对临时
                             // 常量上下界约束 push 到栈尾；用完 pop 回去，
                             // 不影响子树的 frame.constraintsBefore 记账

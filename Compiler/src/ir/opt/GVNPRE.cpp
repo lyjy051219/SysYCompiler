@@ -1,5 +1,6 @@
 #include "ir/opt/GVNPRE.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 
 #include <algorithm>
@@ -1027,9 +1028,12 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         if (BinaryInst::isCompareOp(BI->getOp())) return true;
     }
 
-    if (I->instType == Instruction::SDIV || I->instType == Instruction::UDIV ||
-        I->instType == Instruction::FDIV || I->instType == Instruction::SREM ||
-        I->instType == Instruction::UREM || I->instType == Instruction::FREM) {
+    // 完整 PRE 会把表达式复制到缺失前驱；该前驱可能仍有其他后继，
+    // 因而不能依赖调用方提前拆分关键边来保证安全。统一复用中端的
+    // 投机安全判定，拒绝动态/越界移位、除余、FPTOSI 等可能产生
+    // poison 或故障的表达式。块内 LocalGVN 不经过这里，仍可消除
+    // 已经执行过的同块重复表达式。
+    if (instructionMayFaultOrProducePoison(I)) {
         return true;
     }
 
