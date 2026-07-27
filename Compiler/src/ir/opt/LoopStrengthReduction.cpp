@@ -21,22 +21,10 @@
 #include <unordered_set>
 #include <vector>
 
-bool LoopStrengthReductionPass::hasCostlyElementStride(int64_t Stride) {
-    return Stride > 0 && !IRMath::isPowerOf2(Stride);
-}
-
 std::string LoopStrengthReductionPass::scevKey(const SCEVExpr *E) {
     if (!E) return "<null>";
     if (!E->Key.empty()) return E->Key;
     return "scev@" + IRKey::pointer(E);
-}
-
-bool LoopStrengthReductionPass::hasNonTrivialPrefix(const std::vector<IndexComponent> &Prefix) {
-    if (Prefix.empty()) return false;
-    if (Prefix.size() == 1 && Prefix.front().Expr &&
-        Prefix.front().Expr->isConstant(0))
-        return false;
-    return true;
 }
 
 bool LoopStrengthReductionPass::canUseInPreheader(Value *V, BasicBlock *PreHeader,
@@ -96,8 +84,10 @@ int LoopStrengthReductionPass::estimatePrefixMaterializeCost(
         }
         int ComponentCost =
             estimateMaterializeCost(Component.Expr, L, PreHeader, DT);
-        if (ComponentCost >= UnsupportedMaterializeCost)
+        if (ComponentCost >= UnsupportedMaterializeCost ||
+            Cost >= UnsupportedMaterializeCost - ComponentCost) {
             return UnsupportedMaterializeCost;
+        }
         Cost += ComponentCost;
     }
     return Cost;
@@ -127,30 +117,6 @@ bool LoopStrengthReductionPass::isLoadStoreAddressUse(Instruction *UserI, Use *U
     if (dynamic_cast<LoadInst *>(UserI)) return OpIdx == 0;
     if (dynamic_cast<StoreInst *>(UserI)) return OpIdx == 1;
     return false;
-}
-
-int LoopStrengthReductionPass::countAddressUses(GetElementPtrInst *GEP) {
-    if (!GEP) return 0;
-    int Count = 0;
-    for (Use *U : GEP->getUses()) {
-        auto *UserI = dynamic_cast<Instruction *>(U->getUser());
-        if (isLoadStoreAddressUse(UserI, U)) ++Count;
-    }
-    return Count;
-}
-
-int LoopStrengthReductionPass::countLoopMemoryAddressUses(Loop *L) {
-    int Count = 0;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        if (!BB) continue;
-        for (Instruction *I : *BB) {
-            if (dynamic_cast<LoadInst *>(I) ||
-                dynamic_cast<StoreInst *>(I)) {
-                ++Count;
-            }
-        }
-    }
-    return Count;
 }
 
 bool LoopStrengthReductionPass::getConstantOffsetGEP(GetElementPtrInst *Parent,
@@ -312,6 +278,8 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
     });
 
     std::vector<LSRCandidate> Candidates;
+    // 同一个物理 GEP 只建立一个候选，避免它同时由父地址族和自身遍历产生。
+    std::unordered_set<GetElementPtrInst *> SeenOldGEPs;
     for (Loop *L : Loops) {
         BasicBlock *PreHeader = nullptr;
         BasicBlock *Latch = nullptr;
@@ -428,6 +396,10 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
                     } else if (Node.Offset != 0) {
                         continue;
                     }
+                    if (!Node.GEP ||
+                        !SeenOldGEPs.insert(Node.GEP).second) {
+                        continue;
+                    }
 
                     Candidates.push_back(
                         {Node.GEP, Base, Index, Affine->Start,
@@ -464,6 +436,12 @@ std::string LoopStrengthReductionPass::candidateShapeKey(const LSRCandidate &C,
     return Key.str();
 }
 
+bool LoopStrengthReductionPass::isRepresentablePointerOffset(
+    int64_t Offset) {
+    return Offset >= std::numeric_limits<int>::min() &&
+           Offset <= std::numeric_limits<int>::max();
+}
+
 std::vector<OffsetReuseGroup>
 LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Candidates) {
     std::vector<OffsetReuseGroup> Groups;
@@ -484,11 +462,9 @@ LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Can
             Group.Header = C.Header;
             Group.Latch = C.Latch;
             Group.Step = C.Step;
-            Group.LastIndexStride = C.LastIndexStride;
             Group.Prefix = C.Prefix;
             Group.ResultTy = C.OldGEP ? C.OldGEP->getIRType() : nullptr;
             Group.AnchorStart = *C.StartConst;
-            Group.MaxStart = *C.StartConst;
             Groups.push_back(std::move(Group));
             It = GroupIndex.find(Key);
         }
@@ -496,7 +472,6 @@ LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Can
         OffsetReuseGroup &Group = Groups[It->second];
         Group.Items.push_back(&C);
         Group.AnchorStart = std::min(Group.AnchorStart, *C.StartConst);
-        Group.MaxStart = std::max(Group.MaxStart, *C.StartConst);
     }
 
     Groups.erase(
@@ -504,11 +479,18 @@ LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Can
                        [](const OffsetReuseGroup &Group) {
                            if (Group.Items.size() < 2) return true;
                            std::unordered_set<int64_t> Starts;
-                           for (const LSRCandidate *C : Group.Items)
+                           for (const LSRCandidate *C : Group.Items) {
+                               if (!C || !C->StartConst ||
+                                   *C->StartConst < Group.AnchorStart) {
+                                   return true;
+                               }
+                               int64_t Offset =
+                                   *C->StartConst - Group.AnchorStart;
+                               if (!isRepresentablePointerOffset(Offset))
+                                   return true;
                                Starts.insert(*C->StartConst);
-                           return Starts.size() < 2 ||
-                                  Group.MaxStart - Group.AnchorStart >
-                                      MaxOffsetRange;
+                           }
+                           return Starts.size() < 2;
                        }),
         Groups.end());
 
@@ -519,9 +501,6 @@ LoopStrengthReductionPass::buildOffsetReuseGroups(std::vector<LSRCandidate> &Can
                   if (AD != BD) return AD > BD;
                   if (A.Items.size() != B.Items.size())
                       return A.Items.size() > B.Items.size();
-                  int64_t ARange = A.MaxStart - A.AnchorStart;
-                  int64_t BRange = B.MaxStart - B.AnchorStart;
-                  if (ARange != BRange) return ARange < BRange;
                   return A.Order < B.Order;
               });
     return Groups;
@@ -549,7 +528,6 @@ LoopStrengthReductionPass::buildExactGroups(std::vector<LSRCandidate> &Candidate
             Group.Header = C.Header;
             Group.Latch = C.Latch;
             Group.Step = C.Step;
-            Group.LastIndexStride = C.LastIndexStride;
             Group.Prefix = C.Prefix;
             Group.Suffix = C.Suffix;
             Group.ResultTy = C.OldGEP ? C.OldGEP->getIRType() : nullptr;
@@ -601,8 +579,18 @@ bool LoopStrengthReductionPass::collectRemovableIndexChain(
     return true;
 }
 
-int LoopStrengthReductionPass::countRemovableIndexInsts(
-    const std::vector<LSRCandidate *> &Items) {
+int64_t LoopStrengthReductionPass::estimateRemovableIndexCost(
+    Loop *L, const std::vector<LSRCandidate *> &Items,
+    const DominatorTree &DT) {
+    if (!L || !L->getHeader()) return 0;
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return 0;
+    }
+
     std::unordered_set<User *> AllowedUsers;
     for (LSRCandidate *C : Items) {
         if (C && C->OldGEP) AllowedUsers.insert(C->OldGEP);
@@ -614,25 +602,186 @@ int LoopStrengthReductionPass::countRemovableIndexInsts(
         if (IndexI)
             collectRemovableIndexChain(IndexI, AllowedUsers, Removable);
     }
-    return static_cast<int>(Removable.size());
-}
 
-int LoopStrengthReductionPass::countCoveredAddressUses(
-    const std::vector<LSRCandidate *> &Items) {
-    int Count = 0;
-    for (const LSRCandidate *C : Items) {
-        if (C) Count += countAddressUses(C->OldGEP);
+    int64_t Cost = 0;
+    for (Instruction *I : Removable) {
+        BasicBlock *Parent = I ? I->getParent() : nullptr;
+        if (!Parent || !L->contains(Parent) ||
+            !DT.dominates(Parent, Latch)) {
+            continue;
+        }
+        // 只计入支配回边、且删除候选 GEP 后确定会失去全部用途的指令。
+        if (Cost == std::numeric_limits<int64_t>::max()) return Cost;
+        ++Cost;
     }
-    return Count;
+    return Cost;
 }
 
-bool LoopStrengthReductionPass::coversDenseInnermostAddresses(
-    Loop *L, const std::vector<LSRCandidate *> &Items) {
-    if (!L || !L->isInnermost()) return false;
-    int CoveredAddressUses = countCoveredAddressUses(Items);
-    int LoopAddressUses = countLoopMemoryAddressUses(L);
-    return CoveredAddressUses >= 3 && LoopAddressUses <= 8 &&
-           CoveredAddressUses * 2 >= LoopAddressUses;
+int64_t LoopStrengthReductionPass::estimateOldLoopCost(
+    Loop *L, const std::vector<LSRCandidate *> &Items,
+    const DominatorTree &DT) {
+    if (!L) return -1;
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return -1;
+    }
+
+    int64_t Cost = 0;
+    std::unordered_set<GetElementPtrInst *> CountedGEPs;
+    for (const LSRCandidate *C : Items) {
+        if (!C || C->Used || !C->OldGEP || !C->OldGEP->getParent())
+            return -1;
+        if (!CountedGEPs.insert(C->OldGEP).second) continue;
+
+        BasicBlock *Parent = C->OldGEP->getParent();
+        if (!L->contains(Parent) || !DT.dominates(Parent, Latch))
+            continue;
+
+        // 每个确定随回边执行的旧 GEP 对应一次 IR 地址计算。
+        if (Cost == std::numeric_limits<int64_t>::max()) return Cost;
+        ++Cost;
+    }
+    return Cost;
+}
+
+LSRCostEstimate LoopStrengthReductionPass::estimateExactGroupCost(
+    const LSRGroup &Group, const DominatorTree &DT) {
+    LSRCostEstimate Cost;
+    if (Group.Items.empty() || !Group.L || !Group.PreHeader ||
+        !Group.Header || !Group.Latch || !Group.Base || !Group.ResultTy) {
+        return Cost;
+    }
+
+    int PrefixCost = estimatePrefixMaterializeCost(
+        Group.Prefix, Group.L, Group.PreHeader, DT);
+    int SuffixCost = estimatePrefixMaterializeCost(
+        Group.Suffix, Group.L, Group.PreHeader, DT);
+    int StartCost =
+        Group.StartConst
+            ? 0
+            : estimateMaterializeCost(Group.Start, Group.L, Group.PreHeader,
+                                      DT);
+    if (PrefixCost >= UnsupportedMaterializeCost ||
+        SuffixCost >= UnsupportedMaterializeCost ||
+        StartCost >= UnsupportedMaterializeCost) {
+        return Cost;
+    }
+
+    int64_t OldGEPCost =
+        estimateOldLoopCost(Group.L, Group.Items, DT);
+    if (OldGEPCost < 0) return Cost;
+
+    Cost.RemovableIndexCost =
+        estimateRemovableIndexCost(Group.L, Group.Items, DT);
+    if (OldGEPCost >
+        std::numeric_limits<int64_t>::max() -
+            Cost.RemovableIndexCost) {
+        return LSRCostEstimate();
+    }
+    Cost.OldLoopCost = OldGEPCost + Cost.RemovableIndexCost;
+    // 新循环每轮只保留锁存块中的指针递推 GEP；PHI 不计执行成本。
+    Cost.NewLoopCost = 1;
+    // 预头中的起始 GEP 与 SCEV 展开均为一次性成本。
+    Cost.NewSetupCost =
+        1 + static_cast<int64_t>(PrefixCost) + SuffixCost + StartCost;
+    Cost.Valid = true;
+    return Cost;
+}
+
+LSRCostEstimate LoopStrengthReductionPass::estimateOffsetGroupCost(
+    const OffsetReuseGroup &Group, const DominatorTree &DT) {
+    LSRCostEstimate Cost;
+    if (Group.Items.size() < 2 || !Group.L || !Group.PreHeader ||
+        !Group.Header || !Group.Latch || !Group.Base || !Group.ResultTy) {
+        return Cost;
+    }
+
+    int PrefixCost = estimatePrefixMaterializeCost(
+        Group.Prefix, Group.L, Group.PreHeader, DT);
+    if (PrefixCost >= UnsupportedMaterializeCost) return Cost;
+
+    std::unordered_set<int64_t> Starts;
+    std::unordered_map<int64_t, BasicBlock *> FirstOffsetBlock;
+    std::unordered_set<int64_t> HeaderPromotedOffsets;
+    for (const LSRCandidate *C : Group.Items) {
+        if (!C || !C->StartConst ||
+            *C->StartConst < Group.AnchorStart ||
+            !C->OldGEP || !C->OldGEP->getParent()) {
+            return Cost;
+        }
+        int64_t Offset = *C->StartConst - Group.AnchorStart;
+        if (!isRepresentablePointerOffset(Offset)) return Cost;
+        Starts.insert(*C->StartConst);
+        if (Offset == 0) continue;
+        BasicBlock *Parent = C->OldGEP->getParent();
+        auto [It, Inserted] =
+            FirstOffsetBlock.emplace(Offset, Parent);
+        if (!Inserted && It->second != Parent)
+            HeaderPromotedOffsets.insert(Offset);
+    }
+    if (Starts.size() < 2) return Cost;
+    const uint64_t MaxCost =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (static_cast<uint64_t>(Starts.size()) > MaxCost ||
+        static_cast<uint64_t>(HeaderPromotedOffsets.size()) > MaxCost) {
+        return Cost;
+    }
+
+    int64_t OldGEPCost =
+        estimateOldLoopCost(Group.L, Group.Items, DT);
+    if (OldGEPCost < 0) return Cost;
+
+    Cost.RemovableIndexCost =
+        estimateRemovableIndexCost(Group.L, Group.Items, DT);
+    if (OldGEPCost >
+        std::numeric_limits<int64_t>::max() -
+            Cost.RemovableIndexCost) {
+        return LSRCostEstimate();
+    }
+    Cost.OldLoopCost = OldGEPCost + Cost.RemovableIndexCost;
+    // 一个递推 GEP，加上每个非锚点常量偏移对应的循环内 GEP。
+    Cost.NewLoopCost = static_cast<int64_t>(Starts.size());
+    // 跨基本块共享的偏移 GEP 会被提升到循环头；为预检循环可能多执行的
+    // 一次地址计算计入一次性成本，使模型不依赖具体退出形态猜测收益。
+    const int64_t PromotedCost =
+        static_cast<int64_t>(HeaderPromotedOffsets.size());
+    const int64_t BaseSetupCost =
+        1 + static_cast<int64_t>(PrefixCost);
+    if (PromotedCost >
+        std::numeric_limits<int64_t>::max() - BaseSetupCost) {
+        return LSRCostEstimate();
+    }
+    Cost.NewSetupCost = BaseSetupCost + PromotedCost;
+    Cost.Valid = true;
+    return Cost;
+}
+
+bool LoopStrengthReductionPass::isCostModelProfitable(
+    const LSRCostEstimate &Cost, Loop *L, SCEVResult &SE) {
+    if (!Cost.Valid || !L || Cost.OldLoopCost < 0 ||
+        Cost.NewLoopCost < 0 || Cost.NewSetupCost < 0) {
+        return false;
+    }
+
+    if (Cost.OldLoopCost <= Cost.NewLoopCost) return false;
+    int64_t RecurringSaving = Cost.OldLoopCost - Cost.NewLoopCost;
+
+    auto Trip = SE.analyzeLoopTripCount(L);
+    if (Trip && Trip->Valid && Trip->ConstantTripCount &&
+        (*Trip->ConstantTripCount == 0 || Trip->ProvenNoWrap)) {
+        int64_t Iterations = *Trip->ConstantTripCount;
+        if (Iterations <= 0) return false;
+        // 用除法比较，避免“大迭代次数 × 每轮收益”的有符号溢出。
+        return Iterations > Cost.NewSetupCost / RecurringSaving;
+    }
+
+    // 未知迭代次数只有在 SCEV 证明循环至少执行一次时才参与收益比较；
+    // 这样零次循环也不会无条件承担预头物化成本。
+    if (!Trip || !Trip->Valid || Trip->MayBeZeroTrip) return false;
+    return RecurringSaving >= Cost.NewSetupCost;
 }
 
 void LoopStrengthReductionPass::cleanupDeadIndexChains(
@@ -665,86 +814,18 @@ void LoopStrengthReductionPass::cleanupDeadIndexChains(
     }
 }
 
-bool LoopStrengthReductionPass::isSimpleSingleGEP(const LSRCandidate &C) {
-    if (C.Step != 1 || !C.Start || !C.Start->isConstant(0) ||
-        hasNonTrivialPrefix(C.Prefix)) {
-        return false;
-    }
-    auto *Phi = dynamic_cast<PhiInst *>(C.Index);
-    return Phi && Phi->getParent() == C.Header;
-}
-
 bool LoopStrengthReductionPass::shouldRewriteExactGroup(const LSRGroup &Group,
-                                    const DominatorTree &DT) {
-    if (Group.Items.empty()) return false;
-    bool CostlyStride = hasCostlyElementStride(Group.LastIndexStride);
-
-    int PrefixCost = estimatePrefixMaterializeCost(
-        Group.Prefix, Group.L, Group.PreHeader, DT);
-    int SuffixCost = estimatePrefixMaterializeCost(
-        Group.Suffix, Group.L, Group.PreHeader, DT);
-    int StartCost =
-        Group.StartConst
-            ? 0
-            : estimateMaterializeCost(Group.Start, Group.L, Group.PreHeader,
-                                      DT);
-    int MaxMaterializeCost = CostlyStride ? 2 : 1;
-    if (PrefixCost > MaxMaterializeCost || SuffixCost > MaxMaterializeCost ||
-        StartCost > MaxMaterializeCost)
-        return false;
-
-    if (Group.Items.size() == 1) {
-        const LSRCandidate &C = *Group.Items.front();
-        int Removable = countRemovableIndexInsts(Group.Items);
-        if (isSimpleSingleGEP(C) && !CostlyStride) return false;
-        if (CostlyStride) return countAddressUses(C.OldGEP) > 0;
-        if (C.Step == 1 || C.Step == -1) return false;
-        return Removable > 0 || hasNonTrivialPrefix(C.Prefix);
-    }
-
-    if (Group.Items.size() >= 3) return true;
-
-    int Removable = countRemovableIndexInsts(Group.Items);
-    return CostlyStride || Removable > 0 ||
-           (Group.Step != 1 && Group.Step != -1) ||
-           hasNonTrivialPrefix(Group.Prefix);
+                                    const DominatorTree &DT,
+                                    SCEVResult &SE) {
+    LSRCostEstimate Cost = estimateExactGroupCost(Group, DT);
+    return isCostModelProfitable(Cost, Group.L, SE);
 }
 
 bool LoopStrengthReductionPass::shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
-                                     const DominatorTree &DT) {
-    if (Group.Items.size() < 2) return false;
-    int64_t Range = Group.MaxStart - Group.AnchorStart;
-    if (Range <= 0 || Range > MaxOffsetRange) return false;
-
-    bool CostlyStride = hasCostlyElementStride(Group.LastIndexStride);
-    int MaxPrefixCost = CostlyStride ? 2 : 1;
-    if (estimatePrefixMaterializeCost(Group.Prefix, Group.L, Group.PreHeader,
-                                      DT) > MaxPrefixCost) {
-        return false;
-    }
-
-    std::unordered_set<int64_t> Starts;
-    for (const LSRCandidate *C : Group.Items)
-        Starts.insert(*C->StartConst);
-    if (Starts.size() < 2) return false;
-
-    int Removable = countRemovableIndexInsts(Group.Items);
-    int OffsetGEPs = static_cast<int>(Starts.size()) - 1;
-    int NewLoopGEPs = 1 + OffsetGEPs;
-    if (Group.Items.size() == 2) {
-        if (CostlyStride) return true;
-        if (Range > 4) return false;
-        if (Group.Step != 1 && Group.Step != -1) return true;
-        return Removable > 0 && Range <= 2;
-    }
-
-    if (NewLoopGEPs < static_cast<int>(Group.Items.size()) ||
-        CostlyStride || Removable > 0 ||
-        (Group.Step != 1 && Group.Step != -1)) {
-        return true;
-    }
-
-    return coversDenseInnermostAddresses(Group.L, Group.Items);
+                                     const DominatorTree &DT,
+                                     SCEVResult &SE) {
+    LSRCostEstimate Cost = estimateOffsetGroupCost(Group, DT);
+    return isCostModelProfitable(Cost, Group.L, SE);
 }
 
 PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
@@ -906,7 +987,7 @@ bool LoopStrengthReductionPass::runAddressLSR(Function &F, LoopInfo &LI, SCEVRes
     std::vector<OffsetReuseGroup> OffsetGroups =
         buildOffsetReuseGroups(Candidates);
     for (OffsetReuseGroup &Group : OffsetGroups) {
-        if (!shouldRewriteOffsetGroup(Group, DT)) continue;
+        if (!shouldRewriteOffsetGroup(Group, DT, SE)) continue;
         if (LoopPointerIVs[Group.L] >= pointerIVLimit(Group.L)) continue;
         if (!rewriteOffsetGroup(Group, DT, DeadSeeds)) continue;
         ++LoopPointerIVs[Group.L];
@@ -915,7 +996,7 @@ bool LoopStrengthReductionPass::runAddressLSR(Function &F, LoopInfo &LI, SCEVRes
 
     std::vector<LSRGroup> ExactGroups = buildExactGroups(Candidates);
     for (LSRGroup &Group : ExactGroups) {
-        if (!shouldRewriteExactGroup(Group, DT)) continue;
+        if (!shouldRewriteExactGroup(Group, DT, SE)) continue;
         if (LoopPointerIVs[Group.L] >= pointerIVLimit(Group.L)) continue;
         if (!rewriteExactGroup(Group, DT, DeadSeeds)) continue;
         ++LoopPointerIVs[Group.L];

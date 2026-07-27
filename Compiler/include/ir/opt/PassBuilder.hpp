@@ -22,7 +22,6 @@ class PassBuilder{
     static FunctionPassManager buildLightCleanupPipeline();
     static FunctionPassManager buildHeavyMemoryPipeline();
     static FunctionPassManager buildScalarCleanupPipeline();
-    static FunctionPassManager buildEarlyPeelingPipeline();
     static FunctionPassManager buildPostUnrollCleanupPipeline();
     static FunctionPassManager buildLoopPipeline();
     static FunctionPassManager buildPostLoopCleanupPipeline();

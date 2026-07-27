@@ -27,13 +27,21 @@ public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    // Absolute caps protect compile time. Profitability is governed primarily
-    // by the relative function-size budgets below; the absolute limits apply
-    // only to the specialized side that would actually be cloned.
+    // 绝对上限用于约束编译时间，相对上限用于约束函数级代码膨胀。
+    // 所有候选统一使用同一组预算，不依据测试用例或既有变换痕迹调整阈值。
     static constexpr std::size_t MaxNonTrivialCloneBlocks = 32;
     static constexpr std::size_t MaxNonTrivialCloneInstructions = 192;
     static constexpr std::size_t MaxClonePercentOfFunction = 30;
-    static constexpr std::size_t MaxGeneratedClonePercentOfFunction = 15;
+    // 没有性能画像时按一次迭代估计未知循环，避免猜测循环热度。
+    static constexpr std::int64_t UnknownTripCountEstimate = 1;
+    // 限制单个候选可累计的动态收益，防止大常量循环无界放宽代码膨胀。
+    static constexpr std::int64_t MaxTripCountForProfitability = 64;
+    // 成本统一使用抽象指令单位：每个控制 use 和入口分派各计一条指令。
+    static constexpr std::int64_t ControlUseCost = 1;
+    static constexpr std::int64_t EntryDispatchCost = 1;
+    // 克隆块会增加布局与跳转压力，出口 PHI 会增加版本合流压力。
+    static constexpr std::int64_t ClonedBlockCost = 3;
+    static constexpr std::int64_t ExitPhiVersioningCost = 4;
     static constexpr unsigned RelationLessMask = 1U;
     static constexpr unsigned RelationEqualMask = 2U;
     static constexpr unsigned RelationGreaterMask = 4U;
@@ -91,7 +99,7 @@ private:
         std::vector<BasicBlock *> AllBlocks;
         BlockSet TrueReachable;
         BlockSet FalseReachable;
-        // 保留较大且通常更热的一侧原布局，只克隆另一侧。
+        // 仅以减少静态代码膨胀为目标：保留较大区域，克隆较小区域。
         bool OriginalValue = false;
         BasicBlock *OriginalSucc = nullptr;
         BasicBlock *CloneSucc = nullptr;
@@ -102,7 +110,6 @@ private:
         unsigned ControlUses = 0;
         std::size_t CloneInstructions = 0;
         std::size_t CloneWeight = 0;
-        bool GeneratedByLoopTransform = false;
     };
 
     struct IntegerBoundPredicate {
@@ -165,7 +172,8 @@ private:
     static std::size_t countInstructions(
         const std::vector<BasicBlock *> &Blocks,
         const BlockSet *Filter = nullptr);
-    static unsigned countControlUses(Value *Condition, Loop &L);
+    static unsigned countMustExecuteControlUses(
+        Value *Condition, Loop &L, const DominatorTree &DT);
     static Value *stripBooleanNot(Value *V, bool &Inverted);
     static std::optional<bool> evaluateConstantBoolean(Value *Condition);
     static unsigned predicateRelationMask(BinaryInst::Operation Op);
@@ -194,12 +202,6 @@ private:
     static std::size_t weightedRegionSize(
         const std::vector<BasicBlock *> &Blocks,
         const BlockSet *Filter = nullptr);
-    static bool hasLoopTransformProvenance(
-        const std::vector<BasicBlock *> &Blocks);
-    static bool hasTilingProvenance(
-        const std::vector<BasicBlock *> &Blocks);
-    static unsigned invariantScope(Value *Condition, Loop *L,
-                                   const DominatorTree &DT);
     static bool chooseDirectionalClonePlan(NonTrivialCandidate &C);
     static std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
         Function &F, LoopInfo &LI, const DominatorTree &DT,

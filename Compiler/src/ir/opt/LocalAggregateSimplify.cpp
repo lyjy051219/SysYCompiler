@@ -147,11 +147,8 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
             continue;
         }
 
-        // Recognize a compact immutable power-of-two table.  A proven
-        // in-range dynamic lookup is exactly `1 << index`, which removes
-        // both the address calculation and the memory dependence without
-        // building an expensive select chain.  This is shape-driven, not
-        // tied to a source-level variable name such as SHIFT_TABLE.
+        // 对完整只读数组逐项验证二次幂恒等式。只有索引范围也得到证明时，
+        // 才把动态查表改写为等价移位，从而避免依赖任何源级标识符。
         auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
         auto *CandidateRoot = GEP && GEP->getBasePointer()
                                   ? dynamic_cast<Variable *>(

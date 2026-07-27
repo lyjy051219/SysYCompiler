@@ -5,6 +5,7 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,7 +47,6 @@ struct LSRGroup {
     BasicBlock *Header = nullptr;
     BasicBlock *Latch = nullptr;
     int64_t Step = 0;
-    int64_t LastIndexStride = 0;
     std::vector<IndexComponent> Prefix;
     std::vector<IndexComponent> Suffix;
     std::shared_ptr<IRType> ResultTy;
@@ -61,9 +61,7 @@ struct OffsetReuseGroup {
     BasicBlock *Header = nullptr;
     BasicBlock *Latch = nullptr;
     int64_t Step = 0;
-    int64_t LastIndexStride = 0;
     int64_t AnchorStart = 0;
-    int64_t MaxStart = 0;
     std::vector<IndexComponent> Prefix;
     std::shared_ptr<IRType> ResultTy;
 };
@@ -79,8 +77,17 @@ struct AddressGEPNode {
     int64_t Offset = 0;
 };
 
-// Rewrites affine final-index GEPs into pointer induction variables and shares
-// one pointer IV across nearby constant offsets when doing so is profitable.
+// 成本统一以一条普通 IR 算术/地址计算指令为一单位。
+struct LSRCostEstimate {
+    int64_t OldLoopCost = 0;
+    int64_t NewLoopCost = 0;
+    int64_t NewSetupCost = 0;
+    int64_t RemovableIndexCost = 0;
+    bool Valid = false;
+};
+
+// 将仿射末级索引 GEP 改写为指针归纳变量；只有统一成本模型证明获益时，
+// 才允许多个常量偏移共享同一个指针归纳变量。
 class LoopStrengthReductionPass
     : public PassDescriptor<LoopStrengthReductionPass> {
 public:
@@ -88,12 +95,9 @@ public:
 
 private:
     static constexpr int UnsupportedMaterializeCost = 1000000;
-    static constexpr int64_t MaxOffsetRange = 16;
     static constexpr int MaxPointerIVsPerInnerLoop = 8;
     static constexpr int MaxPointerIVsPerOuterLoop = 4;
-    static bool hasCostlyElementStride(int64_t Stride);
     static std::string scevKey(const SCEVExpr *E);
-    static bool hasNonTrivialPrefix(const std::vector<IndexComponent> &Prefix);
     static bool canUseInPreheader(Value *V, BasicBlock *PreHeader,
                                   const DominatorTree &DT);
     static bool canMaterializeSCEVAtPreheader(
@@ -114,8 +118,6 @@ private:
         BasicBlock *PreHeader, const DominatorTree &DT,
         std::vector<Value *> &Indices);
     static bool isLoadStoreAddressUse(Instruction *UserI, Use *U);
-    static int countAddressUses(GetElementPtrInst *GEP);
-    static int countLoopMemoryAddressUses(Loop *L);
     static bool getConstantOffsetGEP(
         GetElementPtrInst *Parent, Instruction *UserI, Use *U,
         GetElementPtrInst *&Child, int64_t &Offset);
@@ -143,19 +145,27 @@ private:
     static bool collectRemovableIndexChain(
         Instruction *I, std::unordered_set<User *> &AllowedUsers,
         std::unordered_set<Instruction *> &Out);
-    static int countRemovableIndexInsts(
-        const std::vector<LSRCandidate *> &Items);
-    static int countCoveredAddressUses(
-        const std::vector<LSRCandidate *> &Items);
-    static bool coversDenseInnermostAddresses(
-        Loop *L, const std::vector<LSRCandidate *> &Items);
+    static int64_t estimateRemovableIndexCost(
+        Loop *L, const std::vector<LSRCandidate *> &Items,
+        const DominatorTree &DT);
+    static int64_t estimateOldLoopCost(
+        Loop *L, const std::vector<LSRCandidate *> &Items,
+        const DominatorTree &DT);
+    static LSRCostEstimate estimateExactGroupCost(
+        const LSRGroup &Group, const DominatorTree &DT);
+    static LSRCostEstimate estimateOffsetGroupCost(
+        const OffsetReuseGroup &Group, const DominatorTree &DT);
+    static bool isCostModelProfitable(
+        const LSRCostEstimate &Cost, Loop *L, SCEVResult &SE);
+    static bool isRepresentablePointerOffset(int64_t Offset);
     static void cleanupDeadIndexChains(
         const std::vector<Instruction *> &Seeds);
-    static bool isSimpleSingleGEP(const LSRCandidate &Candidate);
     static bool shouldRewriteExactGroup(const LSRGroup &Group,
-                                        const DominatorTree &DT);
+                                        const DominatorTree &DT,
+                                        SCEVResult &SE);
     static bool shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
-                                         const DominatorTree &DT);
+                                         const DominatorTree &DT,
+                                         SCEVResult &SE);
     static PointerIV createPointerIV(
         Value *Base, const std::vector<Value *> &StartIndices, int64_t Step,
         const std::shared_ptr<IRType> &ResultTy, BasicBlock *PreHeader,

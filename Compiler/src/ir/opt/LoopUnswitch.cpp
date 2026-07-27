@@ -443,19 +443,25 @@ bool LoopUnswitchPass::isActiveSpecializedEdge(BasicBlock *Pred, BasicBlock *Suc
 std::size_t LoopUnswitchPass::countInstructions(const std::vector<BasicBlock *> &Blocks,
                                                 const BlockSet *Filter) {
     std::size_t Count = 0;
+    const std::size_t MaxSize = std::numeric_limits<std::size_t>::max();
     for (BasicBlock *BB : Blocks) {
         if (!BB || (Filter && !Filter->count(BB))) continue;
-        Count += static_cast<std::size_t>(BB->size());
+        const std::size_t BlockSize = static_cast<std::size_t>(BB->size());
+        if (BlockSize > MaxSize - Count) return MaxSize;
+        Count += BlockSize;
     }
     return Count;
 }
 
-unsigned LoopUnswitchPass::countControlUses(Value *Condition, Loop &L) {
+unsigned LoopUnswitchPass::countMustExecuteControlUses(
+    Value *Condition, Loop &L, const DominatorTree &DT) {
     if (!Condition) return 0;
     std::unordered_set<Instruction *> Seen;
     for (Use *U : Condition->getUses()) {
         auto *I = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
         if (!I || !I->getParent() || !L.contains(I->getParent())) continue;
+        // 只计算每轮必经位置上的控制 use；条件路径中的偶发 use 不计收益。
+        if (!isMustExecuteBeforeLoopProgress(I->getParent(), L, DT)) continue;
         if (auto *Br = dynamic_cast<BrInst *>(I)) {
             if (Br->getCondition() == Condition) Seen.insert(I);
         } else if (auto *Sel = dynamic_cast<SelectInst *>(I)) {
@@ -819,8 +825,12 @@ bool LoopUnswitchPass::hasAnyCall(const std::vector<BasicBlock *> &Blocks) {
 
 std::size_t LoopUnswitchPass::estimateExitPhiCost(Loop &L) {
     std::size_t Count = 0;
+    const std::size_t MaxSize = std::numeric_limits<std::size_t>::max();
     for (BasicBlock *Exit : L.getExitBlocks()) {
-        if (Exit) Count += Exit->collectPhiNodes().size();
+        if (!Exit) continue;
+        const std::size_t PhiCount = Exit->collectPhiNodes().size();
+        if (PhiCount > MaxSize - Count) return MaxSize;
+        Count += PhiCount;
     }
     return Count;
 }
@@ -834,9 +844,8 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
 
         for (BasicBlock *Pred : LivePreds) {
             if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
-            // Parallel exit edges require duplicate PHI entries, a shape not
-            // produced by the SysY frontend and deliberately outside this
-            // first bounded implementation.
+            // 并行出口边需要为同一前驱维护多项 PHI 输入；当前克隆器没有
+            // 表达这类边，因而在合法性检查中统一保守拒绝。
             if (Pred->countEdgesToSucc(Exit) != 1) return false;
         }
 
@@ -924,41 +933,21 @@ std::vector<BasicBlock *> LoopUnswitchPass::collectFunctionBlocks(Function &F) {
 std::size_t LoopUnswitchPass::weightedRegionSize(const std::vector<BasicBlock *> &Blocks,
                                                  const BlockSet *Filter) {
     std::size_t BlockCount = 0;
-    for (BasicBlock *BB : Blocks)
-        if (BB && (!Filter || Filter->count(BB))) ++BlockCount;
-    return countInstructions(Blocks, Filter) + 3 * BlockCount;
-}
-
-bool LoopUnswitchPass::hasLoopTransformProvenance(
-    const std::vector<BasicBlock *> &Blocks) {
+    const std::size_t MaxSize = std::numeric_limits<std::size_t>::max();
     for (BasicBlock *BB : Blocks) {
-        if (!BB) continue;
-        const std::string &Name = BB->getIdent();
-        if (Name.find(".unr") != std::string::npos ||
-            Name.find(".peel") != std::string::npos) {
-            return true;
-        }
+        if (!BB || (Filter && !Filter->count(BB))) continue;
+        if (BlockCount == MaxSize) return MaxSize;
+        ++BlockCount;
     }
-    return false;
-}
-
-
-unsigned LoopUnswitchPass::invariantScope(Value *Condition, Loop *L,
-                        const DominatorTree &DT) {
-    unsigned Scope = 1;
-    for (Loop *Parent = L ? L->getParentLoop() : nullptr;
-         Parent; Parent = Parent->getParentLoop()) {
-        CanonicalLoopShape ParentShape;
-        if (!getCanonicalLoopShape(Parent, ParentShape) ||
-            !ParentShape.PreHeader->getTerminator() ||
-            !isAvailableAt(Condition,
-                           ParentShape.PreHeader->getTerminator(),
-                           *Parent, DT)) {
-            break;
-        }
-        ++Scope;
+    const std::size_t InstructionCount =
+        countInstructions(Blocks, Filter);
+    const std::size_t BlockUnit =
+        static_cast<std::size_t>(ClonedBlockCost);
+    if (InstructionCount == MaxSize ||
+        BlockCount > (MaxSize - InstructionCount) / BlockUnit) {
+        return MaxSize;
     }
-    return Scope;
+    return InstructionCount + BlockUnit * BlockCount;
 }
 
 bool LoopUnswitchPass::chooseDirectionalClonePlan(NonTrivialCandidate &C) {
@@ -967,9 +956,7 @@ bool LoopUnswitchPass::chooseDirectionalClonePlan(NonTrivialCandidate &C) {
     const std::size_t FalseWeight =
         weightedRegionSize(C.AllBlocks, &C.FalseReachable);
 
-    // Preserve the larger version in the original layout.  In the corpus this
-    // is the loop-body arm of zero-trip guards and is overwhelmingly the hot
-    // path.  It also makes the actually cloned side as small as possible.
+    // 不猜测分支热度，只保留较大的区域并克隆较小的区域，以减少代码膨胀。
     C.OriginalValue = TrueWeight >= FalseWeight;
     C.OriginalSucc = C.OriginalValue ? C.TrueSucc : C.FalseSucc;
     C.CloneSucc = C.OriginalValue ? C.FalseSucc : C.TrueSucc;
@@ -1034,7 +1021,8 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
             C.TrueSucc = T;
             C.FalseSucc = Fals;
             C.AllBlocks = AllBlocks;
-            C.ControlUses = countControlUses(Cond, *L);
+            C.ControlUses =
+                countMustExecuteControlUses(Cond, *L, DT);
             if (C.ControlUses == 0) continue;
             if (!isMustExecuteBeforeLoopProgress(BB, *L, DT)) {
                 continue;
@@ -1073,51 +1061,52 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
             }
 
             const std::size_t ExitPhiCost = estimateExitPhiCost(*L);
-            C.CloneWeight = C.CloneInstructions +
-                            3 * C.CloneReachable.size() +
-                            4 * ExitPhiCost;
-            C.GeneratedByLoopTransform =
-                hasLoopTransformProvenance(AllBlocks);
-            const std::size_t RelativeLimit =
-                C.GeneratedByLoopTransform
-                    ? MaxGeneratedClonePercentOfFunction
-                    : MaxClonePercentOfFunction;
-            if (C.CloneWeight * 100 > FunctionWeight * RelativeLimit) {
+            const std::size_t BaseCloneWeight =
+                C.CloneInstructions +
+                static_cast<std::size_t>(ClonedBlockCost) *
+                    C.CloneReachable.size();
+            const std::size_t MaxSize =
+                std::numeric_limits<std::size_t>::max();
+            if (ExitPhiCost >
+                (MaxSize - BaseCloneWeight) /
+                    static_cast<std::size_t>(ExitPhiVersioningCost)) {
+                continue;
+            }
+            C.CloneWeight =
+                BaseCloneWeight +
+                static_cast<std::size_t>(ExitPhiVersioningCost) *
+                    ExitPhiCost;
+            // 用商和余数计算比例预算，避免函数规模乘百分比时溢出。
+            const std::size_t RelativeCloneLimit =
+                (FunctionWeight / 100) * MaxClonePercentOfFunction +
+                ((FunctionWeight % 100) * MaxClonePercentOfFunction) / 100;
+            if (C.CloneWeight > RelativeCloneLimit) {
+                continue;
+            }
+            if (C.CloneWeight >
+                static_cast<std::size_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
                 continue;
             }
 
-            std::int64_t TripEstimate = 1;
+            // 精确 trip count 来自 SCEV；无法证明时按一次迭代保守估计。
+            std::int64_t TripEstimate = UnknownTripCountEstimate;
             if (auto TC = SE.getSmallConstantTripCount(L)) {
-                TripEstimate = std::clamp<std::int64_t>(*TC, 1, 64);
-            } else if (L->getDepth() >= 2) {
-                // Unknown-trip nested loops dominate the profitable corpus
-                // cases; keep the estimate bounded so size still wins for a
-                // one-use or control-heavy candidate.
-                TripEstimate = 8;
-            } else {
-                TripEstimate = 4;
+                TripEstimate = std::clamp<std::int64_t>(
+                    *TC, 0, MaxTripCountForProfitability);
             }
-            const unsigned Scope = invariantScope(Cond, L, DT);
-            const std::int64_t InvocationFactor =
-                std::int64_t{1} << std::min<unsigned>(Scope - 1, 3);
-            C.Benefit = 3 * std::max<std::int64_t>(
-                0, TripEstimate * C.ControlUses - 1) * InvocationFactor;
-            const std::size_t OriginalWeight =
-                weightedRegionSize(AllBlocks, &C.OriginalReachable);
-            // A single invariant branch in a very small loop is quickly
-            // learned by the predictor; selector/layout overhead can equal
-            // the saved instruction.  Require extra headroom unless either
-            // multiple control uses disappear or a larger hot body is being
-            // specialized.  This separates the tiny transpose shape from the
-            // larger game-of-life body without naming either benchmark.
-            const std::int64_t SmallBodyLayoutPenalty =
-                Scope == 1 && C.ControlUses == 1 && OriginalWeight < 64
-                    ? 8
-                    : 0;
-            C.Cost = static_cast<std::int64_t>(C.CloneWeight) +
-                     SmallBodyLayoutPenalty;
 
-            if (C.Benefit < C.Cost + 4) {
+            // 每轮可消除所有必经控制 use，但版本选择会在入口新增一次分派。
+            const std::int64_t EliminatedControlCost =
+                TripEstimate *
+                static_cast<std::int64_t>(C.ControlUses) *
+                ControlUseCost;
+            C.Benefit = std::max<std::int64_t>(
+                0, EliminatedControlCost - EntryDispatchCost);
+            C.Cost = static_cast<std::int64_t>(C.CloneWeight);
+
+            // 仅当可解释的动态控制收益严格覆盖静态克隆成本时才执行变换。
+            if (C.Benefit <= C.Cost) {
                 continue;
             }
             Consider(std::move(C));

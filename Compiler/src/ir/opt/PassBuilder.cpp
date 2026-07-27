@@ -126,67 +126,6 @@ FunctionPassManager PassBuilder::buildScalarCleanupPipeline() {
     return FPM;
 }
 
-// 2.25 Early guarded peeling, before function inlining.
-//
-// Keeping this phase before inline is important for a general pattern where
-// the first outer iteration initializes loop-carried state consumed by a
-// nested loop, while a readonly helper call remains in every outer iteration.
-// Peeling exposes the one-time initialization first; cleanup deletes the
-// zero-trip residual nest; LICM can then cache the still-small direct call.
-// Every trigger is based on loop/SSA/control and memory proofs, never source
-// identifiers, input values, or benchmark-specific constants.
-FunctionPassManager PassBuilder::buildEarlyPeelingPipeline() {
-    FunctionPassManager FPM;
-    FPM.addPass(BreakCriticalEdgesPass());
-    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
-        LoopSimplifyPass(), 6));
-    FPM.addPass(LCSSAPass());
-    FPM.addPass(LoopPeelingPass());
-
-    FunctionPassManager PeelCleanup;
-    PeelCleanup.addPass(SCCPPass());
-    PeelCleanup.addPass(InstSimplifyPass());
-    PeelCleanup.addPass(RangeAwareSimplifyPass());
-    PeelCleanup.addPass(ConstraintEliminationPass());
-    PeelCleanup.addPass(CFGSimplifyPass());
-    PeelCleanup.addPass(DCEPass());
-    PeelCleanup.addPass(createFixedPointPass<Function,
-        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
-    PeelCleanup.addPass(LCSSAPass());
-    PeelCleanup.addPass(LoopDeletionPass());
-    PeelCleanup.addPass(CFGSimplifyPass());
-    PeelCleanup.addPass(DCEPass());
-    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
-        std::move(PeelCleanup), 3));
-
-    FunctionPassManager CallAndInvariantCleanup;
-    CallAndInvariantCleanup.addPass(createFixedPointPass<Function,
-        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
-    CallAndInvariantCleanup.addPass(LCSSAPass());
-    CallAndInvariantCleanup.addPass(IndVarSimplifyPass());
-    // Schedule transforms are registered only in the post-inline main loop
-    // pipeline. Repeating them here would create another pass instance with a
-    // fresh growth budget and reshape a callee that is immediately inlined.
-    CallAndInvariantCleanup.addPass(LICMPass());
-    CallAndInvariantCleanup.addPass(LocalGVNPass());
-    // Peeling splits the one-time prefix from the stable residual loop.  PRE
-    // is most profitable at precisely this boundary and remains bounded by
-    // the surrounding two-round fixed point.
-    CallAndInvariantCleanup.addPass(GVNPREPass(/*EnablePRE=*/true));
-    CallAndInvariantCleanup.addPass(LoadEliminationPass());
-    CallAndInvariantCleanup.addPass(DSEPass());
-    CallAndInvariantCleanup.addPass(DCEPass());
-    CallAndInvariantCleanup.addPass(CFGSimplifyPass());
-    CallAndInvariantCleanup.addPass(createFixedPointPass<Function,
-        FunctionAnalysisPassManager>(LoopSimplifyPass(), 4));
-    CallAndInvariantCleanup.addPass(LCSSAPass());
-    CallAndInvariantCleanup.addPass(LoopDeletionPass());
-    CallAndInvariantCleanup.addPass(CFGSimplifyPass());
-    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
-        std::move(CallAndInvariantCleanup), 2));
-    return FPM;
-}
-
 // 2.5 展开后深度清理 Pipeline
 // LoopUnroll 会复制控制流、扩大基本块并暴露退化 PHI / 常量分支 / 死副本。
 // 这里使用偏局部、确定性的清理组合，收敛展开带来的直接噪声，再把循环形态
@@ -444,8 +383,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(LocalGVNPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(
         GVNPREPass(/*EnablePRE=*/false), FAM));
-    MPM.addPass(createModuleFunctionBridge(
-        buildEarlyPeelingPipeline(), FAM));
+    // 所有循环剥离统一交给主循环流水线中的通用成本模型，
+    // 不再为某一种嵌套循环形态安排专用的内联前执行阶段。
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass(/*enableRecursiveInline=*/true), FAM));
     // 内联后最容易产生不再被 main 可达调用图引用的 helper，先删掉以减少后续函数 pass 工作量。
     MPM.addPass(DeadFunctionEliminationPass(FAM));

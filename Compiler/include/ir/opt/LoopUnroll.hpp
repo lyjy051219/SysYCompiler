@@ -58,6 +58,10 @@ struct UnrollConfig {
     int MaxGuardedPeelCount = 1;
     int PeelThreshold = 64;
     int MaxPeelBlocks = 24;
+    // 不变 store 的动态收益按目标机上一条普通内存写的成本估算。
+    int PeelStoreCost = 2;
+    // 只有动态收益严格覆盖克隆成本并留出该余量时，才允许由 store 触发剥离。
+    int PeelMinNetBenefit = 1;
 
     int SCEVExpansionBudget = 8;
     bool AllowExpensiveTripCount = false;
@@ -72,31 +76,8 @@ struct UnrollDecision {
     bool NeedRemainder = false;
     bool IsRuntime = false;
     bool IsPeeling = false;
-    // Required by runtime count materialization.  This may come from a global
-    // SCEV no-wrap proof or from contextual ranges at the loop preheader.
+    // 运行时展开在物化迭代次数前必须具备无回绕证明。
     bool TripCountIsProven = false;
-
-    // A guarded peel may prove that a non-IV header PHI reaches an
-    // outer-loop-invariant fixed point after the peeled iteration.  Keeping
-    // the proof result in the decision lets executePeeling specialize only
-    // the residual loop; cloned first-iteration uses have already been
-    // remapped to the original initial value.
-    PhiInst *StabilizedPhi = nullptr;
-    Value *StabilizedValue = nullptr;
-    // Some one-shot state loops converge to max(Initial, Bound), rather than
-    // to Bound unconditionally.  Keep the two pre-loop operands in the
-    // decision and materialize the exact value only after peeling commits;
-    // decision making itself must never mutate IR.
-    Value *StabilizedInitial = nullptr;
-    Value *StabilizedBound = nullptr;
-    // The stable-state proof also identifies the original nested-loop header
-    // test.  Every path reaching the residual outer loop has completed the
-    // peeled iteration, so this test is known to take its exit edge there.
-    // Keeping the exact comparison lets executePeeling expose that zero-trip
-    // fact directly instead of relying on later min/max algebra.
-    BinaryInst *StabilizedInnerExitCmp = nullptr;
-    bool StabilizedInnerContinueOnTrue = true;
-
 };
 
 struct PeelPredicate {
@@ -152,16 +133,6 @@ struct HeaderState {
     bool BackedgeIsOriginalPhi = false;
 };
 
-// 记录剥离后可证明稳定的循环状态；仅保存证明结果，不在决策阶段修改 IR。
-struct ProvenStablePeelState {
-    PhiInst *Phi = nullptr;
-    Value *StableValue = nullptr;
-    Value *Initial = nullptr;
-    Value *Bound = nullptr;
-    BinaryInst *InnerExitCmp = nullptr;
-    bool InnerContinueOnTrue = true;
-};
-
 // PHI 重写统一采用“先收集并校验、再整体提交”的计划，避免留下半更新状态。
 struct PhiRewritePlan {
     PhiInst *OldPhi = nullptr;
@@ -178,14 +149,12 @@ public:
 
     const UnrollConfig &getConfig() const;
 
-    LoopUnrollResult tryToUnrollLoop(Function &F,
-                                     Loop *L,
+    LoopUnrollResult tryToUnrollLoop(Loop *L,
                                      LoopInfo &LI,
                                      DominatorTree &DT,
                                      SCEVResult &SE,
                                      BasicAAResult &AA,
-                                     RangeInfo &RI,
-                                     FunctionAnalysisPassManager &FAM);
+                                     RangeInfo &RI);
 
     bool isCanonicalLoop(Loop *L) const;
     bool canCloneLoopBody(Loop *L, LoopInfo &LI) const;
@@ -208,8 +177,7 @@ public:
                                          SCEVResult &SE,
                                          BasicAAResult &AA,
                                          RangeInfo &RI,
-                                         DominatorTree &DT,
-                                         FunctionAnalysisPassManager &FAM) const;
+                                         DominatorTree &DT) const;
 
     LoopUnrollResult executeFullUnroll(Loop *L,
                                        const UnrollDecision &Decision,
@@ -243,18 +211,14 @@ public:
                                     BasicAAResult &AA);
 
 private:
-    friend class LoopPeelingPass;
-
     UnrollConfig Config;
 
-    // The loop pipeline itself is a bounded fixed point and reuses this pass
-    // object across rounds.  Remember original headers already transformed so
-    // a partial unroll is not multiplied again (for example 4x -> 16x -> 32x)
-    // merely because the outer pipeline ran another cleanup round.
+    // 循环流水线是复用同一 pass 对象的有界固定点。记录已经变换的原始
+    // 循环头，避免外层清理再次运行时把部分展开从 4 倍继续放大到 16 倍。
     std::unordered_map<Function *, std::unordered_set<std::string>>
         TransformedLoopHeaders;
 
-    // 剥离合法性、稳定状态证明与失败回滚的通用辅助函数。
+    // 剥离合法性、收益估算与失败回滚的通用辅助函数。
     static bool containsUndef(
         Value *V, std::unordered_set<Value *> &Active, int Depth = 0);
     static bool isStructurallyLoopInvariant(
@@ -262,39 +226,11 @@ private:
     static std::vector<StoreInst *> collectPeelRedundantStoreCandidates(
         Loop *L, LoopInfo &LI, BasicAAResult &AA,
         const DominatorTree &DT);
-    static bool isDirectUnitIncrement(const InductionDescriptor &IV);
-    static Value *getStrictIncreasingHeaderBound(
-        const LoopTripCountInfo &TCI, const InductionDescriptor &IV);
     static bool proveRuntimeTripCountAtPreheader(
         SCEVResult &SE, const LoopTripCountInfo &TCI, RangeInfo &RI,
         DominatorTree &DT);
-    static bool isExactInnerExitIV(
-        Value *V, const LoopTripCountInfo &TCI, PhiInst *IV);
-    static bool isValueAvailableBeforeOuterLoop(
-        Value *V, Loop *Outer, BasicBlock *PreHeader,
-        DominatorTree &DT);
-    static bool isTrivialForwardOf(
-        Value *Candidate, Value *Source,
-        std::unordered_set<Value *> &Active, int Depth = 0);
-    static bool isKnownReadonlyInvariantCall(
-        CallInst *CI, Loop *Outer, Loop *StableInner,
-        BasicBlock *OuterLatch, DominatorTree &DT, BasicAAResult &AA,
-        const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
-    static std::pair<IntRange, IntRange> getFirstOuterEntryRanges(
-        Value *Initial, Value *Bound, Loop *Outer,
-        BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
-        DominatorTree &DT);
-    static bool proveInitialNotAboveBound(
-        Value *Initial, Value *Bound, Loop *Outer,
-        BasicBlock *OuterPreHeader, SCEVResult &SE, RangeInfo &RI,
-        DominatorTree &DT, IntRange &InitialRange, IntRange &BoundRange);
-    static std::optional<ProvenStablePeelState> findProvenStablePeelState(
-        Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
-        RangeInfo &RI, DominatorTree &DT,
-        FunctionAnalysisPassManager &FAM);
     static void discardUncommittedPeelClones(PeeledBodyCore &Core);
     static void discardUncommittedUnrollClones(UnrolledBodyCore &Core);
-    static UnrollConfig makePeelingOnlyConfig(UnrollConfig Config);
 
     static int nextUnrollSerial();
     static std::string makeUnrollBlockIdent(
@@ -417,18 +353,4 @@ private:
     static LoopUnrollResult executeUnrollWithTail(
         Loop *L, int MainCount, int TailCopies, Value *NumGroups,
         Value *RemainderValue, bool IsRuntime, SCEVResult &SE);
-};
-
-// A peeling-only entry point for an early loop-specialization phase.  It
-// deliberately shares the generic LoopUnroll implementation and legality
-// checks; the separate descriptor merely lets PassBuilder schedule peeling
-// before the heavier unroll decisions without recognizing source names or
-// benchmark-specific patterns.
-class LoopPeelingPass : public PassDescriptor<LoopPeelingPass> {
-public:
-    explicit LoopPeelingPass(UnrollConfig Config = UnrollConfig());
-    PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
-private:
-    LoopUnrollPass Impl;
 };
