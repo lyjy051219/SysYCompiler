@@ -14,10 +14,6 @@
 
 bool LoopUnrollPass::isStructurallyLoopInvariant(
     Value *V, Loop *L, std::unordered_set<Value *> &Active) {
-    // `undef` is represented in the constant hierarchy, but it is not a
-    // repeatable value that can justify deleting later stores.  Reject it
-    // before the generic constant case; recursive operand checks also reject
-    // every pointer/value derived from undef.
     if (!V || !L || Value::isUndef(V)) return false;
     std::unordered_set<Value *> UndefActive;
     if (containsUndef(V, UndefActive, 0)) return false;
@@ -34,10 +30,6 @@ bool LoopUnrollPass::isStructurallyLoopInvariant(
         dynamic_cast<CallInst *>(I) || dynamic_cast<AllocaInst *>(I)) {
         return false;
     }
-    // Do not use an invariant expression that can be undefined for its
-    // operands (division/remainder, FPTOSI, or an unproved shift) as evidence
-    // that later stores repeat the first peeled value.  This keeps the memory
-    // optimization independent of source-level undefined behaviour.
 	if (instructionMayFaultOrProducePoison(I)) return false;
 
     bool PureProducer = dynamic_cast<GetElementPtrInst *>(I) ||
@@ -72,13 +64,6 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
         return Result;
     }
 
-    // If a candidate does not dominate the outer latch, its execution is
-    // justified below by invariant direct-loop control.  That argument is
-    // invalid when a nested-loop exit can reach the store during the same
-    // outer iteration: different inner exits may skip/execute it.  Compute all
-    // such downstream blocks once, without crossing the canonical outer
-    // backedge.  Stores before a nested loop (the profitable common case)
-    // remain eligible because the nested loop cannot reach backwards to them.
     std::vector<BasicBlock *> NestedRoots;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (BB && L->contains(BB) && LI.getLoopFor(BB) != L)
@@ -99,9 +84,6 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
                 return Successors;
             });
 
-    // Every direct-loop control decision (apart from the loop exit itself)
-    // must repeat across iterations.  Then a conditional store either runs
-    // in both the peeled and residual iterations or in neither.
     for (BasicBlock *BB : L->getBlocks()) {
         if (!BB) return {};
         auto *Br = BB->getBranchTerminator();
@@ -112,9 +94,6 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
             return {};
     }
 
-    // Without a complete call ModRef proof here, calls conservatively block
-    // the memory-state optimization (they do not block semantics-preserving
-    // peeling itself).
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return {};
         for (Instruction *I : *BB)
@@ -127,10 +106,6 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
             auto *SI = dynamic_cast<StoreInst *>(I);
             if (!SI) continue;
 
-            // Either every completed peeled iteration executed this store, or
-            // its conditional reachability is controlled solely by the
-            // invariant direct-loop branches checked above.  Nested-loop
-            // control is never guessed.
             if (!DT.dominates(BB, OuterLatch) &&
                 NestedControlledBlocks.count(BB)) {
                 continue;
@@ -183,11 +158,6 @@ bool LoopUnrollPass::isDirectUnitIncrement(const InductionDescriptor &IV) {
            (B == IV.Phi && CA && CA->getVal() == 1);
 }
 
-// Return the invariant operand of a strict, signed, increasing header test
-//     IV < Bound
-// and reject every less precise shape.  In particular, comparing IV.next or
-// using <= would need a different exit-value proof and is intentionally not
-// inferred here.
 Value *LoopUnrollPass::getStrictIncreasingHeaderBound(
     const LoopTripCountInfo &TCI, const InductionDescriptor &IV) {
     if (!TCI.Valid || !TCI.ExitCmp || !TCI.ExitingBlock || !TCI.Header ||
@@ -290,9 +260,6 @@ std::pair<IntRange, IntRange> LoopUnrollPass::getFirstOuterEntryRanges(
     IntRange InitialRange = RI.query(Initial, OuterPreHeader, DT);
     IntRange BoundRange = RI.query(Bound, OuterPreHeader, DT);
 
-    // A dedicated preheader can sit immediately after a conditional guard.
-    // Facts on that unique incoming edge are valid for the first peeled
-    // iteration even though they need not hold at the loop header globally.
     auto Preds = OuterPreHeader->getPredecessors();
     if (Preds.size() == 1 && Preds.front() &&
         !Outer->contains(Preds.front())) {
@@ -302,8 +269,6 @@ std::pair<IntRange, IntRange> LoopUnrollPass::getFirstOuterEntryRanges(
             RI.queryOnEdge(Bound, Preds.front(), OuterPreHeader, DT));
     }
 
-    // For a header-tested loop, only the continue edge reaches the peeled
-    // body.  Its condition is therefore another exact first-iteration fact.
     auto OuterTCI = SE.analyzeLoopTripCount(Outer);
     if (OuterTCI && OuterTCI->Valid && OuterTCI->Latch &&
         OuterTCI->ExitingBlock == OuterTCI->Header &&
@@ -337,13 +302,6 @@ bool LoopUnrollPass::proveInitialNotAboveBound(
         return true;
     }
 
-    // Interval facts intentionally do not retain relations between two SSA
-    // values.  Recover one exact first-iteration relation directly from a
-    // canonical header guard: if the peeled body is reached through
-    //     OuterIV < Bound
-    // then Bound >= OuterStart + 1.  Prove Initial <= OuterStart + 1 using
-    // independent ranges.  This is integer-order reasoning, not a no-wrap
-    // assumption; OuterStart + 1 is also required to stay in i32.
     auto OuterTCI = SE.analyzeLoopTripCount(Outer);
     auto OuterIV = SE.getCanonicalInduction(Outer);
     if (!OuterTCI || !OuterTCI->Valid || !OuterIV || !OuterIV->Valid ||
@@ -361,9 +319,6 @@ bool LoopUnrollPass::proveInitialNotAboveBound(
     return InitialRange.max <= StartRange.min + 1;
 }
 
-// Keep the dynamic-bound profitability exception aligned with LICM's reusable
-// call policy, and narrow it further to calls which execute on every completed
-// outer iteration with loop-invariant arguments.
 bool LoopUnrollPass::isKnownReadonlyInvariantCall(
     CallInst *CI, Loop *Outer, Loop *StableInner,
     BasicBlock *OuterLatch, DominatorTree &DT, BasicAAResult &AA,
@@ -380,9 +335,6 @@ bool LoopUnrollPass::isKnownReadonlyInvariantCall(
     Function *Callee = CI->getDirectCallee();
     if (!Callee || !Callee->front()) return false;
 
-    // The outer-loop clone budget sees a call as one instruction.  Bound the
-    // hidden body as well, since the following inliner may duplicate this
-    // helper into both the peeled and residual paths.
     constexpr std::size_t MaxReadonlyCalleeInstructions = 64;
     std::size_t CalleeInstructions = 0;
     for (BasicBlock *BB : *Callee) {
@@ -410,12 +362,6 @@ bool LoopUnrollPass::isKnownReadonlyInvariantCall(
             return false;
     }
 
-    // Predict LICM's residual-loop Mod/Ref check.  The stable inner loop is
-    // deliberately excluded: the proof paired with this query establishes
-    // that its original copy is zero-trip after peeling, and executePeeling
-    // exposes that fact before LICM runs.  Any write which remains elsewhere
-    // in the residual outer loop makes caching unprofitable and keeps the old
-    // constant-bound restriction.
     std::vector<Value *> ReadPointers;
     for (Value *ReadValue : SEI.RefSet) {
         if (!ReadValue) continue;
@@ -446,24 +392,7 @@ bool LoopUnrollPass::isKnownReadonlyInvariantCall(
     return true;
 }
 
-// Prove the one-shot nested-loop state pattern rather than merely matching
-// its syntax:
-//
-//   P = phi [Initial, outer.preheader], [InnerExit, outer.latch]
-//   J = phi [P, inner.preheader], [J + 1, inner.latch]
-//   while (J < Bound) ...
-//   InnerExit = J
-//
-// Bound must be available before and invariant across the outer loop, the
-// inner exit must dominate the outer latch, and the induction update must be
-// the exact integer operation J + 1.  The first iteration then leaves
-// P == max(Initial, Bound): when Initial < Bound the monotone unit recurrence
-// reaches Bound without wrapping; otherwise the header test is false and P
-// remains Initial.  Every residual iteration therefore starts at a value
-// greater than or equal to Bound and the inner loop is zero-trip.  If ranges
-// already prove Initial <= Bound we retain the cheaper value Bound; otherwise
-// execution materializes the exact max in the outer preheader.  The proof is
-// based only on IR structure and applies independently of source/test names.
+
 std::optional<ProvenStablePeelState>
 LoopUnrollPass::findProvenStablePeelState(
     Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
@@ -472,10 +401,6 @@ LoopUnrollPass::findProvenStablePeelState(
     if (!Outer || Outer->isInnermost() || !Outer->getHeader())
         return std::nullopt;
 
-    // If the sibling work is already visible as another direct subloop,
-    // peeling would clone it without proving any benefit for that sibling.
-    // Keep the enlarged stable-state budget for the single-child shape.  A
-    // not-yet-inlined sibling is handled by the call/bound check below.
     if (Outer->getSubLoops().size() != 1)
         return std::nullopt;
     Loop *StableInner = Outer->getSubLoops().front();
@@ -488,14 +413,6 @@ LoopUnrollPass::findProvenStablePeelState(
         return std::nullopt;
     }
 
-    // A sibling's work may still be represented as a call at this pre-inline
-    // stage and turn into another full loop later.  Dynamic stable bounds are
-    // profitable when every such call is a must-execute, argument-invariant,
-    // known readonly call: peeling exposes the one-shot initialization and the
-    // following LICM phase can lazily cache the call in the residual loop.
-    // Unknown, writing, conditionally executed, or variant-argument calls keep
-    // the former constant-bound restriction.  This is a profitability gate;
-    // the peeling legality proof below is unchanged.
     bool ContainsDisqualifyingCall = false;
     std::size_t ReadonlyCallCount = 0;
     constexpr std::size_t MaxReadonlyCallsForDynamicStablePeel = 4;
@@ -581,11 +498,6 @@ void LoopUnrollPass::discardUncommittedPeelClones(PeeledBodyCore &Core) {
         for (BasicBlock *BB : Iteration)
             if (BB && Seen.insert(BB).second) Blocks.push_back(BB);
 
-    // First sever all SSA cross-links while every defining instruction is
-    // alive, then clear all instruction lists (which removes block operands),
-    // and only then destroy the block nodes.  The clones are unreachable until
-    // the preheader commit, so no original instruction can legitimately use a
-    // cloned definition at this point.
     for (BasicBlock *BB : Blocks) {
         for (Instruction *I : *BB) {
             if (!I || !I->getIRType() ||
@@ -1298,8 +1210,6 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(
 
     if (ValidateOnly) return true;
 
-    // Commit only after every PHI has been validated.  This avoids leaving a
-    // partially rewritten loop header if a later PHI is malformed.
     for (PhiRewritePlan &Plan : Plans) {
         if (Plan.Incoming.empty()) {
             Plan.Replacement =
@@ -1368,10 +1278,6 @@ bool LoopUnrollPass::addIncomingToExitPhisForPeeledBlocks(
         return false;
     }
 
-    // Guarded peeling keeps each cloned exit edge live.  Mirror the original
-    // exiting value through that iteration's value map before changing CFG;
-    // otherwise a zero/short-trip path would reach Exit with a missing PHI
-    // incoming edge.
     std::vector<PhiRewritePlan> Plans;
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
         if (!Phi) return false;
@@ -1462,8 +1368,6 @@ std::vector<BasicBlock *> LoopUnrollPass::collectExitRegionBlocksFrom(
                 if (!Succ || StopBlocks.count(Succ)) continue;
                 Successors.push_back(Succ);
             }
-            // The old explicit stack pushed successors in their natural order,
-            // so LIFO visited the last successor first.
             std::reverse(Successors.begin(), Successors.end());
             return Successors;
         },
@@ -3365,12 +3269,6 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         }
     }
 
-    // The stable-state proof established that this exact nested-loop header
-    // test takes the exit edge on every residual outer iteration.  Materialize
-    // the proven result now.  The peeled clone has its own cloned comparison,
-    // so the first iteration still executes the one-shot nested loop normally.
-    // CFG cleanup can then remove the unreachable residual body before LICM
-    // decides whether the readonly sibling call is reusable.
     if (Decision.StabilizedInnerExitCmp &&
         Decision.StabilizedInnerExitCmp->getParent()) {
         const bool ExitCondition =

@@ -1,12 +1,10 @@
 #include "ir/opt/LatePhiCleanup.hpp"
-
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
-
 #include <unordered_set>
 #include <vector>
 

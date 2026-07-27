@@ -9,9 +9,12 @@
 // CFGSimplifyPass:
 // 1) 消除死块
 // 2) 分支终结指令常量折叠
-// 3) 消除重复 PHI
-// 4) 基本块合并
-// 5) 分支结构化简（无条件/条件）
+// 3) 折叠已知分支条件
+// 4) 消除重复 PHI
+// 5）穿透布尔 PHI 节点的条件分支
+// 6) 规范化布尔 PHI 节点
+// 7) 合并基本块
+// 8) 简化条件分支
 class CFGSimplifyPass : public PassDescriptor<CFGSimplifyPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -45,6 +48,5 @@ private:
 	bool threadBranchOnPhi(Function &F, BasicBlock *BB);
 	bool mergeBlocks(Function &F);
 	bool simplifyUncondBranch(Function &F, BasicBlock *BB);
-	bool simplifyCondBranch(Function &F, BasicBlock *BB);
 	bool simplifyBranches(Function &F);
 };

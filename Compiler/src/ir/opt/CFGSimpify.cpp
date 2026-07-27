@@ -6,6 +6,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -34,9 +35,9 @@ const std::vector<BasicBlock *> &CFGSimplifyPass::predecessorsOf(
 	return It == Preds.end() ? Empty : It->second;
 }
 
-// Return whether A and B denote the same boolean condition.  Negated is true
-// when A == !B.  Keep this deliberately small and purely syntactic: it is used
-// by CFG simplification, where a false positive would select the wrong edge.
+//第三个优化：折叠已知分支条件的接口：判断该块和前驱块条件分支指令是否相同或相反
+//如果均不存在那么是推导不出的
+//A：当前块的条件分支指令的条件值，B：前驱块的条件分支指令的条件值
 bool CFGSimplifyPass::matchBooleanCondition(
 	Value *A, Value *B, bool &Negated) {
 	Negated = false;
@@ -46,6 +47,7 @@ bool CFGSimplifyPass::matchBooleanCondition(
 		return false;
 	}
 
+    //处理A，B如果是XOR的情况，剥离掉XOR指令
 	auto stripNot = [](Value *V, bool &Parity) -> Value * {
 		Parity = false;
 		while (auto *BI = dynamic_cast<BinaryInst *>(V)) {
@@ -69,7 +71,7 @@ bool CFGSimplifyPass::matchBooleanCondition(
 		}
 		return V;
 	};
-
+    //然后判断A和B是否相同或相反
 	bool NotA = false;
 	bool NotB = false;
 	A = stripNot(A, NotA);
@@ -79,8 +81,7 @@ bool CFGSimplifyPass::matchBooleanCondition(
 		return true;
 	}
 
-	// Integer comparisons with identical operands are also safe to correlate.
-	// Do not infer logical complements for the floating unordered predicates.
+    //如果A和B都是比较指令，且操作数相同，则判断它们的比较操作码是否相同或相反
 	auto *CA = dynamic_cast<BinaryInst *>(A);
 	auto *CB = dynamic_cast<BinaryInst *>(B);
 	Value *AL = nullptr;
@@ -118,9 +119,6 @@ bool CFGSimplifyPass::matchBooleanCondition(
 	return true;
 }
 
-// Map one arm of Controller's branch to the predecessor through which that
-// arm reaches Merge.  A short unique-predecessor trampoline chain is allowed;
-// this covers the common diamond and "direct edge + trampoline" shapes.
 BasicBlock *CFGSimplifyPass::resolveArmIncomingPred(
 	BasicBlock *Controller, BasicBlock *Arm, BasicBlock *Merge,
 	const PredecessorMap &Preds) {
@@ -145,10 +143,6 @@ BasicBlock *CFGSimplifyPass::resolveArmIncomingPred(
 	return nullptr;
 }
 
-// A controller accepted by resolveArmIncomingPred can be at most four unique-
-// predecessor trampoline edges above an incoming block.  Walking those local
-// ancestors avoids scanning every block (and rescanning every predecessor)
-// for each boolean PHI in a large function.
 std::vector<BasicBlock *> CFGSimplifyPass::collectControllerCandidates(
 	BasicBlock *IncomingPred, const PredecessorMap &Preds) {
 	std::vector<BasicBlock *> Result;
@@ -162,11 +156,12 @@ std::vector<BasicBlock *> CFGSimplifyPass::collectControllerCandidates(
 	return Result;
 }
 
-//消除死块
+//1.消除死块
 bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 	bool Changed = false;
 	BasicBlock *Entry = F.front();
 
+    //将函数中的基本块复制到一个临时的vector中，避免在删除过程中迭代器失效
 	auto Blocks = snapshotPointers(F);
     //排除入口块之后，检查前驱块：没有/唯一的前驱是自己，满足条件删除
 	for (BasicBlock *BB : Blocks) {
@@ -179,8 +174,8 @@ bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 
 		auto Succs = BB->getSuccessors();
 		for (BasicBlock *Succ : Succs) {
+            //删除前先维护后继块的PHI
 			int EdgeCnt = BB->countEdgesToSucc(Succ);
-            //如果该基本块到后继的边删除了：调用下面这个函数就更新掉后继中PHI来自该基本块的输入值
 			if (EdgeCnt > 0) BasicBlock::removeEdgeFromSuccPhis(Succ, BB, EdgeCnt);
 		}
         //删除基本块连同里面的所有指令
@@ -190,7 +185,7 @@ bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 
 	return Changed;
 }
-//终结指令常量折叠
+//2.终结指令常量折叠
 bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 	bool Changed = false;
 
@@ -205,6 +200,7 @@ bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 		auto *FalseBB = Br->getFalseSuccessor();
 		if (!TrueBB || !FalseBB) continue;
 
+        //2.1如果条件分支的两个后继块相同，则删除一条多余的边，改为无条件分支
 		if (TrueBB == FalseBB) {
 			// cond 分支两条边都到同一个块：删掉一条多余边
 			BasicBlock::removeEdgeFromSuccPhis(TrueBB, BB, 1);
@@ -214,6 +210,7 @@ bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 		}
 
 		bool CondVal = false;
+        //2.2如果条件分支的条件是常量，则根据常量值选择一条边，删除另一条边，改为无条件分支
 		if (!Cond || !Cond->tryGetBoolConst(CondVal)) continue;
 
 		BasicBlock *Taken = CondVal ? TrueBB : FalseBB;
@@ -226,13 +223,12 @@ bool CFGSimplifyPass::foldTerminatorBranches(Function &F) {
 
 	return Changed;
 }
-//消除重复PHI节点
+//4.消除重复PHI节点
 bool CFGSimplifyPass::eliminateDuplicatePhis(Function &F) {
 	bool Changed = false;
 
 	for (BasicBlock *BB : F) {
 		if (!BB) continue;
-
 		bool LocalChanged = true;
 		while (LocalChanged) {
 			LocalChanged = false;
@@ -269,17 +265,10 @@ bool CFGSimplifyPass::eliminateDuplicatePhis(Function &F) {
 	return Changed;
 }
 
-// Canonicalize integer 0/1 PHIs into boolean SSA.  For an ordinary two-arm
-// diamond, remove the PHI entirely and reuse the controlling condition.  For
-// larger short-circuit graphs, keep an i1 PHI plus one zext; this preserves the
-// exact CFG semantics while exposing boolean folding to later passes.  An
-// existing i1 PHI is only changed by a trivial same-constant fold or the proven
-// diamond replacement; it never gets another PHI or a redundant zext wrapper.
+//6.规范化布尔PHI节点
 bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 	bool Changed = false;
 	auto Blocks = snapshotPointers(F);
-	// This routine only replaces instructions, so the predecessor cache remains
-	// valid for its whole invocation.
 	const PredecessorMap Preds = buildPredecessorMap(F);
 
 	for (BasicBlock *BB : Blocks) {
@@ -332,15 +321,239 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 
 			Value *BooleanValue = nullptr;
 			Instruction *InsertedNot = nullptr;
-			// The function entry has an implicit incoming edge which is absent from
-			// getPredecessors().  Never derive its current value from a loop backedge.
+
+			// Recover a bounded, single-entry short-circuit decision tree.  A
+			// multi-way constant PHI is often just the materialized result of
+			// `a && b` / `a || b`; rebuilding that boolean expression in the
+			// common controller removes the PHI without changing the CFG.  Child
+			// conditions are cloned only when they consist of speculatable binary
+			// operations whose operands can also be made available in the root.
+			if (BB != F.front() && Phi->getNumIncomingValues() >= 3) {
+				std::unordered_map<BasicBlock *, bool> IncomingBits;
+				bool UniqueIncomingPreds = true;
+				for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+					BasicBlock *Pred = Phi->getIncomingBlock(I);
+					if (!Pred || !IncomingBits.emplace(Pred, Bits[I]).second) {
+						UniqueIncomingPreds = false;
+						break;
+					}
+				}
+
+				BasicBlock *Root = nullptr;
+				if (UniqueIncomingPreds) {
+					auto FirstCandidates = collectControllerCandidates(
+						Phi->getIncomingBlock(0), Preds);
+					for (BasicBlock *Candidate : FirstCandidates) {
+						if (!Candidate || Candidate == BB ||
+							!BasicBlock::isCondBr(
+								Candidate->getBranchTerminator())) {
+							continue;
+						}
+
+						bool CommonToAll = true;
+						for (unsigned I = 1;
+							 I < Phi->getNumIncomingValues(); ++I) {
+							auto Candidates = collectControllerCandidates(
+								Phi->getIncomingBlock(I), Preds);
+							if (std::find(Candidates.begin(), Candidates.end(),
+										  Candidate) == Candidates.end()) {
+								CommonToAll = false;
+								break;
+							}
+						}
+						if (CommonToAll) {
+							Root = Candidate;
+							break;
+						}
+					}
+				}
+
+				if (Root) {
+					BrInst *RootBr = Root->getBranchTerminator();
+					constexpr unsigned MaxRegionDepth = 6;
+					constexpr unsigned MaxNewInstructions = 10;
+					unsigned NewInstructionCount = 0;
+					bool Failed = false;
+					std::vector<Instruction *> Created;
+					std::unordered_map<Value *, Value *> Materialized;
+					std::unordered_set<BasicBlock *> ActiveBlocks;
+					std::unordered_set<BasicBlock *> ConsumedIncomingPreds;
+
+					auto insertAtRoot = [&](Instruction *I) -> Value * {
+						if (!I || Failed ||
+							NewInstructionCount >= MaxNewInstructions ||
+							!Instruction::insertBefore(RootBr, I)) {
+							delete I;
+							Failed = true;
+							return nullptr;
+						}
+						++NewInstructionCount;
+						Created.push_back(I);
+						return I;
+					};
+
+					auto isSpeculatableBinary = [](BinaryInst::Operation Op) {
+						switch (Op) {
+							case BinaryInst::ADD:
+							case BinaryInst::SUB:
+							case BinaryInst::MUL:
+							case BinaryInst::AND:
+							case BinaryInst::OR:
+							case BinaryInst::XOR:
+							case BinaryInst::E:
+							case BinaryInst::NE:
+							case BinaryInst::L:
+							case BinaryInst::LE:
+							case BinaryInst::G:
+							case BinaryInst::GE:
+								return true;
+							default:
+								return false;
+						}
+					};
+
+					std::function<Value *(Value *)> materializeAtRoot;
+					materializeAtRoot = [&](Value *V) -> Value * {
+						if (!V || Failed || Value::isUndef(V)) return nullptr;
+						if (V->isConst() || V->isParam() || V->isGlobal()) return V;
+						auto *I = dynamic_cast<Instruction *>(V);
+						if (!I) return nullptr;
+						if (I->getParent() == Root) return I;
+						auto Cached = Materialized.find(V);
+						if (Cached != Materialized.end()) return Cached->second;
+
+						auto *BI = dynamic_cast<BinaryInst *>(I);
+						Value *L = nullptr;
+						Value *R = nullptr;
+						if (!BI || !ActiveBlocks.count(I->getParent()) ||
+							!isSpeculatableBinary(BI->getOp()) ||
+							!BinaryInst::getOperands(BI, L, R)) {
+							return nullptr;
+						}
+
+						Value *NewL = materializeAtRoot(L);
+						Value *NewR = materializeAtRoot(R);
+						if (!NewL || !NewR) return nullptr;
+						auto *Clone = new BinaryInst(NewL, BI->getOp(), NewR);
+						Value *Inserted = insertAtRoot(Clone);
+						if (Inserted) Materialized[V] = Inserted;
+						return Inserted;
+					};
+
+					auto makeNot = [&](Value *V) -> Value * {
+						if (!V || !IRType::isBool(V->getIRType())) return nullptr;
+						return insertAtRoot(BinaryInst::createBooleanNot(V));
+					};
+
+					auto combine = [&](Value *Cond, Value *TrueV,
+								   Value *FalseV) -> Value * {
+						if (!Cond || !TrueV || !FalseV) return nullptr;
+						bool T = false;
+						bool FBit = false;
+						const bool TC = TrueV->tryGetBoolConst(T);
+						const bool FC = FalseV->tryGetBoolConst(FBit);
+						if (TC && FC) {
+							if (T == FBit) return TrueV;
+							return T ? Cond : makeNot(Cond);
+						}
+						if (TC) {
+							if (T)
+								return insertAtRoot(new BinaryInst(
+									Cond, BinaryInst::OR, FalseV));
+							Value *Not = makeNot(Cond);
+							return Not ? insertAtRoot(new BinaryInst(
+								Not, BinaryInst::AND, FalseV)) : nullptr;
+						}
+						if (FC) {
+							if (!FBit)
+								return insertAtRoot(new BinaryInst(
+									Cond, BinaryInst::AND, TrueV));
+							Value *Not = makeNot(Cond);
+							return Not ? insertAtRoot(new BinaryInst(
+								Not, BinaryInst::OR, TrueV)) : nullptr;
+						}
+						return insertAtRoot(new SelectInst(Cond, TrueV, FalseV));
+					};
+
+					std::function<Value *(BasicBlock *, unsigned)> buildNode;
+					std::function<Value *(BasicBlock *, BasicBlock *, unsigned)>
+						buildArm;
+
+					buildArm = [&](BasicBlock *Controller, BasicBlock *Arm,
+								   unsigned Depth) -> Value * {
+						if (!Controller || !Arm || Depth > MaxRegionDepth)
+							return nullptr;
+						if (Arm == BB) {
+							auto It = IncomingBits.find(Controller);
+							if (It == IncomingBits.end() ||
+								!ConsumedIncomingPreds.insert(Controller).second)
+								return nullptr;
+							return ConstBool::newConstBool(It->second);
+						}
+
+						BasicBlock *Cur = Arm;
+						BasicBlock *Previous = Controller;
+						for (unsigned D = Depth; D <= MaxRegionDepth; ++D) {
+							const auto &CurPreds = predecessorsOf(Cur, Preds);
+							if (CurPreds.size() != 1 || CurPreds.front() != Previous)
+								return nullptr;
+							BrInst *Br = Cur->getBranchTerminator();
+							if (BasicBlock::isCondBr(Br)) return buildNode(Cur, D);
+							if (!BasicBlock::isUncondBr(Br)) return nullptr;
+							if (!ActiveBlocks.insert(Cur).second) return nullptr;
+							for (Instruction *I : *Cur) {
+								if (I != Br) return nullptr;
+							}
+
+							BasicBlock *Next = Br->getSuccessor(0);
+							if (Next == BB) {
+								auto It = IncomingBits.find(Cur);
+								if (It == IncomingBits.end() ||
+									!ConsumedIncomingPreds.insert(Cur).second)
+									return nullptr;
+								return ConstBool::newConstBool(It->second);
+							}
+							if (!Next || Next == Cur || Next == Controller) return nullptr;
+							Previous = Cur;
+							Cur = Next;
+						}
+						return nullptr;
+					};
+
+					buildNode = [&](BasicBlock *Node, unsigned Depth) -> Value * {
+						if (!Node || Depth > MaxRegionDepth ||
+							!ActiveBlocks.insert(Node).second) {
+							return nullptr;
+						}
+						BrInst *Br = Node->getBranchTerminator();
+						if (!BasicBlock::isCondBr(Br) ||
+							Br->getTrueSuccessor() == Br->getFalseSuccessor()) {
+							return nullptr;
+						}
+						Value *Cond = materializeAtRoot(Br->getCondition());
+						Value *TrueV = buildArm(
+							Node, Br->getTrueSuccessor(), Depth + 1);
+						Value *FalseV = buildArm(
+							Node, Br->getFalseSuccessor(), Depth + 1);
+						return combine(Cond, TrueV, FalseV);
+					};
+
+					Value *Candidate = buildNode(Root, 0);
+					if (!Failed && Candidate &&
+						ConsumedIncomingPreds.size() == IncomingBits.size()) {
+						BooleanValue = Candidate;
+					} else {
+						for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+							delete *It;
+					}
+				}
+			}
+
 			if (BB != F.front() && Phi->getNumIncomingValues() == 2 &&
 				Bits[0] != Bits[1]) {
 				BasicBlock *P0 = Phi->getIncomingBlock(0);
 				BasicBlock *P1 = Phi->getIncomingBlock(1);
 				if (!P0 || !P1 || P0 == P1) {
-					// Duplicate predecessor entries are edge-order-sensitive in this IR;
-					// a block identity alone cannot tell which value is the true arm.
 					P0 = nullptr;
 				}
 				auto P0Candidates = collectControllerCandidates(P0, Preds);
@@ -439,43 +652,43 @@ bool CFGSimplifyPass::normalizeBooleanPhis(Function &F) {
 	return Changed;
 }
 
-// Correlate a block's condition with the condition on every incoming edge.
-// When all predecessors imply the same truth value, fold the branch.  A
-// trivial block then becomes an unconditional trampoline and the existing
-// simplifier performs the actual jump threading.
+//3.折叠已知分支条件
 bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 	bool Changed = false;
 	auto Blocks = snapshotPointers(F);
 
 	for (BasicBlock *BB : Blocks) {
-		// The function entry also has an implicit predecessor.  Looking only at
-		// explicit CFG predecessors there would let a loop backedge incorrectly
-		// determine the entry block's condition on its first/current execution.
+        //3.1筛选基本块：拥有含变量条件Cond的条件分支，且至少有一个前驱块
 		if (!BB || BB == F.front()) continue;
 		auto *Br = BB->getBranchTerminator();
 		if (!BasicBlock::isCondBr(Br)) continue;
 		Value *Cond = Br->getCondition();
 		if (!Cond) continue;
-
 		auto Preds = BB->getPredecessors();
 		if (Preds.empty()) continue;
+
+        //已经从至少一个前驱推导出当前条件值
 		bool HaveKnown = false;
+        //保存所有前驱共同证明的条件值
 		bool KnownValue = false;
+        //每个前驱都能推导出条件值，所有前驱推导出的条件值完全一致
 		bool AllKnownAndEqual = true;
 
 		for (BasicBlock *Pred : Preds) {
-			// An edge from the block to itself describes the previous iteration's
-			// condition, not the condition recomputed in the current iteration.
+            //前驱不能包含自己
 			if (Pred == BB) {
 				AllKnownAndEqual = false;
 				break;
 			}
+
+            //前驱必须是条件分支
 			auto *PBr = Pred ? Pred->getBranchTerminator() : nullptr;
 			if (!BasicBlock::isCondBr(PBr)) {
 				AllKnownAndEqual = false;
 				break;
 			}
 
+            //判断通过前驱的哪条分支进入当前块
 			bool EdgeValue = false;
 			if (PBr->getTrueSuccessor() == BB &&
 				PBr->getFalseSuccessor() != BB) {
@@ -494,6 +707,17 @@ bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 				break;
 			}
 			bool ThisValue = EdgeValue ^ Negated;
+            /*
+            EdgeValue = PredCond 的值
+            Negated   = BBCond 是否等于 !PredCond
+            EdgeValue  Negated	ThisValue	      含义
+            false	   false	false	    条件相同，前驱条件为假
+            true	   false	true	    条件相同，前驱条件为真
+            false	   true	    true	    当前条件是前驱条件的非
+            true	   true	    false	    当前条件是前驱条件的非
+            */
+
+            //汇总所有前驱的推导结果
 			if (!HaveKnown) {
 				HaveKnown = true;
 				KnownValue = ThisValue;
@@ -503,12 +727,14 @@ bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 			}
 		}
 
+        //确定保留和删除的后继
 		if (!HaveKnown || !AllKnownAndEqual) continue;
 		BasicBlock *Taken = KnownValue ? Br->getTrueSuccessor()
 								   : Br->getFalseSuccessor();
 		BasicBlock *Untaken = KnownValue ? Br->getFalseSuccessor()
 									 : Br->getTrueSuccessor();
 		if (!Taken || !Untaken) continue;
+        //进行删除并维护PHI
 		if (Taken != Untaken)
 			BasicBlock::removeEdgeFromSuccPhis(Untaken, BB, 1);
 		if (BasicBlock::replaceCondBrWithUncond(BB, Taken)) Changed = true;
@@ -517,21 +743,35 @@ bool CFGSimplifyPass::foldKnownBranchConditions(Function &F) {
 	return Changed;
 }
 
-// Thread every incoming edge through a branch whose condition is a constant
-// PHI on that edge:
-//
-//   P0 --\                 P0 ----> T
-//         B: c = phi       P1 ----> F
-//   P1 --/   br c
-//
-// B must contain only PHIs and the branch.  Unlike cloning-based jump
-// threading this never duplicates work.  Successor PHIs are expanded with the
-// edge-specific values from B before the block is removed.
+//5.穿透布尔PHI节点的条件分支
+/*
+优化前：
+   P0 --\
+         B: c = phi
+   P1 --/   br c
+
+  B:
+  %c = phi i1 [ true, %P0 ], [ false, %P1 ]
+  br i1 %c, label %T, label %F
+优化后：
+  P0 ----> T
+  P1 ----> F
+*/
 bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 	if (!BB || BB == F.front()) return false;
 	auto *Br = BB->getBranchTerminator();
 	if (!BasicBlock::isCondBr(Br)) return false;
 
+    //1.识别分支条件PHI
+    /*
+    两种形式：
+    %cond = phi i1 [ true, %P0 ], [ false, %P1 ]
+    br i1 %cond, label %T, label %F
+
+    %cond = phi i1 [ true, %P0 ], [ false, %P1 ]
+    %not = xor i1 %cond, true
+    br i1 %not, label %T, label %F
+    */
 	PhiInst *CondPhi = dynamic_cast<PhiInst *>(Br->getCondition());
 	BinaryInst *CondNot = nullptr;
 	bool Negated = false;
@@ -553,10 +793,12 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 	}
 	if (!CondPhi || CondPhi->getParent() != BB) return false;
 
+    //要求当前块除了分支指令、条件非指令和PHI指令之外没有其他指令
 	for (Instruction *I : *BB) {
 		if (I == Br || I == CondNot || dynamic_cast<PhiInst *>(I)) continue;
 		return false;
 	}
+    //Cond只能被分支使用
 	if (CondNot) {
 		for (Use *U : CondNot->getUses()) {
 			if (!U || U->getValue() != CondNot) continue;
@@ -571,6 +813,7 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 		return false;
 	}
 
+    //要求条件 PHI 的 incoming 数量 = BB 的不同前驱数量
 	auto Preds = BB->getPredecessors();
 	if (Preds.empty() || CondPhi->getNumIncomingValues() != Preds.size())
 		return false;
@@ -589,8 +832,6 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 		Destination[Pred] = Bit ? TrueBB : FalseBB;
 	}
 
-	// Every PHI in B must have one unambiguous value per incoming block.  Its
-	// uses may only be the branch or a successor PHI on B's outgoing edge.
 	auto BBPhis = BB->collectPhiNodes();
 	for (PhiInst *Phi : BBPhis) {
 		if (!Phi || Phi->getNumIncomingValues() != Preds.size()) return false;
@@ -619,17 +860,12 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 		}
 	}
 
-	// A predecessor that already reaches the chosen destination would create
-	// duplicate predecessor entries.  The IR cannot attach distinct PHI values
-	// to those edges, so reject that shape whenever the destination has PHIs.
 	for (BasicBlock *Pred : Preds) {
 		BasicBlock *Dest = Destination[Pred];
 		if (!Dest->collectPhiNodes().empty() && Pred->countEdgesToSucc(Dest) != 0)
 			return false;
 	}
 
-	// Build all successor-PHI rewrites before mutating the CFG.  An incoming
-	// value defined by a PHI in B is translated to that PHI's value on Pred->B.
 		std::vector<BranchPhiRewrite> Rewrites;
 	for (BasicBlock *Dest : {TrueBB, FalseBB}) {
 		for (PhiInst *Phi : Dest->collectPhiNodes()) {
@@ -675,25 +911,24 @@ bool CFGSimplifyPass::threadBranchOnPhi(Function &F, BasicBlock *BB) {
 	BB->eraseBlockSafely();
 	return true;
 }
-//合并基本块
+//7.合并基本块
 bool CFGSimplifyPass::mergeBlocks(Function &F) {
 	bool Changed = false;
 	BasicBlock *Entry = F.front();
-
 	auto Blocks = snapshotPointers(F);
 
 	for (BasicBlock *BB : Blocks) {
 		if (!BB || BB == Entry) continue;
 
+        //该块只有一个前驱，该前驱只有一个后继
 		auto Preds = BB->getPredecessors();
 		if (Preds.size() != 1) continue;
-
 		BasicBlock *Pred = Preds[0];
 		if (!Pred || Pred == BB) continue;
-
 		auto PredSuccs = Pred->getSuccessors();
 		if (PredSuccs.size() != 1 || PredSuccs[0] != BB) continue;
 
+        //检查是否有自引用的 PHI 节点，如果有则跳过合并
 		bool HasSelfRefPhi = false;
 		for (PhiInst *Phi : BB->collectPhiNodes()) {
 			if (!Phi) continue;
@@ -707,7 +942,7 @@ bool CFGSimplifyPass::mergeBlocks(Function &F) {
 
 		auto Succs = BB->getSuccessors();
 
-		// 1) 处理当前块中的 PHI（唯一前驱场景）
+		// 1)该块中的PHI一定是单incoming的，所以可以直接把PHI的incoming替换为前驱块的值，然后删除PHI
 		for (PhiInst *Phi : BB->collectPhiNodes()) {
 			if (!Phi) continue;
 			Value *InV = Phi->getIncomingFromPred(Pred);
@@ -756,11 +991,6 @@ bool CFGSimplifyPass::simplifyUncondBranch(Function &F, BasicBlock *BB) {
 	auto Preds = BB->getPredecessors();
 	if (Preds.empty()) return false;
 
-	// If Succ has PHIs, overlapping predecessors would create two incoming
-	// edges from the same block whose edge-specific values cannot be represented
-	// unambiguously by this IR.  Without PHIs, redirecting is always safe and a
-	// subsequent fold turns the resulting two-way-to-one-way branch into an
-	// unconditional jump.
 	auto SuccPhis = Succ->collectPhiNodes();
 	std::unordered_set<BasicBlock *> SuccPredSet;
 	for (BasicBlock *P : Succ->getPredecessors()) {
@@ -848,24 +1078,27 @@ PreservationStatus CFGSimplifyPass::run(Function &F, FunctionAnalysisPassManager
 	bool ChangedAny = false;
 
 	while (true) {
+        //必须迭代到不动点，因为这些子优化会互相创造优化机会
 		bool Changed = false;
-
+        //1.消除死块
 		Changed |= removeDeadBlocks(F);
+        //2.终结指令常量折叠
 		Changed |= foldTerminatorBranches(F);
+        //3.折叠已知分支条件
 		Changed |= foldKnownBranchConditions(F);
+        //4.消除重复PHI节点
 		Changed |= eliminateDuplicatePhis(F);
-		// Thread while the edge-specific constants are still represented by a
-		// PHI.  normalizeBooleanPhis may replace a two-arm PHI with its remote
-		// controller condition, which is useful algebraically but would lose the
-		// local edge facts needed by this zero-duplication transform.
 		{
 			auto Blocks = snapshotPointers(F);
 			for (BasicBlock *BB : Blocks) {
 				if (BB) Changed |= threadBranchOnPhi(F, BB);
 			}
 		}
+        //6.
 		Changed |= normalizeBooleanPhis(F);
+        //7.合并基本块
 		Changed |= mergeBlocks(F);
+        //8.简化条件分支
 		Changed |= simplifyBranches(F);
 
 		ChangedAny |= Changed;

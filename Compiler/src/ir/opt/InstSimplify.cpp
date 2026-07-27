@@ -184,7 +184,24 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 		if (!CommonL && !CommonR) return nullptr;
 	}
 
-	if (CommonL && CommonR) return nullptr;
+	// Every incoming computes the exact same binary expression in its own
+	// predecessor.  None of those predecessor-local instructions necessarily
+	// dominates the merge, so reusing `First` would be invalid SSA.  Rebuild the
+	// expression after the PHIs instead; its common operands must be available
+	// on every path into the block.
+	if (CommonL && CommonR) {
+		if (!DT || !DT->dominatesValue(CommonL, Phi) ||
+			!DT->dominatesValue(CommonR, Phi)) {
+			return nullptr;
+		}
+
+		auto *NewBin = new BinaryInst(CommonL, Op, CommonR);
+		if (!BasicBlock::insertAfterPhiNodes(Phi->getParent(), NewBin)) {
+			delete NewBin;
+			return nullptr;
+		}
+		return NewBin;
+	}
 
 	Value *SampleUncommon = nullptr;
 	if (CommonL) {

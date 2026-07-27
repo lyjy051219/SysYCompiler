@@ -476,6 +476,11 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
 
+    // 标量规范化会把原先不同写法的实参合并为同一 SSA 值；再次运行
+    // DAE 捕获新暴露的局部参数等价类，并立即清理特化副本。
+    MPM.addPass(DAEPass());
+    MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
+
     // 清理阶段可能删除最后一个无副作用 call，再跑一次模块级 DFE 收掉新暴露的死函数。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
 
@@ -496,6 +501,11 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     // Phase 4.5: Post-loop cleanup
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildPostLoopCleanupPipeline(), FAM), 1));
+
+    // 循环展开、LICM 与 post-loop GVN 可能复制或规范化调用点。最后一轮
+    // DAE 放在记忆化之前，避免把记忆化生成的缓存 CFG 和逐参数键逻辑克隆。
+    MPM.addPass(DAEPass());
+    MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
 
     // 循环 DCE/CFG 清理后做最终函数图收敛，避免 late/backend 继续处理死函数体。
     MPM.addPass(DeadFunctionEliminationPass(FAM));
