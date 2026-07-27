@@ -6,6 +6,7 @@
 
 #include <unordered_set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 StoreOnlyGlobalEliminationPass::StoreOnlyGlobalEliminationPass(
@@ -92,40 +93,58 @@ void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
     escape = true;
 }
 
-// 简化版：trace 单一 ptr，成功返回 base 和常量索引序列（若全常量）。
-// 失败（PHI / 多 base / 未知）返回 base=nullptr 或 hasVarIdx/unresolved=true。
+// 追踪单一地址到全局根，并按“根 GEP 到叶 GEP”的顺序拼接常量索引。
+// 只反转 GEP 层级，不能反转同一条 GEP 内的多维索引；改变对象形状的
+// bitcast 无法保持索引含义，按 unresolved 处理。
 StoreOnlyGlobalTraceResult
 StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
     StoreOnlyGlobalTraceResult R;
-    std::vector<int64_t> idx;
+    std::vector<std::vector<int64_t>> PathSegments;
     Value *cur = ptr;
     int depth = 0;
     while (cur && depth < 32) {
         if (auto *var = dynamic_cast<Variable*>(cur)) {
             R.base = var;
-            // 反转：from base 往 leaf，读 GEP 时我们是从 leaf 往 base
-            for (auto it = idx.rbegin(); it != idx.rend(); ++it)
-                R.constPath.push_back(*it);
+            // 只反转 GEP 层级，不反转同一条 GEP 内的索引顺序。
+            for (auto Segment = PathSegments.rbegin();
+                 Segment != PathSegments.rend(); ++Segment)
+                R.constPath.insert(
+                    R.constPath.end(), Segment->begin(), Segment->end());
             return R;
         }
         if (auto *gep = dynamic_cast<GetElementPtrInst*>(cur)) {
-            if (gep->getNumOperands() == 0) { R.unresolved = true; return R; }
-            // UL[1..] 是索引，累积（全常量才有意义）
-            forEachOperand(
-                gep, [&](size_t I, Use *, Value *vi) {
-                if (I == 0) return;
-                if (auto *ci = dynamic_cast<ConstInt*>(vi)) {
-                    idx.push_back((int64_t)ci->getVal());
-                } else {
+            Value *Base = gep->getBasePointer();
+            if (!Base || gep->getNumIndices() == 0) {
+                R.unresolved = true;
+                return R;
+            }
+
+            std::vector<int64_t> Segment;
+            for (size_t I = 0; I < gep->getNumIndices(); ++I) {
+                auto *CI = dynamic_cast<ConstInt *>(gep->getIndex(I));
+                if (!CI) {
                     R.hasVarIdx = true;
+                    continue;
                 }
-            });
-            cur = gep->getOperand(0);
+                int64_t Index = static_cast<int64_t>(CI->getVal());
+                Segment.push_back(Index);
+            }
+            PathSegments.push_back(std::move(Segment));
+
+            cur = Base;
             depth++;
             continue;
         }
         if (auto *bc = dynamic_cast<BitCastInst*>(cur)) {
-            cur = bc->getOperand(0);
+            Value *Source = bc->getUnaryOperand();
+            auto SourceTy = Value::getPointeeType(Source);
+            auto DestinationTy = Value::getPointeeType(bc);
+            if (!Source ||
+                !IRType::hasSameShape(SourceTy, DestinationTy)) {
+                R.unresolved = true;
+                return R;
+            }
+            cur = Source;
             if (!cur) { R.unresolved = true; return R; }
             depth++;
             continue;
@@ -390,7 +409,9 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     Value *ptr = LI->getPointerOperand();
                     if (!ptr) return true;
                     StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
-                    if (tr.base == G) {
+                    if (tr.base == G &&
+                        IRType::hasSameShape(
+                            LI->getIRType(), inner)) {
                         // 只处理标量 load：GEP 路径必须是 {0}（即直接取值）
                         if (!tr.hasVarIdx && !tr.unresolved &&
                             tr.constPath.size() == 1 && tr.constPath[0] == 0)

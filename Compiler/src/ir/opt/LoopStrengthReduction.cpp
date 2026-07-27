@@ -284,6 +284,10 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
         BasicBlock *PreHeader = nullptr;
         BasicBlock *Latch = nullptr;
         if (!L || !L->getLoopSimplifyForm(PreHeader, Latch)) continue;
+        // 指针归纳变量复用整数归纳关系；只有 SCEV 证明整个迭代域无回绕，
+        // 才能把原 i32 索引递推改写为地址递推。
+        auto Trip = SE.analyzeLoopTripCount(L);
+        if (!Trip || !Trip->Valid || !Trip->ProvenNoWrap) continue;
 
         BasicBlock *Header = L->getHeader();
         if (!PreHeader || !Header || !Latch) continue;
@@ -895,6 +899,21 @@ bool LoopStrengthReductionPass::rewriteExactGroup(LSRGroup &Group, const Dominat
 bool LoopStrengthReductionPass::rewriteOffsetGroup(OffsetReuseGroup &Group,
                                const DominatorTree &DT,
                                std::vector<Instruction *> &DeadSeeds) {
+    // 非零偏移地址只能在全部原 GEP 所在的同一块、原执行位置生成。
+    // 把它提升到 header 会让零次或退出检查额外形成越界 inbounds 地址。
+    std::unordered_map<int64_t, BasicBlock *> OffsetBlocks;
+    for (LSRCandidate *C : Group.Items) {
+        if (!C || !C->StartConst || !C->OldGEP ||
+            !C->OldGEP->getParent())
+            return false;
+        int64_t Offset = *C->StartConst - Group.AnchorStart;
+        if (Offset == 0) continue;
+        auto [It, Inserted] =
+            OffsetBlocks.emplace(Offset, C->OldGEP->getParent());
+        if (!Inserted && It->second != C->OldGEP->getParent())
+            return false;
+    }
+
     std::vector<Value *> StartIndices;
     if (!materializePrefix(Group.Prefix, Group.L, Group.PreHeader, DT,
                            StartIndices)) {
@@ -951,8 +970,11 @@ bool LoopStrengthReductionPass::rewriteOffsetGroup(OffsetReuseGroup &Group,
                 }
             }
         }
-        if (!Instruction::insertBefore(InsertBefore, OffsetGEP))
-            Group.Header->insertAfterPhiNodes(OffsetGEP);
+        if (!InsertBefore ||
+            !Instruction::insertBefore(InsertBefore, OffsetGEP)) {
+            delete OffsetGEP;
+            return false;
+        }
         OffsetValues.emplace(Offset, OffsetGEP);
     }
 

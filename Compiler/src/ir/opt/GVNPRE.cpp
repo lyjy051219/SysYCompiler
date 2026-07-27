@@ -10,11 +10,14 @@
 GVNPREPass::GVNPREPass(bool EnablePRE) : EnablePRE(EnablePRE) {}
 
 bool ExprKey::operator==(const ExprKey &RHS) const {
-    return Opcode == RHS.Opcode && Args == RHS.Args;
+    return Opcode == RHS.Opcode && ResultType == RHS.ResultType &&
+           Args == RHS.Args;
 }
 
 std::size_t ExprKeyHash::operator()(const ExprKey &K) const {
     std::size_t H = static_cast<std::size_t>(K.Opcode);
+    const auto TypeHash = reinterpret_cast<std::uintptr_t>(K.ResultType);
+    H ^= TypeHash + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
     for (int V : K.Args) {
         auto X = static_cast<std::size_t>(static_cast<std::uint32_t>(V));
         H ^= X + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
@@ -491,7 +494,7 @@ int GVNPRESolver::getOrAssignValueNum(Value *V, bool &IsFresh) {
 }
 
 bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
-    if (!I) return false;
+    if (!I || !I->getIRType()) return false;
 
     auto appendOperands = [&](Instruction *Inst, std::vector<int> &Args) {
         forEachOperand(
@@ -503,6 +506,9 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 
     K.Args.clear();
     K.Opcode = (static_cast<unsigned>(I->instType) << 8);
+    // 转换、GEP 和 select 可以具有相同操作码及操作数、但产生不同类型。
+    // 类型必须进入全局值编号键，避免把不同目标类型的值错误 RAUW。
+    K.ResultType = I->getIRType().get();
 
     if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
         Value *LHS = nullptr;
@@ -540,8 +546,8 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 
     if (I->instType == Instruction::CALL) {
         auto *CI = dynamic_cast<CallInst *>(I);
-        if (!CI) return false;
-        if (getCallModRef(CI) != ModRefInfo::NoModRef) {
+        if (!CI || getCallModRef(CI) != ModRefInfo::NoModRef ||
+            !isCallCSEEligible(CI)) {
             return false;
         }
         appendOperands(I, K.Args);
@@ -580,6 +586,27 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
     }
 
     return ModRefInfo::ModRef;
+}
+
+bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
+    if (!CI || CI->getBuiltinCallee() || !CI->getIRType() ||
+        CI->getIRType()->isVoid() || CI->getIRType()->isPointer())
+        return false;
+
+    Function *Callee = CI->getDirectCallee();
+    if (!Callee || CI->getArgCount() != Callee->getParamCount())
+        return false;
+
+    ModRefInfo MRI = getCallModRef(CI);
+    if (!isNoModRef(MRI) && MRI != ModRefInfo::Ref)
+        return false;
+
+    // SideEffectAnalysis 会把 SysY I/O、计时及其 wrapper 的 hasBuiltin
+    // 沿调用图传播。它们可能依赖输入或外部环境，不能进行调用 CSE；
+    // 普通纯函数则无需因递归、undef 或合法纯算术被一概禁用。
+    const SideEffectInfo &Effects =
+        FAM.getResult<SideEffectAnalysis>(*Callee);
+    return !Effects.hasBuiltin;
 }
 
 std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
@@ -836,7 +863,9 @@ bool GVNPRESolver::processCall(Instruction *I) {
     auto *CI = dynamic_cast<CallInst *>(I);
     if (!CI) return false;
 
-    if (getCallModRef(CI) != ModRefInfo::Ref) return false;
+    if (getCallModRef(CI) != ModRefInfo::Ref ||
+        !isCallCSEEligible(CI))
+        return false;
 
     BasicBlock *BB = I->getParent();
     if (!BB) return false;
@@ -1023,7 +1052,6 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         I->instType == Instruction::LOAD   || I->instType == Instruction::STORE) {
         return true;
     }
-
     if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
         if (BinaryInst::isCompareOp(BI->getOp())) return true;
     }
@@ -1037,10 +1065,9 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         return true;
     }
 
-    // PRE may insert an expression on a path where it did not previously
-    // execute.  Even a memory-pure call may trap or fail to return, so calls
-    // are only eliminated by the dominating-call GVN path and are never
-    // speculated by PRE.
+    // PRE 可能把表达式放到原本不执行它的路径。即使 call 不修改内存，
+    // 也可能失败或不返回，因此 call 只允许走支配关系成立的 GVN 消除，
+    // 绝不由 PRE 投机插入。
     if (dynamic_cast<CallInst *>(I)) return true;
 
     return false;

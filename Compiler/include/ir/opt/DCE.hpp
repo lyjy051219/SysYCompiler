@@ -2,6 +2,7 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
+#include <cstddef>
 #include <unordered_map>
 
 // 死代码消除 (Dead Code Elimination)
@@ -28,7 +29,7 @@ private:
 		CallInst *CI, FunctionAnalysisPassManager &FAM);
 };
 
-// Reusable helper: classify whether a call has observable side effects.
+// 可复用的调用可观察副作用判定。
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM);
 
 // 共享的“无环且所有 CFG 路径都返回”结构证明。
@@ -36,24 +37,20 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM);
 // 调用方仍需分别检查指令与内存行为。
 bool hasAcyclicReturningCFG(Function &F);
 
-// Return true only when I is an integer shift whose constant amount is in the
-// half-open range [0, bitwidth(lhs)).  A dynamic, ill-typed or out-of-range
-// shift is deliberately not classified as safe to speculate or reuse as a
-// defined-value proof.  Dead-code removal itself follows poison semantics.
-//
-// This legality predicate is shared by DCE's whole-function scan,
-// IfConversion and LICM so they cannot silently disagree for non-i32 values.
+// 仅当 I 是整数移位且常量移位量位于 [0, bitwidth(lhs)) 时返回 true。
+// 动态、类型错误或越界移位不能作为可投机执行或“值有定义”的证据。
+// DCE、IfConversion 与 LICM 共用该判定，避免在非 i32 类型上规则不一致。
 bool hasDefinedConstantShiftAmount(const Instruction *I);
 
-// Return true for context-independent observable execution not already
-// classified by each caller (stores, calls and terminators are handled there).
-// At present the IR has no volatile, atomic, or constrained arithmetic
-// instruction, so ordinary loads and poison-producing arithmetic are
-// deliberately not preserved.
+// 在有界 def-use 图中检查值是否显式或传递依赖 undef。该接口只供确实
+// 需要“值稳定”证明的变换使用；普通折叠、GVN 与死代码删除不得全局套用。
+bool valueMayDependOnUndef(
+	const Value *V, std::size_t MaxVisitedValues = 256);
+
+// 返回 true 表示即使结果无人使用，也必须保留该指令的执行。
+// 普通 undef/poison 仍按本 IR 的通用语义处理；这里只有显式可观察行为
+// 或未知指令种类需要强制保留。
 bool dceInstructionMustBePreserved(Instruction *I);
 
-// A separate predicate for motion/speculation.  Pure operations may be legal
-// to delete when dead but illegal to move onto paths where they did not execute
-// originally.  Keeping this separate prevents DCE policy from silently
-// weakening LICM or peeling legality.
+// 用于移动或投机执行的统一危险指令判定；不用于普通死代码删除。
 bool instructionMayFaultOrProducePoison(const Instruction *I);

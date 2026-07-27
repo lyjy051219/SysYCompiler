@@ -327,6 +327,9 @@ private:
     static bool canMaterializeSCEV(
         const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
         const DominatorTree &DT);
+    // SCEV 的 Div/Mod 只有在除数为通用安全常量时才允许搬到预头；
+    // 未证明的动态除数、零和 -1 都保留在原控制流中。
+    static bool hasSafeSCEVDivisor(const SCEVExpr *E);
     static Value *materializeSCEV(
         const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
         const DominatorTree &DT,

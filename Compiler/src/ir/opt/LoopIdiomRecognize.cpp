@@ -6,6 +6,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/GepOpt.hpp"
 #include "lib/IRUtils.hpp"
 
 #include <cstring>
@@ -279,7 +280,7 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
 
 bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     Function &F, const CopyLoopMatch &First,
-    const CopyLoopMatch &Second, DominatorTree &DT,
+    const CopyLoopMatch &Second, DominatorTree &DT, RangeInfo &RI,
     bool &CFGChanged) {
     if (!First.L || !Second.L || First.L == Second.L ||
         First.ExitBlock != Second.PreHeader ||
@@ -379,14 +380,22 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         !AvailableAt(First.RuntimeBound, First.PreHeader))
         return false;
 
+    // 只校验将被提升到循环外并传给 intrinsic 的实际起始地址；循环体内
+    // 原有访存仍由原控制流约束，不额外施加整对象静态边界门禁。
     GetElementPtrInst *SourceStart = materializeStartPointer(
         First.Source, First.IndVar, First.Start, First.PreHeader);
-    if (!SourceStart) return false;
+    if (!SourceStart ||
+        !gepIsProvablyWithinKnownObject(SourceStart, RI, DT)) {
+        delete SourceStart;
+        return false;
+    }
     GetElementPtrInst *DestStart = materializeStartPointer(
         Second.Destination, Second.IndVar, Second.Start,
         First.PreHeader);
-    if (!DestStart) {
+    if (!DestStart ||
+        !gepIsProvablyWithinKnownObject(DestStart, RI, DT)) {
         delete SourceStart;
+        delete DestStart;
         return false;
     }
 
@@ -510,6 +519,7 @@ PairFailure:
 
 bool LoopIdiomRecognizePass::transformLoop(
     Function &F, Loop *L, SCEVResult &SE, DominatorTree &DT,
+    RangeInfo &RI,
     bool &CFGChanged) {
     if (!L || !L->isInnermost()) return false;
     BasicBlock *PreHeader = nullptr;
@@ -550,7 +560,8 @@ bool LoopIdiomRecognizePass::transformLoop(
     auto *DestGEP = dynamic_cast<GetElementPtrInst *>(
         Store->getPointerOperand());
     LinearAccess DestAccess;
-    if (!matchLinearAccess(DestGEP, IV->Phi, L, DestAccess)) return false;
+    if (!matchLinearAccess(DestGEP, IV->Phi, L, DestAccess))
+        return false;
 
     // In a header-tested loop, an operation placed in the exiting header runs
     // once for the final failed test as well (and even on a zero-trip entry).
@@ -601,15 +612,23 @@ bool LoopIdiomRecognizePass::transformLoop(
             L, *TCI, *IV, Store, DestGEP, SourceLoad, SourceGEP, DT))
         return false;
 
+    // intrinsic 可能位于零次循环也会到达的路径，因而在提交替换前只对
+    // 新物化的起始指针做统一对象边界证明。
     auto *DestStart = materializeStartPointer(
         DestAccess, IV->Phi, *IV->ConstantStart, PreHeader);
-    if (!DestStart) return false;
+    if (!DestStart ||
+        !gepIsProvablyWithinKnownObject(DestStart, RI, DT)) {
+        delete DestStart;
+        return false;
+    }
 
     GetElementPtrInst *SourceStart = nullptr;
     if (!IsMemset) {
         SourceStart = materializeStartPointer(
             SourceAccess, IV->Phi, *IV->ConstantStart, PreHeader);
-        if (!SourceStart) {
+        if (!SourceStart ||
+            !gepIsProvablyWithinKnownObject(SourceStart, RI, DT)) {
+            delete SourceStart;
             delete DestStart;
             return false;
         }
@@ -807,6 +826,7 @@ PreservationStatus LoopIdiomRecognizePass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
+    auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
     bool Changed = false;
@@ -826,7 +846,7 @@ PreservationStatus LoopIdiomRecognizePass::run(
     for (const CopyLoopMatch &First : Copies) {
         for (const CopyLoopMatch &Second : Copies) {
             if (transformTemporaryCopyPair(
-                    F, First, Second, DT, CFGChanged)) {
+                    F, First, Second, DT, RI, CFGChanged)) {
                 // Even a constant-size pair deletes memory instructions from
                 // two loops.  Rebuild MemorySSA/SCEV/LoopInfo before looking
                 // for another pair or scalar idiom.
@@ -836,7 +856,7 @@ PreservationStatus LoopIdiomRecognizePass::run(
     }
 
     for (Loop *L : Loops) {
-        Changed |= transformLoop(F, L, SE, DT, CFGChanged);
+        Changed |= transformLoop(F, L, SE, DT, RI, CFGChanged);
         // A versioned loop changes predecessor sets and invalidates the loop
         // forest.  Let the surrounding fixed-point pipeline rebuild analyses
         // before considering another runtime idiom.

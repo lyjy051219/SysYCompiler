@@ -72,6 +72,24 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
     return true;
 }
 
+bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
+                                          DominatorTree& DT) {
+    if (!AI) return false;
+
+    // 当前重命名器沿入口支配树工作。只要存在不可达用户，就保守保留
+    // 整个 alloca 及其全部 load/store，避免只改写可达部分后留下悬空
+    // 地址，或者在删除 alloca 时级联破坏不可达基本块。
+    for (Use *UseEdge : AI->getUses()) {
+        auto *UserInst =
+            dynamic_cast<Instruction *>(UseEdge ? UseEdge->getUser() : nullptr);
+        if (!UserInst || !UserInst->getParent() ||
+            !DT.getNode(UserInst->getParent())) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
     clean();
     for (Use *use : AI->getUses()) {
@@ -302,8 +320,12 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     BlockInfo blockInfo;
     bool roundChanged = false;
 
-    for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB))
-        if (isAllocaPromotable(AI)) Allocas.push_back(AI);
+    for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
+        // 快速路径和通用 SSA 路径必须处理同一组完整用户。不可达分量
+        // 不在当前 DominatorTree 中，因而该 alloca 本轮整体保留。
+        if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT))
+            Allocas.push_back(AI);
+    }
 
     if(Allocas.empty()) {
         // Earlier rounds may already have promoted or deleted allocas.  Do
@@ -514,6 +536,10 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 
     // ========== 7. 清除 Alloca 指令 ==========
     for (AllocaInst* AI : Allocas) {
+        // 正常情况下，支配树重命名已经消除全部直接 load/store 用户。
+        // 若 IR 异常或后续扩展遗漏了某类用户，宁可保留 alloca，也不能
+        // 依赖 Value 析构级联删除仍然存活的指令。
+        if (AI->hasUses()) continue;
         blockInfo.deleteIndex(AI);
         delete AI;
     }

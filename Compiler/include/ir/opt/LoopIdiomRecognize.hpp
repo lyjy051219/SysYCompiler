@@ -9,6 +9,7 @@
 class DominatorTree;
 class Function;
 class Loop;
+class RangeInfo;
 class SCEVResult;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
@@ -67,8 +68,9 @@ private:
                                     CopyLoopMatch &Match);
     static bool transformTemporaryCopyPair(
         Function &F, const CopyLoopMatch &First,
-        const CopyLoopMatch &Second, DominatorTree &DT,
+        const CopyLoopMatch &Second, DominatorTree &DT, RangeInfo &RI,
         bool &CFGChanged);
     static bool transformLoop(Function &F, Loop *L, SCEVResult &SE,
-                              DominatorTree &DT, bool &CFGChanged);
+                              DominatorTree &DT, RangeInfo &RI,
+                              bool &CFGChanged);
 };

@@ -4,6 +4,16 @@
 
 #include <vector>
 
+class DominatorTree;
+class RangeInfo;
+
+// 用于“把地址计算移到原执行域之外”时的通用对象边界证明：地址必须
+// 追溯到已知 global/alloca，沿途 GEP 逐维在界且 bitcast 不改变形状。
+bool pointerIsProvablyWithinKnownObject(
+    Value *Pointer, RangeInfo &RI, const DominatorTree &DT);
+bool gepIsProvablyWithinKnownObject(
+    GetElementPtrInst *GEP, RangeInfo &RI, const DominatorTree &DT);
+
 struct GepCombineGroup {
     std::vector<GetElementPtrInst *> Geps;
 };
@@ -25,5 +35,9 @@ public:
 private:
     static bool combineChainedGEPs(Function &F);
     static bool foldGEPOfPhi(Function &F);
-    static bool combineLoopGEPs(Function &F);
+    static bool isKnownNoWrapAdd(
+        BinaryInst *Inst, BasicBlock *ContextBlock, RangeInfo &RI,
+        const DominatorTree &DT);
+    static bool combineLoopGEPs(
+        Function &F, RangeInfo &RI, const DominatorTree &DT);
 };

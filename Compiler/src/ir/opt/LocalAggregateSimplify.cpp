@@ -5,9 +5,13 @@
 #include "lib/IRUtils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -66,7 +70,13 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
     Value *Current = Pointer;
     while (Current && Seen.insert(Current).second) {
         if (auto *BC = dynamic_cast<BitCastInst *>(Current)) {
-            Current = BC->getUnaryOperand();
+            Value *Source = BC->getUnaryOperand();
+            if (!Source ||
+                !IRType::hasSameShape(
+                    Value::getPointeeType(Source),
+                    Value::getPointeeType(BC)))
+                return false;
+            Current = Source;
             continue;
         }
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Current)) {
@@ -105,6 +115,330 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
     return !Path.empty() && PointeeTy && IRType::isScalar(PointeeTy);
 }
 
+bool LocalAggregateSimplifyPass::collectInt32ConstantTable(
+    Variable *Source, int Count, std::vector<int32_t> &Values) {
+    Values.clear();
+    if (!Source || Count <= 0 || Count > MaxSynthArrayElements)
+        return false;
+
+    auto ArrayTy =
+        std::dynamic_pointer_cast<ARRAYType>(Source->getPointeeType());
+    if (!ArrayTy || ArrayTy->getElementCount() != Count)
+        return false;
+    auto ElementTy = ArrayTy->getElementType();
+    if (!ElementTy || !ElementTy->isInt() || ElementTy->isBool() ||
+        ElementTy->getIntegerBitWidth() != 32)
+        return false;
+
+    Values.reserve(static_cast<size_t>(Count));
+    for (int I = 0; I < Count; ++I) {
+        Value *Element = Source->getConstantElement({I});
+        int64_t Raw = 0;
+        if (!Element || !Element->tryGetInt64ConstAtWidth(32, Raw) ||
+            Raw < std::numeric_limits<int32_t>::min() ||
+            Raw > std::numeric_limits<int32_t>::max()) {
+            Values.clear();
+            return false;
+        }
+        Values.push_back(static_cast<int32_t>(Raw));
+    }
+    return true;
+}
+
+bool LocalAggregateSimplifyPass::evaluateSynthExpression(
+    const std::shared_ptr<LocalAggregateSynthExpression> &Expression,
+    int32_t Index, int32_t &Result) {
+    if (!Expression) return false;
+    if (Expression->Kind == LocalAggregateSynthExpressionKind::Index) {
+        Result = Index;
+        return true;
+    }
+    if (Expression->Kind == LocalAggregateSynthExpressionKind::Constant) {
+        Result = Expression->Constant;
+        return true;
+    }
+    if (Expression->Kind != LocalAggregateSynthExpressionKind::Binary)
+        return false;
+
+    int32_t Left = 0;
+    int32_t Right = 0;
+    if (!evaluateSynthExpression(Expression->Left, Index, Left) ||
+        !evaluateSynthExpression(Expression->Right, Index, Right))
+        return false;
+
+    // SysY 的 int 是 32 位有符号数。算术候选一旦在完整定义域的任一点
+    // 溢出就丢弃；不能借助有符号溢出、非法移位等未定义行为凑出表值。
+    int64_t Wide = 0;
+    switch (Expression->Op) {
+    case BinaryInst::ADD:
+        Wide = static_cast<int64_t>(Left) + static_cast<int64_t>(Right);
+        break;
+    case BinaryInst::SUB:
+        Wide = static_cast<int64_t>(Left) - static_cast<int64_t>(Right);
+        break;
+    case BinaryInst::MUL:
+        Wide = static_cast<int64_t>(Left) * static_cast<int64_t>(Right);
+        break;
+    case BinaryInst::AND:
+    case BinaryInst::OR:
+    case BinaryInst::XOR: {
+        uint32_t L = 0;
+        uint32_t R = 0;
+        uint32_t Bits = 0;
+        std::memcpy(&L, &Left, sizeof(L));
+        std::memcpy(&R, &Right, sizeof(R));
+        if (Expression->Op == BinaryInst::AND)
+            Bits = L & R;
+        else if (Expression->Op == BinaryInst::OR)
+            Bits = L | R;
+        else
+            Bits = L ^ R;
+        std::memcpy(&Result, &Bits, sizeof(Result));
+        return true;
+    }
+    case BinaryInst::SHL: {
+        if (Right < 0 || Right >= 32 || Left < 0) return false;
+        uint64_t Shifted =
+            static_cast<uint64_t>(static_cast<uint32_t>(Left)) << Right;
+        if (Shifted >
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
+            return false;
+        Result = static_cast<int32_t>(Shifted);
+        return true;
+    }
+    case BinaryInst::LSHR:
+    case BinaryInst::ASHR: {
+        if (Right < 0 || Right >= 32) return false;
+        uint32_t Bits = 0;
+        std::memcpy(&Bits, &Left, sizeof(Bits));
+        Bits >>= static_cast<unsigned>(Right);
+        if (Expression->Op == BinaryInst::ASHR && Left < 0 && Right != 0)
+            Bits |= ~uint32_t{0} << (32U - static_cast<unsigned>(Right));
+        std::memcpy(&Result, &Bits, sizeof(Result));
+        return true;
+    }
+    default:
+        return false;
+    }
+
+    if (Wide < std::numeric_limits<int32_t>::min() ||
+        Wide > std::numeric_limits<int32_t>::max())
+        return false;
+    Result = static_cast<int32_t>(Wide);
+    return true;
+}
+
+std::shared_ptr<LocalAggregateSynthExpression>
+LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
+    const std::vector<int32_t> &Values) {
+    if (Values.empty() ||
+        Values.size() > static_cast<size_t>(MaxSynthArrayElements))
+        return nullptr;
+
+    using ExpressionPtr =
+        std::shared_ptr<LocalAggregateSynthExpression>;
+    using SemanticVector = std::vector<int32_t>;
+
+    std::map<SemanticVector, ExpressionPtr> KnownStates;
+    std::vector<std::vector<ExpressionPtr>> StatesByCost(
+        static_cast<size_t>(MaxSynthExpressionCost + 1));
+
+    auto AddKnownState = [&](const SemanticVector &Semantics,
+                             const ExpressionPtr &Expression) {
+        if (!Expression || Expression->Cost < 0 ||
+            Expression->Cost > MaxSynthExpressionCost)
+            return;
+        if (!KnownStates.emplace(Semantics, Expression).second)
+            return;
+        StatesByCost[static_cast<size_t>(Expression->Cost)]
+            .push_back(Expression);
+    };
+
+    // 终结符只包含索引和从当前常量表系统化提取的常量；候选集合不读取
+    // 函数名、变量名、文件路径或运行时输入。
+    auto IndexExpression =
+        std::make_shared<LocalAggregateSynthExpression>();
+    IndexExpression->Kind = LocalAggregateSynthExpressionKind::Index;
+    IndexExpression->Cost = 0;
+    SemanticVector IndexSemantics;
+    IndexSemantics.reserve(Values.size());
+    for (size_t I = 0; I < Values.size(); ++I)
+        IndexSemantics.push_back(static_cast<int32_t>(I));
+    AddKnownState(IndexSemantics, IndexExpression);
+    if (IndexSemantics == Values) return IndexExpression;
+
+    std::vector<int32_t> Constants;
+    auto AddConstant = [&](int64_t Candidate) {
+        if (Candidate < std::numeric_limits<int32_t>::min() ||
+            Candidate > std::numeric_limits<int32_t>::max() ||
+            Constants.size() >= static_cast<size_t>(MaxSynthConstants))
+            return;
+        int32_t Value = static_cast<int32_t>(Candidate);
+        if (std::find(Constants.begin(), Constants.end(), Value) ==
+            Constants.end())
+            Constants.push_back(Value);
+    };
+
+    AddConstant(0);
+    AddConstant(1);
+    AddConstant(-1);
+    AddConstant(Values.front());
+    AddConstant(Values.back());
+    for (size_t I = 1; I < Values.size(); ++I)
+        AddConstant(static_cast<int64_t>(Values[I]) -
+                    static_cast<int64_t>(Values[I - 1]));
+    for (size_t I = 2; I < Values.size(); ++I) {
+        int64_t CurrentDelta =
+            static_cast<int64_t>(Values[I]) - Values[I - 1];
+        int64_t PreviousDelta =
+            static_cast<int64_t>(Values[I - 1]) - Values[I - 2];
+        AddConstant(CurrentDelta - PreviousDelta);
+    }
+    for (int32_t Value : Values) AddConstant(Value);
+
+    for (int32_t Constant : Constants) {
+        auto ConstantExpression =
+            std::make_shared<LocalAggregateSynthExpression>();
+        ConstantExpression->Kind =
+            LocalAggregateSynthExpressionKind::Constant;
+        ConstantExpression->Constant = Constant;
+        ConstantExpression->Cost = 0;
+        SemanticVector Semantics(Values.size(), Constant);
+        AddKnownState(Semantics, ConstantExpression);
+        if (Semantics == Values) return ConstantExpression;
+    }
+
+    const BinaryInst::Operation Operations[] = {
+        BinaryInst::ADD, BinaryInst::SUB, BinaryInst::MUL,
+        BinaryInst::AND, BinaryInst::OR, BinaryInst::XOR,
+        BinaryInst::SHL, BinaryInst::LSHR, BinaryInst::ASHR};
+
+    for (int Cost = 1; Cost <= MaxSynthExpressionCost; ++Cost) {
+        std::set<SemanticVector> PendingSemantics;
+        std::vector<std::pair<SemanticVector, ExpressionPtr>> Pending;
+        bool EnumerationBudgetReached = false;
+        std::vector<int> LeftCostOrder;
+        LeftCostOrder.reserve(static_cast<size_t>(Cost));
+        for (int LeftCost = 0; LeftCost < Cost; ++LeftCost)
+            LeftCostOrder.push_back(LeftCost);
+        // 同成本下优先组合深度均衡的子表达式，使固定预算覆盖更多不同
+        // 语法树形状；排序只依赖语法成本，不读取目标表的局部匹配程度。
+        std::sort(
+            LeftCostOrder.begin(), LeftCostOrder.end(),
+            [Cost](int Left, int Right) {
+                int LeftImbalance =
+                    std::abs(Left - (Cost - Left - 1));
+                int RightImbalance =
+                    std::abs(Right - (Cost - Right - 1));
+                if (LeftImbalance != RightImbalance)
+                    return LeftImbalance < RightImbalance;
+                return Left < Right;
+            });
+        for (int LeftCost : LeftCostOrder) {
+            int RightCost = Cost - LeftCost - 1;
+            const auto &LeftStates =
+                StatesByCost[static_cast<size_t>(LeftCost)];
+            const auto &RightStates =
+                StatesByCost[static_cast<size_t>(RightCost)];
+
+            for (const ExpressionPtr &Left : LeftStates) {
+                for (const ExpressionPtr &Right : RightStates) {
+                    for (BinaryInst::Operation Op : Operations) {
+                        auto Candidate =
+                            std::make_shared<LocalAggregateSynthExpression>();
+                        Candidate->Kind =
+                            LocalAggregateSynthExpressionKind::Binary;
+                        Candidate->Op = Op;
+                        Candidate->Cost = Cost;
+                        Candidate->Left = Left;
+                        Candidate->Right = Right;
+
+                        SemanticVector Semantics;
+                        Semantics.reserve(Values.size());
+                        bool Defined = true;
+                        for (size_t I = 0; I < Values.size(); ++I) {
+                            int32_t Evaluated = 0;
+                            if (!evaluateSynthExpression(
+                                    Candidate, static_cast<int32_t>(I),
+                                    Evaluated)) {
+                                Defined = false;
+                                break;
+                            }
+                            Semantics.push_back(Evaluated);
+                        }
+                        if (!Defined) continue;
+
+                        // 命中前已经对数组完整定义域逐点验证；不是根据少数
+                        // 样本猜测公式，也不会为范围外输入生成快速路径。
+                        if (Semantics == Values) return Candidate;
+                        if (KnownStates.count(Semantics) ||
+                            PendingSemantics.count(Semantics))
+                            continue;
+                        PendingSemantics.insert(Semantics);
+                        Pending.push_back(
+                            {std::move(Semantics), std::move(Candidate)});
+                        if (Pending.size() >=
+                            static_cast<size_t>(MaxSynthPendingStates)) {
+                            // 搜索状态达到统一预算后立即停止本层枚举；此时
+                            // 只会少做优化，不会用不完整验证接受候选。
+                            EnumerationBudgetReached = true;
+                            break;
+                        }
+                    }
+                    if (EnumerationBudgetReached) break;
+                }
+                if (EnumerationBudgetReached) break;
+            }
+            if (EnumerationBudgetReached) break;
+        }
+
+        // 按固定语法枚举顺序截断状态，不根据“部分命中几个表项”调整
+        // 搜索方向，避免把不完整匹配当作收益或正确性证据。
+        if (Pending.size() >
+            static_cast<size_t>(MaxSynthStatesPerCost))
+            Pending.resize(static_cast<size_t>(MaxSynthStatesPerCost));
+        for (const auto &Entry : Pending)
+            AddKnownState(Entry.first, Entry.second);
+    }
+
+    return nullptr;
+}
+
+Value *LocalAggregateSimplifyPass::materializeSynthExpression(
+    const std::shared_ptr<LocalAggregateSynthExpression> &Expression,
+    Value *Index, Instruction *InsertBefore,
+    std::vector<Instruction *> &Created) {
+    if (!Expression || !Index || !InsertBefore) return nullptr;
+    if (Expression->Kind == LocalAggregateSynthExpressionKind::Index)
+        return Index;
+    if (Expression->Kind == LocalAggregateSynthExpressionKind::Constant)
+        return Value::makeIntegerLike(Index, Expression->Constant);
+    if (Expression->Kind != LocalAggregateSynthExpressionKind::Binary)
+        return nullptr;
+
+    Value *Left = materializeSynthExpression(
+        Expression->Left, Index, InsertBefore, Created);
+    Value *Right = materializeSynthExpression(
+        Expression->Right, Index, InsertBefore, Created);
+    if (!Left || !Right) return nullptr;
+
+    auto *Binary = new BinaryInst(Left, Expression->Op, Right);
+    if (!InsertBefore->insertBefore(Binary)) {
+        delete Binary;
+        return nullptr;
+    }
+    Created.push_back(Binary);
+    return Binary;
+}
+
+bool LocalAggregateSimplifyPass::isSynthExpressionProfitable(
+    const std::shared_ptr<LocalAggregateSynthExpression> &Expression) {
+    // 仅比较表达式自身与 load；即使 GEP 因为另有用途不能删除，也不会把
+    // 它虚构成收益。相等成本同样拒绝，避免无收益地扩大活跃值范围。
+    return Expression && Expression->Cost >= 0 &&
+           Expression->Cost < GenericScalarLoadCost;
+}
+
 void LocalAggregateSimplifyPass::deleteDeadPointerChain(Value *Pointer) {
     while (auto *I = dynamic_cast<Instruction *>(Pointer)) {
         if (I->hasUses()) return;
@@ -122,6 +456,10 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     std::unordered_map<Variable *, bool> ReadOnlyCache;
+    std::unordered_map<
+        Variable *, std::shared_ptr<LocalAggregateSynthExpression>>
+        SynthCache;
+    std::unordered_set<Variable *> SynthAttempted;
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
 
     for (LoadInst *Load : collectInstructions<LoadInst>(F)) {
@@ -147,8 +485,9 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
             continue;
         }
 
-        // 对完整只读数组逐项验证二次幂恒等式。只有索引范围也得到证明时，
-        // 才把动态查表改写为等价移位，从而避免依赖任何源级标识符。
+        // 对只读 i32 常量表运行统一的有界表达式枚举。候选必须在完整
+        // 定义域逐点相等，索引范围沿用原 pass 的通用控制流证明；
+        // 不依赖函数名、块名或某个具体输入值。
         auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
         auto *CandidateRoot = GEP && GEP->getBasePointer()
                                   ? dynamic_cast<Variable *>(
@@ -165,44 +504,52 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
         auto ArrayTy = std::dynamic_pointer_cast<ARRAYType>(
             CandidateRoot->getPointeeType());
         int Count = ArrayTy ? ArrayTy->getElementCount() : 0;
-        if (!ArrayTy || Count <= 0 || Count > 31 ||
+        if (!ArrayTy || Count <= 0 ||
+            Count > MaxSynthArrayElements ||
             !IRType::isScalar(ArrayTy->getElementType()))
             continue;
         auto CacheIt = ReadOnlyCache.find(CandidateRoot);
         bool ReadOnly = CacheIt != ReadOnlyCache.end()
                             ? CacheIt->second
                             : (ReadOnlyCache[CandidateRoot] =
-                                   isWholeProgramReadOnlyVariable(
-                                       CandidateRoot));
+                                       isWholeProgramReadOnlyVariable(
+                                           CandidateRoot));
         if (!ReadOnly) continue;
 
-        bool IsPowerTable = true;
-        for (int N = 0; N < Count; ++N) {
-            auto *C = dynamic_cast<ConstInt *>(
-                CandidateRoot->getConstantElement({N}));
-            if (!C || static_cast<uint32_t>(C->getVal()) !=
-                          (uint32_t{1} << N)) {
-                IsPowerTable = false;
-                break;
-            }
+        std::shared_ptr<LocalAggregateSynthExpression> Expression;
+        if (SynthAttempted.insert(CandidateRoot).second) {
+            std::vector<int32_t> TableValues;
+            if (collectInt32ConstantTable(
+                    CandidateRoot, Count, TableValues))
+                SynthCache[CandidateRoot] =
+                    synthesizeInt32TableExpression(TableValues);
         }
-        if (!IsPowerTable) continue;
+        auto SynthIt = SynthCache.find(CandidateRoot);
+        if (SynthIt != SynthCache.end())
+            Expression = SynthIt->second;
+        if (!isSynthExpressionProfitable(Expression)) continue;
 
         IntRange IndexRange = RI.query(Index, BB, DT);
         if (IndexRange.isBottom() || IndexRange.min < 0 ||
             IndexRange.max >= Count)
             continue;
-        Value *One = Value::makeIntegerLike(Index, 1);
-        if (!One ||
+        if (!Index->getIRType() || Index->getIRType()->isBool() ||
+            Index->getIRType()->getIntegerBitWidth() != 32 ||
             !IRType::hasSameShape(Load->getIRType(),
-                                  One->getIRType()))
+                                  Index->getIRType()))
             continue;
-        auto *Shift = new BinaryInst(One, BinaryInst::SHL, Index);
-        if (!Load->insertBefore(Shift)) {
-            delete Shift;
+
+        std::vector<Instruction *> Created;
+        Value *Synthesized = materializeSynthExpression(
+            Expression, Index, Load, Created);
+        if (!Synthesized ||
+            !IRType::hasSameShape(Load->getIRType(),
+                                  Synthesized->getIRType())) {
+            for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                delete *It;
             continue;
         }
-        Replacements.push_back({Load, Shift});
+        Replacements.push_back({Load, Synthesized});
     }
 
     for (auto &Replacement : Replacements) {
@@ -229,8 +576,13 @@ LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     }
 
     if (auto *BC = dynamic_cast<BitCastInst *>(V)) {
-        if (Value *Operand = BC->getUnaryOperand())
-            Result = tracePointer(Operand, Visiting);
+        Value *Operand = BC->getUnaryOperand();
+        if (!Operand ||
+            !IRType::hasSameShape(
+                Value::getPointeeType(Operand),
+                Value::getPointeeType(BC)))
+            return Result;
+        Result = tracePointer(Operand, Visiting);
         return Result;
     }
 
@@ -478,7 +830,8 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
             LocalAggregatePointerPath Dest = tracePointer(SI->getPointerOperand());
             if (Dest.Root != AI) continue;
 
-            if (!StateValid || !Dest.IsConstant || Dest.Indices.empty()) {
+            if (!StateValid || !Dest.IsConstant ||
+                Dest.Indices.empty()) {
                 StateValid = false;
                 InitialValue = nullptr;
                 Overwrites.clear();
@@ -608,7 +961,8 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
 }
 
 Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
-    Variable *Source, int Count, Value *Index, Instruction *InsertBefore) {
+    Variable *Source, int Count, Value *Index, Instruction *InsertBefore,
+    std::vector<Instruction *> &Created) {
     int ConstIndex = 0;
     if (Value::tryGetIntIndex(Index, ConstIndex)) {
         if (ConstIndex < 0 || ConstIndex >= Count) return nullptr;
@@ -641,12 +995,14 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
             delete Cmp;
             return nullptr;
         }
+        Created.push_back(Cmp);
         auto *Sel = new SelectInst(Cmp, Elements[static_cast<size_t>(I)],
                                    Result);
         if (!InsertBefore->insertBefore(Sel)) {
             delete Sel;
             return nullptr;
         }
+        Created.push_back(Sel);
         Result = Sel;
     }
     return Result;
@@ -666,6 +1022,18 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     Value *FirstElement = Variable::getConstantElement(Plan.Source, {0});
     if (!FirstElement) return false;
 
+    std::vector<int32_t> TableValues;
+    std::shared_ptr<LocalAggregateSynthExpression> Expression;
+    if (collectInt32ConstantTable(Plan.Source, Count, TableValues))
+        Expression = synthesizeInt32TableExpression(TableValues);
+    bool CanUseExpression = isSynthExpressionProfitable(Expression);
+
+    Value *First = Variable::getConstantElement(Plan.Source, {0});
+    bool Uniform = First != nullptr;
+    for (int I = 1; Uniform && I < Count; ++I)
+        Uniform = Value::areEqualConstants(
+            First, Variable::getConstantElement(Plan.Source, {I}));
+
     bool HasDynamicIndex = false;
     for (LoadInst *LI : Plan.Loads) {
         if (!IRType::hasSameShape(LI->getIRType(),
@@ -682,30 +1050,49 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
             if (ConstIndex < 0 || ConstIndex >= Count) return false;
         } else {
             HasDynamicIndex = true;
+            if (CanUseExpression &&
+                (!Index->getIRType() || Index->getIRType()->isBool() ||
+                 Index->getIRType()->getIntegerBitWidth() != 32 ||
+                 !IRType::hasSameShape(LI->getIRType(),
+                                       Index->getIRType())))
+                CanUseExpression = false;
         }
     }
-    if (HasDynamicIndex && Count > kMaxDynamicSelectArrayElements) {
-        Value *First = Variable::getConstantElement(Plan.Source, {0});
-        bool Uniform = First != nullptr;
-        for (int I = 1; Uniform && I < Count; ++I)
-            Uniform = Value::areEqualConstants(
-                First, Variable::getConstantElement(Plan.Source, {I}));
-        if (!Uniform) return false;
-    }
+    if (HasDynamicIndex && !CanUseExpression &&
+        Count > kMaxDynamicSelectArrayElements && !Uniform)
+        return false;
 
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
+    std::vector<Instruction *> Created;
     Replacements.reserve(Plan.Loads.size());
     for (LoadInst *LI : Plan.Loads) {
         auto *GEP = dynamic_cast<GetElementPtrInst *>(LI->getPointerOperand());
         Value *Index = nullptr;
-        if (!getDirectOneDimElementIndex(AI, GEP, Index)) return false;
+        if (!getDirectOneDimElementIndex(AI, GEP, Index)) {
+            for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                delete *It;
+            return false;
+        }
 
-        Value *Replacement =
-            buildConstantArrayLookup(Plan.Source, Count, Index, LI);
+        int ConstIndex = 0;
+        bool IsConstantIndex =
+            Value::tryGetIntIndex(Index, ConstIndex);
+        Value *Replacement = nullptr;
+        if (!IsConstantIndex && CanUseExpression)
+            Replacement = materializeSynthExpression(
+                Expression, Index, LI, Created);
+        else
+            Replacement = buildConstantArrayLookup(
+                Plan.Source, Count, Index, LI, Created);
         if (!Replacement ||
             !IRType::hasSameShape(LI->getIRType(),
-                                  Replacement->getIRType()))
+                                  Replacement->getIRType())) {
+            // 所有替换都在验证结束后统一提交；失败时按逆序删除新建节点，
+            // 保证 pass 不会留下半完成的表达式或 select 链。
+            for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                delete *It;
             return false;
+        }
         Replacements.push_back({LI, Replacement});
     }
 
@@ -1022,13 +1409,14 @@ LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
             }
 
             if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && CallInst::isNonVolatileMemcpy(CI) && OperandIndex == 1) {
+                CI && CallInst::isNonVolatileMemcpy(CI) &&
+                OperandIndex == 1) {
                 if (SeenWrites.insert(I).second) Result.Writes.push_back(I);
                 continue;
             }
 
-            // A load, a memcpy source, storing the pointer itself, or passing
-            // it to any other call makes the allocation observable.
+            // load、memcpy 源、保存指针本身或传入未知调用都可能产生
+            // 可观察行为，必须保留整个对象。
             Result.IsDead = false;
             break;
         }
@@ -1043,8 +1431,7 @@ bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     for (Instruction *I : Uses.Writes)
         delete I;
 
-    // Parents are discovered before their derived pointers, so reverse order
-    // removes leaves before roots.
+    // 父地址先于派生地址被发现，因此逆序删除可保证先叶子、后根节点。
     for (auto It = Uses.DerivedPointers.rbegin();
          It != Uses.DerivedPointers.rend(); ++It) {
         Instruction *I = *It;

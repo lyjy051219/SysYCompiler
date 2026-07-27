@@ -22,6 +22,7 @@ struct InstRecord {
 
 struct ExprKey {
 	unsigned Opcode = 0;
+	const IRType *ResultType = nullptr;
 	std::vector<int> Args;
 
 	bool operator==(const ExprKey &RHS) const;
@@ -161,6 +162,7 @@ private:
 	bool buildExpressionKey(Instruction *I, ExprKey &K);
 
 	ModRefInfo getCallModRef(CallInst *CI);
+	bool isCallCSEEligible(CallInst *CI);
 	std::vector<Value *> collectCallReadPtrs(CallInst *CI);
 	static bool identicalCall(CallInst *A, CallInst *B);
 

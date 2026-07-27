@@ -1201,6 +1201,13 @@ bool LoopUnrollPass::isValueAvailableAtPreheader(Value *V, Loop *L, BasicBlock *
            DT.dominates(I->getParent(), PreHeader);
 }
 
+bool LoopUnrollPass::hasSafeSCEVDivisor(const SCEVExpr *E) {
+    if (!E || E->Operands.size() != 2) return false;
+    const SCEVExpr *Divisor = E->Operands[1];
+    return Divisor && Divisor->Kind == SCEVExprKind::Constant &&
+           Divisor->ConstValue != 0 && Divisor->ConstValue != -1;
+}
+
 bool LoopUnrollPass::canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
                         const DominatorTree &DT) {
     if (!E) return false;
@@ -1213,12 +1220,15 @@ bool LoopUnrollPass::canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *
     case SCEVExprKind::Add:
     case SCEVExprKind::Sub:
     case SCEVExprKind::Mul:
-    case SCEVExprKind::Div:
-    case SCEVExprKind::Mod:
     case SCEVExprKind::Min:
     case SCEVExprKind::Max:
     case SCEVExprKind::Compare:
         return E->Operands.size() == 2 &&
+               canMaterializeSCEV(E->Operands[0], L, PreHeader, DT) &&
+               canMaterializeSCEV(E->Operands[1], L, PreHeader, DT);
+    case SCEVExprKind::Div:
+    case SCEVExprKind::Mod:
+        return hasSafeSCEVDivisor(E) &&
                canMaterializeSCEV(E->Operands[0], L, PreHeader, DT) &&
                canMaterializeSCEV(E->Operands[1], L, PreHeader, DT);
     case SCEVExprKind::Cast:

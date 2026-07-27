@@ -44,6 +44,10 @@ private:
     // 判断某个 CallInst 是否是对本函数的调用
     bool isSelfCall(CallInst *CI, Function &F);
 
+    // 判断入口 alloca 的派生地址是否离开当前递归帧
+    bool allocaAddressEscapes(AllocaInst *AI);
+    bool hasEscapingEntryAlloca(Function &F);
+
     // 标记非自递归的尾调用 (call 紧接 ret, 但 call 目标 ≠ 当前函数)
     bool markTailCalls(Function &F);
 

@@ -94,6 +94,85 @@ bool TailRecursionEliminationPass::hasSelfRecursion(Function &F) {
         F, [&](CallInst *CI) { return !isSelfCall(CI, F); });
 }
 
+bool TailRecursionEliminationPass::allocaAddressEscapes(
+    AllocaInst *AI) {
+    if (!AI) return false;
+
+    std::vector<Value *> WorkList{AI};
+    std::unordered_set<Value *> Visited;
+
+    while (!WorkList.empty()) {
+        Value *Current = WorkList.back();
+        WorkList.pop_back();
+        if (!Current || !Visited.insert(Current).second) continue;
+
+        for (Use *UseEdge : Current->getUses()) {
+            auto *UserInst =
+                dynamic_cast<Instruction *>(UseEdge ? UseEdge->getUser()
+                                                    : nullptr);
+            if (!UserInst) return true;
+
+            // GEP、位转换、PHI 和 select 只传播地址身份；继续沿结果
+            // 检查，直到遇到真实的内存访问或逃逸点。
+            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(UserInst)) {
+                if (GEP->getBasePointer() != Current) return true;
+                WorkList.push_back(GEP);
+                continue;
+            }
+            if (auto *BitCast = dynamic_cast<BitCastInst *>(UserInst)) {
+                if (BitCast->getUnaryOperand() != Current) return true;
+                WorkList.push_back(BitCast);
+                continue;
+            }
+            if (dynamic_cast<PhiInst *>(UserInst)) {
+                WorkList.push_back(UserInst);
+                continue;
+            }
+            if (auto *Select = dynamic_cast<SelectInst *>(UserInst)) {
+                if (Select->getTrueValue() != Current &&
+                    Select->getFalseValue() != Current) {
+                    return true;
+                }
+                WorkList.push_back(Select);
+                continue;
+            }
+
+            // 作为 load/store 的地址仅访问当前帧对象，不会让地址逃逸；
+            // 把地址本身存入任意内存则可能跨递归帧继续存活，必须拒绝。
+            if (auto *Load = dynamic_cast<LoadInst *>(UserInst)) {
+                if (Load->getPointerOperand() != Current) return true;
+                continue;
+            }
+            if (auto *Store = dynamic_cast<StoreInst *>(UserInst)) {
+                if (Store->getValueOperand() == Current) return true;
+                if (Store->getPointerOperand() != Current) return true;
+                continue;
+            }
+
+            if (dynamic_cast<CallInst *>(UserInst)) {
+                // 当前 IR 没有 nocapture 属性；传给任意调用都按逃逸处理。
+                return true;
+            }
+
+            // 返回地址、间接调用以及当前未显式建模的新指令都不能证明
+            // 地址只在本帧内使用，保守拒绝整函数的尾递归消除。
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TailRecursionEliminationPass::hasEscapingEntryAlloca(Function &F) {
+    BasicBlock *Entry = F.front();
+    if (!Entry) return false;
+
+    for (AllocaInst *AI : collectInstructions<AllocaInst>(*Entry)) {
+        if (allocaAddressEscapes(AI)) return true;
+    }
+    return false;
+}
+
 bool TailRecursionEliminationPass::isReadonlyLikeCallInst(Instruction *I,
                                    FunctionAnalysisPassManager &FAM,
                                    Function &F) {
@@ -617,8 +696,10 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
     changed |= markTailCalls(F);
 
     // 第2步: 自递归尾递归消除
-    //快速检查call：如果一个函数中没有符合要求的call就直接退出
-    if (!hasSelfRecursion(F)) {
+    // 入口 alloca 会被搬到循环外并只分配一次。若其派生地址能逃逸，
+    // 原本逐递归帧独立的对象会被错误折叠为同一个对象，因此整函数
+    // 必须保守跳过 TRE；没有自递归时同样直接退出。
+    if (!hasSelfRecursion(F) || hasEscapingEntryAlloca(F)) {
         if (!changed) return PreservationStatus::all();
         // 仅打 tail-call 标记，不改 CFG/内存访问关系。
         PreservationStatus PA;

@@ -10,18 +10,16 @@
 #include <vector>
 
 class BasicBlock;
-class DominatorTree;
 class Instruction;
 class Loop;
 class LoopDependenceInfo;
-class LoopInfo;
 class SCEVResult;
 class StoreInst;
 class Value;
+struct ClonedBlockRegion;
 
-// Conservative loop distribution by statement slices.  The pass keeps the
-// original loop for the first statement partition and serializes one cloned
-// loop containing the second partition after it.
+// 按语句反向切片进行保守的循环分布。原循环保留第一分区，克隆循环保留
+// 第二分区，并把两个完整循环按原语句次序串行连接。
 class LoopDistributionPass : public PassDescriptor<LoopDistributionPass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -47,19 +45,11 @@ private:
     };
 
     struct DistributionPlan {
-        struct ForwardedValue {
-            StoreInst *Store = nullptr;
-            Instruction *Producer = nullptr;
-        };
-
         DistributionShape Shape;
         std::vector<StoreInst *> FirstStores;
         std::vector<StoreInst *> SecondStores;
         InstructionSet FirstSlice;
         InstructionSet SecondSlice;
-        InstructionSet SecondLegalitySlice;
-        std::vector<ForwardedValue> ForwardedValues;
-        std::vector<Loop *> PrunedFirstLoops;
         unsigned LocalityDistance = 0;
     };
 
@@ -82,8 +72,16 @@ private:
     static std::optional<DistributionShape> getDistributionShape(
         Function &F, Loop *L);
     static InstructionSet collectBackwardSlice(
-        StoreInst *Root, const BlockSet &LoopBlocks,
-        const InstructionSet *StopValues = nullptr);
+        StoreInst *Root, const BlockSet &LoopBlocks);
+    static InstructionSet collectExclusiveSlice(
+        const InstructionSet &Discarded, const InstructionSet &Retained);
+    static bool canDuplicateSharedSlice(
+        const DistributionShape &Shape, const InstructionSet &First,
+        const InstructionSet &Second);
+    static bool mapInstructionSet(
+        const InstructionSet &Original, const ClonedBlockRegion &Region,
+        InstructionSet &Mapped);
+    static void deleteExclusiveSlice(InstructionSet &Candidates);
     static void mergeSlice(InstructionSet &Into,
                            const InstructionSet &From);
     static unsigned strideBucket(std::int64_t Stride);
@@ -93,30 +91,13 @@ private:
     static unsigned localityDistance(const InstructionSet &First,
                                      const InstructionSet &Second, Loop *L,
                                      LoopDependenceInfo &LD);
-    static unsigned interchangeOpportunity(
-        const InstructionSet &Slice, Loop *L,
-        LoopDependenceInfo &LD);
     static std::optional<DistributionPlan> findDistributionPlan(
-        Function &F, Loop *L, LoopDependenceInfo &LD,
-        DominatorTree &DT, const LoopInfo &LI, SCEVResult &SE);
-    static bool buildForwardingPlan(DistributionPlan &Plan,
-                                    const BlockSet &Blocks,
-                                    LoopDependenceInfo &LD,
-                                    DominatorTree &DT,
-                                    const LoopInfo &LI);
-    static bool isAnchorOrderedDistributionLegal(
-        const DistributionPlan &Plan, LoopDependenceInfo &LD,
-        DominatorTree &DT);
+        Function &F, Loop *L, LoopDependenceInfo &LD);
     static void destroyClonedBlocks(std::vector<BasicBlock *> &Blocks);
-    static void deleteDeadClonedSlice(
-        Instruction *Root, const BlockSet &ClonedBlocks);
-    static bool isPrunableFirstLoop(
-        Loop *L, const DistributionPlan &Plan, SCEVResult &SE);
-    static void pruneFirstLoopCFG(Loop *L);
     static bool executeDistribution(Function &F,
                                     const DistributionPlan &Plan);
 
-    // The surrounding loop pipeline is a fixed point.  Bound code growth over
-    // all invocations of the same pass object, rather than per invocation.
+    // 外层循环流水线会迭代到不动点，因此按同一 pass 对象的全部调用累计
+    // 限制代码增长，不能在每次调用时重新获得预算。
     std::unordered_map<Function *, unsigned> TransformCounts;
 };

@@ -184,11 +184,8 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 		if (!CommonL && !CommonR) return nullptr;
 	}
 
-	// Every incoming computes the exact same binary expression in its own
-	// predecessor.  None of those predecessor-local instructions necessarily
-	// dominates the merge, so reusing `First` would be invalid SSA.  Rebuild the
-	// expression after the PHIs instead; its common operands must be available
-	// on every path into the block.
+	// 每个前驱都计算同一二元表达式，但前驱内指令不支配汇合块；
+	// 因此只能在 PHI 后重建，并要求公共操作数支配汇合点。
 	if (CommonL && CommonR) {
 		if (!DT || !DT->dominatesValue(CommonL, Phi) ||
 			!DT->dominatesValue(CommonR, Phi)) {
@@ -579,9 +576,8 @@ Value *InstSimplifier::simplifyMul(
 	maybeSwapCommutative(BI, LHS, RHS, Changed);
 
 	if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
-		// Choosing integer undef as zero is valid under the IR's undef
-		// semantics.  It is not valid for strict FP when the other operand
-		// may be Inf (0.0 * Inf is NaN).
+		// 整数 undef 可按通用 refinement 语义选择为零；严格浮点下
+		// 另一操作数可能为 Inf，因此仍传播为 undef。
 		return IsIntArith ? Value::makeZeroForType(BI->getIRType())
 		                  : Value::makeUndefForType(BI->getIRType());
 	}
@@ -627,8 +623,7 @@ Value *InstSimplifier::simplifyDiv(
 	// for signed INT_MIN, 0 - x wraps back to x and the quotient is 1.
 
 	if (LHS->isConst() && RHS->isConst()) {
-		// foldConstants distinguishes integer zero-divisor undef from IEEE
-		// fdiv Inf/NaN and is safe for fully constant operands.
+		// 常量折叠会区分整数除零产生的 undef 与 IEEE 浮点 Inf/NaN。
 		return BinaryInst::foldConstants(Op, LHS, RHS);
 	}
 
@@ -663,7 +658,8 @@ Value *InstSimplifier::simplifyDiv(
 	}
 
 	// fdiv x, -1.0 and 0.0 - x disagree for signed zero.
-	if (IsIntArith && Op == BinaryInst::DIV && Value::isConstMinusOne(RHS)) {
+	if (IsIntArith && Op == BinaryInst::DIV &&
+		Value::isConstMinusOne(RHS)) {
 		return new BinaryInst(Value::makeZeroForType(Ty), BinaryInst::SUB, LHS);
 	}
 
@@ -676,13 +672,15 @@ Value *InstSimplifier::simplifyRem(
 	const bool IsFloat = IRType::isFloat(Ty);
 	const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
 
-	if (IsIntArith && InstSimplifyPass::isNegationPair(LHS, RHS)) {
+	if (IsIntArith && BI->getOp() == BinaryInst::MOD &&
+		InstSimplifyPass::isNegationPair(LHS, RHS)) {
+		// 该恒等式只属于有符号余数；UREM 的模数是补码位型，
+		// 不能把“0-x”解释成数学负数。
 		return Value::makeZeroForType(Ty);
 	}
 
 	if (LHS->isConst() && RHS->isConst()) {
-		// Constant IEEE frem, including a zero divisor, is handled as NaN by
-		// foldConstants rather than integer-style undef.
+		// IEEE frem（包括零除数）由常量折叠按 NaN 处理。
 		return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 	}
 
@@ -692,14 +690,17 @@ Value *InstSimplifier::simplifyRem(
 		               : Value::makeZeroForType(Ty);
 	}
 
-	if (IsIntArith && Value::isConstZero(LHS)) return Value::makeZeroForType(Ty);
+	if (IsIntArith && Value::isConstZero(LHS))
+		return Value::makeZeroForType(Ty);
 	if (Value::isConstZero(RHS)) {
 		return IsFloat ? nullptr : Value::makeUndefForType(Ty);
 	}
 	if (IsIntArith && Value::isConstOne(RHS)) return Value::makeZeroForType(Ty);
-	if (IsIntArith && BI->getOp() == BinaryInst::MOD && Value::isConstMinusOne(RHS))
+	if (IsIntArith && BI->getOp() == BinaryInst::MOD &&
+		Value::isConstMinusOne(RHS))
 		return Value::makeZeroForType(Ty);
-	if (IsIntArith && LHS == RHS) return Value::makeZeroForType(Ty);
+	if (IsIntArith && LHS == RHS)
+		return Value::makeZeroForType(Ty);
 
 	return nullptr;
 }
@@ -1214,7 +1215,7 @@ Value *InstSimplifier::simplifyPhi(PhiInst *Phi) {
 	if (!Common) return nullptr;
 
 	if (HasUndef) {
-		// 无法确认支配关系时(例如没有DT)必须保守退出，避免错误化简。
+		// undef incoming 可选择成共同值；仍需确保该共同值在 PHI 处可用。
 		if (!DT) return nullptr;
 		if (!DT->dominatesValue(Common, Phi)) return nullptr;
 	}

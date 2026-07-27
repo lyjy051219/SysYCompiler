@@ -16,20 +16,16 @@ class Instruction;
 class Loop;
 class LoopAccessInfo;
 class LoopInfo;
-class LoadInst;
 class PhiInst;
 class PostDominatorTree;
 class SCEVResult;
-class StoreInst;
 struct SCEVExpr;
 class Value;
 
-// Fuse two adjacent sibling loops by retaining the first loop's control and
-// placing the second loop's body between the first and second latches.  The
-// implementation deliberately accepts a narrow, fully preflighted CFG shape:
-// both loops are finite header-tested loops over the same exact iteration
-// domain.  Interleaving is accepted either by LoopAccessAnalysis or by the
-// narrower modular-integer RMW proof represented below.
+// 融合两个相邻的同级循环：保留第一个循环的控制结构，并把第二个循环的
+// 主体接入第一个循环的迭代路径。候选必须先完整验证 CFG 形状，两个循环
+// 都必须是有限、头部判定且迭代域严格相同的循环；所有跨循环内存次序都
+// 必须由统一的 LoopAccessAnalysis 证明合法，不允许指令形状专用旁路。
 class LoopFusionPass : public PassDescriptor<LoopFusionPass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -41,12 +37,9 @@ private:
     static constexpr std::size_t MaxFlowFusionInstructions = 128;
     static constexpr std::size_t MaxBridgeInstructions = 24;
     static constexpr std::size_t MaxMovedHeaderPhis = 32;
-    static constexpr unsigned MaxEquivalentValueDepth = 24;
-    static constexpr unsigned MaxDependencyWalkDepth = 64;
 
     using BlockSet = std::unordered_set<BasicBlock *>;
     using InstructionSet = std::unordered_set<Instruction *>;
-    using ValueSet = std::unordered_set<Value *>;
 
     struct LoopShape {
         Loop *L = nullptr;
@@ -84,18 +77,6 @@ private:
         BasicBlock *NewPredecessor = nullptr;
     };
 
-    // A deliberately narrow proof object for an integer read-modify-write.
-    // SourceRoots contains every read-only allocation touched by the loop;
-    // each one must be a unique global/stack object distinct from TargetRoot.
-    struct IntegerReductionUpdate {
-        StoreInst *Store = nullptr;
-        LoadInst *TargetLoad = nullptr;
-        Value *Pointer = nullptr;
-        Value *Delta = nullptr;
-        Value *TargetRoot = nullptr;
-        std::unordered_set<Value *> SourceRoots;
-    };
-
     struct FusionCandidate {
         LoopShape First;
         LoopShape Second;
@@ -105,8 +86,6 @@ private:
         std::vector<EdgeRewrite> EdgeRewrites;
         std::vector<PhiRewrite> PhiRewrites;
         unsigned SameIterationFlowPairs = 0;
-        unsigned SameIterationConflictPairs = 0;
-        bool CommutativeIntegerReduction = false;
     };
 
     static bool expressionKeysEqual(const SCEVExpr *A,
@@ -132,21 +111,6 @@ private:
     static bool isRepeatedByteConstant(Value *V);
     static bool isUnitStrideAccess(Value *Pointer, PhiInst *Induction);
     static bool isSingleStoreIdiomCandidate(const LoopShape &Shape);
-    static bool isUniqueMemoryObject(Value *Root);
-    static bool hasReductionControlShape(const LoopShape &Shape);
-    static bool valueDependsOn(Value *V, Value *Needle,
-                               unsigned Depth, ValueSet &Visited);
-    static bool collectDependencySourceRoots(
-        Value *V, Value *TargetRoot, unsigned Depth,
-        ValueSet &Visited, std::unordered_set<Value *> &SourceRoots);
-    static bool valuesEquivalentUnderInductionMap(
-        Value *First, PhiInst *FirstInduction,
-        Value *Second, PhiInst *SecondInduction,
-        unsigned Depth);
-    static bool matchIntegerReductionUpdate(
-        const LoopShape &Shape, IntegerReductionUpdate &Update);
-    static bool isCommutativeIntegerReductionFusion(
-        const FusionCandidate &Candidate);
     static bool isProfitable(const FusionCandidate &Candidate);
     static bool isLCSSAAndStructurallyAdjacent(
         const FusionCandidate &Candidate, const LoopInfo &LI);

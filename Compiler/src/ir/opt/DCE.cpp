@@ -59,11 +59,9 @@ bool DCEPass::isGuaranteedRemovableFunction(
 
 	for (BasicBlock *BB : F) {
 		for (Instruction *I : *BB) {
-			// Stores are observable even when their destination is local to the
-			// callee because the call boundary is the unit being removed.  An
-			// ordinary non-volatile load, however, has no observable result once
-			// all of its users are dead; an invalid address already makes the
-			// source program undefined in this IR.
+			// 以整个调用为删除单位时，store 始终可观察。普通非 volatile
+			// load 和纯算术若结果无用，则沿用本 IR 的常规 undef/poison
+			// 语义，不因为它们可能接收非法输入而额外保留。
 			if (dynamic_cast<StoreInst *>(I)) {
 				Memo[&F] = ReturnProofState::Failed;
 				return false;
@@ -125,16 +123,40 @@ bool hasDefinedConstantShiftAmount(const Instruction *I) {
 		Amount < BitWidth;
 }
 
+bool valueMayDependOnUndef(
+	const Value *V, std::size_t MaxVisitedValues) {
+	if (!V || MaxVisitedValues == 0) return true;
+
+	std::vector<const Value *> WorkList{V};
+	std::unordered_set<const Value *> Seen;
+	while (!WorkList.empty()) {
+		const Value *Current = WorkList.back();
+		WorkList.pop_back();
+		if (!Current || Value::isUndef(Current)) return true;
+		if (!Seen.insert(Current).second) continue;
+		if (Seen.size() > MaxVisitedValues) return true;
+
+		auto *I = dynamic_cast<const Instruction *>(Current);
+		if (!I) continue;
+		for (std::size_t Index = 0;
+			 Index < I->getNumOperands(); ++Index) {
+			Value *Operand = I->getOperand(Index);
+			if (!Operand || Value::isUndef(Operand)) return true;
+			// 常量、参数、函数和基本块不可能在自身内部继续携带 undef；
+			// 只沿 SSA 指令定义继续遍历。
+			if (dynamic_cast<Instruction *>(Operand))
+				WorkList.push_back(Operand);
+		}
+	}
+	return false;
+}
+
 bool dceInstructionMustBePreserved(Instruction *I) {
 	if (!I) return true;
-	// The current IR has only ordinary (non-volatile, non-atomic) loads and
-	// unconstrained arithmetic/conversions.  Their invalid-input behaviour is
-	// represented as undefined/poison semantics, not as an observable trap.
-	// Consequently an unused load, div/rem, shift, or fptosi can be removed.
-	// Stores, control flow and calls are classified separately by the caller.
-	// If volatile/atomic/constrained instructions are introduced later, their
-	// explicit flags belong in this predicate.  Keep unknown instruction kinds
-	// conservative so extending InstType cannot silently weaken DCE.
+	// 当前 IR 只有普通（非 volatile、非 atomic）load，以及非 constrained
+	// 的算术和转换。它们的非法输入由 undef/poison 语义表示，并非可观察
+	// trap，所以结果无人使用时可以删除。store、控制流和 call 由调用者
+	// 另行判定；未知的新指令仍默认保留。
 	switch (I->instType) {
 		case Instruction::RET:
 		case Instruction::BR:
@@ -180,6 +202,8 @@ bool dceInstructionMustBePreserved(Instruction *I) {
 
 bool instructionMayFaultOrProducePoison(const Instruction *I) {
 	if (!I) return true;
+	// SysY 运行时库可能通过数组参数访问任意用户内存，而普通 load 本身
+	// 没有携带“地址已验证”属性，因此移动或投机执行时一律保守处理。
 	if (dynamic_cast<const LoadInst *>(I)) return true;
 
 	switch (I->instType) {
@@ -207,14 +231,13 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 
 	if (auto* BIF = dynamic_cast<BuildInFunction*>(Callee)) {
 		const std::string& N = BIF->getIdent();
-		// I/O builtins have observable side effects even if they are memory-readonly.
+		// SysY 输出函数具有可观察副作用，即使内存分类可能是 readonly。
 		if (BuildInFunction::isOutputName(N)) {
 			return true;
 		}
 
-		// Readonly is not enough: a read may fault, and an I/O-like readonly
-		// builtin is observable.  Only an explicit readnone/no-side-effect
-		// contract permits removal.
+		// readonly 并不足以允许删除；只有明确的 readnone/no-side-effect
+		// 契约才表示该内置调用不可观察。
 		return classifyBuiltin(BIF) != FuncAttr::NoModRef;
 	}
 

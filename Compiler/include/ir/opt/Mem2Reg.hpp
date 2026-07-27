@@ -27,6 +27,7 @@ public:
 private:
     bool promoteMemoryToRegister(Function& F, DominatorTree& dominant);
     bool isAllocaPromotable(const AllocaInst* AI);
+    bool areAllocaUsersReachable(const AllocaInst* AI, DominatorTree& DT);
     bool rewriteSingleStoreAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
     bool rewriteSingleBlockAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
 

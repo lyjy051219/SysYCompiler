@@ -539,15 +539,21 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             Instruction *term = pred->back();
             if (auto *br = dynamic_cast<BrInst *>(term)) {
                 if (br->isConditional()) {
-                    // 条件分支
-                    Value *cond = br->getCondition();
-                    auto *falseBB = br->getFalseSuccessor();
-
-                    if (auto *cmpInst = dynamic_cast<BinaryInst *>(cond)) {
-                        ConstraintElimConstraint c;
-                        bool negate = (BB == falseBB);
-                        if (extractConstraint(cmpInst, negate, RI, DT, c)) {
-                            constraintStack.push_back(c);
+                    BasicBlock *trueBB = br->getTrueSuccessor();
+                    BasicBlock *falseBB = br->getFalseSuccessor();
+                    // 同一条件分支的两条边若汇入同一个块，进入该块并不能
+                    // 证明条件为真或为假；只有唯一命中的边才能提供路径事实。
+                    if (trueBB && falseBB && trueBB != falseBB &&
+                        (BB == trueBB || BB == falseBB)) {
+                        Value *cond = br->getCondition();
+                        if (auto *cmpInst =
+                                dynamic_cast<BinaryInst *>(cond)) {
+                            ConstraintElimConstraint c;
+                            bool negate = (BB == falseBB);
+                            if (extractConstraint(
+                                    cmpInst, negate, RI, DT, c)) {
+                                constraintStack.push_back(c);
+                            }
                         }
                     }
                 }

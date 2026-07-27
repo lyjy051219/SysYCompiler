@@ -47,16 +47,13 @@ bool LoopFusionPass::hasNoLiveOut(const LoopShape &Shape) {
 
 bool LoopFusionPass::isSafeReorderedInstruction(Instruction *I) {
     if (!I) return false;
-    // Loads remain in their original control domain and are covered by the
-    // cross-loop memory-dependence proof.  The generic speculation predicate
-    // flags every load because hoisting it onto a new path could fault, which
-    // fusion does not do.
+    // load 仍位于原循环执行域内，跨循环访存次序由 LoopAccess 统一证明；
+    // 这里不能套用针对“提升到新路径”的 load 投机规则。
     if (dynamic_cast<LoadInst *>(I)) return true;
     if (!instructionMayFaultOrProducePoison(I)) return true;
 
-    // SysY remainder-heavy kernels commonly use a compile-time non-zero
-    // divisor.  This operation cannot trap; reject -1 as well so signed
-    // INT_MIN division/remainder follows the same conservative rule.
+    // 对整数除法和余数，仅在常量除数从语义上排除零，并对有符号运算
+    // 额外排除 -1 时放行；这是通用合法性证明，不是收益或用例 matcher。
     auto *Binary = dynamic_cast<BinaryInst *>(I);
     if (!Binary) return false;
     BinaryInst::Operation Op = Binary->getOp();
@@ -86,7 +83,8 @@ bool LoopFusionPass::hasUnsupportedLoopInstruction(
     return false;
 }
 
-bool LoopFusionPass::hasDistributionProvenance(const LoopShape &Shape) {
+bool LoopFusionPass::hasDistributionProvenance(
+    const LoopShape &Shape) {
     if (!Shape.Header || !Shape.PreHeader) return true;
     if (Shape.Header->getIdent().find(".dist") != std::string::npos ||
         Shape.PreHeader->getIdent().find(".dist") != std::string::npos) {
@@ -281,8 +279,10 @@ bool LoopFusionPass::isUnitStrideAccess(Value *Pointer,
 
     Value *Base = nullptr;
     std::vector<Value *> Indices;
-    if (!GEP->getBaseAndIndices(Base, Indices) || !Base || Indices.empty())
+    if (!GEP->getBaseAndIndices(Base, Indices) ||
+        !Base || Indices.empty()) {
         return false;
+    }
 
     std::size_t InductionIndex = 0;
     unsigned InductionCount = 0;
@@ -326,289 +326,31 @@ bool LoopFusionPass::isSingleStoreIdiomCandidate(
             if (auto *CurrentStore = dynamic_cast<StoreInst *>(I)) {
                 if (Store) return false;
                 Store = CurrentStore;
-            } else if (auto *CurrentLoad = dynamic_cast<LoadInst *>(I)) {
+            } else if (auto *CurrentLoad =
+                           dynamic_cast<LoadInst *>(I)) {
                 if (Load) return false;
                 Load = CurrentLoad;
             }
         }
     }
     if (!Store ||
-        !isUnitStrideAccess(Store->getPointerOperand(), Shape.Induction)) {
+        !isUnitStrideAccess(
+            Store->getPointerOperand(), Shape.Induction)) {
         return false;
     }
-    if (isRepeatedByteConstant(Store->getValueOperand())) return !Load;
+    if (isRepeatedByteConstant(Store->getValueOperand()))
+        return !Load;
     return Load && Store->getValueOperand() == Load &&
-           isUnitStrideAccess(Load->getPointerOperand(), Shape.Induction);
-}
-
-bool LoopFusionPass::isUniqueMemoryObject(Value *Root) {
-    if (!Root || Root->isUndef()) return false;
-    if (dynamic_cast<AllocaInst *>(Root)) return true;
-    auto *Object = dynamic_cast<Variable *>(Root);
-    return Object && Object->isGlobal();
-}
-
-bool LoopFusionPass::hasReductionControlShape(const LoopShape &Shape) {
-    if (!Shape.Header || !Shape.BodyEntry || !Shape.Latch ||
-        Shape.BodyEntry != Shape.Latch || Shape.Blocks.size() != 2 ||
-        !Shape.HeaderBranch || !Shape.LatchBranch ||
-        !Shape.HeaderBranch->isConditional() ||
-        !BasicBlock::isUncondBr(Shape.LatchBranch) ||
-        Shape.LatchBranch->getTrueSuccessor() != Shape.Header ||
-        !Shape.BodyEntry->collectPhiNodes().empty()) {
-        return false;
-    }
-
-    std::vector<PhiInst *> HeaderPhis = Shape.Header->collectPhiNodes();
-    if (HeaderPhis.size() != 1 || HeaderPhis.front() != Shape.Induction)
-        return false;
-    for (Instruction *I : *Shape.Header) {
-        if (I == Shape.Induction || I == Shape.ExitCompare ||
-            I == Shape.HeaderBranch) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-bool LoopFusionPass::valueDependsOn(Value *V, Value *Needle,
-                                    unsigned Depth,
-                                    ValueSet &Visited) {
-    if (!V || !Needle) return true;
-    if (V == Needle) return true;
-    if (Depth >= MaxDependencyWalkDepth) return true;
-    auto *I = dynamic_cast<Instruction *>(V);
-    if (!I || !Visited.insert(V).second) return false;
-
-    for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
-        Value *Operand = I->getOperand(Index);
-        if (dynamic_cast<BasicBlock *>(Operand)) continue;
-        if (valueDependsOn(Operand, Needle, Depth + 1, Visited))
-            return true;
-    }
-    return false;
-}
-
-bool LoopFusionPass::collectDependencySourceRoots(
-    Value *V, Value *TargetRoot, unsigned Depth,
-    ValueSet &Visited, std::unordered_set<Value *> &SourceRoots) {
-    if (!V || !TargetRoot || Depth >= MaxDependencyWalkDepth)
-        return false;
-    auto *I = dynamic_cast<Instruction *>(V);
-    if (!I || !Visited.insert(V).second) return true;
-
-    if (auto *Load = dynamic_cast<LoadInst *>(I)) {
-        Value *Root = Value::stripPointerCastsAndGEP(
-            Load->getPointerOperand());
-        if (!isUniqueMemoryObject(Root) || Root == TargetRoot)
-            return false;
-        SourceRoots.insert(Root);
-    }
-    for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
-        Value *Operand = I->getOperand(Index);
-        if (dynamic_cast<BasicBlock *>(Operand)) continue;
-        if (!collectDependencySourceRoots(
-                Operand, TargetRoot, Depth + 1, Visited, SourceRoots)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool LoopFusionPass::valuesEquivalentUnderInductionMap(
-    Value *First, PhiInst *FirstInduction,
-    Value *Second, PhiInst *SecondInduction,
-    unsigned Depth) {
-    if (!First || !Second || !FirstInduction || !SecondInduction ||
-        Depth >= MaxEquivalentValueDepth) {
-        return false;
-    }
-    if (First == Second) return true;
-    if (First == FirstInduction || Second == SecondInduction)
-        return First == FirstInduction && Second == SecondInduction;
-    if (First->isConst() || Second->isConst())
-        return Value::areEqualConstants(First, Second);
-
-    auto FirstType = First->getIRType();
-    auto SecondType = Second->getIRType();
-    if (!FirstType || !SecondType || !FirstType->hasSameShape(*SecondType))
-        return false;
-
-    auto *FirstGEP = dynamic_cast<GetElementPtrInst *>(First);
-    auto *SecondGEP = dynamic_cast<GetElementPtrInst *>(Second);
-    if (FirstGEP || SecondGEP) {
-        if (!FirstGEP || !SecondGEP) return false;
-        Value *FirstBase = nullptr;
-        Value *SecondBase = nullptr;
-        std::vector<Value *> FirstIndices;
-        std::vector<Value *> SecondIndices;
-        if (!FirstGEP->getBaseAndIndices(FirstBase, FirstIndices) ||
-            !SecondGEP->getBaseAndIndices(SecondBase, SecondIndices) ||
-            FirstIndices.size() != SecondIndices.size() ||
-            !valuesEquivalentUnderInductionMap(
-                FirstBase, FirstInduction, SecondBase, SecondInduction,
-                Depth + 1)) {
-            return false;
-        }
-        for (std::size_t Index = 0; Index < FirstIndices.size(); ++Index) {
-            if (!valuesEquivalentUnderInductionMap(
-                    FirstIndices[Index], FirstInduction,
-                    SecondIndices[Index], SecondInduction, Depth + 1)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    auto *FirstLoad = dynamic_cast<LoadInst *>(First);
-    auto *SecondLoad = dynamic_cast<LoadInst *>(Second);
-    if (FirstLoad || SecondLoad) {
-        return FirstLoad && SecondLoad &&
-               valuesEquivalentUnderInductionMap(
-                   FirstLoad->getPointerOperand(), FirstInduction,
-                   SecondLoad->getPointerOperand(), SecondInduction,
-                   Depth + 1);
-    }
-
-    auto *FirstBinary = dynamic_cast<BinaryInst *>(First);
-    auto *SecondBinary = dynamic_cast<BinaryInst *>(Second);
-    if (FirstBinary || SecondBinary) {
-        if (!FirstBinary || !SecondBinary ||
-            FirstBinary->getOp() != SecondBinary->getOp()) {
-            return false;
-        }
-        Value *FirstLHS = nullptr;
-        Value *FirstRHS = nullptr;
-        Value *SecondLHS = nullptr;
-        Value *SecondRHS = nullptr;
-        return FirstBinary->getOperands(FirstLHS, FirstRHS) &&
-               SecondBinary->getOperands(SecondLHS, SecondRHS) &&
-               valuesEquivalentUnderInductionMap(
-                   FirstLHS, FirstInduction, SecondLHS, SecondInduction,
-                   Depth + 1) &&
-               valuesEquivalentUnderInductionMap(
-                   FirstRHS, FirstInduction, SecondRHS, SecondInduction,
-                   Depth + 1);
-    }
-
-    auto *FirstInstruction = dynamic_cast<Instruction *>(First);
-    auto *SecondInstruction = dynamic_cast<Instruction *>(Second);
-    if (!FirstInstruction || !SecondInstruction ||
-        FirstInstruction->instType != SecondInstruction->instType) {
-        return false;
-    }
-    switch (FirstInstruction->instType) {
-        case Instruction::TRUNC:
-        case Instruction::ZEXT:
-        case Instruction::SEXT:
-        case Instruction::BITCAST:
-            return valuesEquivalentUnderInductionMap(
-                FirstInstruction->getUnaryOperand(), FirstInduction,
-                SecondInstruction->getUnaryOperand(), SecondInduction,
-                Depth + 1);
-        default:
-            return false;
-    }
-}
-
-bool LoopFusionPass::matchIntegerReductionUpdate(
-    const LoopShape &Shape, IntegerReductionUpdate &Update) {
-    if (!hasReductionControlShape(Shape)) return false;
-
-    std::vector<LoadInst *> Loads;
-    for (BasicBlock *BB : Shape.Blocks) {
-        if (!BB) return false;
-        for (Instruction *I : *BB) {
-            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
-                if (Update.Store) return false;
-                Update.Store = Store;
-            } else if (auto *Load = dynamic_cast<LoadInst *>(I)) {
-                Loads.push_back(Load);
-            } else if (dynamic_cast<CallInst *>(I)) {
-                return false;
-            }
-        }
-    }
-    if (!Update.Store) return false;
-
-    auto *Add = dynamic_cast<BinaryInst *>(Update.Store->getValueOperand());
-    auto AddType = Add ? Add->getIRType() : nullptr;
-    if (!Add || Add->getOp() != BinaryInst::ADD || !AddType ||
-        !AddType->isInt() || !Add->hasExactlyOneUse()) {
-        return false;
-    }
-
-    Value *LHS = nullptr;
-    Value *RHS = nullptr;
-    if (!Add->getOperands(LHS, RHS)) return false;
-    auto *LHSLoad = dynamic_cast<LoadInst *>(LHS);
-    auto *RHSLoad = dynamic_cast<LoadInst *>(RHS);
-    Value *StorePointer = Update.Store->getPointerOperand();
-    const bool LHSIsTarget =
-        LHSLoad && LHSLoad->getPointerOperand() == StorePointer;
-    const bool RHSIsTarget =
-        RHSLoad && RHSLoad->getPointerOperand() == StorePointer;
-    if (LHSIsTarget == RHSIsTarget) return false;
-
-    Update.TargetLoad = LHSIsTarget ? LHSLoad : RHSLoad;
-    Update.Delta = LHSIsTarget ? RHS : LHS;
-    Update.Pointer = StorePointer;
-    if (!Update.TargetLoad || !Update.Delta ||
-        !Update.TargetLoad->hasExactlyOneUse() ||
-        !Update.TargetLoad->getIRType() ||
-        !Update.TargetLoad->getIRType()->hasSameShape(*AddType) ||
-        !Update.Delta->getIRType() ||
-        !Update.Delta->getIRType()->hasSameShape(*AddType)) {
-        return false;
-    }
-
-    Update.TargetRoot = Value::stripPointerCastsAndGEP(Update.Pointer);
-    if (!isUniqueMemoryObject(Update.TargetRoot)) return false;
-    for (LoadInst *Load : Loads) {
-        Value *Root = Value::stripPointerCastsAndGEP(
-            Load ? Load->getPointerOperand() : nullptr);
-        if (!isUniqueMemoryObject(Root)) return false;
-        if (Root == Update.TargetRoot) {
-            if (Load != Update.TargetLoad) return false;
-            continue;
-        }
-        Update.SourceRoots.insert(Root);
-    }
-
-    ValueSet Visited;
-    if (valueDependsOn(Update.Delta, Update.TargetLoad, 0, Visited))
-        return false;
-    Visited.clear();
-    return collectDependencySourceRoots(
-        Update.Delta, Update.TargetRoot, 0, Visited,
-        Update.SourceRoots);
-}
-
-bool LoopFusionPass::isCommutativeIntegerReductionFusion(
-    const FusionCandidate &Candidate) {
-    IntegerReductionUpdate First;
-    IntegerReductionUpdate Second;
-    if (!matchIntegerReductionUpdate(Candidate.First, First) ||
-        !matchIntegerReductionUpdate(Candidate.Second, Second) ||
-        First.TargetRoot != Second.TargetRoot) {
-        return false;
-    }
-
-    return valuesEquivalentUnderInductionMap(
-        First.Pointer, Candidate.First.Induction,
-        Second.Pointer, Candidate.Second.Induction, 0);
+           isUnitStrideAccess(
+               Load->getPointerOperand(), Shape.Induction);
 }
 
 bool LoopFusionPass::isProfitable(const FusionCandidate &Candidate) {
     const std::size_t Instructions = Candidate.First.InstructionCount +
                                      Candidate.Second.InstructionCount;
-    // Independent loops do not provide locality reuse. Even with a real flow
-    // edge, fusing a unit-stride single-store producer can hide a memset/memcpy
-    // candidate from the later LoopIdiomRecognize pass. Preserve that producer
-    // and keep every other fused hot body small enough to limit pressure.
-    return (Candidate.CommutativeIntegerReduction ||
-            Candidate.SameIterationFlowPairs != 0) &&
+    // 融合收益只来自统一分析报告的同迭代真依赖。单 store 的通用
+    // memset/memcpy idiom 留给后续 LoopIdiomRecognize，避免破坏阶段收益。
+    return Candidate.SameIterationFlowPairs != 0 &&
            !isSingleStoreIdiomCandidate(Candidate.First) &&
            Instructions <= MaxFlowFusionInstructions;
 }
@@ -802,18 +544,13 @@ LoopFusionPass::buildCandidate(
 
     LoopFusionAccessResult Access =
         LA.analyzeFusion(Candidate.First.L, Candidate.Second.L);
-    Candidate.CommutativeIntegerReduction =
-        isCommutativeIntegerReductionFusion(Candidate);
-    if ((!Access.Legal || Access.Unknown) &&
-        !Candidate.CommutativeIntegerReduction) {
+    // 所有候选都必须直接通过统一的 LoopAccess 合法性证明。Unknown 与
+    // Illegal 都表示证据不足，任何具体 opcode/def-use 形状都不能旁路。
+    if (!Access.Legal || Access.Unknown) {
         return std::nullopt;
     }
-    if (Access.Legal && !Access.Unknown) {
-        Candidate.SameIterationFlowPairs =
-            Access.SameIterationFlowPairs;
-        Candidate.SameIterationConflictPairs =
-            Access.SameIterationConflictPairs;
-    }
+    Candidate.SameIterationFlowPairs =
+        Access.SameIterationFlowPairs;
     if (!isProfitable(Candidate)) return std::nullopt;
 
     auto FirstExitIndex = findUniqueSuccessorIndex(

@@ -1,8 +1,14 @@
 #include "ir/opt/GepOpt.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/RangeAnalysis.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 
+#include <algorithm>
+#include <functional>
+#include <iterator>
+#include <limits>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +64,182 @@
 // =====================================================================
 // Part 1: 链式 GEP 合并
 // =====================================================================
+bool pointerIsProvablyWithinKnownObject(
+    Value *Pointer, RangeInfo &RI, const DominatorTree &DT) {
+    if (!Pointer || valueMayDependOnUndef(Pointer)) return false;
+
+    std::unordered_set<Value *> ActiveRanges;
+    std::function<IntRange(Value *, BasicBlock *, unsigned)>
+        queryDefinedIndexRange;
+    queryDefinedIndexRange =
+        [&](Value *Index, BasicBlock *Context, unsigned Depth) -> IntRange {
+        if (!Index || !Context || Depth > 8 ||
+            valueMayDependOnUndef(Index))
+            return IntRange();
+
+        IntRange Known = RI.query(Index, Context, DT);
+        if (!Known.isTop() && !Known.isBottom())
+            return Known;
+
+        auto *Binary = dynamic_cast<BinaryInst *>(Index);
+        if (!Binary || !ActiveRanges.insert(Index).second)
+            return Known;
+        Value *LHS = nullptr;
+        Value *RHS = nullptr;
+        if (!Binary->getOperands(LHS, RHS)) {
+            ActiveRanges.erase(Index);
+            return IntRange();
+        }
+
+        IntRange Left =
+            queryDefinedIndexRange(LHS, Context, Depth + 1);
+        IntRange Right =
+            queryDefinedIndexRange(RHS, Context, Depth + 1);
+        IntRange Result;
+        if (!Left.isBottom() && !Right.isBottom() &&
+            !Left.isTop() && !Right.isTop()) {
+            int64_t Minimum = 0;
+            int64_t Maximum = 0;
+            bool Defined = false;
+            switch (Binary->getOp()) {
+                case BinaryInst::ADD:
+                    Defined =
+                        IRMath::addI32(
+                            Left.min, Right.min, Minimum) &&
+                        IRMath::addI32(
+                            Left.max, Right.max, Maximum);
+                    break;
+                case BinaryInst::SUB:
+                    Defined =
+                        IRMath::addI32(
+                            Left.min, -Right.max, Minimum) &&
+                        IRMath::addI32(
+                            Left.max, -Right.min, Maximum);
+                    break;
+                case BinaryInst::MUL: {
+                    int64_t Products[4] = {
+                        Left.min * Right.min,
+                        Left.min * Right.max,
+                        Left.max * Right.min,
+                        Left.max * Right.max};
+                    auto Bounds = std::minmax_element(
+                        std::begin(Products), std::end(Products));
+                    Minimum = *Bounds.first;
+                    Maximum = *Bounds.second;
+                    Defined =
+                        Minimum >= std::numeric_limits<int32_t>::min() &&
+                        Maximum <= std::numeric_limits<int32_t>::max();
+                    break;
+                }
+                case BinaryInst::SHL:
+                    if (Right.isSingleValue() && Right.min >= 0 &&
+                        Right.min < 31 && Left.min >= 0) {
+                        int64_t Scale = int64_t{1} << Right.min;
+                        Minimum = Left.min * Scale;
+                        Maximum = Left.max * Scale;
+                        Defined =
+                            Maximum <=
+                            std::numeric_limits<int32_t>::max();
+                    }
+                    break;
+                case BinaryInst::LSHR:
+                    if (Right.isSingleValue() && Right.min >= 0 &&
+                        Right.min < 31 && Left.min >= 0) {
+                        Minimum = Left.min >> Right.min;
+                        Maximum = Left.max >> Right.min;
+                        Defined = true;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            if (Defined) Result = IntRange(Minimum, Maximum);
+        }
+        ActiveRanges.erase(Index);
+        return Result;
+    };
+
+    std::vector<GetElementPtrInst *> Chain;
+    std::unordered_set<Value *> Seen;
+    Value *Current = Pointer;
+    while (Current && Seen.insert(Current).second) {
+        if (auto *Node = dynamic_cast<GetElementPtrInst *>(Current)) {
+            Chain.push_back(Node);
+            Current = Node->getBasePointer();
+            continue;
+        }
+        if (auto *BC = dynamic_cast<BitCastInst *>(Current)) {
+            Value *Source = BC->getUnaryOperand();
+            auto SourceTy = Value::getPointeeType(Source);
+            auto DestinationTy = Value::getPointeeType(BC);
+            if (!Source ||
+                !IRType::hasSameShape(SourceTy, DestinationTy))
+                return false;
+            Current = Source;
+            continue;
+        }
+        break;
+    }
+
+    auto *RootGlobal = dynamic_cast<Variable *>(Current);
+    if (!dynamic_cast<AllocaInst *>(Current) &&
+        (!RootGlobal || !RootGlobal->isGlobal()))
+        return false;
+
+    for (GetElementPtrInst *Node : Chain) {
+        Value *Base = Node->getBasePointer();
+        BasicBlock *Context = Node->getParent();
+        if (!Base || !Context || Node->getNumIndices() == 0)
+            return false;
+
+        auto indexIsWithin = [&](Value *Index, int64_t Minimum,
+                                 int64_t Maximum) {
+            if (!Index || Minimum > Maximum) return false;
+            if (auto *CI = dynamic_cast<ConstInt *>(Index)) {
+                int64_t Value = static_cast<int64_t>(CI->getVal());
+                return Value >= Minimum && Value <= Maximum;
+            }
+            if (!Index->getIRType() ||
+                !Index->getIRType()->isInt())
+                return false;
+            IntRange Range =
+                queryDefinedIndexRange(Index, Context, 0);
+            return !Range.isBottom() && Range.min >= Minimum &&
+                   Range.max <= Maximum;
+        };
+
+        // 已知 global/alloca 在当前 IR 中只代表一个完整对象。首索引必须
+        // 恒为 0；后续索引则由 TypeSystem 的数组层级逐维给出边界。
+        if (!indexIsWithin(Node->getIndex(0), 0, 0))
+            return false;
+
+        std::shared_ptr<IRType> AddressedTy =
+            Value::getPointeeType(Base);
+        for (size_t I = 1; I < Node->getNumIndices(); ++I) {
+            auto ArrayTy =
+                std::dynamic_pointer_cast<ARRAYType>(AddressedTy);
+            if (!ArrayTy || ArrayTy->getElementCount() <= 0 ||
+                !indexIsWithin(
+                    Node->getIndex(I), 0,
+                    static_cast<int64_t>(
+                        ArrayTy->getElementCount()) - 1))
+                return false;
+            AddressedTy = ArrayTy->getElementType();
+        }
+
+        auto ResultTy = Value::getPointeeType(Node);
+        if (!AddressedTy || !ResultTy ||
+            !IRType::hasSameShape(AddressedTy, ResultTy))
+            return false;
+    }
+    return true;
+}
+
+bool gepIsProvablyWithinKnownObject(
+    GetElementPtrInst *GEP, RangeInfo &RI, const DominatorTree &DT) {
+    return GEP && pointerIsProvablyWithinKnownObject(GEP, RI, DT);
+}
+
 bool GepCombinePass::combineChainedGEPs(Function &F) {
     bool changed = false;
 
@@ -83,7 +265,6 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
         if (BaseGEP->countUses() > 1) continue;
 
         if (BaseGEP->getNumIndices() < 1) continue;
-
         Value *firstIdx = GEP->getIndex(0);
         Value *baseLastIdx = BaseGEP->getIndex(BaseGEP->getNumIndices() - 1);
 
@@ -118,11 +299,18 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
             auto *CI1 = firstIdx ? firstIdx->as<ConstInt>() : nullptr;
             auto *CI2 = baseLastIdx ? baseLastIdx->as<ConstInt>() : nullptr;
             if (CI1 && CI2) {
-                int sumVal = CI1->getVal() + CI2->getVal();
+                int64_t checkedSum = 0;
+                // GEP 索引是 i32。宿主 C++ 加法和目标 i32 加法都必须无溢出，
+                // 否则不能把两级索引折叠为一个常量。
+                if (!IRMath::addI32(
+                        CI1->getVal(), CI2->getVal(), checkedSum)) {
+                    continue;
+                }
                 std::vector<Value *> newIndices;
                 for (size_t i = 0; i + 1 < BaseGEP->getNumIndices(); i++)
                     newIndices.push_back(BaseGEP->getIndex(i));
-                newIndices.push_back(ConstInt::newConstInt(sumVal));
+                newIndices.push_back(
+                    ConstInt::newConstInt(static_cast<int>(checkedSum)));
                 for (size_t i = 1; i < GEP->getNumIndices(); i++)
                     newIndices.push_back(GEP->getIndex(i));
 
@@ -188,7 +376,6 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                 if (I == 0) return true;
                 auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Incoming);
                 if (!OtherGEP) return false;
-
                 if (OtherGEP->getNumIndices() != FirstGEP->getNumIndices()) {
                     return false;
                 }
@@ -265,7 +452,34 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
 // =====================================================================
 // Part 3: 循环内相邻 GEP 合并
 // =====================================================================
-bool GepCombinePass::combineLoopGEPs(Function &F) {
+bool GepCombinePass::isKnownNoWrapAdd(
+    BinaryInst *Inst, BasicBlock *ContextBlock, RangeInfo &RI,
+    const DominatorTree &DT) {
+    if (!Inst || !ContextBlock || Inst->getOp() != BinaryInst::ADD)
+        return false;
+
+    Value *LHS = nullptr;
+    Value *RHS = nullptr;
+    if (!Inst->getOperands(LHS, RHS) || !LHS || !RHS ||
+        !IRType::hasIntegerBitWidth(LHS->getIRType(), 32) ||
+        !IRType::hasIntegerBitWidth(RHS->getIRType(), 32)) {
+        return false;
+    }
+
+    IntRange LRange = RI.query(LHS, ContextBlock, DT);
+    IntRange RRange = RI.query(RHS, ContextBlock, DT);
+    if (LRange.isBottom() || RRange.isBottom()) return false;
+
+    int64_t CheckedMin = 0;
+    int64_t CheckedMax = 0;
+    return IRMath::addI32(
+               LRange.min, RRange.min, CheckedMin) &&
+           IRMath::addI32(
+               LRange.max, RRange.max, CheckedMax);
+}
+
+bool GepCombinePass::combineLoopGEPs(
+    Function &F, RangeInfo &RI, const DominatorTree &DT) {
     bool changed = false;
 
     for (BasicBlock *BB : F) {
@@ -316,7 +530,6 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
             for (size_t i = 1; i < grp.Geps.size(); i++) {
                 auto *prevGEP = grp.Geps[i - 1];
                 auto *curGEP = grp.Geps[i];
-
                 Value *prevLast = prevGEP->getIndex(prevGEP->getNumIndices() - 1);
                 Value *curLast = curGEP->getIndex(curGEP->getNumIndices() - 1);
 
@@ -330,7 +543,10 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
                         if (lhs == prevLast) offset = rhs ? rhs->as<ConstInt>() : nullptr;
                         else if (rhs == prevLast) offset = lhs ? lhs->as<ConstInt>() : nullptr;
 
-                        if (offset) {
+                        if (offset &&
+                            isKnownNoWrapAdd(Bin, BB, RI, DT)) {
+                            // 只有证明原 i32 加法不回绕后，才能把
+                            // gep(base, prev+C) 改写为 gep(gep(base, prev), C)。
                             std::vector<Value *> newIndices;
                             newIndices.push_back(ConstInt::newConstInt(offset->getVal()));
                             curGEP->reset(prevGEP, newIndices);
@@ -345,20 +561,46 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
                     if (auto *CurBin = dynamic_cast<BinaryInst *>(curLast)) {
                         if (PrevBin->getOp() == BinaryInst::ADD &&
                             CurBin->getOp() == BinaryInst::ADD) {
-                            Value *prevBase = nullptr;
-                            Value *prevOffset = nullptr;
-                            Value *curBase = nullptr;
-                            Value *curOffset = nullptr;
-                            if (!PrevBin->getOperands(prevBase, prevOffset) ||
-                                !CurBin->getOperands(curBase, curOffset))
+                            Value *PrevLHS = nullptr;
+                            Value *PrevRHS = nullptr;
+                            Value *CurLHS = nullptr;
+                            Value *CurRHS = nullptr;
+                            if (!PrevBin->getOperands(PrevLHS, PrevRHS) ||
+                                !CurBin->getOperands(CurLHS, CurRHS))
                                 continue;
-                            auto *prevOff = prevOffset ? prevOffset->as<ConstInt>() : nullptr;
-                            auto *curOff = curOffset ? curOffset->as<ConstInt>() : nullptr;
 
-                            if (prevBase == curBase && prevOff && curOff) {
-                                int diff = curOff->getVal() - prevOff->getVal();
+                            Value *PrevBase = PrevLHS;
+                            Value *CurBase = CurLHS;
+                            ConstInt *PrevOffset =
+                                PrevRHS ? PrevRHS->as<ConstInt>() : nullptr;
+                            ConstInt *CurOffset =
+                                CurRHS ? CurRHS->as<ConstInt>() : nullptr;
+                            if (!PrevOffset) {
+                                PrevOffset =
+                                    PrevLHS ? PrevLHS->as<ConstInt>() : nullptr;
+                                PrevBase = PrevRHS;
+                            }
+                            if (!CurOffset) {
+                                CurOffset =
+                                    CurLHS ? CurLHS->as<ConstInt>() : nullptr;
+                                CurBase = CurRHS;
+                            }
+
+                            int64_t CheckedDiff = 0;
+                            if (PrevBase == CurBase && PrevOffset && CurOffset &&
+                                isKnownNoWrapAdd(PrevBin, BB, RI, DT) &&
+                                isKnownNoWrapAdd(CurBin, BB, RI, DT) &&
+                                IRMath::addI32(
+                                    CurOffset->getVal(),
+                                    -static_cast<int64_t>(
+                                        PrevOffset->getVal()),
+                                    CheckedDiff)) {
+                                // 两个原始加法和常量差都经过 i32 检查，重基址
+                                // 不会把原来的回绕语义变成指针宽度算术。
                                 std::vector<Value *> newIndices;
-                                newIndices.push_back(ConstInt::newConstInt(diff));
+                                newIndices.push_back(
+                                    ConstInt::newConstInt(
+                                        static_cast<int>(CheckedDiff)));
                                 curGEP->reset(prevGEP, newIndices);
                                 changed = true;
                                 continue;
@@ -375,6 +617,8 @@ bool GepCombinePass::combineLoopGEPs(Function &F) {
 
 PreservationStatus GepCombinePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = false;
+    auto &RI = FAM.getResult<RangeAnalysis>(F);
+    auto &DT = FAM.getResult<DominantAnalysis>(F);
 
     for (int iter = 0; iter < 4; iter++) {
         if (!combineChainedGEPs(F)) break;
@@ -382,7 +626,7 @@ PreservationStatus GepCombinePass::run(Function &F, FunctionAnalysisPassManager 
     }
 
     changed |= foldGEPOfPhi(F);
-    changed |= combineLoopGEPs(F);
+    changed |= combineLoopGEPs(F, RI, DT);
 
     if (!changed) return PreservationStatus::all();
 
