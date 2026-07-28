@@ -8,38 +8,6 @@
 #include <stack>
 #include <unordered_map>
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
 bool ConstraintEliminationPass::isKnownNoWrapAddSub(
     BinaryInst *inst, BasicBlock *contextBlock, RangeInfo &RI,
     const DominatorTree &DT) {
@@ -57,8 +25,6 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
         return false;
 
-     
-     
     IntRange lhsRange = RI.query(lhs, contextBlock, DT);
     IntRange rhsRange = RI.query(rhs, contextBlock, DT);
     if (lhsRange.isBottom() || rhsRange.isBottom()) return false;
@@ -70,7 +36,6 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
                IRMath::addI32(lhsRange.max, rhsRange.max, resultMax);
     }
 
-     
     return IRMath::addI32(lhsRange.min, -rhsRange.max, resultMin) &&
            IRMath::addI32(lhsRange.max, -rhsRange.min, resultMax);
 }
@@ -96,8 +61,7 @@ ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
 
     if (BI->getOp() == BinaryInst::ADD) {
         if (auto *C = dynamic_cast<ConstInt *>(lhs)) {
-             
-             
+
             if (!isKnownNoWrapAddSub(BI, contextBlock, RI, DT))
                 return {V, 0, true};
             ConstraintElimOffsetExpr E =
@@ -185,17 +149,6 @@ bool ConstraintEliminationPass::rewriteOffsetConstraint(
     return true;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool ConstraintEliminationPass::extractConstraint(
     BinaryInst *cmp, bool negate, RangeInfo &RI, const DominatorTree &DT,
     ConstraintElimConstraint &out) {
@@ -205,8 +158,6 @@ bool ConstraintEliminationPass::extractConstraint(
     Value *rhs = nullptr;
     if (!cmp->getOperands(lhs, rhs)) return false;
 
-     
-     
     if (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
         return false;
@@ -216,9 +167,6 @@ bool ConstraintEliminationPass::extractConstraint(
     Value *bound = rhs;
     BasicBlock *contextBlock = cmp->getParent();
 
-     
-     
-     
     // 1.4 对 (x+C) op K、(x-C) op K、(C-x) op K 做常量移项；要求原算术无回绕、
     // 新边界仍在 i32，最后一种形态还需反转谓词方向。
     if (auto *rConst = dynamic_cast<ConstInt *>(rhs)) {
@@ -233,8 +181,6 @@ bool ConstraintEliminationPass::extractConstraint(
                     return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
                 };
 
-                 
-                 
                 if (lBI->getOp() == BinaryInst::ADD) {
                     ConstInt *cConst = dynamic_cast<ConstInt *>(la);
                     Value *xVal = lb;
@@ -245,8 +191,7 @@ bool ConstraintEliminationPass::extractConstraint(
                     if (cConst) {
                         int64_t newBound = c2 - (int64_t)cConst->getVal();
                         if (inI32(newBound)) {
-                             
-                             
+
                             out.val = xVal;
                             out.op = op;
                             out.bound = ConstInt::newConstInt((int)newBound);
@@ -257,12 +202,12 @@ bool ConstraintEliminationPass::extractConstraint(
                         }
                     }
                 }
-                 
+
                 else if (lBI->getOp() == BinaryInst::SUB) {
                     auto *lbConst = dynamic_cast<ConstInt *>(lb);
                     auto *laConst = dynamic_cast<ConstInt *>(la);
                     if (lbConst) {
-                         
+
                         int64_t newBound = c2 + (int64_t)lbConst->getVal();
                         if (inI32(newBound)) {
                             out.val = la;
@@ -274,10 +219,10 @@ bool ConstraintEliminationPass::extractConstraint(
                             return true;
                         }
                     } else if (laConst) {
-                         
+
                         int64_t newBound = (int64_t)laConst->getVal() - c2;
                         if (inI32(newBound)) {
-                             
+
                             BinaryInst::Operation flipped = BinaryInst::reversePredicate(op);
                             out.val = lb;
                             out.op = flipped;
@@ -326,49 +271,25 @@ bool ConstraintEliminationPass::comparableBoundValues(
     return false;
 }
 
- 
- 
 bool ConstraintEliminationPass::implies(
     const ConstraintElimConstraint &known,
     const ConstraintElimConstraint &target) {
     // 2.1 仅比较同一 val 且边界可换算的约束，按整数严格/非严格端点关系判断
     // known 是否足以推出 target；等式可推出对应范围与不等式。
-     
+
     if (known.val != target.val) return false;
 
-     
-     
     int64_t kB = 0;
     int64_t tB = 0;
     bool comparableBound = comparableBoundValues(known, target, kB, tB);
     bool sameBound = comparableBound && kB == tB;
-
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
-     
 
     if (sameBound && known.op == target.op) return true;
 
     if (!comparableBound) return false;
 
     switch (known.op) {
-        case BinaryInst::L:  
+        case BinaryInst::L:
             switch (target.op) {
                 case BinaryInst::L:  return kB <= tB;
                 case BinaryInst::LE: return kB <= tB + 1;
@@ -376,7 +297,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::LE:  
+        case BinaryInst::LE:
             switch (target.op) {
                 case BinaryInst::L:  return kB < tB;
                 case BinaryInst::LE: return kB <= tB;
@@ -384,7 +305,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::G:  
+        case BinaryInst::G:
             switch (target.op) {
                 case BinaryInst::G:  return kB >= tB;
                 case BinaryInst::GE: return kB >= tB - 1;
@@ -392,7 +313,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::GE:  
+        case BinaryInst::GE:
             switch (target.op) {
                 case BinaryInst::G:  return kB > tB;
                 case BinaryInst::GE: return kB >= tB;
@@ -400,7 +321,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::E:  
+        case BinaryInst::E:
             switch (target.op) {
                 case BinaryInst::E:  return kB == tB;
                 case BinaryInst::L:  return kB < tB;
@@ -417,7 +338,6 @@ bool ConstraintEliminationPass::implies(
     return false;
 }
 
- 
 bool ConstraintEliminationPass::isImplied(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
@@ -440,13 +360,6 @@ bool ConstraintEliminationPass::isImplied(
     return false;
 }
 
- 
- 
- 
- 
- 
- 
- 
 bool ConstraintEliminationPass::impliesTransitive(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
@@ -458,26 +371,19 @@ bool ConstraintEliminationPass::impliesTransitive(
         return false;
     (void)checkedTargetConst;
 
-     
     for (auto &k1 : stack) {
         if (k1.val != target.val) continue;
-        if (k1.boundIsConst) continue;           
-        if (k1.bound == target.bound) continue;  
+        if (k1.boundIsConst) continue;
+        if (k1.bound == target.bound) continue;
         Value *mid = k1.bound;
-         
+
         for (auto &k2 : stack) {
             if (k2.val != mid) continue;
             if (!k2.boundIsConst) continue;
-             
-             
-             
-             
-             
-             
-             
+
             auto compose = [](BinaryInst::Operation a, BinaryInst::Operation b)
                 -> BinaryInst::Operation {
-                 
+
                 if ((a == BinaryInst::L  || a == BinaryInst::LE) &&
                     (b == BinaryInst::L  || b == BinaryInst::LE))
                     return (a == BinaryInst::L || b == BinaryInst::L)
@@ -491,7 +397,7 @@ bool ConstraintEliminationPass::impliesTransitive(
                 return BinaryInst::BinaryUnknown == 0 ? BinaryInst::NE : BinaryInst::NE;
             };
             BinaryInst::Operation combined = compose(k1.op, k2.op);
-            if (combined == BinaryInst::NE) continue;  
+            if (combined == BinaryInst::NE) continue;
             ConstraintElimConstraint synthesized;
             synthesized.val = target.val;
             synthesized.op = combined;
@@ -506,7 +412,6 @@ bool ConstraintEliminationPass::impliesTransitive(
     return false;
 }
 
- 
 bool ConstraintEliminationPass::isImpliedChained(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
@@ -546,12 +451,9 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
         BasicBlock *BB = node->Block;
         if (!BB) continue;
 
-         
         while ((int)constraintStack.size() > frame.constraintsBefore)
             constraintStack.pop_back();
 
-         
-         
         // 2.1 若当前块只有一个条件分支前驱，把所走 true/false 边对应的规范化条件
         // 压栈；多前驱块不能假定某一条边条件必然成立。
         auto preds = BB->getPredecessors();
@@ -562,8 +464,7 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                 if (br->isConditional()) {
                     BasicBlock *trueBB = br->getTrueSuccessor();
                     BasicBlock *falseBB = br->getFalseSuccessor();
-                     
-                     
+
                     if (trueBB && falseBB && trueBB != falseBB &&
                         (BB == trueBB || BB == falseBB)) {
                         Value *cond = br->getCondition();
@@ -581,9 +482,6 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             }
         }
 
-         
-         
-         
         // 2.2 对当前条件分支提取目标约束，并临时加入 RangeAnalysis 给出的上下界；
         // 依次尝试直接/一跳蕴含及其否定，记录可折叠的布尔结果。
         if (!constraintStack.empty()) {
@@ -595,16 +493,13 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                         ConstraintElimConstraint target;
                         if (extractConstraint(
                                 cmpInst, false, RI, DT, target)) {
-                             
-                             
-                             
+
                             size_t savedSize = constraintStack.size();
                             if (target.val->getIRType() &&
                                 target.val->getIRType()->isInt()) {
                                 IntRange vr = RI.query(target.val, BB, DT);
                                 if (!vr.isTop() && !vr.isBottom()) {
-                                     
-                                     
+
                                     ConstraintElimConstraint lo, hi;
                                     lo.val = target.val;
                                     lo.op = BinaryInst::GE;
@@ -637,7 +532,6 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             }
         }
 
-         
         // 2.3 将当前约束深度随子节点入栈，使该路径事实传播到整个支配子树。
         int curSize = (int)constraintStack.size();
         std::vector<DominatorNode *> children;
@@ -647,9 +541,6 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             dfsStack.push({*it, curSize});
     }
 
-     
-     
-     
     // 3. 遍历结束后再改写分支条件；重新校验候选仍是原条件，避免收集阶段修改 CFG
     // 或条件 use，并把证明结果替换为布尔常量交给 CFGSimplify 清边。
     for (const auto &Candidate : toFold) {
@@ -664,7 +555,6 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
 
     if (!changed) return PreservationStatus::all();
 
-     
     // 4. 此处只替换条件值，CFG 尚未改变，因此保留支配树与循环树。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();

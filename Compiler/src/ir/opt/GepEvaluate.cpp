@@ -4,26 +4,6 @@
 
 #include <vector>
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
 bool GepEvaluatePass::evaluateGEP(Function &F) {
     // 1. 对 GEP 做快照，后续可以安全删除或在其前方插入新指令。
     bool changed = false;
@@ -35,7 +15,6 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
         if (!Base) continue;
         size_t numIndices = GEP->getNumIndices();
 
-         
         // 2. 空索引不改变地址，直接退化为基址。
         if (numIndices == 0) {
             GEP->replaceAllUsesWith(Base);
@@ -44,7 +23,6 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
             continue;
         }
 
-         
         // 3. undef 基址无法产生定义良好的地址，将结果统一传播为同类型 undef。
         if (Base->isUndef()) {
             GEP->replaceAllUsesWith(UndefValue::NewUndefValue(GEP->getIRType()));
@@ -53,8 +31,6 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
             continue;
         }
 
-         
-         
         // 4. 对含多个非零索引的复杂地址，在第二个非零索引处分段：前段先计算
         // 中间基址，后段从零索引重新进入对象，限制单条 GEP 的寻址复杂度。
         {

@@ -15,9 +15,7 @@ bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     // 2.1 零次循环只能跳过控制流和无副作用纯计算；未知指令及 DCE 白名单外语义保留。
     if (!I) return false;
     if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
-     
-     
-     
+
     if (dceInstructionMustBePreserved(I)) return false;
     if (dynamic_cast<BinaryInst *>(I)) return true;
     if (dynamic_cast<SelectInst *>(I) ||
@@ -33,9 +31,7 @@ bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     case Instruction::BITCAST:
         return true;
     default:
-         
-         
-         
+
         return false;
     }
 }
@@ -53,12 +49,6 @@ bool LoopDeletionPass::hasNoObservableLoopInstruction(Loop *L) {
     return true;
 }
 
- 
- 
- 
- 
- 
- 
 bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
     SCEVResult &SE, const LoopTripCountInfo &TCI) {
     // 1.1 运行期 trip count 只有在 header 以规范 i32 归纳变量、直接 ±1 更新和
@@ -81,8 +71,6 @@ bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
     };
     if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
 
-     
-     
     auto *Update = dynamic_cast<BinaryInst *>(IV->UpdateValue);
     if (!Update) return false;
     Value *UpdateL = Update->getOperand(0);
@@ -124,9 +112,6 @@ Value *LoopDeletionPass::resolveZeroTripValue(
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I || !I->getParent() || !L->contains(I->getParent())) return V;
 
-     
-     
-     
     auto *Phi = dynamic_cast<PhiInst *>(I);
     if (!Phi || Phi->getParent() != L->getHeader()) return nullptr;
     ScopedActiveMark ActiveMark(Active, V);
@@ -149,7 +134,7 @@ bool LoopDeletionPass::planZeroTripPhiReplacements(
         std::unordered_set<Value *> Active;
         Value *Replacement =
             resolveZeroTripValue(OnExit, L, TCI.PreHeader, Active);
-         
+
         if (!Replacement ||
             !IRType::hasSameShape(Replacement->getIRType(),
                                   Phi->getIRType())) {
@@ -238,9 +223,6 @@ bool LoopDeletionPass::deleteLoopCFG(
     if (!PreHeader->replaceTerminator(new BrInst(Exit))) return false;
     applyPhiReplacements(PhiPlan);
 
-     
-     
-     
     // 4.1 以 undef 断开异常残留值 use，分两轮先 clear 全部块再 delete，安全处理
     // 循环内部互相引用和回边。
     for (BasicBlock *BB : LoopBlocks) {
@@ -271,8 +253,7 @@ PreservationStatus LoopDeletionPass::run(
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
     bool Changed = false;
-     
-     
+
     for (Loop *L : LI.getLoopsInPostOrder(true)) {
         if (!L || !L->getHeader() || !L->getSubLoops().empty()) continue;
         if (L->getHeader()->getParent() != &F) continue;
@@ -290,11 +271,6 @@ PreservationStatus LoopDeletionPass::run(
             continue;
         }
 
-         
-         
-         
-         
-         
         // 1.2 候选必须已证明有限：常量次数要求无回绕，运行期次数要求严格单位步长；
         // 零次循环还要求退出测试位于 header，确保 body 从未执行。
         bool ZeroTrip = TCI->ConstantTripCount &&
@@ -316,8 +292,7 @@ PreservationStatus LoopDeletionPass::run(
         // 无可观察行为并规划公共 exit 值。
         PhiReplacementMap PhiPlan;
         if (ZeroTrip) {
-             
-             
+
             bool HeaderSafe = true;
             for (Instruction *I : *L->getHeader())
                 if (!isSafeToSkipOnZeroTrip(I)) {

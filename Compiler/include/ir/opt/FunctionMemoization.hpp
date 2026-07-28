@@ -8,7 +8,6 @@
 #include <string>
 #include <vector>
 
- 
 // 候选快照保存目标、自递归调用点和所有返回点，使模块扫描与 CFG 提交阶段分离。
 struct FunctionMemoizationCandidate {
     Function *Target = nullptr;
@@ -16,7 +15,6 @@ struct FunctionMemoizationCandidate {
     std::vector<RetInst *> Returns;
 };
 
- 
 // 流程：1. 验证纯标量、NoModRef、多分支递归函数；2. 在模块缓存预算内创建键/结果数组；
 // 3. 插入 lookup/hit 入口 CFG；4. 在每个原返回点按发布顺序写入直接映射缓存。
 class FunctionMemoizationPass

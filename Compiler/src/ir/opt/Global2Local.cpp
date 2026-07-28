@@ -29,8 +29,6 @@ bool Global2LocalPass::isRecursiveFrom(
 		});
 }
 
- 
- 
 bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	// 2.1 标量全局只允许作为直接 load/store 地址，不能把地址本身存出或参与其他运算。
 	if (!U || !GV) return false;
@@ -42,7 +40,7 @@ bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	}
 
 	if (auto *SI = dynamic_cast<StoreInst *>(UserI)) {
-		 
+
 		return SI->getPointerOperand() == GV;
 	}
 
@@ -58,8 +56,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 
 	auto CallGraph = M->buildDirectCallGraph();
-	 
-	 
+
 	if (isRecursiveFrom(Main, CallGraph))
 		return PreservationStatus::all();
 
@@ -155,8 +152,6 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			CanPromote = false;
 		}
 
-		 
-		 
 		// 2.2 候选的任一 main use 若可能位于计时屏障之后或跨回边越过屏障，
 		// 则入口初始化会改变计时区间内存成本，必须放弃局部化。
 		if (CanPromote && Main->mayReachTimingCall()) {
@@ -213,7 +208,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			const int ByteSize = static_cast<int>(C.ElemTy->getSize());
 			std::vector<Value *> Args;
 			Args.push_back(Alloca);
-			 
+
 			Args.push_back(C.GV);
 			Args.push_back(ConstInt::newConstInt(ByteSize));
 			Args.push_back(ConstBool::newConstBool(false));

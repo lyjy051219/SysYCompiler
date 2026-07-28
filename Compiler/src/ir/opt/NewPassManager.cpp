@@ -38,18 +38,16 @@ void PreservationStatus::markCrossUnitInvalidationHandled() {
 }
 
 void PreservationStatus::merge(const PreservationStatus &Arg) {
-    // 1.1 顺序组合多个 pass 的保存集合时取交集：任一 pass 显式 discard 的分析
+    // 结果合并 1. 顺序组合多个 pass 的保存集合时取交集：任一 pass 显式 discard 的分析
     // 始终失效；“全部保留”是交集单位元，进入非单位元合并后，跨单元失效已
     // 处理标志也按两侧取交。
     if (Arg.areAllKept()) return;
 
-     
     if (areAllKept()) {
         *this = Arg;
         return;
     }
 
-     
     CrossUnitInvalidationHandled =
         CrossUnitInvalidationHandled && Arg.CrossUnitInvalidationHandled;
 
@@ -110,7 +108,7 @@ PreservationStatus &PassResult::preservedAnalyses() {
 }
 
 void PassResult::merge(const PassResult &Arg) {
-    // 1.2 pipeline 的 changed 取并集，preservation 取交集，得到整个组合 pass 的摘要。
+    // 结果合并 2. pipeline 的 changed 取并集，preservation 取交集，得到组合摘要。
     IRChanged = IRChanged || Arg.IRChanged;
     Preserved.merge(Arg.Preserved);
 }
@@ -135,7 +133,6 @@ void AnalysisPassManager<IRUnitT>::eraseCachedResults(
     // 变空时同时删除图节点，避免缓存重建后继承陈旧依赖。
     for (const CacheKey &Key : Keys) ResultCache.erase(Key);
 
-     
     for (const CacheKey &Key : Keys) {
         auto ForwardIt = AnalysisDependencies.find(Key);
         if (ForwardIt == AnalysisDependencies.end()) continue;
@@ -151,7 +148,6 @@ void AnalysisPassManager<IRUnitT>::eraseCachedResults(
         }
     }
 
-     
     for (const CacheKey &Key : Keys) {
         auto ReverseIt = ReverseAnalysisDependencies.find(Key);
         if (ReverseIt == ReverseAnalysisDependencies.end()) continue;
@@ -170,7 +166,7 @@ void AnalysisPassManager<IRUnitT>::eraseCachedResults(
 
 template <typename IRUnitT>
 void AnalysisPassManager<IRUnitT>::clear() {
-    // 2.4 只有没有正在构造的分析时才能整体清空缓存与依赖图。
+    // 4. 显式整体清理只有在没有分析正在构造时才合法；结果缓存与依赖图同步归零。
     assert(ActiveAnalysisStack.empty() &&
            "cannot clear analyses while an analysis is running");
     ResultCache.clear();
@@ -181,14 +177,13 @@ void AnalysisPassManager<IRUnitT>::clear() {
 template <typename IRUnitT>
 void AnalysisPassManager<IRUnitT>::invalidate(
     IRUnitT &IR, const PassResult &Result) {
-    // 3. unchanged pass 不触发任何失效；changed pass 先按 preservation 与分析结果
+    // 3.1 unchanged pass 不触发任何失效；changed pass 先按 preservation 与分析结果
     // 自身 invalidate 钩子筛出当前 IR 单元和跨单元分析的初始失效键。
     if (!Result.changedIR()) return;
 
     const PreservationStatus &PA = Result.preservedAnalyses();
     std::set<CacheKey> InvalidKeys;
 
-     
     for (auto &Entry : ResultCache) {
         PassID *AnalysisID = Entry.first.first;
         const bool IsCrossUnit =
@@ -200,9 +195,7 @@ void AnalysisPassManager<IRUnitT>::invalidate(
         }
     }
 
-     
-     
-    // 3.1 沿反向依赖图求传递闭包；跨 IR 单元分析一处失效时，同一分析 ID 的全部
+    // 3.2 沿反向依赖图求传递闭包；跨 IR 单元分析一处失效时，同一分析 ID 的全部
     // 缓存实例一起驱逐，保证模块级/跨函数摘要一致。
     std::vector<CacheKey> Worklist(InvalidKeys.begin(), InvalidKeys.end());
     std::set<PassID *> ExpandedCrossUnitIDs;
@@ -227,10 +220,9 @@ void AnalysisPassManager<IRUnitT>::invalidate(
         }
     }
 
-    // 3.2 闭包稳定后统一删缓存与图边，避免遍历依赖关系时修改容器。
+    // 3.3 闭包稳定后统一删缓存与图边，避免遍历依赖关系时修改容器。
     eraseCachedResults(InvalidKeys);
 
-     
     // 3.4 若当前层没有负责跨单元失效，则通知上层桥接/模块管理器处理外层缓存。
     if (!PA.wasCrossUnitInvalidationHandled() && IRMutationCallback)
         IRMutationCallback();
@@ -249,25 +241,24 @@ ModuleFunctionBridge::ModuleFunctionBridge(
 
 PassResult ModuleFunctionBridge::run(
     Module &M, ModuleAnalysisPassManager &) {
-    // 6. 依次在每个函数上运行同一个类型擦除 pass，并立即用单函数结果失效 FAM；
+    // 2. 依次在每个函数上运行同一个类型擦除 pass，并立即用单函数结果失效 FAM；
     // 所有函数结果的 changed/preservation 再合并为模块桥接结果。
     PreservationStatus PA = PreservationStatus::all();
     bool Changed = false;
     for (auto &F : M.getFunctions()) {
         PassResult FuncResult = Pass->run(*F, FAM);
-         
+
         FAM.invalidate(*F, FuncResult);
         PA.merge(FuncResult.preservedAnalyses());
         if (FuncResult.changedIR()) Changed = true;
     }
-    // 6.1 changed 时标记函数级跨单元失效已经逐函数处理，避免模块回调重复清空；
+    // 3. changed 时标记函数级跨单元失效已经逐函数处理，避免模块回调重复清空；
     // 全部未改则保留精确的合并 preservation。
     if (!Changed) return PassResult::unchanged(std::move(PA));
     PA.markCrossUnitInvalidationHandled();
     return PassResult::changed(std::move(PA));
 }
 
- 
 template class AnalysisPassManager<Module>;
 template class AnalysisPassManager<Function>;
 template class PassManager<Module>;

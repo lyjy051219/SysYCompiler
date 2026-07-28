@@ -14,11 +14,6 @@ class SCEVResult;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
 
- 
- 
- 
- 
- 
 // 流程：1. 由 SCEV 匹配单位步长连续访问；2. 区分 memset、memcpy 与临时数组双复制；
 // 3. 证明对象边界、无额外副作用及 trip count 安全；4. 常量次数直接替换，
 // 运行期次数建立有收益/溢出 guard 的 intrinsic fast path 并保留原循环慢路径。

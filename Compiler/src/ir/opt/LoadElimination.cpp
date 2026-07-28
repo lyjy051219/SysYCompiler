@@ -11,7 +11,6 @@
 #include <unordered_set>
 #include <vector>
 
- 
 LoadElimQueryResult LoadElimQueryResult::known(Value *V) {
     return {KNOWN, V, {}};
 }
@@ -33,33 +32,6 @@ LoadElimQueryResult LoadElimQueryResult::phiNeeded(
     return {PHI_NEEDED, nullptr, std::move(M)};
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
- 
- 
- 
-
 bool LoadEliminationPass::isTypeCompatible(
     Value *source, LoadInst *targetLoad) {
     if (!source || !targetLoad) return false;
@@ -77,7 +49,6 @@ bool LoadEliminationPass::mayModifyPointer(
     Value *P = Location.Pointer;
     if (!P || !I) return true;
 
-     
     if (auto *CI = dynamic_cast<CallInst *>(I);
         CI && CI->mayReachTimingCall()) {
         return true;
@@ -95,16 +66,6 @@ bool LoadEliminationPass::mayModifyPointer(
     return false;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool LoadEliminationPass::isUnmodifiedOnAllPaths(
     LoadInst *Candidate, LoadInst *Target, Value *P,
     DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
@@ -129,10 +90,6 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
         BasicBlock *BB = State.BB;
         if (!BB) return false;
 
-         
-         
-         
-         
         // 目标块首次只扫描 load 之前的前缀；经回边再次到达时必须扫描整块，
         // 才不会漏掉上一轮迭代中位于目标 load 之后的写入。
         if (!State.TargetPrefixOnly && !visited.insert(BB).second) continue;
@@ -152,8 +109,7 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
         }
 
         if (BB == CandidateBB) {
-             
-             
+
             if (!reachedCandidate) return false;
             continue;
         }
@@ -168,15 +124,6 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
     return true;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
     LoadInst *Target, BasicBlock *BB, DominatorTree &DT,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -187,10 +134,6 @@ LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
     Value *P = Target ? Target->getPointerOperand() : nullptr;
     if (!Target || !BB || !P) return nullptr;
 
-     
-     
-     
-     
     Loop *TargetLoop = LI.getLoopFor(BB);
     if (!TargetLoop) return nullptr;
     if (auto *PtrI = dynamic_cast<Instruction *>(P)) {
@@ -225,12 +168,6 @@ LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
     return nullptr;
 }
 
- 
- 
- 
- 
- 
- 
 LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     BasicBlock *BB, Value *P, Instruction *stopBefore, LoadInst *targetLoad,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -246,7 +183,7 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     }
 
     while (cur) {
-         
+
         if (auto *SI = dynamic_cast<StoreInst *>(cur)) {
             Value *StorePtr = SI->getPointerOperand();
             Value *StoredVal = SI->getValueOperand();
@@ -256,11 +193,11 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
                     return LoadElimQueryResult::known(StoredVal);
                 }
                 if (ai != AliasInfo::NoAlias) {
-                    return LoadElimQueryResult::clobbered();   
+                    return LoadElimQueryResult::clobbered();
                 }
             }
         }
-         
+
         else if (auto *LI2 = dynamic_cast<LoadInst *>(cur)) {
             if (LI2 != targetLoad) {
                 Value *LoadPtr = LI2->getPointerOperand();
@@ -270,7 +207,7 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
                 }
             }
         }
-         
+
         else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
             if (CI->mayReachTimingCall()) {
                 return LoadElimQueryResult::clobbered();
@@ -280,14 +217,13 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
             if (isModSet(MR)) {
                 return LoadElimQueryResult::clobbered();
             }
-             
-             
+
             if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
                 AA.callMayAliasPointer(CI, P, LI)) {
                 return LoadElimQueryResult::clobbered();
             }
         }
-         
+
         else {
             ModRefInfo MR = getInstModRefInfo(
                 MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
@@ -302,12 +238,6 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     return LoadElimQueryResult::needPredecessors();
 }
 
- 
- 
- 
- 
- 
- 
 LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     Value *P, BasicBlock *BB, LoadInst *targetLoad, int depth,
     std::unordered_set<BasicBlock*> &onStack,
@@ -321,17 +251,14 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
         return LoadElimQueryResult::unknown();
     }
 
-     
     ScopedActiveMark ActiveMark(onStack, BB);
     if (!ActiveMark.inserted()) return LoadElimQueryResult::unknown();
 
-     
     auto memoIt = memo.find(BB);
     if (memoIt != memo.end()) {
         return memoIt->second;
     }
 
-     
     LoadElimQueryResult result = scanBlockBackward(BB, P, nullptr, targetLoad, AA, LI, FAM);
 
     if (result.kind == LoadElimQueryResult::KNOWN || result.kind == LoadElimQueryResult::CLOBBERED) {
@@ -339,12 +266,11 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
         return result;
     }
 
-     
     // 3.3 汇总全部前驱：值相同则直接可用，值不同则返回需在当前汇合点建 PHI；
     // 任一路径被 clobber 或还需要嵌套 PHI 时，本层不继续猜测。
     auto preds = BB->getPredecessors();
     if (preds.empty()) {
-         
+
         memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
@@ -371,7 +297,7 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
                 allSame = false;
             }
         } else if (predResult.kind == LoadElimQueryResult::PHI_NEEDED) {
-             
+
             memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
@@ -393,9 +319,6 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     return finalResult;
 }
 
- 
- 
- 
 bool LoadEliminationPass::processLoad(
     LoadInst *loadInst, BasicBlock *BB,
     DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
@@ -405,7 +328,6 @@ bool LoadEliminationPass::processLoad(
     Value *P = loadInst ? loadInst->getPointerOperand() : nullptr;
     if (!P) return false;
 
-     
     LoadElimQueryResult result = scanBlockBackward(BB, P, loadInst, loadInst, AA, LI, FAM);
 
     if (result.kind == LoadElimQueryResult::KNOWN) {
@@ -415,12 +337,9 @@ bool LoadEliminationPass::processLoad(
     }
 
     if (result.kind != LoadElimQueryResult::NEED_PREDECESSORS) {
-        return false;    
+        return false;
     }
 
-     
-     
-     
     // 4.1 块内无定义时，优先尝试有总预算限制的跨回边支配 load 复用。
     if (DominatingQueryBudget > 0) {
         --DominatingQueryBudget;
@@ -432,7 +351,6 @@ bool LoadEliminationPass::processLoad(
         }
     }
 
-     
     // 4.2 常规前驱求解要求每条入边均得到已知值；全相同直接替换，否则在块首
     // 合成 PHI，再用该 PHI 替换 load。
     auto preds = BB->getPredecessors();
@@ -450,7 +368,7 @@ bool LoadEliminationPass::processLoad(
             P, pred, loadInst, 1, onStack, memo, AA, LI, FAM);
 
         if (predResult.kind != LoadElimQueryResult::KNOWN) {
-            return false;    
+            return false;
         }
 
         predValues.push_back({pred, predResult.value});
@@ -471,7 +389,6 @@ bool LoadEliminationPass::processLoad(
         return true;
     }
 
-     
     PhiInst *phi = new PhiInst(loadInst->getIRType());
     for (auto &[pred, val] : predValues) {
         phi->addIncoming(val, pred);
@@ -482,9 +399,6 @@ bool LoadEliminationPass::processLoad(
     return true;
 }
 
- 
- 
- 
 bool LoadEliminationPass::processFunction(
     Function &F, DominatorTree &DT,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -510,11 +424,10 @@ bool LoadEliminationPass::processFunction(
         BasicBlock *BB = node->Block;
         if (!BB) continue;
 
-         
         auto loads = collectInstructions<LoadInst>(*BB);
 
         for (LoadInst *LI2 : loads) {
-             
+
             if (LI2->getParent() != BB) continue;
             changed |= processLoad(LI2, BB, DT, AA, LI, FAM,
                                    DominatingQueryBudget);
@@ -525,9 +438,6 @@ bool LoadEliminationPass::processFunction(
     return changed;
 }
 
- 
- 
- 
 PreservationStatus LoadEliminationPass::run(Function &F,
                                             FunctionAnalysisPassManager &FAM) {
     // 1. 获取别名、循环、支配和 MemorySSA，分别服务内存冲突、回边与定义链证明。
@@ -535,11 +445,6 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
-     
-     
-     
-     
-     
     // 2. 快速层：在查询预算内让 MemorySSA 找每个 load 的最近 clobber；只有该定义
     // 是支配目标且无计时屏障的 MustAlias store，才计划用其存储值转发。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
@@ -574,12 +479,6 @@ PreservationStatus LoadEliminationPass::run(Function &F,
             MSSAReplacements.push_back({Load, Stored});
     }
 
-     
-     
-     
-     
-     
-     
     // 2.1 先解析计划之间的传递依赖并检测环，再批量替换 use、批量删除 load，
     // 避免先删一个 load 后让另一条计划持有悬空替换值。
     std::unordered_map<LoadInst *, Value *> Planned;

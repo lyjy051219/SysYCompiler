@@ -72,7 +72,7 @@ void GlobalInitializerFoldPass::copyInitializer(Variable *Destination,
     if (!Destination || !Source) return;
     Value *SourceInit = Source->getUsee();
     if (!SourceInit) {
-         
+
         Destination->clearOperands();
         return;
     }
@@ -93,9 +93,6 @@ PreservationStatus GlobalInitializerFoldPass::run(
     BasicBlock *Entry = Main->front();
     if (!Entry) return PreservationStatus::all();
 
-     
-     
-     
     // 2. 顺序扫描入口前缀：在任何可能观察或改变内存的普通 load/store/call 之前，
     // 识别完整全局对象 memcpy；首个不匹配的内存操作之后不再折叠，保持执行顺序语义。
     bool SafePrefix = true;

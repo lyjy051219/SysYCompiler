@@ -21,9 +21,7 @@ bool InstSimplifyPass::getBinaryOperandsForOp(
 
 bool InstSimplifyPass::matchNegation(Value *V, Value *&Y) {
 	// 2.1 统一识别整数 0-Y；浮点负号受 NaN 与有符号零约束，不进入整数恒等式匹配。
-	 
-	 
-	 
+
 	if (!V || !IRType::isInt(V->getIRType())) return false;
 
 	Value *L = nullptr;
@@ -46,7 +44,7 @@ bool InstSimplifyPass::isNegationPair(Value *A, Value *B) {
 
 	int32_t AI = 0, BI = 0;
 	if (Value::tryGetIntConst(A, AI) && Value::tryGetIntConst(B, BI)) {
-		 
+
 		return static_cast<int64_t>(AI) == -static_cast<int64_t>(BI);
 	}
 
@@ -199,8 +197,6 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 		if (!CommonL && !CommonR) return nullptr;
 	}
 
-	 
-	 
 	// 两侧都相同仍需在汇合块克隆表达式，不能直接拿任一前驱定义替换。
 	if (CommonL && CommonR) {
 		if (!DT || !DT->dominatesValue(CommonL, Phi) ||
@@ -467,8 +463,6 @@ Value *InstSimplifier::simplifyAdd(
 		return Value::makeUndefForType(BI->getIRType());
 	}
 
-	 
-	 
 	float FloatZero = 0.0f;
 	const bool IsNegativeFloatZero = IRType::isFloat(BI->getIRType()) &&
 		Value::tryGetFloatConst(RHS, FloatZero) && FloatZero == 0.0f &&
@@ -481,7 +475,6 @@ Value *InstSimplifier::simplifyAdd(
 		return Value::makeZeroForType(BI->getIRType());
 	}
 
-	 
 	if (IsIntArith && RHS->isConst()) {
 		Value *AL = nullptr;
 		Value *AR = nullptr;
@@ -514,8 +507,6 @@ Value *InstSimplifier::simplifySub(
 		return Value::makeUndefForType(BI->getIRType());
 	}
 
-	 
-	 
 	float FloatZero = 0.0f;
 	const bool IsPositiveFloatZero = IRType::isFloat(BI->getIRType()) &&
 		Value::tryGetFloatConst(RHS, FloatZero) && FloatZero == 0.0f &&
@@ -524,12 +515,10 @@ Value *InstSimplifier::simplifySub(
 		return LHS;
 	}
 
-	 
 	if (IsIntArith && LHS == RHS) {
 		return Value::makeZeroForType(BI->getIRType());
 	}
 
-	 
 	if (IsIntArith) {
 		Value *AL = nullptr;
 		Value *AR = nullptr;
@@ -539,7 +528,6 @@ Value *InstSimplifier::simplifySub(
 		}
 	}
 
-	 
 	if (IsIntArith) {
 		Value *Y = nullptr;
 		if (InstSimplifyPass::matchNegation(RHS, Y)) {
@@ -547,7 +535,6 @@ Value *InstSimplifier::simplifySub(
 		}
 	}
 
-	 
 	if (IsIntArith) {
 		Value *L0 = nullptr;
 		Value *L1 = nullptr;
@@ -573,7 +560,6 @@ Value *InstSimplifier::simplifySub(
 		}
 	}
 
-	 
 	if (IsIntArith) {
 		Value *L0 = nullptr;
 		Value *L1 = nullptr;
@@ -608,13 +594,11 @@ Value *InstSimplifier::simplifyMul(
 	maybeSwapCommutative(BI, LHS, RHS, Changed);
 
 	if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
-		 
-		 
+
 		return IsIntArith ? Value::makeZeroForType(BI->getIRType())
 		                  : Value::makeUndefForType(BI->getIRType());
 	}
 
-	 
 	if (IsIntArith && Value::isConstZero(RHS)) {
 		return Value::makeZeroForType(BI->getIRType());
 	}
@@ -628,7 +612,6 @@ Value *InstSimplifier::simplifyMul(
 		return new BinaryInst(Value::makeZeroForType(BI->getIRType()), BinaryInst::SUB, LHS);
 	}
 
-	 
 	if (IRType::isInt(BI->getIRType())) {
 		int32_t C = 0;
 		if (Value::tryGetIntConst(RHS, C) && C > 0) {
@@ -653,11 +636,8 @@ Value *InstSimplifier::simplifyDiv(
 	const bool IsFloat = IRType::isFloat(Ty);
 	const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
 
-	 
-	 
-
 	if (LHS->isConst() && RHS->isConst()) {
-		 
+
 		return BinaryInst::foldConstants(Op, LHS, RHS);
 	}
 
@@ -677,12 +657,10 @@ Value *InstSimplifier::simplifyDiv(
 		return IsFloat ? nullptr : Value::makeUndefForType(Ty);
 	}
 
-	 
 	if (IsIntArith && Value::isConstZero(LHS)) {
 		return Value::makeZeroForType(Ty);
 	}
 
-	 
 	if (IsIntArith && LHS == RHS) {
 		return Value::makeOneForType(Ty);
 	}
@@ -691,7 +669,6 @@ Value *InstSimplifier::simplifyDiv(
 		return LHS;
 	}
 
-	 
 	if (IsIntArith && Op == BinaryInst::DIV &&
 		Value::isConstMinusOne(RHS)) {
 		return new BinaryInst(Value::makeZeroForType(Ty), BinaryInst::SUB, LHS);
@@ -710,13 +687,12 @@ Value *InstSimplifier::simplifyRem(
 
 	if (IsIntArith && BI->getOp() == BinaryInst::MOD &&
 		InstSimplifyPass::isNegationPair(LHS, RHS)) {
-		 
-		 
+
 		return Value::makeZeroForType(Ty);
 	}
 
 	if (LHS->isConst() && RHS->isConst()) {
-		 
+
 		return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
 	}
 
@@ -760,7 +736,6 @@ Value *InstSimplifier::simplifyAnd(
 		return LHS;
 	if (Value::isConstMinusOne(RHS)) return LHS;
 
-	 
 	if (IRType::isBool(BI->getIRType())) {
 		auto isNotOf = [](Value *MaybeNot, Value *X) {
 			auto *Not = dynamic_cast<BinaryInst *>(MaybeNot);
@@ -774,8 +749,6 @@ Value *InstSimplifier::simplifyAnd(
 			return ConstBool::newConstBool(false);
 	}
 
-	 
-	 
 	auto absorbsOr = [](Value *X, Value *MaybeOr) {
 		auto *Or = dynamic_cast<BinaryInst *>(MaybeOr);
 		Value *OL = nullptr;
@@ -820,7 +793,6 @@ Value *InstSimplifier::simplifyOr(
 			return ConstBool::newConstBool(true);
 	}
 
-	 
 	auto absorbsAnd = [](Value *X, Value *MaybeAnd) {
 		auto *And = dynamic_cast<BinaryInst *>(MaybeAnd);
 		Value *AL = nullptr;
@@ -831,7 +803,6 @@ Value *InstSimplifier::simplifyOr(
 	if (absorbsAnd(LHS, RHS)) return LHS;
 	if (absorbsAnd(RHS, LHS)) return RHS;
 
-	 
 	if (IRType::isBool(BI->getIRType())) {
 		Value *GL = nullptr;
 		Value *GR = nullptr;
@@ -879,8 +850,7 @@ Value *InstSimplifier::simplifyXor(
 	if (LHS == RHS) return Value::makeZeroForType(BI->getIRType());
 
 	if (IRType::isBool(BI->getIRType()) && Value::isConstOne(RHS)) {
-		 
-		 
+
 		auto *Inner = dynamic_cast<BinaryInst *>(LHS);
 		Value *IL = nullptr;
 		Value *IR = nullptr;
@@ -899,9 +869,7 @@ Value *InstSimplifier::simplifyCmp(
 	// 4. 比较先折叠常量（显式保留 NaN 谓词语义），再规范布尔扩展与常量比较，
 	// 随后识别 min/max select、2 次幂余数及非浮点自比较模式。
 	if (LHS->isConst() && RHS->isConst()) {
-			 
-			 
-			 
+
 		if (IRType::isFloat(LHS->getIRType())) {
 			float LV = 0.0f;
 			float RV = 0.0f;
@@ -948,11 +916,6 @@ Value *InstSimplifier::simplifyCmp(
 		if (Value *V = tryBoolCmpConst(RHS, LHS)) return V;
 	}
 
-	 
-	 
-	 
-	 
-	 
 	auto matchExtremum = [](Value *V, Value *Bound) {
 		auto *Sel = dynamic_cast<SelectInst *>(V);
 		if (!Sel || !Bound || !IRType::isInt(Sel->getIRType()) ||
@@ -1011,11 +974,6 @@ Value *InstSimplifier::simplifyCmp(
 			return ConstBool::newConstBool(true);
 	}
 
-	 
-	 
-	 
-	 
-	 
 	if (BI->getOp() == BinaryInst::E) {
 		auto tryModEqPow2 = [&](Value *A, Value *B) -> Value * {
 			Value *X = nullptr;
@@ -1057,9 +1015,6 @@ Value *InstSimplifier::simplifyCmp(
 		if (Value *R = tryModEqPow2(RHS, LHS)) return R;
 	}
 
-	 
-	 
-	 
 	if (LHS == RHS && !IRType::isFloat(LHS->getIRType())) {
 		switch (BI->getOp()) {
 		case BinaryInst::E:
@@ -1140,8 +1095,7 @@ Value *InstSimplifier::simplifySelect(SelectInst *SI) {
 	}
 
 	if (Cond->isConst() && TV->isConst() && FV->isConst()) {
-		 
-		 
+
 		bool ConstCond = false;
 		if (Value::tryGetBoolConst(Cond, ConstCond)) {
 			return ConstCond ? TV : FV;
@@ -1190,14 +1144,13 @@ Value *InstSimplifier::simplifySelect(SelectInst *SI) {
 
 			if (!IsFloatCmp && Cmp->getOp() == BinaryInst::E &&
 				((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
-				 
-				 
+
 				return FV;
 			}
 
 			if (!IsFloatCmp && Cmp->getOp() == BinaryInst::NE &&
 				((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
-				 
+
 				return TV;
 			}
 
@@ -1259,7 +1212,7 @@ Value *InstSimplifier::simplifyPhi(PhiInst *Phi) {
 	if (!Common) return nullptr;
 
 	if (HasUndef) {
-		 
+
 		if (!DT) return nullptr;
 		if (!DT->dominatesValue(Common, Phi)) return nullptr;
 	}

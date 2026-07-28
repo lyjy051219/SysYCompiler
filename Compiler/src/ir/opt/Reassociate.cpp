@@ -152,11 +152,6 @@ uint32_t ReassociateEngine::getRank(Value *V) const {
 	if (!V) return 0;
 	if (V && V->isConst()) return 1;
 
-
-
-
-
-
 	if (auto *I = dynamic_cast<Instruction *>(V)) {
 		switch (I->instType) {
 			case Instruction::SDIV:
@@ -222,7 +217,6 @@ void ReassociateEngine::pushTodo(Instruction *I) {
 	Todo.push(I);
 }
 
-
 // 待办项按 LIFO 消费；已经删除或变死的节点跳过，其余重新走完整候选流程。
 bool ReassociateEngine::processTodo() {
 	bool Changed = false;
@@ -248,8 +242,6 @@ bool ReassociateEngine::feedsAddressComputation(Instruction *Root) const {
 		for (Instruction *UserI : I->getInstructionUsers()) {
 			if (dynamic_cast<GetElementPtrInst *>(UserI)) return true;
 			// 只穿过保持整数地址含义的宽度转换，不跨入任意算术表达式。
-
-
 
 			if (UserI->instType == Instruction::ZEXT ||
 				UserI->instType == Instruction::SEXT ||
@@ -507,7 +499,6 @@ Value *ReassociateEngine::optExp(
 		if (Ops.size() >= 2) {
 			// 2.3 分桶后严格一对一消去 X 与 (-1) * X，保留未配对的重复项。
 
-
 			std::vector<char> Removed(Ops.size(), 0);
 			bool CanceledAny = false;
 			std::unordered_map<Value *, std::vector<size_t>> PosIdx;
@@ -673,10 +664,6 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 	// 地址保护模式还要排除最终供 GEP 使用的表达式。
 	if (!BinaryInst::isReassociateOp(Op)) return false;
 
-
-
-
-
 	if (PreserveAddressArithmetic && feedsAddressComputation(I)) return false;
 
 	Value *LHS = nullptr;
@@ -689,7 +676,6 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 
 	// 2. 合法性验证沿候选表达式的定义链检查计时屏障；固定预算耗尽即放弃，
 	// 避免把重建节点跨越计时分段，同时限制异常深图的编译时间。
-
 
 	std::vector<Value *> TimingWorkList{LHS, RHS};
 	std::unordered_set<Value *> TimingVisited;
@@ -781,9 +767,6 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 
 	// 6. 使用函数级确定秩建立全序，随后反复调用 optExp，直到操作数列不再
 	// 收缩或直接得到整棵树的替换值。
-
-
-
 
 	std::sort(Ops.begin(), Ops.end(), [&](Value *A, Value *B) {
 		return rankComesBefore(A, B);

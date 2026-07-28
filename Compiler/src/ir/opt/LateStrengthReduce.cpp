@@ -153,8 +153,7 @@ bool LateStrengthReducePass::reduceFunction(Function &F) {
         if (!LHS->getIRType() || !LHS->getIRType()->isInt() ||
             !RHS->getIRType() || !RHS->getIRType()->isInt())
             continue;
-         
-         
+
         if (LHS->integerBitWidth(0) != 32 ||
             RHS->integerBitWidth(0) != 32)
             continue;

@@ -13,35 +13,6 @@ StoreOnlyGlobalEliminationPass::StoreOnlyGlobalEliminationPass(
     FunctionAnalysisPassManager &FAM)
     : FAM(FAM) {}
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
- 
- 
- 
 void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
                                   std::unordered_set<Value*> &bases,
                                   std::unordered_set<Value*> &visited,
@@ -90,14 +61,11 @@ void StoreOnlyGlobalEliminationPass::collectReachableBases(Value *ptr,
             });
         return;
     }
-     
+
     if (dynamic_cast<AllocaInst*>(ptr)) return;
     escape = true;
 }
 
- 
- 
- 
 StoreOnlyGlobalTraceResult
 StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
     // 1.2 对单一路径从叶到根剥离同形 bitcast 与 GEP，分段记录常量索引；
@@ -109,7 +77,7 @@ StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
     while (cur && depth < 32) {
         if (auto *var = dynamic_cast<Variable*>(cur)) {
             R.base = var;
-             
+
             for (auto Segment = PathSegments.rbegin();
                  Segment != PathSegments.rend(); ++Segment)
                 R.constPath.insert(
@@ -153,7 +121,7 @@ StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
             depth++;
             continue;
         }
-         
+
         R.unresolved = true;
         return R;
     }
@@ -161,7 +129,6 @@ StoreOnlyGlobalEliminationPass::traceBaseAndIndex(Value *ptr) {
     return R;
 }
 
- 
 void StoreOnlyGlobalEliminationPass::markGlobalRead(
                            Variable *G, const StoreOnlyGlobalTraceResult *tr,
                            std::unordered_map<Variable*, StoreOnlyGlobalReadInfo> &reads) {
@@ -175,16 +142,14 @@ void StoreOnlyGlobalEliminationPass::markGlobalRead(
         info.constIdx.clear();
         return;
     }
-     
-     
-     
+
     if (tr->constPath.size() == 1 && tr->constPath[0] == 0) {
-         
+
         info.constIdx.insert(0);
     } else if (tr->constPath.size() >= 2 && tr->constPath[0] == 0) {
-        info.constIdx.insert(tr->constPath[1]);    
+        info.constIdx.insert(tr->constPath[1]);
     } else {
-         
+
         info.anyIndexRead = true;
         info.constIdx.clear();
     }
@@ -200,10 +165,8 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
     }
     if (candidates.empty()) return PreservationStatus::all();
 
-     
     std::unordered_map<Variable*, StoreOnlyGlobalReadInfo> reads;
 
-     
     // 2. 扫描全模块的读取来源：直接 load 尽量精确到索引；无法单根追踪的地址
     // 合并所有可能基址，若地址逃逸则保守标记全部候选。
     for (auto &funcPtr : M.getFunctions()) {
@@ -211,12 +174,11 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         if (!F) continue;
 
         forEachInstruction(*F, [&](Instruction *I) {
-                 
+
                 if (auto *LI = dynamic_cast<LoadInst*>(I)) {
                     Value *ptr = LI->getPointerOperand();
                     if (!ptr) return;
 
-                     
                     StoreOnlyGlobalTraceResult tr = traceBaseAndIndex(ptr);
                     if (tr.base) {
                         if (auto *v = dynamic_cast<Variable*>(tr.base)) {
@@ -224,13 +186,13 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         }
                         return;
                     }
-                     
+
                     std::unordered_set<Value*> bases;
                     std::unordered_set<Value*> visited;
                     bool escape = false;
                     collectReachableBases(ptr, bases, visited, escape);
                     if (escape) {
-                         
+
                         for (Variable *G : candidates) reads[G].anyIndexRead = true;
                     } else {
                         for (Value *b : bases) {
@@ -241,20 +203,15 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     return;
                 }
 
-                 
                 // 2.1 调用按三类汇总：builtin 使用属性，已定义函数使用传递副作用摘要，
                 // 未知调用读取任意全局；参数读取只映射被 callee RefSet 标记的形参。
                 if (auto *CI = dynamic_cast<CallInst*>(I)) {
                     Value *callee = CI->getCallee();
                     if (!callee) return;
 
-                     
                     if (auto *BIF = dynamic_cast<BuildInFunction*>(callee)) {
                         FuncAttr attr = classifyBuiltin(BIF);
-                         
-                         
-                         
-                         
+
                         if (attr == FuncAttr::Untracked) {
                             for (Variable *G : candidates)
                                 reads[G].anyIndexRead = true;
@@ -265,7 +222,7 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                             attr == FuncAttr::MemReadOnly ||
                             attr == FuncAttr::MemReadWrite;
                         if (maybeRead) {
-                             
+
                             for (unsigned k = 0; k < CI->getArgCount(); k++) {
                                 Value *arg = CI->getArg(k);
                                 if (!arg || !arg->getIRType()) continue;
@@ -287,27 +244,25 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         return;
                     }
 
-                     
                     if (auto *calleeF = dynamic_cast<Function*>(callee)) {
                         auto &SEI = FAM.getResult<SideEffectAnalysis>(*calleeF);
-                         
-                         
+
                         if (SEI.hasBuiltin) {
                             for (Variable *G : candidates)
                                 reads[G].anyIndexRead = true;
                             return;
                         }
-                         
+
                         for (Value *refV : SEI.RefSet) {
                             if (auto *v = dynamic_cast<Variable*>(refV))
                                 if (v->isGlobal()) markGlobalRead(v, nullptr, reads);
                         }
-                         
+
                         auto &params = calleeF->getParams();
                         for (unsigned i = 0; i < params.size() && i < CI->getArgCount(); i++) {
                             Value *p = params[i].get();
                             if (!p) continue;
-                            if (!SEI.RefSet.count(p)) continue;   
+                            if (!SEI.RefSet.count(p)) continue;
                             Value *arg = CI->getArg(i);
                             if (!arg) continue;
                             std::unordered_set<Value*> bases;
@@ -326,14 +281,12 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                         return;
                     }
 
-                     
                     for (Variable *G : candidates) reads[G].anyIndexRead = true;
                     return;
                 }
         });
     }
 
-     
     // 3. 第二次扫描所有 store：全局从未读取则删除全部写；仅有常量索引读取时，
     // 删除落在未读索引上的精确写入；任何模糊地址都保留。
     bool changed = false;
@@ -352,15 +305,15 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
             if (!G || !G->isGlobal() || !candidates.count(G)) continue;
 
             auto it = reads.find(G);
-             
+
             if (it == reads.end()) {
                 toDelete.push_back(SI);
                 continue;
             }
             const StoreOnlyGlobalReadInfo &info = it->second;
-             
+
             if (info.anyIndexRead) continue;
-             
+
             if (tr.hasVarIdx || tr.unresolved) continue;
             int64_t key = 0;
             if (tr.constPath.size() == 1 && tr.constPath[0] == 0) {
@@ -378,11 +331,6 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         }
     }
 
-     
-     
-     
-     
-     
     // 4. 对删除写入后只读的标量全局做常量传播。用每个函数的 AA/LoopInfo/ModRef
     // 证明整个模块没有间接写，再把完整对象 load 替换为显式或零初始化常量。
     for (auto &g : M.getGlobalVar()) {
@@ -390,18 +338,12 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         Variable *G = g.get();
         if (!G || !G->isGlobal()) continue;
 
-         
         auto inner = IRType::getPointeeType(G->getIRType());
         if (!inner) continue;
         if (!inner->isScalar()) continue;
 
-         
-         
-         
-         
-         
         bool anyWrite = false;
-         
+
         std::vector<LoadInst*> loads;
         for (auto &funcPtr : M.getFunctions()) {
             Function *F = funcPtr.get();
@@ -426,12 +368,12 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
                     if (tr.base == G &&
                         IRType::hasSameShape(
                             LI->getIRType(), inner)) {
-                         
+
                         if (!tr.hasVarIdx && !tr.unresolved &&
                             tr.constPath.size() == 1 && tr.constPath[0] == 0)
                             loads.push_back(LI);
                         else if (tr.constPath.empty())
-                            loads.push_back(LI);   
+                            loads.push_back(LI);
                     }
                 }
                 return true;
@@ -440,15 +382,14 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         }
         if (anyWrite || loads.empty()) continue;
 
-         
         Value *initVal = G->getUsee();
         Value *constRepl = nullptr;
         if (initVal) {
             if (auto *ci = dynamic_cast<ConstInt*>(initVal)) constRepl = ci;
             else if (auto *cf = dynamic_cast<ConstFloat*>(initVal)) constRepl = cf;
-             
+
         } else {
-             
+
             constRepl = Value::makeZeroForType(inner);
         }
         if (!constRepl) continue;
@@ -460,10 +401,6 @@ PreservationStatus StoreOnlyGlobalEliminationPass::run(
         }
     }
 
-     
-     
-     
-     
     // 5. store/load 清理后统一移除没有任何 use 的全局量，最后失效全部模块相关分析。
     {
         auto &gvars = M.getGlobalVar();

@@ -9,34 +9,6 @@
 #include <cmath>
 #include <unordered_set>
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
 bool RangeAwareSimplifyPass::isPureIntExprOp(BinaryInst::Operation op) {
     switch (op) {
         case BinaryInst::ADD:
@@ -148,9 +120,6 @@ int RangeAwareSimplifyPass::evalTruth(
     return -1;
 }
 
- 
- 
- 
 bool RangeAwareSimplifyPass::strengthReduce(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 7. 收集整数除法/取模，要求除数为 2 的幂且被除数在当前程序点已证明非负。
@@ -168,12 +137,9 @@ bool RangeAwareSimplifyPass::strengthReduce(
         Value *rhs = nullptr;
         if (!BI->getOperands(lhs, rhs)) continue;
 
-         
-         
         if (!lhs->getIRType() || !lhs->getIRType()->isInt()) continue;
         if (!rhs->getIRType() || !rhs->getIRType()->isInt()) continue;
 
-         
         auto *rhsConst = dynamic_cast<ConstInt *>(rhs);
         if (!rhsConst || !IRMath::isPowerOf2(rhsConst->getVal())) continue;
         int shift = IRMath::log2i(rhsConst->getVal());
@@ -181,27 +147,22 @@ bool RangeAwareSimplifyPass::strengthReduce(
         BasicBlock *BB = BI->getParent();
         if (!BB) continue;
 
-         
-         
         if (!isKnownNonNegative(lhs, BB, RI, DT)) continue;
 
         // 7.1 非负 sdiv 可改为算术右移，非负 srem 可改为掩码；先插入替代指令，
         // 再替换 use 并删除原指令，保持遍历快照有效。
         if (BI->getOp() == BinaryInst::DIV) {
-             
-             
-             
+
             Value *shiftVal = ConstInt::newConstInt(shift);
             auto *newInst = new BinaryInst(lhs, BinaryInst::ASHR, shiftVal);
-             
+
             BasicBlock::Iterator it(BI);
             it.insertBefore(newInst);
             BI->replaceAllUsesWith(newInst);
             delete BI;
             changed = true;
         } else if (BI->getOp() == BinaryInst::MOD) {
-             
-             
+
             int maskVal = rhsConst->getVal() - 1;
             Value *mask = ConstInt::newConstInt(maskVal);
             auto *newInst = new BinaryInst(lhs, BinaryInst::AND, mask);
@@ -216,33 +177,22 @@ bool RangeAwareSimplifyPass::strengthReduce(
     return changed;
 }
 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldConstants(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 2. 首轮只收集能被区间或已知位锁定为单值的纯计算指令；调用、内存操作和
     // 尚在数据流收敛中的 PHI 不因单次范围结果而删除。
     bool changed = false;
 
-     
     std::vector<Instruction *> intToFold;
     std::vector<Instruction *> floatToFold;
 
     for (Instruction *I : collectInstructions(F)) {
         if (!I->getIRType()) continue;
-         
-         
-         
-         
-         
+
         if (dynamic_cast<CallInst *>(I)) continue;
         if (dynamic_cast<LoadInst *>(I)) continue;
         if (dynamic_cast<StoreInst *>(I)) continue;
-         
-         
-         
-         
+
         if (dynamic_cast<PhiInst *>(I)) continue;
 
         BasicBlock *block = I->getParent();
@@ -252,8 +202,7 @@ bool RangeAwareSimplifyPass::foldConstants(
         if (Ty->isInt()) {
             if (dynamic_cast<ConstInt *>(I)) continue;
             IntRange range = RI.query(I, block, DT);
-             
-             
+
             bool singleInt = range.isSingleValue();
             if (!singleInt) {
                 KnownBits kb = RI.queryBits(I, block, DT);
@@ -268,7 +217,7 @@ bool RangeAwareSimplifyPass::foldConstants(
         } else if (Ty->isFloat()) {
             if (dynamic_cast<ConstFloat *>(I)) continue;
             FloatRange range = RI.queryFloat(I, block, DT);
-             
+
             if (range.isSingleValue()) {
                 floatToFold.push_back(I);
             }
@@ -306,10 +255,6 @@ bool RangeAwareSimplifyPass::foldConstants(
         FloatRange range = RI.queryFloat(I, block, DT);
         if (!range.isSingleValue()) continue;
 
-         
-         
-         
-         
         float Folded = static_cast<float>(range.min);
         if (range.min == 0.0 && range.mayNegativeZero &&
             !range.mayPositiveZero)
@@ -322,9 +267,6 @@ bool RangeAwareSimplifyPass::foldConstants(
     return changed;
 }
 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldComparisons(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 3. 快照六类比较，根据操作数类型分别使用整数或浮点范围证明恒真/恒假。
@@ -350,21 +292,14 @@ bool RangeAwareSimplifyPass::foldComparisons(
 
         auto OpTy = lhs->getIRType();
 
-         
-         
         // 3.1 整数等值比较先用已知位冲突证明必不相等，再用不相交/单值区间
         // 处理全部谓词；Top 和 Bottom 都不是可用于折叠的事实。
         if (OpTy->isInt() && rhs->getIRType()->isInt()) {
             IntRange lRange = queryIntExpr(lhs, BB, RI, DT);
             IntRange rRange = queryIntExpr(rhs, BB, RI, DT);
 
-             
-             
             if (lRange.isBottom() || rRange.isBottom()) continue;
 
-             
-             
-             
             if (cmp->getOp() == BinaryInst::E || cmp->getOp() == BinaryInst::NE) {
                 KnownBits lKB = RI.queryBits(lhs, BB, DT);
                 KnownBits rKB = RI.queryBits(rhs, BB, DT);
@@ -378,38 +313,34 @@ bool RangeAwareSimplifyPass::foldComparisons(
                 }
             }
 
-             
-             
-             
-             
             if (lRange.isTop() || rRange.isTop())
                 continue;
 
-            int result = -1;  
+            int result = -1;
 
             switch (cmp->getOp()) {
-                case BinaryInst::L:   
+                case BinaryInst::L:
                     if (lRange.max < rRange.min) result = 1;
                     else if (lRange.min >= rRange.max) result = 0;
                     break;
-                case BinaryInst::LE:  
+                case BinaryInst::LE:
                     if (lRange.max <= rRange.min) result = 1;
                     else if (lRange.min > rRange.max) result = 0;
                     break;
-                case BinaryInst::G:   
+                case BinaryInst::G:
                     if (lRange.min > rRange.max) result = 1;
                     else if (lRange.max <= rRange.min) result = 0;
                     break;
-                case BinaryInst::GE:  
+                case BinaryInst::GE:
                     if (lRange.min >= rRange.max) result = 1;
                     else if (lRange.max < rRange.min) result = 0;
                     break;
-                case BinaryInst::E:   
+                case BinaryInst::E:
                     if (lRange.max < rRange.min || lRange.min > rRange.max) result = 0;
                     else if (lRange.isSingleValue() && rRange.isSingleValue() &&
                              lRange.min == rRange.min) result = 1;
                     break;
-                case BinaryInst::NE:  
+                case BinaryInst::NE:
                     if (lRange.max < rRange.min || lRange.min > rRange.max) result = 1;
                     else if (lRange.isSingleValue() && rRange.isSingleValue() &&
                              lRange.min == rRange.min) result = 0;
@@ -425,10 +356,6 @@ bool RangeAwareSimplifyPass::foldComparisons(
             continue;
         }
 
-         
-         
-         
-         
         // 3.2 浮点端点推理仅在两侧都有数值且明确排除 NaN 时成立，否则 ordered
         // 比较和 != 的 NaN 语义会使整数式端点规则失效。
         if (OpTy->isFloat() && rhs->getIRType()->isFloat()) {
@@ -442,7 +369,7 @@ bool RangeAwareSimplifyPass::foldComparisons(
             int result = -1;
 
             switch (cmp->getOp()) {
-                case BinaryInst::L:   
+                case BinaryInst::L:
                     if (lRange.max < rRange.min) result = 1;
                     else if (lRange.min >= rRange.max) result = 0;
                     break;
@@ -482,11 +409,6 @@ bool RangeAwareSimplifyPass::foldComparisons(
     return changed;
 }
 
- 
- 
- 
- 
- 
 int RangeAwareSimplifyPass::evalIntCmp(
     BinaryInst::Operation op, const IntRange &l, const IntRange &r) {
     if (l.isTop() || r.isTop() || l.isBottom() || r.isBottom()) return -1;
@@ -520,26 +442,12 @@ int RangeAwareSimplifyPass::evalIntCmp(
     return -1;
 }
 
- 
 bool RangeAwareSimplifyPass::isIntCmpOp(BinaryInst::Operation op) {
     return op == BinaryInst::L || op == BinaryInst::LE ||
            op == BinaryInst::G || op == BinaryInst::GE ||
            op == BinaryInst::E || op == BinaryInst::NE;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldIcmpOfSelect(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 4. 对 icmp(select(c,t,f), rhs) 分别求两臂比较结果；两臂相同则折为常量，
@@ -561,7 +469,6 @@ bool RangeAwareSimplifyPass::foldIcmpOfSelect(
         BasicBlock *BB = cmp->getParent();
         if (!BB) continue;
 
-         
         auto *sel = dynamic_cast<SelectInst *>(lhs);
         if (!sel) continue;
         Value *tv = sel->getTrueValue();
@@ -581,29 +488,23 @@ bool RangeAwareSimplifyPass::foldIcmpOfSelect(
         if (resT < 0 || resF < 0) continue;
 
         if (resT == resF) {
-             
+
             cmp->replaceAllUsesWith(ConstBool::newConstBool(resT == 1));
             delete cmp;
             changed = true;
         } else if (resT == 1 && resF == 0) {
-             
+
             Value *cond = sel->getCondition();
             cmp->replaceAllUsesWith(cond);
             delete cmp;
             changed = true;
         }
-         
+
     }
 
     return changed;
 }
 
- 
- 
- 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldSelectByConditionRange(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 5. 用区间或已知位判定非直接比较条件的真假，选中对应 select 分支。
@@ -630,18 +531,6 @@ bool RangeAwareSimplifyPass::foldSelectByConditionRange(
     return changed;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldAbsViaSelect(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 6.1 识别以 x 与 0 比较并在 x/-x 间选择的 abs 形态；只有区间证明 x
@@ -676,19 +565,18 @@ bool RangeAwareSimplifyPass::foldAbsViaSelect(
         Value *tv = SI->getTrueValue();
         Value *fv = SI->getFalseValue();
 
-         
         Value *x = nullptr;
         Value *neg = nullptr;
         bool isAbs = false;
         auto op = cmp->getOp();
 
         if (op == BinaryInst::L || op == BinaryInst::LE) {
-             
+
             if (matchNeg(tv) == cmpLhs && fv == cmpLhs) {
                 x = cmpLhs; neg = tv; isAbs = true;
             }
         } else if (op == BinaryInst::GE || op == BinaryInst::G) {
-             
+
             if (tv == cmpLhs && matchNeg(fv) == cmpLhs) {
                 x = cmpLhs; neg = fv; isAbs = true;
             }
@@ -715,17 +603,6 @@ bool RangeAwareSimplifyPass::foldAbsViaSelect(
     return changed;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 6.2 识别比较 a、b 后在两者间选择的 min/max 形态，严格区分 < 与 <=
@@ -746,9 +623,8 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
         Value *tv = SI->getTrueValue();
         Value *fv = SI->getFalseValue();
 
-         
-        bool straight = (tv == a && fv == b);   
-        bool flipped  = (tv == b && fv == a);   
+        bool straight = (tv == a && fv == b);
+        bool flipped  = (tv == b && fv == a);
         if (!straight && !flipped) continue;
 
         auto op = cmp->getOp();
@@ -764,13 +640,7 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
         if (ra.isTop() || rb.isTop() || ra.isBottom() || rb.isBottom())
             continue;
 
-         
-         
-         
-         
-         
-         
-        int cmpResult = -1;  
+        int cmpResult = -1;
         switch (op) {
             case BinaryInst::G:
                 if (ra.min >  rb.max) cmpResult = 1;
@@ -792,7 +662,6 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
         }
         if (cmpResult < 0) continue;
 
-         
         Value *chosen = (cmpResult == 1) ? tv : fv;
         SI->replaceAllUsesWith(chosen);
         delete SI;
@@ -802,9 +671,6 @@ bool RangeAwareSimplifyPass::foldMinMaxViaSelect(
     return changed;
 }
 
- 
- 
- 
 bool RangeAwareSimplifyPass::convertSignedToUnsigned(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
     // 8. 预留的有符号余数扫描阶段目前只收集范围证据；IR 尚无独立 urem，
@@ -826,12 +692,6 @@ bool RangeAwareSimplifyPass::convertSignedToUnsigned(
         IntRange lRange = RI.query(lhs, BB, DT);
         IntRange rRange = RI.query(rhs, BB, DT);
 
-         
-         
-         
-         
-         
-         
         (void)lRange;
         (void)rRange;
     }
@@ -847,7 +707,6 @@ PreservationStatus RangeAwareSimplifyPass::run(Function &F,
 
     bool changed = false;
 
-
     // 2—8. 依次消费单值、比较、select 模式与非负证明；后一步可以继续利用前一步
     // 暴露的简单值，但不会重新计算范围，因此每个局部改写仍独立完成合法性检查。
     changed |= foldConstants(F, RI, DT);
@@ -861,8 +720,6 @@ PreservationStatus RangeAwareSimplifyPass::run(Function &F,
 
     if (!changed) return PreservationStatus::all();
 
-     
-     
     // 9. 只替换计算值、不直接改 CFG，支配与循环结构仍可保留。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();

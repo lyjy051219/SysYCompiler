@@ -8,8 +8,6 @@ struct IntRange;
 class DominatorTree;
 class RangeInfo;
 
- 
- 
 // 流程：1. 用范围与已知位补强局部表达式事实；2. 折叠单值和恒定比较；
 // 3. 化简比较/select 组合及 abs/min/max；4. 在非负证明下削减 2 次幂除余。
 class RangeAwareSimplifyPass : public PassDescriptor<RangeAwareSimplifyPass> {

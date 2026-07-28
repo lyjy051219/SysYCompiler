@@ -7,11 +7,6 @@ class PhiInst;
 class SCEVResult;
 class Value;
 
-
-
-
-
-
 // 规范化后续循环 pass 观察到的归纳变量：
 // 1. 用 SCEV 键发现可能重复的整数递推，再逐边核验完全相同的 SSA 形状；
 // 2. 合并通过核验的重复 PHI，删除一套冗余的每轮更新；

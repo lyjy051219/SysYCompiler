@@ -37,7 +37,6 @@ struct ConstraintElimFoldCandidate {
     bool result = false;
 };
 
- 
 // 流程：1. 在无回绕证明下规范比较与常量偏移；2. 沿支配树维护路径约束栈；
 // 3. 结合范围上下界做直接/一跳蕴含和矛盾判断；4. 将已证明分支条件折为常量。
 class ConstraintEliminationPass : public PassDescriptor<ConstraintEliminationPass> {

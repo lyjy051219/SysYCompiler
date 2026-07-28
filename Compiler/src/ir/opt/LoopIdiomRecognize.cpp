@@ -44,8 +44,7 @@ bool LoopIdiomRecognizePass::matchLinearAccess(
     if (DynamicCount != 1) return false;
 
     auto ElementTy = IRType::getPointeeType(GEP->getIRType());
-     
-     
+
     if (!ElementTy ||
         (!ElementTy->hasIntegerBitWidth(32) && !ElementTy->isFloat()))
         return false;
@@ -155,8 +154,6 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     })) return false;
     if (ConditionalBranches != 1) return false;
 
-     
-     
     for (Instruction *I : Allowed) {
         if (!I) continue;
         for (Use *U : I->getUses()) {
@@ -187,7 +184,7 @@ GetElementPtrInst *LoopIdiomRecognizePass::materializeStartPointer(
     Indices[Access.InductionIndex] = StartValue;
 
     auto *StartGEP = new GetElementPtrInst(Access.Base, Indices);
-     
+
     StartGEP->updateType();
     if (!PreHeader->insertBeforeTerminator(StartGEP)) {
         delete StartGEP;
@@ -266,10 +263,6 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
         return false;
     Match.Load = Loads.front();
 
-     
-     
-     
-     
     if (TCI->ExitingBlock == TCI->Header &&
         (Match.Store->getParent() == TCI->Header ||
          Match.Load->getParent() == TCI->Header))
@@ -311,9 +304,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         return false;
     }
 
-     
-     
-     
     BasicBlock *Bridge = First.ExitBlock;
     if (!Bridge || !Bridge->getBranchTerminator() ||
         Bridge->getBranchTerminator()->isConditional() ||
@@ -339,9 +329,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         TempRead->getBasePointer() != Temporary)
         return false;
 
-     
-     
-     
     if (First.Destination.Indices.size() !=
             Second.Source.Indices.size() ||
         First.Destination.InductionIndex !=
@@ -358,8 +345,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
             return false;
     }
 
-     
-     
     std::unordered_set<Value *> TempPointerUses;
     for (Use *U : Temporary->getUses()) {
         if (!U || U->getValue() != Temporary) continue;
@@ -397,8 +382,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         !AvailableAt(First.RuntimeBound, First.PreHeader))
         return false;
 
-     
-     
     // 4.5 先物化两端首地址，并用范围/对象边界证明整条 GEP 链在已知对象内。
     GetElementPtrInst *SourceStart = materializeStartPointer(
         First.Source, First.IndVar, First.Start, First.PreHeader);
@@ -589,12 +572,6 @@ bool LoopIdiomRecognizePass::transformLoop(
     if (!matchLinearAccess(DestGEP, IV->Phi, L, DestAccess))
         return false;
 
-     
-     
-     
-     
-     
-     
     if (TCI->ExitingBlock == TCI->Header &&
         Store->getParent() == TCI->Header)
         return false;
@@ -629,9 +606,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             return false;
     }
 
-     
-     
-     
     if (TCI->ExitingBlock == TCI->Header && SourceLoad &&
         SourceLoad->getParent() == TCI->Header)
         return false;
@@ -640,8 +614,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             L, *TCI, *IV, Store, DestGEP, SourceLoad, SourceGEP, DT))
         return false;
 
-     
-     
     // 3. 物化目标及可选源首地址，并证明它们位于已知 alloca/global 对象边界内。
     auto *DestStart = materializeStartPointer(
         DestAccess, IV->Phi, *IV->ConstantStart, PreHeader);
@@ -674,10 +646,7 @@ bool LoopIdiomRecognizePass::transformLoop(
     if (IsConstant) {
         ByteCount = ConstInt::newConstInt(ConstantByteCount);
     } else {
-         
-         
-         
-         
+
         if (TCI->ExitingBlock != TCI->Header ||
             *IV->ConstantStart < 0 ||
             *IV->ConstantStart > std::numeric_limits<int32_t>::max()) {
@@ -716,10 +685,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             }
         }
 
-         
-         
-         
-         
         if (!PreHeader->getBranchTerminator() ||
             PreHeader->getBranchTerminator()->isConditional() ||
             PreHeader->getSuccessors().size() != 1 ||
@@ -868,9 +833,6 @@ PreservationStatus LoopIdiomRecognizePass::run(
     bool CFGChanged = false;
     std::vector<Loop *> Loops = LI.getLoopsInPostOrder(true);
 
-     
-     
-     
     // 4. 优先预匹配全部简单复制循环并尝试消除相邻临时数组复制对；该变换跨两个循环，
     // 成功后直接使全部分析失效并返回。
     std::vector<CopyLoopMatch> Copies;
@@ -886,9 +848,7 @@ PreservationStatus LoopIdiomRecognizePass::run(
         for (const CopyLoopMatch &Second : Copies) {
             if (transformTemporaryCopyPair(
                     F, First, Second, DT, RI, CFGChanged)) {
-                 
-                 
-                 
+
                 return PreservationStatus::none();
             }
         }
@@ -896,9 +856,7 @@ PreservationStatus LoopIdiomRecognizePass::run(
 
     for (Loop *L : Loops) {
         Changed |= transformLoop(F, L, SE, DT, RI, CFGChanged);
-         
-         
-         
+
         if (CFGChanged) break;
     }
     if (!Changed) return PreservationStatus::all();

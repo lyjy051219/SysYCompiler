@@ -43,7 +43,6 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
         IRType::getPointeeType(AI ? AI->getIRType() : nullptr);
     if (!pointeeType) return false;
 
-     
     if (pointeeType->isArray() || pointeeType->isVoid()) {
         return false;
     }
@@ -59,12 +58,10 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
                 return false;
             }
 
-             
             if (dynamic_cast<AllocaInst*>(storedVal)) {
                 return false;
             }
 
-             
             if (storedVal->getIRType() != pointeeType) {
                 return false;
             }
@@ -80,9 +77,6 @@ bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
     // 1.2 所有访问块都必须存在于入口支配树；不可达 use 无法参与统一重命名。
     if (!AI) return false;
 
-     
-     
-     
     for (Use *UseEdge : AI->getUses()) {
         auto *UserInst =
             dynamic_cast<Instruction *>(UseEdge ? UseEdge->getUser() : nullptr);
@@ -109,12 +103,11 @@ bool PromotePass::allocaCrossesTimingBarrier(
         if (Seen.insert(I).second) Accesses.push_back(I);
     }
 
-     
     constexpr std::size_t MaxTimingCheckedAccesses = 128;
     if (Accesses.size() > MaxTimingCheckedAccesses) return true;
     for (Instruction *From : Accesses) {
         for (Instruction *To : Accesses) {
-             
+
             if (F.hasTimingBarrierOnPath(From, To)) return true;
         }
     }
@@ -268,9 +261,6 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     return true;
 }
 
- 
- 
- 
 void PromotePass::computeIDF(
     const std::set<BasicBlock*>& DefBlocks,
     const std::set<BasicBlock*>& LiveInBlocks,
@@ -280,13 +270,12 @@ void PromotePass::computeIDF(
 {
     // 3.2 从定义块按支配深度处理迭代支配边界，只在变量 live-in 的汇合块放 PHI；
     // 新 PHI 块若不是原定义块会重新入队，使 IDF 闭包完整。
-     
+
     using DTNPair = std::pair<unsigned, DominatorNode*>;
     std::priority_queue<DTNPair> PQ;
 
-     
     std::set<DominatorNode*> VisitedWorkList;
-     
+
     std::set<DominatorNode*> VisitedPHI;
 
     for (BasicBlock* BB : DefBlocks) {
@@ -303,7 +292,6 @@ void PromotePass::computeIDF(
         auto [rootLevel, root] = PQ.top();
         PQ.pop();
 
-         
         std::stack<DominatorNode*> WorkList;
         std::set<DominatorNode*> LocalVisited;
         WorkList.push(root);
@@ -313,7 +301,6 @@ void PromotePass::computeIDF(
             DominatorNode* node = WorkList.top();
             WorkList.pop();
 
-             
             for (BasicBlock* succ : node->Block->getSuccessors()) {
                 DominatorNode* succNode = DT.getNode(succ);
                 if (!succNode) continue;
@@ -321,23 +308,19 @@ void PromotePass::computeIDF(
                 auto succLevelIt = DomLevels.find(succNode);
                 if (succLevelIt == DomLevels.end()) continue;
 
-                 
                 if (succLevelIt->second > rootLevel) continue;
 
-                 
                 if (!LiveInBlocks.count(succ)) continue;
 
                 if (VisitedPHI.insert(succNode).second) {
                     PhiBlocks.insert(succ);
 
-                     
                     if (!DefBlocks.count(succ) && VisitedWorkList.insert(succNode).second) {
                         PQ.push({succLevelIt->second, succNode});
                     }
                 }
             }
 
-             
             for (auto* child = node->FirstChild; child; child = child->NextSibling) {
                 if (LocalVisited.insert(child).second)
                     WorkList.push(child);
@@ -353,7 +336,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     BasicBlock* EntryBB = F.front();
     if (!EntryBB) return false;
 
-     
     while (true) {
     std::vector<AllocaInst*> Allocas;
     AllocaInfo info;
@@ -361,22 +343,17 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     bool roundChanged = false;
 
     for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
-         
-         
+
         if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT) &&
             !allocaCrossesTimingBarrier(AI, F))
             Allocas.push_back(AI);
     }
 
     if(Allocas.empty()) {
-         
-         
-         
-         
+
         return changed;
     }
 
-     
     // 2. 先删除无 use alloca，并尝试唯一 store、单块两条无需 PHI 的快速路径。
     for(unsigned i = 0; i != Allocas.size(); ++i){
         auto AI = Allocas[i];
@@ -423,7 +400,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-     
     std::unordered_map<DominatorNode*, unsigned> DomLevels;
     {
         DominatorNode* root = DT.getNode(F.front());
@@ -441,8 +417,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
             }
         }
     }
-
-     
 
     std::map<AllocaInst*, unsigned> AllocaIndex;
     for (unsigned i = 0; i < Allocas.size(); ++i)
@@ -464,11 +438,9 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         std::shared_ptr<IRType> allocType =
             IRType::getPointeeType(AI->getIRType());
 
-         
         std::set<BasicBlock*> LiveInBlocks;
         computeLiveInBlocks(AI, DefBlocks[i], LiveInBlocks,PredMap);
 
-         
         std::set<BasicBlock*> phiBlocks;
         computeIDF(DefBlocks[i], LiveInBlocks, phiBlocks, DT, DomLevels);
 
@@ -479,7 +451,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-     
     // 4. 为每个 alloca 建当前 SSA 值栈，以 undef 作为入口初值；随后显式 DFS 支配树
     // 完成重命名，frame 记录本块压栈次数以便离开子树时精确恢复。
     unsigned numAllocas = Allocas.size();
@@ -504,7 +475,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         if(!frame.Processed){
             frame.Processed = true;
 
-             
             // 4.1 进入块先压入该块新 PHI，再顺序把 load 替换为栈顶、把 store 值压栈，
             // 最后为每个 CFG 后继的 PHI 填入当前出块值。
             auto phiIt = PhiNodes.find(BB);
@@ -515,7 +485,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                 }
             }
 
-             
             std::vector<Instruction*> instsToDelete;
 
             for(auto inst : *BB){
@@ -555,7 +524,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                 delete inst;
             }
 
-             
             auto succs = BB->getSuccessors();
             for(BasicBlock* succBB : succs){
                 auto succPhiIt = PhiNodes.find(succBB);
@@ -567,7 +535,6 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
             }
         }
 
-         
         // 4.2 子节点处理完毕后按 PushCounts 回退各变量值栈，保持兄弟支配子树隔离。
         if(frame.ChildIter != nullptr){
             DominatorNode* child = frame.ChildIter;
@@ -583,19 +550,15 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-     
     // 5. 删除已无访问的 alloca；若异常残留 use 则保守保留对象。
     for (AllocaInst* AI : Allocas) {
-         
-         
-         
+
         if (AI->hasUses()) continue;
         blockInfo.deleteIndex(AI);
         delete AI;
     }
     roundChanged = true;
 
-     
     // 6. 反复折叠自引用以外 incoming 全相同的 PHI，直到本轮 SSA 图不再退化。
     bool phiChanged = true;
     while (phiChanged) {
@@ -664,7 +627,6 @@ void PromotePass::computeLiveInBlocks(
             continue;
         }
 
-         
         bool foundStoreFirst = false;
         bool foundLoadBeforeStore = false;
         for (auto inst : *BB) {
@@ -687,9 +649,6 @@ void PromotePass::computeLiveInBlocks(
         }
     }
 
-     
-     
-     
     std::set<BasicBlock *> SeedBlocks(
         UseBlocksToPropagate.begin(), UseBlocksToPropagate.end());
     forEachReachablePreOrderCustomSucc<BasicBlock>(
@@ -717,7 +676,7 @@ bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
 
     bool AllSame = forEachPhiIncoming(
         Phi, [&singleVal, Phi](unsigned, Value *V, BasicBlock *) {
-             
+
             if (V == Phi) return true;
             if (singleVal == nullptr) {
                 singleVal = V;
@@ -728,7 +687,7 @@ bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
     if (!AllSame) return false;
 
     if (singleVal == nullptr) {
-         
+
         singleVal = UndefValue::NewUndefValue(Phi->getIRType());
     }
 

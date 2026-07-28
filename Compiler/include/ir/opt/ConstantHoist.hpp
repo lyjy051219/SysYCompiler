@@ -31,11 +31,6 @@ struct ConstantHoistCollectResult {
     std::unordered_map<int32_t, ConstantHoistCandidate> intBuckets;
 };
 
-
-
-
-
-
 // 将可共享的大整数常量改写成“公共基值 + 块内小偏移”：
 // 1. 过滤依赖字面量形态的操作数，并按常量值收集使用点；
 // 2. 把差值可由目标立即数编码的常量聚成一组，执行次数不足的组直接放弃；

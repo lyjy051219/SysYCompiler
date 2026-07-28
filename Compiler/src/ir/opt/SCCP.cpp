@@ -375,7 +375,6 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     }
 }
 
-
 // 求解步骤 2.3：分支把数值格信息转成边可行性。常量条件只开放选中边，
 // Bottom 条件开放两边，Top 条件等待后续数据流信息。
 void SCCPSolver::visitBranchInst(BrInst* Br) {
@@ -420,7 +419,6 @@ void SCCPSolver::visitBranchInst(BrInst* Br) {
         }
     }
 }
-
 
 void SCCPSolver::visitRetInst(RetInst*) {
 }

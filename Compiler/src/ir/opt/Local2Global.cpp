@@ -8,9 +8,6 @@
 #include <utility>
 #include <vector>
 
- 
- 
- 
 bool Local2GlobalPass::isRecursiveFrom(
 	Function *F, const FunctionCallGraph &CallGraph) {
 	// 1.1 从 main 的直接调用边出发检查能否回到自身；递归会让静态对象破坏每次调用
@@ -42,11 +39,6 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 		return PreservationStatus::all();
 	}
 
-	 
-	 
-	 
-	 
-	 
 	// 2. 只考察 main 入口块中的大对象，并预先判断函数是否可能到达计时屏障。
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
@@ -57,9 +49,6 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
 
-		 
-		 
-		 
 		// 2.1 若 alloca 的动态执行位置可能跨越计时调用，则保留栈分配，避免改变
 		// 计时区间内的初始化/分配成本；其余对象按目标阈值进入工作表。
 		if (MainMayReachTiming &&
@@ -81,7 +70,6 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 		std::shared_ptr<IRType> ElemTy = Entry.second;
 		if (!AI || !ElemTy) continue;
 
-		 
 		auto *GV = new Variable(Variable::GlobalVariable, ElemTy, AI->getIdent());
 		AI->replaceAllUsesWith(GV);
 		delete AI;

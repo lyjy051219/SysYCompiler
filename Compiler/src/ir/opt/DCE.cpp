@@ -21,7 +21,7 @@ bool hasAcyclicReturningCFG(Function &F) {
 	std::function<bool(BasicBlock *)> Visit = [&](BasicBlock *BB) -> bool {
 		if (!BB) return false;
 		unsigned &C = Color[BB];
-		if (C == 1) return false;  
+		if (C == 1) return false;
 		if (C == 2) return true;
 		C = 1;
 		Instruction *Term = BB->getTerminator();
@@ -49,7 +49,7 @@ bool DCEPass::isGuaranteedRemovableFunction(
 	auto It = Memo.find(&F);
 	if (It != Memo.end()) {
 		if (It->second == ReturnProofState::Proven) return true;
-		 
+
 		return false;
 	}
 	Memo[&F] = ReturnProofState::Visiting;
@@ -63,17 +63,12 @@ bool DCEPass::isGuaranteedRemovableFunction(
 
 	for (BasicBlock *BB : F) {
 		for (Instruction *I : *BB) {
-			 
-			 
-			 
+
 			if (dynamic_cast<StoreInst *>(I)) {
 				Memo[&F] = ReturnProofState::Failed;
 				return false;
 			}
 
-			 
-			 
-			 
 			if (dceInstructionMustBePreserved(I)) {
 				Memo[&F] = ReturnProofState::Failed;
 				return false;
@@ -120,8 +115,7 @@ bool hasDefinedConstantShiftAmount(const Instruction *I) {
 
 	auto Ty = LHS->getIRType();
 	if (!Ty || !Ty->isInt()) return false;
-	 
-	 
+
 	const int BitWidth = Ty->isBool() ? 1 : LHS->integerBitWidth(0);
 	int32_t Amount = 0;
 	return BitWidth > 0 && RHS->tryGetIntConst(Amount) && Amount >= 0 &&
@@ -149,8 +143,7 @@ bool valueMayDependOnUndef(
 			 Index < I->getNumOperands(); ++Index) {
 			Value *Operand = I->getOperand(Index);
 			if (!Operand || Value::isUndef(Operand)) return true;
-			 
-			 
+
 			if (dynamic_cast<Instruction *>(Operand))
 				WorkList.push_back(Operand);
 		}
@@ -161,10 +154,7 @@ bool valueMayDependOnUndef(
 bool dceInstructionMustBePreserved(Instruction *I) {
 	// 2.3 用已知指令种类白名单隔离未来扩展：未识别 opcode 默认具有不可丢弃语义。
 	if (!I) return true;
-	 
-	 
-	 
-	 
+
 	switch (I->instType) {
 		case Instruction::RET:
 		case Instruction::BR:
@@ -211,8 +201,7 @@ bool dceInstructionMustBePreserved(Instruction *I) {
 bool instructionMayFaultOrProducePoison(const Instruction *I) {
 	// 2.4 标记即使结果无用户也可能陷阱或产生 poison 的操作，供推测执行类 pass 复用。
 	if (!I) return true;
-	 
-	 
+
 	if (dynamic_cast<const LoadInst *>(I)) return true;
 
 	switch (I->instType) {
@@ -237,20 +226,18 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	// 1.3 调用删除按 builtin/普通函数分流：输出、计时与非 NoModRef builtin 保留；
 	// 普通函数必须通过完整的“无副作用且必返回”递归证明。
 	if (!CI) return true;
-	 
+
 	if (CI->mayReachTimingCall()) return true;
 	Value* Callee = CI->getCallee();
 	if (!Callee) return true;
 
 	if (auto* BIF = dynamic_cast<BuildInFunction*>(Callee)) {
 		const std::string& N = BIF->getIdent();
-		 
+
 		if (BuildInFunction::isOutputName(N)) {
 			return true;
 		}
 
-		 
-		 
 		return classifyBuiltin(BIF) != FuncAttr::NoModRef;
 	}
 
@@ -267,13 +254,10 @@ bool DCEPass::isDeletableInstruction(
 	// 2. 候选必须没有指令用户，且不是终结指令、store、未知指令或有可观察行为的 call。
 	if (!I) return false;
 
-	 
 	if (I->countInstructionUses() > 0) return false;
 
-	 
 	if (I->instType == Instruction::RET || I->instType == Instruction::BR) return false;
 
-	 
 	if (I->instType == Instruction::STORE) {
 		return false;
 	}
@@ -308,15 +292,11 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		if (Erased.count(I)) return false;
 		if (!isDeletableInstruction(I, FAM)) return false;
 
-		 
-		 
-		 
-		 
 		std::vector<Instruction *> OperandDefs;
 		OperandDefs.reserve(I->getNumOperands());
 		forEachOperand(
 			I, [&](size_t, Use *U, Value *Op) {
-				if (!U || !Op || Op == I) return;  
+				if (!U || !Op || Op == I) return;
 				if (auto *DefI = dynamic_cast<Instruction *>(Op))
 					OperandDefs.push_back(DefI);
 			});
@@ -325,7 +305,6 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		for (Instruction *DefI : OperandDefs) {
 			if (Erased.count(DefI)) continue;
 
-			 
 			bool DefIHasInstUser = DefI->countInstructionUses() > 0;
 
 			if (!DefIHasInstUser && isDeletableInstruction(DefI, FAM)) {
@@ -339,11 +318,9 @@ PassResult DCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 		return true;
 	};
 
-	 
 	// 3. 对函数做一次稳定快照；每个种子删除后立即排空级联工作表，再继续下一个种子。
 	auto AllInsts = collectInstructions(F);
 
-	 
 	for (Instruction* I : AllInsts) {
 		if (!I) continue;
 		if (Erased.count(I)) continue;

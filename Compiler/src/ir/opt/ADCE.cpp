@@ -9,94 +9,55 @@
 
 #include <vector>
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
- 
- 
- 
- 
- 
 bool ADCEPass::callHasObservableSideEffect(CallInst *CI) {
     // 1.1 仅明确标为 NoModRef 的 builtin 可作为死根删除；普通函数和未知 callee
     // 还可能不返回或具有未被局部摘要覆盖的行为，统一视为可观察。
     Value *Callee = CI ? CI->getCallee() : nullptr;
     if (!Callee) return true;
 
-     
     if (auto *BIF = dynamic_cast<BuildInFunction *>(Callee)) {
         FuncAttr attr = classifyBuiltin(BIF);
-         
+
         if (attr == FuncAttr::NoModRef)
             return false;
-         
+
         return true;
     }
 
-     
     if (dynamic_cast<Function *>(Callee)) {
         return true;
     }
 
-     
     return true;
 }
 
- 
 bool ADCEPass::isRootLive(
     Instruction *I, PostDominatorTree &PDT) {
     // 1.2 根活跃集合包含写内存、返回、未知语义指令和有副作用调用；无条件分支
     // 保持 CFG 连通，无法到达出口区域的条件分支也因后支配信息不可靠而保留。
-     
+
     if (dynamic_cast<StoreInst *>(I)) return true;
 
-     
     if (dynamic_cast<RetInst *>(I)) return true;
 
-     
-     
-     
     if (dceInstructionMustBePreserved(I)) return true;
 
-     
     if (auto *CI = dynamic_cast<CallInst *>(I))
         return callHasObservableSideEffect(CI);
 
-     
     if (auto *BI = dynamic_cast<BrInst *>(I)) {
-         
+
         if (!BI->isConditional()) return true;
 
-         
-         
-         
         BasicBlock *BB = BI->getParent();
         if (BB && !PDT.isReachableToExit(BB)) return true;
 
-         
-         
-
-         
         return false;
     }
 
-     
     return false;
 }
 
- 
 void ADCEPass::markLive(Instruction *I, ADCEContext &ctx) {
     // 2.1 活跃指令只入队一次，并同步标记其所在块，供数据与控制依赖闭包使用。
     if (!ctx.LiveInsts.insert(I).second)
@@ -106,11 +67,6 @@ void ADCEPass::markLive(Instruction *I, ADCEContext &ctx) {
     if (BB) ctx.LiveBlocks.insert(BB);
 }
 
- 
- 
- 
- 
- 
 void ADCEPass::markControlDependences(
     BasicBlock *B, PostDominatorTree &PDT, ADCEContext &ctx) {
     // 2.2 对每个活跃块，从其前驱沿立即后支配链走到该块的立即后支配者；路径上的
@@ -118,19 +74,15 @@ void ADCEPass::markControlDependences(
     if (!B) return;
     if (!ctx.CDProcessed.insert(B).second) return;
 
-     
-     
     if (!PDT.isReachableToExit(B)) return;
 
     BasicBlock *stop = PDT.getIPostDom(B);
-     
 
     for (BasicBlock *P : B->getPredecessors()) {
         BasicBlock *runner = P;
         while (runner != stop) {
             if (runner == nullptr) break;
 
-             
             if (!PDT.isReachableToExit(runner)) break;
 
             Instruction *term = runner->back();
@@ -145,10 +97,6 @@ void ADCEPass::markControlDependences(
     }
 }
 
- 
- 
- 
- 
 BasicBlock *ADCEPass::pickSurvivorSuccessor(
     BasicBlock *BB, PostDominatorTree &PDT) {
     // 3.1 死条件分支只能保留原有后继，避免凭空增加边和修复任意 PHI；优先选择
@@ -161,23 +109,18 @@ BasicBlock *ADCEPass::pickSurvivorSuccessor(
     BasicBlock *falseBB = br->getFalseSuccessor();
     if (!trueBB || !falseBB) return trueBB ? trueBB : falseBB;
 
-     
     if (trueBB == falseBB) return trueBB;
 
-     
     BasicBlock *ipostdom = PDT.getIPostDom(BB);
     if (ipostdom == trueBB)  return trueBB;
     if (ipostdom == falseBB) return falseBB;
 
-     
     if (PDT.postDominates(trueBB, falseBB))  return trueBB;
     if (PDT.postDominates(falseBB, trueBB))  return falseBB;
 
-     
     return trueBB;
 }
 
- 
 bool ADCEPass::sweep(
     Function &F, PostDominatorTree &PDT, ADCEContext &ctx,
     bool &cfgChanged) {
@@ -186,12 +129,11 @@ bool ADCEPass::sweep(
     bool changed = false;
     cfgChanged = false;
 
-     
     std::vector<BasicBlock *> blocksToRewrite;
     for (auto bb : F) {
         Instruction *term = bb->back();
         if (!term) continue;
-        if (ctx.LiveInsts.count(term)) continue;   
+        if (ctx.LiveInsts.count(term)) continue;
         auto *br = dynamic_cast<BrInst *>(term);
         if (br && br->isConditional()) {
             blocksToRewrite.push_back(bb);
@@ -203,29 +145,25 @@ bool ADCEPass::sweep(
         BasicBlock *trueBB = br->getTrueSuccessor();
         BasicBlock *falseBB = br->getFalseSuccessor();
 
-         
         BasicBlock *survivor = pickSurvivorSuccessor(BB, PDT);
         BasicBlock *dropped  = (survivor == trueBB) ? falseBB : trueBB;
 
-         
         if (dropped != survivor) {
             BasicBlock::removeEdgeFromSuccPhis(dropped, BB, -1);
         }
 
-         
         BasicBlock::replaceCondBrWithUncond(BB, survivor);
         changed = true;
         cfgChanged = true;
     }
 
-     
     // 3.2 第二阶段收集所有非终结死指令；若仍被其他死节点引用，先用同型 undef
     // 断开 use，再统一删除整个死值图。
     std::vector<Instruction *> deadInsts;
     for (auto bb : F) {
         for (auto inst : *bb) {
             if (ctx.LiveInsts.count(inst)) continue;
-            if (inst == bb->back()) continue;   
+            if (inst == bb->back()) continue;
             deadInsts.push_back(inst);
         }
     }
@@ -241,38 +179,31 @@ bool ADCEPass::sweep(
     return changed;
 }
 
- 
 PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     // 1. 获取后支配树并从所有可观察根初始化活跃工作表。
     PostDominatorTree &PDT = FAM.getResult<PostDominantAnalysis>(F);
 
-     
     ADCEContext ctx;
 
-     
     forEachInstruction(F, [&](Instruction *I) {
         if (isRootLive(I, PDT)) markLive(I, ctx);
     });
 
-     
     // 2. 迭代闭包：沿操作数标记数据依赖，同时从普通指令所在块和 PHI 的每条
     // incoming 边补充控制依赖，直到工作表清空。
     while (!ctx.Worklist.empty()) {
         Instruction *I = ctx.Worklist.front();
         ctx.Worklist.pop_front();
 
-         
         forEachOperand(I, [&](size_t, Use *, Value *V) {
             if (auto *OpI = dynamic_cast<Instruction *>(V)) {
                 markLive(OpI, ctx);
             }
         });
 
-         
         BasicBlock *BB = I->getParent();
         markControlDependences(BB, PDT, ctx);
 
-         
         if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
             forEachPhiIncoming(
                 Phi, [&](unsigned, Value *, BasicBlock *IncomingBlock) {
@@ -281,12 +212,10 @@ PreservationStatus ADCEPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
         }
     }
 
-     
     // 3. 标记完成后执行分支改写与死指令清扫。
     bool cfgChanged = false;
     bool changed = sweep(F, PDT, ctx, cfgChanged);
 
-     
     if (!changed) return PreservationStatus::all();
 
     // 4. 若只删除普通指令则保留 CFG 分析；一旦重写分支，支配/后支配/循环均失效。

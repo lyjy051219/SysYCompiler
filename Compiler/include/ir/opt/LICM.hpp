@@ -12,9 +12,6 @@
 
 class MemorySSAResult;
 
- 
- 
-
 using ExitValueKey = std::pair<BasicBlock *, Value *>;
 
 struct ExitValueKeyHash {

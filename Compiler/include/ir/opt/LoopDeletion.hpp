@@ -23,7 +23,6 @@ public:
 private:
 	using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;
 
-	 
 	static bool isSafeToSkipOnZeroTrip(Instruction *I);
 	static bool hasNoObservableLoopInstruction(Loop *L);
 	static bool isProvablyFiniteStrictUnitStepLoop(

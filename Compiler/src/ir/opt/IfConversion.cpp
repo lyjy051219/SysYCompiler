@@ -9,9 +9,6 @@
 
 #include <vector>
 
- 
- 
- 
 bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 	// 2.1 白名单只接纳无副作用且不会新增陷阱/毒值的指令；移位还需常量位数合法。
 	if (!I) return false;
@@ -40,12 +37,7 @@ bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 		case Instruction::SITOFP:
 		case Instruction::BITCAST:
 			return true;
-		 
-		 
-		 
-		 
-		 
-		 
+
 		default:
 			return false;
 	}
@@ -99,8 +91,6 @@ bool IfConversionPass::checkBlockConvertible(BasicBlock *BB) {
 	return true;
 }
 
- 
- 
 bool IfConversionPass::usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
 	// 2.3 分支内定义只能在本分支继续使用，或作为汇合块 PHI 的 incoming；
 	// 这样把指令上提到控制块后不会产生跨区域的 SSA 可见性变化。
@@ -145,11 +135,7 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	BasicBlock *Pred = Preds[0];
 	BasicBlock *Succ = Succs[0];
 	if (!Pred || !Succ) return false;
-	 
-	 
-	 
-	 
-	 
+
 	if (Pred == TrueBB || Succ == TrueBB || Succ == Pred) return false;
 
 	BrInst *PredBr = Pred->getBranchTerminator();
@@ -167,12 +153,11 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	bool HasElse = false;
 	bool CondTrueToTrueBB = false;
 
-	 
 	if ((Dest0 == TrueBB && Dest1 == Succ) || (Dest1 == TrueBB && Dest0 == Succ)) {
 		CondTrueToTrueBB = (Dest0 == TrueBB);
 		HasElse = false;
 	} else {
-		 
+
 		if (Dest0 == TrueBB && Dest1 != Succ) {
 			ElseBB = Dest1;
 			HasElse = true;
@@ -202,7 +187,6 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 		if (ElseBr->getSuccessor(0) != Succ) return false;
 	}
 
-	 
 	if (HasElse) {
 		if (!hasExactPreds(Succ, TrueBB, ElseBB)) return false;
 	} else {
@@ -213,22 +197,17 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	if (!checkBlockConvertible(TrueBB)) return false;
 	if (HasElse && !checkBlockConvertible(ElseBB)) return false;
 
-	 
-	 
 	if (!TrueBB->collectPhiNodes().empty()) return false;
 	if (HasElse && !ElseBB->collectPhiNodes().empty()) return false;
 
 	if (!usersAreSafeForHoist(TrueBB, Succ)) return false;
 	if (HasElse && !usersAreSafeForHoist(ElseBB, Succ)) return false;
 
-	 
 	// 3. 汇合块必须确有二元 PHI，并且每个 incoming 都来自预期两条边且不在
 	// 汇合块内部定义；这些 PHI 将逐一转换成 select。
 	auto SuccPhis = Succ->collectPhiNodes();
 	if (SuccPhis.empty()) return false;
 
-	 
-	 
 	BasicBlock *OtherArmBB = HasElse ? ElseBB : Pred;
 	for (PhiInst *Phi : SuccPhis) {
 		if (!Phi || Phi->getNumIncomingValues() != 2 ||
@@ -237,10 +216,7 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 		Value *TrueIncoming = Phi->getIncomingFromPred(TrueBB);
 		Value *OtherIncoming = Phi->getIncomingFromPred(OtherArmBB);
 		if (!TrueIncoming || !OtherIncoming) return false;
-		 
-		 
-		 
-		 
+
 		auto IsDefinedInMerge = [Succ](Value *V) {
 			auto *I = dynamic_cast<Instruction *>(V);
 			return I && I->getParent() == Succ;
@@ -253,8 +229,7 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	// 4. 最后应用代码尺寸与加权成本预算，避免消除分支却增加过多无条件计算。
 	int InstCnt = countCandidateInsts(TrueBB) + (HasElse ? countCandidateInsts(ElseBB) : 0);
 	if (InstCnt > 4) return false;
-	 
-	 
+
 	int WeightedCost = candidateCost(TrueBB) +
 		(HasElse ? candidateCost(ElseBB) : 0) +
 		static_cast<int>(SuccPhis.size());
@@ -290,7 +265,6 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 
 	auto Phis = M.Succ->collectPhiNodes();
 
-	 
 	// 5.1 删除条件分支，把两臂的可推测指令按原有臂内顺序移到控制块。
 	delete M.PredBr;
 
@@ -306,9 +280,6 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 		Value *VFromTrueBB = Phi->getIncomingFromPred(M.TrueBB);
 		BasicBlock *OtherArmBB = M.HasElse ? M.ElseBB : M.Pred;
 		Value *VFromOtherArm = Phi->getIncomingFromPred(OtherArmBB);
-		 
-		 
-		 
 
 		Value *SelTrueV = M.CondTrueToTrueBB ? VFromTrueBB : VFromOtherArm;
 		Value *SelFalseV = M.CondTrueToTrueBB ? VFromOtherArm : VFromTrueBB;

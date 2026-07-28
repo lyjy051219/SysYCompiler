@@ -46,8 +46,6 @@ struct PhiTranslateKeyHash {
 	std::size_t operator()(const PhiTranslateKey &K) const;
 };
 
- 
- 
 // PRE 的块出口可用项同时保存 leader 和其定义块。
 struct AvailEntry {
 	Instruction *Inst = nullptr;
@@ -55,14 +53,13 @@ struct AvailEntry {
 };
 using AvailSet = std::unordered_map<int, AvailEntry>;
 
- 
 // 对循环 PHI 和其纯表达式操作数做共递归等价判断，三态 memo 负责终止循环图。
 class PhiCongruenceMatcher {
 public:
 	bool equivalent(Value *A, Value *B);
 
 private:
-	 
+
 	struct ValuePair {
 		Value *A = nullptr;
 		Value *B = nullptr;
@@ -123,7 +120,6 @@ private:
 	std::vector<BasicBlock *> RPO;
 	std::unordered_map<PhiTranslateKey, int, PhiTranslateKeyHash> PhiTranslateTable;
 
-	 
 	std::unordered_map<BasicBlock *, AvailSet> AvailOut;
 
 	struct MemoryLoadRecord {
@@ -161,7 +157,7 @@ private:
 	void forgetInstruction(Instruction *I);
 	bool isBeforeInSameBlock(Instruction *A, Instruction *B) const;
 	Instruction *findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const;
-	 
+
 	Instruction *findAvailLeader(int Num, BasicBlock *PredBB) const;
 
 	int allocateFreshNum(Value *V);
@@ -176,9 +172,6 @@ private:
 	void markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc);
 	void processBranchForDeadBlocks(Instruction *I);
 
-	 
-	 
-	 
 	bool eliminateCongruentPhis();
 	bool processLoad(Instruction *I);
 	bool processCall(Instruction *I);
@@ -186,9 +179,9 @@ private:
 
 	static bool isBackedge(BasicBlock *Pred, BasicBlock *BB, const DominatorTree &DT);
 	bool shouldSkipPREInst(Instruction *I);
-	 
+
 	int phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred);
-	 
+
 	Value *resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB,
 	                           BasicBlock *PredBB);
 
@@ -197,9 +190,6 @@ private:
 
 };
 
- 
- 
- 
 // 函数 pass 负责取得支配、循环、AA、MemorySSA 并运行 GVNPRESolver，
 // 可通过构造参数关闭 PRE、只执行全局值编号。
 class GVNPREPass : public PassDescriptor<GVNPREPass> {
@@ -211,8 +201,6 @@ private:
 	bool EnablePRE = true;
 };
 
- 
- 
 // 线性低成本层：每块独立按真实操作数建纯表达式键，顺序复用首个 leader；
 // 计时调用清空本块表，不做跨块数据流或内存值编号。
 class LocalGVNPass : public PassDescriptor<LocalGVNPass> {
@@ -220,7 +208,7 @@ public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-	 
+
 	struct LocalExprKey {
 		unsigned Opcode = 0;
 		unsigned SubOpcode = 0;

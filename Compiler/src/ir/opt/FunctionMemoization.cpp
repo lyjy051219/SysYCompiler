@@ -40,7 +40,7 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     if (Inst->instType == Instruction::FPTOSI) return true;
     if (Inst->instType == Instruction::BITCAST) {
         Value *Source = Inst->getUnaryOperand();
-         
+
         return !Source ||
                !isSupportedScalarType(Source->getIRType()) ||
                !isSupportedScalarType(Inst->getIRType());
@@ -88,8 +88,6 @@ bool FunctionMemoizationPass::collectCandidate(
         return false;
     }
 
-     
-     
     if (F.mayReachTimingCall()) return false;
 
     BasicBlock *OriginalEntry = F.front();
@@ -122,7 +120,6 @@ bool FunctionMemoizationPass::collectCandidate(
         for (Instruction *Inst : *Block) {
             if (hasUnsafeOrUndefinedOperation(Inst)) return false;
 
-             
             if (dynamic_cast<AllocaInst *>(Inst) ||
                 dynamic_cast<LoadInst *>(Inst) ||
                 dynamic_cast<StoreInst *>(Inst) ||
@@ -224,7 +221,6 @@ Value *FunctionMemoizationPass::appendKeyBits(
     if (Argument->getIRType()->isInt()) return Argument;
     if (!Argument->getIRType()->isFloat()) return nullptr;
 
-     
     auto *Bits = new BitCastInst(Argument, INTType::getInt32Ty());
     Block.pushBack(Bits);
     return Bits;
@@ -330,7 +326,7 @@ bool FunctionMemoizationPass::transformCandidate(
     Value *IsHit = InitialHit;
 
     for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {
-         
+
         auto *StoredKey = new LoadInst(KeyPointers[Index]);
         LookupBlock->pushBack(StoredKey);
         auto *KeyMatches = new BinaryInst(
@@ -362,7 +358,6 @@ bool FunctionMemoizationPass::transformCandidate(
         Value *Result = Return->getReturnValue();
         if (!Result) continue;
 
-         
         Return->insertBefore(new StoreInst(
             ConstInt::newConstInt(0), ValidPointer));
         for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {

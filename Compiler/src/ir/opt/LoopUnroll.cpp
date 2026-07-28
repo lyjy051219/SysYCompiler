@@ -1975,7 +1975,6 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
         return LoopUnrollResult::Unmodified;
     }
 
-
     // 3. 决策完成后只分派到一条执行路径，执行阶段仍会重新核验与该路径相关的 trip/CFG 条件。
     switch (Decision.Kind) {
     case UnrollKind::Full:

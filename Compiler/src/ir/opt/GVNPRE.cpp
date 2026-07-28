@@ -90,9 +90,6 @@ bool PhiCongruenceMatcher::equivalentPhis(
         return false;
     }
 
-     
-     
-     
     std::unordered_set<BasicBlock *> SeenA;
     std::unordered_set<BasicBlock *> SeenB;
     bool Equal = forEachPhiIncoming(
@@ -131,8 +128,7 @@ bool PhiCongruenceMatcher::equivalentImpl(
     if (!IA || !IB || IA->instType != IB->instType ||
         !isSupportedPureInstruction(IA) ||
         !isSupportedPureInstruction(IB)) {
-         
-         
+
         return false;
     }
 
@@ -298,17 +294,12 @@ void GVNPRESolver::buildTablesForPRE() {
     }
 }
 
- 
- 
 void GVNPRESolver::buildAvailOut() {
     // 3.2 按支配树前序复制立即支配者的出口可用表，再加入本块首次出现的每个值号；
     // 因而 AvailOut 中的 leader 必然支配对应块出口。
     BasicBlock *Entry = F.front();
     if (!Entry) return;
 
-     
-     
-     
     std::vector<BasicBlock *> Roots;
     if (!isDeadBlock(Entry)) Roots.push_back(Entry);
     auto DomOrder =
@@ -327,25 +318,21 @@ void GVNPRESolver::buildAvailOut() {
     for (BasicBlock *BB : DomOrder) {
         auto &Avail = AvailOut[BB];
 
-         
         BasicBlock *IDom = DT.getIDom(BB);
         if (IDom && !isDeadBlock(IDom)) {
             auto It = AvailOut.find(IDom);
             if (It != AvailOut.end()) {
-                Avail = It->second;  
+                Avail = It->second;
             }
         }
 
-         
         for (Instruction *I : *BB) {
             if (!I || !hasResultValue(I)) continue;
             auto VIt = ValueNum.find(I);
             if (VIt == ValueNum.end()) continue;
             int Num = VIt->second;
             if (Num <= 0) continue;
-             
-             
-             
+
             if (I->instType == Instruction::ALLOCA ||
                 I->instType == Instruction::RET   ||
                 I->instType == Instruction::BR)
@@ -434,8 +421,6 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
     return Best;
 }
 
- 
- 
 Instruction *GVNPRESolver::findAvailLeader(int Num, BasicBlock *PredBB) const {
     if (!PredBB) return nullptr;
     auto AOIt = AvailOut.find(PredBB);
@@ -527,8 +512,7 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 
     K.Args.clear();
     K.Opcode = (static_cast<unsigned>(I->instType) << 8);
-     
-     
+
     K.ResultType = I->getIRType().get();
 
     if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
@@ -627,9 +611,6 @@ bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
     if (!isNoModRef(MRI) && MRI != ModRefInfo::Ref)
         return false;
 
-     
-     
-     
     const SideEffectInfo &Effects =
         FAM.getResult<SideEffectAnalysis>(*Callee);
     return !Effects.hasBuiltin;
@@ -798,11 +779,6 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         }
     }
 
-     
-     
-     
-     
-     
     // 2.12 否则在相同 clobber 版本下复用支配的 MustAlias load；共同 clobber
     // 证明两次读取之间没有改变该位置的内存定义。
     if (Clobber) {
@@ -928,9 +904,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 for (Value *RP : ReadPtrs) {
                     if (!RP || !RP->isPointerValue())
                         continue;
-                     
-                     
-                     
+
                     if (!AA.haveKnownDistinctUnderlyingObjects(RP, SPtr))
                         return false;
                 }
@@ -942,9 +916,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
-                     
-                     
-                     
+
                     MemorySSAValid = false;
                     AvailableMemoryLoads.clear();
                     delete I;
@@ -986,7 +958,7 @@ bool GVNPRESolver::runGVN() {
 
             if (auto *CI = dynamic_cast<CallInst *>(I);
                 CI && CI->mayReachTimingCall()) {
-                 
+
                 AvailableMemoryLoads.clear();
             }
 
@@ -1093,8 +1065,6 @@ bool GVNPRESolver::eliminateCongruentPhis() {
                 PhiCongruenceMatcher Matcher;
                 if (!Matcher.equivalent(Leader, Candidate)) continue;
 
-                 
-                 
                 auto CrossesTiming = [&](Value *Root) {
                     std::vector<Value *> WorkList{Root};
                     std::unordered_set<Value *> Seen;
@@ -1154,27 +1124,15 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         if (BinaryInst::isCompareOp(BI->getOp())) return true;
     }
 
-     
-     
-     
-     
-     
     if (instructionMayFaultOrProducePoison(I)) {
         return true;
     }
 
-     
-     
-     
     if (dynamic_cast<CallInst *>(I)) return true;
 
     return false;
 }
 
- 
- 
- 
- 
 int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) {
     // 3.4 把汇合块中的值号翻译到指定前驱：若值号来自 PHI，取该边 incoming；
     // 若来自表达式，递归翻译各参数并重新查规范表达式键，结果按边缓存。
@@ -1186,13 +1144,11 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
 
     int Result = Num;
 
-     
-     
     if (FromBB) {
         for (Instruction *DefI : *FromBB) {
             if (!DefI) continue;
             auto *Phi = dynamic_cast<PhiInst *>(DefI);
-            if (!Phi) break;  
+            if (!Phi) break;
             auto VIt = ValueNum.find(DefI);
             if (VIt == ValueNum.end() || VIt->second != Num) continue;
 
@@ -1212,8 +1168,6 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
         }
     }
 
-     
-     
     auto EI = NumToExpr.find(Num);
     if (EI != NumToExpr.end()) {
         ExprKey NewK = EI->second;
@@ -1225,7 +1179,6 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             ArgNum = Translated;
         }
 
-         
         unsigned BaseOp = NewK.Opcode >> 8;
         if (BaseOp == Instruction::ADD  || BaseOp == Instruction::FADD ||
             BaseOp == Instruction::MUL  || BaseOp == Instruction::FMUL ||
@@ -1239,7 +1192,7 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             if (Found != ExpressionTable.end()) {
                 Result = Found->second;
             }
-             
+
         }
     }
 
@@ -1247,10 +1200,6 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
     return Result;
 }
 
- 
- 
- 
- 
 Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicBlock *PredBB) {
     // 3.5 克隆到缺失前驱前，块内操作数需经 PHI translate 找到该前驱可用 leader；
     // 块外定义则必须支配前驱，否则无法构造合法 SSA 操作数。
@@ -1258,7 +1207,7 @@ Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicB
 
     auto *OpI = dynamic_cast<Instruction *>(OrigV);
     if (!OpI) {
-         
+
         return OrigV;
     }
 
@@ -1266,23 +1215,21 @@ Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicB
     if (!DefBB) return nullptr;
 
     if (DefBB == SrcBB) {
-         
+
         bool OpFresh = false;
         int OpNum    = getOrAssignValueNum(OrigV, OpFresh);
         int TransNum = phiTranslate(OpNum, SrcBB, PredBB);
 
-         
         if (Instruction *Avail = findAvailLeader(TransNum, PredBB)) {
             return Avail;
         }
-         
+
         if (Instruction *Leader = findLeader(TransNum, PredBB, nullptr)) {
             return Leader;
         }
-        return nullptr;  
+        return nullptr;
     }
 
-     
     if (!DT.dominates(DefBB, PredBB)) return nullptr;
     return OrigV;
 }
@@ -1307,7 +1254,6 @@ bool GVNPRESolver::runPRE() {
 
     if (!F.front()) return false;
 
-     
     std::vector<BasicBlock *> Roots{F.front()};
     std::vector<BasicBlock *> DFSOrder =
         buildPreOrderFromRoots<BasicBlock>(Roots);
@@ -1333,7 +1279,6 @@ bool GVNPRESolver::runPRE() {
             BasicBlock *PREPred = nullptr;
             bool Abort   = false;
 
-             
             std::unordered_map<BasicBlock *, Value *> PredMap;
             std::vector<BasicBlock *> ConsideredPreds;
 
@@ -1353,7 +1298,6 @@ bool GVNPRESolver::runPRE() {
 
                 int TransNum = phiTranslate(Num, BB, Pred);
 
-                 
                 Instruction *Leader = findAvailLeader(TransNum, Pred);
                 if (!Leader) {
                     Leader = findLeader(TransNum, Pred, nullptr);
@@ -1369,7 +1313,7 @@ bool GVNPRESolver::runPRE() {
                     break;
                 }
                 if (Leader == I) {
-                     
+
                     NumWithout = 2;
                     Abort      = true;
                     break;
@@ -1381,7 +1325,6 @@ bool GVNPRESolver::runPRE() {
 
             if (Abort) continue;
 
-             
             if (!(NumWithout == 1 && NumWith > 0 && PREPred)) {
                 continue;
             }
@@ -1393,7 +1336,6 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
 
-             
             // 3.7 在缺失前驱终结前克隆表达式，并逐操作数解析该边可用值；任一操作数
             // 无合法 leader 时丢弃离线克隆。
             Instruction *Cloned = I->clone({});
@@ -1408,7 +1350,6 @@ bool GVNPRESolver::runPRE() {
                 I, [&](size_t Idx, Use *, Value *OrigV) {
                 if (!OrigV) return false;
 
-                 
                 Value *Resolved = resolveAvailOperand(OrigV, BB, PREPred);
                 if (!Resolved) return false;
 
@@ -1422,16 +1363,13 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
 
-             
             PREPred->insertBeforeTerminator(Cloned);
             ValueNum[Cloned] = Num;
             NumToValue[Num]  = Cloned;
             addRecord(Num, Cloned, PREPred);
 
-             
             AvailOut[PREPred][Num] = {Cloned, PREPred};
 
-             
             // 3.8 在汇合块 PHI 区后建立新 PHI，合并已有 leader 与新克隆；同步更新
             // 值号、AvailOut 及其支配子树，并清除从本块出发的旧翻译缓存。
             auto *NewPhi = new PhiInst(I->getIRType());
@@ -1446,14 +1384,11 @@ bool GVNPRESolver::runPRE() {
                 }
             }
 
-             
             ValueNum[NewPhi] = Num;
             NumToValue[Num]  = NewPhi;
             addRecord(Num, NewPhi, BB);
             AvailOut[BB][Num] = {NewPhi, BB};
 
-             
-             
             for (BasicBlock *Cand : RPO) {
                 if (!Cand || Cand == BB || isDeadBlock(Cand)) continue;
                 if (DT.dominates(BB, Cand)) {
@@ -1467,8 +1402,6 @@ bool GVNPRESolver::runPRE() {
                 }
             }
 
-             
-             
             for (auto It = PhiTranslateTable.begin(); It != PhiTranslateTable.end(); ) {
                 if (It->first.From == BB)
                     It = PhiTranslateTable.erase(It);

@@ -44,7 +44,7 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-     
+
     struct PathScanState {
         BasicBlock *BB = nullptr;
         bool TargetPrefixOnly = false;

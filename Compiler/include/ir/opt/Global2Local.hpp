@@ -26,7 +26,6 @@ private:
 	static constexpr size_t RISCVThreshold = 32;
 	bool RelaxScalarUses = false;
 
-	 
 	static bool isRecursiveFrom(
 		Function *Root, const FunctionCallGraph &CallGraph);
 	static bool isSafeScalarUseInMain(Use *U, Variable *GV);

@@ -38,7 +38,6 @@ enum class LocalAggregateSynthExpressionKind {
 // 常量表综合只保存与源码命名无关的整数表达式语法树；Cost 是生成该树所需的
 // 二元 IR 指令数，候选仍须在完整表定义域逐点验证。
 
-
 struct LocalAggregateSynthExpression {
     LocalAggregateSynthExpressionKind Kind =
         LocalAggregateSynthExpressionKind::Index;
@@ -58,11 +57,6 @@ struct LocalAggregateSynthExpression {
 // 5. 删除只有写入、地址未逃逸且从未被观察的聚合对象。
 // 每阶段都重新快照剩余 alloca，前一阶段的清理结果自然成为下一阶段输入。
 
-
-
-
-
-
 class LocalAggregateSimplifyPass
     : public PassDescriptor<LocalAggregateSimplifyPass> {
 public:
@@ -72,14 +66,12 @@ private:
     // 表综合预算只限制编译时间，不降低正确性门槛；超出元素、常量、表达式
     // 深度或状态数限制时直接放弃，任何接受项都覆盖完整数组定义域。
 
-
     static constexpr int MaxSynthArrayElements = 32;
     static constexpr int MaxSynthConstants = 12;
     static constexpr int MaxSynthExpressionCost = 3;
     static constexpr int MaxSynthStatesPerCost = 128;
     static constexpr int MaxSynthPendingStates = 4096;
     // 只有严格少于一次标量 load 的保守成本估计时才接受综合表达式。
-
 
     static constexpr int GenericScalarLoadCost = 4;
 

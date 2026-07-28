@@ -10,12 +10,8 @@
 #include <unordered_set>
 #include "lib/CFG.hpp"
 
- 
- 
- 
 class Module;
 class Function;
-
 
 // 每个分析类型持有唯一静态 PassID 地址，作为注册表、缓存和 preservation 的稳定键。
 struct alignas(8) PassID {};
@@ -87,7 +83,6 @@ struct PassManagerHasResultInvalidator<
         std::declval<IRUnitT &>(),
         std::declval<const PreservationStatus &>()))>> : std::true_type {};
 
- 
 // CRTP 描述符只提供类型身份；AnalysisDescriptor 进一步暴露该分析的静态 ID。
 template <typename DerivedT>
 struct PassDescriptor {};
@@ -177,9 +172,9 @@ private:
     }
 };
 
-// AnalysisPassManager 流程：1. 注册分析工厂；2. getResult 按 (PassID, IR*) 查缓存；
-// 3. 构造期间记录嵌套分析依赖；4. 变换后求失效与反向依赖闭包；5. 驱逐缓存并
-// 在需要时通知外层 IR 单元。
+// AnalysisPassManager 流程：1. 注册分析工厂并标记跨 IR 单元分析；2. getResult
+// 按 (PassID, IR*) 查询或构造缓存，同时记录嵌套查询依赖；3. 变换后从直接失效键
+// 出发求反向依赖闭包；4. 统一驱逐结果和图边，并在需要时通知外层 IR 单元。
 template <typename IRUnitT>
 class AnalysisPassManager {
 private:
@@ -190,8 +185,7 @@ private:
     std::map<PassID*, PassPtr> AnalysisPasses;
     std::map<CacheKey, ResultPtr> ResultCache;
     std::set<PassID*> CrossUnitAnalysisIDs;
-     
-     
+
     // 正向图用于删除旧依赖边，反向图用于从失效分析传播到所有传递使用者。
     std::map<CacheKey, std::set<CacheKey>> AnalysisDependencies;
     std::map<CacheKey, std::set<CacheKey>> ReverseAnalysisDependencies;
@@ -215,7 +209,8 @@ public:
 
     template <typename PassT>
     typename PassT::Result &getResult(IRUnitT &IR) {
-        // 2.1 若当前正在构造另一分析，先登记依赖；缓存命中直接返回具体结果。
+        // 2.1 生成精确到 IR 实例的缓存键；若另一分析正在构造，先记录
+        // “活动分析依赖本次查询”的边。
         assert(AnalysisPasses.count(PassT::ID()) && "Pass not registered");
         PassID *RequestedID = PassT::ID();
         auto Key = CacheKey{RequestedID, &IR};
@@ -224,10 +219,11 @@ public:
 
         auto it = ResultCache.find(Key);
         if (it != ResultCache.end()) {
+            // 2.2 缓存命中只做安全的 wrapper 下转，不重复运行分析。
             using WrapperT = AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
             return static_cast<WrapperT &>(*it->second).Result;
         }
-        // 2.2 缓存未命中时以 RAII 维护活动分析栈，运行类型擦除分析并原位缓存结果；
+        // 2.3 缓存未命中时以 RAII 维护活动分析栈，运行类型擦除分析并原位缓存结果；
         // 析构 guard 保证异常路径也不会遗留伪活动状态。
         auto &Pass = *AnalysisPasses.at(RequestedID);
 
@@ -246,7 +242,7 @@ public:
 
     template <typename PassT>
     void setCachedResult(IRUnitT &IR, typename PassT::Result Result) {
-        // 2.3 外部预计算结果只填充空缓存，不覆盖已建立依赖关系的现有实例。
+        // 2.4 外部预计算结果只填充空缓存，不覆盖已建立依赖关系的现有实例。
         assert(AnalysisPasses.count(PassT::ID()) && "Pass not registered");
         using WrapperT =
             AnalysisResultWrapper<IRUnitT, PassT, typename PassT::Result>;
@@ -272,7 +268,6 @@ public:
 
     void invalidate(IRUnitT &IR, const PassResult &Result);
 
-     
     void invalidate(IRUnitT &IR, PreservationStatus PA);
 };
 
@@ -281,8 +276,9 @@ using ModuleAnalysisPassManager = AnalysisPassManager<Module>;
 extern template class AnalysisPassManager<Function>;
 using FunctionAnalysisPassManager = AnalysisPassManager<Function>;
 
-// PassManager 流程：1. addPass 完成类型擦除并保持声明顺序；2. 逐 pass 执行；
-// 3. 每一步立即失效 analysis cache；4. 合并 changed 与 preservation 作为整体结果。
+// PassManager 流程：1. addPass 完成类型擦除并保持声明顺序；2. run 安装跨层级
+// mutation callback；3. 逐 pass 执行并立即失效 analysis cache；4. 合并 changed
+// 与 preservation，作为整个 pipeline 的结果。
 template <typename IRUnitT, typename AnalysisManagerT = AnalysisManager<IRUnitT>>
 class PassManager : public PassDescriptor<PassManager<IRUnitT, AnalysisManagerT>> {
 protected:
@@ -302,11 +298,11 @@ public:
     }
 
     PassResult run(IRUnitT &IR, AnalysisManagerT &AM) {
-        // 4.1 上层 mutation callback 先传给分析管理器，使跨 IR 单元变化能向外冒泡。
+        // 2. 上层 mutation callback 先传给分析管理器，使跨 IR 单元变化能向外冒泡。
         if (IRMutationCallback) {
             AM.setIRMutationCallback(IRMutationCallback);
         }
-        // 4.2 严格按 addPass 顺序运行；每个变换返回后立即失效缓存，再把 changed
+        // 3—4. 严格按 addPass 顺序运行；每个变换返回后立即失效缓存，再把 changed
         // 与 preservation 合入 pipeline 总结果，后续 pass 因而只能看到有效分析。
         PassResult Overall = PassResult::unchanged();
         for (auto &Pass : Passes) {
@@ -318,8 +314,8 @@ public:
     }
 
     template <typename PassT>
-    std::enable_if_t<!std::is_same_v<PassT, PassManager>, void> addPass(PassT &&Pass) {  
-        // 4.0 在构建期完成类型擦除，vector 顺序就是运行顺序。
+    std::enable_if_t<!std::is_same_v<PassT, PassManager>, void> addPass(PassT &&Pass) {
+        // 1. 在构建期完成类型擦除，vector 顺序就是运行顺序。
         using PassWrapperT = PassWrapper<IRUnitT, PassT, AnalysisManagerT>;
         Passes.push_back(std::unique_ptr<PassInterfaceT>(
             new PassWrapperT(std::forward<PassT>(Pass))));
@@ -330,16 +326,15 @@ public:
     }
 };
 
- 
- 
-// FixedPointPass 对一个已类型擦除 pass 有界重复执行；每轮立即失效缓存并合并结果，
-// 首次报告 unchanged 即达到固定点。
+// FixedPointPass 流程：1. 持有一个已类型擦除的 pass/pipeline；2. 有界重复执行并
+// 在每轮后立即失效缓存、合并结果；3. 首次报告 unchanged 即达到固定点，达到
+// MaxIterations 则以当前累计结果安全退出。
 template <typename IRUnitT, typename AnalysisManagerT = AnalysisManager<IRUnitT>>
 class FixedPointPass : public PassDescriptor<FixedPointPass<IRUnitT, AnalysisManagerT>> {
 private:
     using PassInterfaceT = PassInterface<IRUnitT, AnalysisManagerT>;
     std::unique_ptr<PassInterfaceT> InnerPass;
-    int MaxIterations;  
+    int MaxIterations;
 
 public:
     explicit FixedPointPass(std::unique_ptr<PassInterfaceT> Inner, int MaxIters = 8)
@@ -352,16 +347,13 @@ public:
         while (Iter < MaxIterations) {
             ++Iter;
 
-             
-            // 5.1 运行一轮、失效其缓存并合并总结果；changedIR 是唯一继续条件。
+            // 2. 运行一轮，随后立即失效该轮缓存并合入总结果；changedIR 是唯一
+            // 继续条件，preservation 只参与累计结果合并。
             PassResult IterResult = InnerPass->run(IR, AM);
 
-             
             AM.invalidate(IR, IterResult);
             Overall.merge(IterResult);
 
-             
-             
             if (!IterResult.changedIR()) {
                 break;
             }
@@ -376,8 +368,8 @@ using ModulePassManager = PassManager<Module>;
 extern template class PassManager<Function>;
 using FunctionPassManager = PassManager<Function>;
 
-// ModuleFunctionBridge 把单个函数 pass 适配成模块 pass：逐函数执行并失效 FAM，
-// 再把函数结果合并为一次模块级 PassResult。
+// ModuleFunctionBridge 流程：1. 把函数 pass 类型擦除为模块 pass；2. 按模块函数顺序
+// 逐个执行并立即失效 FAM；3. 合并所有函数结果，标记跨单元失效已由桥接层处理。
 class ModuleFunctionBridge : public PassDescriptor<ModuleFunctionBridge> {
 public:
     using FunctionPassInterfaceT = PassInterface<Function, FunctionAnalysisPassManager>;
@@ -407,7 +399,7 @@ template <typename IRUnitT,
           typename AnalysisManagerT = AnalysisManager<IRUnitT>,
           typename PassT>
 FixedPointPass<IRUnitT, AnalysisManagerT>
-createFixedPointPass(PassT &&Pass, int MaxIters = 8) {  
+createFixedPointPass(PassT &&Pass, int MaxIters = 8) {
     using PassWrapperT = PassWrapper<IRUnitT, PassT, AnalysisManagerT>;
     return FixedPointPass<IRUnitT, AnalysisManagerT>(
         std::unique_ptr<PassInterface<IRUnitT, AnalysisManagerT>>(

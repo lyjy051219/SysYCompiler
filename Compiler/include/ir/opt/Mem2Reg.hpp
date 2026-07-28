@@ -37,14 +37,12 @@ private:
     bool rewriteSingleStoreAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
     bool rewriteSingleBlockAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
 
-     
     void computeLiveInBlocks(
         AllocaInst* AI,
         const std::set<BasicBlock*>& DefBlocks,
         std::set<BasicBlock*>& LiveInBlocks,
         const std::unordered_map<BasicBlock*, std::vector<BasicBlock*>>& PredMap);
 
-     
     void computeIDF(
         const std::set<BasicBlock*>& DefBlocks,
         const std::set<BasicBlock*>& LiveInBlocks,
@@ -52,7 +50,6 @@ private:
         DominatorTree& DT,
         const std::unordered_map<DominatorNode*, unsigned>& DomLevels);
 
-     
     bool simplifyPhiNode(PhiInst* Phi);
 };
 

@@ -11,25 +11,6 @@
 #include <vector>
 #include <queue>
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
-
- 
- 
- 
-
 bool DSEPass::storesHaveIdenticalCoverage(const StoreInst *First,
                                           const StoreInst *Second) {
     Value *FirstValue = First ? First->getValueOperand() : nullptr;
@@ -47,9 +28,6 @@ bool DSEPass::storeFullyCoversPointer(
            PointeeTy == StoredValue->getIRType();
 }
 
- 
- 
- 
 bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
     // 2.1 从 alloca 沿 GEP/bitcast use 闭包追踪；只允许作为 load/store 地址使用，
     // 一旦被存入内存或交给其他用户就视为逃逸，函数出口也不能据此删除最后写入。
@@ -84,32 +62,19 @@ bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
                 continue;
             }
             if (auto *SI = dynamic_cast<StoreInst *>(Usr)) {
-                 
-                 
+
                 if (SI->getPointerOperand() != Current ||
                     SI->getValueOperand() == Current)
                     return false;
                 continue;
             }
 
-             
-             
             return false;
         }
     }
     return true;
 }
 
- 
- 
- 
- 
- 
- 
- 
- 
- 
- 
 bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                                      const LoopInfo &LoopInfo) {
     // 1. 从块尾逆向维护“尚未被观察的后继 store”。load 会清除所有可能别名项；
@@ -184,8 +149,6 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 continue;
             }
 
-             
-             
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
                 AliasInfo Alias = AA.alias(
@@ -209,23 +172,11 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
     return changed;
 }
 
- 
- 
- 
 bool DSEPass::eliminateInBlock(BasicBlock *BB) {
     (void)BB;
     return false;
 }
 
- 
- 
- 
-
- 
- 
- 
- 
- 
 DSEBlockColor DSEPass::classifyFrom(
     Instruction *First, const MemoryLocation &Location,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -236,7 +187,7 @@ DSEBlockColor DSEPass::classifyFrom(
     Value *P = Location.Pointer;
     if (!P) return DSEBlockColor::Clobber;
     for (Instruction *I = First; I; I = I->getNext()) {
-         
+
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             Value *StorePtr = SI->getPointerOperand();
             if (StorePtr &&
@@ -248,12 +199,8 @@ DSEBlockColor DSEPass::classifyFrom(
             }
         }
 
-         
-         
-         
-         
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-             
+
             if (CI->mayReachTimingCall()) {
                 return DSEBlockColor::Clobber;
             }
@@ -263,11 +210,6 @@ DSEBlockColor DSEPass::classifyFrom(
             }
         }
 
-         
-         
-         
-         
-         
         ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
 
         if (isRefSet(MR) || isModSet(MR)) return DSEBlockColor::Clobber;
@@ -276,9 +218,6 @@ DSEBlockColor DSEPass::classifyFrom(
     return DSEBlockColor::Transparent;
 }
 
- 
- 
- 
 bool DSEPass::isStoreDead(
     StoreInst *S1,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -291,31 +230,24 @@ bool DSEPass::isStoreDead(
     if (!P) return false;
     if (!B1) return false;
 
-     
     MemoryLocation StoreLocation = MemoryLocation::get(S1);
     DSEBlockColor tailColor = classifyFrom(
         S1->getNext(), StoreLocation, AA, LI, FAM);
-    if (tailColor == DSEBlockColor::Kill) return true;    
-    if (tailColor == DSEBlockColor::Clobber) return false;   
+    if (tailColor == DSEBlockColor::Kill) return true;
+    if (tailColor == DSEBlockColor::Clobber) return false;
 
-     
-     
-     
-     
     // 2.4 若控制流直接退出，只有未逃逸栈对象的最终值不可观察，其他内存必须保留。
     {
         auto b1Succs = B1->getSuccessors();
         if (b1Succs.empty()) {
             if (isNonEscapingLocalStackPointer(P)) {
-                return true;    
+                return true;
             } else {
-                return false;   
+                return false;
             }
         }
     }
 
-     
-     
     // 2.5 对所有后继做有界 BFS。每条路径都必须在首次观察前被完整覆盖；透明环、
     // 预算耗尽、任一 clobber 或可观察出口都会让证明失败。
     std::unordered_set<BasicBlock *> visited;
@@ -333,10 +265,7 @@ bool DSEPass::isStoreDead(
         worklist.pop();
 
         if (visited.count(BB)) {
-             
-             
-             
-             
+
             if (BB == B1) {
                 return false;
             }
@@ -345,26 +274,23 @@ bool DSEPass::isStoreDead(
         visited.insert(BB);
 
         if (--blockBudget < 0) {
-            return false;   
+            return false;
         }
 
         DSEBlockColor color = classifyFrom(
             BB->front(), StoreLocation, AA, LI, FAM);
 
         if (color == DSEBlockColor::Kill) {
-            continue;   
+            continue;
         }
 
         if (color == DSEBlockColor::Clobber) {
-            return false;   
+            return false;
         }
 
-         
         auto succs = BB->getSuccessors();
         if (succs.empty()) {
-             
-             
-             
+
             if (isNonEscapingLocalStackPointer(P)) {
                 continue;
             } else {
@@ -377,28 +303,16 @@ bool DSEPass::isStoreDead(
         }
     }
 
-     
     return true;
 }
-
- 
- 
- 
 
 PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     // 1. 获取 AA、LoopInfo 与 MemorySSA，为覆盖判定、索引范围和到达定义提供依据。
     bool changed = false;
 
-     
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-     
-     
-     
-     
-     
-     
     // 2. 第一层在无计时调用的函数中，用 MemorySSA 有界查询删除“写入值本身已冗余”
     // 的 store；先收集后删除，保持查询期间 MemorySSA 稳定。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
@@ -406,8 +320,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
-     
-     
+
     if (!F.mayReachTimingCall()) {
         for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
             if (queriedStores >= MaxMemorySSAStoreQueries) break;
@@ -423,20 +336,14 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         changed = true;
     }
 
-     
-     
-     
     // 3. 第二层逐块逆向消除被块内后继写入完整覆盖的 store。
     for (BasicBlock *BB : F) {
         changed |= eliminateInBlockWithAA(BB, AA, LI);
     }
 
-     
-     
     // 4. 第三层快照剩余 store，跨 CFG 证明所有路径在观察前均被覆盖，再统一删除。
     auto allStores = collectInstructions<StoreInst>(F);
 
-     
     std::vector<StoreInst *> toDelete;
     for (StoreInst *SI : allStores) {
         if (isStoreDead(SI, AA, LI, FAM)) {
@@ -453,12 +360,10 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         return PreservationStatus::all();
     }
 
-     
-     
     // 5. 删除 store 不改变 CFG；内存版本、别名和副作用结论必须重新计算。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
-    PA.keep<PostDominantAnalysis>();   
+    PA.keep<PostDominantAnalysis>();
     PA.keep<LoopAnalysis>();
     PA.discard<SideEffectAnalysis>();
     PA.discard<BasicAliasAnalysis>();
