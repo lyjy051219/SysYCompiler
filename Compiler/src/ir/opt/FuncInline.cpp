@@ -60,6 +60,28 @@ bool FuncInlinePass::isInlineSite(
 	CalleeInlineProfile& OutProfile)
 {
 	if (!CI || !Callee) return false;
+	// 计时调用的封装函数也属于计时语义的一部分。内联会消除原调用边界，
+	// 并使后续代码移动、循环变换有机会重排或复制计时调用，因此统一拒绝。
+	if (CI->mayReachTimingCall() || Callee->mayReachTimingCall()) return false;
+
+	// 当前内联实现会把被调函数的 alloca 移到调用者入口。若入口到
+	// 调用点，或调用点经循环回边返回自身的路径穿过计时边界，则保留原调用。
+	bool CalleeHasAlloca = false;
+	for (BasicBlock *BB : *Callee) {
+		if (!BB) continue;
+		for (Instruction *I : *BB) {
+			if (dynamic_cast<AllocaInst *>(I)) {
+				CalleeHasAlloca = true;
+				break;
+			}
+		}
+		if (CalleeHasAlloca) break;
+	}
+	if (CalleeHasAlloca && Caller.mayReachTimingCall() && Caller.front() &&
+		(Caller.hasTimingBarrierOnPath(Caller.front(), nullptr, CI) ||
+		 Caller.hasTimingBarrierOnPath(CI, CI))) {
+		return false;
+	}
 	constexpr int kCallSitesThreshold = 3;
 	constexpr int kInstThreshold = 200;
 	constexpr int kRecursiveExpandMaxInst = 100;

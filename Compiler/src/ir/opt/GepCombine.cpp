@@ -263,6 +263,7 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
 
         // 单 use 检查：base GEP 必须只被当前 GEP 使用
         if (BaseGEP->countUses() > 1) continue;
+        if (F.hasTimingBarrierOnPath(BaseGEP, GEP)) continue;
 
         if (BaseGEP->getNumIndices() < 1) continue;
         Value *firstIdx = GEP->getIndex(0);
@@ -352,6 +353,7 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
         for (PhiInst *Phi : phis) {
             if (Phi->getNumIncomingValues() < 2) continue;
             if (!Phi->getIRType() || !Phi->getIRType()->isPointer()) continue;
+            if (F.hasTimingBarrierOnPath(Phi, Phi)) continue;
 
             // PHI 单 use 检查
             if (Phi->countUses() > 1) continue;
@@ -373,9 +375,10 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
 
             valid = forEachPhiIncoming(
                 Phi, [&](unsigned I, Value *Incoming, BasicBlock *) {
-                if (I == 0) return true;
                 auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Incoming);
                 if (!OtherGEP) return false;
+                if (F.hasTimingBarrierOnPath(OtherGEP, Phi)) return false;
+                if (I == 0) return true;
                 if (OtherGEP->getNumIndices() != FirstGEP->getNumIndices()) {
                     return false;
                 }
@@ -530,6 +533,7 @@ bool GepCombinePass::combineLoopGEPs(
             for (size_t i = 1; i < grp.Geps.size(); i++) {
                 auto *prevGEP = grp.Geps[i - 1];
                 auto *curGEP = grp.Geps[i];
+                if (F.hasTimingBarrierOnPath(prevGEP, curGEP)) continue;
                 Value *prevLast = prevGEP->getIndex(prevGEP->getNumIndices() - 1);
                 Value *curLast = curGEP->getIndex(curGEP->getNumIndices() - 1);
 

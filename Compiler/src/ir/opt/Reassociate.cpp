@@ -29,6 +29,7 @@ bool ReassociatePass::isDeadInstruction(
 	}
 
 	if (auto *CI = dynamic_cast<CallInst *>(I)) {
+		if (CI->mayReachTimingCall()) return false;
 		if (dceCallHasSideEffect(CI, FAM)) return false;
 	}
 
@@ -644,6 +645,27 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 	if (!IRType::isInt(LHS ? LHS->getIRType() : nullptr) ||
 		!IRType::isInt(RHS ? RHS->getIRType() : nullptr)) {
 		return false;
+	}
+
+	// 重建表达式树会把所有被展开的节点放到根指令之前。若旧节点与根
+	// 之间存在计时屏障，就把整棵候选树留在原有计时分段中。
+	std::vector<Value *> TimingWorkList{LHS, RHS};
+	std::unordered_set<Value *> TimingVisited;
+	std::size_t TimingBudget = 0;
+	while (!TimingWorkList.empty()) {
+		Value *Current = TimingWorkList.back();
+		TimingWorkList.pop_back();
+		if (!Current || !TimingVisited.insert(Current).second) continue;
+		if (++TimingBudget > 256) return false;
+
+		auto *Def = dynamic_cast<Instruction *>(Current);
+		if (!Def || !Def->getParent()) continue;
+		if (F.hasTimingBarrierOnPath(Def, I)) return false;
+		if (!dynamic_cast<BinaryInst *>(Def)) continue;
+		forEachOperand(
+			Def, [&](size_t, Use *, Value *Operand) {
+				if (Operand) TimingWorkList.push_back(Operand);
+			});
 	}
         //2.如果本条指令是SUB A-B指令，直接优化成A + B×（-1），将新生成的指令加入TodoList，然后直接返回执行下一条指令
 	if (Op == BinaryInst::SUB) {

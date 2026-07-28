@@ -57,6 +57,18 @@ bool LoopUnswitchPass::getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape)
     return true;
 }
 
+bool LoopUnswitchPass::loopMayReachTimingCall(const Loop *L) {
+    if (!L) return true;
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (!BB) return true;
+        for (Instruction *I : *BB) {
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (CI && CI->mayReachTimingCall()) return true;
+        }
+    }
+    return false;
+}
+
 bool LoopUnswitchPass::isDirectLoopBlock(const LoopInfo &LI, Loop *L, BasicBlock *BB) {
     return L && BB && LI.getLoopFor(BB) == L;
 }
@@ -214,6 +226,9 @@ LoopUnswitchPass::findTrivialCandidate(
     }
 
     for (Loop *L : LI.getLoopsInPostOrder()) {
+        // Trivial unswitch 会把循环内分支提前到前置块，计时调用所在循环
+        // 必须保留原控制流和调用位置。
+        if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
 
@@ -288,6 +303,8 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
         !C.Branch || !C.Exit || !C.Continue) {
         return false;
     }
+    // 候选发现与提交之间仍做一次语义校验，避免使用失效候选改写计时循环。
+    if (loopMayReachTimingCall(C.L)) return false;
 
     BasicBlock *OldPreHeader = C.Shape.PreHeader;
     BasicBlock *Header = C.Shape.Header;
@@ -888,6 +905,8 @@ LoopUnswitchPass::findEntryKnownCandidates(
     LoopInfo &LI, const DominatorTree &DT) {
     std::vector<EntryKnownCandidate> Result;
     for (Loop *L : LI.getLoopsInPostOrder()) {
+        // 即使入口条件可证明，仍不能折叠含计时调用循环中的控制流。
+        if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape) ||
             !Shape.PreHeader->getTerminator()) {
@@ -990,6 +1009,8 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
     if (FunctionWeight == 0) return std::nullopt;
 
     for (Loop *L : LI.getLoopsInPostOrder()) {
+        // 非平凡 unswitch 会克隆循环的一侧；含计时调用的循环不参与候选。
+        if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
 
@@ -1406,6 +1427,7 @@ void LoopUnswitchPass::eraseDeadOriginalBlocks(const std::vector<BasicBlock *> &
 
 bool LoopUnswitchPass::transformEntryKnown(const EntryKnownCandidate &C) {
     if (!C.Condition || !C.L) return false;
+    if (loopMayReachTimingCall(C.L)) return false;
     BlockSet Blocks;
     for (BasicBlock *BB : C.AllBlocks)
         if (BB) Blocks.insert(BB);
@@ -1418,6 +1440,8 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
         !C.CloneSucc) {
         return false;
     }
+    // 在创建任何版本化块之前重新确认，禁止复制计时调用或其封装调用。
+    if (loopMayReachTimingCall(C.L)) return false;
     BrInst *OldPreBr = C.Shape.PreHeader->getBranchTerminator();
     if (!BasicBlock::isUncondBr(OldPreBr) ||
         OldPreBr->getTrueSuccessor() != C.Shape.Header ||

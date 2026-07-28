@@ -46,11 +46,21 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 	// alloca 每次执行都创建新对象的语义。
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
+	const bool MainMayReachTiming = Main->mayReachTimingCall();
 
 	for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
 		std::shared_ptr<IRType> ElemTy =
 			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
+
+		// 全局化会把栈分配移到程序启动阶段。若入口到 alloca 之间，或
+		// 从该 alloca 绕回自身的循环路径上存在计时边界，就会把原本
+		// 计入测量区间的分配移出区间，因此保留原局部对象。
+		if (MainMayReachTiming &&
+			(Main->hasTimingBarrierOnPath(EntryBB, nullptr, AI) ||
+			 Main->hasTimingBarrierOnPath(AI, AI))) {
+			continue;
+		}
 
 		if (ElemTy->getSize() > RISCVThreshold) {
 			WorkList.emplace_back(AI, ElemTy);

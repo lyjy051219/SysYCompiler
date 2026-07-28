@@ -12,7 +12,7 @@
 #include <unordered_map>
 
 class BlockInfo;
-class AllocaInfo;
+struct AllocaInfo;
 
 struct Mem2RegRenameFrame {
     DominatorNode *Node = nullptr;
@@ -28,6 +28,8 @@ private:
     bool promoteMemoryToRegister(Function& F, DominatorTree& dominant);
     bool isAllocaPromotable(const AllocaInst* AI);
     bool areAllocaUsersReachable(const AllocaInst* AI, DominatorTree& DT);
+    static bool allocaCrossesTimingBarrier(
+        const AllocaInst *AI, const Function &F);
     bool rewriteSingleStoreAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
     bool rewriteSingleBlockAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
 

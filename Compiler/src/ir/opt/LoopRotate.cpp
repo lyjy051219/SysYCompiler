@@ -25,6 +25,16 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     BasicBlock *Header = L.getHeader();
     if (!Header) return false;
 
+    // 循环旋转会把循环头指令复制到前置块，并改变各次迭代的执行位置。
+    // 若循环（含子循环）调用计时函数或其封装函数，则整个候选不可旋转。
+    for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (CI && CI->mayReachTimingCall()) return false;
+        }
+    }
+
     // 条件1：LoopSimplify 形态
     BasicBlock *PreHeader = nullptr;
     BasicBlock *Latch = nullptr;

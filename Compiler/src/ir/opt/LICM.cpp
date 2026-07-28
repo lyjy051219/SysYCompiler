@@ -165,7 +165,11 @@ bool LICMPass::isReusableLoopInvariantCall(
 	BasicAAResult &AA,
 	const LoopInfo &LI,
 	FunctionAnalysisPassManager &FAM) {
-	if (!CI) return false;
+	if (!CI || CI->mayReachTimingCall()) return false;
+	for (Instruction *I : LoopInsts) {
+		auto *LoopCall = dynamic_cast<CallInst *>(I);
+		if (LoopCall && LoopCall->mayReachTimingCall()) return false;
+	}
 	auto *CalleeFunc = CI->getDirectCallee();
 	if (!CalleeFunc || !CalleeFunc->front()) return false;
 
@@ -612,6 +616,17 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		if (!PreHeader || !Latch) return LocalChanged;
 		const bool CanSink = HasLoopSimplifyForm && InLCSSA;
 
+		// 循环代码移动会改变不同迭代中的执行次数；循环内只要存在
+		// 计时调用或其包装调用，就不能只按首次到达路径判断安全性。
+		for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
+			if (!LoopBB) continue;
+			for (Instruction *LoopI : *LoopBB) {
+				auto *LoopCall = dynamic_cast<CallInst *>(LoopI);
+				if (LoopCall && LoopCall->mayReachTimingCall())
+					return LocalChanged;
+			}
+		}
+
 		auto ExitBlocks = L->getExitBlocks();
 		if (ExitBlocks.empty()) return LocalChanged;
 		auto Latches = L->getBackedgeSrcs();
@@ -667,6 +682,20 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				if (!isInvariant(I, *L, DT, SinkInvariant)) continue;
 
 				BasicBlock *DefBB = I->getParent();
+				bool CrossesTiming = false;
+				for (BasicBlock *ExitBB : ExitBlocks) {
+					Instruction *InsertBefore = ExitBB ? ExitBB->front() : nullptr;
+					while (InsertBefore &&
+						   dynamic_cast<PhiInst *>(InsertBefore)) {
+						InsertBefore = InsertBefore->getNext();
+					}
+					if (!InsertBefore ||
+						F.hasTimingBarrierOnPath(I, InsertBefore)) {
+						CrossesTiming = true;
+						break;
+					}
+				}
+				if (CrossesTiming) continue;
 				std::unordered_map<BasicBlock *, Instruction *> ExitClone;
 
 				for (BasicBlock *ExitBB : ExitBlocks) {
@@ -771,6 +800,13 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					continue;
 				}
 				auto LoopInsts = collectLiveLoopInsts();
+				Instruction *PreHeaderTerminator =
+					PreHeader->getTerminator();
+				if (!PreHeaderTerminator ||
+					F.hasTimingBarrierOnPath(
+						PreHeader, PreHeaderTerminator->getPrev(), I)) {
+					continue;
+				}
 
 				bool Aggressive = true;
 				for (BasicBlock *ExitBB : ExitBlocks)

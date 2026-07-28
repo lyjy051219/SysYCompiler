@@ -371,6 +371,9 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
         if (!prevInst) continue;
         auto *CI = dynamic_cast<CallInst*>(prevInst);
         if (!CI) continue;
+        // tail 标记会改变后端的调用序列，计时函数及其封装调用必须保持
+        // 普通调用语义，不能参与尾调用优化。
+        if (CI->mayReachTimingCall()) continue;
         //4.call调用的函数不是自身
         if (isSelfCall(CI, F)) continue;
         //2.简单逃逸分析：没有任何Alloca被call指令当作参数传走
@@ -691,6 +694,10 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 // Pass 入口
 PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = false;
+
+    // 尾递归转循环会改变递归调用次数与栈帧边界。只要函数体中的任意
+    // 直接调用能够到达计时函数，就保守保留整段递归控制流。
+    if (F.mayReachTimingCall()) return PreservationStatus::all();
 
     // 第1步: 标记非自递归的尾调用，打上tail标记，以便后端可以进行优化栈帧复用
     changed |= markTailCalls(F);

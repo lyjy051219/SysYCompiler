@@ -226,6 +226,12 @@ std::string LoopUnrollPass::makePeelBlockIdent(Function *F,
 bool LoopUnrollPass::isSupportedCloneInstruction(Instruction *I) {
     if (!I) return false;
 
+    // 展开和剥离都会复制循环体。计时调用及其封装调用不能被复制，
+    // 此处作为所有克隆路径共享的最后一道合法性检查。
+    if (auto *CI = dynamic_cast<CallInst *>(I)) {
+        if (CI->mayReachTimingCall()) return false;
+    }
+
     switch (I->instType) {
     case Instruction::RET:
     case Instruction::ALLOCA:
@@ -1922,6 +1928,18 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
                                                  RangeInfo &RI) {
     if (!L) {
         return LoopUnrollResult::Unmodified;
+    }
+
+    // 循环展开会改变循环体静态副本数，剥离还会改变首轮执行位置。
+    // 计时调用（包括经用户函数间接到达的调用）所在循环一律不变换。
+    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+        if (!BB) return LoopUnrollResult::Unmodified;
+        for (Instruction *I : *BB) {
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (CI && CI->mayReachTimingCall()) {
+                return LoopUnrollResult::Unmodified;
+            }
+        }
     }
 
     if (!isCanonicalLoop(L)) {

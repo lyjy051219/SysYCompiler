@@ -150,6 +150,22 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			CanPromote = false;
 		}
 
+		// 局部副本的初始化会被放到入口 PHI 之后；若原任一访问只能在
+		// 穿过计时屏障后到达，就不能把初始化工作移到计时区间之外。
+		if (CanPromote && Main->mayReachTimingCall()) {
+			for (Use *U : MainUses) {
+				auto *UserI = dynamic_cast<Instruction *>(
+					U ? U->getUser() : nullptr);
+				if (!UserI ||
+					Main->hasTimingBarrierOnPath(
+						MainEntry, nullptr, UserI) ||
+					Main->hasTimingBarrierOnPath(UserI, UserI)) {
+					CanPromote = false;
+					break;
+				}
+			}
+		}
+
 		if (!CanPromote || MainUses.empty()) continue;
 
 		WorkList.push_back(

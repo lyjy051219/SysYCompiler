@@ -60,8 +60,6 @@ LoadElimQueryResult LoadElimQueryResult::phiNeeded(
 // 辅助函数
 // =====================================================================
 
-// MustAlias only identifies an address; it does not make differently-sized
-// or differently-shaped accesses interchangeable.
 bool LoadEliminationPass::isTypeCompatible(
     Value *source, LoadInst *targetLoad) {
     if (!source || !targetLoad) return false;
@@ -69,10 +67,6 @@ bool LoadEliminationPass::isTypeCompatible(
     return source->getIRType()->hasSameShape(*targetLoad->getIRType());
 }
 
-// Return true whenever I may change the memory read through P.  Keep the
-// extra pointer-argument check used by the local scanner: a temporarily
-// incomplete interprocedural summary must never turn a call into a false
-// NoModRef result.
 bool LoadEliminationPass::mayModifyPointer(
     const MemoryLocation &Location, Instruction *I, BasicAAResult &AA,
     const LoopInfo &LI,
@@ -80,6 +74,12 @@ bool LoadEliminationPass::mayModifyPointer(
 {
     Value *P = Location.Pointer;
     if (!P || !I) return true;
+
+    // 计时调用及其包装调用是完整优化屏障，不能把内存值跨过它复用。
+    if (auto *CI = dynamic_cast<CallInst *>(I);
+        CI && CI->mayReachTimingCall()) {
+        return true;
+    }
 
     ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
     if (isModSet(MR)) return true;
@@ -263,6 +263,9 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
         }
         // CallInst: 先查 ModRef（主判据），helper 做 fallback
         else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
+            if (CI->mayReachTimingCall()) {
+                return LoadElimQueryResult::clobbered();
+            }
             ModRefInfo MR = getInstModRefInfo(
                 MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
             if (isModSet(MR)) {
@@ -539,6 +542,7 @@ PreservationStatus LoadEliminationPass::run(Function &F,
             if (Store->getParent() == BB &&
                 !Instruction::comesBefore(Store, Load))
                 continue;
+            if (F.hasTimingBarrierOnPath(Store, Load)) continue;
             if (AA.aliasWithIndexRange(MemoryLocation::get(Load),
                                        MemoryLocation::get(Store), LI) !=
                 AliasInfo::MustAlias)

@@ -245,6 +245,10 @@ DSEBlockColor DSEPass::classifyFrom(
         // 这是对 getInstModRefInfo 的补充，因为 SideEffectAnalysis
         // 对自递归调用可能返回不完整的 ModRef 信息。
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            // 计时调用以及可达计时调用的包装函数必须截断覆盖证明。
+            if (CI->mayReachTimingCall()) {
+                return DSEBlockColor::Clobber;
+            }
             if (!CI->getBuiltinCallee() &&
                 AA.callMayAliasPointer(CI, P, LI)) {
                 return DSEBlockColor::Clobber;
@@ -387,12 +391,16 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
-    for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
-        if (queriedStores >= MaxMemorySSAStoreQueries) break;
-        ++queriedStores;
-        if (MSSA.isStoreValueRedundant(
-                SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
-            redundantValueStores.push_back(SI);
+    // MemorySSA 的同值证明不携带计时分段；含计时调用时跳过该快速阶段，
+    // 后续块内和全局 DSE 仍会通过显式屏障做精确判断。
+    if (!F.mayReachTimingCall()) {
+        for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
+            if (queriedStores >= MaxMemorySSAStoreQueries) break;
+            ++queriedStores;
+            if (MSSA.isStoreValueRedundant(
+                    SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
+                redundantValueStores.push_back(SI);
+            }
         }
     }
     for (StoreInst *SI : redundantValueStores) {

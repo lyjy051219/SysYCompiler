@@ -154,7 +154,7 @@ FuncAttr classifyBuiltin(BuildInFunction* BIF) {
     if (!BIF) return FuncAttr::Untracked;
     const std::string& N = BIF->getIdent();
 
-    // 1. 系统/计时函数：对用户代码的指针没有任何内存副作用
+    // 1. 计时函数本身不读写用户指针；其观测屏障由指令级查询单独保护
     if (BuildInFunction::isTimingName(N)) return FuncAttr::Sylib;
 
     // 2. 标量 I/O 函数：完全没有指针参数，既不 Mod 也不 Ref
@@ -510,6 +510,9 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
     if (I->instType == Instruction::CALL) {
         auto *CI = dynamic_cast<CallInst *>(I);
         if (!CI) return ModRefInfo::ModRef;
+
+        // 计时调用及其包装调用是完整观测屏障，任何访存优化都不得穿越。
+        if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
 
         std::vector<Value*> Args = CI->getArgs();
 

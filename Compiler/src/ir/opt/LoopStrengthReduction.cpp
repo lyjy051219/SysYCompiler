@@ -284,6 +284,21 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
         BasicBlock *PreHeader = nullptr;
         BasicBlock *Latch = nullptr;
         if (!L || !L->getLoopSimplifyForm(PreHeader, Latch)) continue;
+        bool HasTimingCall = false;
+        for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
+            if (!LoopBB) continue;
+            for (Instruction *LoopI : *LoopBB) {
+                auto *CI = dynamic_cast<CallInst *>(LoopI);
+                if (CI && CI->mayReachTimingCall()) {
+                    HasTimingCall = true;
+                    break;
+                }
+            }
+            if (HasTimingCall) break;
+        }
+        // 指针递推会把每轮的地址计算拆到预头和锁存块，不能在含计时
+        // 屏障的循环中改变其动态执行次数或相对次序。
+        if (HasTimingCall) continue;
         // 指针归纳变量复用整数归纳关系；只有 SCEV 证明整个迭代域无回绕，
         // 才能把原 i32 索引递推改写为地址递推。
         auto Trip = SE.analyzeLoopTripCount(L);
@@ -308,6 +323,13 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
             for (Instruction *I : *BB) {
                 auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
                 if (!GEP) continue;
+                Instruction *PreHeaderTerminator =
+                    PreHeader->getTerminator();
+                if (!PreHeaderTerminator ||
+                    F.hasTimingBarrierOnPath(
+                        PreHeader, PreHeaderTerminator->getPrev(), GEP)) {
+                    continue;
+                }
 
                 Value *Base = nullptr;
                 Value *Index = nullptr;

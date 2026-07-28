@@ -84,6 +84,10 @@ bool FunctionMemoizationPass::collectCandidate(
         return false;
     }
 
+    // 计时调用及其包装函数绝不能缓存化；显式调用图门禁不依赖
+    // 副作用摘要的构建顺序，防止未来分析调整削弱这条约束。
+    if (F.mayReachTimingCall()) return false;
+
     BasicBlock *OriginalEntry = F.front();
     if (!OriginalEntry || !OriginalEntry->getPredecessors().empty() ||
         !OriginalEntry->collectPhiNodes().empty()) {

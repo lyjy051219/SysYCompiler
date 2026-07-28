@@ -141,6 +141,20 @@ PassResult IndVarSimplifyPass::run(
     // remaining loops deterministically.
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L) continue;
+        bool HasTimingCall = false;
+        for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
+            if (!BB) continue;
+            for (Instruction *I : *BB) {
+                auto *CI = dynamic_cast<CallInst *>(I);
+                if (CI && CI->mayReachTimingCall()) {
+                    HasTimingCall = true;
+                    break;
+                }
+            }
+            if (HasTimingCall) break;
+        }
+        // 合并递推会删除一套每轮更新，计时循环中必须保留原执行次数。
+        if (HasTimingCall) continue;
         if (mergeExactRecurrences(L, SE) || orientExitComparison(L, SE)) {
             Changed = true;
             break;

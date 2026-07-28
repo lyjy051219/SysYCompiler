@@ -8,6 +8,7 @@
 #include <queue>
 #include <set>
 #include <stack>
+#include <unordered_set>
 
 void AllocaInfo::clean() {
     StoreBlocks.clear();
@@ -88,6 +89,31 @@ bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
         }
     }
     return true;
+}
+
+bool PromotePass::allocaCrossesTimingBarrier(
+    const AllocaInst *AI, const Function &F) {
+    if (!AI || !F.mayReachTimingCall()) return false;
+
+    std::vector<Instruction *> Accesses;
+    std::unordered_set<Instruction *> Seen;
+    for (Use *U : AI->getUses()) {
+        auto *I = dynamic_cast<Instruction *>(
+            U ? U->getUser() : nullptr);
+        if (!I) return true;
+        if (Seen.insert(I).second) Accesses.push_back(I);
+    }
+
+    // 路径查询为每对访问做 CFG 搜索；超出预算时保守保留内存形式。
+    constexpr std::size_t MaxTimingCheckedAccesses = 128;
+    if (Accesses.size() > MaxTimingCheckedAccesses) return true;
+    for (Instruction *From : Accesses) {
+        for (Instruction *To : Accesses) {
+            // From==To 用于识别经过计时调用后回到同一访问的循环路径。
+            if (F.hasTimingBarrierOnPath(From, To)) return true;
+        }
+    }
+    return false;
 }
 
 void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
@@ -323,7 +349,8 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
         // 快速路径和通用 SSA 路径必须处理同一组完整用户。不可达分量
         // 不在当前 DominatorTree 中，因而该 alloca 本轮整体保留。
-        if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT))
+        if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT) &&
+            !allocaCrossesTimingBarrier(AI, F))
             Allocas.push_back(AI);
     }
 

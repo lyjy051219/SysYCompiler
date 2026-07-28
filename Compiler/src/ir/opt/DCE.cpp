@@ -226,6 +226,8 @@ bool instructionMayFaultOrProducePoison(const Instruction *I) {
 
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	if (!CI) return true;
+	// 计时调用及其包装调用始终可观察，不依赖副作用摘要的缓存时机。
+	if (CI->mayReachTimingCall()) return true;
 	Value* Callee = CI->getCallee();
 	if (!Callee) return true;
 

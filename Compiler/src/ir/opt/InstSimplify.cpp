@@ -130,6 +130,10 @@ bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
 		}
 		ModRefInfo MRI = getInstModRefInfo(
 			MemoryLocation::get(L), I, *AA, *LI, *FAM);
+		if (auto *CI = dynamic_cast<CallInst *>(I);
+			CI && CI->mayReachTimingCall()) {
+			return false;
+		}
 		if (isModSet(MRI)) return false;
 	}
 
@@ -160,6 +164,7 @@ bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
 
 Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 	if (!Phi) return nullptr;
+	if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
 	const unsigned N = Phi->getNumIncomingValues();
 	if (N < 2) return nullptr;
 
@@ -176,6 +181,7 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 	for (unsigned i = 0; i < N; ++i) {
 		auto *Bin = dynamic_cast<BinaryInst *>(Phi->getIncomingValue(i));
 		if (!Bin || Bin->getOp() != Op) return nullptr;
+		if (!F || F->hasTimingBarrierOnPath(Bin, Phi)) return nullptr;
 		Value *L = nullptr;
 		Value *R = nullptr;
 		if (!BinaryInst::getOperands(Bin, L, R)) return nullptr;
@@ -244,6 +250,7 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 
 Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
 	if (!Phi) return nullptr;
+	if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
 	const unsigned N = Phi->getNumIncomingValues();
 	if (N < 2) return nullptr;
 
@@ -262,6 +269,7 @@ Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
 	for (unsigned i = 0; i < N; ++i) {
 		auto *GEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
 		if (!GEP || GEP->hasOnlyConstantIndices()) return nullptr;
+		if (!F || F->hasTimingBarrierOnPath(GEP, Phi)) return nullptr;
 
 		Value *Ptr = nullptr;
 		std::vector<Value *> Idxs;
@@ -349,6 +357,7 @@ Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
 
 Value *InstSimplifier::foldPhiOfLoad(PhiInst *Phi) {
 	if (!Phi) return nullptr;
+	if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
 	const unsigned N = Phi->getNumIncomingValues();
 	if (N < 2) return nullptr;
 
@@ -360,6 +369,7 @@ Value *InstSimplifier::foldPhiOfLoad(PhiInst *Phi) {
 	for (unsigned i = 0; i < N; ++i) {
 		auto *L = dynamic_cast<LoadInst *>(Phi->getIncomingValue(i));
 		if (!L) return nullptr;
+		if (!F || F->hasTimingBarrierOnPath(L, Phi)) return nullptr;
 		if (!L->hasExactlyOneUse()) return nullptr;
 		if (L->getParent() != Phi->getIncomingBlock(i)) return nullptr;
 		if (!isLoadSuitableForSinking(L)) return nullptr;

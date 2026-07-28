@@ -231,6 +231,18 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     std::vector<CallInst *> getDirectCallSites() const;
     //检查该函数的所有Use是不是全都是直接调用
     bool hasOnlyDirectCallUses() const;
+    // 判断函数体内是否直接包含计时调用，不忽略不可达基本块。
+    bool containsTimingCall() const;
+    // 判断从当前函数沿直接调用图是否能够到达计时调用。
+    bool mayReachTimingCall() const;
+    // 判断两个位置之间是否存在一条经过计时调用且能够到达终点的 CFG 路径。
+    // StartAfter 和 EndBefore 本身均不计入查询区间。
+    bool hasTimingBarrierOnPath(
+        BasicBlock *StartBlock, const Instruction *StartAfter,
+        const Instruction *EndBefore) const;
+    bool hasTimingBarrierOnPath(
+        const Instruction *StartAfter,
+        const Instruction *EndBefore) const;
     //判断这个函数是不是main函数/Builtin函数/没有函数体的函数，这些函数特有，从而在优化阶段特殊处理
     bool hasReservedSignature() const;
     bool hasBlockIdent(const std::string &Name) const;
@@ -605,7 +617,8 @@ class CallInst : public Instruction{
     void dumpIR() override;
     //TailCall:Call后面紧跟着Ret指令，且Call的返回值直接作为Ret的返回值
     bool isTailCall() const { return tailCall; }
-    void setTailCall(bool v) { tailCall = v; }
+    // 设置尾调用标记；计时调用及其包装调用不得改写为尾调用。
+    void setTailCall(bool v);
     //返回第 0 个操作数：即被调用的函数
     Value *getCallee() const;
     //返回第 0 个操作数
@@ -613,6 +626,10 @@ class CallInst : public Instruction{
     //返回Callee是内置函数
     BuildInFunction *getBuiltinCallee() const;
     std::string getCalleeName() const;
+    // 判断当前调用是否直接调用计时 Runtime。
+    bool isTimingCall() const;
+    // 判断当前调用或其直接被调函数是否能够到达计时 Runtime。
+    bool mayReachTimingCall() const;
     //返回第Index+1个操作数
     Value *getArg(unsigned Index) const;
     std::vector<Value *> getArgs() const;

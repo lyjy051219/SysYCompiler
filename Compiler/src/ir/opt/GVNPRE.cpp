@@ -411,6 +411,7 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
         if (UseI && R.BB == UseBB && !isBeforeInSameBlock(R.Inst, UseI)) {
             continue;
         }
+        if (UseI && F.hasTimingBarrierOnPath(R.Inst, UseI)) continue;
         Best = R.Inst;
         if (R.Inst->isConst()) return Best;
     }
@@ -567,6 +568,7 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 
 ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
     if (!CI) return ModRefInfo::ModRef;
+    if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
 
     if (auto *BIF = CI->getBuiltinCallee()) {
         FuncAttr Attr = classifyBuiltin(BIF);
@@ -589,7 +591,8 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
 }
 
 bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
-    if (!CI || CI->getBuiltinCallee() || !CI->getIRType() ||
+    if (!CI || CI->mayReachTimingCall() || CI->getBuiltinCallee() ||
+        !CI->getIRType() ||
         CI->getIRType()->isVoid() || CI->getIRType()->isPointer())
         return false;
 
@@ -755,6 +758,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             bool Dominates = StoreBB && DT.dominates(StoreBB, BB) &&
                 (StoreBB != BB || Instruction::comesBefore(Store, LIst));
             if (Dominates && TypeCompatible(Store->getValueOperand()) &&
+                !F.hasTimingBarrierOnPath(Store, LIst) &&
                 AA.aliasWithIndexRange(Location,
                                        MemoryLocation::get(Store), LI) ==
                     AliasInfo::MustAlias) {
@@ -781,7 +785,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
                 !TypeCompatible(It->Load) ||
                 !DT.dominates(It->Block, BB) ||
                 (It->Block == BB &&
-                 !Instruction::comesBefore(It->Load, LIst)))
+                 !Instruction::comesBefore(It->Load, LIst)) ||
+                F.hasTimingBarrierOnPath(It->Load, LIst))
                 continue;
             if (AA.aliasWithIndexRange(Location, It->Location, LI) !=
                 AliasInfo::MustAlias)
@@ -843,6 +848,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             }
 
             if (auto *CI = dynamic_cast<CallInst *>(Cur)) {
+                if (CI->mayReachTimingCall()) return RememberAndFail();
                 ModRefInfo MRI = getInstModRefInfo(
                     Location, Cur, AA, LI, FAM);
                 if (isModSet(MRI) ||
@@ -898,6 +904,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
             }
 
             if (auto *PrevCall = dynamic_cast<CallInst *>(Cur)) {
+                if (PrevCall->mayReachTimingCall()) return false;
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
@@ -940,6 +947,12 @@ bool GVNPRESolver::runGVN() {
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
             if (isDeadBlock(BB)) break;
+
+            if (auto *CI = dynamic_cast<CallInst *>(I);
+                CI && CI->mayReachTimingCall()) {
+                // 内存值缓存不能越过计时屏障；标量 leader 由路径查询过滤。
+                AvailableMemoryLoads.clear();
+            }
 
             if (I->instType == Instruction::PHI) {
                 continue;
@@ -1005,6 +1018,21 @@ bool GVNPRESolver::eliminateCongruentPhis() {
 
     for (BasicBlock *BB : RPO) {
         if (!BB || isDeadBlock(BB)) continue;
+        if (Loop *L = LI.getLoopFor(BB)) {
+            bool HasTimingCall = false;
+            for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
+                if (!LoopBB) continue;
+                for (Instruction *LoopI : *LoopBB) {
+                    auto *CI = dynamic_cast<CallInst *>(LoopI);
+                    if (CI && CI->mayReachTimingCall()) {
+                        HasTimingCall = true;
+                        break;
+                    }
+                }
+                if (HasTimingCall) break;
+            }
+            if (HasTimingCall) continue;
+        }
         auto Phis = BB->collectPhiNodes();
         std::unordered_set<PhiInst *> Removed;
 
@@ -1024,6 +1052,34 @@ bool GVNPRESolver::eliminateCongruentPhis() {
 
                 PhiCongruenceMatcher Matcher;
                 if (!Matcher.equivalent(Leader, Candidate)) continue;
+
+                // 合并循环或分支 PHI 会让其中一套纯 SSA 计算随后变死。
+                // 若任一被匹配子图到替换点之间经过计时屏障，就保留两套计算。
+                auto CrossesTiming = [&](Value *Root) {
+                    std::vector<Value *> WorkList{Root};
+                    std::unordered_set<Value *> Seen;
+                    std::size_t Budget = 0;
+                    while (!WorkList.empty()) {
+                        Value *Current = WorkList.back();
+                        WorkList.pop_back();
+                        if (!Current || !Seen.insert(Current).second) continue;
+                        if (++Budget > 512) return true;
+
+                        auto *Def = dynamic_cast<Instruction *>(Current);
+                        if (!Def || !Def->getParent()) continue;
+                        if (Def != Leader && Def != Candidate &&
+                            F.hasTimingBarrierOnPath(Def, Candidate)) {
+                            return true;
+                        }
+                        forEachOperand(
+                            Def, [&](size_t, Use *, Value *Operand) {
+                                if (Operand) WorkList.push_back(Operand);
+                            });
+                    }
+                    return false;
+                };
+                if (CrossesTiming(Leader) || CrossesTiming(Candidate))
+                    continue;
 
                 Candidate->replaceAllUsesWith(Leader);
                 Removed.insert(Candidate);
@@ -1259,6 +1315,10 @@ bool GVNPRESolver::runPRE() {
                     PREPred = Pred;
                     continue;
                 }
+                if (F.hasTimingBarrierOnPath(Leader, I)) {
+                    Abort = true;
+                    break;
+                }
                 if (Leader == I) {
                     // This is a back-edge scenario or same instruction: abort
                     NumWithout = 2;
@@ -1274,6 +1334,13 @@ bool GVNPRESolver::runPRE() {
 
             // PRE condition: exactly one pred missing, at least one has it
             if (!(NumWithout == 1 && NumWith > 0 && PREPred)) {
+                continue;
+            }
+
+            Instruction *PredTerminator = PREPred->getTerminator();
+            if (!PredTerminator ||
+                F.hasTimingBarrierOnPath(
+                    PREPred, PredTerminator->getPrev(), I)) {
                 continue;
             }
 
@@ -1468,6 +1535,11 @@ PreservationStatus LocalGVNPass::run(Function &F,
 
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
+            if (auto *CI = dynamic_cast<CallInst *>(I);
+                CI && CI->mayReachTimingCall()) {
+                Leaders.clear();
+                continue;
+            }
             LocalExprKey Key;
             if (!buildLocalExprKey(I, Key)) continue;
 

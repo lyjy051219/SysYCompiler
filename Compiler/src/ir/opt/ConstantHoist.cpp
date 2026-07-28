@@ -277,6 +277,26 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);
         if (!insertBB) insertBB = entry;
 
+        // baseSSA 会插到 PHI 序列之后；任一 use 若与该插入点之间存在
+        // 计时屏障，整组都不能共享这个被提前物化的常量。
+        Instruction *InsertAfter = nullptr;
+        for (Instruction *I : *insertBB) {
+            if (!dynamic_cast<PhiInst *>(I)) break;
+            InsertAfter = I;
+        }
+        bool CrossesTiming = false;
+        for (const ConstantHoistUseSite &UseSite : allUses) {
+            if (!UseSite.inst ||
+                F.hasTimingBarrierOnPath(
+                    insertBB, InsertAfter, UseSite.inst) ||
+                F.hasTimingBarrierOnPath(
+                    UseSite.inst, UseSite.inst)) {
+                CrossesTiming = true;
+                break;
+            }
+        }
+        if (CrossesTiming) continue;
+
         changed |= materializeGroup(G, insertBB);
     }
 

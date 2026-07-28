@@ -724,6 +724,106 @@ bool Function::hasOnlyDirectCallUses() const {
   return static_cast<int>(getDirectCallSites().size()) == countUses();
 }
 
+bool Function::containsTimingCall() const {
+  // 计时调用即使暂时位于不可达块中，也不能被后续 CFG 变换意外复制回来。
+  for (const BasicBlock *BB : *this) {
+    if (!BB) continue;
+    for (const Instruction *I : *BB) {
+      auto *CI = dynamic_cast<const CallInst *>(I);
+      if (CI && CI->isTimingCall()) return true;
+    }
+  }
+  return false;
+}
+
+bool Function::mayReachTimingCall() const {
+  // 中端会持续改写调用关系，因此按需遍历而不保存可能失效的跨函数缓存。
+  std::queue<const Function *> WorkList;
+  std::unordered_set<const Function *> Visited;
+  WorkList.push(this);
+  Visited.insert(this);
+
+  while (!WorkList.empty()) {
+    const Function *Current = WorkList.front();
+    WorkList.pop();
+    if (!Current) continue;
+
+    for (const BasicBlock *BB : *Current) {
+      if (!BB) continue;
+      for (const Instruction *I : *BB) {
+        auto *CI = dynamic_cast<const CallInst *>(I);
+        if (!CI) continue;
+        if (CI->isTimingCall()) return true;
+        Function *Callee = CI->getDirectCallee();
+        if (Callee && Visited.insert(Callee).second)
+          WorkList.push(Callee);
+      }
+    }
+  }
+  return false;
+}
+
+bool Function::hasTimingBarrierOnPath(
+    BasicBlock *StartBlock, const Instruction *StartAfter,
+    const Instruction *EndBefore) const {
+  // 参数不完整时保守拒绝移动，避免结构损坏的 IR 绕过计时保护。
+  if (!StartBlock || !EndBefore || StartBlock->getParent() != this ||
+      !EndBefore->getParent() ||
+      EndBefore->getParent()->getParent() != this ||
+      (StartAfter && StartAfter->getParent() != StartBlock))
+    return true;
+  struct TimingPathState {
+    BasicBlock *Block;
+    Instruction *Next;
+    bool SawTiming;
+  };
+
+  std::queue<TimingPathState> WorkList;
+  std::unordered_set<BasicBlock *> VisitedWithoutTiming;
+  std::unordered_set<BasicBlock *> VisitedWithTiming;
+
+  Instruction *First = StartAfter ? StartAfter->getNext() : StartBlock->front();
+  WorkList.push({StartBlock, First, false});
+  if (!StartAfter) VisitedWithoutTiming.insert(StartBlock);
+
+  while (!WorkList.empty()) {
+    TimingPathState State = WorkList.front();
+    WorkList.pop();
+    if (!State.Block) continue;
+
+    bool SawTiming = State.SawTiming;
+    bool ReachedEnd = false;
+    for (Instruction *I = State.Next; I; I = I->getNext()) {
+      if (I == EndBefore) {
+        if (SawTiming) return true;
+        // 该路径已到达查询终点，终点之后的指令不属于移动区间。
+        ReachedEnd = true;
+        break;
+      }
+      auto *CI = dynamic_cast<CallInst *>(I);
+      if (CI && CI->mayReachTimingCall()) SawTiming = true;
+    }
+
+    // EndBefore 位于当前块时，上面的路径已经终止，不能继续沿后继搜索。
+    if (ReachedEnd) continue;
+
+    for (BasicBlock *Succ : State.Block->getSuccessors()) {
+      if (!Succ || Succ->getParent() != this) continue;
+      auto &Visited = SawTiming ? VisitedWithTiming : VisitedWithoutTiming;
+      if (!Visited.insert(Succ).second) continue;
+      WorkList.push({Succ, Succ->front(), SawTiming});
+    }
+  }
+  return false;
+}
+
+bool Function::hasTimingBarrierOnPath(
+    const Instruction *StartAfter, const Instruction *EndBefore) const {
+  if (!StartAfter || !StartAfter->getParent()) return true;
+  return hasTimingBarrierOnPath(
+      StartAfter->getParent(), StartAfter, EndBefore);
+}
+
 bool Function::hasReservedSignature() const {
   return ident == "main" || BuildInFunction::isKnownRuntimeName(ident) ||
          const_cast<Function *>(this)->front() == nullptr;
@@ -2535,6 +2635,22 @@ std::string CallInst::getCalleeName() const {
   return {};
 }
 
+bool CallInst::isTimingCall() const {
+  // 计时名称只由 BuildInFunction 统一维护，优化 Pass 不自行匹配字符串。
+  return BuildInFunction::isTimingName(getCalleeName());
+}
+
+bool CallInst::mayReachTimingCall() const {
+  if (isTimingCall()) return true;
+  Function *Callee = getDirectCallee();
+  return Callee && Callee->mayReachTimingCall();
+}
+
+void CallInst::setTailCall(bool v) {
+  // 尾调用会改变调用序列和返回路径，计时边界必须保持普通调用形式。
+  tailCall = v && !mayReachTimingCall();
+}
+
 Value *CallInst::getArg(unsigned Index) const {
   return getOperand(static_cast<size_t>(Index) + 1);
 }
@@ -3279,7 +3395,8 @@ Instruction* BinaryInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
 }
 
 Instruction* CallInst::clone(const std::unordered_map<Value*, Value*>& VMap) {
-    if (userList.empty()) return nullptr;
+    // 复制会改变计时调用的静态及动态出现次数，包装调用同样禁止复制。
+    if (userList.empty() || mayReachTimingCall()) return nullptr;
     Value *Callee = remapVal(userList[0]->getValue(), VMap);
     std::vector<Value *> Args;
     for (size_t i = 1; i < userList.size(); ++i) {

@@ -143,6 +143,8 @@ private:
     static bool isAvailableAt(Value *V, Instruction *UsePoint,
                               const Loop &L, const DominatorTree &DT);
     static bool getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape);
+    // 判断循环及其子循环中是否存在可到达计时函数的调用。
+    static bool loopMayReachTimingCall(const Loop *L);
     static bool isDirectLoopBlock(const LoopInfo &LI, Loop *L,
                                   BasicBlock *BB);
     static std::vector<BasicBlock *> collectExitingBlocks(Loop &L);

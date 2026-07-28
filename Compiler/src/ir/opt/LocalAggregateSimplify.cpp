@@ -804,9 +804,42 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     std::vector<LoadInst *> DeadLoads;
 
     auto Instructions = collectInstructions(*BB);
+    Function *ParentF = BB->getParent();
+    if (ParentF && ParentF->mayReachTimingCall()) {
+        std::vector<Instruction *> Accesses;
+        for (Instruction *I : Instructions) {
+            Value *Pointer = nullptr;
+            if (auto *LI = dynamic_cast<LoadInst *>(I)) {
+                Pointer = LI->getPointerOperand();
+            } else if (auto *SI = dynamic_cast<StoreInst *>(I)) {
+                Pointer = SI->getPointerOperand();
+            } else if (auto *CI = dynamic_cast<CallInst *>(I);
+                       CI && CallInst::isMemcpyLike(CI) &&
+                       CI->getArgCount() >= 1) {
+                Pointer = CI->getArg(0);
+            }
+            if (Pointer && tracePointer(Pointer).Root == AI)
+                Accesses.push_back(I);
+        }
+
+        if (Accesses.size() > 128) return false;
+        for (Instruction *From : Accesses) {
+            for (Instruction *To : Accesses) {
+                // 自身配对同时覆盖经过计时调用后回到该访问的循环。
+                if (ParentF->hasTimingBarrierOnPath(From, To))
+                    return false;
+            }
+        }
+    }
 
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            if (CI->mayReachTimingCall()) {
+                StateValid = false;
+                InitialValue = nullptr;
+                Overwrites.clear();
+                continue;
+            }
             if (!CallInst::isMemcpyLike(CI) || CI->getArgCount() < 2) continue;
 
             LocalAggregatePointerPath Dest = tracePointer(CI->getArg(0));
@@ -1018,6 +1051,16 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     LocalAggregateReadOnlyConstantArrayPlan Plan;
     if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
         return false;
+    std::vector<Instruction *> TimingAccesses{Plan.InitCopy};
+    for (LoadInst *LI : Plan.Loads) {
+        if (!LI) return false;
+        TimingAccesses.push_back(LI);
+    }
+    for (Instruction *From : TimingAccesses) {
+        for (Instruction *To : TimingAccesses) {
+            if (F.hasTimingBarrierOnPath(From, To)) return false;
+        }
+    }
 
     Value *FirstElement = Variable::getConstantElement(Plan.Source, {0});
     if (!FirstElement) return false;
@@ -1295,6 +1338,21 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     if (SlotTypes.empty()) return false;
 
     if (InitCopy) {
+        Function *ParentF = AI->getParent()
+                                ? AI->getParent()->getParent()
+                                : nullptr;
+        if (!ParentF) return false;
+        std::vector<Instruction *> TimingAccesses{InitCopy};
+        TimingAccesses.insert(TimingAccesses.end(), MemoryAccesses.begin(),
+                              MemoryAccesses.end());
+        for (Instruction *From : TimingAccesses) {
+            for (Instruction *To : TimingAccesses) {
+                if (!From || !To ||
+                    ParentF->hasTimingBarrierOnPath(From, To)) {
+                    return false;
+                }
+            }
+        }
         for (Instruction *Access : MemoryAccesses) {
             if (!Access) return false;
             if (Access->getParent() == InitCopy->getParent()) {
