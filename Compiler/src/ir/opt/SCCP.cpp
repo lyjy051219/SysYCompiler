@@ -8,6 +8,8 @@
 
 #include <cmath>
 
+// 格值合并实现求解器的单调性：未提供信息的 Top 不改变现状，任一 Bottom
+// 使结果过定义，两个语义相等的常量保持 Constant，否则下降到 Bottom。
 LatticeValue::LatticeValue() : state(Top), constVal(nullptr) {}
 
 LatticeValue LatticeValue::getTop() {
@@ -62,7 +64,7 @@ bool LatticeValue::mergeIn(const LatticeValue &Other) {
     }
     if (constVal == Other.constVal) return false;
 
-    // 不同常量对象仍可能表示相同的整数、浮点数或布尔值。
+    // 常量对象地址可以不同，仍须按类型和值判断语义相等。
     if (Value::areEqualConstants(constVal, Other.constVal)) return false;
 
     state = Bottom;
@@ -72,24 +74,24 @@ bool LatticeValue::mergeIn(const LatticeValue &Other) {
 
 SCCPSolver::SCCPSolver() = default;
 
-// SCCPSolver 实现
+// 求解步骤 1.1：按需初始化格值。字面常量直接为 Constant，全局地址因运行时
+// 可观察而设为 Bottom，其余 SSA 定义从 Top 开始等待可行路径传播。
 LatticeValue& SCCPSolver::getValueState(Value* V) {
     auto it = ValueState.find(V);
     if (it != ValueState.end()) return it->second;
 
-    // 初始化：常量 → Constant，其他 → Top
     LatticeValue& LV = ValueState[V];
     if (V->isConst()) {
         LV = LatticeValue::getConstant(V);
     }
-    // 全局变量（非常量）→ Bottom（地址不可预测）
     else if (V->isGlobal()) {
         LV = LatticeValue::getBottom();
     }
-    // 其他默认 Top
+
     return LV;
 }
 
+// 求解步骤 2：格值下降后重新访问全部指令使用者，使数据流变化继续传播。
 void SCCPSolver::pushUsersToWorkList(Value* V) {
     auto Users = V->getInstructionUsers();
     InstWorkList.insert(InstWorkList.end(), Users.begin(), Users.end());
@@ -104,19 +106,21 @@ bool SCCPSolver::mergeInValue(Value* V, const LatticeValue& NewVal) {
     return false;
 }
 
+// 求解步骤 1：首次发现基本块可执行时，把整块加入扫描队列。
 void SCCPSolver::markBlockExecutable(BasicBlock* BB) {
     if (ExecutableBlocks.insert(BB).second) {
         BBWorkList.push_back(BB);
     }
 }
 
+// 求解步骤 1.2：记录新可行 CFG 边。若目标块早已可执行，只需重新计算其
+// PHI；否则把目标块整体加入块队列。
 bool SCCPSolver::markEdgeFeasible(BasicBlock* Source, BasicBlock* Dest) {
     auto edge = std::make_pair(Source, Dest);
     if (!FeasibleEdges.insert(edge).second)
-        return false; // 已经可行
+        return false;
 
     if (ExecutableBlocks.count(Dest)) {
-        // 目标块已经可执行，重新访问其 Phi 节点
         for (auto inst : *Dest) {
             PhiInst* Phi = dynamic_cast<PhiInst*>(inst);
             if (!Phi) break;
@@ -143,16 +147,15 @@ LatticeValue SCCPSolver::getLatticeValue(Value* V) const {
     return LatticeValue::getTop();
 }
 
-// 核心求解循环
+// 求解步骤 3：优先排空由格值变化产生的指令队列，再扫描新发现的可执行块；
+// 任一访问器产生的新工作都会使外层循环继续，直至控制流和数值同时稳定。
 void SCCPSolver::solve() {
     while (!BBWorkList.empty() || !InstWorkList.empty()) {
-        // 优先处理指令工作队列
         while (!InstWorkList.empty()) {
             Instruction* I = InstWorkList.back();
             InstWorkList.pop_back();
             visitInstruction(I);
         }
-        // 处理基本块工作队列
         while (!BBWorkList.empty()) {
             BasicBlock* BB = BBWorkList.back();
             BBWorkList.pop_back();
@@ -163,9 +166,9 @@ void SCCPSolver::solve() {
     }
 }
 
-//指令分发
+// 指令分发只处理已经证明可执行的块；每个访问器均为纯求解操作，不在工作
+// 队列尚未收敛时改写 IR。
 void SCCPSolver::visitInstruction(Instruction* I) {
-    // 只处理所在基本块可执行的指令
     BasicBlock* parent = I->getParent();
     if (!parent || !isBlockExecutable(parent)) return;
 
@@ -192,34 +195,35 @@ void SCCPSolver::visitInstruction(Instruction* I) {
                I->instType == Instruction::TRUNC) {
         visitCastInst(I);
     } else if (I->instType == Instruction::BITCAST) {
-        // 位模式转换不在 SCCP 中推断具体目标值。
+        // 位模式转换不在当前常量求值范围内，结果保守视为过定义。
         mergeInValue(I, LatticeValue::getBottom());
     } else if (I->instType == Instruction::SELECT) {
         visitSelectInst(I);
     }
 }
 
-// Phi 节点
+// 求解步骤 2.1：PHI 只合并已证明可行的入边；遇到 Bottom 可提前停止，因为
+// 后续入边不可能再提高格值精度。
 void SCCPSolver::visitPhiNode(PhiInst* Phi) {
     BasicBlock* PhiBB = Phi->getParent();
     LatticeValue Result = LatticeValue::getTop();
 
     forEachPhiIncoming(
         Phi, [&](unsigned, Value *InVal, BasicBlock *InBB) {
-            // 只考虑可行边
             if (!isEdgeFeasible(InBB, PhiBB))
                 return true;
 
             LatticeValue InLV = getValueState(InVal);
 
             Result.mergeIn(InLV);
-            return !Result.isBottom(); // 已经是 Bottom，无需继续
+            return !Result.isBottom();
         });
 
     mergeInValue(Phi, Result);
 }
 
-// 二元运算指令
+// 求解步骤 2.2：先应用在存在过定义操作数时仍严格成立的代数恒等式，再按
+// 三态格传播；两个常量最终交由统一常量折叠器计算。
 void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     Value* LHS = nullptr;
     Value* RHS = nullptr;
@@ -247,11 +251,9 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
                !std::signbit(F);
     };
 
-    // 代数恒等式：允许在一侧是 Bottom/NAC 时仍然精确传播。
     switch (op) {
     case BinaryInst::ADD:
-        // In strict IEEE arithmetic only -0.0 is an additive identity:
-        // +0.0 + -0.0 produces +0.0, not the RHS -0.0.
+        // 严格 IEEE 语义下仅 -0.0 是加法恒等元，不能把 +0.0 一概消去。
         if (lhsConst && lhsConst->isConstZero() &&
             (!IsFloat || isNegativeFloatZero(lhsConst))) {
             mergeInValue(BI, LV_RHS);
@@ -264,7 +266,7 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         }
         break;
     case BinaryInst::SUB:
-        // x - +0.0 is exact; x - -0.0 is not for x == -0.0.
+        // x - +0.0 恒等于 x；对 -0.0 不成立。
         if (rhsConst && rhsConst->isConstZero() &&
             (!IsFloat || isPositiveFloatZero(rhsConst))) {
             mergeInValue(BI, LV_LHS);
@@ -272,7 +274,7 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         }
         break;
     case BinaryInst::MUL:
-        // fmul 0.0, Inf/NaN is NaN and signed zero is observable.
+        // 仅整数乘零可直接归零；浮点零与 Inf/NaN 的组合不能这样折叠。
         if (!IsFloat &&
             ((lhsConst && lhsConst->isConstZero()) ||
              (rhsConst && rhsConst->isConstZero()))) {
@@ -301,7 +303,7 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         }
         break;
     case BinaryInst::MOD:
-        // frem x, 1.0 is not generally zero.
+        // 有符号整数模一恒为零；浮点余数不适用。
         if (!IsFloat && rhsConst && rhsConst->isConstOne()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
@@ -352,18 +354,18 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         break;
     }
 
-    // 如果任一操作数为 Bottom → 结果 Bottom
+    // 任一操作数过定义且没有恒等式可用时，结果同样过定义。
     if (LV_LHS.isBottom() || LV_RHS.isBottom()) {
         mergeInValue(BI, LatticeValue::getBottom());
         return;
     }
 
-    // 如果任一操作数为 Top → 结果暂时为 Top（等待更多信息）
+    // Top 表示尚需等待更多可行路径，本轮不降低结果格值。
     if (LV_LHS.isTop() || LV_RHS.isTop()) {
-        return; // 保持 Top，不做改变
+        return;
     }
 
-    // 两个操作数都是 Constant → 尝试常量折叠
+    // 两个操作数均为常量时执行完整语义折叠；不支持或非法的组合降为 Bottom。
     Value* result =
         BinaryInst::foldConstants(op, lhsConst, rhsConst, true);
     if (result) {
@@ -373,12 +375,13 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     }
 }
 
-// 分支指令 → 控制流发现
+
+// 求解步骤 2.3：分支把数值格信息转成边可行性。常量条件只开放选中边，
+// Bottom 条件开放两边，Top 条件等待后续数据流信息。
 void SCCPSolver::visitBranchInst(BrInst* Br) {
     BasicBlock* BrBB = Br->getParent();
 
     if (!Br->isConditional()) {
-        // 无条件跳转
         BasicBlock* dest = Br->getTrueSuccessor();
         if (dest) markEdgeFeasible(BrBB, dest);
         return;
@@ -392,22 +395,19 @@ void SCCPSolver::visitBranchInst(BrInst* Br) {
         LatticeValue condLV = getValueState(cond);
 
         if (condLV.isBottom()) {
-            // 条件不确定，两条边都可行
             if (trueBB) markEdgeFeasible(BrBB, trueBB);
             if (falseBB) markEdgeFeasible(BrBB, falseBB);
             return;
         }
 
         if (condLV.isTop()) {
-            // 尚未确定，先不标记任何边
             return;
         }
 
-        // 条件是常量
         Value* constCond = condLV.getConstantValue();
         bool condTrue = false;
         if (!constCond || !constCond->tryGetBoolConst(condTrue)) {
-            // 无法判断，保守处理
+            // 无法解释为布尔值时保守开放两条边。
             if (trueBB) markEdgeFeasible(BrBB, trueBB);
             if (falseBB) markEdgeFeasible(BrBB, falseBB);
             return;
@@ -421,32 +421,30 @@ void SCCPSolver::visitBranchInst(BrInst* Br) {
     }
 }
 
-// Ret, Load, Store, Call, GEP, Cast
+
 void SCCPSolver::visitRetInst(RetInst*) {
-    // Ret 不产生新值，无需传播
 }
 
+// 内存、调用和地址结果尚未纳入稀疏常量内存模型：有返回值的此类指令均
+// 视为过定义，store/ret 因不产生 SSA 结果无需更新格值。
 void SCCPSolver::visitLoadInst(LoadInst* LI) {
-    // 保守处理 Load：标记为 Bottom（不做 load 常量传播）
     mergeInValue(LI, LatticeValue::getBottom());
 }
 
 void SCCPSolver::visitStoreInst(StoreInst*) {
-    // Store 不产生值
 }
 
 void SCCPSolver::visitCallInst(CallInst* CI) {
-    // 保守处理：Call 返回值标为 Bottom
     if (CI->getIRType() && !CI->getIRType()->isVoid()) {
         mergeInValue(CI, LatticeValue::getBottom());
     }
 }
 
 void SCCPSolver::visitGEPInst(GetElementPtrInst* GEP) {
-    // GEP 结果为指针，标为 Bottom
     mergeInValue(GEP, LatticeValue::getBottom());
 }
 
+// 求解步骤 2.4：cast 等待操作数稳定；常量输入按目标类型折叠，失败则过定义。
 void SCCPSolver::visitCastInst(Instruction* I) {
     Value* operand = I->getUnaryOperand();
     if (!operand) {
@@ -460,10 +458,9 @@ void SCCPSolver::visitCastInst(Instruction* I) {
         return;
     }
     if (opLV.isTop()) {
-        return; // 等待更多信息
+        return;
     }
 
-    // 操作数是常量，尝试常量折叠
     Value* result = Instruction::foldConstantCast(
         I->instType, opLV.getConstantValue(), I->getIRType());
     if (result) {
@@ -473,7 +470,8 @@ void SCCPSolver::visitCastInst(Instruction* I) {
     }
 }
 
-// Select 指令: %r = select i1 %c, T %a, T %b
+// 求解步骤 2.5：select 两臂相等时无需知道条件；过定义条件合并两臂，未知
+// 条件继续等待，常量条件则只传播被选择的一臂。
 void SCCPSolver::visitSelectInst(Instruction* I) {
     auto *SI = dynamic_cast<SelectInst *>(I);
     if (!SI) {
@@ -484,7 +482,6 @@ void SCCPSolver::visitSelectInst(Instruction* I) {
     Value* trueVal = SI->getTrueValue();
     Value* falseVal = SI->getFalseValue();
 
-    // 无论条件是否已知，只要两侧值相同，select 结果可直接确定。
     LatticeValue trueLV = getValueState(trueVal);
     LatticeValue falseLV = getValueState(falseVal);
     if (trueLV.isConstant() && falseLV.isConstant() &&
@@ -497,7 +494,6 @@ void SCCPSolver::visitSelectInst(Instruction* I) {
     LatticeValue condLV = getValueState(cond);
 
     if (condLV.isBottom()) {
-        // 条件不确定，两条路径都可能，合并 true 和 false 的格值
         LatticeValue result = trueLV;
         result.mergeIn(falseLV);
         mergeInValue(I, result);
@@ -505,10 +501,9 @@ void SCCPSolver::visitSelectInst(Instruction* I) {
     }
 
     if (condLV.isTop()) {
-        return; // 条件尚未确定
+        return;
     }
 
-    // 条件是常量 → 直接选择对应分支的值
     Value* constCond = condLV.getConstantValue();
     bool isTrue = false;
     if (!constCond || !constCond->tryGetBoolConst(isTrue)) {
@@ -519,12 +514,13 @@ void SCCPSolver::visitSelectInst(Instruction* I) {
     mergeInValue(I, getValueState(isTrue ? trueVal : falseVal));
 }
 
-// 变换阶段：将求解结果应用到 IR
+// 改写阶段在求解完全收敛后统一执行，避免遍历期间的 CFG 变化污染可行性
+// 集合。顺序固定为常量替换、不可达块清理、常量分支折叠。
 bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
     bool changed = false;
     CfgChanged = false;
 
-    // 1. 收集不可达块
+    // 1. 快照未进入可执行集合的基本块，后续删除时不再查询已变化的 CFG。
     std::vector<BasicBlock*> deadBlocks;
     for (auto bb : F) {
         if (!isBlockExecutable(bb)) {
@@ -532,18 +528,18 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
         }
     }
 
-    // 2. 在可达块中替换常量
+    // 2. 在可达块中用求得的常量替换无副作用 SSA 指令；先快照指令以允许
+    // 删除已失去全部使用的定义。
     for (auto bb : F) {
         if (!isBlockExecutable(bb)) continue;
 
-        // 安全遍历：先收集再处理
         std::vector<Instruction*> insts;
         for (auto inst : *bb) {
             insts.push_back(inst);
         }
 
         for (Instruction* I : insts) {
-            // 跳过无结果类型（void）、终止指令、有副作用的指令
+            // 终结、内存写、栈分配和调用不属于可直接删除的纯值定义。
             if (I->getIRType()->isVoid()) continue;
             if (dynamic_cast<RetInst*>(I)) continue;
             if (dynamic_cast<BrInst*>(I)) continue;
@@ -560,26 +556,22 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
             Value* constVal = LV.getConstantValue();
             if (!constVal) continue;
 
-            // 不要用自己替换自己
             if (constVal == I) continue;
 
-            // 替换所有使用
             I->replaceAllUsesWith(constVal);
 
-            // 如果指令不再被使用，且无副作用，可以删除
             if (!I->hasUses()) {
-                delete I; // ~Node 会自动从链表摘除，~Use 会断开关联
+                delete I;
             }
             changed = true;
         }
     }
 
-    // 3. 处理不可达块
-    // 3a. 清理不可达块 → 可达后继 的 Phi 条目
+    // 3. 删除死块前，先从每个可达后继 PHI 中移除对应入边；重建后的 PHI
+    // 若为空或仅有一个输入，则立即折叠为 undef 或唯一输入。
     for (BasicBlock* DeadBB : deadBlocks) {
         for (BasicBlock* succ : DeadBB->getSuccessors()) {
             if (isBlockExecutable(succ)) {
-                // 移除 succ 中 Phi 来自 DeadBB 的 incoming
                 std::vector<PhiInst*> phis;
                 for (auto inst : *succ) {
                     PhiInst* phi = dynamic_cast<PhiInst*>(inst);
@@ -624,7 +616,8 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
         }
     }
 
-    // 3b. 断开不可达块中指令的 Use，然后删除指令和块
+    // 4. 先把死块定义的残余外部使用替换为 undef，再分三轮断开指令、移除
+    // 块内容和摘除基本块，避免跨死块引用形成悬空 use。
     for (BasicBlock* DeadBB : deadBlocks) {
         for (auto inst : *DeadBB) {
             if (inst->hasUses()) {
@@ -647,7 +640,8 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
         CfgChanged = true;
     }
 
-    // 4. 对于可达块中条件为常量的分支，替换为无条件跳转
+    // 5. 可达块中的已知条件分支改为无条件分支；改写前同步删除未选边在
+    // 后继 PHI 中的输入。
     for (auto bb : F) {
         if (!isBlockExecutable(bb)) continue;
         if (bb->size() == 0) continue;
@@ -674,11 +668,9 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
 
         if (!target || !removed) continue;
 
-        // 移除 removed 块中 Phi 来自当前块的 incoming
         if (removed != target)
             BasicBlock::removeEdgeFromSuccPhis(removed, bb, -1);
 
-        // 替换条件分支为无条件跳转
         BasicBlock::replaceCondBrWithUncond(bb, target);
         changed = true;
         CfgChanged = true;
@@ -687,24 +679,25 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
     return changed;
 }
 
-// SCCP Pass 入口
+// Pass 主流程：初始化入口与参数边界，运行双工作队列求解到不动点，再一次性
+// 将结果写回 IR。
 PreservationStatus SCCPPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     SCCPSolver Solver;
 
-    // 1. 标记入口块为可执行
+    // 1. 入口块是初始唯一可执行块。
     BasicBlock* entry = F.front();
     if (!entry) return PreservationStatus::all();
     Solver.markBlockExecutable(entry);
 
-    // 2. 函数参数标记为 Bottom（非常量）
+    // 2. 函数参数由调用者决定，初始设为过定义。
     for (auto& param : F.getParams()) {
         Solver.mergeInValue(param.get(), LatticeValue::getBottom());
     }
 
-    // 3. 求解
+    // 3. 交替传播可行边和数值格，直到两者均不再变化。
     Solver.solve();
 
-    // 4. 应用变换
+    // 4. 提交常量替换、死块删除与分支折叠。
     bool cfgChanged = false;
     bool changed = Solver.rewriteConstants(F, cfgChanged);
 
@@ -713,14 +706,14 @@ PreservationStatus SCCPPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
     PreservationStatus PA;
     if (!cfgChanged) {
+        // 5. 纯 SSA 改写保留 CFG 分析；GEP、指针 PHI 或内存指令变化仍可能
+        // 改变别名和传递副作用答案。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
-        // Replacing GEP indices/pointer PHIs or removing memory instructions
-        // can change alias and transitive side-effect answers even when the
-        // CFG itself is unchanged.
         PA.discard<BasicAliasAnalysis>();
         PA.discard<SideEffectAnalysis>();
     }
+    // 删除基本块或折叠分支时保持空保留集，使所有依赖 CFG 的分析重新计算。
     return PA;
 }

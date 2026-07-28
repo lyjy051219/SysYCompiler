@@ -129,6 +129,7 @@ LoopDependenceInfo::LoopDependenceInfo(LoopDependenceInfo &&) noexcept =
 LoopDependenceInfo &
 LoopDependenceInfo::operator=(LoopDependenceInfo &&) noexcept = default;
 
+// 仿射化递归展开 SCEV；只接受可精确相加缩放的表达式，非线性、截断或溢出均返回非 Exact。
 LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
                                                Loop *Scope) const {
     LoopAffineExpr Result;
@@ -185,9 +186,7 @@ LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
     }
 
     case SCEVExprKind::Cast:
-        // Truncation is modular and cannot be represented by this affine
-        // vocabulary.  The remaining integer-preserving casts are transparent
-        // for the canonical non-wrapping induction values consumed here.
+
         if (E->CastKind == SCEVCastKind::Trunc || E->Operands.size() != 1)
             return Result;
         return buildAffine(E->Operands[0], Scope);
@@ -195,9 +194,6 @@ LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
     case SCEVExprKind::AddRec: {
         if (E->Operands.size() != 2 || !E->RecLoop) return Result;
 
-        // A recurrence outside Scope is a symbolic invariant for this query.
-        // Keeping it whole avoids incorrectly exposing a parent-loop axis in
-        // an inner-loop-only dependence vector.
         if (!loopIsInScope(E->RecLoop, Scope)) {
             Result.Exact = true;
             Result.InvariantTerms[E] = 1;
@@ -236,9 +232,11 @@ LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
     return Result;
 }
 
+// 访存建模沿类型化 GEP 链收集同字节步长的下标带，并验证根对象在循环内稳定。
 bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
                                            std::size_t Order,
                                            LoopMemoryAccess &Access) const {
+    // 1. 识别 Load/Store 的读写角色和真实访问区间，其他指令不形成标量访问。
     if (!I || !Scope || !SE) return false;
 
     if (auto *Load = dynamic_cast<LoadInst *>(I)) {
@@ -257,9 +255,7 @@ bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
     Access.Order = Order;
     if (!Access.Pointer) return false;
 
-    // Group index expressions by their immediate typed byte stride.  This is
-    // intentionally not flattenZeroBasedChain(): split row/element GEPs often
-    // have a non-zero first index and are still exactly representable.
+    // 2. 逆向穿过 GEP/BitCast，把相同步长的分段 GEP 下标合并为一个坐标带。
     std::map<int64_t, LoopAffineExpr, std::greater<int64_t>> Bands;
     Value *Current = Access.Pointer;
     std::unordered_set<Value *> Visited;
@@ -324,14 +320,12 @@ bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
     if (!Current) Exact = false;
     Access.Root = Current;
 
-    // A loop-local pointer PHI/select/load that was not decomposed above can
-    // change its allocation object between iterations.  It is not a stable
-    // affine root even when all explicit GEP indices were affine.
     if (auto *RootI = dynamic_cast<Instruction *>(Current)) {
         BasicBlock *RootBB = RootI->getParent();
         if (RootBB && Scope->contains(RootBB)) Exact = false;
     }
 
+    // 3. 发布根、下标和步长；环、深度预算、未知类型或循环内动态根都会使地址不精确。
     Access.Subscripts.reserve(Bands.size());
     Access.ByteStrides.reserve(Bands.size());
     for (auto &Band : Bands) {
@@ -352,17 +346,13 @@ bool LoopDependenceInfo::isWriteConflict(const LoopMemoryAccess &A,
 bool LoopDependenceInfo::areNoAlias(const LoopMemoryAccess &A,
                                     const LoopMemoryAccess &B) const {
     if (!AA || !LI || !A.Pointer || !B.Pointer) return false;
-    // A same-root NoAlias can describe only the two current SSA instances
-    // (for example A[i] versus A[i+1]); those locations may still meet in
-    // different iterations.  Consume BasicAA only after the complete GEP
-    // chains lead to different roots.
+
     if (!A.Root || !B.Root || A.Root == B.Root) return false;
-    // NoAlias is the only BasicAA answer consumed here.  MustAlias describes
-    // two SSA pointer values in one execution; it is not a loop-carried
-    // dependence proof.
+
     return AA->alias(A.Location, B.Location, *LI) == AliasInfo::NoAlias;
 }
 
+// 轴相等证明要求同根、同布局和不回绕归纳轴，并找到唯一的单位系数坐标带。
 bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
                                         const LoopMemoryAccess &B,
                                         Loop *Axis) const {
@@ -384,8 +374,6 @@ bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
         return false;
     }
 
-    // 只接受布局完整、元素访问不重叠的混合基数数组地址。展平地址或通过
-    // 较小元素 GEP 进行宽访问的情况需要字节范围求解器，不能在这里推断。
     if (*A.Location.Size >
         static_cast<std::size_t>(A.ByteStrides.back())) {
         return false;
@@ -408,8 +396,7 @@ bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
             !isPureAxisCoordinate(BExpr, Axis, BCoefficient)) {
             continue;
         }
-        // 单位系数在整数位宽上仍是一一映射；任意倍数可能因模回绕把两个
-        // 不同归纳值映射到同一下标。该轴也不得在其他维度再次出现并抵消。
+
         if (ACoefficient != BCoefficient ||
             (ACoefficient != 1 && ACoefficient != -1) ||
             AExpr.Constant != BExpr.Constant) {
@@ -433,8 +420,10 @@ bool LoopDependenceInfo::areForcedEqual(const LoopMemoryAccess &A,
     return false;
 }
 
+// 循环依赖主流程：收集可建模访存，枚举潜在写冲突，再生成逐轴方向向量。
 std::unique_ptr<LoopDependenceInfo::LoopSummary>
 LoopDependenceInfo::buildSummary(Loop *L) {
+    // 1. 验证依赖分析齐备，并按外到内顺序收集当前循环树的轴。
     auto Summary = std::make_unique<LoopSummary>();
     if (!L || !Func || !LI || !SE || !AA) {
         Summary->UnknownMemory = true;
@@ -443,6 +432,7 @@ LoopDependenceInfo::buildSummary(Loop *L) {
 
     collectLoopsPreorder(L, Summary->Loops);
 
+    // 2. 按函数稳定顺序扫描循环体；Call、预算超限或非仿射地址设置 UnknownMemory。
     std::size_t Order = 0;
     for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
         if (!BB) continue;
@@ -467,6 +457,7 @@ LoopDependenceInfo::buildSummary(Loop *L) {
         }
     }
 
+    // 3. 枚举访问对：先排除无写冲突和不同对象，再分类依赖类型与每个轴的方向。
     const std::size_t Count = Summary->Accesses.size();
     std::size_t ExaminedPairs = 0;
     for (std::size_t I = 0; I < Count; ++I) {
@@ -534,6 +525,7 @@ bool LoopDependenceInfo::hasUnknownMemory(Loop *L) {
     return !L || getOrBuildSummary(L).UnknownMemory;
 }
 
+// 交换查询要求每个潜在冲突至少在两个交换轴之一被证明局限于同次迭代。
 bool LoopDependenceInfo::isInterchangeLegal(Loop *Outer, Loop *Inner) {
     if (!Outer || !Inner || Outer == Inner || !Inner->getHeader() ||
         !Outer->contains(Inner->getHeader())) {
@@ -561,6 +553,7 @@ bool LoopDependenceInfo::isInterchangeLegal(Loop *Outer, Loop *Inner) {
     return true;
 }
 
+// 分布查询验证原块内顺序，并要求反向冲突在被复制循环树的每个轴上均为同次迭代。
 bool LoopDependenceInfo::isDistributionLegal(
     Loop *L, const InstructionSet &First, const InstructionSet &Second) {
     if (!L) return false;
@@ -575,22 +568,14 @@ bool LoopDependenceInfo::isDistributionLegal(
                 continue;
             }
             if (areNoAlias(SecondAccess, FirstAccess)) continue;
-            // Fission executes the complete First partition before Second.
-            // Prove that this agrees with the original dynamic order.  A
-            // function-layout order across blocks is not an execution-order
-            // proof, so this compact implementation accepts only the exact
-            // same-block instruction order and otherwise refuses the cut.
+
             if (!FirstAccess.Inst || !SecondAccess.Inst ||
                 FirstAccess.Inst->getParent() !=
                     SecondAccess.Inst->getParent() ||
                 FirstAccess.Order >= SecondAccess.Order) {
                 return false;
             }
-            // Distribution serializes two copies of L's complete loop tree.
-            // A Second -> First conflict is therefore safe only when address
-            // equality forces the two dynamic accesses into the same
-            // iteration on every cloned axis.  Checking L alone would miss a
-            // dependence carried by one of its descendants.
+
             for (Loop *Axis : Summary.Loops) {
                 if (!areForcedEqual(SecondAccess, FirstAccess, Axis))
                     return false;
@@ -618,11 +603,10 @@ bool LoopDependenceInfo::isConflictLocalToIteration(
         return true;
     }
 
-    // 分布只改变不同 L 迭代之间的先后关系。地址相等若能反推出 L
-    // 坐标相等，冲突就局限在同一迭代，原有语句顺序仍可保留。
     return areForcedEqual(*First, *Second, L);
 }
 
+// 调度专用查询只处理外层不变读取与有限内层写，并由范围别名证明覆盖完整内层域。
 bool LoopDependenceInfo::isInvariantAccessDisjointFromLoopWrite(
     Instruction *Invariant, Instruction *Write,
     Loop *Scope, Loop *VaryingLoop) {
@@ -663,10 +647,6 @@ bool LoopDependenceInfo::isInvariantAccessDisjointFromLoopWrite(
             return false;
     }
 
-    // 这个查询只在“外层前缀 load 与内层 write”的结构契约下
-    // 使用。BasicAA 的范围模式会要求变量下标是已证明不回绕的规范
-    // 归纳更新，并以字节访问宽度检查整个内层域。结构门禁避免
-    // 把普通 A[i] / A[i+1] 的点对点结论错用为跨迭代 NoAlias。
     return AA->aliasWithIndexRange(
                First->Location, Second->Location, *LI) ==
            AliasInfo::NoAlias;
@@ -711,10 +691,13 @@ bool LoopDependenceInfo::invalidate(Function &,
            !PA.isKept(BasicAliasAnalysis::ID());
 }
 
+// Pass 入口依次取得循环、标量演化和别名结果，再返回按需构建的依赖查询器。
 LoopDependenceInfo LoopDependenceAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
+    // 1. 依赖建模依次取得循环树、标量演化和基础别名结果。
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    // 2. 返回函数级惰性查询器，每个 LoopSummary 在首次请求时构造并缓存。
     return LoopDependenceInfo(&F, &LI, &SE, &AA);
 }

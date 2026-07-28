@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+// 步骤 1.1：沿全局对象派生出的 GEP/形状保持 bitcast 遍历完整 use 图；仅允许
+// load 或作为非 volatile memcpy 源，任一写入、逃逸或未知调用都会否定只读性。
 bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
     Variable *Source) {
     if (!Source || (Source->vartag != Variable::GlobalConstant &&
@@ -48,15 +50,15 @@ bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
                 CI->getArgIndex(U) == 1)
                 continue;
 
-            // Passing the address to an arbitrary call, storing through it,
-            // or storing the address itself can make the initializer stale or
-            // observable.  Keep the proof whole-program and structural.
+            // 证明必须覆盖整个指针闭包，不能因只检查当前 load 而忽略别处写入。
             return false;
         }
     }
     return true;
 }
 
+// 步骤 1.2：从 load 指针逆向剥离形状保持 bitcast 和 GEP，再按正向顺序解析
+// 全常量零基路径；结果必须落到全局对象的标量元素。
 bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
     Value *Pointer, Variable *&Root, std::vector<int> &Path,
     std::shared_ptr<IRType> &PointeeTy) {
@@ -115,6 +117,8 @@ bool LocalAggregateSimplifyPass::traceConstantGlobalPointer(
     return !Path.empty() && PointeeTy && IRType::isScalar(PointeeTy);
 }
 
+// 步骤 1.3：提取用于表达式综合的一维 i32 常量表；元素数、数组形状、位宽
+// 和每个初始化值均须完全匹配，不能以缺失元素参与枚举。
 bool LocalAggregateSimplifyPass::collectInt32ConstantTable(
     Variable *Source, int Count, std::vector<int32_t> &Values) {
     Values.clear();
@@ -145,6 +149,8 @@ bool LocalAggregateSimplifyPass::collectInt32ConstantTable(
     return true;
 }
 
+// 步骤 1.4：按 IR 的 i32 语义解释综合候选。算术使用宽类型检查有符号溢出，
+// 位运算按位模式执行，移位显式排除非法位数及当前 IR 不允许的溢出情形。
 bool LocalAggregateSimplifyPass::evaluateSynthExpression(
     const std::shared_ptr<LocalAggregateSynthExpression> &Expression,
     int32_t Index, int32_t &Result) {
@@ -166,8 +172,7 @@ bool LocalAggregateSimplifyPass::evaluateSynthExpression(
         !evaluateSynthExpression(Expression->Right, Index, Right))
         return false;
 
-    // SysY 的 int 是 32 位有符号数。算术候选一旦在完整定义域的任一点
-    // 溢出就丢弃；不能借助有符号溢出、非法移位等未定义行为凑出表值。
+    // 候选必须在完整定义域的每一点都有定义，不能借未定义行为凑出表值。
     int64_t Wide = 0;
     switch (Expression->Op) {
     case BinaryInst::ADD:
@@ -228,6 +233,8 @@ bool LocalAggregateSimplifyPass::evaluateSynthExpression(
     return true;
 }
 
+// 步骤 1.5：以“在完整表定义域上的结果向量”为状态做有界枚举；语义相同的
+// 树只保留首个低成本代表，命中目标向量才接受表达式。
 std::shared_ptr<LocalAggregateSynthExpression>
 LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
     const std::vector<int32_t> &Values) {
@@ -254,8 +261,8 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
             .push_back(Expression);
     };
 
-    // 终结符只包含索引和从当前常量表系统化提取的常量；候选集合不读取
-    // 函数名、变量名、文件路径或运行时输入。
+    // 1.5.1 以索引自身和固定来源的少量常量为零成本种子；常量集合来自表的
+    // 端点、一阶/二阶差分和表值，并受统一数量预算限制。
     auto IndexExpression =
         std::make_shared<LocalAggregateSynthExpression>();
     IndexExpression->Kind = LocalAggregateSynthExpressionKind::Index;
@@ -314,6 +321,8 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
         BinaryInst::SHL, BinaryInst::LSHR, BinaryInst::ASHR};
 
     for (int Cost = 1; Cost <= MaxSynthExpressionCost; ++Cost) {
+        // 1.5.2 按总指令成本逐层组合已知状态。相同成本下优先平衡的子树成本
+        // 划分，使固定状态预算覆盖更多不同形状。
         std::set<SemanticVector> PendingSemantics;
         std::vector<std::pair<SemanticVector, ExpressionPtr>> Pending;
         bool EnumerationBudgetReached = false;
@@ -321,8 +330,6 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
         LeftCostOrder.reserve(static_cast<size_t>(Cost));
         for (int LeftCost = 0; LeftCost < Cost; ++LeftCost)
             LeftCostOrder.push_back(LeftCost);
-        // 同成本下优先组合深度均衡的子表达式，使固定预算覆盖更多不同
-        // 语法树形状；排序只依赖语法成本，不读取目标表的局部匹配程度。
         std::sort(
             LeftCostOrder.begin(), LeftCostOrder.end(),
             [Cost](int Left, int Right) {
@@ -368,8 +375,8 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
                         }
                         if (!Defined) continue;
 
-                        // 命中前已经对数组完整定义域逐点验证；不是根据少数
-                        // 样本猜测公式，也不会为范围外输入生成快速路径。
+                        // 每个候选已在整个数组定义域逐点求值；完整相等时立即
+                        // 接受，而非根据局部样本或运行时输入猜测。
                         if (Semantics == Values) return Candidate;
                         if (KnownStates.count(Semantics) ||
                             PendingSemantics.count(Semantics))
@@ -379,8 +386,7 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
                             {std::move(Semantics), std::move(Candidate)});
                         if (Pending.size() >=
                             static_cast<size_t>(MaxSynthPendingStates)) {
-                            // 搜索状态达到统一预算后立即停止本层枚举；此时
-                            // 只会少做优化，不会用不完整验证接受候选。
+                            // 达到枚举预算只停止优化搜索，不放宽候选正确性。
                             EnumerationBudgetReached = true;
                             break;
                         }
@@ -392,8 +398,7 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
             if (EnumerationBudgetReached) break;
         }
 
-        // 按固定语法枚举顺序截断状态，不根据“部分命中几个表项”调整
-        // 搜索方向，避免把不完整匹配当作收益或正确性证据。
+        // 1.5.3 按确定枚举顺序截断本成本层状态，不依据部分匹配程度调整搜索。
         if (Pending.size() >
             static_cast<size_t>(MaxSynthStatesPerCost))
             Pending.resize(static_cast<size_t>(MaxSynthStatesPerCost));
@@ -404,6 +409,8 @@ LocalAggregateSimplifyPass::synthesizeInt32TableExpression(
     return nullptr;
 }
 
+// 步骤 1.6：递归在原 load 前物化已验证表达式；Created 记录全部新节点，供
+// 调用者在后续类型检查失败时逆序回滚。
 Value *LocalAggregateSimplifyPass::materializeSynthExpression(
     const std::shared_ptr<LocalAggregateSynthExpression> &Expression,
     Value *Index, Instruction *InsertBefore,
@@ -431,14 +438,16 @@ Value *LocalAggregateSimplifyPass::materializeSynthExpression(
     return Binary;
 }
 
+// 收益验证只比较表达式自身与一次标量 load，严格更便宜才允许替换；旧 GEP
+// 是否还能删除不计入收益，避免高估。
 bool LocalAggregateSimplifyPass::isSynthExpressionProfitable(
     const std::shared_ptr<LocalAggregateSynthExpression> &Expression) {
-    // 仅比较表达式自身与 load；即使 GEP 因为另有用途不能删除，也不会把
-    // 它虚构成收益。相等成本同样拒绝，避免无收益地扩大活跃值范围。
     return Expression && Expression->Cost >= 0 &&
            Expression->Cost < GenericScalarLoadCost;
 }
 
+// 步骤 1 清理辅助：load 删除后，从其指针向根逆向删除无 use 的 GEP/bitcast，
+// 遇到仍被使用或非透明指令即停止。
 void LocalAggregateSimplifyPass::deleteDeadPointerChain(Value *Pointer) {
     while (auto *I = dynamic_cast<Instruction *>(Pointer)) {
         if (I->hasUses()) return;
@@ -451,6 +460,8 @@ void LocalAggregateSimplifyPass::deleteDeadPointerChain(Value *Pointer) {
     }
 }
 
+// 步骤 1 主流程同时处理两类只读全局 load：常量路径直接取初始化值；受范围
+// 证明约束的一维动态 i32 查表尝试用完整定义域等价表达式替换。
 bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
     Function &F, FunctionAnalysisPassManager &FAM) {
     auto &DT = FAM.getResult<DominantAnalysis>(F);
@@ -470,6 +481,7 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
         Variable *Root = nullptr;
         std::vector<int> Path;
         std::shared_ptr<IRType> ElementTy;
+        // 1.7 常量路径：缓存整程序只读证明，读取精确初始化元素并核对 load 类型。
         if (traceConstantGlobalPointer(Pointer, Root, Path, ElementTy)) {
             auto CacheIt = ReadOnlyCache.find(Root);
             bool ReadOnly = CacheIt != ReadOnlyCache.end()
@@ -485,9 +497,8 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
             continue;
         }
 
-        // 对只读 i32 常量表运行统一的有界表达式枚举。候选必须在完整
-        // 定义域逐点相等，索引范围沿用原 pass 的通用控制流证明；
-        // 不依赖函数名、块名或某个具体输入值。
+        // 1.8 动态路径候选只接受全局一维数组的 [0, index] GEP，常量 index 已
+        // 由前一分支处理；每个源表最多执行一次有界表达式综合。
         auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
         auto *CandidateRoot = GEP && GEP->getBasePointer()
                                   ? dynamic_cast<Variable *>(
@@ -529,6 +540,8 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
             Expression = SynthIt->second;
         if (!isSynthExpressionProfitable(Expression)) continue;
 
+        // 1.9 RangeAnalysis 必须证明运行时索引完整落在表定义域，且索引与
+        // load 都是同形 i32，综合式才具有与原 load 相同的定义范围和类型。
         IntRange IndexRange = RI.query(Index, BB, DT);
         if (IndexRange.isBottom() || IndexRange.min < 0 ||
             IndexRange.max >= Count)
@@ -552,6 +565,8 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
         Replacements.push_back({Load, Synthesized});
     }
 
+    // 1.10 所有候选验证完后统一提交：替换 load，删除其定义，再清理失去使用
+    // 的透明指针链。综合失败产生的节点已在候选局部逆序回滚。
     for (auto &Replacement : Replacements) {
         LoadInst *Load = Replacement.first;
         if (!Load || !Load->getParent()) continue;
@@ -563,6 +578,8 @@ bool LocalAggregateSimplifyPass::foldReadOnlyGlobalLoads(
     return !Replacements.empty();
 }
 
+// 步骤 2—5 的通用路径追踪：沿形状保持 bitcast 和零基 GEP 递归到 alloca；
+// 环检测防止异常 use 图无限递归，动态索引只把 IsConstant 置否而保留根信息。
 LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(
     Value *V, std::unordered_set<Value *> &Visiting) {
     LocalAggregatePointerPath Result;
@@ -618,6 +635,8 @@ LocalAggregatePointerPath LocalAggregateSimplifyPass::tracePointer(Value *V) {
     return tracePointer(V, Visiting);
 }
 
+// 步骤 4.1：解析以 alloca 为直接基址的非空全常量聚合路径，并返回路径末端
+// 类型；首索引必须为零，保持访问在同一个分配对象内。
 bool LocalAggregateSimplifyPass::getDirectConstantPath(
     AllocaInst *AI, GetElementPtrInst *GEP, std::vector<int> &Path,
     std::shared_ptr<IRType> &PointeeTy) {
@@ -646,6 +665,7 @@ bool LocalAggregateSimplifyPass::getDirectConstantPath(
     return PointeeTy != nullptr;
 }
 
+// 标量路径辅助在通用常量路径基础上额外要求末端类型可独立建槽。
 bool LocalAggregateSimplifyPass::getDirectConstantScalarPath(
     AllocaInst *AI, GetElementPtrInst *GEP, std::vector<int> &Path,
     std::shared_ptr<IRType> &ElementTy) {
@@ -655,6 +675,8 @@ bool LocalAggregateSimplifyPass::getDirectConstantScalarPath(
     return true;
 }
 
+// 步骤 4.2：从已知派生地址继续追加零基全常量 GEP 路径，并同步解析新的
+// pointee 类型；NewPath 始终相对根 alloca。
 bool LocalAggregateSimplifyPass::appendConstantAggregateGEPPath(
     Value *Base, GetElementPtrInst *GEP, const std::vector<int> &BasePath,
     std::vector<int> &NewPath, std::shared_ptr<IRType> &PointeeTy) {
@@ -686,6 +708,8 @@ bool LocalAggregateSimplifyPass::appendConstantAggregateGEPPath(
     return true;
 }
 
+// 步骤 3.1：识别一维标量数组的直接 [0, index] 元素地址；index 可为动态
+// 整数，后续阶段再验证其值域或选择表达能力。
 bool LocalAggregateSimplifyPass::getDirectOneDimElementIndex(
     AllocaInst *AI, GetElementPtrInst *GEP, Value *&Index) {
     Index = nullptr;
@@ -706,6 +730,8 @@ bool LocalAggregateSimplifyPass::getDirectOneDimElementIndex(
            Index->getIRType()->isInt();
 }
 
+// 步骤 4.3：识别标量指针上的单常量偏移 GEP，要求偏移前后标量类型一致，
+// 供展平路径后映射到相邻标量槽。
 bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
     Value *Base, GetElementPtrInst *GEP, int &Offset) {
     Offset = 0;
@@ -722,15 +748,13 @@ bool LocalAggregateSimplifyPass::getConstantOffsetScalarGEP(
            IRType::hasSameScalarType(BaseTy, GEPTy);
 }
 
+// 步骤 2/3 的 memcpy 源证明：GlobalConstant 天然只读；保留下来的合成
+// GlobalVariable 仅在每个 use 都是非 volatile memcpy 源时才可视为不可变。
 bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
     if (!Source) return false;
     if (Source->vartag == Variable::GlobalConstant) return true;
     if (Source->vartag != Variable::GlobalVariable) return false;
 
-    // Global2Local may retain the original synthesized global as the memcpy
-    // source. Treat it as immutable only when every remaining use is a
-    // non-volatile memcpy source; any load, store, GEP, or unknown call makes
-    // this proof fail conservatively.
     for (Use *U : Source->getUses()) {
         if (!U || U->getValue() != Source) continue;
         auto *CI = dynamic_cast<CallInst *>(U->getUser());
@@ -740,6 +764,8 @@ bool LocalAggregateSimplifyPass::isProvablyReadOnlySource(Variable *Source) {
     return true;
 }
 
+// 步骤 2/3 的初始化匹配：memcpy 必须从已证只读的同形全局源完整覆盖目标
+// alloca，字节数为非负精确常量，不接受部分初始化。
 bool LocalAggregateSimplifyPass::isWholeConstantCopy(
     CallInst *CI, AllocaInst *Destination, Variable *Source) {
     if (!CI || !Destination || !Source ||
@@ -756,8 +782,8 @@ bool LocalAggregateSimplifyPass::isWholeConstantCopy(
            IRType::hasSameShape(DestTy, SourceTy);
 }
 
-// Constant forwarding is intentionally restricted to one block. Validate the
-// whole pointer-use graph first so an unmodelled use cannot silently alias it.
+// 步骤 2.1：在转发前遍历 alloca 的完整透明指针图，要求所有派生地址、
+// load/store 和 memcpy 都位于同一基本块；任何逃逸或未知用途都拒绝整项。
 bool LocalAggregateSimplifyPass::hasSupportedSameBlockUses(
     AllocaInst *AI, BasicBlock *BB) {
     std::vector<Value *> Worklist{AI};
@@ -793,6 +819,8 @@ bool LocalAggregateSimplifyPass::hasSupportedSameBlockUses(
     return true;
 }
 
+// 步骤 2 主流程在单块程序序上维护“最近完整常量初始化 + 各元素覆盖”状态，
+// 只替换能由该精确状态回答的常量路径 load。
 bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     BasicBlock *BB = AI ? AI->getParent() : nullptr;
     if (!BB || !hasSupportedSameBlockUses(AI, BB)) return false;
@@ -805,6 +833,8 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
 
     auto Instructions = collectInstructions(*BB);
     Function *ParentF = BB->getParent();
+    // 2.2 若函数含计时语义，先收集该对象的全部访问并逐对检查屏障；固定预算
+    // 限制二次检查开销，任何可能跨屏障的转发都整体放弃。
     if (ParentF && ParentF->mayReachTimingCall()) {
         std::vector<Instruction *> Accesses;
         for (Instruction *I : Instructions) {
@@ -825,13 +855,14 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
         if (Accesses.size() > 128) return false;
         for (Instruction *From : Accesses) {
             for (Instruction *To : Accesses) {
-                // 自身配对同时覆盖经过计时调用后回到该访问的循环。
                 if (ParentF->hasTimingBarrierOnPath(From, To))
                     return false;
             }
         }
     }
 
+    // 2.3 顺序解释同块指令：计时调用或不支持的写入使状态失效；完整常量
+    // memcpy 重置初值，常量路径 store 更新覆盖表，load 从覆盖或初值中转发。
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
             if (CI->mayReachTimingCall()) {
@@ -899,11 +930,13 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
         Changed = true;
     }
 
+    // 2.4 扫描结束后统一删除已被替换的 load，避免遍历过程中链表失效。
     for (LoadInst *LI : DeadLoads)
         delete LI;
     return Changed;
 }
 
+// 步骤 3 的形状辅助只接受一维标量数组，并返回固定元素数。
 int LocalAggregateSimplifyPass::getOneDimScalarArrayCount(AllocaInst *AI) {
     auto ArrTy = std::dynamic_pointer_cast<ARRAYType>(AllocaInst::getAllocatedType(AI));
     if (!ArrTy || !IRType::isScalar(ArrTy->getElementType()))
@@ -911,6 +944,8 @@ int LocalAggregateSimplifyPass::getOneDimScalarArrayCount(AllocaInst *AI) {
     return ArrTy->getElementCount();
 }
 
+// bool index 仅能覆盖至多两个元素；普通整数可为后续表达式或 select 比较
+// 构造任意合法元素编号。
 bool LocalAggregateSimplifyPass::indexTypeCanSelectAll(
     Value *Index, int Count) {
     if (!Index || !Index->getIRType() ||
@@ -919,6 +954,9 @@ bool LocalAggregateSimplifyPass::indexTypeCanSelectAll(
     return !Index->getIRType()->isBool() || Count <= 2;
 }
 
+// 步骤 3.2：构造只读局部数组展开计划。alloca 只能有一次完整常量 memcpy
+// 初始化和若干直接元素 GEP；每个 GEP 只能被 load，初始化还须在所有 load
+// 的控制流位置之前满足当前实现的入口/同块顺序约束。
 bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
     Function &F, AllocaInst *AI,
     LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count) {
@@ -993,6 +1031,8 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
     return true;
 }
 
+// 步骤 3.3：常量索引直接取元素；动态索引若所有元素相同直接取公共值，否则
+// 在原 load 前构造逐元素比较/select 链，并记录每个新节点供事务式回滚。
 Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
     Variable *Source, int Count, Value *Index, Instruction *InsertBefore,
     std::vector<Instruction *> &Created) {
@@ -1041,6 +1081,8 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
     return Result;
 }
 
+// 步骤 3 主流程先完整验证数组、索引、类型、计时顺序与代码增长收益，再为
+// 全部 load 构造替换值；任一失败都回滚所有新指令，成功后统一删除旧对象。
 bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     Function &F, AllocaInst *AI) {
     constexpr int kMaxDynamicSelectArrayElements = 2;
@@ -1051,6 +1093,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     LocalAggregateReadOnlyConstantArrayPlan Plan;
     if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
         return false;
+    // 3.4 初始化和每个读取之间不得穿过计时屏障，否则消除内存访问可能改变
+    // 计时边界内的动态指令序列。
     std::vector<Instruction *> TimingAccesses{Plan.InitCopy};
     for (LoadInst *LI : Plan.Loads) {
         if (!LI) return false;
@@ -1071,6 +1115,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         Expression = synthesizeInt32TableExpression(TableValues);
     bool CanUseExpression = isSynthExpressionProfitable(Expression);
 
+    // 3.5 统一表无需 select；非统一动态表优先采用有收益的综合表达式，若未
+    // 综合成功则只允许至多两个元素的极小 select 链。
     Value *First = Variable::getConstantElement(Plan.Source, {0});
     bool Uniform = First != nullptr;
     for (int I = 1; Uniform && I < Count; ++I)
@@ -1105,6 +1151,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         Count > kMaxDynamicSelectArrayElements && !Uniform)
         return false;
 
+    // 3.6 预构造每个 load 的替换。综合表达式、常量元素和 select 链必须与
+    // load 类型同形；任一项失败时逆序删除本计划创建的全部节点。
     std::vector<std::pair<LoadInst *, Value *>> Replacements;
     std::vector<Instruction *> Created;
     Replacements.reserve(Plan.Loads.size());
@@ -1130,8 +1178,6 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         if (!Replacement ||
             !IRType::hasSameShape(LI->getIRType(),
                                   Replacement->getIRType())) {
-            // 所有替换都在验证结束后统一提交；失败时按逆序删除新建节点，
-            // 保证 pass 不会留下半完成的表达式或 select 链。
             for (auto It = Created.rbegin(); It != Created.rend(); ++It)
                 delete *It;
             return false;
@@ -1139,6 +1185,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         Replacements.push_back({LI, Replacement});
     }
 
+    // 3.7 所有构造均成功后提交：替换并删除 load、初始化 memcpy、无用元素
+    // GEP，最后仅在 alloca 已无 use 时删除根对象。
     for (auto &Replacement : Replacements) {
         Replacement.first->replaceAllUsesWith(Replacement.second);
         delete Replacement.first;
@@ -1155,6 +1203,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     return true;
 }
 
+// 步骤 4.4：为一个精确标量路径登记槽位类型；重复路径必须保持同一标量
+// 类型，新路径使总槽数超出预算时立即拒绝标量化。
 bool LocalAggregateSimplifyPass::addScalarSlot(
     std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,
     const std::vector<int> &Path,
@@ -1168,6 +1218,8 @@ bool LocalAggregateSimplifyPass::addScalarSlot(
     return static_cast<int>(SlotTypes.size()) <= MaxScalarizedElements;
 }
 
+// 步骤 4.5：递归验证某个派生指针的完整 use 闭包。标量末端只允许 load/store；
+// 其余路径只能继续经过可展平的标量常量偏移或零基常量聚合 GEP。
 bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
     AllocaInst *AI, Value *Ptr, const std::vector<int> &PtrPath,
     std::vector<GetElementPtrInst *> &TransparentPtrs,
@@ -1197,6 +1249,8 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
         }
 
         int Offset = 0;
+        // 4.5.1 标量偏移先把当前路径展平成线性编号，再按偏移反解回根聚合
+        // 路径；越界、类型不匹配或同一 GEP 映射冲突均拒绝。
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
             GEP && OperandIndex == 0 &&
             getConstantOffsetScalarGEP(Ptr, GEP, Offset)) {
@@ -1234,6 +1288,8 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
 
         std::vector<int> NewPath;
         std::shared_ptr<IRType> NewPointeeTy;
+        // 4.5.2 聚合派生 GEP 追加全常量相对路径；末端只能是标量或可继续
+        // 递归的数组，其他复合类型不在本 pass 的标量化范围内。
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
             GEP && OperandIndex == 0 &&
             appendConstantAggregateGEPPath(Ptr, GEP, PtrPath, NewPath,
@@ -1268,6 +1324,8 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
     return true;
 }
 
+// 步骤 4 主流程先建立完整标量化计划，再创建槽位并替换地址；计划要求对象
+// 地址不逃逸、所有访问路径恒定，且可选初始化 memcpy 的顺序完全可证明。
 bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     AllocaInst *AI) {
     constexpr int kMaxScalarizedElements = 32;
@@ -1284,6 +1342,8 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     std::map<GetElementPtrInst *, std::vector<int>> DirectPath;
     std::map<GetElementPtrInst *, std::vector<int>> TransparentPath;
 
+    // 4.1 收集根 alloca 的直接用途：至多一次完整只读 memcpy 初始化，其余
+    // 必须是全常量 GEP；遇到标量末端时登记对应槽位。
     for (Use *U : AI->getUses()) {
         if (!U || U->getValue() != AI) continue;
         auto *UserI = dynamic_cast<Instruction *>(U->getUser());
@@ -1325,6 +1385,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
 
     if (ElementPtrs.empty()) return false;
 
+    // 4.2 从每个直接 GEP 递归验证透明派生指针与最终内存访问，补全槽位表。
     for (GetElementPtrInst *GEP : ElementPtrs) {
         auto PathIt = DirectPath.find(GEP);
         if (PathIt == DirectPath.end()) return false;
@@ -1337,6 +1398,8 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
 
     if (SlotTypes.empty()) return false;
 
+    // 4.3 有初始化 memcpy 时，所有标量访问与初始化之间不得跨计时屏障；同块
+    // 访问必须位于 memcpy 之后，跨块访问只在初始化位于 alloca 块时接受。
     if (InitCopy) {
         Function *ParentF = AI->getParent()
                                 ? AI->getParent()->getParent()
@@ -1365,11 +1428,12 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         }
     }
 
+    // 4.4 在修改 IR 前提取每个实际槽位的初始化常量，并按真实标量类型核验，
+    // 防止相同存储大小的不同整数位宽被混用。
     std::map<std::vector<int>, Value *> InitialValues;
     if (InitSource) {
         for (auto &Entry : SlotTypes) {
             Value *Init = Variable::getConstantElement(InitSource, Entry.first);
-            // 标量槽位按真实标量类型匹配，区分存储大小相同的不同整数位宽。
             if (!Init ||
                 !IRType::hasSameScalarType(Init->getIRType(),
                                            Entry.second))
@@ -1378,6 +1442,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         }
     }
 
+    // 4.5 在原聚合 alloca 前为每条被访问路径创建标量 alloca。
     std::map<std::vector<int>, AllocaInst *> Slots;
     for (auto &Entry : SlotTypes) {
         auto *Slot = new AllocaInst(Entry.second);
@@ -1388,6 +1453,8 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         Slots[Entry.first] = Slot;
     }
 
+    // 4.6 以标量 store 替代整对象初始化；store 插在原 memcpy 之前，或在无
+    // memcpy 时插在原 alloca 之前，保持后续访问可见的初值。
     if (!InitialValues.empty()) {
         Instruction *InitInsertPoint = InitCopy ? static_cast<Instruction *>(InitCopy)
                                                 : static_cast<Instruction *>(AI);
@@ -1401,6 +1468,8 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         }
     }
 
+    // 4.7 先逆序改写更深的透明派生 GEP，再处理根的直接 GEP，保证先叶子后
+    // 父节点删除；只有精确落到已建槽位的地址才替换。
     for (auto It = TransparentPtrs.rbegin(); It != TransparentPtrs.rend();
          ++It) {
         GetElementPtrInst *GEP = *It;
@@ -1423,6 +1492,7 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
         delete GEP;
     }
 
+    // 4.8 删除已被标量 store 取代的 memcpy，并在根 alloca 确认无 use 后删除。
     if (InitCopy) delete InitCopy;
 
     if (AI->hasUses()) return false;
@@ -1430,6 +1500,8 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
     return true;
 }
 
+// 步骤 5.1：遍历聚合指针闭包，收集纯写入和透明派生地址。load、作为 memcpy
+// 源、保存指针本身或传给未知调用均构成可观察用途，使整个对象不可删除。
 LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
     AllocaInst *AI) {
     LocalAggregateDeadUses Result;
@@ -1473,8 +1545,6 @@ LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
                 continue;
             }
 
-            // load、memcpy 源、保存指针本身或传入未知调用都可能产生
-            // 可观察行为，必须保留整个对象。
             Result.IsDead = false;
             break;
         }
@@ -1482,6 +1552,8 @@ LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
     return Result;
 }
 
+// 步骤 5.2：先删除全部写入，再按发现顺序的逆序删除派生指针，最后仅在根
+// alloca 已无 use 时删除对象；逆序保证叶子先于父地址消失。
 bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     LocalAggregateDeadUses Uses = collectDeadAggregateUses(AI);
     if (!Uses.IsDead) return false;
@@ -1489,7 +1561,6 @@ bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     for (Instruction *I : Uses.Writes)
         delete I;
 
-    // 父地址先于派生地址被发现，因此逆序删除可保证先叶子、后根节点。
     for (auto It = Uses.DerivedPointers.rbegin();
          It != Uses.DerivedPointers.rend(); ++It) {
         Instruction *I = *It;
@@ -1501,6 +1572,7 @@ bool LocalAggregateSimplifyPass::deleteDeadAggregate(AllocaInst *AI) {
     return true;
 }
 
+// 每个阶段重新快照仍存活的数组 alloca，避免前一阶段删除对象后留下悬空项。
 std::vector<AllocaInst *>
 LocalAggregateSimplifyPass::collectArrayAllocas(Function &F) {
     std::vector<AllocaInst *> Aggregates;
@@ -1514,16 +1586,23 @@ LocalAggregateSimplifyPass::run(Function &F,
                                 FunctionAnalysisPassManager &FAM) {
     bool Changed = false;
 
+    // 1. 先折叠只读全局 load 与可综合动态查表。
     Changed |= foldReadOnlyGlobalLoads(F, FAM);
+    // 2. 转发同块内由完整常量拷贝和常量覆盖确定的元素 load。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= forwardConstantLoads(AI);
+    // 3. 将只读常量初始化的小数组整体展开并删除内存对象。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= expandReadOnlyConstantArrayLoads(F, AI);
+    // 4. 把剩余仅有常量路径访问的聚合拆成标量槽。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= scalarizeConstantIndexedAggregate(AI);
+    // 5. 删除最后仍只被写入、从未被观察的聚合对象。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= deleteDeadAggregate(AI);
 
+    // 6. 任一阶段都可能删除内存操作、指针表达式或 alloca，保守失效全部函数
+    // 分析；完全未改写时保留所有分析结果。
     return Changed ? PreservationStatus::none()
                    : PreservationStatus::all();
 }

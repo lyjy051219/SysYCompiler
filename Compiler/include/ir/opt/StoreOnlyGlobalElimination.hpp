@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+// 单地址追踪结果同时携带全局根、根到叶常量索引路径及变量索引/解析失败标志。
 struct StoreOnlyGlobalTraceResult {
     Value *base = nullptr;
     std::vector<int64_t> constPath;
@@ -14,17 +15,20 @@ struct StoreOnlyGlobalTraceResult {
     bool unresolved = false;
 };
 
+// 每个全局的读取摘要：精确第一维索引集合，或“任意索引可能被读”的保守状态。
 struct StoreOnlyGlobalReadInfo {
     bool anyIndexRead = false;
     std::unordered_set<int64_t> constIdx;
 };
 
-// 只写全局变量消除（索引精确版）：
-//   1) 对每个全局 G，跟踪是否被读，以及（对数组 G）被读的"常量索引集合"
-//   2) 复用 SideEffectAnalysis：Call 的实参只在 callee 实际 Ref 时才算读
-//   3) 删除：store 到从未被读的 global 全删；store 到数组常量索引 c 且 c
-//      不在读集合且数组没有变量索引读 → 删
-// 需要访问 FAM 以查 SideEffect/BasicAA/LoopInfo
+ 
+ 
+ 
+ 
+ 
+ 
+// 流程：1. 全模块收集 load/call 对全局及索引的读取摘要；2. 删除从未被读的写入；
+// 3. 对无写标量传播静态初值；4. 删除失去全部 use 的全局对象。
 class StoreOnlyGlobalEliminationPass : public PassDescriptor<StoreOnlyGlobalEliminationPass> {
 public:
     explicit StoreOnlyGlobalEliminationPass(

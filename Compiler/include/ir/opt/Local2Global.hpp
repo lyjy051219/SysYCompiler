@@ -5,7 +5,9 @@
 
 #include <cstddef>
 
-// 将超大局部栈分配(alloca)提升为全局变量，避免超大栈对象。
+ 
+// 流程：1. 排除递归 main；2. 从入口 alloca 中筛选不跨计时屏障的大对象；
+// 3. 创建同型全局、替换全部 use 并删除栈分配。
 class Local2GlobalPass : public PassDescriptor<Local2GlobalPass> {
 public:
 	PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
@@ -13,7 +15,7 @@ public:
 private:
 	static constexpr size_t RISCVThreshold = 1024;
 
-	// 递归入口的栈对象不能提升成所有栈帧共享的全局对象。
+	 
 	static bool isRecursiveFrom(
 		Function *F, const FunctionCallGraph &CallGraph);
 };

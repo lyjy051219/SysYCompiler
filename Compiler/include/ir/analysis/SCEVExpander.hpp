@@ -9,17 +9,14 @@
 #include <unordered_set>
 #include <vector>
 
-// Materialize the small, loop-invariant SCEV language used by this project.
-//
-// This is deliberately a separate utility instead of transform-specific
-// recursive builders.  A preflight walk checks dominance, expression shape,
-// division safety and a hard cost budget before any instruction is inserted,
-// so callers never leave a half-expanded expression in the IR.
+// SCEVExpander 把循环不变的有限 SCEV 子语言物化到指定块终结指令之前。
+// 流程先检查支配、表达式形状和成本预算，再事务式插入并记录新指令。
 class SCEVExpander {
 public:
     SCEVExpander(const Loop *Scope, BasicBlock *InsertBlock,
                  const DominatorTree &DT, unsigned Budget = 16);
 
+    // canExpand/estimateCost 是无副作用预检；expand 失败时不会留下部分 IR。
     bool canExpand(const SCEVExpr *E) const;
     int estimateCost(const SCEVExpr *E) const;
     Value *expand(const SCEVExpr *E);

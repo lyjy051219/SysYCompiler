@@ -11,7 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
-// 查询结果的构造统一放在实现文件，头文件只暴露语义明确的工厂接口。
+ 
 LoadElimQueryResult LoadElimQueryResult::known(Value *V) {
     return {KNOWN, V, {}};
 }
@@ -33,32 +33,32 @@ LoadElimQueryResult LoadElimQueryResult::phiNeeded(
     return {PHI_NEEDED, nullptr, std::move(M)};
 }
 
-// =====================================================================
-// LoadElimination++ — Available Memory Value Forwarding
-//
-// 对每个 load P，回答：所有到达此 load 的路径上，
-// P 的最近相关内存事件各给出什么值？
-//
-// Known(V):       所有路径值相同 → load 替换为 V
-// PhiNeeded:      各前驱已知但值不同 → 在当前块头插 PHI
-// Clobbered:      某路径上出现无法证明的事件 → 保守不动
-// Unknown:        预算耗尽 / 环依赖 → 保守不动
-// NeedPredecessors: 块内没找到定义，要继续查前驱（仅内部使用）
-//
-// 和 DSE 的关键区别：纯 Ref（只读）不阻断 load forwarding。
-// 只有 Mod（写操作）才破坏已知值。
-//
-// 比 cmmc 强在：
-// - 递归回溯 predecessor（最多 8 层），不只看一层 last-value
-// - AA MustAlias + 类型检查，不只做精确指针匹配
-// - if-else PHI synthesis（分支两边不同值 → 自动造 PHI）
-// - onStack + memo 正确处理钻石图和循环
-// - 支配 load 跨透明回边复用（完整路径无 Mod 证明）
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 
-// =====================================================================
-// 辅助函数
-// =====================================================================
+ 
+ 
+ 
 
 bool LoadEliminationPass::isTypeCompatible(
     Value *source, LoadInst *targetLoad) {
@@ -72,10 +72,12 @@ bool LoadEliminationPass::mayModifyPointer(
     const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 1.1 把计时调用视为完整屏障，再以 ModRef 为主判据；对摘要声称 NoModRef
+    // 的普通调用追加实参与目标地址的别名兜底，任何不确定写入都终止转发。
     Value *P = Location.Pointer;
     if (!P || !I) return true;
 
-    // 计时调用及其包装调用是完整优化屏障，不能把内存值跨过它复用。
+     
     if (auto *CI = dynamic_cast<CallInst *>(I);
         CI && CI->mayReachTimingCall()) {
         return true;
@@ -93,21 +95,23 @@ bool LoadEliminationPass::mayModifyPointer(
     return false;
 }
 
-// Check the complete CFG region between Candidate and Target.  Block
-// dominance alone is insufficient: a backedge may execute a store after the
-// dominating load and before a later dynamic execution of Target.  Walking
-// backwards over every predecessor (including loop backedges) and rejecting
-// any possible Mod proves that Candidate's value is still available.
-//
-// Reaching Candidate cuts a path: an execution through Candidate refreshes
-// the SSA value, so instructions before it are irrelevant.  The visited set
-// makes transparent cycles converge.  DT dominance guarantees that no finite
-// entry-to-Target path can bypass Candidate.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool LoadEliminationPass::isUnmodifiedOnAllPaths(
     LoadInst *Candidate, LoadInst *Target, Value *P,
     DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 2.1 候选 load 必须支配目标。随后从目标反向遍历全部前驱路径，直到每条路径
+    // 都命中候选；期间一旦出现可能修改该地址的指令，证明即失败。
     if (!Candidate || !Target || !P) return false;
     BasicBlock *CandidateBB = Candidate->getParent();
     BasicBlock *TargetBB = Target->getParent();
@@ -125,10 +129,12 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
         BasicBlock *BB = State.BB;
         if (!BB) return false;
 
-        // The initial Target state scans only instructions before the load.
-        // If a loop backedge reaches TargetBB again, it must be scanned as a
-        // complete block so that a store *after* Target in the previous
-        // iteration is not missed.
+         
+         
+         
+         
+        // 目标块首次只扫描 load 之前的前缀；经回边再次到达时必须扫描整块，
+        // 才不会漏掉上一轮迭代中位于目标 load 之后的写入。
         if (!State.TargetPrefixOnly && !visited.insert(BB).second) continue;
         if (++scannedBlocks > MaxPathScanBlocks) return false;
 
@@ -146,8 +152,8 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
         }
 
         if (BB == CandidateBB) {
-            // Candidate must physically belong to this block and precede all
-            // instructions that were scanned above.
+             
+             
             if (!reachedCandidate) return false;
             continue;
         }
@@ -162,27 +168,29 @@ bool LoadEliminationPass::isUnmodifiedOnAllPaths(
     return true;
 }
 
-// The recursive predecessor solver intentionally treats a CFG cycle as
-// Unknown.  That is correct for arbitrary reaching definitions, but misses a
-// common nested-loop case:
-//
-//   invariant = load A[i][k]       // dominates the inner loop
-//   while (j < n) use load A[i][k]
-//
-// Search the dominator chain for such a load and separately prove that the
-// entire intervening CFG region contains no possible Mod of the address.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
     LoadInst *Target, BasicBlock *BB, DominatorTree &DT,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 2.2 该兜底只服务循环：地址必须在目标循环外定义，再沿支配链寻找循环外、
+    // MustAlias 且类型一致的 load，并交给全路径扫描验证跨迭代没有写入。
     Value *P = Target ? Target->getPointerOperand() : nullptr;
     if (!Target || !BB || !P) return nullptr;
 
-    // This fallback exists specifically for a predecessor query stopped by a
-    // loop backedge.  Outside loops the normal dataflow is cheaper.  Reusing a
-    // value across iterations also requires the address itself to be defined
-    // outside the innermost loop.
+     
+     
+     
+     
     Loop *TargetLoop = LI.getLoopFor(BB);
     if (!TargetLoop) return nullptr;
     if (auto *PtrI = dynamic_cast<Instruction *>(P)) {
@@ -217,18 +225,19 @@ LoadInst *LoadEliminationPass::findAvailableDominatingLoad(
     return nullptr;
 }
 
-// =====================================================================
-// scanBlockBackward: 从块内某位置向前扫描，寻找 P 的最近可用值。
-//
-// stopBefore: 扫描到此指令前停止。nullptr = 从块末尾开始扫全块。
-// targetLoad: 正在查询的 load 指令，用于类型检查和避免自引用。
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
 LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     BasicBlock *BB, Value *P, Instruction *stopBefore, LoadInst *targetLoad,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    // 确定起始指令
+    // 3.1 从指定位置向块首逆向寻找最近内存事件：MustAlias store/load 给出已知值，
+    // MayAlias 写入或有写效应调用返回 Clobbered，纯读事件可以继续穿越。
     Instruction *cur = nullptr;
     if (stopBefore) {
         cur = stopBefore->getPrev();
@@ -237,7 +246,7 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     }
 
     while (cur) {
-        // store → load forwarding
+         
         if (auto *SI = dynamic_cast<StoreInst *>(cur)) {
             Value *StorePtr = SI->getPointerOperand();
             Value *StoredVal = SI->getValueOperand();
@@ -247,11 +256,11 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
                     return LoadElimQueryResult::known(StoredVal);
                 }
                 if (ai != AliasInfo::NoAlias) {
-                    return LoadElimQueryResult::clobbered();  // MayAlias store → 值可能被改
+                    return LoadElimQueryResult::clobbered();   
                 }
             }
         }
-        // load → load 复用
+         
         else if (auto *LI2 = dynamic_cast<LoadInst *>(cur)) {
             if (LI2 != targetLoad) {
                 Value *LoadPtr = LI2->getPointerOperand();
@@ -261,7 +270,7 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
                 }
             }
         }
-        // CallInst: 先查 ModRef（主判据），helper 做 fallback
+         
         else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
             if (CI->mayReachTimingCall()) {
                 return LoadElimQueryResult::clobbered();
@@ -271,14 +280,14 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
             if (isModSet(MR)) {
                 return LoadElimQueryResult::clobbered();
             }
-            // 纯 Ref → 不阻断 load forwarding，继续
-            // 安全网：ModRef 说 NoModRef 但传了 aliasing pointer → Clobbered
+             
+             
             if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
                 AA.callMayAliasPointer(CI, P, LI)) {
                 return LoadElimQueryResult::clobbered();
             }
         }
-        // 其他指令
+         
         else {
             ModRefInfo MR = getInstModRefInfo(
                 MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
@@ -293,12 +302,12 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
     return LoadElimQueryResult::needPredecessors();
 }
 
-// =====================================================================
-// queryAvailableValue: 递归查询块末尾 P 的可用值。
-//
-// onStack: 当前递归栈上的块（检测真实 CFG 环）
-// memo:    缓存块末尾查询结果（钻石图共享祖先只算一次）
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
 LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     Value *P, BasicBlock *BB, LoadInst *targetLoad, int depth,
     std::unordered_set<BasicBlock*> &onStack,
@@ -306,21 +315,23 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 3.2 递归求解块入口的可用值。深度预算、递归栈环或无法解释的前驱都保守失败；
+    // memo 让钻石 CFG 的公共祖先只求解一次。
     if (depth > MaxQueryDepth) {
         return LoadElimQueryResult::unknown();
     }
 
-    // 环检测：当前递归栈上的块
+     
     ScopedActiveMark ActiveMark(onStack, BB);
     if (!ActiveMark.inserted()) return LoadElimQueryResult::unknown();
 
-    // 缓存命中
+     
     auto memoIt = memo.find(BB);
     if (memoIt != memo.end()) {
         return memoIt->second;
     }
 
-    // 块内扫描（扫全块，从末尾开始）
+     
     LoadElimQueryResult result = scanBlockBackward(BB, P, nullptr, targetLoad, AA, LI, FAM);
 
     if (result.kind == LoadElimQueryResult::KNOWN || result.kind == LoadElimQueryResult::CLOBBERED) {
@@ -328,10 +339,12 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
         return result;
     }
 
-    // result.kind == NEED_PREDECESSORS
+     
+    // 3.3 汇总全部前驱：值相同则直接可用，值不同则返回需在当前汇合点建 PHI；
+    // 任一路径被 clobber 或还需要嵌套 PHI 时，本层不继续猜测。
     auto preds = BB->getPredecessors();
     if (preds.empty()) {
-        // 函数入口，P 的初始值未知
+         
         memo[BB] = LoadElimQueryResult::clobbered();
         return memo[BB];
     }
@@ -358,7 +371,7 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
                 allSame = false;
             }
         } else if (predResult.kind == LoadElimQueryResult::PHI_NEEDED) {
-            // 前驱本身需要 PHI → 第一版不处理嵌套 PHI
+             
             memo[BB] = LoadElimQueryResult::clobbered();
             return memo[BB];
         }
@@ -380,18 +393,19 @@ LoadElimQueryResult LoadEliminationPass::queryAvailableValue(
     return finalResult;
 }
 
-// =====================================================================
-// processLoad: 尝试消除一个 load 指令。
-// =====================================================================
+ 
+ 
+ 
 bool LoadEliminationPass::processLoad(
     LoadInst *loadInst, BasicBlock *BB,
     DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM, int &DominatingQueryBudget)
 {
+    // 4. 单条 load 先查询块内最近定义，这是成本最低且无需修改 SSA 的路径。
     Value *P = loadInst ? loadInst->getPointerOperand() : nullptr;
     if (!P) return false;
 
-    // Step 1: 块内扫描（从 load 位置向前）
+     
     LoadElimQueryResult result = scanBlockBackward(BB, P, loadInst, loadInst, AA, LI, FAM);
 
     if (result.kind == LoadElimQueryResult::KNOWN) {
@@ -401,12 +415,13 @@ bool LoadEliminationPass::processLoad(
     }
 
     if (result.kind != LoadElimQueryResult::NEED_PREDECESSORS) {
-        return false;   // CLOBBERED 或其他
+        return false;    
     }
 
-    // The predecessor query below cannot solve transparent CFG cycles.  A
-    // dominating MustAlias load is nevertheless reusable when every path
-    // from it to this load is proven free of possible modifications.
+     
+     
+     
+    // 4.1 块内无定义时，优先尝试有总预算限制的跨回边支配 load 复用。
     if (DominatingQueryBudget > 0) {
         --DominatingQueryBudget;
         if (LoadInst *available = findAvailableDominatingLoad(
@@ -417,7 +432,9 @@ bool LoadEliminationPass::processLoad(
         }
     }
 
-    // Step 2: 查前驱
+     
+    // 4.2 常规前驱求解要求每条入边均得到已知值；全相同直接替换，否则在块首
+    // 合成 PHI，再用该 PHI 替换 load。
     auto preds = BB->getPredecessors();
     if (preds.empty()) return false;
 
@@ -433,7 +450,7 @@ bool LoadEliminationPass::processLoad(
             P, pred, loadInst, 1, onStack, memo, AA, LI, FAM);
 
         if (predResult.kind != LoadElimQueryResult::KNOWN) {
-            return false;   // 任何非 KNOWN → 放弃
+            return false;    
         }
 
         predValues.push_back({pred, predResult.value});
@@ -454,7 +471,7 @@ bool LoadEliminationPass::processLoad(
         return true;
     }
 
-    // Step 3: PHI synthesis
+     
     PhiInst *phi = new PhiInst(loadInst->getIRType());
     for (auto &[pred, val] : predValues) {
         phi->addIncoming(val, pred);
@@ -465,14 +482,16 @@ bool LoadEliminationPass::processLoad(
     return true;
 }
 
-// =====================================================================
-// processFunction: 支配树前序遍历处理所有 load。
-// =====================================================================
+ 
+ 
+ 
 bool LoadEliminationPass::processFunction(
     Function &F, DominatorTree &DT,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 5. 按支配树前序处理基本块，使支配侧先完成替换；每块先快照 load，避免删除
+    // 当前指令破坏遍历，并共享函数级跨回边查询预算。
     bool changed = false;
     int DominatingQueryBudget = MaxDominatingQueriesPerFunction;
 
@@ -491,11 +510,11 @@ bool LoadEliminationPass::processFunction(
         BasicBlock *BB = node->Block;
         if (!BB) continue;
 
-        // 收集本块所有 load（先收集再处理，避免遍历时删指令）
+         
         auto loads = collectInstructions<LoadInst>(*BB);
 
         for (LoadInst *LI2 : loads) {
-            // 检查 load 是否还活着（可能被前一轮 processLoad 间接影响）
+             
             if (LI2->getParent() != BB) continue;
             changed |= processLoad(LI2, BB, DT, AA, LI, FAM,
                                    DominatingQueryBudget);
@@ -506,20 +525,23 @@ bool LoadEliminationPass::processFunction(
     return changed;
 }
 
-// =====================================================================
-// LoadEliminationPass::run
-// =====================================================================
+ 
+ 
+ 
 PreservationStatus LoadEliminationPass::run(Function &F,
                                             FunctionAnalysisPassManager &FAM) {
+    // 1. 获取别名、循环、支配和 MemorySSA，分别服务内存冲突、回边与定义链证明。
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
-    // MemorySSA can answer the common cross-block case without recursively
-    // rebuilding a reaching-value lattice for each load.  Only forward from
-    // one concrete, dominating, full-width store.  A Phi/LiveOnEntry result,
-    // a MayAlias address, or a walker budget miss is deliberately ignored and
-    // falls through to the existing path solver below.
+     
+     
+     
+     
+     
+    // 2. 快速层：在查询预算内让 MemorySSA 找每个 load 的最近 clobber；只有该定义
+    // 是支配目标且无计时屏障的 MustAlias store，才计划用其存储值转发。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMSSAQueries = 512;
     constexpr std::size_t MaxMSSAWalk = 256;
@@ -552,12 +574,14 @@ PreservationStatus LoadEliminationPass::run(Function &F,
             MSSAReplacements.push_back({Load, Stored});
     }
 
-    // A forwarded store value can itself be an earlier load that is also in
-    // the replacement set.  Resolve that relation before mutating anything;
-    // otherwise deleting the earlier load first can leave a later
-    // replacement pointing at freed IR.  Cycles are not expected in valid
-    // dominance order, but are rejected conservatively rather than relying on
-    // that assumption.
+     
+     
+     
+     
+     
+     
+    // 2.1 先解析计划之间的传递依赖并检测环，再批量替换 use、批量删除 load，
+    // 避免先删一个 load 后让另一条计划持有悬空替换值。
     std::unordered_map<LoadInst *, Value *> Planned;
     for (const auto &Replacement : MSSAReplacements)
         Planned.emplace(Replacement.first, Replacement.second);
@@ -597,12 +621,14 @@ PreservationStatus LoadEliminationPass::run(Function &F,
         changed = true;
     }
 
+    // 3—5. 对快速层未覆盖的 load 运行块内、前驱数据流与跨回边支配证明。
     changed |= processFunction(F, DT, AA, LI, FAM);
 
     if (!changed) {
         return PreservationStatus::all();
     }
 
+    // 6. CFG 未变，结构分析可保留；load 消失改变别名缓存、MemorySSA 和副作用摘要。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

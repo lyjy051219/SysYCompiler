@@ -5,13 +5,15 @@
 #include <cstdint>
 #include <unordered_set>
 
-// Late, control-flow-neutral strength reduction.
-//
-// This pass intentionally avoids the full RangeAwareSimplify comparison and
-// constant folds, because after loop rotation/LCSSA those folds are much more
-// sensitive to contextual range precision. It only rewrites signed div/rem by
-// a positive power-of-two when the dividend is syntactically guaranteed
-// non-negative.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+// 流程：1. 快照残留整数除余；2. 无符号 2 次幂直接降为移位/掩码；
+// 3. 有符号路径先证明非负，否则仅对除以 2 构造符号偏置序列；4. 失效值分析。
 class LateStrengthReducePass : public PassDescriptor<LateStrengthReducePass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

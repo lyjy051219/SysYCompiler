@@ -10,26 +10,25 @@
 #include <set>
 #include <string>
 
-//Preds->MergeBlock->Target
-//修改Target中的Phi节点--将来自Preds的边提升到MergeBlock的新Phi，并将MergeBlock这个新Phi作为Target
+// CFG 合并步骤的公共 PHI 修复：把 Preds 对 Target 的多条输入先汇入
+// MergeBlock，再让 Target 只接收一条来自 MergeBlock 的输入。新建 PHI 始终
+// 放在块首，保持“PHI 先于普通指令”的结构不变量。
 bool LoopSimplifyPass::rewritePhisForMergedPreds(
     BasicBlock *Target,
     const std::unordered_set<BasicBlock *> &Preds,
     BasicBlock *MergeBlock) {
     if (!Target || !MergeBlock || Preds.empty()) return false;
 
-    //1. 收集Target中的Phi节点 (已重构为面向对象调用)
+    // 1. 快照目标块 PHI，避免替换和删除过程中迭代器失效。
     auto phis = Target->collectPhiNodes();
     bool changed = false;
 
-    //2.遍历每个Phi节点
+    // 2. 对每个 PHI 拆分待合并输入与原样保留的输入。
     for (PhiInst *phi : phis) {
         std::vector<std::pair<Value *, BasicBlock *>> moved;
         std::vector<std::pair<Value *, BasicBlock *>> kept;
-        //遍历当前Phi节点的所有输入边，收集来自Preds的边到moved里，其他边到kept里
         forEachPhiIncoming(
             phi, [&](unsigned, Value *inValue, BasicBlock *inBlock) {
-            //判断每个输入边的来源块是否在Preds中，如果在就放到moved里，否则放到kept里
             if (Preds.count(inBlock)) {
                 moved.push_back({inValue, inBlock});
             } else {
@@ -40,29 +39,25 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
         if (moved.empty()) continue;
 
         Value *mergedValue = nullptr;
-        //如果moved只有一条边，说明Preds只有一个Value传递到了Target，那么就直接用这个Value作为mergedValue
+        // 3. 多条输入在 MergeBlock 内新建桥接 PHI；单条输入可直接透传。
         if (moved.size() == 1) {
             mergedValue = moved.front().first;
         } else {
-            //如果moved包含多条边，用moved中的Value和BasicBlock创建一个新的Phi节点mergePhi
             auto *mergePhi = new PhiInst(phi->getIRType());
             for (auto &kv : moved) {
                 mergePhi->addIncoming(kv.first, kv.second);
             }
-            // 【致命Bug已修复】：必须使用 push_front 保证 PHI 节点在基本块的最顶端！
             MergeBlock->pushFront(mergePhi);
             mergedValue = mergePhi;
         }
 
-        //为Target创建一个newPhi，将kept和mergedValue作为输入边添加到newPhi中
+        // 4. 用“保留输入 + 合并输入”重建目标 PHI，并消去仅剩单输入的退化项。
         auto *newPhi = new PhiInst(phi->getIRType());
         for (auto &kv : kept) {
             newPhi->addIncoming(kv.first, kv.second);
         }
         newPhi->addIncoming(mergedValue, MergeBlock);
 
-        //如果合并完newPhi只有一个输入，那么就删除newPhi
-        //剩下的就是常规将使用Phi的地方替换成newPhi
         if (newPhi->getNumIncomingValues() == 1) {
             phi->replaceAllUsesWith(newPhi->getIncomingValue(0));
             delete newPhi;
@@ -77,11 +72,11 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
     return changed;
 }
 
+// 步骤 1：收集全部循环外前驱；若尚无唯一直连预头，则插入合并块、重定向
+// 入口边并通过公共 PHI 修复保持每条入边的原值。
 bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
-    //第一步：获取该循环的循环头
     BasicBlock *header = L.getHeader();
     if (!header) return false;
-    //第二步：获取所有来自循环外部（用LoopAnalysis去判定）的前驱块
     std::vector<BasicBlock *> outPreds;
     for (BasicBlock *pred : header->getPredecessors()) {
         if (!L.contains(pred)) {
@@ -91,8 +86,7 @@ bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
 
     if (outPreds.empty()) return false;
 
-    // 幂等性保护：如果已存在唯一外部前驱且该前驱只跳转到 Header，
-    // 说明 PreHeader 形态已经满足，不应重复插入。
+    // 已有唯一外部前驱且只通向循环头时，它本身就是合格预头。
     if (outPreds.size() == 1) {
         BasicBlock *candidate = outPreds.front();
         auto succs = candidate ? candidate->getSuccessors() : std::vector<BasicBlock *>{};
@@ -101,25 +95,24 @@ bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
         }
     }
 
-    //第三步：创建PreHeader
     auto *preheader = new BasicBlock();
     F.pushBlock(preheader);
-    //第四步：建立前驱块和PreHeader之间的联系，取消前驱块和Header之间的联系--其实就是改动Br
+    // 先重定向 CFG，再按同一前驱集合重建头部 PHI，最后补上预头到头部的边。
     for (BasicBlock *pred : outPreds) {
         BasicBlock::redirectBranchTarget(pred, header, preheader);
     }
-    //第五步：修改Header中的Phi节点
     std::unordered_set<BasicBlock *> outSet(outPreds.begin(), outPreds.end());
     rewritePhisForMergedPreds(header, outSet, preheader);
-    //第六步：添加Br在PreHeader和Header之间
+
     preheader->genUnCondInst(header);
     return true;
 }
 
+// 步骤 2：为同时含循环内外前驱的出口插入专用出口。每次只拆一个出口，
+// 防止继续使用已因本次 CFG 变更而过期的 LoopInfo。
 bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
-    //Key:ExitingBlock Value:来自循环内部的前驱块集合
     std::map<BasicBlock *, std::set<BasicBlock *>> exitInsidePreds;
-    //遍历所有的出口块，及其循环内部的前驱
+    // 2.1 按退出目标归并所有来自循环内部的边。
     for (auto *bb : F) {
         if (!L.contains(bb)) continue;
         for (BasicBlock *succ : bb->getSuccessors()) {
@@ -133,7 +126,7 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
         BasicBlock *exitBB = it.first;
         const std::set<BasicBlock *> &insidePredSet = it.second;
         if (!exitBB || insidePredSet.empty()) continue;
-        //只有这个ExitingBlock有来自循环外部的前驱我们才需要加入DedicatedExit
+        // 2.2 只有还存在循环外前驱时，目标块才不是专用出口。
         bool hasOutsidePred = false;
         for (BasicBlock *pred : exitBB->getPredecessors()) {
             if (!L.contains(pred)) {
@@ -143,10 +136,10 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
         }
 
         if (!hasOutsidePred) continue;
-        //创建DedicatedExit块
+        // 2.3 插入中转块、重定向循环内退出边并同步折叠目标 PHI 输入。
         auto *dedExit = new BasicBlock();
         F.pushBlock(dedExit);
-        //依旧还是那三步
+
         std::unordered_set<BasicBlock *> insidePreds(insidePredSet.begin(), insidePredSet.end());
         for (BasicBlock *pred : insidePredSet) {
             BasicBlock::redirectBranchTarget(pred, exitBB, dedExit);
@@ -154,23 +147,19 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
 
         rewritePhisForMergedPreds(exitBB, insidePreds, dedExit);
         dedExit->genUnCondInst(exitBB);
-
-        // LoopInfo belongs to the CFG snapshot at pass entry.  Even though a
-        // dedicated exit is outside the loop, do not perform another CFG
-        // rewrite with that snapshot.  The caller invalidates/rebuilds the
-        // dominator tree and LoopInfo before continuing with the next exit.
+        // LoopInfo 对应入口时的 CFG 快照；提交一次结构变化后立即返回。
         return true;
     }
 
     return false;
 }
 
+// 步骤 3：多个循环内前驱都回到头部时，插入唯一 latch，并用桥接 PHI 合并
+// 每条回边携带的递推值。
 bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
     BasicBlock *header = L.getHeader();
     if (!header) return false;
-    //vector用来存放所有回边的来源块
     std::vector<BasicBlock *> backedgePreds;
-    //遍历前驱依据LoopInfo找到所有回边来源块
     for (BasicBlock *pred : header->getPredecessors()) {
         if (L.contains(pred)) {
             backedgePreds.push_back(pred);
@@ -178,10 +167,9 @@ bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
     }
 
     if (backedgePreds.size() <= 1) return false;
-    //创建Latch块
     auto *latch = new BasicBlock();
     F.pushBlock(latch);
-    //依旧是那三步
+
     std::unordered_set<BasicBlock *> backedgeSet(backedgePreds.begin(), backedgePreds.end());
     for (BasicBlock *pred : backedgePreds) {
         BasicBlock::redirectBranchTarget(pred, header, latch);
@@ -192,25 +180,26 @@ bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
     return true;
 }
 
+// 步骤 3.2：在 CFG 已规范时清理头部的空 PHI、单输入 PHI 和纯自环 PHI；
+// 这些改写只改变 SSA，不改变控制流。
 bool LoopSimplifyPass::simplifyHeaderPhis(Loop &L) {
     BasicBlock *header = L.getHeader();
     if (!header) return false;
 
-    // (已重构为面向对象调用)
     auto phis = header->collectPhiNodes();
     if (phis.empty()) return false;
 
     bool changed = false;
     for (PhiInst *phi : phis) {
         unsigned n = phi->getNumIncomingValues();
-        // 情况 1：PHI 节点没有任何输入边
+        // 空输入和纯自环没有外部可达定义，统一替换为 undef。
         if (n == 0) {
             phi->replaceAllUsesWith(UndefValue::NewUndefValue(phi->getIRType()));
             delete phi;
             changed = true;
             continue;
         }
-        // 情况 2：退化 PHI —— 只有 1 条输入边
+        // 单输入 PHI 直接转发唯一值。
         if (n == 1) {
             phi->replaceAllUsesWith(phi->getIncomingValue(0));
             delete phi;
@@ -222,7 +211,6 @@ bool LoopSimplifyPass::simplifyHeaderPhis(Loop &L) {
             phi, [phi](unsigned, Value *Incoming, BasicBlock *) {
                 return Incoming == phi;
             });
-        // 情况 3：退化 PHI —— 所有输入边都来自于 PHI 自己（自循环Phi）
         if (allSelf) {
             phi->replaceAllUsesWith(UndefValue::NewUndefValue(phi->getIRType()));
             delete phi;
@@ -237,11 +225,8 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     bool changed = false;
     bool cfgChanged = false;
-    // LoopInfo belongs to the CFG snapshot at pass entry.  Process the loop
-    // forest in post-order, but stop immediately after the first structural
-    // rewrite.  A surrounding FixedPointPass is responsible for invalidating
-    // analyses and invoking us again with fresh DT/LoopInfo where convergence
-    // is required.  This keeps ordinary cleanup invocations cheap.
+    // 1. 以循环森林后序处理内层循环；发生首个 CFG 变化便停止，外层不动点
+    // 会在重建支配树和 LoopInfo 后再次调用本 pass。
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L || !L->getHeader()) continue;
 
@@ -259,8 +244,8 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
 
     PreservationStatus PA;
     if (!cfgChanged) {
-        // 仅做了退化 PHI 简化，不改 CFG；但 pointer PHI replacement
-        // still changes alias and ModRef relationships.
+        // 2. 仅退化 PHI 被消除时保留 CFG 分析；指针 PHI 的替换仍会改变别名
+        // 与 ModRef 结论，因此使相关分析失效。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
@@ -269,6 +254,7 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
         return PA;
     }
 
+    // 3. 插入或重定向基本块后，所有 CFG、循环、别名与副作用分析均需重建。
     PA.discard<DominantAnalysis>();
     PA.discard<PostDominantAnalysis>();
     PA.discard<LoopAnalysis>();
@@ -278,9 +264,8 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
 }
 
 bool LoopSimplifyPass::runOnLoop(Function &F, Loop &L, bool &cfgChanged) {
-    // The loop list is already in post-order.  Return immediately after any
-    // CFG rewrite so the caller can rebuild LoopInfo before attempting the
-    // next canonicalization step (including another step on this same loop).
+    // 对单个循环严格按“预头 → 专用出口 → 唯一 latch → PHI 清理”推进；
+    // 任一结构步骤成功后立即交还控制权，避免读取过期分析。
     if (insertPreHeader(F, L)) {
         cfgChanged = true;
         return true;

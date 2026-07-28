@@ -7,6 +7,7 @@
 
 class PostDominatorTree;
 
+// 标记阶段状态：活跃指令/块、反向数据依赖工作表和已展开控制依赖的块。
 struct ADCEContext {
     std::unordered_set<Instruction*> LiveInsts;
     std::unordered_set<BasicBlock*> LiveBlocks;
@@ -14,9 +15,11 @@ struct ADCEContext {
     std::unordered_set<BasicBlock*> CDProcessed;
 };
 
-// Aggressive Dead Code Elimination
-// Mark-Sweep: 从 root-live 指令反向传播活性 + postdom 控制依赖补活
-// Sweep: 死条件分支改写为无条件跳转 + 删死指令
+ 
+ 
+ 
+// 流程：1. 以可观察操作和必要 CFG 为活跃根；2. 沿操作数和后支配控制依赖求闭包；
+// 3. 将死条件分支改为原后继无条件边；4. 用 undef 断开并删除其余死指令。
 class ADCEPass : public PassDescriptor<ADCEPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

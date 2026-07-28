@@ -99,9 +99,7 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
     if (!C.L || !C.Parent || !C.Branch || !C.Shape.Header) return false;
     if (!isMustExecuteBeforeLoopProgress(C.Parent, *C.L, DT)) return false;
 
-    // Reach the candidate during the first iteration only.  Crossing an edge
-    // back to Header would make an instruction in the region execute before
-    // the candidate in an earlier iteration and invalidate prefix motion.
+    // 3.1 前向收集从 Header 到候选分支的首迭代前缀；若到 Parent 前跨过回边或退出边，则外提会改变动态执行次数。
     BlockSet Forward;
     std::vector<BasicBlock *> ForwardRoots{C.Shape.Header};
     bool ForwardComplete =
@@ -130,9 +128,7 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
             });
     if (!ForwardComplete || !Forward.count(C.Parent)) return false;
 
-    // Every block reachable before Parent must still be able to reach Parent
-    // without taking the loop backedge.  This excludes a side path on which
-    // the original branch was never executed.
+    // 3.1.1 反向收集不经回边可达 Parent 的块，并要求它覆盖全部前向前缀，排除原条件未执行的旁路。
     BlockSet CanReachParent;
     std::vector<BasicBlock *> ReverseRoots{C.Parent};
     forEachReachablePreOrderCustomSucc<BasicBlock>(
@@ -156,6 +152,7 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(const TrivialCandidate &C, const Loop
             return TraversalControl::Continue;
         });
 
+    // 3.1.2 前缀必须全是当前循环直属块，且 Parent 之前不含内存定义、可故障或必须保留的指令。
     for (BasicBlock *BB : Forward) {
         if (!CanReachParent.count(BB) || !isDirectLoopBlock(LI, C.L, BB))
             return false;
@@ -202,9 +199,7 @@ bool LoopUnswitchPass::validateTrivialExitPhis(const TrivialCandidate &C,
         }
         if (SplitExit && RemainingCount == 0) return false;
 
-        // Exit PHIs produced by LCSSA do not depend on each other.  Reject an
-        // unusual cyclic/cross-PHI form instead of creating a definition in
-        // the new merge block that is used by its predecessor.
+        // 3.1.3 出口 PHI 的输入不得依赖同一 Exit 中的其他 PHI，避免拆分出口后创造从合流块反向使用前驱定义的环。
         if (!forEachPhiIncoming(
                 Phi, [&C](unsigned, Value *Incoming, BasicBlock *) {
                     auto *InI = dynamic_cast<Instruction *>(Incoming);
@@ -226,8 +221,7 @@ LoopUnswitchPass::findTrivialCandidate(
     }
 
     for (Loop *L : LI.getLoopsInPostOrder()) {
-        // Trivial unswitch 会把循环内分支提前到前置块，计时调用所在循环
-        // 必须保留原控制流和调用位置。
+        // 3. 从内向外扫描 trivial 候选：计时循环不参与，条件必须在 preheader 可用，且两分支恰好一个在循环内、一个为退出。
         if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
@@ -303,7 +297,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
         !C.Branch || !C.Exit || !C.Continue) {
         return false;
     }
-    // 候选发现与提交之间仍做一次语义校验，避免使用失效候选改写计时循环。
+    // 3.2 提交前重新检查计时门禁、preheader 边和原分支身份，防止候选在发现后过期。
     if (loopMayReachTimingCall(C.L)) return false;
 
     BasicBlock *OldPreHeader = C.Shape.PreHeader;
@@ -326,6 +320,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
                            ExitPreds.front() == C.Parent;
 
     if (ReuseExit) {
+        // 3.2.1 Exit 仅由 Parent 到达时直接复用，将其 PHI 前驱改为执行外提分支的 OldPreHeader。
         for (PhiInst *Phi : C.Exit->collectPhiNodes()) {
             forEachPhiIncoming(
                 Phi, [Phi, &C, OldPreHeader](
@@ -335,15 +330,14 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
                 });
         }
     } else {
+        // 3.2.2 Exit 还有其他前驱时新建 ExitMerge，将非 PHI 正文和终结指令移到合流块。
         auto *ExitMerge = new BasicBlock();
         F.pushBlock(ExitMerge);
         ExitMerge->setIdent(
             F.makeUniqueBlockIdent(C.Exit->getIdent() + ".unswitch.merge"));
         ExitDestination = ExitMerge;
 
-        // Moving the terminator changes every outgoing CFG edge from
-        // C.Exit -> Succ into ExitMerge -> Succ.  Preserve the old successor
-        // list so their PHIs can be updated after the move.
+        // 3.2.2.1 在搬迁终结指令前快照旧后继，搬迁后把它们的 PHI 前驱从 C.Exit 统一改为 ExitMerge。
         const std::vector<BasicBlock *> OldExitSuccessors =
             C.Exit->getSuccessors();
         std::vector<Instruction *> NonPhis;
@@ -366,10 +360,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
                 else Remaining.push_back(In);
             }
 
-            // Keep an exit PHI even for a single remaining edge.  Remaining
-            // values may be defined inside the loop, and forwarding them
-            // directly to ExitMerge would break LCSSA at the new immediate
-            // exit block C.Exit.
+            // 3.2.2.2 C.Exit 中即使只剩一条循环前驱也保留 NormalPhi，使循环内值先在立即出口满足 LCSSA，再与外提直达值合流。
             auto *NormalPhi = new PhiInst(OldPhi->getIRType());
             NormalPhi->setIdent(OldPhi->getIdent() + ".unswitch.normal");
             for (const auto &In : Remaining)
@@ -403,9 +394,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
     setHeaderPredecessor(Header, OldPreHeader, NewPreHeader);
     NewPreHeader->genUnCondInst(Header);
 
-    // Reuse the original conditional branch object in the old preheader.
-    // Besides matching the intended transform, this guarantees that no
-    // branch flags or condition spelling are accidentally lost.
+    // 3.2.3 将原条件分支对象从 Parent 整体搬到 OldPreHeader，保留其条件形式和所有分支属性。
     const unsigned ExitOperand = C.ExitOnTrue ? 1U : 2U;
     const unsigned ContinueOperand = C.ExitOnTrue ? 2U : 1U;
     C.Branch->replaceOperand(ExitOperand, ExitDestination);
@@ -419,7 +408,7 @@ bool LoopUnswitchPass::transformTrivial(Function &F, const TrivialCandidate &C) 
     for (BasicBlock *BB : C.L->getBlocksIncludingSubLoops())
         if (BB) OriginalLoopBlocks.insert(BB);
     replaceConditionUsesInBlocks(C.Condition, OriginalLoopBlocks,
-                                 /*KnownValue=*/!C.ExitOnTrue);
+                                 !C.ExitOnTrue);
     return true;
 }
 
@@ -477,7 +466,7 @@ unsigned LoopUnswitchPass::countMustExecuteControlUses(
     for (Use *U : Condition->getUses()) {
         auto *I = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
         if (!I || !I->getParent() || !L.contains(I->getParent())) continue;
-        // 只计算每轮必经位置上的控制 use；条件路径中的偶发 use 不计收益。
+        // 5.3 收益只计每迭代在进展或退出前必经的 branch/select use，不用偶发路径使用猜测热度。
         if (!isMustExecuteBeforeLoopProgress(I->getParent(), L, DT)) continue;
         if (auto *Br = dynamic_cast<BrInst *>(I)) {
             if (Br->getCondition() == Condition) Seen.insert(I);
@@ -700,9 +689,7 @@ std::optional<bool> LoopUnswitchPass::getEntryKnownValue(
     if (auto Constant = evaluateConstantBoolean(Condition))
         return Constant;
 
-    // First follow the actual dynamic entry path.  Unlike a bare block-
-    // dominance test, a unique-predecessor chain cannot reuse a condition
-    // fact from an earlier iteration of an enclosing loop.
+    // 4.1 先沿 preheader 的唯一前驱链回溯真实动态入口边，只使用确实选中当前链条的 guard 事实。
     BasicBlock *Current = PreHeader;
     BlockSet Visited;
     for (unsigned Depth = 0; Current && Depth != 32; ++Depth) {
@@ -735,10 +722,8 @@ std::optional<bool> LoopUnswitchPass::getEntryKnownValue(
         Current = Pred;
     }
 
-    // A successor with a unique incoming edge turns block dominance into
-    // edge dominance.  For a guard in an enclosing loop, additionally prove
-    // that the SSA condition is invariant across that loop so a fact from an
-    // earlier outer iteration cannot leak into the current one.
+    // 4.2 再沿支配树回溯 guard：只有 guard 某后继的唯一入边支配 preheader 时，块支配才能升级为边事实。
+    // 4.2.1 guard 位于包围循环时，还须证明目标条件对该循环不变，禁止把早先外迭代的事实泄漏到当前迭代。
     Current = PreHeader;
     Visited.clear();
     for (unsigned Depth = 0; Current && Depth != 32; ++Depth) {
@@ -774,6 +759,7 @@ std::optional<bool> LoopUnswitchPass::getEntryKnownValue(
 }
 
 bool LoopUnswitchPass::cloneClosureIsLegal(const NonTrivialCandidate &C) {
+    // 5.1 克隆闭包内的活跃 PHI 入边、普通数据操作数和 CFG 目标都不得引用被剪掉的循环内块。
     if (!C.L || !C.Parent || !C.CloneSucc || !C.OriginalSucc)
         return false;
     for (BasicBlock *BB : C.AllBlocks) {
@@ -861,8 +847,7 @@ bool LoopUnswitchPass::validateVersionedExitPhis(const NonTrivialCandidate &C) {
 
         for (BasicBlock *Pred : LivePreds) {
             if (!Pred || Pred->countEdgesToSucc(Exit) == 0) continue;
-            // 并行出口边需要为同一前驱维护多项 PHI 输入；当前克隆器没有
-            // 表达这类边，因而在合法性检查中统一保守拒绝。
+            // 5.1.1 每个版本的活跃前驱必须恰好有一条出口边；并行边需要同前驱多项 PHI 表达，当前克隆计划不支持。
             if (Pred->countEdgesToSucc(Exit) != 1) return false;
         }
 
@@ -905,7 +890,7 @@ LoopUnswitchPass::findEntryKnownCandidates(
     LoopInfo &LI, const DominatorTree &DT) {
     std::vector<EntryKnownCandidate> Result;
     for (Loop *L : LI.getLoopsInPostOrder()) {
-        // 即使入口条件可证明，仍不能折叠含计时调用循环中的控制流。
+        // 4. 从内向外收集 entry-known 候选，计时循环仍不可折叠；同一循环内相同条件只记录一次。
         if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape) ||
@@ -975,7 +960,7 @@ bool LoopUnswitchPass::chooseDirectionalClonePlan(NonTrivialCandidate &C) {
     const std::size_t FalseWeight =
         weightedRegionSize(C.AllBlocks, &C.FalseReachable);
 
-    // 不猜测分支热度，只保留较大的区域并克隆较小的区域，以减少代码膨胀。
+    // 5.2 无 profile 时不选热分支，而是按“指令+块布局”权重保留较大闭包、克隆较小闭包。
     C.OriginalValue = TrueWeight >= FalseWeight;
     C.OriginalSucc = C.OriginalValue ? C.TrueSucc : C.FalseSucc;
     C.CloneSucc = C.OriginalValue ? C.FalseSucc : C.TrueSucc;
@@ -1009,7 +994,7 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
     if (FunctionWeight == 0) return std::nullopt;
 
     for (Loop *L : LI.getLoopsInPostOrder()) {
-        // 非平凡 unswitch 会克隆循环的一侧；含计时调用的循环不参与候选。
+        // 5. 枚举 non-trivial 候选：分支两侧都必须留在循环内，条件在 preheader 可用，Parent 在每迭代进展前必经。
         if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
@@ -1051,6 +1036,7 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
 
             C.TrueReachable = collectSpecializedReachable(*L, BB, T);
             C.FalseReachable = collectSpecializedReachable(*L, BB, Fals);
+            // 5.1 把 Parent 的分支固定为 true/false 后分别求循环内可达闭包，两个版本都必须保留 Header 和 Parent。
             if (!C.TrueReachable.count(Shape.Header) ||
                 !C.TrueReachable.count(BB) ||
                 !C.FalseReachable.count(Shape.Header) ||
@@ -1070,6 +1056,7 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
 
             C.CloneInstructions =
                 countInstructions(AllBlocks, &C.CloneReachable);
+            // 5.4 绝对预算限制克隆块/指令数，且克隆闭包中不得含任何调用。
             if (C.CloneInstructions > MaxNonTrivialCloneInstructions) {
                 continue;
             }
@@ -1097,7 +1084,7 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
                 BaseCloneWeight +
                 static_cast<std::size_t>(ExitPhiVersioningCost) *
                     ExitPhiCost;
-            // 用商和余数计算比例预算，避免函数规模乘百分比时溢出。
+            // 5.4.1 相对预算用商和余数计算函数权重的百分比，避免先乘百分比导致 size_t 溢出。
             const std::size_t RelativeCloneLimit =
                 (FunctionWeight / 100) * MaxClonePercentOfFunction +
                 ((FunctionWeight % 100) * MaxClonePercentOfFunction) / 100;
@@ -1110,14 +1097,14 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
                 continue;
             }
 
-            // 精确 trip count 来自 SCEV；无法证明时按一次迭代保守估计。
+            // 5.4.2 动态收益使用 SCEV 小常量 trip count 并在上限饱和；无法证明时只按一次迭代估计。
             std::int64_t TripEstimate = UnknownTripCountEstimate;
             if (auto TC = SE.getSmallConstantTripCount(L)) {
                 TripEstimate = std::clamp<std::int64_t>(
                     *TC, 0, MaxTripCountForProfitability);
             }
 
-            // 每轮可消除所有必经控制 use，但版本选择会在入口新增一次分派。
+            // 5.4.3 收益为 trip estimate 乘必经控制 use 数，并扣除新增的单次 preheader 版本分派。
             const std::int64_t EliminatedControlCost =
                 TripEstimate *
                 static_cast<std::int64_t>(C.ControlUses) *
@@ -1126,7 +1113,7 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
                 0, EliminatedControlCost - EntryDispatchCost);
             C.Cost = static_cast<std::int64_t>(C.CloneWeight);
 
-            // 仅当可解释的动态控制收益严格覆盖静态克隆成本时才执行变换。
+            // 5.4.4 只有动态控制收益严格大于含出口版本化在内的静态增长时，候选才进入最优比较。
             if (C.Benefit <= C.Cost) {
                 continue;
             }
@@ -1180,10 +1167,8 @@ bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
         Plans.push_back(std::move(P));
     }
 
-    // Collapsing mutually-referential singleton PHIs would make deletion
-    // order observable (A -> B, B -> A can leave a dangling replacement).
-    // Retained multi-incoming PHIs break such chains, so conservatively reject
-    // only cycles made entirely from singleton replacements.
+    // 6.1 先为每个克隆 PHI 收集特化后仍活跃的入边：零边折叠为 undef，单边折叠为值，多边则重建 PHI。
+    // 6.1.1 若单边替换之间构成环，删除顺序会留下悬垂替换；因此在任何改写前先拒绝纯单边环。
     std::unordered_map<Value *, Value *> SingletonReplacements;
     for (PhiPrunePlan &P : Plans) {
         if (P.Incoming.size() != 1) continue;
@@ -1254,6 +1239,7 @@ bool LoopUnswitchPass::pruneClonedPhis(ClonedBlockRegion &Region,
 }
 
 void LoopUnswitchPass::destroyBlocks(std::vector<BasicBlock *> Blocks) {
+    // 6.2 回滚游离克隆时先清空所有 operand 打断跨块 use 链，再清空并销毁基本块。
     for (BasicBlock *BB : Blocks) {
         if (!BB) continue;
         for (Instruction *I : *BB)
@@ -1282,6 +1268,7 @@ LoopUnswitchPass::planVersionedExit(
     ClonedBlockRegion &Region) {
     if (!Exit) return std::nullopt;
 
+    // 6.3 对每个循环 Exit 离线收集原版本/克隆版本的出口前驱和 PHI 值，两侧数量必须与活跃出口边精确对应。
     VersionedExitPlan Plan;
     Plan.Exit = Exit;
 
@@ -1341,6 +1328,7 @@ void LoopUnswitchPass::applyVersionedExitPlan(Function &F, VersionedExitPlan &Pl
     if (!Exit || (Plan.OriginalPreds.empty() && Plan.ClonePreds.empty()))
         return;
 
+    // 6.4 提交出口计划时，每个存活版本先经独立 proxy 收集本版本 LCSSA 值，再在原 Exit 合流两个 proxy。
     BasicBlock *OriginalProxy = nullptr;
     BasicBlock *CloneProxy = nullptr;
     if (!Plan.OriginalPreds.empty()) {
@@ -1426,6 +1414,7 @@ void LoopUnswitchPass::eraseDeadOriginalBlocks(const std::vector<BasicBlock *> &
 }
 
 bool LoopUnswitchPass::transformEntryKnown(const EntryKnownCandidate &C) {
+    // 4.3 entry-known 提交仅把选中循环内的条件 use 替换为已证明布尔常量，后续简化 pass 负责折叠 CFG。
     if (!C.Condition || !C.L) return false;
     if (loopMayReachTimingCall(C.L)) return false;
     BlockSet Blocks;
@@ -1440,7 +1429,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
         !C.CloneSucc) {
         return false;
     }
-    // 在创建任何版本化块之前重新确认，禁止复制计时调用或其封装调用。
+    // 6. 提交前重新验证计时门禁、preheader 和候选分支全部仍与发现阶段一致。
     if (loopMayReachTimingCall(C.L)) return false;
     BrInst *OldPreBr = C.Shape.PreHeader->getBranchTerminator();
     if (!BasicBlock::isUncondBr(OldPreBr) ||
@@ -1453,6 +1442,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
         return false;
     }
 
+    // 6.1 先创建两个游离版本 preheader，再只克隆 CloneReachable 闭包；原 CFG 在此阶段尚未改写。
     auto *OriginalPreHeader = new BasicBlock();
     F.pushBlock(OriginalPreHeader);
     OriginalPreHeader->setIdent(F.makeUniqueBlockIdent(
@@ -1485,6 +1475,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
     }
 
     auto RollbackClones = [&]() {
+        // 6.1.1 PHI 剪枝、特化分支或出口计划失败时，销毁完整克隆区域和两个未连入的 preheader。
         destroyBlocks(Region->ClonedBlocks);
         delete OriginalPreHeader;
         delete ClonedPreHeader;
@@ -1516,9 +1507,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
         ExitPlans.push_back(std::move(*Plan));
     }
 
-    // All remaining operations were preflighted before the first mutation of
-    // the original CFG.  From here onward the transform commits atomically at
-    // the pass level.
+    // 6.5 所有可失败的克隆、PHI 剪枝和出口计划已在原 CFG 首次变更前完成；从此处开始集中提交。
     setHeaderPredecessor(C.Shape.Header, C.Shape.PreHeader,
                          OriginalPreHeader);
     OriginalPreHeader->genUnCondInst(C.Shape.Header);
@@ -1531,6 +1520,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
            "preflighted original unswitch branch disappeared");
     (void)SpecializedOriginal;
 
+    // 6.5.1 原版本和克隆版本内的条件 use 分别替换为互补常量，两侧 Parent 都已变为无条件分支。
     BlockSet OriginalVersionBlocks = C.OriginalReachable;
     BlockSet ClonedVersionBlocks;
     for (BasicBlock *BB : C.CloneReachable) {
@@ -1545,6 +1535,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
     for (VersionedExitPlan &Plan : ExitPlans)
         applyVersionedExitPlan(F, Plan);
 
+    // 6.5.2 原 preheader 改为按循环不变条件选择版本，最后删除原版本中特化后不可达的块。
     BasicBlock *TruePreHeader =
         C.OriginalValue ? OriginalPreHeader : ClonedPreHeader;
     BasicBlock *FalsePreHeader =
@@ -1566,6 +1557,7 @@ PassResult LoopUnswitchPass::run(Function &F,
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
+    // 1. 优先尝试无代码增长的 trivial 外提；成功后记录互斥模式并使全部分析失效。
     if (State.Kind != SelectedKind::NonTrivial) {
         auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
         if (auto Candidate = findTrivialCandidate(F, LI, DT, MSSA)) {
@@ -1576,14 +1568,11 @@ PassResult LoopUnswitchPass::run(Function &F,
         }
     }
 
-    // Once this function selected trivial unswitching, later fixed-point
-    // rounds may find another trivial branch but must never switch modes.
+    // 1.1 函数一旦选择 trivial 模式，后续固定点轮次仍可继续处理 trivial 候选，但绝不转入代码克隆模式。
     if (State.Kind == SelectedKind::Trivial)
         return PassResult::unchanged();
 
-    // Entry facts are proof-driven and never clone code.  Apply every fact in
-    // one batch so the three outer fixed-point rounds are not consumed one at
-    // a time, and keep their quota independent from Full Unswitch.
+    // 4. entry-known 由 guard 事实驱动且不增长代码，因此一次批量提交所有已证明条件，不占用完整克隆额度。
     bool EntryChanged = false;
     for (const EntryKnownCandidate &Candidate :
          findEntryKnownCandidates(LI, DT)) {
@@ -1595,8 +1584,7 @@ PassResult LoopUnswitchPass::run(Function &F,
         return PassResult::changed(PreservationStatus::none());
     }
 
-    // Keep code-growing versioning bounded.  Entry-known remains available in
-    // later rounds even after this quota is exhausted.
+    // 5.5 每个函数最多提交一次完整版本克隆；额度耗尽后的后续轮次仍可使用不克隆的 entry-known 路径。
     if (State.FullCloneCount != 0)
         return PassResult::unchanged();
 

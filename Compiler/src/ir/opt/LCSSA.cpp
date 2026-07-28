@@ -6,6 +6,8 @@
 #include "ir/analysis/SideEffect.hpp"
 #include <set>
 
+// 校验辅助：循环外使用必须是位于退出块的 PHI，且具体 use 对应的 PHI 入边
+// 前驱仍在循环内；普通循环外使用或绕过退出块的 PHI 均破坏 LCSSA。
 bool LCSSAPass::isLCSSAForm(Loop *L) {
     if (!L) {
         return false;
@@ -42,6 +44,8 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
 		});
 }
 
+// 步骤 3.2：求定义在指定块入口处可见的 LCSSA 值。递归沿直接支配关系向
+// 循环边界回溯，仅在从循环内 IDom 进入外部汇合块时建立桥接 PHI。
 Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
                                    Instruction *InstDef,
                                    const Loop &L,
@@ -49,13 +53,12 @@ Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
                                    std::unordered_map<BasicBlock *, Value *> &MapValue,
                                    InstructionWorkList &WorkList,
                                    bool &Changed) {
-    //1,避免重复计算
+    // 3.2.1 已求值块直接复用；预先缓存的新 PHI 也会截断 CFG 环递归。
     auto It = MapValue.find(BB);
     if (It != MapValue.end()) return It->second;
 
-    // 2. 递归基底：如果回溯到了循环内部，直接返回原始定义
+    // 3.2.2 回溯到循环内部时，以支配性决定返回原定义还是 undef。
     if (L.contains(BB)) {
-        // 安全检查：确保定义点确实支配这个内部块
         if (DT.dominates(InstDef->getParent(), BB)) {
             return MapValue[BB] = InstDef;
         } else {
@@ -63,23 +66,22 @@ Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
         }
     }
 
-    // 3. 获取直接支配块 (IDom)
+    // 不可由支配树连接到边界的外部块没有可靠定义。
     BasicBlock *IDom = DT.getIDom(BB);
     if (!IDom) {
         return MapValue[BB] = UndefValue::NewUndefValue(InstDef->getIRType());
     }
 
-    // 4. IDom 在循环外：说明控制流在到达 BB 之前并没有发生新的汇合，
-    // BB 的值必然来自于支配它的 IDom，所以这里是直线回溯的情况，我们直接递归向 IDom 要值即可
+    // 3.2.3 IDom 也在循环外说明尚未发生新的路径汇合，继续沿直线支配链
+    // 复用上游值即可。
     if (!L.contains(IDom)) {
         Value *Val = getValueForBlock(IDom, InstDef, L, DT, MapValue,
                                       WorkList, Changed);
         return MapValue[BB] = Val;
     }
 
-    // 5. IDom 在循环内：这是最核心的情况！
-    // 此时 BB 一定是一个汇合点，它的前驱来自不同的出口。
-    // 我们必须在这里原生地新建一个 PHI 节点，来收拢它的各个前驱路径。
+    // 3.2.4 IDom 在循环内而当前块在循环外，说明这里跨越边界并可能汇合；
+    // 先缓存桥接 PHI，再递归向每个前驱取得输入值。
     auto *BridgePhi = new PhiInst(InstDef->getIRType());
     BridgePhi->setIdent(BridgePhi->getIdent() + ".lcssa");
 
@@ -87,7 +89,6 @@ Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
 
     for (BasicBlock *Pred : BB->getPredecessors()) {
         if (!Pred) continue;
-        // 递归向每一个前驱要值
         Value *Incoming = getValueForBlock(Pred, InstDef, L, DT, MapValue,
                                            WorkList, Changed);
         if (!Incoming) {
@@ -105,12 +106,13 @@ Value *LCSSAPass::getValueForBlock(BasicBlock *BB,
     BB->pushFront(BridgePhi);
     Changed = true;
 
-    // 将新生成的桥接 PHI 加入队列，触发可能的链式反应
+    // 新桥接 PHI 也可能被更外层循环视为跨界定义，压入工作队列继续闭包。
     WorkList.push(BridgePhi);
 
     return BridgePhi;
 }
 
+// 步骤 2—4：把单条循环内定义的所有外部 use 改写为经出口 PHI 传递的值。
 bool LCSSAPass::runLCSSA(Instruction *I,
                                    Function &F,
                                    const LoopInfo &LI,
@@ -119,7 +121,7 @@ bool LCSSAPass::runLCSSA(Instruction *I,
                                    InstructionWorkList &WorkList) {
     if (!I) return false;
     if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-        // 幂等性保护：LCSSA 自己生成的桥接/出口 PHI 不再重复参与构造。
+        // 本 pass 生成的 PHI 已满足当前层边界，不重复为其构造同层出口 PHI。
         if (Phi->getIdent().find(".lcssa") != std::string::npos) {
             return false;
         }
@@ -130,24 +132,22 @@ bool LCSSAPass::runLCSSA(Instruction *I,
 
     Loop *L = LI.getLoopFor(DefBB);
     if (!L) return false;
-    //第一步：收集所有的ExitingBlock，如果没有（死循环），直接返回
+    // 无退出边的死循环不存在可达的跨界传递点。
     auto ExitBlocks = L->getExitBlocks();
     if (ExitBlocks.empty()) {
         return false;
     }
-    //第一步：下面处理有ExitingBlock的情况
     bool Changed = false;
 
-    //第二步，寻找这条指令在循环外部的Uses
+    // 2. 快照 use，并把 PHI 的概念使用位置解释为对应 incoming 前驱块；
+    // 不可达 use 先替换为 undef，其余循环外 use 记为边界改写点。
     auto Uses = I->getUses();
-    //定义在循环外部的Use集合
     std::vector<ExternalUse> Boundaries;
     for (Use *U : Uses) {
         if (!U || U->getValue() != I) continue;
 
         auto *UserInst = dynamic_cast<Instruction *>(U->getUser());
         if (!UserInst) continue;
-        //情况1：如果User是Phi，那我们就收集这个Phi所在块的前驱块
         auto *UserPhi = dynamic_cast<PhiInst *>(UserInst);
         BasicBlock *UseBlock = nullptr;
 
@@ -159,21 +159,18 @@ bool LCSSAPass::runLCSSA(Instruction *I,
             UseBlock = UserPhi->getIncomingBlock(
                 static_cast<unsigned>(*OpIndex / 2));
         } else {
-            //情况2：如果正常指令，它的UseBlock就是它所在的基本块
             UseBlock = UserInst->getParent();
         }
 
         if (!UseBlock) continue;
 
-        //情况3：处理不可达块
         if (Reachable.find(UseBlock) == Reachable.end()) {
-            // 幂等性保护：已经是 undef 时，不要重复替换成新的 undef 实例。
             if (!dynamic_cast<UndefValue *>(U->getValue())) {
                 Changed |= U->replaceUseeWith(UndefValue::NewUndefValue(I->getIRType()));
             }
             continue;
         }
-        //如果上述收集的使用块在循环之外，就是我们要找的循环边界
+
         if (!L->contains(UseBlock)) {
             Boundaries.push_back({U, UserInst, UserPhi, UseBlock});
         }
@@ -183,12 +180,11 @@ bool LCSSAPass::runLCSSA(Instruction *I,
 
     std::unordered_map<BasicBlock *, Value *> MapValue;
 
-    // 第三步：在出口块插入最初的 LCSSA PHI 节点
+    // 3.1 为定义所支配的每个出口建立初始 LCSSA PHI：循环内前驱传原定义，
+    // 其他前驱传 undef。MapValue 以这些 PHI 作为递归求值的边界种子。
     for (BasicBlock *ExitBB : ExitBlocks) {
         if (!ExitBB) continue;
-        //情况1：指令所在块不支配ExitingBlock
         if (!DT.dominates(DefBB, ExitBB)) continue;
-        //情况2：已经为ExitingBlock插入过值了
         if (MapValue.count(ExitBB)) continue;
 
         auto *LCPhi = new PhiInst(I->getIRType());
@@ -198,11 +194,9 @@ bool LCSSAPass::runLCSSA(Instruction *I,
         for (BasicBlock *Pred : ExitBB->getPredecessors()) {
             if (!Pred) continue;
             if (L->contains(Pred)) {
-                //正常情况：指令所在块支配ExitingBlock，插入LCSSA
                 LCPhi->addIncoming(I, Pred);
                 HasIncoming = true;
             } else {
-                //特殊情况：指令所在块不支配ExitingBlock，插入UndefValue占位
                 LCPhi->addIncoming(UndefValue::NewUndefValue(I->getIRType()), Pred);
             }
         }
@@ -213,13 +207,13 @@ bool LCSSAPass::runLCSSA(Instruction *I,
         }
 
         ExitBB->pushFront(LCPhi);
-        MapValue[ExitBB] = LCPhi; // 将出口 PHI 存入缓存，作为递归的终点
+        MapValue[ExitBB] = LCPhi;
         Changed = true;
 
         WorkList.push(LCPhi);
     }
 
-    // 第四步：外部 Use 重写
+    // 4. 对每个边界 use 递归取得其概念使用块上的值，并一次性替换原定义。
     for (const ExternalUse &EU : Boundaries) {
         if (!EU.U || EU.U->getValue() != I) continue;
 
@@ -239,21 +233,22 @@ bool LCSSAPass::runLCSSA(Instruction *I,
 PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
-    // 计算可达块
+    // 1. 预先计算可达块，供单定义处理阶段隔离不可达 use。
     std::unordered_set<BasicBlock *> Reachable;
     F.collectReachableBlocks(Reachable);
 
     InstructionWorkList WorkList;
     bool Changed = false;
 
-    //1：获取所有的循环，并按照后序遍历 (Post-Order) 的顺序排列
+    // 2. 循环后序保证先封闭内层循环的数据流。
     std::vector<Loop*> PostOrderLoops = LI.getLoopsInPostOrder();
 
-    //2：按后序遍历的顺序，逐个处理循环
     for (Loop *L : PostOrderLoops) {
         auto ExitBlocks = L->getExitBlocks();
-        if (ExitBlocks.empty()) continue; // 死循环直接跳过
+        if (ExitBlocks.empty()) continue;
 
+        // 2.1 从退出块沿 IDom 反向收集循环内、支配某条退出路径的块；退出块
+        // 只作为遍历根，不应自身进入内部定义集合。
         std::unordered_set<BasicBlock*> ExitDominatingBlocks;
         std::unordered_set<BasicBlock *> ExitRoots(
             ExitBlocks.begin(), ExitBlocks.end());
@@ -271,8 +266,6 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
             },
             [L, &ExitRoots,
              &ExitDominatingBlocks](BasicBlock *Curr) {
-                // Exit blocks only seed the walk; the old algorithm inserted
-                // their in-loop IDom, never the exit roots themselves.
                 if (ExitRoots.count(Curr))
                     return TraversalControl::Continue;
                 ExitDominatingBlocks.insert(Curr);
@@ -281,7 +274,8 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
                 return TraversalControl::Continue;
             });
 
-        //我们直接遍历这些支配ExitingBlock，并且在循环中的基本块的这些指令即可
+        // 2.2 只把当前循环层中的有用定义加入去重工作队列；子循环已由后序
+        // 先行处理，本 pass 生成的 PHI 也不重复入队。
         forEachInstructionInBlocks(
             ExitDominatingBlocks,
             [&LI, L, &WorkList](BasicBlock *BB, Instruction *Inst) {
@@ -293,7 +287,7 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
                 WorkList.push(Inst);
             });
 
-        // 4：局部收敛处理
+        // 3—4. 处理初始定义及其新建桥接 PHI，直到当前循环层局部收敛。
         while (!WorkList.empty()) {
             Instruction *I = WorkList.pop();
             Changed |= runLCSSA(I, F, LI, DT, Reachable, WorkList);
@@ -308,8 +302,8 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();
     PA.keep<LoopAnalysis>();
-    // LCSSA inserts PHIs, including pointer-typed PHIs.  Their base/offset and
-    // ModRef relationships are absent from cached AA/side-effect results.
+    // 5. 仅插入 PHI 并改写 use，CFG 分析保持有效；指针 PHI 会改变基址、
+    // 偏移及 ModRef 推导，因此别名和副作用分析必须失效。
     PA.discard<BasicAliasAnalysis>();
     PA.discard<SideEffectAnalysis>();
     return PA;

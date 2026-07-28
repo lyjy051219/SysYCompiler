@@ -6,21 +6,19 @@
 #include <vector>
 #include <set>
 #include <variant>
-
-//少了位宽的区分，向量优化，基础代数化简
-// 格值 (Lattice Value)--三态格模型
-// Top(未知/未定义) → Constant(常量) → Bottom(过定义/非常量)
+// SCCP 使用单调三态格：Top 表示尚无可执行路径提供信息，Constant 表示所有
+// 已知可行路径给出同一常量，Bottom 表示过定义。合并只能沿
+// Top -> Constant -> Bottom 下降，因此工作队列必然收敛。
 class LatticeValue {
 public:
     enum State { Top, Constant, Bottom };
 
 private:
     State state;
-    Value* constVal; // 仅当 state == Constant 时有效
+    Value* constVal;
 
 public:
     LatticeValue();
-    //创建三个状态的静态函数
     static LatticeValue getTop();
     static LatticeValue getBottom();
     static LatticeValue getConstant(Value* v);
@@ -32,62 +30,50 @@ public:
 
     Value* getConstantValue() const;
 
-    // 格合并
-    // Top ∧ x = x
-    // Bottom ∧ x = Bottom
-    // Const(a) ∧ Const(a) = Const(a)
-    // Const(a) ∧ Const(b) = Bottom (a != b)
+    // 合并来自新可行路径的信息；只有格值下降时返回 true。
     bool mergeIn(const LatticeValue& other);
 
 };
 
-// SCCP 求解器 (Solver)
+// 求解阶段同时传播“边是否可行”和“SSA 值处于哪个格状态”：
+// 1. 新可执行块进入块队列，新可行边使目标 PHI 重新求值；
+// 2. 值格下降时把其指令使用者压入指令队列；
+// 3. 两个队列迭代至不动点后，统一提交常量替换和 CFG 清理。
 class SCCPSolver {
 public:
     SCCPSolver();
 
-    // 标记一个基本块为可执行
     void markBlockExecutable(BasicBlock* BB);
 
-    // 标记一条边 (Source → Dest) 为可达
     bool markEdgeFeasible(BasicBlock* Source, BasicBlock* Dest);
 
-    // 核心求解循环
     void solve();
 
-    // 查询接口
     bool isBlockExecutable(BasicBlock* BB) const;
     bool isEdgeFeasible(BasicBlock* From, BasicBlock* To) const;
     LatticeValue getLatticeValue(Value* V) const;
 
-    // 应用变换：将常量替换到 IR 中，返回是否有改动
+    // 服务步骤 3：先替换可达块常量，再修复并删除不可达块，最后折叠已知
+    // 条件分支；CfgChanged 区分纯 SSA 改写与 CFG 改写。
     bool rewriteConstants(Function& F, bool &CfgChanged);
 
-    // 格值合并，如果发生变化则通知使用者
     bool mergeInValue(Value* V, const LatticeValue& NewVal);
 
 private:
-    // 格值映射
     std::unordered_map<Value*, LatticeValue> ValueState;
 
-    // 可达基本块集合
     std::unordered_set<BasicBlock*> ExecutableBlocks;
-    // 可达边集合
     std::set<std::pair<BasicBlock*, BasicBlock*>> FeasibleEdges;
 
-    // 工作队列
     std::vector<BasicBlock*> BBWorkList;
     std::vector<Instruction*> InstWorkList;
 
-    // 获取/更新格值
     LatticeValue& getValueState(Value* V);
 
-    // 将值的使用者压入 InstWorkList
     void pushUsersToWorkList(Value* V);
 
-
-
-    // 指令访问者
+    // 服务求解步骤 1—2：各访问器只根据当前可行边和操作数格值产生更低的
+    // 格值或新可行边，不直接修改 IR。
     void visitInstruction(Instruction* I);
     void visitPhiNode(PhiInst* Phi);
     void visitBinaryInst(BinaryInst* BI);
@@ -96,18 +82,16 @@ private:
     void visitLoadInst(LoadInst* LI);
     void visitStoreInst(StoreInst* SI);
     void visitCallInst(CallInst* CI);
-    void visitCastInst(Instruction* I); // SITOFP, FPTOSI, Zext
+    void visitCastInst(Instruction* I);
     void visitGEPInst(GetElementPtrInst* GEP);
 
-    // 获取可行的后继块
     void getFeasibleSuccessors(BrInst* Br,
                                std::vector<bool>& Succs);
 
-    // Select 指令访问者
     void visitSelectInst(Instruction* I);
 };
 
-// SCCP Pass
+// Pass 入口负责初始化边界条件、运行求解器，并按 CFG 是否变化声明分析失效。
 class SCCPPass : public PassDescriptor<SCCPPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

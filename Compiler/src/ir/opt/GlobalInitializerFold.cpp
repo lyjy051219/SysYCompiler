@@ -6,6 +6,7 @@
 #include <vector>
 
 bool GlobalInitializerFoldPass::isRecursiveMain(Module &M, Function *Main) {
+    // 1.1 main 一旦可能被再次调用，运行期拷贝就不再只执行一次，不能提升为静态初值。
     if (!Main) return true;
     for (CallInst *CI : collectInstructions<CallInst>(M))
         if (CI->getDirectCallee() == Main) return true;
@@ -13,6 +14,7 @@ bool GlobalInitializerFoldPass::isRecursiveMain(Module &M, Function *Main) {
 }
 
 Variable *GlobalInitializerFoldPass::getWholeObjectGlobal(Value *Pointer) {
+    // 2.1 只剥离 bitcast 和全零 GEP；任一非零索引都意味着只指向子对象而非完整全局量。
     std::unordered_set<Value *> Seen;
     while (Pointer && Seen.insert(Pointer).second) {
         if (auto *BC = dynamic_cast<BitCastInst *>(Pointer)) {
@@ -36,6 +38,7 @@ Variable *GlobalInitializerFoldPass::getWholeObjectGlobal(Value *Pointer) {
 
 bool GlobalInitializerFoldPass::isFullGlobalCopy(
     CallInst *CI, Variable *&Destination, Variable *&Source) {
+    // 2.2 将 memcpy 约束为两个不同的同型全局对象，并要求常量长度精确覆盖整个对象。
     Destination = nullptr;
     Source = nullptr;
     if (!CI || !CI->isNonVolatileMemcpy() || CI->getArgCount() < 4)
@@ -65,10 +68,11 @@ bool GlobalInitializerFoldPass::isFullGlobalCopy(
 
 void GlobalInitializerFoldPass::copyInitializer(Variable *Destination,
                                                  Variable *Source) {
+    // 3.1 把源对象的静态初值转移到目标；无显式源初值对应目标的零初始化表示。
     if (!Destination || !Source) return;
     Value *SourceInit = Source->getUsee();
     if (!SourceInit) {
-        // An absent initializer is this IR's canonical zeroinitializer.
+         
         Destination->clearOperands();
         return;
     }
@@ -81,6 +85,7 @@ void GlobalInitializerFoldPass::copyInitializer(Variable *Destination,
 PreservationStatus GlobalInitializerFoldPass::run(
     Module &M, ModuleAnalysisPassManager &MAM) {
     (void)MAM;
+    // 1. 仅处理非递归 main 的入口块，保证被折叠的初始化动作在程序启动时执行一次。
     Function *Main = M.getMainFunction();
     if (!Main || Main->size() == 0 || isRecursiveMain(M, Main))
         return PreservationStatus::all();
@@ -88,9 +93,11 @@ PreservationStatus GlobalInitializerFoldPass::run(
     BasicBlock *Entry = Main->front();
     if (!Entry) return PreservationStatus::all();
 
-    // A failed/unknown memory operation makes every later copy ineligible:
-    // it may have observed the old destination initializer or changed the
-    // source.  Arithmetic, alloca, GEP, and casts are harmless in the prefix.
+     
+     
+     
+    // 2. 顺序扫描入口前缀：在任何可能观察或改变内存的普通 load/store/call 之前，
+    // 识别完整全局对象 memcpy；首个不匹配的内存操作之后不再折叠，保持执行顺序语义。
     bool SafePrefix = true;
     std::vector<CallInst *> FoldedCalls;
     for (Instruction *I : *Entry) {
@@ -111,6 +118,7 @@ PreservationStatus GlobalInitializerFoldPass::run(
             SafePrefix = false;
     }
 
+    // 3. 候选在扫描时只更新初始化器，最后统一删除对应调用，避免遍历期间迭代器失效。
     if (FoldedCalls.empty()) return PreservationStatus::all();
     for (CallInst *CI : FoldedCalls) delete CI;
     return PreservationStatus::none();

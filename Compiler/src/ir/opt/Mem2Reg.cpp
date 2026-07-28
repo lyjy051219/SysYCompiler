@@ -37,11 +37,13 @@ unsigned BlockInfo::getInstIndex(const Instruction* I){
 void BlockInfo::deleteIndex(const Instruction* I){InstNum.erase(I);}
 
 bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
+    // 1.1 仅提升非数组标量，且 alloca 的每个 use 必须是类型精确匹配的直接 load/store；
+    // 地址被存储或交给其他指令都意味着逃逸。
     auto pointeeType =
         IRType::getPointeeType(AI ? AI->getIRType() : nullptr);
     if (!pointeeType) return false;
 
-    // 只提升标量局部对象；数组和 void 对象不进入 Mem2Reg。
+     
     if (pointeeType->isArray() || pointeeType->isVoid()) {
         return false;
     }
@@ -57,12 +59,12 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
                 return false;
             }
 
-            // 指针逃逸：将 alloca 地址作为值存入其它内存。
+             
             if (dynamic_cast<AllocaInst*>(storedVal)) {
                 return false;
             }
 
-            // 类型不匹配：store 值类型必须与 alloca 的被分配类型一致。
+             
             if (storedVal->getIRType() != pointeeType) {
                 return false;
             }
@@ -75,11 +77,12 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
 
 bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
                                           DominatorTree& DT) {
+    // 1.2 所有访问块都必须存在于入口支配树；不可达 use 无法参与统一重命名。
     if (!AI) return false;
 
-    // 当前重命名器沿入口支配树工作。只要存在不可达用户，就保守保留
-    // 整个 alloca 及其全部 load/store，避免只改写可达部分后留下悬空
-    // 地址，或者在删除 alloca 时级联破坏不可达基本块。
+     
+     
+     
     for (Use *UseEdge : AI->getUses()) {
         auto *UserInst =
             dynamic_cast<Instruction *>(UseEdge ? UseEdge->getUser() : nullptr);
@@ -93,6 +96,8 @@ bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
 
 bool PromotePass::allocaCrossesTimingBarrier(
     const AllocaInst *AI, const Function &F) {
+    // 1.3 对访问点做有界两两可达检查；任意访问顺序可能跨计时屏障时保留内存形态，
+    // 避免提升改变计时区间内实际执行的 load/store。
     if (!AI || !F.mayReachTimingCall()) return false;
 
     std::vector<Instruction *> Accesses;
@@ -104,12 +109,12 @@ bool PromotePass::allocaCrossesTimingBarrier(
         if (Seen.insert(I).second) Accesses.push_back(I);
     }
 
-    // 路径查询为每对访问做 CFG 搜索；超出预算时保守保留内存形式。
+     
     constexpr std::size_t MaxTimingCheckedAccesses = 128;
     if (Accesses.size() > MaxTimingCheckedAccesses) return true;
     for (Instruction *From : Accesses) {
         for (Instruction *To : Accesses) {
-            // From==To 用于识别经过计时调用后回到同一访问的循环路径。
+             
             if (F.hasTimingBarrierOnPath(From, To)) return true;
         }
     }
@@ -117,6 +122,7 @@ bool PromotePass::allocaCrossesTimingBarrier(
 }
 
 void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
+    // 2. 汇总定义块、使用块、唯一 store 与是否仅在一个块使用，为快速路径分类。
     clean();
     for (Use *use : AI->getUses()) {
         User* user = use->getUser();
@@ -142,6 +148,8 @@ void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
 }
 
 bool PromotePass::rewriteSingleStoreAlloca(AllocaInfo &info,AllocaInst* AI,DominatorTree& DT,BlockInfo &blockInfo){
+    // 2.1 唯一 store 快速路径：store 值必须在每个 load 处可用；同块按指令序检查，
+    // 跨块用支配关系检查。先验证全部 load，避免只替换一部分后失败。
     StoreInst* onlyStore = info.OnlyStore;
     Value* val = onlyStore->getValueOperand();
     BasicBlock* BB = onlyStore->getParent();
@@ -197,6 +205,8 @@ bool PromotePass::rewriteSingleStoreAlloca(AllocaInfo &info,AllocaInst* AI,Domin
 }
 
 bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,DominatorTree& DT,BlockInfo &blockInfo){
+    // 2.2 单块快速路径：按缓存的指令序排序 store，每个 load 取最近前置 store；
+    // 无 store 时读 undef，有 store 却在首个 store 前读取则退回通用 SSA 构造。
     std::vector<std::pair<unsigned,StoreInst*>> stores;
     for (Use *use : AI->getUses()) {
         User* user = use->getUser();
@@ -258,9 +268,9 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     return true;
 }
 
-// computeIDF:
-//   使用优先队列 (深度最大的先处理) + 支配树子树 DFS
-//   直接在子树 CFG 后继中发现 DF 边，无需预计算全局 DF
+ 
+ 
+ 
 void PromotePass::computeIDF(
     const std::set<BasicBlock*>& DefBlocks,
     const std::set<BasicBlock*>& LiveInBlocks,
@@ -268,13 +278,15 @@ void PromotePass::computeIDF(
     DominatorTree& DT,
     const std::unordered_map<DominatorNode*, unsigned>& DomLevels)
 {
-    // {level, node} 大顶堆，level 最大(最深)的先处理
+    // 3.2 从定义块按支配深度处理迭代支配边界，只在变量 live-in 的汇合块放 PHI；
+    // 新 PHI 块若不是原定义块会重新入队，使 IDF 闭包完整。
+     
     using DTNPair = std::pair<unsigned, DominatorNode*>;
     std::priority_queue<DTNPair> PQ;
 
-    // 已进入扫描逻辑（对应算法中的 VisitedWorkList）
+     
     std::set<DominatorNode*> VisitedWorkList;
-    // 已决定插入 Phi（对应算法中的 VisitedPHI）
+     
     std::set<DominatorNode*> VisitedPHI;
 
     for (BasicBlock* BB : DefBlocks) {
@@ -291,7 +303,7 @@ void PromotePass::computeIDF(
         auto [rootLevel, root] = PQ.top();
         PQ.pop();
 
-        // WorkList DFS：遍历 root 支配树子孙
+         
         std::stack<DominatorNode*> WorkList;
         std::set<DominatorNode*> LocalVisited;
         WorkList.push(root);
@@ -301,7 +313,7 @@ void PromotePass::computeIDF(
             DominatorNode* node = WorkList.top();
             WorkList.pop();
 
-            // 检查 node 的 CFG 后继
+             
             for (BasicBlock* succ : node->Block->getSuccessors()) {
                 DominatorNode* succNode = DT.getNode(succ);
                 if (!succNode) continue;
@@ -309,23 +321,23 @@ void PromotePass::computeIDF(
                 auto succLevelIt = DomLevels.find(succNode);
                 if (succLevelIt == DomLevels.end()) continue;
 
-                // succ 比本轮根更深，仍被严格支配，不是本轮 IDF 候选
+                 
                 if (succLevelIt->second > rootLevel) continue;
 
-                // Pruned: 只在 live-in 块放 Phi
+                 
                 if (!LiveInBlocks.count(succ)) continue;
 
                 if (VisitedPHI.insert(succNode).second) {
                     PhiBlocks.insert(succ);
 
-                    // 新产生的定义块继续参与 IDF 迭代
+                     
                     if (!DefBlocks.count(succ) && VisitedWorkList.insert(succNode).second) {
                         PQ.push({succLevelIt->second, succNode});
                     }
                 }
             }
 
-            // 将支配树子节点加入 WorkList
+             
             for (auto* child = node->FirstChild; child; child = child->NextSibling) {
                 if (LocalVisited.insert(child).second)
                     WorkList.push(child);
@@ -335,11 +347,13 @@ void PromotePass::computeIDF(
 }
 
 bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
+    // 1. 每轮重新收集入口 alloca，过滤不可提升、不可达及跨计时屏障的对象；循环执行
+    // 是为了让本轮删除和 PHI 化简暴露的新快速路径在下一轮继续处理。
     bool changed = false;
     BasicBlock* EntryBB = F.front();
     if (!EntryBB) return false;
 
-    // 外层不动点循环：直到本轮找不到可提升/可消除的 alloca
+     
     while (true) {
     std::vector<AllocaInst*> Allocas;
     AllocaInfo info;
@@ -347,22 +361,23 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     bool roundChanged = false;
 
     for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
-        // 快速路径和通用 SSA 路径必须处理同一组完整用户。不可达分量
-        // 不在当前 DominatorTree 中，因而该 alloca 本轮整体保留。
+         
+         
         if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT) &&
             !allocaCrossesTimingBarrier(AI, F))
             Allocas.push_back(AI);
     }
 
     if(Allocas.empty()) {
-        // Earlier rounds may already have promoted or deleted allocas.  Do
-        // not lose that mutation merely because the final discovery round is
-        // empty: fixed-point convergence and analysis invalidation consume
-        // the cumulative answer.
+         
+         
+         
+         
         return changed;
     }
 
-    // 简单优化: 删除无用 alloca / 单 store / 单 block
+     
+    // 2. 先删除无 use alloca，并尝试唯一 store、单块两条无需 PHI 的快速路径。
     for(unsigned i = 0; i != Allocas.size(); ++i){
         auto AI = Allocas[i];
         if (!AI->hasUses()) {
@@ -400,6 +415,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         continue;
     }
 
+    // 3. 为剩余对象一次性建立前驱表与支配树层级，供活跃性和 IDF 计算共享。
     std::unordered_map<BasicBlock*, std::vector<BasicBlock*>> PredMap;
     for (auto bb : F) {
         for (BasicBlock* succ : bb->getSuccessors()) {
@@ -407,7 +423,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-    //4.计算Pruned SSA
+     
     std::unordered_map<DominatorNode*, unsigned> DomLevels;
     {
         DominatorNode* root = DT.getNode(F.front());
@@ -426,13 +442,14 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-    // ========== 5. 计算 IDF + Pruned Phi 放置 ==========
+     
 
     std::map<AllocaInst*, unsigned> AllocaIndex;
     for (unsigned i = 0; i < Allocas.size(); ++i)
         AllocaIndex[Allocas[i]] = i;
 
     std::vector<std::set<BasicBlock*>> DefBlocks(Allocas.size());
+    // 3.1 分别收集每个对象的 store 定义块，反向求 live-in，再在 pruned IDF 中插入 PHI。
     for (unsigned i = 0; i < Allocas.size(); ++i) {
         for (Use *use : Allocas[i]->getUses()) {
             if (StoreInst* SI = dynamic_cast<StoreInst*>(use->getUser()))
@@ -447,11 +464,11 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         std::shared_ptr<IRType> allocType =
             IRType::getPointeeType(AI->getIRType());
 
-        // 计算 live-in blocks
+         
         std::set<BasicBlock*> LiveInBlocks;
         computeLiveInBlocks(AI, DefBlocks[i], LiveInBlocks,PredMap);
 
-        //计算IDF
+         
         std::set<BasicBlock*> phiBlocks;
         computeIDF(DefBlocks[i], LiveInBlocks, phiBlocks, DT, DomLevels);
 
@@ -462,7 +479,9 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-    // ========== 6. 变量重命名 ==========
+     
+    // 4. 为每个 alloca 建当前 SSA 值栈，以 undef 作为入口初值；随后显式 DFS 支配树
+    // 完成重命名，frame 记录本块压栈次数以便离开子树时精确恢复。
     unsigned numAllocas = Allocas.size();
     std::vector<std::stack<Value*>> IncomingVals(numAllocas);
 
@@ -485,7 +504,9 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         if(!frame.Processed){
             frame.Processed = true;
 
-            // 6.1 处理该块中的 Phi 结点
+             
+            // 4.1 进入块先压入该块新 PHI，再顺序把 load 替换为栈顶、把 store 值压栈，
+            // 最后为每个 CFG 后继的 PHI 填入当前出块值。
             auto phiIt = PhiNodes.find(BB);
             if(phiIt != PhiNodes.end()){
                 for(auto& [allocIdx, phi] : phiIt->second){
@@ -494,7 +515,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                 }
             }
 
-            // 6.2 遍历块中的指令，处理 load 和 store
+             
             std::vector<Instruction*> instsToDelete;
 
             for(auto inst : *BB){
@@ -534,7 +555,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
                 delete inst;
             }
 
-            // 6.3 填充后继块的 Phi 结点
+             
             auto succs = BB->getSuccessors();
             for(BasicBlock* succBB : succs){
                 auto succPhiIt = PhiNodes.find(succBB);
@@ -546,7 +567,8 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
             }
         }
 
-        // 6.4 DFS 遍历子节点
+         
+        // 4.2 子节点处理完毕后按 PushCounts 回退各变量值栈，保持兄弟支配子树隔离。
         if(frame.ChildIter != nullptr){
             DominatorNode* child = frame.ChildIter;
             frame.ChildIter = child->NextSibling;
@@ -561,18 +583,20 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         }
     }
 
-    // ========== 7. 清除 Alloca 指令 ==========
+     
+    // 5. 删除已无访问的 alloca；若异常残留 use 则保守保留对象。
     for (AllocaInst* AI : Allocas) {
-        // 正常情况下，支配树重命名已经消除全部直接 load/store 用户。
-        // 若 IR 异常或后续扩展遗漏了某类用户，宁可保留 alloca，也不能
-        // 依赖 Value 析构级联删除仍然存活的指令。
+         
+         
+         
         if (AI->hasUses()) continue;
         blockInfo.deleteIndex(AI);
         delete AI;
     }
     roundChanged = true;
 
-    // ========== 8. Trivial Phi Simplification ==========
+     
+    // 6. 反复折叠自引用以外 incoming 全相同的 PHI，直到本轮 SSA 图不再退化。
     bool phiChanged = true;
     while (phiChanged) {
         phiChanged = false;
@@ -602,12 +626,14 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 }
 
 PassResult PromotePass::run(Function &F, FunctionAnalysisPassManager &FAM){
+    // 1. 获取支配树并执行快速路径、pruned PHI 放置和 SSA 重命名完整流程。
     auto &dominant = FAM.getResult<DominantAnalysis>(F);
 
     if(!promoteMemoryToRegister(F, dominant)) {
         return PassResult::unchanged();
     }
 
+    // 7. CFG 未改，结构分析保持；内存对象转为 SSA 值后 AA 与副作用摘要失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();
@@ -623,6 +649,8 @@ void PromotePass::computeLiveInBlocks(
     std::set<BasicBlock*>& LiveInBlocks,
     const std::unordered_map<BasicBlock*, std::vector<BasicBlock*>>& PredMap)
 {
+    // 3.1 以可能在本块首个定义前读取的块为种子反向传播；传播遇到其他定义块停止，
+    // 得到真正需要 incoming 值的区域，避免在完整 DF 上过量插 PHI。
     std::vector<BasicBlock*> UseBlocksToPropagate;
 
     for (Use *use : AI->getUses()) {
@@ -636,7 +664,7 @@ void PromotePass::computeLiveInBlocks(
             continue;
         }
 
-        // 该块既有 load 又有 store，检查指令顺序
+         
         bool foundStoreFirst = false;
         bool foundLoadBeforeStore = false;
         for (auto inst : *BB) {
@@ -659,9 +687,9 @@ void PromotePass::computeLiveInBlocks(
         }
     }
 
-    // Seed blocks are live-in and propagate through predecessors even when
-    // they also define the alloca.  A DefBlock reached later through an edge
-    // remains a barrier, matching the original two-phase seed/BFS behavior.
+     
+     
+     
     std::set<BasicBlock *> SeedBlocks(
         UseBlocksToPropagate.begin(), UseBlocksToPropagate.end());
     forEachReachablePreOrderCustomSucc<BasicBlock>(
@@ -684,11 +712,12 @@ void PromotePass::computeLiveInBlocks(
 }
 
 bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
+    // 6.1 忽略 PHI 自引用后要求所有 incoming 相同；没有其他值时退化为同型 undef。
     Value* singleVal = nullptr;
 
     bool AllSame = forEachPhiIncoming(
         Phi, [&singleVal, Phi](unsigned, Value *V, BasicBlock *) {
-            // 只跳过 phi 自引用（循环回边），不跳过 undef
+             
             if (V == Phi) return true;
             if (singleVal == nullptr) {
                 singleVal = V;
@@ -699,7 +728,7 @@ bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
     if (!AllSame) return false;
 
     if (singleVal == nullptr) {
-        // 所有 incoming 都是自引用（不应发生），替换为 undef
+         
         singleVal = UndefValue::NewUndefValue(Phi->getIRType());
     }
 

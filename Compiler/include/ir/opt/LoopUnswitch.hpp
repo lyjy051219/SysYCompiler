@@ -20,26 +20,29 @@ class LoopInfo;
 class MemorySSAResult;
 class SCEVResult;
 
-// 循环条件外提：优先执行无代码膨胀的特化，必要时再克隆一侧循环区域。
-// Pass 保存每个函数已选择的模式，避免固定点流水线重复克隆同一循环。
+// LoopUnswitch 的整体流程：
+// 1. 每个函数在固定点轮次间保留所选模式，优先尝试 trivial，选定后不再切换到克隆模式。
+// 2. 所有候选都要求 LoopSimplify + LCSSA、循环不变布尔条件在 preheader 可用，且循环子树不能到达计时调用。
+// 3. trivial 路径将“继续/退出循环”分支移到 preheader，证明前缀必经且无内存定义、故障或可观察指令。
+// 4. entry-known 路径从动态入口链或支配 guard 证明条件常量，批量替换循环内 use，不克隆代码。
+// 5. non-trivial 路径分别求两个分支特化的可达闭包，保留较大一侧并克隆较小一侧，再以动态控制收益严格覆盖静态增长为准入。
+// 6. 克隆、PHI 剪枝和版本化出口均先离线计划；提交前失败销毁全部克隆，成功后统一使函数分析失效。
 class LoopUnswitchPass : public PassDescriptor<LoopUnswitchPass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    // 绝对上限用于约束编译时间，相对上限用于约束函数级代码膨胀。
-    // 所有候选统一使用同一组预算，不依据测试用例或既有变换痕迹调整阈值。
+    // 5.4 非平凡克隆同时受块数、指令数和函数规模百分比限制，并统一使用抽象指令成本。
     static constexpr std::size_t MaxNonTrivialCloneBlocks = 32;
     static constexpr std::size_t MaxNonTrivialCloneInstructions = 192;
     static constexpr std::size_t MaxClonePercentOfFunction = 30;
-    // 没有性能画像时按一次迭代估计未知循环，避免猜测循环热度。
+    // 5.4.1 无 profile 时未知 trip count 只估一次，已知次数也饱和到上限，防止收益无界放大。
     static constexpr std::int64_t UnknownTripCountEstimate = 1;
-    // 限制单个候选可累计的动态收益，防止大常量循环无界放宽代码膨胀。
     static constexpr std::int64_t MaxTripCountForProfitability = 64;
-    // 成本统一使用抽象指令单位：每个控制 use 和入口分派各计一条指令。
+    // 5.4.2 收益计算为每迭代消除的必经控制 use，再扣除一次入口版本分派。
     static constexpr std::int64_t ControlUseCost = 1;
     static constexpr std::int64_t EntryDispatchCost = 1;
-    // 克隆块会增加布局与跳转压力，出口 PHI 会增加版本合流压力。
+    // 5.4.3 静态成本除指令外还计入块布局/跳转和出口 PHI 版本合流压力。
     static constexpr std::int64_t ClonedBlockCost = 3;
     static constexpr std::int64_t ExitPhiVersioningCost = 4;
     static constexpr unsigned RelationLessMask = 1U;
@@ -99,7 +102,7 @@ private:
         std::vector<BasicBlock *> AllBlocks;
         BlockSet TrueReachable;
         BlockSet FalseReachable;
-        // 仅以减少静态代码膨胀为目标：保留较大区域，克隆较小区域。
+        // 5.2 不猜测分支热度：Original 固定保留加权较大的区域，Clone 固定选较小的区域。
         bool OriginalValue = false;
         BasicBlock *OriginalSucc = nullptr;
         BasicBlock *CloneSucc = nullptr;
@@ -143,7 +146,7 @@ private:
     static bool isAvailableAt(Value *V, Instruction *UsePoint,
                               const Loop &L, const DominatorTree &DT);
     static bool getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape);
-    // 判断循环及其子循环中是否存在可到达计时函数的调用。
+    // 2.1 实现所有路径共享的形状、条件可用性、必经性和计时调用门禁。
     static bool loopMayReachTimingCall(const Loop *L);
     static bool isDirectLoopBlock(const LoopInfo &LI, Loop *L,
                                   BasicBlock *BB);
@@ -159,6 +162,7 @@ private:
     static std::optional<TrivialCandidate> findTrivialCandidate(
         Function &F, LoopInfo &LI, const DominatorTree &DT,
         const MemorySSAResult &MSSA);
+    // 3.2 提交 trivial 外提，并在出口有其他前驱时重建 LCSSA/合流 PHI。
     static bool replaceConditionUsesInBlocks(Value *Condition,
                                              const BlockSet &Blocks,
                                              bool KnownValue);
@@ -194,6 +198,7 @@ private:
     static std::optional<bool> getEntryKnownValue(
         Value *Condition, BasicBlock *PreHeader, const LoopInfo &LI,
         const DominatorTree &DT);
+    // 5.1 证明两个特化可达闭包的 SSA/CFG 封闭性，评估预算并选出最优候选。
     static bool cloneClosureIsLegal(const NonTrivialCandidate &C);
     static bool hasAnyCall(const std::vector<BasicBlock *> &Blocks);
     static std::size_t estimateExitPhiCost(Loop &L);
@@ -208,6 +213,7 @@ private:
     static std::optional<NonTrivialCandidate> findBestNonTrivialCandidate(
         Function &F, LoopInfo &LI, const DominatorTree &DT,
         SCEVResult &SE);
+    // 6.1 在游离克隆上剪枝 PHI、计划版本出口；任一预检失败都可销毁整个区域。
     static Value *mapValue(Value *V, const ValueToValueMap &VMap);
     static bool pruneClonedPhis(ClonedBlockRegion &Region,
                                 const NonTrivialCandidate &C,
@@ -228,5 +234,6 @@ private:
     static bool transformEntryKnown(const EntryKnownCandidate &C);
     static bool transformNonTrivial(Function &F, NonTrivialCandidate &C);
 
+    // 1.1 状态跨固定点调用保留，记录函数已选模式和是否已消耗唯一完整克隆额度。
     std::unordered_map<Function *, FunctionState> States;
 };

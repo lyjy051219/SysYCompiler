@@ -83,14 +83,16 @@ bool PhiCongruenceMatcher::isSupportedPureInstruction(Instruction *I) {
 
 bool PhiCongruenceMatcher::equivalentPhis(
     PhiInst *A, PhiInst *B, unsigned Depth) {
+    // 2.1 同块 PHI 按前驱而非 incoming 顺序配对，每个前驱必须恰出现一次；
+    // 对应值再递归比较，避免因边枚举顺序不同漏掉等价关系。
     if (!A || !B || A->getParent() != B->getParent() ||
         A->getNumIncomingValues() != B->getNumIncomingValues()) {
         return false;
     }
 
-    // Match by predecessor rather than operand order.  Duplicate incoming
-    // blocks are edge-sensitive in this IR and cannot be translated
-    // unambiguously, so leave those uncommon forms alone.
+     
+     
+     
     std::unordered_set<BasicBlock *> SeenA;
     std::unordered_set<BasicBlock *> SeenB;
     bool Equal = forEachPhiIncoming(
@@ -116,6 +118,8 @@ bool PhiCongruenceMatcher::equivalentPhis(
 
 bool PhiCongruenceMatcher::equivalentImpl(
     Value *A, Value *B, unsigned Depth) {
+    // 2.2 仅递归比较无 undef 的纯表达式。值对用三态 memo 处理循环 PHI：正在访问
+    // 的同一对暂按共递归相等，最终由外层操作码、类型和全部操作数共同定论。
     if (A == B) return A && !Value::isUndef(A);
     if (!A || !B || Value::isUndef(A) || Value::isUndef(B) ||
         Depth > 128 || A->getIRType().get() != B->getIRType().get()) {
@@ -127,8 +131,8 @@ bool PhiCongruenceMatcher::equivalentImpl(
     if (!IA || !IB || IA->instType != IB->instType ||
         !isSupportedPureInstruction(IA) ||
         !isSupportedPureInstruction(IB)) {
-        // Constants are interned by representation, and parameters/globals
-        // are only equal by identity (handled above).
+         
+         
         return false;
     }
 
@@ -178,6 +182,7 @@ GVNPRESolver::GVNPRESolver(Function &F,
       EnablePRE(EnablePRE) {}
 
 bool GVNPRESolver::run() {
+    // 1. 先应用函数/基本块规模预算；预算内先让 GVN 收敛，再按配置运行 PRE 收敛。
     if (isFunctionTooLargeForGVNPRE()) {
         return false;
     }
@@ -208,6 +213,8 @@ bool GVNPRESolver::isFunctionTooLargeForGVNPRE() const {
 }
 
 bool GVNPRESolver::runGVNFixedPoint() {
+    // 2. 每轮重建值号与可达性，直到没有冗余被删除或达到轮数上限；删除会暴露
+    // 新支配 leader，因此不能只扫描一次。
     bool AnyChanged = false;
     for (int Round = 0; Round < kMaxGVNRounds; ++Round) {
         clearIterationState();
@@ -222,6 +229,8 @@ bool GVNPRESolver::runGVNFixedPoint() {
 }
 
 bool GVNPRESolver::runPREFixedPoint() {
+    // 3. PRE 每轮先重建值号表和支配可用集，再补一条缺失路径；新表达式/PHI 会
+    // 改变后续可用性，因此同样有界迭代。
     bool AnyChanged = false;
     for (int Round = 0; Round < kMaxPRERounds; ++Round) {
         clearIterationState();
@@ -238,6 +247,7 @@ bool GVNPRESolver::runPREFixedPoint() {
 }
 
 void GVNPRESolver::clearIterationState() {
+    // 1.1 清空所有派生表与查询预算，确保新一轮不使用被上一轮删除指令的记录。
     NextValueNum = 1;
     ValueNum.clear();
     ExpressionTable.clear();
@@ -256,6 +266,7 @@ bool GVNPRESolver::hasResultValue(Instruction *I) {
 }
 
 void GVNPRESolver::rebuildRPOAndReachability() {
+    // 1.2 从入口重建 RPO，并以同一集合区分真实不可达块。
     ReachableBlocks.clear();
     RPO.clear();
 
@@ -268,6 +279,7 @@ void GVNPRESolver::rebuildRPOAndReachability() {
 }
 
 void GVNPRESolver::buildTablesForPRE() {
+    // 3.1 按 RPO 为 PRE 预编号全部可达结果值，同时根据常量分支标记本轮死区域。
     for (BasicBlock *BB : RPO) {
         if (isDeadBlock(BB)) continue;
 
@@ -286,15 +298,17 @@ void GVNPRESolver::buildTablesForPRE() {
     }
 }
 
-// Build AVAIL_OUT: top-down dominator tree traversal.
-// Each block inherits its dominator's AVAIL_OUT, then adds its own defs.
+ 
+ 
 void GVNPRESolver::buildAvailOut() {
+    // 3.2 按支配树前序复制立即支配者的出口可用表，再加入本块首次出现的每个值号；
+    // 因而 AvailOut 中的 leader 必然支配对应块出口。
     BasicBlock *Entry = F.front();
     if (!Entry) return;
 
-    // The old stack pushed children in their natural order, so LIFO visited
-    // siblings in reverse order.  Reverse the custom successor list to retain
-    // that exact order while pruning a dead child's entire dominator subtree.
+     
+     
+     
     std::vector<BasicBlock *> Roots;
     if (!isDeadBlock(Entry)) Roots.push_back(Entry);
     auto DomOrder =
@@ -313,25 +327,25 @@ void GVNPRESolver::buildAvailOut() {
     for (BasicBlock *BB : DomOrder) {
         auto &Avail = AvailOut[BB];
 
-        // Inherit from idom
+         
         BasicBlock *IDom = DT.getIDom(BB);
         if (IDom && !isDeadBlock(IDom)) {
             auto It = AvailOut.find(IDom);
             if (It != AvailOut.end()) {
-                Avail = It->second; // copy idom's AVAIL_OUT
+                Avail = It->second;  
             }
         }
 
-        // Add/override with definitions in BB
+         
         for (Instruction *I : *BB) {
             if (!I || !hasResultValue(I)) continue;
             auto VIt = ValueNum.find(I);
             if (VIt == ValueNum.end()) continue;
             int Num = VIt->second;
             if (Num <= 0) continue;
-            // Only insert if not already available (leader wins by domtree order)
-            // Since we process top-down, the first definition dominates all uses.
-            // Skip ALLOCA/BR/RET as they don't produce useful value leaders.
+             
+             
+             
             if (I->instType == Instruction::ALLOCA ||
                 I->instType == Instruction::RET   ||
                 I->instType == Instruction::BR)
@@ -359,6 +373,7 @@ void GVNPRESolver::addRecord(int Num, Instruction *I, BasicBlock *BB) {
 }
 
 void GVNPRESolver::forgetInstruction(Instruction *I) {
+    // 2.3 删除前同步驱逐 ValueNum、LeaderTable 与代表值，防止后续命中悬空 leader。
     if (!I) return;
 
     auto VNIt = ValueNum.find(I);
@@ -397,6 +412,7 @@ bool GVNPRESolver::isBeforeInSameBlock(Instruction *A, Instruction *B) const {
 }
 
 Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const {
+    // 2.4 leader 必须支配 use；同块还必须位于 use 之前，且两者之间不能跨计时屏障。
     if (!UseBB) return nullptr;
 
     auto It = LeaderTable.find(Num);
@@ -418,8 +434,8 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
     return Best;
 }
 
-// O(1) lookup using AVAIL_OUT (domtree-propagated).
-// PredBB: the block we want the value to be available in.
+ 
+ 
 Instruction *GVNPRESolver::findAvailLeader(int Num, BasicBlock *PredBB) const {
     if (!PredBB) return nullptr;
     auto AOIt = AvailOut.find(PredBB);
@@ -439,6 +455,8 @@ int GVNPRESolver::allocateFreshNum(Value *V) {
 }
 
 int GVNPRESolver::getOrAssignValueNum(Value *V, bool &IsFresh) {
+    // 2.5 内存、PHI、控制和有副作用调用各获独立值号；其余纯表达式由规范键查表，
+    // 已有键共享值号，新键同时登记反向表达式供 PHI translate 使用。
     if (!V) {
         IsFresh = false;
         return 0;
@@ -495,6 +513,8 @@ int GVNPRESolver::getOrAssignValueNum(Value *V, bool &IsFresh) {
 }
 
 bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
+    // 2.6 表达式键包含精确结果类型、opcode/谓词和操作数值号；交换律运算排序，
+    // 比较交换两侧时同步反转谓词，调用仅接纳可 CSE 的 NoModRef 情形。
     if (!I || !I->getIRType()) return false;
 
     auto appendOperands = [&](Instruction *Inst, std::vector<int> &Args) {
@@ -507,8 +527,8 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 
     K.Args.clear();
     K.Opcode = (static_cast<unsigned>(I->instType) << 8);
-    // 转换、GEP 和 select 可以具有相同操作码及操作数、但产生不同类型。
-    // 类型必须进入全局值编号键，避免把不同目标类型的值错误 RAUW。
+     
+     
     K.ResultType = I->getIRType().get();
 
     if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
@@ -567,6 +587,7 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 }
 
 ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
+    // 2.7 builtin 按属性、普通函数按副作用摘要分类；计时、未知及未跟踪指针一律 ModRef。
     if (!CI) return ModRefInfo::ModRef;
     if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
 
@@ -591,6 +612,8 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
 }
 
 bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
+    // 2.8 调用 CSE 仅支持已定义、非 builtin、非 void/指针返回且摘要至多 Ref 的函数，
+    // 并排除传递调用 builtin 的不稳定摘要。
     if (!CI || CI->mayReachTimingCall() || CI->getBuiltinCallee() ||
         !CI->getIRType() ||
         CI->getIRType()->isVoid() || CI->getIRType()->isPointer())
@@ -604,15 +627,16 @@ bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
     if (!isNoModRef(MRI) && MRI != ModRefInfo::Ref)
         return false;
 
-    // SideEffectAnalysis 会把 SysY I/O、计时及其 wrapper 的 hasBuiltin
-    // 沿调用图传播。它们可能依赖输入或外部环境，不能进行调用 CSE；
-    // 普通纯函数则无需因递归、undef 或合法纯算术被一概禁用。
+     
+     
+     
     const SideEffectInfo &Effects =
         FAM.getResult<SideEffectAnalysis>(*Callee);
     return !Effects.hasBuiltin;
 }
 
 std::vector<Value *> GVNPRESolver::collectCallReadPtrs(CallInst *CI) {
+    // 2.9 将只读调用的 RefSet 映射为实际全局和指针实参，供两次调用间写入屏障检查。
     std::vector<Value *> ReadPtrs;
     if (!CI) return ReadPtrs;
 
@@ -680,6 +704,8 @@ bool GVNPRESolver::identicalCall(CallInst *A, CallInst *B) {
 }
 
 void GVNPRESolver::markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc) {
+    // 2.10 从常量分支未取后继收集候选区域，再迭代剔除仍有区域外前驱的块；剩余块
+    // 才真正只由死边可达，可从本轮值编号与 PRE 路径中排除。
     if (!BrBB || !DeadSucc || DeadSucc == BrBB) return;
 
     std::vector<BasicBlock *> Roots{DeadSucc};
@@ -730,6 +756,8 @@ void GVNPRESolver::processBranchForDeadBlocks(Instruction *I) {
 }
 
 bool GVNPRESolver::processLoad(Instruction *I) {
+    // 2.11 load 消除先查询有预算的 MemorySSA clobber：若最近定义是支配目标的
+    // MustAlias store，直接转发其值。
     auto *LIst = dynamic_cast<LoadInst *>(I);
     if (!LIst) return false;
     Value *Ptr = LIst->getPointerOperand();
@@ -770,11 +798,13 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         }
     }
 
-    // Two dominating loads with the same reaching memory state and the same
-    // byte location observe the same value.  Keying by the MemorySSA clobber
-    // prevents a syntactically identical address from being reused across an
-    // intervening store/call.  The bounded reverse search favors nearby
-    // leaders and caps compile time on load-heavy functions.
+     
+     
+     
+     
+     
+    // 2.12 否则在相同 clobber 版本下复用支配的 MustAlias load；共同 clobber
+    // 证明两次读取之间没有改变该位置的内存定义。
     if (Clobber) {
         std::size_t Compared = 0;
         for (auto It = AvailableMemoryLoads.rbegin();
@@ -806,6 +836,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         return false;
     };
 
+    // 2.13 最后沿唯一前驱链做有界逆向扫描，最近 MustAlias store/load 可转发，
+    // MayAlias 写、调用 Mod 或计时屏障终止；失败候选记入 clobber 版本缓存。
     BasicBlock *ScanBB = BB;
     Instruction *StartI = I->getPrev();
 
@@ -866,6 +898,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
 }
 
 bool GVNPRESolver::processCall(Instruction *I) {
+    // 2.14 对 Ref-only 调用沿唯一前驱链寻找实参与 callee 完全相同的先前调用；
+    // 两者之间对任一读地址的 store/call 写入都会阻断复用。
     auto *CI = dynamic_cast<CallInst *>(I);
     if (!CI) return false;
 
@@ -894,9 +928,9 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 for (Value *RP : ReadPtrs) {
                     if (!RP || !RP->isPointerValue())
                         continue;
-                    // A callee RefSet entry describes an unknown range in the
-                    // referenced object.  A different GEP offset is not enough
-                    // to move the call across this store.
+                     
+                     
+                     
                     if (!AA.haveKnownDistinctUnderlyingObjects(RP, SPtr))
                         return false;
                 }
@@ -908,9 +942,9 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
-                    // MemorySSA models every call as a Def node.  This solver
-                    // has no incremental updater, so stop consulting the
-                    // snapshot after deleting one; scalar GVN may continue.
+                     
+                     
+                     
                     MemorySSAValid = false;
                     AvailableMemoryLoads.clear();
                     delete I;
@@ -937,6 +971,8 @@ bool GVNPRESolver::processCall(Instruction *I) {
 }
 
 bool GVNPRESolver::runGVN() {
+    // 2. 先消除递归等价 PHI，再按 RPO 扫描可达指令；计时调用清空内存 load 缓存，
+    // 常量分支即时标记死块，load/call 使用专门的内存感知路径。
     bool Changed = eliminateCongruentPhis();
 
     for (BasicBlock *BB : RPO) {
@@ -950,7 +986,7 @@ bool GVNPRESolver::runGVN() {
 
             if (auto *CI = dynamic_cast<CallInst *>(I);
                 CI && CI->mayReachTimingCall()) {
-                // 内存值缓存不能越过计时屏障；标量 leader 由路径查询过滤。
+                 
                 AvailableMemoryLoads.clear();
             }
 
@@ -978,6 +1014,8 @@ bool GVNPRESolver::runGVN() {
                 continue;
             }
 
+            // 2.15 普通结果获取值号：新表达式登记 leader，已有表达式寻找合法支配
+            // leader 替换；删除前同步清理所有编号记录。
             bool Fresh = false;
             int Num = getOrAssignValueNum(I, Fresh);
             if (Num <= 0) continue;
@@ -1014,6 +1052,8 @@ bool GVNPRESolver::runGVN() {
 }
 
 bool GVNPRESolver::eliminateCongruentPhis() {
+    // 2.16 在每个可达块中成对比较同型 PHI；含计时调用的循环整体跳过，并对候选
+    // 操作数图做有界跨屏障检查后才合并。
     bool Changed = false;
 
     for (BasicBlock *BB : RPO) {
@@ -1053,8 +1093,8 @@ bool GVNPRESolver::eliminateCongruentPhis() {
                 PhiCongruenceMatcher Matcher;
                 if (!Matcher.equivalent(Leader, Candidate)) continue;
 
-                // 合并循环或分支 PHI 会让其中一套纯 SSA 计算随后变死。
-                // 若任一被匹配子图到替换点之间经过计时屏障，就保留两套计算。
+                 
+                 
                 auto CrossesTiming = [&](Value *Root) {
                     std::vector<Value *> WorkList{Root};
                     std::unordered_set<Value *> Seen;
@@ -1101,6 +1141,8 @@ bool GVNPRESolver::isBackedge(BasicBlock *Pred, BasicBlock *BB, const DominatorT
 }
 
 bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
+    // 3.3 PRE 只补纯、可安全推测且有结果的标量表达式；控制、内存、比较、调用和
+    // 可能陷阱/poison 的指令全部排除。
     if (!I || !hasResultValue(I)) return true;
 
     if (I->instType == Instruction::ALLOCA || I->instType == Instruction::RET ||
@@ -1112,28 +1154,30 @@ bool GVNPRESolver::shouldSkipPREInst(Instruction *I) {
         if (BinaryInst::isCompareOp(BI->getOp())) return true;
     }
 
-    // 完整 PRE 会把表达式复制到缺失前驱；该前驱可能仍有其他后继，
-    // 因而不能依赖调用方提前拆分关键边来保证安全。统一复用中端的
-    // 投机安全判定，拒绝动态/越界移位、除余、FPTOSI 等可能产生
-    // poison 或故障的表达式。块内 LocalGVN 不经过这里，仍可消除
-    // 已经执行过的同块重复表达式。
+     
+     
+     
+     
+     
     if (instructionMayFaultOrProducePoison(I)) {
         return true;
     }
 
-    // PRE 可能把表达式放到原本不执行它的路径。即使 call 不修改内存，
-    // 也可能失败或不返回，因此 call 只允许走支配关系成立的 GVN 消除，
-    // 绝不由 PRE 投机插入。
+     
+     
+     
     if (dynamic_cast<CallInst *>(I)) return true;
 
     return false;
 }
 
-// Improved phiTranslate:
-// 1. Check PHI nodes in FromBB for direct mapping
-// 2. If Num corresponds to a compound expression, recursively translate operands
-//    and check if the resulting ExprKey exists in ExpressionTable
+ 
+ 
+ 
+ 
 int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) {
+    // 3.4 把汇合块中的值号翻译到指定前驱：若值号来自 PHI，取该边 incoming；
+    // 若来自表达式，递归翻译各参数并重新查规范表达式键，结果按边缓存。
     PhiTranslateKey Key{Num, FromBB, ToPred};
     auto It = PhiTranslateTable.find(Key);
     if (It != PhiTranslateTable.end()) {
@@ -1142,13 +1186,13 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
 
     int Result = Num;
 
-    // Step 1: Look for a PHI in FromBB whose value-number matches Num,
-    // and return the value-number of the incoming value from ToPred.
+     
+     
     if (FromBB) {
         for (Instruction *DefI : *FromBB) {
             if (!DefI) continue;
             auto *Phi = dynamic_cast<PhiInst *>(DefI);
-            if (!Phi) break; // PHIs always come first
+            if (!Phi) break;  
             auto VIt = ValueNum.find(DefI);
             if (VIt == ValueNum.end() || VIt->second != Num) continue;
 
@@ -1168,8 +1212,8 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
         }
     }
 
-    // Step 2: Translate compound expression by recursively translating operands.
-    // If all operands translate, look up the resulting ExprKey.
+     
+     
     auto EI = NumToExpr.find(Num);
     if (EI != NumToExpr.end()) {
         ExprKey NewK = EI->second;
@@ -1181,7 +1225,7 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             ArgNum = Translated;
         }
 
-        // Re-canonicalize commutative ops after translation
+         
         unsigned BaseOp = NewK.Opcode >> 8;
         if (BaseOp == Instruction::ADD  || BaseOp == Instruction::FADD ||
             BaseOp == Instruction::MUL  || BaseOp == Instruction::FMUL ||
@@ -1195,7 +1239,7 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
             if (Found != ExpressionTable.end()) {
                 Result = Found->second;
             }
-            // If not found, Result stays as original Num — expression not available
+             
         }
     }
 
@@ -1203,16 +1247,18 @@ int GVNPRESolver::phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred) 
     return Result;
 }
 
-// Resolve an operand value for hoisting to PredBB.
-// OrigV: original operand of instruction in SrcBB.
-// If OrigV is defined in SrcBB itself, find its translated leader in PredBB.
-// If OrigV is defined outside SrcBB, verify it dominates PredBB.
+ 
+ 
+ 
+ 
 Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicBlock *PredBB) {
+    // 3.5 克隆到缺失前驱前，块内操作数需经 PHI translate 找到该前驱可用 leader；
+    // 块外定义则必须支配前驱，否则无法构造合法 SSA 操作数。
     if (!OrigV) return nullptr;
 
     auto *OpI = dynamic_cast<Instruction *>(OrigV);
     if (!OpI) {
-        // Constants, globals, params – always available
+         
         return OrigV;
     }
 
@@ -1220,23 +1266,23 @@ Value *GVNPRESolver::resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB, BasicB
     if (!DefBB) return nullptr;
 
     if (DefBB == SrcBB) {
-        // Operand is defined in the same block: need its translated version in PredBB
+         
         bool OpFresh = false;
         int OpNum    = getOrAssignValueNum(OrigV, OpFresh);
         int TransNum = phiTranslate(OpNum, SrcBB, PredBB);
 
-        // First try fast AVAIL_OUT lookup
+         
         if (Instruction *Avail = findAvailLeader(TransNum, PredBB)) {
             return Avail;
         }
-        // Fallback: full LeaderTable scan
+         
         if (Instruction *Leader = findLeader(TransNum, PredBB, nullptr)) {
             return Leader;
         }
-        return nullptr; // Not available — hoisting blocked
+        return nullptr;  
     }
 
-    // Operand comes from outside SrcBB: must dominate PredBB
+     
     if (!DT.dominates(DefBB, PredBB)) return nullptr;
     return OrigV;
 }
@@ -1254,13 +1300,14 @@ void GVNPRESolver::seedDeadBlocksToLeaderTable() {
 }
 
 bool GVNPRESolver::runPRE() {
+    // 3. 先把死块结果加入 leader 表以稳定值号，再按入口 DFS 扫描非入口汇合块。
     bool Changed = false;
 
     seedDeadBlocksToLeaderTable();
 
     if (!F.front()) return false;
 
-    // Snapshot entry-reachable CFG pre-order before PRE starts mutating IR.
+     
     std::vector<BasicBlock *> Roots{F.front()};
     std::vector<BasicBlock *> DFSOrder =
         buildPreOrderFromRoots<BasicBlock>(Roots);
@@ -1286,10 +1333,12 @@ bool GVNPRESolver::runPRE() {
             BasicBlock *PREPred = nullptr;
             bool Abort   = false;
 
-            // PredMap: pred -> available leader value (for preds where it IS available)
+             
             std::unordered_map<BasicBlock *, Value *> PredMap;
             std::vector<BasicBlock *> ConsideredPreds;
 
+            // 3.6 对每条非死、非回边前驱翻译当前表达式值号；PRE 只接受恰好一条
+            // 缺失、至少一条已有的部分冗余形态，避免代码膨胀和循环回边插入。
             for (BasicBlock *Pred : Preds) {
                 if (!Pred || isDeadBlock(Pred)) {
                     Abort = true;
@@ -1304,7 +1353,7 @@ bool GVNPRESolver::runPRE() {
 
                 int TransNum = phiTranslate(Num, BB, Pred);
 
-                // Fast AVAIL_OUT lookup first, then fallback to full scan
+                 
                 Instruction *Leader = findAvailLeader(TransNum, Pred);
                 if (!Leader) {
                     Leader = findLeader(TransNum, Pred, nullptr);
@@ -1320,7 +1369,7 @@ bool GVNPRESolver::runPRE() {
                     break;
                 }
                 if (Leader == I) {
-                    // This is a back-edge scenario or same instruction: abort
+                     
                     NumWithout = 2;
                     Abort      = true;
                     break;
@@ -1332,7 +1381,7 @@ bool GVNPRESolver::runPRE() {
 
             if (Abort) continue;
 
-            // PRE condition: exactly one pred missing, at least one has it
+             
             if (!(NumWithout == 1 && NumWith > 0 && PREPred)) {
                 continue;
             }
@@ -1344,7 +1393,9 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
 
-            // Clone the instruction and fix operands for PREPred
+             
+            // 3.7 在缺失前驱终结前克隆表达式，并逐操作数解析该边可用值；任一操作数
+            // 无合法 leader 时丢弃离线克隆。
             Instruction *Cloned = I->clone({});
             if (!Cloned) continue;
 
@@ -1357,7 +1408,7 @@ bool GVNPRESolver::runPRE() {
                 I, [&](size_t Idx, Use *, Value *OrigV) {
                 if (!OrigV) return false;
 
-                // Use improved resolveAvailOperand to find the right value in PREPred
+                 
                 Value *Resolved = resolveAvailOperand(OrigV, BB, PREPred);
                 if (!Resolved) return false;
 
@@ -1371,16 +1422,18 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
 
-            // Insert cloned instruction into PREPred before its terminator
+             
             PREPred->insertBeforeTerminator(Cloned);
             ValueNum[Cloned] = Num;
             NumToValue[Num]  = Cloned;
             addRecord(Num, Cloned, PREPred);
 
-            // Update AVAIL_OUT[PREPred] so future PRE rounds see this new def
+             
             AvailOut[PREPred][Num] = {Cloned, PREPred};
 
-            // Create PHI at BB to merge
+             
+            // 3.8 在汇合块 PHI 区后建立新 PHI，合并已有 leader 与新克隆；同步更新
+            // 值号、AvailOut 及其支配子树，并清除从本块出发的旧翻译缓存。
             auto *NewPhi = new PhiInst(I->getIRType());
             BB->insertAfterPhiNodes(NewPhi);
 
@@ -1393,14 +1446,14 @@ bool GVNPRESolver::runPRE() {
                 }
             }
 
-            // Give PHI the same num; update leader tables and AVAIL_OUT[BB]
+             
             ValueNum[NewPhi] = Num;
             NumToValue[Num]  = NewPhi;
             addRecord(Num, NewPhi, BB);
             AvailOut[BB][Num] = {NewPhi, BB};
 
-            // Propagate updated availability to domtree children of BB
-            // (simple: invalidate their AVAIL_OUT entry so next lookup falls back)
+             
+             
             for (BasicBlock *Cand : RPO) {
                 if (!Cand || Cand == BB || isDeadBlock(Cand)) continue;
                 if (DT.dominates(BB, Cand)) {
@@ -1414,8 +1467,8 @@ bool GVNPRESolver::runPRE() {
                 }
             }
 
-            // Invalidate phiTranslate cache entries involving BB (they may be stale)
-            // Selective: remove keys where FromBB == BB
+             
+             
             for (auto It = PhiTranslateTable.begin(); It != PhiTranslateTable.end(); ) {
                 if (It->first.From == BB)
                     It = PhiTranslateTable.erase(It);
@@ -1434,6 +1487,7 @@ bool GVNPRESolver::runPRE() {
 }
 
 PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1. 获取支配、循环、AA 与 MemorySSA，构造求解器执行 GVN 及可选 PRE 固定点。
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
@@ -1446,6 +1500,7 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
         return PreservationStatus::all();
     }
 
+    // 4. CFG 不变，结构分析可保留；表达式/内存访问与调用集合变化使其余分析失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();
@@ -1476,6 +1531,8 @@ std::size_t LocalGVNPass::LocalExprKeyHash::operator()(
 }
 
 bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
+    // 1.1 本地键直接使用操作数指针，只覆盖无 undef 的纯二元/GEP/select/cast；
+    // 交换律二元式规范操作数顺序，不涉及跨块值号或内存表达式。
     if (!I || !I->getIRType() || I->getIRType()->isVoid())
         return false;
 
@@ -1525,6 +1582,8 @@ bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
 
 PreservationStatus LocalGVNPass::run(Function &F,
                                      FunctionAnalysisPassManager &) {
+    // 1. 每个基本块独立维护表达式 leader 表，按程序顺序将重复纯表达式替换为首个；
+    // 计时调用清空表，禁止跨越计时边界合并地址或计算。
     bool Changed = false;
 
     for (BasicBlock *BB : F) {
@@ -1562,6 +1621,7 @@ PreservationStatus LocalGVNPass::run(Function &F,
     }
 
     if (!Changed) return PreservationStatus::all();
+    // 2. 仅删普通指令，保留 CFG 分析并失效 AA/副作用摘要。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

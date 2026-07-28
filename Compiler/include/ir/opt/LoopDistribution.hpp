@@ -18,8 +18,13 @@ class StoreInst;
 class Value;
 struct ClonedBlockRegion;
 
-// 按语句反向切片进行保守的循环分布。原循环保留第一分区，克隆循环保留
-// 第二分区，并把两个完整循环按原语句次序串行连接。
+// 按连续 store 序列的反向切片保守分布循环：
+// 1. 选择有限、LCSSA、单出口且无 live-out/内存相关控制的规范循环；
+// 2. 为每个 store 建立循环内反向切片，枚举保持原 store 次序的连续切分点；
+// 3. 验证共享切片可复制、危险指令只属于一个分区，并由统一依赖分析证明
+//    两分区串行执行合法；
+// 4. 用多维访问步长差异评估局部性收益，选择距离最大的计划；
+// 5. 克隆完整循环，原循环保留第一分区、克隆循环保留第二分区，再串行接 CFG。
 class LoopDistributionPass : public PassDescriptor<LoopDistributionPass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -60,6 +65,8 @@ private:
 
     using LocalityProfile = std::vector<DimensionLocality>;
 
+    // 服务步骤 1：控制条件若反向依赖循环内 load/call，则两个分区可能走不同
+    // 路径；深度预算耗尽也按“依赖内存”处理，不能当作纯净证明。
     static bool hasUnsupportedInstruction(Instruction *I);
     static bool valueDependsOnLoad(Value *V,
                                    std::unordered_set<Value *> &Seen,
@@ -71,6 +78,8 @@ private:
     static bool hasLoopLiveOut(const DistributionShape &Shape);
     static std::optional<DistributionShape> getDistributionShape(
         Function &F, Loop *L);
+    // 服务步骤 2：反向切片只沿循环内 SSA 定义传播；共享节点随后单独验证能否
+    // 在两个克隆循环中各执行一次。
     static InstructionSet collectBackwardSlice(
         StoreInst *Root, const BlockSet &LoopBlocks);
     static InstructionSet collectExclusiveSlice(
@@ -97,7 +106,7 @@ private:
     static bool executeDistribution(Function &F,
                                     const DistributionPlan &Plan);
 
-    // 外层循环流水线会迭代到不动点，因此按同一 pass 对象的全部调用累计
-    // 限制代码增长，不能在每次调用时重新获得预算。
+    // 外层流水线会重复调用本 pass；按函数和 pass 对象累计限制分布次数，避免
+    // 每轮重新获得克隆预算而无界增长代码。
     std::unordered_map<Function *, unsigned> TransformCounts;
 };

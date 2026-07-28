@@ -13,11 +13,15 @@
 #include <cstring>
 #include <utility>
 
+// 步骤 2 的迭代域比较只接受非空且完全相同的 SCEV 结构键，不以指针身份或
+// 局部形状猜测数学等价。
 bool LoopFusionPass::expressionKeysEqual(const SCEVExpr *A,
                                          const SCEVExpr *B) {
     return A && B && !A->Key.empty() && A->Key == B->Key;
 }
 
+// 步骤 1.1：待融合循环及其全部子循环都必须由 SCEV 证明有限，防止融合改变
+// 原本串行的无限执行行为。
 bool LoopFusionPass::hasFiniteLoopTree(Loop *L, SCEVResult &SE) {
     if (!L || !SE.isKnownFiniteLoop(L)) return false;
     for (Loop *SubLoop : L->getSubLoops()) {
@@ -26,6 +30,8 @@ bool LoopFusionPass::hasFiniteLoopTree(Loop *L, SCEVResult &SE) {
     return true;
 }
 
+// 步骤 2.1：循环内任一指令结果都不得在循环块集之外使用；控制结构被删除
+// 后不会留下需要跨循环边界保留的值。
 bool LoopFusionPass::hasNoLiveOut(const LoopShape &Shape) {
     if (!Shape.L || Shape.BlockLookup.empty()) return false;
     for (BasicBlock *BB : Shape.Blocks) {
@@ -45,15 +51,14 @@ bool LoopFusionPass::hasNoLiveOut(const LoopShape &Shape) {
     return true;
 }
 
+// 步骤 2.2：判断把第二循环指令移入第一循环迭代顺序是否可安全执行。load
+// 留在融合后的循环执行域，由内存依赖分析另证次序；其他指令不得 fault/poison。
 bool LoopFusionPass::isSafeReorderedInstruction(Instruction *I) {
     if (!I) return false;
-    // load 仍位于原循环执行域内，跨循环访存次序由 LoopAccess 统一证明；
-    // 这里不能套用针对“提升到新路径”的 load 投机规则。
     if (dynamic_cast<LoadInst *>(I)) return true;
     if (!instructionMayFaultOrProducePoison(I)) return true;
 
-    // 对整数除法和余数，仅在常量除数从语义上排除零，并对有符号运算
-    // 额外排除 -1 时放行；这是通用合法性证明，不是收益或用例 matcher。
+    // 整数除余仅在常量除数排除零，且有符号操作额外排除 -1 时可重排。
     auto *Binary = dynamic_cast<BinaryInst *>(I);
     if (!Binary) return false;
     BinaryInst::Operation Op = Binary->getOp();
@@ -67,6 +72,8 @@ bool LoopFusionPass::isSafeReorderedInstruction(Instruction *I) {
            Divisor->getVal() != -1;
 }
 
+// 步骤 2.3：调用、alloca、ret 或任何未通过重排安全判定的循环指令都使结构
+// 候选失效；store 的内存次序在后续 LoopAccess 统一验证。
 bool LoopFusionPass::hasUnsupportedLoopInstruction(
     const LoopShape &Shape) {
     for (BasicBlock *BB : Shape.Blocks) {
@@ -83,6 +90,8 @@ bool LoopFusionPass::hasUnsupportedLoopInstruction(
     return false;
 }
 
+// 已由 LoopDistribution 产生的循环不立即再融合，避免两个相反结构 pass 在
+// 外层不动点中来回振荡；来源标记可位于头、预头或任一循环块。
 bool LoopFusionPass::hasDistributionProvenance(
     const LoopShape &Shape) {
     if (!Shape.Header || !Shape.PreHeader) return true;
@@ -97,6 +106,8 @@ bool LoopFusionPass::hasDistributionProvenance(
     return false;
 }
 
+// 步骤 2.4：桥接块计算会被移到第一循环预头，只接受不会访问内存、产生
+// 副作用、fault 或 poison 的有限纯地址/整数转换指令。
 bool LoopFusionPass::isSafeBridgeInstruction(Instruction *I) {
     if (!I || dynamic_cast<PhiInst *>(I) || dynamic_cast<LoadInst *>(I) ||
         dynamic_cast<StoreInst *>(I) || dynamic_cast<CallInst *>(I) ||
@@ -114,6 +125,8 @@ bool LoopFusionPass::isSafeBridgeInstruction(Instruction *I) {
            dynamic_cast<TruncInst *>(I);
 }
 
+// 桥指令操作数必须在新位置可用：非指令值天然可用，桥内定义须已按原顺序
+// 加入外提集，其他指令定义须支配第一循环预头终结点。
 bool LoopFusionPass::valueDominatesPreheader(
     Value *V, BasicBlock *PreHeader, BasicBlock *Bridge,
     const InstructionSet &EarlierBridgeInstructions,
@@ -129,6 +142,8 @@ bool LoopFusionPass::valueDominatesPreheader(
            DT.dominatesValue(Def, PreHeaderTerminator);
 }
 
+// 步骤 2.5：按程序序验证并收集整座桥的非终结指令；桥必须唯一无条件跳到
+// 第二头部，且指令数受预算限制。
 bool LoopFusionPass::collectBridgeInstructions(
     FusionCandidate &Candidate, const DominatorTree &DT) {
     BasicBlock *Bridge = Candidate.Bridge;
@@ -162,6 +177,8 @@ bool LoopFusionPass::collectBridgeInstructions(
     return true;
 }
 
+// 步骤 2.6：预计算融合后的 PHI 前驱修复。第一头部回边将来自第二 latch；
+// 第二头部除归纳变量外的 PHI 移到第一头部，初值边改接第一预头。
 bool LoopFusionPass::collectHeaderPhiRewrites(
     FusionCandidate &Candidate, const DominatorTree &DT) {
     const LoopShape &First = Candidate.First;
@@ -217,6 +234,8 @@ bool LoopFusionPass::collectHeaderPhiRewrites(
     return FoundInduction;
 }
 
+// 步骤 2.7：第二头部只能保留 PHI、退出比较和以该比较为唯一条件 use 的
+// 分支；删除该头部时不会丢失第二循环的有效载荷计算。
 bool LoopFusionPass::secondHeaderContainsOnlyControl(
     const FusionCandidate &Candidate) {
     const LoopShape &Second = Candidate.Second;
@@ -238,6 +257,8 @@ bool LoopFusionPass::secondHeaderContainsOnlyControl(
     return true;
 }
 
+// 步骤 2.8：两循环必须有不同但同类型的 canonical IV，相同非零常量步长、
+// 零迭代属性、SCEV 起点、步长表达式和 trip count。
 bool LoopFusionPass::sameIterationDomain(const LoopShape &First,
                                          const LoopShape &Second) {
     if (!First.Induction || !Second.Induction ||
@@ -256,6 +277,7 @@ bool LoopFusionPass::sameIterationDomain(const LoopShape &First,
     return FirstType && SecondType && FirstType->hasSameShape(*SecondType);
 }
 
+// 步骤 3 的 idiom 收益保护辅助：识别可由 memset 表达的重复字节常量。
 bool LoopFusionPass::isRepeatedByteConstant(Value *V) {
     std::uint32_t Bits = 0;
     if (auto *Integer = dynamic_cast<ConstInt *>(V)) {
@@ -272,6 +294,8 @@ bool LoopFusionPass::isRepeatedByteConstant(Value *V) {
     return Bits == Byte * 0x01010101U;
 }
 
+// 判断指针是否是以 canonical IV 为唯一动态维度、其余维度全为常量，且该
+// 维度步长恰为末级 i32/float 元素大小的连续访问。
 bool LoopFusionPass::isUnitStrideAccess(Value *Pointer,
                                         PhiInst *Induction) {
     auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
@@ -316,6 +340,8 @@ bool LoopFusionPass::isUnitStrideAccess(Value *Pointer,
                static_cast<std::int64_t>(ElementType->getSize());
 }
 
+// 步骤 3.1：识别单 store 的 memset 或单 load-to-store 的 memcpy 循环；这类
+// 循环留给 LoopIdiomRecognize，不用融合破坏更专门的收益机会。
 bool LoopFusionPass::isSingleStoreIdiomCandidate(
     const LoopShape &Shape) {
     StoreInst *Store = nullptr;
@@ -345,16 +371,18 @@ bool LoopFusionPass::isSingleStoreIdiomCandidate(
                Load->getPointerOperand(), Shape.Induction);
 }
 
+// 步骤 3.2：融合收益必须来自 LoopAccess 报告的同迭代真依赖，同时限制总
+// 指令数，并排除首循环的单 store idiom。
 bool LoopFusionPass::isProfitable(const FusionCandidate &Candidate) {
     const std::size_t Instructions = Candidate.First.InstructionCount +
                                      Candidate.Second.InstructionCount;
-    // 融合收益只来自统一分析报告的同迭代真依赖。单 store 的通用
-    // memset/memcpy idiom 留给后续 LoopIdiomRecognize，避免破坏阶段收益。
     return Candidate.SameIterationFlowPairs != 0 &&
            !isSingleStoreIdiomCandidate(Candidate.First) &&
            Instructions <= MaxFlowFusionInstructions;
 }
 
+// 步骤 2.9：验证两循环同级、均为 LCSSA 且由唯一桥严格串接；第二体入口和
+// 最终出口不得含 PHI，避免重定向后还需无法预先描述的数据流修复。
 bool LoopFusionPass::isLCSSAAndStructurallyAdjacent(
     const FusionCandidate &Candidate, const LoopInfo &LI) {
     const LoopShape &First = Candidate.First;
@@ -394,6 +422,8 @@ bool LoopFusionPass::isLCSSAAndStructurallyAdjacent(
     return HasBridgePred && HasLatchPred;
 }
 
+// 步骤 4 的边计划只接受分支中恰好一次出现的目标，拒绝重复 CFG 边导致的
+// 后继索引歧义。
 std::optional<unsigned> LoopFusionPass::findUniqueSuccessorIndex(
     BrInst *Branch, BasicBlock *Successor) {
     if (!Branch || !Successor) return std::nullopt;
@@ -406,6 +436,8 @@ std::optional<unsigned> LoopFusionPass::findUniqueSuccessorIndex(
     return Result;
 }
 
+// 步骤 1：为单个循环构建可融合结构摘要。要求规范 preheader/header/latch、
+// canonical IV 与头部退出 trip 信息、唯一退出边，以及所有体路径到达 latch。
 std::optional<LoopFusionPass::LoopShape> LoopFusionPass::buildLoopShape(
     Function &F, Loop *L, SCEVResult &SE,
     const PostDominatorTree &PDT) {
@@ -424,6 +456,7 @@ std::optional<LoopFusionPass::LoopShape> LoopFusionPass::buildLoopShape(
 
     auto Induction = SE.getCanonicalInduction(L);
     auto Trip = SE.analyzeLoopTripCount(L);
+    // 1.2 退出判定必须位于 header，使融合后可完整复用第一循环的预检语义。
     if (!Induction || !Induction->Valid || !Induction->Phi ||
         !Induction->UpdateValue || !Induction->Start || !Induction->Step ||
         !Induction->ConstantStep || !Trip || !Trip->Valid ||
@@ -472,6 +505,8 @@ std::optional<LoopFusionPass::LoopShape> LoopFusionPass::buildLoopShape(
     }
 
     Shape.Blocks = L->getBlocksInFunctionOrder();
+    // 1.3 全循环只能由 header 向摘要中的 Exit 退出一次，body entry 必须最终
+    // 到达 latch；块数和指令数同时在此汇总供后续代码量预算使用。
     if (Shape.Blocks.empty()) return std::nullopt;
     Shape.BlockLookup.insert(Shape.Blocks.begin(), Shape.Blocks.end());
     unsigned ExitEdgeCount = 0;
@@ -496,6 +531,8 @@ std::optional<LoopFusionPass::LoopShape> LoopFusionPass::buildLoopShape(
     return Shape;
 }
 
+// 候选构建把全部可能失败的结构、语义、依赖、收益和改写位置检查集中在提交
+// 之前，成功返回的计划可由 commitCandidate 无条件执行。
 std::optional<LoopFusionPass::FusionCandidate>
 LoopFusionPass::buildCandidate(
     Function &F, Loop *FirstLoop, LoopInfo &LI, SCEVResult &SE,
@@ -505,6 +542,7 @@ LoopFusionPass::buildCandidate(
     if (!First || !First->Exit) return std::nullopt;
 
     BasicBlock *Bridge = First->Exit;
+    // 1.4 第一退出必须是无条件通向另一循环头部的桥，由此唯一发现第二循环。
     BrInst *BridgeBranch = Bridge->getBranchTerminator();
     if (!BasicBlock::isUncondBr(BridgeBranch)) return std::nullopt;
     BasicBlock *SecondHeader = BridgeBranch->getTrueSuccessor();
@@ -518,6 +556,8 @@ LoopFusionPass::buildCandidate(
     Candidate.First = std::move(*First);
     Candidate.Second = std::move(*Second);
     Candidate.Bridge = Bridge;
+    // 2. 依次核验迭代域、相邻 LCSSA、live-out、重排安全、来源、第二头部、
+    // 桥外提和 PHI 移动；任一证据不足都放弃整对循环。
     if (!sameIterationDomain(Candidate.First, Candidate.Second) ||
         !isLCSSAAndStructurallyAdjacent(Candidate, LI) ||
         !hasNoLiveOut(Candidate.First) ||
@@ -544,8 +584,8 @@ LoopFusionPass::buildCandidate(
 
     LoopFusionAccessResult Access =
         LA.analyzeFusion(Candidate.First.L, Candidate.Second.L);
-    // 所有候选都必须直接通过统一的 LoopAccess 合法性证明。Unknown 与
-    // Illegal 都表示证据不足，任何具体 opcode/def-use 形状都不能旁路。
+    // 3. 跨循环访存次序必须直接由统一 LoopAccess 证明；Illegal 和 Unknown
+    // 都不能通过特定 opcode 或 def-use 形状旁路。
     if (!Access.Legal || Access.Unknown) {
         return std::nullopt;
     }
@@ -553,6 +593,8 @@ LoopFusionPass::buildCandidate(
         Access.SameIterationFlowPairs;
     if (!isProfitable(Candidate)) return std::nullopt;
 
+    // 4. 最后解析三条待重接边的唯一后继槽位并记录计划：第一头部退出改到
+    // 第二出口，第一 latch 进入第二 body，第二 latch 回到第一 header。
     auto FirstExitIndex = findUniqueSuccessorIndex(
         Candidate.First.HeaderBranch, Candidate.Bridge);
     auto FirstLatchIndex = findUniqueSuccessorIndex(
@@ -576,7 +618,10 @@ LoopFusionPass::buildCandidate(
     return Candidate;
 }
 
+// 步骤 4 提交：先移动仍需保留的定义和 PHI，再替换 IV、重接 CFG，最后删除
+// 已完全脱离的第二头部与桥；顺序保证每个中间状态都不产生悬空 Value use。
 void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
+    // 4.1 将桥中纯计算按原顺序外提到第一预头。
     for (Instruction *I : Candidate.HoistedBridgeInstructions) {
         assert(I && I->getParent() == Candidate.Bridge);
         I->eraseFromParent();
@@ -586,6 +631,7 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
         (void)Inserted;
     }
 
+    // 4.2 按预先记录的 incoming 槽位修复第一回边和被移动第二 PHI 的初值边。
     for (const PhiRewrite &Rewrite : Candidate.PhiRewrites) {
         assert(Rewrite.Phi && Rewrite.NewPredecessor &&
                Rewrite.Phi->getIncomingBlock(Rewrite.IncomingIndex) ==
@@ -596,6 +642,7 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
         (void)Rewritten;
     }
 
+    // 4.3 把第二头部的非 IV PHI 移到第一头部 PHI 序列之后。
     for (PhiInst *Phi : Candidate.MovedSecondPhis) {
         assert(Phi && Phi->getParent() == Candidate.Second.Header);
         Phi->eraseFromParent();
@@ -604,6 +651,7 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
         (void)Inserted;
     }
 
+    // 4.4 两循环迭代域已严格相等，第二 IV 的所有使用可直接换成第一 IV。
     Candidate.Second.Induction->replaceAllUsesWith(
         Candidate.First.Induction);
 
@@ -617,10 +665,8 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
         (void)Rewritten;
     }
 
-    // Clear both removed blocks before deleting either one.  The bridge branch
-    // still names the second header, while the second IV still names the bridge
-    // as an incoming predecessor; clearing only one and immediately deleting
-    // its block would leave the other block with a dangling Value use.
+    // 4.5 两个待删块仍可能互相引用，先同时 clear 断开操作数，再断言无 use
+    // 并删除，避免逐块删除留下悬空边或 PHI 前驱。
     Candidate.Second.Header->clear();
     Candidate.Bridge->clear();
     assert(!Candidate.Second.Header->hasUses());
@@ -628,6 +674,7 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
     delete Candidate.Second.Header;
     delete Candidate.Bridge;
 
+    // 4.6 给保留的融合载荷块添加来源标记，供结构 pass 防止反向振荡。
     BasicBlock *ProvenanceBlock = Candidate.First.BodyEntry;
     Function *F = ProvenanceBlock ? ProvenanceBlock->getParent() : nullptr;
     assert(F && "fusion payload must remain attached to its function");
@@ -635,6 +682,8 @@ void LoopFusionPass::commitCandidate(FusionCandidate &Candidate) {
         ProvenanceBlock->getIdent() + ".fuse"));
 }
 
+// Pass 主流程按循环后序寻找首个完整候选；同一 pass 对象按函数累计总融合
+// 预算，每次提交后立即返回并使全部分析失效，让下一轮使用新 CFG 快照。
 PassResult LoopFusionPass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
     unsigned &Count = TransformCounts[&F];

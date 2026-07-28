@@ -8,14 +8,17 @@
 #include <string>
 #include <vector>
 
-// 候选快照只保存原函数中的节点，统一扫描结束后才提交改写。
+ 
+// 候选快照保存目标、自递归调用点和所有返回点，使模块扫描与 CFG 提交阶段分离。
 struct FunctionMemoizationCandidate {
     Function *Target = nullptr;
     std::vector<CallInst *> RecursiveCalls;
     std::vector<RetInst *> Returns;
 };
 
-// 为满足严格条件的纯递归函数插入有界、精确键的直接映射缓存。
+ 
+// 流程：1. 验证纯标量、NoModRef、多分支递归函数；2. 在模块缓存预算内创建键/结果数组；
+// 3. 插入 lookup/hit 入口 CFG；4. 在每个原返回点按发布顺序写入直接映射缓存。
 class FunctionMemoizationPass
     : public PassDescriptor<FunctionMemoizationPass> {
 public:

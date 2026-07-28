@@ -4,27 +4,28 @@
 
 #include <vector>
 
-// =====================================================================
-// GepEvaluate — 单条 GEP 指令化简
-//
-// 当前 IR 使用 typed pointer。GEP 的零索引不是 no-op，它会改变结果指针类型。
-// 因此全零消除和尾零裁剪在 typed pointer IR 下不安全，不做。
-//
-// 保留的规则：
-//
-// 首先处理无索引的退化 GEP。gep(p) 没有任何索引时结果等于 p 本身，
-// 类型不变，可以安全替换。前端正常不会生成这种，但做防御性处理。
-//
-// 然后处理 undef 基址传播。gep(undef, ...) 的结果无论偏移多少仍然是 undef，
-// 直接替换为结果类型的 undef 值。
-//
-// 最后做多非零索引拆分。如果一条 GEP 有超过 1 个非零索引（首部零索引不算），
-// 在第二个非零索引处拆分成两条串联的 GEP，每条只有一个非零索引。
-// 这样更利于别名分析区分不同数组元素的访问，也更利于后端指令选择。
-// 拆分不改变地址计算语义：两个 GEP 串联的偏移等价于原始单个 GEP。
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 
 bool GepEvaluatePass::evaluateGEP(Function &F) {
+    // 1. 对 GEP 做快照，后续可以安全删除或在其前方插入新指令。
     bool changed = false;
 
     auto geps = collectInstructions<GetElementPtrInst>(F);
@@ -34,7 +35,8 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
         if (!Base) continue;
         size_t numIndices = GEP->getNumIndices();
 
-        // 无索引的退化 GEP：gep(p) 没有索引，结果就是 p，类型不变
+         
+        // 2. 空索引不改变地址，直接退化为基址。
         if (numIndices == 0) {
             GEP->replaceAllUsesWith(Base);
             delete GEP;
@@ -42,7 +44,8 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
             continue;
         }
 
-        // undef 基址传播：gep(undef, ...) → undef
+         
+        // 3. undef 基址无法产生定义良好的地址，将结果统一传播为同类型 undef。
         if (Base->isUndef()) {
             GEP->replaceAllUsesWith(UndefValue::NewUndefValue(GEP->getIRType()));
             delete GEP;
@@ -50,8 +53,10 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
             continue;
         }
 
-        // 多非零索引拆分：有 >= 2 个非零索引时，在第二个非零索引处拆分。
-        // 前半 GEP 保留到第一个非零索引，后半 GEP 从前半结果出发、首索引补 0。
+         
+         
+        // 4. 对含多个非零索引的复杂地址，在第二个非零索引处分段：前段先计算
+        // 中间基址，后段从零索引重新进入对象，限制单条 GEP 的寻址复杂度。
         {
             int nonZeroCount = 0;
             size_t splitPoint = 0;
@@ -75,6 +80,7 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
                 for (size_t i = 0; i + 1 < splitPoint; i++)
                     frontIndices.push_back(GEP->getIndex(i));
 
+                // 4.1 先插入前段并更新类型，再原位重置旧 GEP；旧 GEP 的用户无需改写。
                 auto *frontGEP = new GetElementPtrInst(Base, frontIndices);
                 frontGEP->updateType();
 
@@ -96,8 +102,10 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
 }
 
 PreservationStatus GepEvaluatePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1—4. 完成退化折叠、undef 传播和复杂 GEP 拆分。
     bool changed = evaluateGEP(F);
     if (!changed) return PreservationStatus::all();
+    // 5. 指令形态变化但 CFG 不变，支配树和循环树仍然有效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

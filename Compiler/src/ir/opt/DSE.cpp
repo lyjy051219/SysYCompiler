@@ -11,24 +11,24 @@
 #include <vector>
 #include <queue>
 
-// =====================================================================
-// Dead Store Elimination — Forward Kill Coverage 模型
-//
-// 对每个 store S1 to pointer P，从 S1 出发做前向 BFS：
-//   KILL:        块内第一个 P 相关事件是 MustAlias 完整覆盖 store → 路径被挡住
-//   CLOBBER:     块内第一个 P 相关事件无法继续证明死亡 → S1 alive
-//   TRANSPARENT: 块内无 P 相关事件 → 继续探索后继
-//
-// S1 is dead ⟺ BFS 走完所有可达路径，全部被 KILL 挡住，
-//              没有任何一条路径落到 CLOBBER 或非局部 exit。
-//
-// 分支联合覆盖：if-else 两边都写 %p，BFS 两条路径都被 KILL 挡住，
-//              自然判定 S1 为 dead。不需要单个 store 后支配 S1。
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 
-// =====================================================================
-// Phase 1: 块内 DSE
-// =====================================================================
+ 
+ 
+ 
 
 bool DSEPass::storesHaveIdenticalCoverage(const StoreInst *First,
                                           const StoreInst *Second) {
@@ -47,10 +47,12 @@ bool DSEPass::storeFullyCoversPointer(
            PointeeTy == StoredValue->getIRType();
 }
 
-// A stack allocation is private at function exit only while none of its
-// derived pointers escapes.  Merely tracing P back to an alloca is not enough:
-// the address may have been stored elsewhere or retained by an earlier call.
+ 
+ 
+ 
 bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
+    // 2.1 从 alloca 沿 GEP/bitcast use 闭包追踪；只允许作为 load/store 地址使用，
+    // 一旦被存入内存或交给其他用户就视为逃逸，函数出口也不能据此删除最后写入。
     auto *Root = dynamic_cast<AllocaInst *>(
         Value::stripPointerCastsAndGEP(Pointer));
     if (!Root) return false;
@@ -82,34 +84,36 @@ bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
                 continue;
             }
             if (auto *SI = dynamic_cast<StoreInst *>(Usr)) {
-                // Using Current as the destination is an ordinary access.
-                // Storing Current as the value publishes the address.
+                 
+                 
                 if (SI->getPointerOperand() != Current ||
                     SI->getValueOperand() == Current)
                     return false;
                 continue;
             }
 
-            // Calls, returns, PHIs/selects and every unmodelled pointer use are
-            // conservatively considered captures.
+             
+             
             return false;
         }
     }
     return true;
 }
 
-// 块内逆向扫描时，PendingStores 表示“位于当前位置之后，可能
-// 覆盖更早 store”的候选。候选只能跨过确定 NoAlias 的内存事件：
-//
-//   store 1, p
-//   x = load q       ; q MayAlias p
-//   store 2, p
-//
-// 如果 load q 没有清除 p 的候选，第一个 store 会被错删。同理，
-// 一个仅 MayAlias 的 store 不能当作完整覆盖证明；这里也将它作为
-// 保守的候选边界，避免未来引入不同访存宽度后误判。
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                                      const LoopInfo &LoopInfo) {
+    // 1. 从块尾逆向维护“尚未被观察的后继 store”。load 会清除所有可能别名项；
+    // 当前 store 若被同覆盖范围的 MustAlias 后继 store 覆盖即可删除。
     if (BB == nullptr) {
         return false;
     }
@@ -129,6 +133,8 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 continue;
             }
 
+            // 当前 store 本身会改变所有可能别名地址的待定状态；清除冲突项后，
+            // 再把它登记为向更早指令可见的最近写入。
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
                 Value *StorePtr = PendingIt->first;
@@ -178,8 +184,8 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 continue;
             }
 
-            // MayAlias store 不足以证明覆盖了 Pending store 的完整
-            // 对象。把这些候选停在此处，只保留 NoAlias 候选跨过它。
+             
+             
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
                 AliasInfo Alias = AA.alias(
@@ -203,32 +209,34 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
     return changed;
 }
 
-// 保留类内原有 helper 的 ABI；真正的块内 DSE 需要 AA/LoopInfo，
-// run() 会调用上面的 eliminateInBlockWithAA。没有别名信息时不做
-// 一个可能不安全的快速删除。
+ 
+ 
+ 
 bool DSEPass::eliminateInBlock(BasicBlock *BB) {
     (void)BB;
     return false;
 }
 
-// =====================================================================
-// Phase 2: 全局 DSE — Forward Kill Coverage
-// =====================================================================
+ 
+ 
+ 
 
-// 从 First 开始扫描，确定对指针 P 的第一个相关事件。
-//
-// MustAlias 只能证明起始地址一致，不能单独证明覆盖宽度。
-// KILL 还要求 store value 与 P 的 pointee 是同一 IRType，防止
-// bitcast/不同宽度访存把部分覆盖误当成完整覆盖。
+ 
+ 
+ 
+ 
+ 
 DSEBlockColor DSEPass::classifyFrom(
     Instruction *First, const MemoryLocation &Location,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 2.2 顺序扫描一段路径：完整 MustAlias 覆盖记为 Kill；任何可能读/写目标的
+    // 指令记为 Clobber；扫描到底仍未观察目标则为 Transparent。
     Value *P = Location.Pointer;
     if (!P) return DSEBlockColor::Clobber;
     for (Instruction *I = First; I; I = I->getNext()) {
-        // 先检查 KILL：MustAlias store
+         
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             Value *StorePtr = SI->getPointerOperand();
             if (StorePtr &&
@@ -240,12 +248,12 @@ DSEBlockColor DSEPass::classifyFrom(
             }
         }
 
-        // 对 CallInst 做额外安全检查：
-        // 如果 call 传递了任何可能 alias P 的指针参数 → CLOBBER
-        // 这是对 getInstModRefInfo 的补充，因为 SideEffectAnalysis
-        // 对自递归调用可能返回不完整的 ModRef 信息。
+         
+         
+         
+         
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            // 计时调用以及可达计时调用的包装函数必须截断覆盖证明。
+             
             if (CI->mayReachTimingCall()) {
                 return DSEBlockColor::Clobber;
             }
@@ -255,11 +263,11 @@ DSEBlockColor DSEPass::classifyFrom(
             }
         }
 
-        // 再检查 CLOBBER
-        // CLOBBER 合并了两种失败：
-        //   READ:    I 可能读 P（isRefSet）
-        //   BARRIER: I 可能改 P 但无法证明完整覆盖（isModSet 且非 MustAlias store）
-        // 后续若需区分，在此拆分。
+         
+         
+         
+         
+         
         ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
 
         if (isRefSet(MR) || isModSet(MR)) return DSEBlockColor::Clobber;
@@ -268,44 +276,48 @@ DSEBlockColor DSEPass::classifyFrom(
     return DSEBlockColor::Transparent;
 }
 
-// isStoreDead: 判断一个 store 是否为 dead store。
-// 不使用全局早退 isReachableToExit —— 同块覆盖在任何块中都可以检测到。
-// 只在 BFS 走到 exit 块时，根据指针是否 local 决定是否放行。
+ 
+ 
+ 
 bool DSEPass::isStoreDead(
     StoreInst *S1,
     BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
+    // 2.3 先分类 store 所在块的尾部；同块已 Kill 可立即删除，已 Clobber 则立即保留。
     if (!S1) return false;
     Value *P = S1->getPointerOperand();
     BasicBlock *B1 = S1->getParent();
     if (!P) return false;
     if (!B1) return false;
 
-    // Phase A: 检查 S1 所在块的剩余指令
+     
     MemoryLocation StoreLocation = MemoryLocation::get(S1);
     DSEBlockColor tailColor = classifyFrom(
         S1->getNext(), StoreLocation, AA, LI, FAM);
-    if (tailColor == DSEBlockColor::Kill) return true;   // 同块覆盖
-    if (tailColor == DSEBlockColor::Clobber) return false;  // 同块就被读了
+    if (tailColor == DSEBlockColor::Kill) return true;    
+    if (tailColor == DSEBlockColor::Clobber) return false;   
 
-    // Phase A.5: B1 本身是 exit 块的情况
-    // Phase A 返回 TRANSPARENT 说明 S1 之后到块末尾无 P 相关事件。
-    // 如果 B1 没有后继（即 exit 块），则函数即将返回。
-    // 非局部指针在返回后 caller 可能读 → S1 alive。
+     
+     
+     
+     
+    // 2.4 若控制流直接退出，只有未逃逸栈对象的最终值不可观察，其他内存必须保留。
     {
         auto b1Succs = B1->getSuccessors();
         if (b1Succs.empty()) {
             if (isNonEscapingLocalStackPointer(P)) {
-                return true;   // 局部变量，返回后无人读，store 可删
+                return true;    
             } else {
-                return false;  // 非局部指针，caller 可能读 → S1 alive
+                return false;   
             }
         }
     }
 
-    // Phase B: 前向 BFS
-    // visited 的作用是图遍历终止，保证有环图（循环）中 BFS 不死循环。
+     
+     
+    // 2.5 对所有后继做有界 BFS。每条路径都必须在首次观察前被完整覆盖；透明环、
+    // 预算耗尽、任一 clobber 或可观察出口都会让证明失败。
     std::unordered_set<BasicBlock *> visited;
     std::queue<BasicBlock *> worklist;
     visited.insert(B1);
@@ -321,10 +333,10 @@ bool DSEPass::isStoreDead(
         worklist.pop();
 
         if (visited.count(BB)) {
-            // 如果 BFS 遇到了 B1（存放被分析 store 的块），说明存在循环回边。
-            // 循环回边意味着：store 的值在下一次迭代前可能被读到，
-            // 而且下一次迭代的 store 写的可能是不同地址（动态索引）。
-            // 保守处理：视为不可证明，S1 alive。
+             
+             
+             
+             
             if (BB == B1) {
                 return false;
             }
@@ -333,26 +345,26 @@ bool DSEPass::isStoreDead(
         visited.insert(BB);
 
         if (--blockBudget < 0) {
-            return false;  // 超出预算，保守放弃
+            return false;   
         }
 
         DSEBlockColor color = classifyFrom(
             BB->front(), StoreLocation, AA, LI, FAM);
 
         if (color == DSEBlockColor::Kill) {
-            continue;  // 这条路径被覆盖 store 挡住，不再探索后继
+            continue;   
         }
 
         if (color == DSEBlockColor::Clobber) {
-            return false;  // 存在一条路径上 P 被读或被不可证明地修改 → S1 alive
+            return false;   
         }
 
-        // TRANSPARENT: 块内无 P 相关事件
+         
         auto succs = BB->getSuccessors();
         if (succs.empty()) {
-            // exit 块：函数即将返回。
-            // 只有 P 是栈内存（返回后对 caller 不可见）时才可忽略此 exit。
-            // 非局部指针（global/param）在函数返回后 caller 可能读 → S1 alive。
+             
+             
+             
             if (isNonEscapingLocalStackPointer(P)) {
                 continue;
             } else {
@@ -365,34 +377,37 @@ bool DSEPass::isStoreDead(
         }
     }
 
-    // BFS 完成，所有路径都被 KILL 挡住或走到了安全 exit
+     
     return true;
 }
 
-// =====================================================================
-// DSEPass::run
-// =====================================================================
+ 
+ 
+ 
 
 PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1. 获取 AA、LoopInfo 与 MemorySSA，为覆盖判定、索引范围和到达定义提供依据。
     bool changed = false;
 
-    // 取分析结果
+     
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-    // === Phase 0: MemorySSA-backed idempotent stores ===
-    // MemorySSA describes the IR at the point it is requested.  Query every
-    // candidate before deleting anything, then mutate in one batch; otherwise
-    // the first deletion would make the cached def-use graph stale.  The
-    // function-wide query cap and per-walk budget bound compile time.  Failure
-    // to prove a candidate within either budget is conservatively ignored.
+     
+     
+     
+     
+     
+     
+    // 2. 第一层在无计时调用的函数中，用 MemorySSA 有界查询删除“写入值本身已冗余”
+    // 的 store；先收集后删除，保持查询期间 MemorySSA 稳定。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMemorySSAStoreQueries = 256;
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
-    // MemorySSA 的同值证明不携带计时分段；含计时调用时跳过该快速阶段，
-    // 后续块内和全局 DSE 仍会通过显式屏障做精确判断。
+     
+     
     if (!F.mayReachTimingCall()) {
         for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
             if (queriedStores >= MaxMemorySSAStoreQueries) break;
@@ -408,18 +423,20 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         changed = true;
     }
 
-    // === Phase 1: 块内 DSE ===
-    // 此阶段会直接 delete 死 store。所有跨内存事件的候选都必须
-    // 经过 AA 证明 NoAlias，不再只按 Value* 相等性清障。
+     
+     
+     
+    // 3. 第二层逐块逆向消除被块内后继写入完整覆盖的 store。
     for (BasicBlock *BB : F) {
         changed |= eliminateInBlockWithAA(BB, AA, LI);
     }
 
-    // === Phase 2: 全局 DSE — Forward Kill Coverage ===
-    // Phase 1 之后再收集存活 store，避免对已删指令的悬空指针
+     
+     
+    // 4. 第三层快照剩余 store，跨 CFG 证明所有路径在观察前均被覆盖，再统一删除。
     auto allStores = collectInstructions<StoreInst>(F);
 
-    // 先收集，再统一删除
+     
     std::vector<StoreInst *> toDelete;
     for (StoreInst *SI : allStores) {
         if (isStoreDead(SI, AA, LI, FAM)) {
@@ -436,11 +453,12 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         return PreservationStatus::all();
     }
 
-    // DSE 只删 store，不改 CFG，不改指针关系
-    // SideEffect 的 ModSet 可能变化（少了 store）
+     
+     
+    // 5. 删除 store 不改变 CFG；内存版本、别名和副作用结论必须重新计算。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
-    PA.keep<PostDominantAnalysis>();  // [DSE] 不改 CFG，后支配树仍有效
+    PA.keep<PostDominantAnalysis>();   
     PA.keep<LoopAnalysis>();
     PA.discard<SideEffectAnalysis>();
     PA.discard<BasicAliasAnalysis>();

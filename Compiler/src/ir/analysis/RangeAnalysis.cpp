@@ -8,13 +8,7 @@
 #include <cstdlib>
 #include <limits>
 
-// =====================================================================
-// IntRange 算术运算
-//
-// 所有运算用 int64 检测 i32 溢出。普通 i32 IR 是 wrap 语义；一旦
-// 数学区间可能越界，饱和端点并不保守，必须退回 Top。
-// =====================================================================
-
+// 整数格运算在数学结果可能越过 i32 或无法用单区间表示时返回 Top，绝不使用饱和端点。
 int IntRange::trailingZerosOf(int64_t v) {
     if (v == 0) return 31;
     uint64_t u = static_cast<uint64_t>(v < 0 ? -v : v);
@@ -45,12 +39,11 @@ IntRange conservativeIntegerRangeForValue(const Value *V) {
         return IntRange();
     if (V->getIRType()->hasIntegerBitWidth(1))
         return IntRange(0, 1);
-    // IntRange/KnownBits 当前仍是 i32 专用格。对 i8/i64 使用 Top
-    // 哨兵，确保下游不会把完整值域误认为可用于变换的窄区间。
+
     return IntRange();
 }
 
-} // 匿名命名空间
+}
 
 bool IntRange::isTop() const {
     return min == I32_MIN && max == I32_MAX;
@@ -115,7 +108,7 @@ IntRange IntRange::add(const IntRange &rhs) const {
     int64_t hi = max + rhs.max;
     if (lo < I32_MIN || hi > I32_MAX) return IntRange();
     IntRange r(lo, hi);
-    // 对齐：a + b 的 trailing zeros ≥ min(a.tz, b.tz)
+
     r.knownTrailingZeros = std::min(knownTrailingZeros, rhs.knownTrailingZeros);
     return r;
 }
@@ -132,7 +125,7 @@ IntRange IntRange::sub(const IntRange &rhs) const {
 
 IntRange IntRange::mul(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    // 四端点取 min/max
+
     int64_t v1 = min * rhs.min;
     int64_t v2 = min * rhs.max;
     int64_t v3 = max * rhs.min;
@@ -141,7 +134,7 @@ IntRange IntRange::mul(const IntRange &rhs) const {
     int64_t hi = std::max({v1, v2, v3, v4});
     if (lo < I32_MIN || hi > I32_MAX) return IntRange();
     IntRange r(lo, hi);
-    // 对齐：a * b 的 trailing zeros = a.tz + b.tz，上限 31
+
     int tz = knownTrailingZeros + rhs.knownTrailingZeros;
     r.knownTrailingZeros = std::min(tz, 31);
     return r;
@@ -149,9 +142,9 @@ IntRange IntRange::mul(const IntRange &rhs) const {
 
 IntRange IntRange::sdiv(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    // 除数包含 0 → 全范围
+
     if (rhs.min <= 0 && rhs.max >= 0) return IntRange();
-    // 四端点取 min/max
+
     int64_t v1 = min / rhs.min;
     int64_t v2 = min / rhs.max;
     int64_t v3 = max / rhs.min;
@@ -165,54 +158,28 @@ IntRange IntRange::sdiv(const IntRange &rhs) const {
 IntRange IntRange::srem(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
     if (rhs.min <= 0 && rhs.max >= 0) return IntRange();
-    // |a % b| < |b|，符号跟随被除数
+
     int64_t absMax = std::max(std::abs(rhs.min), std::abs(rhs.max)) - 1;
     if (min >= 0) return IntRange(0, std::min(max, absMax));
     if (max <= 0) return IntRange(std::max(min, -absMax), 0);
     return IntRange(-absMax, absMax);
 }
 
-// =====================================================================
-// 位运算（shl / lshr / ashr / and / or）
-//
-// 移位：只处理"移位量是常量"这个强情形；变量移位一律 Top。
-//   理由：非常量移位对端点不单调（例如 x>>y，y ∈ [0, 31] 端点翻飞），
-//   严格区间算得到的端点没有参考价值，退到 Top 让下游 pass 不做错误推断。
-//
-// shl：按 int64 计算避免 i32 溢出，结果 clamp 到 i32 范围。移位常量超出
-//   [0, 31] 退 Top（SysY 里 >= 32 位移位实质 UB，但分析阶段不能假设）。
-//
-// ashr：算术右移，对负数端点仍然单调（-1 >> 1 = -1, -2 >> 1 = -1），所以
-//   端点推导精确可行。
-//
-// lshr：逻辑右移。只在 x 非负时退化成 ashr 的语义；否则 Top（i32 的符号位
-//   被当 MSB 填入，结果变成大正数，和 signed 区间语义脱节）。
-//
-// and/or：只对"非负 ∩ 非负"这一快路径做紧范围估计；混符号场合一律 Top。
-//   这是轻量近似，不做完整 known-bits lattice。
-// =====================================================================
-
 IntRange IntRange::shl(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
     if (!rhs.isSingleValue()) return IntRange();
     int64_t k = rhs.min;
     if (k < 0 || k >= 31) return IntRange();
-    // IR 语义是 i32 按位宽归一化（参见 SCCP::normalizeSignedToWidth）：
-    //   shl 结果在 i32 里会环绕（wraparound），1<<31 = 0x80000000 = INT32_MIN
-    // 我们的 IntRange 是 "在 i32 范围内的真实值的紧包络"，不是饱和模型；
-    // 所以一旦左移越过 i32 边界就必须 Top，不能截断端点 —— 截断会把 overflow
-    // 后的实际值（负数）错报成 I32_MAX，导致下游 isNonNegative 判错。
-    //
-    // 另外：C++14+ 下负数左移是 UB，所以必须先在非负 path 上做。
-    if (min < 0) return IntRange(); // 负数左移，保守 Top（也避开 UB）
-    // 用无符号 64 位乘以 2^k 做等价移位，纯数学安全
+
+    if (min < 0) return IntRange();
+
     uint64_t mul = (uint64_t)1 << k;
     uint64_t u1 = (uint64_t)min * mul;
     uint64_t u2 = (uint64_t)max * mul;
-    // 任一端点越过 INT32_MAX，wraparound 语义不能用端点表示 → Top
+
     if (u1 > (uint64_t)I32_MAX || u2 > (uint64_t)I32_MAX) return IntRange();
     IntRange r((int64_t)u1, (int64_t)u2);
-    // 对齐：shl 往 LSB 填 k 个 0，所以 tz 至少 k，原来的 tz 被吃进去
+
     int tz = knownTrailingZeros + (int)k;
     r.knownTrailingZeros = std::min(tz, 31);
     return r;
@@ -223,7 +190,7 @@ IntRange IntRange::ashr(const IntRange &rhs) const {
     if (!rhs.isSingleValue()) return IntRange();
     int64_t k = rhs.min;
     if (k < 0 || k >= 32) return IntRange();
-    // 算术右移：按符号填充；端点单调保持
+
     int64_t v1 = min >> k;
     int64_t v2 = max >> k;
     return IntRange(std::min(v1, v2), std::max(v1, v2));
@@ -234,7 +201,7 @@ IntRange IntRange::lshr(const IntRange &rhs) const {
     if (!rhs.isSingleValue()) return IntRange();
     int64_t k = rhs.min;
     if (k < 0 || k >= 32) return IntRange();
-    // 负数走 lshr 会把符号位塞进来，signed 区间无法表示，退 Top
+
     if (min < 0) return IntRange();
     int64_t v1 = (uint32_t)min >> k;
     int64_t v2 = (uint32_t)max >> k;
@@ -243,15 +210,15 @@ IntRange IntRange::lshr(const IntRange &rhs) const {
 
 IntRange IntRange::band(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    // 对齐：AND 的结果 tz ≥ max(a.tz, b.tz)（任一侧有 0 的位，结果也是 0）
+
     int tz = std::max(knownTrailingZeros, rhs.knownTrailingZeros);
-    // 双方都非负时，结果 ∈ [0, min(lMax, rMax)]
+
     if (min >= 0 && rhs.min >= 0) {
         IntRange r(0, std::min(max, rhs.max));
         r.knownTrailingZeros = std::min(tz, 31);
         return r;
     }
-    // 一侧是非负常量 c，and 的结果一定 ∈ [0, c]（位压在掩码内）
+
     if (min == max && min >= 0) {
         IntRange r(0, min);
         r.knownTrailingZeros = std::min(tz, 31);
@@ -262,21 +229,12 @@ IntRange IntRange::band(const IntRange &rhs) const {
         r.knownTrailingZeros = std::min(tz, 31);
         return r;
     }
-    IntRange r; // Top 范围，但 alignment 还是可以保留
+    IntRange r;
     r.knownTrailingZeros = std::min(tz, 31);
     return r;
 }
 
-// =====================================================================
-// KnownBits → IntRange 反推
-//
-// 把 KB 翻成一条信号：
-//   - 冲突：不可达 → bottom
-//   - 某些 bit 锁定后，可以给出 unsigned minUnsigned / maxUnsigned
-//   - 再结合符号位的状态判断 signed 范围
-//   - 符号位未知：signed 范围会被分成两段 [neg_min, neg_max] ∪ [pos_min, pos_max]
-//     这里用"两段的并集 minmax"做保守近似（= 全 i32 范围），无害
-// =====================================================================
+// KnownBits 传播只保留逐位可证明事实，冲突表示不可达并在更新阶段被保守忽略。
 KnownBits::KnownBits() = default;
 
 KnownBits::KnownBits(uint32_t z, uint32_t o) : zero(z), one(o) {}
@@ -411,24 +369,24 @@ IntRange KnownBits::toIntRange() const {
     if (isTop()) return IntRange();
 
     uint32_t unknown = ~(zero | one);
-    uint32_t unsignedMin = one;                 // 未知位都当 0
-    uint32_t unsignedMax = one | unknown;       // 未知位都当 1
+    uint32_t unsignedMin = one;
+    uint32_t unsignedMax = one | unknown;
 
     bool signKnown0 = (zero & 0x80000000u) != 0;
     bool signKnown1 = (one  & 0x80000000u) != 0;
 
     if (signKnown0) {
-        // 非负 → unsigned 值等于 signed 值
+
         return IntRange((int64_t)unsignedMin, (int64_t)unsignedMax);
     }
     if (signKnown1) {
-        // 负数 → 位型 cast 到 int32 得到负 signed
+
         int64_t lo = (int32_t)unsignedMin;
         int64_t hi = (int32_t)unsignedMax;
-        // 翻成负后 lo 可能比 hi 大（极端情况），用 min/max 整理
+
         return IntRange(std::min(lo, hi), std::max(lo, hi));
     }
-    // 符号位未知：值可正可负 → 最松 i32 全范围；但 trailing zeros 还是能保留
+
     IntRange r;
     r.knownTrailingZeros = getTrailingZeros();
     return r;
@@ -436,10 +394,9 @@ IntRange KnownBits::toIntRange() const {
 
 IntRange IntRange::bor(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
-    // 对齐：OR 的结果 tz ≥ min(a.tz, b.tz)（两侧都是 0 的位才保证是 0）
+
     int tz = std::min(knownTrailingZeros, rhs.knownTrailingZeros);
-    // 双方都非负时，结果非负且不会小于任一输入的下界，但上界不好估紧
-    // 保守给 [max(minL, minR), I32_MAX]
+
     if (min >= 0 && rhs.min >= 0) {
         IntRange r(std::max(min, rhs.min), I32_MAX);
         r.knownTrailingZeros = tz;
@@ -450,14 +407,7 @@ IntRange IntRange::bor(const IntRange &rhs) const {
     return r;
 }
 
-// =====================================================================
-// FloatRange 算术运算
-//
-// 用 float 完成端点运算，再提升为 double 存储。如果直接用
-// double 运算，FLT_MAX + FLT_MAX 会被误认为有限数，而真实 f32
-// 结果是 +Inf。NaN 和 +/-0 与数值区间分开传播。
-// =====================================================================
-
+// 浮点格以 f32 执行端点运算，再用 double 保存包络，并独立传播 NaN、无穷和零符号。
 double FloatRange::F_MIN_INF() {
     return -std::numeric_limits<double>::infinity();
 }
@@ -620,8 +570,7 @@ FloatRange FloatRange::intersectWith(const FloatRange &other) const {
         if (R.hasNumericValues() && R.min <= 0.0 && R.max >= 0.0) {
             R.mayPositiveZero = mayPositiveZero && other.mayPositiveZero;
             R.mayNegativeZero = mayNegativeZero && other.mayNegativeZero;
-            // If zero was the only numerical intersection but neither sign
-            // is present, the numerical intersection is empty.
+
             if (R.min == 0.0 && R.max == 0.0 &&
                 !R.mayPositiveZero && !R.mayNegativeZero) {
                 R.min = 1.0;
@@ -662,8 +611,7 @@ FloatRange FloatRange::mul(const FloatRange &rhs) const {
                X.min < FloatRange::F_MAX_INF() &&
                X.max > FloatRange::F_MIN_INF();
     };
-    // Endpoint-only evaluation of [-inf,+inf] * 0 sees NaN at both
-    // endpoints, but finite interior values also produce signed zero.
+
     if ((containsZero() && HasFiniteNumeric(rhs)) ||
         (rhs.containsZero() && HasFiniteNumeric(*this)))
         R = R.unionWith(FloatRange(0.0, 0.0));
@@ -676,8 +624,6 @@ FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
                   (containsZero() && rhs.containsZero()) ||
                   (mayContainInfinity() && rhs.mayContainInfinity());
 
-    // Preserve exact 0/0, inf/inf and signed-zero behaviour before the
-    // discontinuous interval fallback below.
     if (isExactNumericValue() && rhs.isExactNumericValue()) {
         float V = exactF32Value(*this) / exactF32Value(rhs);
         FloatRange Exact(static_cast<double>(V));
@@ -685,11 +631,6 @@ FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
         return Exact;
     }
 
-    // A denominator envelope touching/crossing numerical zero is
-    // discontinuous even when the zero-sign set says exact zero itself is
-    // absent (for example a PHI of {-1,+1}).  The interval abstraction does
-    // not track a minimum nonzero magnitude, so only the full numerical
-    // envelope is sound.  MayNaN separately records whether exact 0/0 exists.
     bool DenominatorTouchesZero = rhs.hasNumericValues() &&
                                   rhs.min <= 0.0 && rhs.max >= 0.0;
     if (DenominatorTouchesZero) {
@@ -700,8 +641,7 @@ FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
 
     FloatRange R = evaluateFloatEndpoints(
         *this, rhs, MayNaN, [](float A, float B) { return A / B; });
-    // As above, an unbounded numerator divided by exact infinity has NaN at
-    // its infinite endpoints but signed-zero results for finite interiors.
+
     bool NumeratorHasFinite = hasNumericValues() &&
                               min < F_MAX_INF() && max > F_MIN_INF();
     if (NumeratorHasFinite && rhs.mayContainInfinity())
@@ -713,35 +653,33 @@ LoopInductionInfo::LoopInductionInfo()
     : RecLoop(nullptr), initial(0), step(0), hasUpperBound(false),
       upperBound(0), noWrap(false) {}
 
-// =====================================================================
-// RangeInfo 查询接口
-// =====================================================================
-
 void RangeInfo::setLoopInduction(Value *v,
                                  const LoopInductionInfo &info) {
     LoopInductions[v] = info;
 }
 
+// 整数查询流程：常量或不支持位宽先处理，再将全局范围与支配链、精确块提示依次取交。
 IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
                           const DominatorTree &DT) const {
-    // 常量直接返回精确范围
+
+    // 1. 常量可直接得到单点范围；未建模的整数位宽退化为该类型的完整范围。
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return IntRange(CI->getVal());
     if (!isModeledIntegerRangeType(val))
         return conservativeIntegerRangeForValue(val);
 
-    // 全局范围
+    // 2. 以固定点求出的全局范围为基线；没有结果时保持类型完整范围，不凭空制造精度。
     IntRange range = conservativeIntegerRangeForValue(val);
     auto gIt = GlobalRanges.find(val);
     if (gIt != GlobalRanges.end())
         range = gIt->second;
 
-    // 沿支配树向上找 contextual 收窄，取交集
+    // 3. 查询点存在时，沿有限深度 IDom 链叠加支配事实，最后再叠加当前块精确提示。
     if (ctxBlock) {
         auto cIt = ContextualRanges.find(val);
         if (cIt != ContextualRanges.end()) {
             auto &blockMap = cIt->second;
-            // 从 ctxBlock 沿 idom 链向上走，最多 8 层
+
             BasicBlock *runner = ctxBlock;
             for (int depth = 0; depth < 8 && runner; depth++) {
                 auto bIt = blockMap.find(runner);
@@ -765,7 +703,7 @@ IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
 
 FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
                                   const DominatorTree &DT) const {
-    // 常量浮点直接返回精确范围
+
     if (auto *CF = dynamic_cast<ConstFloat *>(val))
         return FloatRange((double)CF->getVal());
 
@@ -792,12 +730,7 @@ FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
     return range;
 }
 
-// =====================================================================
-// 边敏感查询（沿 predBB → succBB 边进入 succBB 时的值）。
-// 先取 pred 处的支配上下文，再和最终 CFG rebuild 产生的
-// edge fact 取交集。这也适用于 loop header 等多前驱块，
-// 不会把某一条入边的条件泄漏到其他入边。
-// =====================================================================
+// 边查询以 predecessor 上下文为基线，再叠加最终 CFG 重建出的特定 pred->succ 事实。
 IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
                                  BasicBlock *succBB,
                                  const DominatorTree &DT) const {
@@ -818,9 +751,6 @@ IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
     return R;
 }
 
-// =====================================================================
-// KnownBits 查询 API（和 IntRange 的 query 对齐）
-// =====================================================================
 KnownBits RangeInfo::queryBits(Value *val) const {
     if (!val ||
         !IRType::hasIntegerBitWidth(val->getIRType(), 32))
@@ -899,24 +829,9 @@ bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
     return true;
 }
 
-// =====================================================================
-// 范围求解器 — 复用 SCCP 的 worklist 不动点框架
-//
-// 和 SCCP 相同的基础设施：
-//   ExecutableBlocks, FeasibleEdges, BBWorkList, InstWorkList
-// 不同的 lattice：从 {Top, Constant, Bottom} 扩展为 IntRange [min,max]
-//
-// 两阶段：
-//   Phase 1 Forward（widening）：从 def 推 use，遇到循环靠 MAX_ENQUEUE
-//     兜底 widen 到 Top 保证收敛
-//   Phase 2 Narrowing（backward constraint propagation）：widening 收敛后
-//     解锁 Widened，用 intersect-only 语义重跑若干轮，对二元运算做
-//     backward 推导（z = x + y ⟹ x = z - y），把过宽的结果收回来
-// =====================================================================
-
+// 求解器内部未见过的值按类型初始化为 Top；i1 使用完整布尔域。
 IntRange &RangeSolver::getRange(Value *V) {
-    // 全局范围默认初始化为 Top（全范围）。
-    // 每条指令首次 visit 时会被 visitXxx 赋予计算出的范围。
+
     auto It = ValueRanges.find(V);
     if (It == ValueRanges.end())
         It = ValueRanges.emplace(
@@ -924,26 +839,15 @@ IntRange &RangeSolver::getRange(Value *V) {
     return It->second;
 }
 
-// KnownBits 取值：常量直接返回精确 KB，其他值查表
 KnownBits RangeSolver::getBits(Value *V) {
     if (!V ||
         !IRType::hasIntegerBitWidth(V->getIRType(), 32))
         return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return KnownBits::fromConst(CI->getVal());
-    return ValueBits[V]; // 缺省 Top
+    return ValueBits[V];
 }
 
-// 边敏感查询（solver 内部用）：取 V 在某 BB 视角下的 range/KB
-//
-// 动机：solver 主循环用 getRange(V) 只拿 global 值。如果 V 经过一条
-//   条件分支到了 BB，条件收窄已经写入 ContextualRanges[V][BB]，但
-//   global 还是宽的。PHI 合并、visitBinary 等拿 operand 时，沿着操作
-//   数"在自己 user 所在块"的视角能吃到这条收窄，收敛更快、更紧。
-//
-// 只读 BB 本层的 contextual（不沿 idom 链往上走）——solver 没有 DT 引用，
-//   而 per-block 就已经能吃到"直接前驱对 V 的收窄"这个最高频的场景。
-//   更深层的由 forward worklist 迭代自然带上来。
 IntRange RangeSolver::getRangeInBlock(Value *V, BasicBlock *BB) {
     if (!isModeledIntegerRangeType(V))
         return conservativeIntegerRangeForValue(V);
@@ -973,23 +877,20 @@ KnownBits RangeSolver::getBitsInBlock(Value *V, BasicBlock *BB) {
     return kb;
 }
 
-// 统一把某个值的指令用户重新加入求解队列，并保留 use-list 的顺序和重复项。
 void RangeSolver::enqueueInstructionUsers(Value *V) {
     if (!V) return;
     for (Instruction *User : V->getInstructionUsers())
         InstWorkList.push_back(User);
 }
 
-// KnownBits 更新。forward 覆盖；narrowing 走 intersect。
-// 任何一方 bit 变化都把 users 放回 worklist，让 IntRange 有机会通过
-// KB.toIntRange() 被重新拉紧。
+// KnownBits 更新与区间更新共享用户工作队列，使两个格可以互相收紧并共同收敛。
 bool RangeSolver::updateBits(Value *V, const KnownBits &newBits) {
     if (!V ||
         !IRType::hasIntegerBitWidth(V->getIRType(), 32))
         return false;
     auto &cur = ValueBits[V];
     KnownBits merged = NarrowingMode ? cur.intersectWith(newBits) : newBits;
-    if (merged.isConflict()) return false; // 不可达路径保守忽略
+    if (merged.isConflict()) return false;
     if (merged == cur) return false;
     cur = merged;
     enqueueInstructionUsers(V);
@@ -999,7 +900,7 @@ bool RangeSolver::updateBits(Value *V, const KnownBits &newBits) {
 void RangeSolver::updateBitsContextual(Value *V, BasicBlock *block,
                                    const KnownBits &kb) {
     auto it = ContextualBits[V].find(block);
-    // Top 约束等于没约束，删除旧的（和 updateContextual 对齐）
+
     if (kb.isTop()) {
         if (it == ContextualBits[V].end()) return;
         ContextualBits[V].erase(it);
@@ -1012,7 +913,6 @@ void RangeSolver::updateBitsContextual(Value *V, BasicBlock *block,
     enqueueInstructionUsers(V);
 }
 
-// 联动：从 KnownBits 反推一条 IntRange，和 newRange intersect 作为最终写入
 IntRange RangeSolver::tightenWithBits(Value *V, const IntRange &newRange) {
     KnownBits kb = getBits(V);
     if (kb.isTop()) return newRange;
@@ -1021,14 +921,9 @@ IntRange RangeSolver::tightenWithBits(Value *V, const IntRange &newRange) {
     return newRange.intersectWith(fromKB);
 }
 
-// 全局范围更新：赋值语义（forward）或 intersect-only 语义（narrowing）
-//
-// Forward 模式：直接覆盖（union/算术计算出的新值）；MAX_ENQUEUE 到阈值
-//   widen 到 Top 并锁定
-// Narrowing 模式：只允许变窄（intersect with current）；widen 锁不生效
-//   这是 backward constraint propagation 的核心：让 widening 到 Top 的值
-//   在约束回推时被收回
+// 核心更新不变量：前向阶段超过次数预算即锁为 Top，narrowing 阶段只取交且不引入 Bottom。
 bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
+    // 1. 未建模位宽只允许保存类型完整范围，防止 i32 规则错误套用到其他整数类型。
     if (!isModeledIntegerRangeType(V)) {
         IntRange Full = conservativeIntegerRangeForValue(V);
         auto It = ValueRanges.find(V);
@@ -1037,11 +932,12 @@ bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
         ValueRanges[V] = Full;
         return true;
     }
-    // ---- Narrowing 路径 ----
+
+    // 2. Narrowing 只把旧值与新值取交；冲突产生 Bottom 时拒绝更新，避免不安全的欠近似。
     if (NarrowingMode) {
         auto &cur = getRange(V);
         IntRange intersected = cur.intersectWith(newRange);
-        // 不引入 bottom（空区间意味着不可达，narrowing 阶段保守忽略）
+
         if (intersected.isBottom()) return false;
         if (intersected == cur) return false;
         cur = intersected;
@@ -1049,7 +945,7 @@ bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
         return true;
     }
 
-    // ---- Forward 路径 ----
+    // 3. 前向阶段先正常覆盖；达到更新预算后一次性扩大为 Top，并锁定该值保证终止。
     if (Widened.count(V)) return false;
 
     auto &cur = getRange(V);
@@ -1058,14 +954,8 @@ bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
     int &vCount = EnqueueCount[V];
     vCount++;
     if (vCount >= MAX_ENQUEUE) {
-        // 直接 widen 到 Top。曾尝试过"保符号"（非负值 widen 到 [0, INT_MAX]），
-        // 但会和 narrowing 阶段的 backward 推导组合成 over-narrowing：
-        // 例如循环归纳变量 i 本来有 forward [0, INT_MAX]，narrowing 通过 GEP
-        // 索引反推 + SUB backward 会把 i 的 PHI 错误收缩成 [1, 16]，
-        // 导致 while(i>0) 这种出口条件被 foldComparisons 恒 true 折叠
-        // 保守回到 Top，让 sign 信息靠 contextual
-        // 和 narrowing 自行恢复。
-        cur = IntRange(); // Top
+
+        cur = IntRange();
         Widened.insert(V);
     } else {
         cur = newRange;
@@ -1075,7 +965,6 @@ bool RangeSolver::updateRange(Value *V, const IntRange &newRange) {
     return true;
 }
 
-// 浮点版本的 updateRange（forward/narrowing 同样语义）
 bool RangeSolver::updateFloatRange(Value *V, const FloatRange &newRange) {
     if (NarrowingMode) {
         auto &cur = FloatValueRanges[V];
@@ -1102,18 +991,15 @@ bool RangeSolver::updateFloatRange(Value *V, const FloatRange &newRange) {
     return true;
 }
 
-// 上下文范围更新：赋值语义。
-// 条件分支收窄产生的 per-block 约束，每次分支指令被 visit 时重新计算。
-// 如果分支操作数的范围变宽了，收窄结果也会相应变宽。
 void RangeSolver::updateContextual(Value *V, BasicBlock *block,
                                const IntRange &range) {
     auto it = ContextualRanges[V].find(block);
 
     if (range.isTop()) {
-        // 约束退化成 Top：必须删除旧约束，不能残留过窄范围
-        if (it == ContextualRanges[V].end()) return; // 本来就没有，不用动
+
+        if (it == ContextualRanges[V].end()) return;
         ContextualRanges[V].erase(it);
-        // 通知使用者：约束变宽了
+
         enqueueInstructionUsers(V);
         return;
     }
@@ -1124,7 +1010,6 @@ void RangeSolver::updateContextual(Value *V, BasicBlock *block,
     enqueueInstructionUsers(V);
 }
 
-// 浮点版本的 updateContextual
 void RangeSolver::updateFloatContextual(Value *V, BasicBlock *block,
                                     const FloatRange &range) {
     auto it = FloatContextualRanges[V].find(block);
@@ -1147,11 +1032,12 @@ void RangeSolver::markBlockExecutable(BasicBlock *BB) {
         BBWorkList.push_back(BB);
 }
 
+// 新可行边会激活目标块；若块已执行，则只重排 PHI 以合并新增 incoming。
 bool RangeSolver::markEdgeFeasible(BasicBlock *From, BasicBlock *To) {
     if (!FeasibleEdges.insert({From, To}).second)
         return false;
     if (ExecutableBlocks.count(To)) {
-        // 块已可达，但新边可能带来新 PHI incoming → 重新处理块头的 PHI
+
         for (Instruction *I : *To) {
             if (!dynamic_cast<PhiInst *>(I)) break;
             InstWorkList.push_back(I);
@@ -1162,15 +1048,9 @@ bool RangeSolver::markEdgeFeasible(BasicBlock *From, BasicBlock *To) {
     return true;
 }
 
-// --- 指令访问者 ---
-
-// SCEV 接口占位：不在 visitPhi 中直接覆盖 global range。
-// SCEV 事实只在 solve 尾部作为循环体 contextual range 写入，避免把
-// header/exit 路径也误收窄。
-// 根据 SCEV 归纳变量信息推断活动迭代范围
 IntRange RangeSolver::rangeFromInduction(
 const LoopInductionInfo &info) const {
-    if (!info.hasUpperBound || !info.noWrap) return IntRange(); // Top
+    if (!info.hasUpperBound || !info.noWrap) return IntRange();
     if (info.step > 0)
         return IntRange(info.initial, info.upperBound);
     if (info.step < 0)
@@ -1178,6 +1058,7 @@ const LoopInductionInfo &info) const {
     return IntRange(info.initial);
 }
 
+// SCEV 提示只写入非 Header、非退出的活动循环体块，不能覆盖 PHI 的全局范围。
 void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
     if (!SCEV) return;
 
@@ -1199,9 +1080,7 @@ void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
 
         BasicBlock *header = info.RecLoop->getHeader();
         for (BasicBlock *BB : info.RecLoop->getBlocksIncludingSubLoops()) {
-            // Header PHI can also take the first value that leaves the loop
-            // through the header condition, so the active-iteration range is
-            // intentionally limited to safe, non-exiting body blocks.
+
             if (!BB || BB == header) continue;
             if (info.RecLoop->isExitingBlock(BB)) continue;
 
@@ -1219,8 +1098,10 @@ void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
     }
 }
 
+// PHI 传递只合并可行入边；浮点取包络，整数同时汇合区间和 KnownBits。
 void RangeSolver::visitPhi(PhiInst *Phi) {
-    // 浮点 PHI
+
+    // 1. 浮点 PHI 对可行入边取包络；未建模整数 PHI 直接回退为保守格值。
     auto phiTy = Phi->getIRType();
     if (phiTy && phiTy->isFloat()) {
         FloatRange fresult = FloatRange::bottom();
@@ -1236,7 +1117,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
                 inRange = FloatValueRanges[inVal];
             fresult = fresult.unionWith(inRange);
             });
-        // 浮点 PHI 范围更新（统一走 updateFloatRange）
+
         updateFloatRange(Phi, fresult);
         return;
     }
@@ -1247,8 +1128,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
         return;
     }
 
-    // SCEV 优先：如果外部（未来的 SCEV pass）已经为这个 PHI 推断出
-    // 循环归纳变量范围，优先使用，不走 union-of-incomings
+    // 2. 若 SCEV 已识别归纳变量，优先使用其初值、步长和边界生成更精确范围。
     if (ScevInductions) {
         auto it = ScevInductions->find(Phi);
         if (it != ScevInductions->end()) {
@@ -1257,10 +1137,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
         }
     }
 
-    // 整数 PHI：edge-sensitive union
-    // 每个 incoming 取 "inVal 在 pred 块视角" 的 range/KB ——
-    // pred 块上如果有条件分支把 inVal 收窄过（pred 的 contextual），
-    // 这里就能吃到，而不是只拿 inVal 的 global range。
+    // 3. 普通整数 PHI 只汇合可行入边，同时合并区间与 KnownBits，再用位信息收紧区间。
     IntRange result = IntRange::bottom();
     KnownBits kbResult;
     bool firstKB = true;
@@ -1275,7 +1152,7 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
             inRange = IntRange(CI->getVal());
             inKB = KnownBits::fromConst(CI->getVal());
         } else {
-            // 暂时退回 global（regression bisect）
+
             inRange = getRange(inVal);
             inKB = getBits(inVal);
         }
@@ -1288,12 +1165,14 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     updateRange(Phi, result);
 }
 
+// 二元指令先按类型前向计算结果格；整数 KnownBits 并行传播，narrowing 时再反推 ADD/SUB 操作数。
 void RangeSolver::visitBinary(BinaryInst *BI) {
+    // 1. 解析两个操作数；形态不完整时无法建立可靠传递函数，直接保守退出。
     Value *lhs = nullptr;
     Value *rhs = nullptr;
     if (!BI->getOperands(lhs, rhs)) return;
 
-    // 浮点二元运算
+    // 2. 浮点运算只做前向区间计算；除四则运算外回退为 Top，不参与整数反推。
     auto resultTy = BI->getIRType();
     if (resultTy && resultTy->isFloat()) {
         FloatRange lf = dynamic_cast<ConstFloat *>(lhs) ?
@@ -1310,15 +1189,13 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
             case BinaryInst::DIV: fresult = lf.fdiv(rf); break;
             default: fresult = FloatRange(); break;
         }
-        // 浮点范围更新（带 widening / narrowing，由 updateFloatRange 统一处理）
+
         updateFloatRange(BI, fresult);
 
-
-        // Do not backward-narrow floating ADD/SUB: f32 rounding means the
-        // real-number inverse interval is not a sound proof for operands.
         return;
     }
 
+    // 3. 比较结果固定在 [0, 1]；不支持位宽则保留完整类型范围和未知位信息。
     if (BinaryInst::isCompareOp(BI->getOp())) {
         updateBits(BI, KnownBits::top());
         updateRange(BI, IntRange(0, 1));
@@ -1331,13 +1208,7 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         return;
     }
 
-    // 整数二元运算
-    //   操作数走 global range —— 不能用 BB-sensitive contextual：narrowBinaryBackward
-    //   会把结果 range.sub(otherOperandRange) 写回操作数的 GLOBAL range，如果
-    //   任一侧是 contextual 收窄的结果，backward 推导会把块局部事实传染给全局，
-    //   其它不受该 contextual 影响的块立刻 over-narrow → WA。
-    //   (PHI 的 incoming 是纯 forward 汇合，没有 backward 写回操作数，安全；
-    //    可以用 getRangeInBlock。visitBinary 不行。)
+    // 4. 使用操作数的全局格值做前向传递，避免把某一分支的上下文事实泄漏到其他路径。
     IntRange lRange = dynamic_cast<ConstInt *>(lhs) ?
         IntRange(dynamic_cast<ConstInt *>(lhs)->getVal()) : getRange(lhs);
     IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
@@ -1351,9 +1222,7 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         if (!rRange.isSingleValue() || rRange.min < 0 ||
             rRange.min >= ResultBitWidth)
             return false;
-        // IntRange/KnownBits model 32-bit arithmetic.  A zero shift is an
-        // identity at every width; other narrow-width shifts conservatively
-        // stay Top until the lattices become width-parametric.
+
         return IsModeledI32 || rRange.min == 0;
     };
 
@@ -1364,18 +1233,17 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         case BinaryInst::MUL:  result = IsModeledI32 ? lRange.mul(rRange) : IntRange();  break;
         case BinaryInst::DIV:  result = IsModeledI32 ? lRange.sdiv(rRange) : IntRange(); break;
         case BinaryInst::MOD:  result = IsModeledI32 ? lRange.srem(rRange) : IntRange(); break;
-        // 位运算/移位：走扩展的 IntRange 方法
+
         case BinaryInst::SHL:  result = HasModeledShiftAmount() ? lRange.shl(rRange) : IntRange();  break;
         case BinaryInst::ASHR: result = HasModeledShiftAmount() ? lRange.ashr(rRange) : IntRange(); break;
         case BinaryInst::LSHR: result = HasModeledShiftAmount() ? lRange.lshr(rRange) : IntRange(); break;
         case BinaryInst::AND:  result = lRange.band(rRange); break;
         case BinaryInst::OR:   result = lRange.bor(rRange);  break;
-        // XOR / UDIV / UREM 等当前 SysY 中端不会直接产出，保守 Top
+
         default: result = IntRange(); break;
     }
 
-    // —— KnownBits 并行推导 —— 操作数同样走 global（原因同上）
-    // 移位常量必须是 const 才推位级事实；否则 KB = Top
+    // 5. KnownBits 与区间并行传播；位传递完成后再把确定的位模式投影回结果区间。
     KnownBits lKB = getBits(lhs);
     KnownBits rKB = getBits(rhs);
     KnownBits resKB = KnownBits::top();
@@ -1412,32 +1280,23 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         default: break;
     }
     updateBits(BI, resKB);
-    // 联动：KB 能推出的 range 和 IntRange 算出的 range 取交
+
     result = tightenWithBits(BI, result);
     updateRange(BI, result);
 
-    // Backward constraint propagation：只在 narrowing 阶段做
-    // 对 ADD/SUB 做 z = x op y ⟹ 反推 x / y 的范围
-    // 例：z ∈ [0, 10], y 是常量 3 ⟹ x ∈ [-3, 7]
+    // 6. 仅在 Narrowing 且结果为已建模 i32 时反推 ADD/SUB 操作数，其他运算保持保守。
     if (NarrowingMode && IsModeledI32) {
         narrowBinaryBackward(BI, lhs, rhs, lRange, rRange);
     }
 }
 
-// 反推二元运算操作数的范围（仅 narrowing 阶段使用）
-//
-// 完整反推（ADD/SUB）：
-//   z = x + y ⟹ x = z - y,  y = z - x
-//   z = x - y ⟹ x = z + y,  y = x - z
-// MUL/DIV/MOD 以及浮点运算不做反推：wrap、除法溢出和 f32 舍入都
-// 需要比当前区间 lattice 更强的证明。
+// 反向收窄仅处理已证明前向运算不回绕的 i32 ADD/SUB；其他算术保持保守。
 void RangeSolver::narrowBinaryBackward(
 BinaryInst *BI, Value *lhs, Value *rhs, const IntRange &lRange,
 const IntRange &rRange) {
     auto ty = BI->getIRType();
     if (!ty) return;
 
-    // 整数路径
     if (ty->isInt()) {
         IntRange zR = getRange(BI);
         switch (BI->getOp()) {
@@ -1457,20 +1316,17 @@ const IntRange &rRange) {
                     updateRange(rhs, lRange.sub(zR));
                 break;
             }
-            // MUL/DIV/MOD backward sign inference is disabled.  MUL may
-            // wrap, and DIV/MOD need stronger nonzero/overflow facts than
-            // this interval lattice currently records.
+
             default: break;
         }
         return;
     }
 
-    // Floating-point backward narrowing is intentionally disabled because
-    // f32 arithmetic is not an exact real-number equation.
 }
 
+// 分支访问先标记可行边，再为单前驱后继生成临时块约束；多前驱块不得继承某一条边事实。
 void RangeSolver::visitBranch(BrInst *Br) {
-    // 无条件分支
+    // 1. 无条件分支只登记唯一边；条件分支取得两侧目标和当前比较。
     if (!Br->isConditional()) {
         auto *dest = Br->getTrueSuccessor();
         BasicBlock *fromBB = Br->getParent();
@@ -1478,7 +1334,6 @@ void RangeSolver::visitBranch(BrInst *Br) {
         return;
     }
 
-    // 条件分支
     Value *cond = Br->getCondition();
     auto *trueBB = Br->getTrueSuccessor();
     auto *falseBB = Br->getFalseSuccessor();
@@ -1486,10 +1341,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
 
     if (!trueBB || !falseBB) return;
 
-    // 条件分支收窄：条件是 icmp 比较指令时，在 true/false 分支上收窄操作数范围。
-    // 安全性约束：只在目标块的唯一前驱就是当前块时才收窄。
-    // 如果目标块有多个前驱（典型如 loop header），从其他前驱进入时
-    // 这个条件不成立，收窄会变成错误的 over-constrain。
+    // 2. 只有唯一入边目标可在求解期写块上下文，浮点含 NaN 时放弃数值收窄。
     bool trueSinglePred = (trueBB->getPredecessors().size() == 1);
     bool falseSinglePred = (falseBB->getPredecessors().size() == 1);
 
@@ -1501,11 +1353,6 @@ void RangeSolver::visitBranch(BrInst *Br) {
         if (cmpInst->getOperands(lhs, rhs)) {
             auto op = cmpInst->getOp();
 
-            // 浮点分支收窄：操作数类型 IR_FLOAT 时走浮点路径。
-            // 比较遵循 C/IEEE ordered 关系（!= 对 NaN 为真）。当前
-            // 实现只消费“两侧全局范围都排除 NaN”的强证明；若任一侧
-            // 可能为 NaN 就保守保留 Top，不把某条边错误解释为纯数值
-            // 关系。
             auto lhsTy = lhs->getIRType();
             auto rhsTy = rhs->getIRType();
             if (lhsTy && rhsTy &&
@@ -1535,7 +1382,6 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 double NINF = FloatRange::F_MIN_INF();
                 double PINF = FloatRange::F_MAX_INF();
 
-                // flt: lhs < rhs
                 if (op == BinaryInst::L) {
                     if (trueSinglePred) {
                         updateFloatContextual(lhs, trueBB, FloatRange(NINF, rF.max));
@@ -1546,7 +1392,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         updateFloatContextual(rhs, falseBB, FloatRange(NINF, lF.max));
                     }
                 }
-                // fle: lhs <= rhs
+
                 else if (op == BinaryInst::LE) {
                     if (trueSinglePred) {
                         updateFloatContextual(lhs, trueBB, FloatRange(NINF, rF.max));
@@ -1557,7 +1403,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         updateFloatContextual(rhs, falseBB, FloatRange(NINF, lF.max));
                     }
                 }
-                // fgt: lhs > rhs
+
                 else if (op == BinaryInst::G) {
                     if (trueSinglePred) {
                         updateFloatContextual(lhs, trueBB, FloatRange(rF.min, PINF));
@@ -1568,7 +1414,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         updateFloatContextual(rhs, falseBB, FloatRange(lF.min, PINF));
                     }
                 }
-                // fge: lhs >= rhs
+
                 else if (op == BinaryInst::GE) {
                     if (trueSinglePred) {
                         updateFloatContextual(lhs, trueBB, FloatRange(rF.min, PINF));
@@ -1579,7 +1425,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         updateFloatContextual(rhs, falseBB, FloatRange(lF.min, PINF));
                     }
                 }
-                // feq: lhs == rhs
+
                 else if (op == BinaryInst::E) {
                     if (trueSinglePred) {
                         updateFloatContextual(lhs, trueBB, rF);
@@ -1592,7 +1438,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 return;
             }
 
-            // 整数分支收窄
+            // 3. 整数比较生成真假两侧区间，并为等值和符号测试补充 KnownBits。
             IntRange lRange = dynamic_cast<ConstInt *>(lhs) ?
                 IntRange(dynamic_cast<ConstInt *>(lhs)->getVal()) : getRange(lhs);
             IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
@@ -1616,7 +1462,6 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 return;
             }
 
-            // slt: lhs < rhs
             if (op == BinaryInst::L) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
@@ -1631,7 +1476,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         IntRange(IntRange::I32_MIN, lRange.max));
                 }
             }
-            // sle: lhs <= rhs
+
             else if (op == BinaryInst::LE) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
@@ -1646,7 +1491,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         IntRange(IntRange::I32_MIN, lRange.max - 1));
                 }
             }
-            // sgt: lhs > rhs
+
             else if (op == BinaryInst::G) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
@@ -1661,7 +1506,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         IntRange(lRange.min, IntRange::I32_MAX));
                 }
             }
-            // sge: lhs >= rhs
+
             else if (op == BinaryInst::GE) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
@@ -1676,7 +1521,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                         IntRange(lRange.min + 1, IntRange::I32_MAX));
                 }
             }
-            // eq: lhs == rhs
+
             else if (op == BinaryInst::E) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB, rRange);
@@ -1684,14 +1529,9 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 }
             }
 
-            // —— 边敏感 KnownBits：eq/ne 下窄化 ——
-            //   x == c  (true 分支):  lhs 的 KB = KB(c)
-            //   x == c  (false 分支): 不保留 KB（只排除一个具体值，KB 无损表达）
-            //   x != c  (false 分支): 和 "x == c 的 true 分支" 等价
-            // 常量/非常量两侧对称处理
             auto applyEqKB = [&](Value *a, Value *b, BasicBlock *succ, bool predOnSucc){
                 if (!predOnSucc) return;
-                // a 要从 b 身上继承 KB
+
                 KnownBits bKB = getBits(b);
                 if (bKB.isTop()) return;
                 updateBitsContextual(a, succ, bKB);
@@ -1703,9 +1543,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 applyEqKB(lhs, rhs, falseBB, falseSinglePred);
                 applyEqKB(rhs, lhs, falseBB, falseSinglePred);
             }
-            // slt / sge 时：lhs < 0 的 true 分支 → 符号位 = 1
-            //              lhs < 0 的 false 分支 → 符号位 = 0
-            // 同理 lhs <= -1 等。只对 rhs 是 0 常量的这一高频形态生效
+
             auto applySignBitKB = [&](Value *x, BasicBlock *succ, bool knownNeg,
                                       bool predOnSucc) {
                 if (!predOnSucc) return;
@@ -1717,7 +1555,7 @@ void RangeSolver::visitBranch(BrInst *Br) {
             if (auto *rC = dynamic_cast<ConstInt *>(rhs)) {
                 int rv = rC->getVal();
                 if (rv == 0) {
-                    // x < 0 / x <= -1: rv=0 只对 < 成立；x >= 0 / x > -1 对 >= 成立
+
                     if (op == BinaryInst::L) {
                         applySignBitKB(lhs, trueBB,  true,  trueSinglePred);
                         applySignBitKB(lhs, falseBB, false, falseSinglePred);
@@ -1730,10 +1568,12 @@ void RangeSolver::visitBranch(BrInst *Br) {
         }
     }
 
+    // 4. 无论能否收窄，两个条件后继都加入可行图并驱动后续固定点。
     markEdgeFeasible(fromBB, trueBB);
     markEdgeFeasible(fromBB, falseBB);
 }
 
+// 调用结果只精确建模已知输入内建；用户函数和未知被调目标因缺少可靠跨函数失效机制返回 Top。
 void RangeSolver::visitCall(CallInst *CI) {
     Value *callee = CI->getCallee();
     if (!callee) return;
@@ -1746,44 +1586,32 @@ void RangeSolver::visitCall(CallInst *CI) {
             updateFloatRange(CI, FloatRange());
     };
 
-    // 内置函数范围推断
     if (auto *BIF = dynamic_cast<BuildInFunction *>(callee)) {
         std::string name = BIF->getIdent();
         if (name == "getch") {
-            // Runtime loads an i8 and sign-extends it to i32.  Bytes above
-            // 0x7f therefore produce negative values; ASCII-only [0,127]
-            // is not a valid proof for arbitrary input bytes.
+
             updateRange(CI, IntRange(-128, 127));
             return;
         }
         if (name == "getint") {
-            // getint 可以返回任何 i32
+
             updateRange(CI, IntRange());
             return;
         }
-        // 其他内置函数返回值当 Top
+
         SetTopForResultType();
         return;
     }
 
-    // 用户函数 return summary 在没有 module/call-graph invalidation
-    // proxy 时可能过期。不消费 process-static cache，一律 Top。
     if (dynamic_cast<Function *>(callee)) {
         SetTopForResultType();
         return;
     }
 
-    // 无法识别的 callee → Top
     SetTopForResultType();
 }
 
-// =====================================================================
-// Select：%r = select %c, %a, %b
-//
-// 语义上是条件三元，整数/浮点均取 a、b 的 union。
-// 不尝试靠 %c 的条件信息收窄（condition 是 boolean，其"真分支蕴含什么"
-// 已经在 visitBranch 做过；select 不在 CFG 上，做不到支配推理）。
-// =====================================================================
+// Select 不建立 CFG 上下文，只对两臂的整数/浮点结果取并集。
 void RangeSolver::visitSelect(SelectInst *SI) {
     Value *tv = SI->getTrueValue();
     Value *fv = SI->getFalseValue();
@@ -1813,15 +1641,7 @@ void RangeSolver::visitSelect(SelectInst *SI) {
     }
 }
 
-// =====================================================================
-// Cast 指令的范围推导
-//
-// zext  i1 → i32：结果 ∈ [0, 1]（我们的 ConstBool 也遵循这个语义）
-// sext  i1 → i32：结果 ∈ {-1, 0}，给 [-1, 0]（i1 的 1 符号扩展到 -1）
-// trunc i32 → i1：结果 ∈ [0, 1]
-// sitofp i32 → f32：把整数端点直接转成 float 端点；溢出风险对 i32 下忽略
-// fptosi f32 → i32：浮点区间转 i32，±inf 或超范围 → Top
-// =====================================================================
+// Cast 按源/目标位宽和浮点异常语义分类；未完整建模或可能越界的转换返回 Top。
 void RangeSolver::visitCast(Instruction *I) {
     Value *src = I->getUnaryOperand();
     if (!src || !src->getIRType() || !I->getIRType()) return;
@@ -1836,11 +1656,11 @@ void RangeSolver::visitCast(Instruction *I) {
                                     : 0;
 
     if (dynamic_cast<ZextInst *>(I)) {
-        // 当前仅精确建模 i1 到 i32，其余整数位宽保守返回完整值域。
+
         if (srcTy == IR_INT && SourceBits == 1 &&
             DestinationBits == 32) {
             updateRange(I, IntRange(0, 1));
-            // KB：高 31 位都是 0，最低位未知（取决于 bool）
+
             updateBits(I, KnownBits(0xFFFFFFFEu, 0));
         } else if (dstTy == IR_INT) {
             updateRange(I, conservativeIntegerRangeForValue(I));
@@ -1849,12 +1669,11 @@ void RangeSolver::visitCast(Instruction *I) {
         return;
     }
     if (dynamic_cast<SextInst *>(I)) {
-        // 当前仅精确建模 i1 到 i32，其余整数位宽保守返回完整值域。
+
         if (srcTy == IR_INT && SourceBits == 1 &&
             DestinationBits == 32) {
             updateRange(I, IntRange(-1, 0));
-            // KB：值只能是 0x00000000 或 0xFFFFFFFF；位型未知都归 Top
-            // （因为高位取决于最低位，没法用单一 KB 刻画）
+
         } else if (dstTy == IR_INT) {
             updateRange(I, conservativeIntegerRangeForValue(I));
             updateBits(I, KnownBits::top());
@@ -1862,10 +1681,10 @@ void RangeSolver::visitCast(Instruction *I) {
         return;
     }
     if (dynamic_cast<TruncInst *>(I)) {
-        // 截断到 i1 时只看最低位；其他目标宽度暂不做位级推导。
+
         if (dstTy == IR_INT && DestinationBits == 1) {
             updateRange(I, IntRange(0, 1));
-            // KB：高 31 位都是 0；bit0 继承源的 bit0
+
             KnownBits srcKB = getBits(src);
             uint32_t z = 0xFFFFFFFEu;
             uint32_t o = 0;
@@ -1879,12 +1698,11 @@ void RangeSolver::visitCast(Instruction *I) {
         return;
     }
     if (dynamic_cast<SITOFPInst *>(I)) {
-        // int → float：把端点直接转成 double（无精度损失，i32 ⊂ double）
+
         IntRange r = dynamic_cast<ConstInt *>(src) ?
             IntRange(dynamic_cast<ConstInt *>(src)->getVal()) : getRange(src);
         if (r.isBottom()) { updateFloatRange(I, FloatRange::bottom()); return; }
-        // sitofp rounds to f32.  Store the actual rounded endpoints rather
-        // than the exact integer endpoints represented in double.
+
         if (r.isSingleValue()) {
             updateFloatRange(I, FloatRange(
                 static_cast<double>(static_cast<float>(r.min))));
@@ -1901,12 +1719,7 @@ void RangeSolver::visitCast(Instruction *I) {
             updateBits(I, KnownBits::top());
             return;
         }
-        // float → int：端点向零截断；±inf / NaN 保守退 Top。
-        // 越界行为：一旦端点超过 i32 可表示范围，fptosi 的结果按 IR 语义
-        // 未定义（poison / undef）。这里不能 clamp 到 I32_MIN/I32_MAX，
-        // 因为 RangeAwareSimplify 会把单值区间直接折成 ConstInt —— 把
-        // 1e20f 折成 INT32_MAX 就是改程序行为。安全做法：任一端点超
-        // 出范围 → Top。
+
         FloatRange r = dynamic_cast<ConstFloat *>(src) ?
             FloatRange((double)dynamic_cast<ConstFloat *>(src)->getVal()) :
             FloatValueRanges[src];
@@ -1917,7 +1730,7 @@ void RangeSolver::visitCast(Instruction *I) {
         double lo = std::trunc(r.min);
         double hi = std::trunc(r.max);
         if (!std::isfinite(lo) || !std::isfinite(hi)) { updateRange(I, IntRange()); return; }
-        // 越界直接 Top（而不是夹到边界）
+
         if (lo < (double)IntRange::I32_MIN || hi > (double)IntRange::I32_MAX) {
             updateRange(I, IntRange());
             return;
@@ -1928,7 +1741,7 @@ void RangeSolver::visitCast(Instruction *I) {
         updateRange(I, IntRange(iLo, iHi));
         return;
     }
-    // BitCast 指针层面，不产生整数/浮点范围
+
 }
 
 void RangeSolver::visitInstruction(Instruction *I) {
@@ -1947,16 +1760,16 @@ void RangeSolver::visitInstruction(Instruction *I) {
                dynamic_cast<FPTOSIInst *>(I)) {
         visitCast(I);
     } else if (dynamic_cast<LoadInst *>(I)) {
-        // load 的结果范围未知
+
         updateRange(I, IntRange());
     }
-    // store, ret 等不产生 i32 值的指令不处理
+
 }
 
-// Forward 不动点迭代主循环
+// 1. 前向固定点优先处理值变化产生的指令队列，再扫描首次变为可达的基本块。
 void RangeSolver::runForward() {
     while (!BBWorkList.empty() || !InstWorkList.empty()) {
-        // 优先处理指令队列
+
         while (!InstWorkList.empty()) {
             Instruction *I = InstWorkList.back();
             InstWorkList.pop_back();
@@ -1966,7 +1779,6 @@ void RangeSolver::runForward() {
             visitInstruction(I);
         }
 
-        // 处理块队列
         if (!BBWorkList.empty()) {
             BasicBlock *BB = BBWorkList.back();
             BBWorkList.pop_back();
@@ -1977,18 +1789,11 @@ void RangeSolver::runForward() {
     }
 }
 
-// Narrowing 阶段：backward constraint propagation
-//
-// Forward 收敛后某些值被 widen 到 Top，此阶段用 intersect-only 语义
-// 重跑若干轮，把这些值收回来。重点：
-//   1) updateRange 切到 intersect-only 模式（NarrowingMode=true）
-//   2) 二元运算 visitBinary 会调用 narrowBinaryBackward 做 z=x+y ⟹ x=z-y
-//      这种反推
-//   3) 轮次有上限（NARROW_ROUNDS=3），不追求极限精度，避免过度迭代
+// 2. Narrowing 把更新切为只取交模式，并在 O(指令数) 预算内重访所有可达指令。
 bool RangeSolver::runNarrowing(Function &F) {
+    // 2.1 切换到只取交模式，并按可达指令数设置有限预算，保证第二阶段必然终止。
     NarrowingMode = true;
-    // 硬预算：narrowing 总访问指令次数上限，避免病态函数上跑飞
-    // 经验值：指令数 * 4 足够大多数场景收敛
+
     size_t instCount = 0;
     for (BasicBlock *BB : F) {
         if (ExecutableBlocks.count(BB)) {
@@ -1997,8 +1802,7 @@ bool RangeSolver::runNarrowing(Function &F) {
     }
     size_t budget = instCount * 4 + 64;
 
-    // 单次 pass：把所有可达指令压入 worklist 一次，然后驱动收敛
-    // worklist 本身的传播会把"narrow 后需要复查"的用户拉回来
+    // 2.2 将所有可达指令重新入队，使 widening 丢失的精度有机会从最终前向格中恢复。
     for (BasicBlock *BB : F) {
         if (!ExecutableBlocks.count(BB)) continue;
         for (Instruction *I : *BB) {
@@ -2006,6 +1810,7 @@ bool RangeSolver::runNarrowing(Function &F) {
         }
     }
 
+    // 2.3 驱动队列直到稳定或预算耗尽；未完成会由调用者识别并放弃依赖欠近似的结果。
     while (!InstWorkList.empty() && budget > 0) {
         Instruction *I = InstWorkList.back();
         InstWorkList.pop_back();
@@ -2022,17 +1827,15 @@ bool RangeSolver::runNarrowing(Function &F) {
     return Complete;
 }
 
-// Rebuild transform-visible integer path facts from the *final* value
-// lattice and the *current* CFG.  Forward solving deliberately uses a
-// mutable contextual map to accelerate convergence; exposing that map
-// after widening/narrowing can retain a fact derived from an earlier,
-// narrower operand state.  A single final scan is both sound and O(CFG).
+// 3. 清除求解期临时约束，从最终全局格和当前 CFG 单次重建整数块事实与边事实。
 void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
+    // 3.1 丢弃求解期随可行边增量生成的临时事实，避免残留过时 CFG 约束。
     ContextualRanges.clear();
     ContextualBits.clear();
     EdgeRanges.clear();
     EdgeBits.clear();
 
+    // 3.2 后续闭包统一读取最终全局格，并只记录非 Top、非冲突且可安全落块的事实。
     auto FinalRange = [&](Value *V) -> IntRange {
         if (auto *CI = dynamic_cast<ConstInt *>(V))
             return IntRange(CI->getVal());
@@ -2065,9 +1868,7 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
         if (Existing != EdgeMap.end()) {
             Fact = Existing->second.intersectWith(Fact);
             if (Fact.isBottom()) {
-                // The edge is infeasible, but this analysis does not hand
-                // an explicit reachability proof to transforms.  Dropping
-                // the fact is safer than exposing Bottom as a value range.
+
                 EdgeMap.erase(Existing);
                 if (HasUniqueIncomingEdge(Pred, Succ)) {
                     auto CIt = ContextualRanges.find(V);
@@ -2105,14 +1906,14 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                 ContextualBits[V][Succ].intersectWith(Fact);
     };
 
+    // 3.3 扫描当前 CFG 的条件边，从最终比较操作数重新导出真假边范围与 KnownBits。
     for (BasicBlock *Pred : F) {
         if (!Pred) continue;
         auto *Br = Pred->getBranchTerminator();
         if (!Br || !Br->isConditional()) continue;
         BasicBlock *TrueBB = Br->getTrueSuccessor();
         BasicBlock *FalseBB = Br->getFalseSuccessor();
-        // If both branch labels are the same there is no distinguishable
-        // true/false edge in this IR's (pred,succ) edge key.
+
         if (!TrueBB || !FalseBB || TrueBB == FalseBB) continue;
 
         auto *Cmp = dynamic_cast<BinaryInst *>(Br->getCondition());
@@ -2186,8 +1987,6 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                 break;
         }
 
-        // Preserve the common sign-bit facts without deriving them from
-        // any source-level UB or array bound assumption.
         if (auto *RC = dynamic_cast<ConstInt *>(RHS)) {
             if (RC->getVal() == 0) {
                 if (Cmp->getOp() == BinaryInst::L) {
@@ -2206,25 +2005,17 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
     }
 }
 
-// --- 主求解入口 ---
-
+// RangeAnalysis 主求解流程严格分阶段运行；任何 narrowing 截断都会丢弃部分下近似。
 RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
+    // 1. 从入口启动可达性与前向传播，更新次数预算保证循环最终扩宽收敛。
     CurFunc = &F;
 
-    // Step 1: Forward 不动点（widening）
-    // 参数保持 Top 初值（不从 cache seed，避免函数被用偏紧参数分析导致
-    // 返回值低估）
     markBlockExecutable(F.front());
     runForward();
 
-    // Step 2: Narrowing（backward constraint propagation）。
-    // 跨函数 return cache 当前禁用，不发布顺序敏感 summary。
+    // 2. 在最终前向格上执行反向收窄；预算耗尽时清空值事实，查询自然退化为 Top。
     const bool NarrowingComplete = runNarrowing(F);
 
-    // A budget cutoff leaves a partially intersected (under-approximating)
-    // lattice.  Do not expose it to transforms: dropping all facts yields
-    // Top on query and is conservative, without copying every analysis map
-    // on the normal completed path.
     if (!NarrowingComplete) {
         ValueRanges.clear();
         FloatValueRanges.clear();
@@ -2232,11 +2023,7 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
         BlockLocalRanges.clear();
     }
 
-    // Branch/GEP contextual facts derived while the lattice was changing
-    // are never exposed.  Rebuild integer branch facts once from the
-    // current CFG and final global lattice.  This naturally includes newly
-    // cloned/peeled blocks whenever RangeAnalysis is recomputed after the
-    // CFG-transform invalidation.
+    // 3. 丢弃求解期上下文，并仅在 narrowing 完成后从最终 CFG 重建路径事实。
     ContextualRanges.clear();
     FloatContextualRanges.clear();
     ContextualBits.clear();
@@ -2245,12 +2032,11 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
     if (NarrowingComplete)
         rebuildIntegerContextualFacts(F);
 
-    // Step 4: 用 SCEV 证明出的有限归纳变量范围补充循环体上下文信息。
-    // 只写 non-header loop blocks，保留 header/exit 判断的保守性。
+    // 4. 叠加 SCEV 已证明有限且不回绕的循环体局部归纳范围。
     if (NarrowingComplete)
         applySCEVContextHints(SCEV);
 
-    // Step 5: 构建结果
+    // 5. 移交各格、上下文和归纳摘要，形成只读分析结果。
     RangeInfo info;
     info.GlobalRanges = std::move(ValueRanges);
     info.ContextualRanges = std::move(ContextualRanges);
@@ -2266,15 +2052,14 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
     return info;
 }
 
-// =====================================================================
-// RangeAnalysis Pass
-// =====================================================================
-
 PassID RangeAnalysis::Key;
 
+// Pass 入口取得 SCEV 后创建一次性求解器，并返回封装好的范围信息。
 RangeAnalysis::Result RangeAnalysis::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) const {
+    // 1. 获取循环次数与归纳范围提示所需的 SCEV 结果。
     auto &SCEV = FAM.getResult<SCEVAnalysis>(F);
+    // 2. 创建一次性求解器，运行五阶段流程并返回只读范围结果。
     RangeSolver solver;
     return solver.solve(F, &SCEV);
 }

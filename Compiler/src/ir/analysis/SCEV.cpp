@@ -17,9 +17,7 @@ SCEVResult::SCEVResult(SCEVResult &&) = default;
 
 SCEVResult &SCEVResult::operator=(SCEVResult &&) = default;
 
-// 仅解析由构造方式保证为常量的 SSA 转发。这里不做数学意义上的常量折叠：
-// PHI 或 select 转发不能隐藏可能溢出的算术运算，因此返回值必须在每条输入路径上
-// 都与原始 IR 值精确一致。
+// 常量溯源只穿过所有路径值完全相同的 PHI/Select，不把可能回绕的算术伪装成常量。
 std::optional<int64_t> SCEVResult::getTrivialExactIntConstant(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V) || Depth > 32) return std::nullopt;
@@ -116,6 +114,7 @@ bool SCEVResult::invalidate(Function &, const PreservationStatus &PA) {
     return !PA.isKept(SCEVAnalysis::ID());
 }
 
+// 表达式工厂先做局部规范化和折叠，再按结构 Key 驻留以保证等价节点复用。
 const SCEVExpr *SCEVResult::intern(std::unique_ptr<SCEVExpr> E) {
     auto It = Interned.find(E->Key);
     if (It != Interned.end()) return It->second;
@@ -414,12 +413,16 @@ const SCEVExpr *SCEVResult::mod(const SCEVExpr *L, const SCEVExpr *R) {
     return makeBinary(SCEVExprKind::Mod, L, R);
 }
 
+// 值到 SCEV 的入口使用缓存和活动标记截断 SSA 环，构造失败统一降级为 Unknown。
 const SCEVExpr *SCEVResult::getSCEV(Value *V) {
+    // 1. 命中缓存直接返回；正在递归构造的值作为 Unknown 打断循环依赖。
     if (!V) return nullptr;
     auto It = ValueCache.find(V);
     if (It != ValueCache.end()) return It->second;
     if (ActiveValues[V]) return makeUnknown(V);
     ActiveValues[V] = true;
+
+    // 2. 按 IR 指令类型构造表达式并缓存，空结果不会泄漏给消费者。
     const SCEVExpr *E = create(V);
     ActiveValues[V] = false;
     if (!E) E = makeUnknown(V);
@@ -427,6 +430,7 @@ const SCEVExpr *SCEVResult::getSCEV(Value *V) {
     return E;
 }
 
+// 指令分派只建模当前符号语言支持的算术、PHI、Select、GEP 和 Cast。
 const SCEVExpr *SCEVResult::create(Value *V) {
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return makeConstant(CI->getVal(), V->getIRType());
@@ -479,9 +483,7 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
     case BinaryInst::MUL: return mul(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::DIV: return div(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::MOD: return mod(getSCEV(LHS), getSCEV(RHS));
-    // The compact SCEV language currently has only signed Div/Mod kinds.
-    // Keep unsigned operations opaque instead of conflating their value
-    // semantics with signed arithmetic.
+
     case BinaryInst::UDIV:
     case BinaryInst::UREM: return makeUnknown(BI);
     default: break;
@@ -524,6 +526,7 @@ const SCEVExpr *SCEVResult::createFromPhi(PhiInst *Phi) {
     return Common ? Common : makeUnknown(Phi);
 }
 
+// Header PHI 识别先分离循环外起点与循环内更新，再尝试加法递推或简单乘除递推。
 const SCEVExpr *SCEVResult::tryHeaderPhi(PhiInst *Phi, const Loop *L) {
     Value *Start = nullptr;
     Value *Update = nullptr;
@@ -559,6 +562,7 @@ SCEVResult::findAdditiveDelta(PhiInst *Self, Value *V, const Loop *L) {
     return findAdditiveDeltaImpl(Self, V, L, Active, 0);
 }
 
+// 加法更新递归要求 Self 只出现一次；合流 PHI 的每条循环内路径必须产生完全相同的 Delta。
 std::optional<SCEVResult::UpdateDelta>
 SCEVResult::findAdditiveDeltaImpl(
     PhiInst *Self, Value *V, const Loop *L,
@@ -570,10 +574,6 @@ SCEVResult::findAdditiveDeltaImpl(
     if (isLoopInvariant(V, L))
         return UpdateDelta{false, getSCEV(V)};
 
-    // LoopSimplify merges multiple continue/backedge paths through a latch
-    // PHI.  That PHI still denotes one affine update when every incoming path
-    // computes exactly the same delta from Self.  Recognize only that strict
-    // equality case; a cyclic merge or one differing path remains unknown.
     if (auto *Merge = dynamic_cast<PhiInst *>(V)) {
         if (!Merge->getParent() || !L->contains(Merge->getParent()) ||
             !Active.insert(Merge).second) {
@@ -855,8 +855,10 @@ const SCEVExpr *SCEVResult::tripFromComparison(const Loop *L, BinaryInst *Cmp,
     return Info.TripCount;
 }
 
+// 迭代次数分析主流程验证 LoopSimplify 形状、唯一退出和规范比较，再推导符号次数。
 std::optional<LoopTripCountInfo>
 SCEVResult::analyzeLoopTripCount(const Loop *L) {
+    // 1. 要求唯一预头、Header、Latch 和专用出口基础形状。
     if (!L) return std::nullopt;
 
     BasicBlock *PreHeader = nullptr;
@@ -871,6 +873,7 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
     Info.Header = Header;
     Info.Latch = Latch;
 
+    // 2. 只扫描当前循环直接块，要求所有离环边由同一条件块指向同一出口。
     for (BasicBlock *BB : collectDirectLoopBlocks(L)) {
         if (!BB) continue;
 
@@ -907,12 +910,15 @@ SCEVResult::analyzeLoopTripCount(const Loop *L) {
     if (!Info.ExitingBlock) return std::nullopt;
     if (DT && !DT->dominates(Info.ExitingBlock, Latch)) return std::nullopt;
 
+    // 3. 退出块必须支配 Latch，且条件必须是可建模的整数比较。
     auto *Br = Info.ExitingBlock->getBranchTerminator();
     Value *Cond = Br->getOperand(0);
     auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
     if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp())) return std::nullopt;
 
     Info.ExitCmp = Cmp;
+
+    // 4. 将比较转换成距离、次数、比较阶段和无回绕信息后封装结果。
     if (!fillTripCountFromComparison(Info)) return std::nullopt;
     Info.Valid = true;
     return Info;
@@ -965,11 +971,6 @@ bool SCEVResult::hasStrictUnitStepExit(
         return false;
     }
 
-    // A latch test of the header PHI may still compute the next update on the
-    // final, failing iteration.  That update can wrap even though `phi < B`
-    // itself gives a finite PHI sequence (for example B == INT_MAX).  Keep the
-    // no-wrap API restricted to a true header test; exact-update latch tests
-    // are safe after the separate first-update check below.
     if (Trip.ComparePhase == LoopExitComparePhase::HeaderPhi &&
         Trip.ExitingBlock == Trip.Latch) {
         return false;
@@ -1013,10 +1014,6 @@ bool SCEVResult::isBackedgeUpdateStartSafe(
         return false;
     }
 
-    // A nested loop may start at the currently active induction value of an
-    // ancestor.  If that ancestor's own unit update is proven non-wrapping,
-    // the active value is safe for one update in the same direction.  Walk
-    // only parents, so the recursive proof cannot cycle.
     for (Loop *Ancestor = L->getParentLoop(); Ancestor;
          Ancestor = Ancestor->getParentLoop()) {
         auto AncestorInduction = getCanonicalInduction(Ancestor);
@@ -1036,8 +1033,10 @@ bool SCEVResult::isBackedgeUpdateStartSafe(
     return false;
 }
 
+// 运行时无回绕证明在预头上下文核验单位更新、比较阶段、起点/边界范围及最终更新包络。
 bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     const LoopTripCountInfo &Info, RangeInfo &RI, DominatorTree &DomTree) {
+    // 1. 只接受有效运行时次数和直接的 i32 加一/减一规范归纳。
     if (!Info.Valid || !Info.IsRuntime || !Info.L || !Info.PreHeader ||
         !Info.Header || !Info.Latch || !Info.ExitingBlock || !Info.ExitCmp ||
         !Info.IndVar) {
@@ -1076,11 +1075,10 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     }
     if (!DirectStep) return false;
 
+    // 2. 用 SSA 身份区分 Header PHI 与 BackedgeUpdate，拒绝单块循环的错误阶段解释。
     Value *Compared = nullptr;
     if (Info.ComparePhase == LoopExitComparePhase::HeaderPhi) {
-        // 单块循环同时也是 latch；即使比较 header PHI，失败的末轮仍会先
-        // 执行 backedge update。这里没有证明那次额外更新，所以不能把它
-        // 当作普通的零次可执行 header-test。
+
         if (Info.ExitingBlock != Info.Header ||
             Info.ExitingBlock == Info.Latch) {
             return false;
@@ -1088,8 +1086,7 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
         Compared = IV->Phi;
     } else if (Info.ComparePhase ==
                LoopExitComparePhase::BackedgeUpdate) {
-        // backedge-update 比较必须发生在唯一 latch。Header == Latch 的
-        // 单块旋转循环也属于这一类。
+
         if (Info.ExitingBlock != Info.Latch)
             return false;
         Compared = IV->UpdateValue;
@@ -1112,6 +1109,7 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
         return false;
     }
 
+    // 3. 在预头查询起点和边界范围，并在宽整数中验证距离计算不会回绕。
     IntRange StartRange = RI.query(IV->StartValue, Info.PreHeader, DomTree);
     IntRange BoundRange = RI.query(RHS, Info.PreHeader, DomTree);
     auto FitsI32Range = [](const IntRange &R) {
@@ -1121,9 +1119,6 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
     if (!FitsI32Range(StartRange) || !FitsI32Range(BoundRange))
         return false;
 
-    // 统一把 ComparedStart 表示为第一次参与退出比较的值。header PHI
-    // 直接从 start 开始；backedge-update 则先做一次严格单位更新。所有
-    // 端点都用 __int128 计算，避免证明代码本身发生有符号溢出。
     __int128 ComparedMin = StartRange.min;
     __int128 ComparedMax = StartRange.max;
     const bool ComparesBackedgeUpdate =
@@ -1137,9 +1132,6 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
         }
     }
 
-    // SCEV 对递增循环展开 Bound-ComparedStart，对递减循环展开对称的
-    // ComparedStart-Bound。必须证明源位宽中的减法精确，不能只依赖数学
-    // 整数上的 trip count。
     __int128 MinDistance = 0;
     __int128 MaxDistance = 0;
     if (*IV->ConstantStep == 1) {
@@ -1158,20 +1150,15 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
         return false;
     }
 
+    // 4. BackedgeUpdate 还需为首轮更新、次数加一和末次更新包络提供额外空间。
     if (!ComparesBackedgeUpdate)
         return true;
 
-    // update-test 至少执行一次，其 trip count 是
-    // max(0, distance) + 1。除了 distance 本身不回绕，还要给最后的 +1
-    // 留出一位；否则 remainder 计算看到的是已经环绕的负数。
     if (MaxDistance >
         static_cast<__int128>(IntRange::I32_MAX) - 1) {
         return false;
     }
 
-    // 严格单位步下，最后一次实际 update 等于第一次 update 与 bound 中
-    // 更靠退出方向的那个值。显式检查这个包络，使证明不依赖“中间值应当
-    // 单调”这一隐含假设；首值和末值均可表示即可覆盖整条更新序列。
     __int128 FinalMin = 0;
     __int128 FinalMax = 0;
     if (*IV->ConstantStep == 1) {
@@ -1189,7 +1176,9 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
            FinalMax <= IntRange::I32_MAX;
 }
 
+// 比较求解器负责定向归纳变量、构造距离和次数、绑定精确 SSA 阶段并证明常量递推安全。
 bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
+    // 1. 把循环递推统一放到比较左侧，右侧必须对当前循环不变。
     const Loop *L = Info.L;
     BinaryInst *Cmp = Info.ExitCmp;
     if (!L || !Cmp) return false;
@@ -1229,6 +1218,8 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     const SCEVExpr *Bound = RHS;
     const SCEVExpr *Distance = nullptr;
     int64_t Step = *StepC;
+
+    // 2. 根据谓词和步长方向构造非负距离；运行时 NE 因缺少整除证明而失败。
     int64_t AbsStep = Step < 0 ? -Step : Step;
 
     switch (Pred) {
@@ -1267,8 +1258,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
             TC = makeConstant(IRMath::ceilDivPositive(*D, AbsStep), Distance->Ty);
         }
     } else {
-        // For !=, a runtime distance is only safe if exact reachability can be
-        // proven.  This compact SCEV does not do symbolic divisibility proofs.
+
         if (Pred == BinaryInst::NE) return false;
 
         const SCEVExpr *Raw = nullptr;
@@ -1284,11 +1274,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
 
     if (!TC) return false;
 
-    // Classify the compared recurrence by SSA identity, not by the block that
-    // happens to contain the branch.  In particular, a one-block do-while has
-    // Header == Latch, so the old `ExitingBlock != Header` test treated a
-    // comparison of the backedge value as a zero-trip header test and was off
-    // by one.
+    // 3. 通过 SSA 身份绑定 HeaderPhi 或唯一回边 Update，并据执行阶段校正一次迭代偏差。
     bool ComparesExactHeaderPhi = false;
     bool ComparesExactBackedgeUpdate = false;
     if (auto *ComparedPhi = dynamic_cast<PhiInst *>(LHSVal)) {
@@ -1302,11 +1288,6 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         }
     }
 
-    // A canonical latch test also commonly compares the exact backedge update
-    // (`next = phi +/- C`).  Associate it only when that very instruction is
-    // the unique in-loop incoming value of the candidate header PHI.  Merely
-    // having an equal SCEV step (for example `i + C` used only by the compare)
-    // is insufficient.
     if (!Info.IndVar) {
         auto *Update = dynamic_cast<BinaryInst *>(LHSVal);
         PhiInst *Candidate = nullptr;
@@ -1354,12 +1335,6 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         }
     }
 
-    // The distance derived from an exact backedge update counts successful
-    // continuations after the first iteration has already executed, so the
-    // first iteration must always be included -- even when Header == Latch.
-    // An exact header PHI needs the same adjustment only for a latch test; a
-    // normal header test can execute zero iterations.  Unknown affine aliases
-    // are rejected rather than assigned a guessed iteration phase.
     if (ComparesExactBackedgeUpdate ||
         (ComparesExactHeaderPhi && Info.ExitingBlock == Info.Latch)) {
         TC = add(TC, makeConstant(1, TC->Ty));
@@ -1372,6 +1347,7 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
         ? LoopExitComparePhase::BackedgeUpdate
         : LoopExitComparePhase::HeaderPhi;
 
+    // 4. 发布符号次数；常量次数仍需独立验证直接更新与 i32 退出值均不回绕。
     Info.Start = Start;
     Info.Step = Affine->Step;
     Info.Bound = Bound;
@@ -1380,13 +1356,6 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     Info.IsRuntime = !Info.ConstantTripCount.has_value();
     Info.MayBeZeroTrip = !Info.ConstantTripCount || *Info.ConstantTripCount == 0;
 
-    // Constant arithmetic above is mathematical arithmetic.  The source IR
-    // recurrence is signed i32 and may wrap, in which case that mathematical
-    // count is neither a termination proof nor a legal range fact.  For now we
-    // publish a no-wrap proof only when the comparison was tied to an exact
-    // header PHI/backedge update and the value at the modeled exit also fits
-    // i32.  Monotonicity then implies every intermediate recurrence value fits
-    // as well.
     if ((Info.ExitingBlock == Info.Header ||
          Info.ExitingBlock == Info.Latch) && Info.IndVar &&
         Info.ConstantTripCount && *Info.ConstantTripCount >= 0) {
@@ -1420,9 +1389,6 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
                 return true;
             });
 
-        // Confirm that the backedge is exactly `phi +/- ConstInt`; otherwise
-        // a mathematically folded invariant step could already have wrapped in
-        // the source IR before entering this recurrence.
         std::optional<int64_t> DirectStep;
         if (auto *Update = dynamic_cast<BinaryInst *>(DirectUpdate)) {
             Value *A = Update->getOperand(0);
@@ -1454,6 +1420,8 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
                 ExitValue <= IntRange::I32_MAX;
         }
     }
+
+    // 5. 从总次数构造回边次数，运行时路径用 max(0, TC-1) 保持非负。
     if (Info.ConstantTripCount) {
         int64_t BE = *Info.ConstantTripCount <= 0 ? 0 : *Info.ConstantTripCount - 1;
         Info.BackedgeTakenCount = makeConstant(BE, TC->Ty);
@@ -1502,9 +1470,6 @@ PhiInst *SCEVResult::findPhiForAffineRec(const Loop *L,
         auto PhiAff = getAffine(Phi);
         if (!PhiAff || PhiAff->RecLoop != L) continue;
 
-        // An equal step is not enough: with two recurrences, or a comparison
-        // of `i + c`, it can associate the exit with the wrong header PHI.
-        // Consumers that rewrite CFG/iterations require the exact recurrence.
         if (!sameExpr(PhiAff->Start, Affine.Start) ||
             !sameExpr(PhiAff->Step, Affine.Step))
             continue;
@@ -1548,15 +1513,14 @@ bool SCEVResult::isTripCountMultipleOf(const Loop *L, int64_t Factor) {
     return (*Info->ConstantTripCount % Factor) == 0;
 }
 
+// 余数查询先要求常量次数已有无回绕证明，再分别构造常量或运行时的主/余次数。
 std::optional<LoopRemainderInfo>
 SCEVResult::getRemainderInfo(const Loop *L, int64_t Factor) {
     if (!L || Factor <= 1) return std::nullopt;
     auto TCInfo = analyzeLoopTripCount(L);
     if (!TCInfo || !TCInfo->TripCount)
         return std::nullopt;
-    // A constant mathematical count must never be consumed when the i32
-    // recurrence can wrap.  Runtime consumers may add a contextual proof at
-    // the exact expansion point, which SCEV itself cannot see.
+
     if (TCInfo->ConstantTripCount && !TCInfo->ProvenNoWrap)
         return std::nullopt;
 
@@ -1590,6 +1554,7 @@ SCEVResult::getRemainderInfo(const Loop *L, int64_t Factor) {
     return Info;
 }
 
+// 规范归纳查询把次数分析选中的 PHI 还原为唯一循环外起点和唯一循环内更新。
 std::optional<InductionDescriptor>
 SCEVResult::getCanonicalInduction(const Loop *L) {
     auto TCInfo = analyzeLoopTripCount(L);
@@ -1631,6 +1596,7 @@ SCEVResult::getCanonicalInduction(const Loop *L) {
     return Desc.Valid ? std::optional<InductionDescriptor>(Desc) : std::nullopt;
 }
 
+// 指定迭代展开递归替换目标循环的 AddRec；不支持的乘除递推保持符号节点。
 const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
                                                const SCEVExpr *Iter,
                                                const Loop *L) {
@@ -1698,10 +1664,9 @@ void SCEVResult::forgetAllLoops() {
     clear();
 }
 
+// 任意 IR 改写会使已返回节点地址失效，因此失效路径整体清空驻留池和派生缓存。
 void SCEVResult::clear() {
-    // IR rewrites invalidate every previously returned SCEVExpr pointer.
-    // Keep the first version simple and flush the whole interned expression
-    // arena instead of trying to maintain fine-grained dependencies.
+
     ExprStorage.clear();
     Interned.clear();
 
@@ -1713,6 +1678,7 @@ void SCEVResult::clear() {
     LoopInductionsReady = false;
 }
 
+// Range 摘要按需扫描 Header PHI；先记录常量起点/步长，只有次数证明无回绕时才发布可用边界。
 const std::unordered_map<Value *, LoopInductionInfo> &
 SCEVResult::getLoopInductions() {
     if (LoopInductionsReady) return LoopInductions;
@@ -1805,9 +1771,12 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
     return "<bad-scev>";
 }
 
+// Pass 主流程获取 LoopInfo 与 DominatorTree，并返回惰性 SCEV 查询上下文。
 SCEVAnalysis::Result
 SCEVAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
+    // 1. 循环递推识别依赖 LoopInfo，退出形状验证依赖 DominatorTree。
     auto &Loops = FAM.getResult<LoopAnalysis>(F);
     auto &Dom = FAM.getResult<DominantAnalysis>(F);
+    // 2. 返回惰性上下文；值表达式和次数信息在查询时驻留并缓存。
     return SCEVResult(&F, &Loops, &Dom);
 }

@@ -25,8 +25,12 @@ struct SCEVExpr;
 class Use;
 class Value;
 
-// 保守交换两个相邻循环轴。矩形同域优先交换规范归纳变量的角色；经过
-// 分布形成的受限非完美循环则在完整依赖与 CFG 证明后执行物理交换。
+// LoopInterchange 的整体流程：
+// 1. 从内到外枚举相邻循环，并用函数级次数上限与循环头记录阻止重复交换。
+// 2. 优先识别旋转后的受限非完美嵌套，完整证明 CFG、SSA、依赖方向和局部性后物理重排循环轴。
+// 3. 其余矩形同域嵌套走角色交换路径，只交换两个规范 IV 的负载使用，必要时下沉外轴纯计算前缀。
+// 4. 先构造游离克隆并完成所有可失败检查，再集中提交 CFG/SSA 改写；失败时销毁未挂接对象。
+// 5. 角色交换保留支配、后支配和循环结构，物理交换则使所有函数分析失效。
 class LoopInterchangePass : public PassDescriptor<LoopInterchangePass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -86,6 +90,7 @@ private:
         long long LocalityBenefit = 0;
     };
 
+    // 3.1 证明两轴起点、步长、迭代次数与零次语义一致，并收集角色交换的 SSA 切片。
     static bool sameIterationDomain(Loop *Outer, Loop *Inner,
                                     SCEVResult &SE,
                                     PhiInst *&OuterIV,
@@ -102,10 +107,12 @@ private:
         std::unordered_set<Value *> &Active, unsigned Depth = 0);
     static long long computeLocalityBenefit(const Candidate &C,
                                             LoopDependenceInfo &LD);
+    // 3.2 要求 LoopSimplify/LCSSA 形态、必经内循环与无外层内存负载，再提交 IV 角色交换。
     static bool validateNestShape(const Candidate &C, const LoopInfo &LI,
                                   const DominatorTree &DT,
                                   const PostDominatorTree &PDT);
     static bool applyCandidate(Function &F, Candidate &C);
+    // 2.1 为物理交换建立完整候选：固定六块 CFG，核验归纳 PHI、可移动控制与依赖方向。
     static bool buildRotatedNestCandidate(
         Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
         DominatorTree &DT, PostDominatorTree &PDT,
@@ -121,6 +128,7 @@ private:
     static void destroyDetachedInstructions(
         std::vector<Instruction *> &Instructions);
 
+    // 1.1 状态跨 pass 固定点轮次保留，同时约束同一循环对和整个函数的变换次数。
     std::unordered_set<HeaderPair, HeaderPairHash> Transformed;
     std::unordered_map<Function *, unsigned> TransformCount;
 };

@@ -14,12 +14,14 @@
 #include <utility>
 #include <vector>
 
+// 同一值号可有多个定义记录，leader 查询再按支配、块内顺序与计时屏障筛选。
 struct InstRecord {
 	int Num = 0;
 	Instruction *Inst = nullptr;
 	BasicBlock *BB = nullptr;
 };
 
+// 全局表达式键由 opcode、精确结果类型与规范化操作数值号组成。
 struct ExprKey {
 	unsigned Opcode = 0;
 	const IRType *ResultType = nullptr;
@@ -44,21 +46,23 @@ struct PhiTranslateKeyHash {
 	std::size_t operator()(const PhiTranslateKey &K) const;
 };
 
-// Per-block set: ValueNum -> (Instruction* leader, BasicBlock* defBB)
-// Used for AVAIL_OUT in PRE phase.
+ 
+ 
+// PRE 的块出口可用项同时保存 leader 和其定义块。
 struct AvailEntry {
 	Instruction *Inst = nullptr;
 	BasicBlock  *DefBB = nullptr;
 };
 using AvailSet = std::unordered_map<int, AvailEntry>;
 
-// 以共同归纳方式比较循环 PHI 所形成的纯 SSA 子图。
+ 
+// 对循环 PHI 和其纯表达式操作数做共递归等价判断，三态 memo 负责终止循环图。
 class PhiCongruenceMatcher {
 public:
 	bool equivalent(Value *A, Value *B);
 
 private:
-	// 对称值对作为递归比较的记忆化键。
+	 
 	struct ValuePair {
 		Value *A = nullptr;
 		Value *B = nullptr;
@@ -84,6 +88,9 @@ private:
 	bool equivalentImpl(Value *A, Value *B, unsigned Depth);
 };
 
+// 流程：1. 在规模预算内重建 RPO/值号；2. GVN 合并支配等价表达式、load 和只读调用；
+// 3. PRE 建立 AvailOut 并经 PHI translate 定位恰缺一条前驱的表达式；
+// 4. 在缺失边克隆并以新 PHI 合流；5. 两阶段分别有界迭代到不动点。
 class GVNPRESolver {
 public:
 	GVNPRESolver(Function &F,
@@ -116,7 +123,7 @@ private:
 	std::vector<BasicBlock *> RPO;
 	std::unordered_map<PhiTranslateKey, int, PhiTranslateKeyHash> PhiTranslateTable;
 
-	// AVAIL_OUT[BB]: num -> {inst, defBB}  (built top-down on domtree)
+	 
 	std::unordered_map<BasicBlock *, AvailSet> AvailOut;
 
 	struct MemoryLoadRecord {
@@ -154,7 +161,7 @@ private:
 	void forgetInstruction(Instruction *I);
 	bool isBeforeInSameBlock(Instruction *A, Instruction *B) const;
 	Instruction *findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const;
-	// PRE-specific: find leader using AVAIL_OUT (O(1), domtree-propagated)
+	 
 	Instruction *findAvailLeader(int Num, BasicBlock *PredBB) const;
 
 	int allocateFreshNum(Value *V);
@@ -169,9 +176,9 @@ private:
 	void markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc);
 	void processBranchForDeadBlocks(Instruction *I);
 
-	// Merge loop-carried PHIs that define the same recurrence.  This is kept
-	// separate from ordinary expression numbering because cyclic PHIs need a
-	// co-inductive comparison instead of a one-pass operand hash.
+	 
+	 
+	 
 	bool eliminateCongruentPhis();
 	bool processLoad(Instruction *I);
 	bool processCall(Instruction *I);
@@ -179,9 +186,9 @@ private:
 
 	static bool isBackedge(BasicBlock *Pred, BasicBlock *BB, const DominatorTree &DT);
 	bool shouldSkipPREInst(Instruction *I);
-	// Improved phiTranslate: returns translated ExprKey and resolves to existing num
+	 
 	int phiTranslate(int Num, BasicBlock *FromBB, BasicBlock *ToPred);
-	// Resolve translated operand value available in PredBB
+	 
 	Value *resolveAvailOperand(Value *OrigV, BasicBlock *SrcBB,
 	                           BasicBlock *PredBB);
 
@@ -190,9 +197,11 @@ private:
 
 };
 
-// GVN + PRE 组合优化
-// - GVN：同值冗余消除（包含局部 LOAD/CALL 前扫）
-// - PRE：部分冗余消除（基于 PHITranslate + AVAIL_OUT 集合）
+ 
+ 
+ 
+// 函数 pass 负责取得支配、循环、AA、MemorySSA 并运行 GVNPRESolver，
+// 可通过构造参数关闭 PRE、只执行全局值编号。
 class GVNPREPass : public PassDescriptor<GVNPREPass> {
 public:
 	explicit GVNPREPass(bool EnablePRE = true);
@@ -202,14 +211,16 @@ private:
 	bool EnablePRE = true;
 };
 
-// 线性的块内值编号 Pass；只处理无副作用的 SSA 表达式，供完整
-// GVN/PRE 因函数规模过大而跳过时提供低成本化简。
+ 
+ 
+// 线性低成本层：每块独立按真实操作数建纯表达式键，顺序复用首个 leader；
+// 计时调用清空本块表，不做跨块数据流或内存值编号。
 class LocalGVNPass : public PassDescriptor<LocalGVNPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-	// 块内表达式键只编码无副作用指令的操作码、类型和操作数。
+	 
 	struct LocalExprKey {
 		unsigned Opcode = 0;
 		unsigned SubOpcode = 0;

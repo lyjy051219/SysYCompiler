@@ -12,12 +12,15 @@
 #include <unordered_set>
 #include <vector>
 
+// 步骤 1.1：比较递推更新的操作数时，仅允许两个递推 PHI 互相对应，其他值
+// 必须是同一个 SSA 定义。
 bool IndVarSimplifyPass::correspondingRecurrenceValue(
     Value *A, Value *B, PhiInst *APhi, PhiInst *BPhi) {
     if (A == APhi || B == BPhi) return A == APhi && B == BPhi;
     return A == B;
 }
 
+// 步骤 1.2：核验更新指令的类型和操作码，并仅对可交换运算允许交换操作数。
 bool IndVarSimplifyPass::haveExactUpdateShape(
     Value *A, Value *B, PhiInst *APhi, PhiInst *BPhi) {
     auto *AI = dynamic_cast<BinaryInst *>(A);
@@ -41,10 +44,8 @@ bool IndVarSimplifyPass::haveExactUpdateShape(
            correspondingRecurrenceValue(AR, BL, APhi, BPhi);
 }
 
-// SCEV is used to group candidates, but equality is committed only after an
-// exact SSA recurrence check.  This keeps signed/unsigned operations and
-// casts distinct even if a future analysis canonicalization happens to give
-// them the same mathematical key.
+// 步骤 1.3：按前驱逐项比较两个头部 PHI；循环外起始值必须相同，循环内
+// 回边值必须是步骤 1.2 认可的同形更新。
 bool IndVarSimplifyPass::haveExactRecurrenceShape(
     PhiInst *A, PhiInst *B, Loop *L) {
     if (!A || !B || !L || A->getParent() != B->getParent() ||
@@ -66,6 +67,8 @@ bool IndVarSimplifyPass::haveExactRecurrenceShape(
     return Seen.size() == B->getNumIncomingValues();
 }
 
+// 步骤 1—2：SCEV 键只负责快速发现候选，同键 PHI 仍须通过精确 SSA 核验；
+// 通过后统一替换使用并删除重复 PHI。
 bool IndVarSimplifyPass::mergeExactRecurrences(Loop *L, SCEVResult &SE) {
     BasicBlock *Header = L ? L->getHeader() : nullptr;
     if (!Header) return false;
@@ -98,6 +101,8 @@ bool IndVarSimplifyPass::mergeExactRecurrences(Loop *L, SCEVResult &SE) {
     return Changed;
 }
 
+// 步骤 3：利用已验证的退出信息识别右侧归纳变量，反转谓词和操作数，生成
+// 语义等价的规范比较；不改变退出边或循环迭代域。
 bool IndVarSimplifyPass::orientExitComparison(Loop *L, SCEVResult &SE) {
     auto TCI = SE.analyzeLoopTripCount(L);
     if (!TCI || !TCI->Valid || !TCI->ExitCmp ||
@@ -136,9 +141,8 @@ PassResult IndVarSimplifyPass::run(
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
     bool Changed = false;
-    // Do not continue using SCEV after a rewrite: its cache refers to the old
-    // SSA graph.  A surrounding fixed point will rebuild analyses and visit
-    // remaining loops deterministically.
+    // 1. 按内到外顺序寻找可规范化循环；含计时调用的循环拒绝删除或重排
+    // 每轮指令，以保持计时边界内的动态执行次数。
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L) continue;
         bool HasTimingCall = false;
@@ -153,8 +157,8 @@ PassResult IndVarSimplifyPass::run(
             }
             if (HasTimingCall) break;
         }
-        // 合并递推会删除一套每轮更新，计时循环中必须保留原执行次数。
         if (HasTimingCall) continue;
+        // 2—3. 先合并重复递推，否则规范退出比较；提交首个变化后立刻停止。
         if (mergeExactRecurrences(L, SE) || orientExitComparison(L, SE)) {
             Changed = true;
             break;
@@ -162,6 +166,8 @@ PassResult IndVarSimplifyPass::run(
     }
 
     if (!Changed) return PassResult::unchanged();
+    // 4. 当前 SCEV 缓存描述改写前的 SSA，交由外层不动点重新构建；CFG 与
+    // 循环结构未变，但指针递推替换可能改变别名和副作用结论。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

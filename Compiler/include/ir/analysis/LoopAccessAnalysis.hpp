@@ -15,16 +15,14 @@ class Loop;
 class LoopInfo;
 class SCEVResult;
 
-// A transform-facing classification of two scalar memory operations.  The
-// aligned case means that address equality is possible only when the two loop
-// axes have the same logical iteration number.  It is deliberately stronger
-// than an ordinary same-execution BasicAA query.
+// 访问对分类区分无冲突、仅同逻辑迭代冲突和证据不足三种结果。
 enum class LoopAccessPairKind {
     NoConflict,
     SameIterationOnly,
     Unknown
 };
 
+// 变换摘要引用 LoopDependence 中的稳定访问记录，并汇总未知内存与写入状态。
 struct LoopAccessSummary {
     Loop *Scope = nullptr;
     std::vector<const LoopMemoryAccess *> Accesses;
@@ -39,10 +37,7 @@ struct LoopFusionAccessResult {
     unsigned SameIterationConflictPairs = 0;
 };
 
-// LoopAccessInfo is the conservative bridge between scalar address analysis
-// and schedule transforms.  It does not invent runtime alias checks: distinct
-// objects use BasicAA, while accesses on one object must have typed affine
-// coordinates which force equal logical iterations.
+// LoopAccessInfo 把标量地址证明转换成融合、分块和循环交换可直接消费的判定。
 class LoopAccessInfo {
 public:
     LoopAccessInfo();
@@ -55,24 +50,20 @@ public:
 
     const LoopAccessSummary &getSummary(Loop *Scope);
 
+    // 查询先用不同根的 NoAlias 排除冲突，再尝试证明两个循环轴的逻辑迭代对齐。
     LoopAccessPairKind classifyPair(
         Loop *FirstScope, Loop *FirstAxis,
         const LoopMemoryAccess &First,
         Loop *SecondScope, Loop *SecondAxis,
         const LoopMemoryAccess &Second) const;
 
-    // True only when every conflicting pair from different Axis iterations is
-    // disjoint.  This strong property is sufficient for tiling and jamming.
     bool areIterationsIndependent(Loop *Scope, Loop *Axis);
 
     LoopFusionAccessResult analyzeFusion(Loop *First, Loop *Second);
     bool isFusionLegal(Loop *First, Loop *Second);
 
     bool isRectangularNest(Loop *Outer, Loop *Inner);
-    // True when a read is reused across ReusedAxis iterations but advances
-    // along VaryingAxis.  This excludes small loop-invariant tables: keeping
-    // those hot does not by itself justify changing the two-dimensional
-    // execution order.
+
     bool hasCrossAxisReuse(Loop *Scope, Loop *ReusedAxis,
                            Loop *VaryingAxis);
     std::optional<std::int64_t> getByteStride(Instruction *I, Loop *Scope,
@@ -106,6 +97,7 @@ private:
         const LoopMemoryAccess &Second, Loop *SecondAxis);
 };
 
+// Pass 入口聚合 LoopInfo、SCEV、BasicAA 和 LoopDependence，并返回惰性缓存结果。
 class LoopAccessAnalysis : public AnalysisDescriptor<LoopAccessAnalysis> {
 public:
     using Result = LoopAccessInfo;

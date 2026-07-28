@@ -14,8 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
-// 将目标 Ret 的返回值映射到 Pred 上可用的 SSA 值。
-// 允许处理位于 TargetBB 中的 PHI 与 BitCast 链，其他 TargetBB 本地指令一律判为不合法。
+// 3.2 跨块返回候选的 SSA 解析：TargetBB 内的 PHI 按 Pred 选边，BitCast 在候选块重建，其他目标块本地定义全部拒绝。
 Value *TailRecursionEliminationPass::resolveRetValueForPred(Value *V,
                                      BasicBlock *Pred,
                                      BasicBlock *TargetBB,
@@ -72,7 +71,7 @@ bool TailRecursionEliminationPass::rewriteClonedRetOperandForPred(RetInst *Clone
                                            Instruction *InsertBefore,
                                            std::vector<Instruction *> &ClonedInsts) {
     Value *RetVal = ClonedRet->getReturnValue();
-    if (!RetVal) return true; // void ret
+    if (!RetVal) return true;
 
     std::unordered_set<Value *> Visiting;
     Value *Resolved = resolveRetValueForPred(RetVal, Pred, TargetBB,
@@ -81,14 +80,10 @@ bool TailRecursionEliminationPass::rewriteClonedRetOperandForPred(RetInst *Clone
     ClonedRet->replaceOperand(0, Resolved);
     return true;
 }
-
-
-//  判断 CallInst 是否是对当前函数 F 的自递归调用
 bool TailRecursionEliminationPass::isSelfCall(CallInst *CI, Function &F) {
     return CI && CI->getCallee() == &F;
 }
 
-//  快速检查：函数是否包含自递归调用
 bool TailRecursionEliminationPass::hasSelfRecursion(Function &F) {
     return !forEachInstruction<CallInst>(
         F, [&](CallInst *CI) { return !isSelfCall(CI, F); });
@@ -112,8 +107,7 @@ bool TailRecursionEliminationPass::allocaAddressEscapes(
                                                     : nullptr);
             if (!UserInst) return true;
 
-            // GEP、位转换、PHI 和 select 只传播地址身份；继续沿结果
-            // 检查，直到遇到真实的内存访问或逃逸点。
+            // 2.2 GEP、BitCast、PHI 和 Select 只传播地址身份，将其结果继续放入工作列表。
             if (auto *GEP = dynamic_cast<GetElementPtrInst *>(UserInst)) {
                 if (GEP->getBasePointer() != Current) return true;
                 WorkList.push_back(GEP);
@@ -137,8 +131,7 @@ bool TailRecursionEliminationPass::allocaAddressEscapes(
                 continue;
             }
 
-            // 作为 load/store 的地址仅访问当前帧对象，不会让地址逃逸；
-            // 把地址本身存入任意内存则可能跨递归帧继续存活，必须拒绝。
+            // 2.2.1 作为 load/store 地址仅访问本帧对象；若地址本身被 store，则可跨递归帧存活，必须拒绝。
             if (auto *Load = dynamic_cast<LoadInst *>(UserInst)) {
                 if (Load->getPointerOperand() != Current) return true;
                 continue;
@@ -150,12 +143,11 @@ bool TailRecursionEliminationPass::allocaAddressEscapes(
             }
 
             if (dynamic_cast<CallInst *>(UserInst)) {
-                // 当前 IR 没有 nocapture 属性；传给任意调用都按逃逸处理。
+                // 2.2.2 IR 没有 nocapture 证明，因此地址传给任何调用都按逃逸处理。
                 return true;
             }
 
-            // 返回地址、间接调用以及当前未显式建模的新指令都不能证明
-            // 地址只在本帧内使用，保守拒绝整函数的尾递归消除。
+            // 2.2.3 未显式建模的用法无法证明地址仅存活于本帧，保守终止整函数 TRE。
             return true;
         }
     }
@@ -191,18 +183,15 @@ bool TailRecursionEliminationPass::isReadonlyLikeCallInst(Instruction *I,
     return false;
 }
 
-// 当前 IR 没有显式 dereferenceable 属性。只有直接指向模块全局对象的
-// 普通 load 可以在不依赖运行时路径的情况下证明地址始终有效；参数、
-// GEP、PHI、select 与调用返回的指针都保守拒绝。
+// 3.3.1 跨 self-call 前移 load 需要无条件可解引证明；当前 IR 无 dereferenceable 属性，所以只放行直接指向全局对象的读取。
 bool TailRecursionEliminationPass::isSafelyDereferenceableLoad(LoadInst *LI) {
     if (!LI) return false;
     Value *Pointer = LI->getPointerOperand();
     return Pointer && Pointer->isGlobal();
 }
 
-// 递归检查用户函数调用是否一定返回且执行过程中不产生 fault/poison。
-// CFG 的“无环且所有路径返回”部分复用 DCE 的共享证明；指令部分复用
-// DCE 的未知指令和投机安全判定。ActiveFunctions 用于拒绝直接或间接递归。
+// 3.3.2 递归证明被前移的用户调用必定返回且无 fault/poison：CFG 必须无环且全路径返回，指令必须可投机执行。
+// 3.3.2.1 ActiveFunctions 是跨函数递归边界，任何直接或间接递归都不能作为 will-return 证明。
 bool TailRecursionEliminationPass::isFunctionGuaranteedToReturnWithoutFault(
         Function &Callee,
         std::unordered_set<Function *> &ActiveFunctions) {
@@ -214,7 +203,7 @@ bool TailRecursionEliminationPass::isFunctionGuaranteedToReturnWithoutFault(
         for (Instruction *I : *BB) {
             if (!I) return false;
 
-            // 写内存具有可观察效果，不能从 self-call 之后提前。
+            // 3.3.2.2 写内存不能从 self-call 返回之后前移，即使被调函数最终会返回。
             if (dynamic_cast<StoreInst *>(I)) return false;
 
             if (auto *LI = dynamic_cast<LoadInst *>(I)) {
@@ -230,8 +219,7 @@ bool TailRecursionEliminationPass::isFunctionGuaranteedToReturnWithoutFault(
                 continue;
             }
 
-            // 未知指令以及除法、取模、动态移位、FPTOSI 等都不能作为
-            // “提前执行一定安全”的依据。
+            // 3.3.2.3 未知指令和可产生 fault/poison 的运算不得用作跨调用代码移动的证明。
             if (dceInstructionMustBePreserved(I) ||
                 instructionMayFaultOrProducePoison(I)) {
                 return false;
@@ -247,8 +235,7 @@ bool TailRecursionEliminationPass::isCallGuaranteedToReturnWithoutFault(
         std::unordered_set<Function *> &ActiveFunctions) {
     if (!CI) return false;
 
-    // 运行库和间接调用没有函数体可供本 pass 证明 will-return/fault-free。
-    // 即使其内存属性是 NoModRef，也不能据此猜测控制流与异常行为。
+    // 3.3.2.4 运行库和间接调用没有可审计函数体，NoModRef 也不能替代 will-return/fault-free 证明。
     if (CI->getBuiltinCallee()) return false;
     Function *Callee = CI->getDirectCallee();
     if (!Callee) return false;
@@ -256,10 +243,7 @@ bool TailRecursionEliminationPass::isCallGuaranteedToReturnWithoutFault(
         *Callee, ActiveFunctions);
 }
 
-// 证明后置只读调用可以越过 self-call：
-// 对用户函数，把 SideEffectAnalysis 中的 RefSet 映射到当前调用实参；
-// 对每个实际读取位置，再用统一的 ModRef 接口检查 self-call 不会修改它。
-// 任何未知来源、未跟踪指针或可观察的运行库调用都保守拒绝移动。
+// 3.3.3 只读调用跨 self-call 前移的内存证明：将被调函数 RefSet 映射到实参，逐地址查证 self-call 不会修改该位置。
 bool TailRecursionEliminationPass::canMoveReadonlyCallBeforeSelfCall(
         CallInst *MovedCall, CallInst *SelfCall,
         FunctionAnalysisPassManager &FAM, Function &F) {
@@ -279,7 +263,7 @@ bool TailRecursionEliminationPass::canMoveReadonlyCallBeforeSelfCall(
     const SideEffectInfo &SEI =
         FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
 
-    // 含运行库调用或未跟踪指针时，摘要不足以证明跨调用重排安全。
+    // 3.3.3.1 副作用摘要含运行库调用或未跟踪指针时，不能对跨调用内存次序作肯定证明。
     if (SEI.hasBuiltin) return false;
     for (const auto &Entry : SEI.ptrMap) {
         if (Entry.second.untracked) return false;
@@ -305,7 +289,7 @@ bool TailRecursionEliminationPass::canMoveReadonlyCallBeforeSelfCall(
             ReadPointer =
                 MovedCall->getArg(static_cast<unsigned>(ParamIndex));
         } else {
-            // RefSet 中出现无法映射到调用点的地址，不能猜测其来源。
+            // 3.3.3.2 RefSet 中的非全局/形参地址无法映射到当前调用点，保守拒绝。
             return false;
         }
 
@@ -318,8 +302,7 @@ bool TailRecursionEliminationPass::canMoveReadonlyCallBeforeSelfCall(
     return true;
 }
 
-// 更精细的“前置 self-call 干扰”判定：
-// 仅当该前置 self-call 可能读写状态，或其返回值被使用时，才阻止当前候选。
+// 3.1.1 候选之前的自调用只在可读写状态或返回值仍被使用时构成干扰。
 bool TailRecursionEliminationPass::hasInterferingEarlierSelfCallInBlock(BasicBlock *BB,
                                                  CallInst *StopCI,
                                                  Function &F,
@@ -355,14 +338,12 @@ RetInst *TailRecursionEliminationPass::getRetOnlyTerminatorBlockRet(BasicBlock *
     return FoundRet;
 }
 
-/*  标记非自递归的尾调用
-  扫描所有出口块 (以 RetInst 结尾)，若 ret 前一条指令是
-  非自递归的 CallInst，且满足尾调用条件，则标记为 tail call*/
+// 1. 普通尾调用标记只处理“call 紧邻 ret”的出口，它不改 CFG 或 SSA。
 bool TailRecursionEliminationPass::markTailCalls(Function &F) {
     bool changed = false;
 
     for (auto bb : F) {
-        //1.call必须紧跟ret
+        // 1.1 形状筛选：块必须以 ret 结束，其紧邻前一条指令必须是 call。
         Instruction *terminator = bb->back();
         if (!terminator) continue;
         auto *RI = dynamic_cast<RetInst*>(terminator);
@@ -371,12 +352,10 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
         if (!prevInst) continue;
         auto *CI = dynamic_cast<CallInst*>(prevInst);
         if (!CI) continue;
-        // tail 标记会改变后端的调用序列，计时函数及其封装调用必须保持
-        // 普通调用语义，不能参与尾调用优化。
+        // 1.2 计时调用及其封装必须保持普通后端调用序列，自调用则留给后续转循环路径。
         if (CI->mayReachTimingCall()) continue;
-        //4.call调用的函数不是自身
         if (isSelfCall(CI, F)) continue;
-        //2.简单逃逸分析：没有任何Alloca被call指令当作参数传走
+        // 1.3 反向追溯每个实参的操作数闭包，任何来自 alloca 的地址都不得传给尾调用。
         bool hasEscapingLocalPtr = false;
         for (unsigned i = 0; i < CI->getArgCount(); ++i) {
             Value *argVal = CI->getArg(i);
@@ -408,7 +387,7 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
 
         if (hasEscapingLocalPtr) continue;
         if (CI->isTailCall()) continue;
-        //3.检查Ret返回值与call必须匹配
+        // 1.4 void 函数要求 call 也返回 void；非 void 函数则必须精确返回 call 结果。
         bool isVoid = F.getIRType()->isVoid();
         if (isVoid) {
             if (CI->getIRType()->isVoid()) {
@@ -425,10 +404,7 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
 
     return changed;
 }
-
-
-// 第二部分: 自递归尾递归消除 (Tail Recursion → Loop)
-// 从基本块末尾向前查找对自身的 CallInst（跳过 Ret/Br 终结指令）
+// 3.1 从候选块末尾向前查找最后一个直接自调用，后续只审计该 call 到 ret 的区间。
 CallInst *TailRecursionEliminationPass::findSelfCall(BasicBlock *BB, Function &F) {
     for (Instruction *I = BB->back(); I != nullptr; I = I->getPrev()) {
         if (I->instType != Instruction::CALL) continue;
@@ -439,51 +415,42 @@ CallInst *TailRecursionEliminationPass::findSelfCall(BasicBlock *BB, Function &F
     return nullptr;
 }
 
-// 分析 call..ret 之间的指令:
-//   1. 检查每条指令是否可移动到 call 之前
-//   2. 识别累加/累乘伪尾递归模式
-// 返回 true 表示尾递归可消除
+// 3.3 call..ret 分析同时处理真尾递归和整数加/乘伪尾递归，并证明其余后置指令可跨 self-call 前移。
 bool TailRecursionEliminationPass::analyzeCallRetRange(
         CallInst *CI, RetInst *RI, Function &F,
         FunctionAnalysisPassManager &FAM,
         BinaryInst *&AccInst) {
     AccInst = nullptr;
 
-    // 收集 call 与 ret 之间的指令 (不含 call 和 ret)
+    // 3.3.1 先快照 call 与 ret 之间的开区间，避免分析时改变链表。
     std::vector<Instruction *> between;
     for (Instruction *I = CI->getNext(); I && I != RI; I = I->getNext())
         between.push_back(I);
 
     for (Instruction *I : between) {
-        // ----- 识别累加器模式 -----
+        // 3.3.2 累加器必须是区间内唯一的整数 ADD/MUL，恰好一个操作数为 self-call，且结果唯一地被 ret 使用。
         if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
             auto op = BI->getOp();
-            // 严格浮点加法/乘法不满足结合律，改变递归结合顺序会影响
-            // 舍入、NaN、无穷和有符号零；当前 IR 没有 fast-math 标记，
-            // 因而累加器只允许使用 TypeSystem 中的整数类型。
+            // 3.3.2.1 严格浮点运算无结合律证明，转循环会改变结合顺序，因此只允许整数累加器。
             bool IsIntegerAccumulator =
                 BI->getIRType() && BI->getIRType()->isInt();
             if ((op == BinaryInst::ADD || op == BinaryInst::MUL) &&
                 IsIntegerAccumulator) {
-                // 不支持多条累加指令
                 if (AccInst) return false;
 
                 Value *Op0 = nullptr;
                 Value *Op1 = nullptr;
                 if (!BI->getOperands(Op0, Op1)) return false;
 
-                // 恰好有一个操作数是 call 返回值
                 bool op0IsCall = (Op0 == static_cast<Value *>(CI));
                 bool op1IsCall = (Op1 == static_cast<Value *>(CI));
                 if (!(op0IsCall ^ op1IsCall)) return false;
 
-                // 另一个操作数不能是对自身的递归调用
                 Value *OtherOp = op0IsCall ? Op1 : Op0;
                 if (auto *OtherCI = dynamic_cast<CallInst *>(OtherOp)) {
                     if (isSelfCall(OtherCI, F)) return false;
                 }
 
-                // 只能被使用一次且 User 是 Ret
                 if (!BI->hasExactlyOneUse()) return false;
                 Use *singleUse = BI->getSingleUse();
                 if (!singleUse || singleUse->getUser() != RI) return false;
@@ -493,30 +460,21 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
             }
         }
 
-        // ----- 检查指令能否移到 call 之前 -----
-
-        // 这里发生的是跨 self-call 的代码移动，而不是死代码删除。
-        // 即使别名分析证明递归调用不修改某个地址，也不能把原本只在
-        // 递归返回后执行的 load、除法、非法/动态移位或 FPTOSI 提前到
-        // 可能不返回的路径上。统一复用 DCE.hpp 的未知指令与投机
-        // 安全判定，避免新增 IR 指令后默认被当作可移动，也避免各 pass
-        // 对 poison/fault 语义给出不一致结论。
+        // 3.3.3 其余指令要被移到可能不返回的 self-call 之前，必须同时无可观察副作用、无 fault/poison 且不依赖 call 结果。
         if (dceInstructionMustBePreserved(I) ||
             instructionMayFaultOrProducePoison(I)) {
             return false;
         }
 
-        // STORE 不行
         if (I->instType == Instruction::STORE) return false;
 
-        // CALL: 被调函数必须只读
+        // 3.3.3.1 后置 call 除了只读外，还须通过 will-return/fault-free 与逐地址 ModRef 检查。
         if (I->instType == Instruction::CALL) {
             auto *Call = dynamic_cast<CallInst *>(I);
             if (!canMoveReadonlyCallBeforeSelfCall(Call, CI, FAM, F))
                 return false;
         }
 
-        // 操作数不能依赖 call 的返回值
         if (!forEachOperand(
                 I, [CI](size_t, Use *, Value *Operand) {
                     return Operand != static_cast<Value *>(CI);
@@ -525,12 +483,10 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
         }
     }
 
-    // 非 void 返回必须精确返回 self-call，或返回上面完整验证过的
-    // 整数累加器；不能仅凭块内存在一个递归调用就删除任意返回值。
+    // 3.3.4 最终返回值必须精确为 self-call 或已证明的累加器；不接受任何其他依赖递归结果的表达式。
     Value *RetValue = RI->getReturnValue();
     if (!F.getIRType() || F.getIRType()->isVoid()) {
-        // void 情况只接受 call 紧邻 ret 的真正尾位置，不把原本位于
-        // 递归返回之后的计算提前到可能不返回的 self-call 之前。
+        // 3.3.4.1 void 路径只允许 call 紧邻 ret，不将任何原本位于递归返回后的计算前移。
         return !RetValue && CI->getNext() == RI;
     }
     if (!RetValue) return false;
@@ -538,7 +494,7 @@ bool TailRecursionEliminationPass::analyzeCallRetRange(
     return RetValue == static_cast<Value *>(CI);
 }
 
-// 执行单个尾递归 → 循环 变换
+// 4. 单站点提交将已证明的自调用改为通往共享循环头的回边。
 bool TailRecursionEliminationPass::eliminateTailRecursion(
         BasicBlock *BB, CallInst *CI, RetInst *RI,
         BinaryInst *AccInst, Function &F,
@@ -548,16 +504,15 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         PhiInst *&AccPhi,
         std::vector<BasicBlock *> &TailBackedgeBlocks) {
 
-    // ===== 3.1 创建循环头 (仅首次调用时执行) =====
+    // 4.1 首个站点初始化公共循环：新建一次性函数入口，原入口成为循环头。
     if (!LoopHeader) {
         BasicBlock *OldEntry = F.front();
 
-        // 创建新入口块
         BasicBlock *NewEntry = new BasicBlock();
         F.pushFront(NewEntry);
         NewEntry->genUnCondInst(OldEntry);
 
-        // 将原入口块中所有 Alloca 搬到 NewEntry 的 Br 之前
+        // 4.1.1 将入口 alloca 搬到循环外；阶段 2 已证明其地址不逃逸，因此单次分配不会合并可观察的递归帧对象。
         {
             auto allocas = collectInstructions<AllocaInst>(*OldEntry);
             Instruction *brInst = NewEntry->back();
@@ -569,7 +524,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
             }
         }
 
-        // 为每个形参在 OldEntry 创建 PHI
+        // 4.1.2 为每个形参在循环头建 PHI，首次输入来自 NewEntry，并把函数体内旧形参使用统一转向 PHI。
         auto &Params = F.getParams();
         ArgPhis.clear();
         for (size_t i = 0; i < Params.size(); ++i) {
@@ -584,7 +539,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         LoopHeader = OldEntry;
     }
 
-    // ===== 3.2 将尾递归实参添加到原入口块 PHI =====
+    // 4.2 将当前 self-call 的每个实参作为当前块回边值接入形参 PHI。
     {
         for (size_t i = 0; i < ArgPhis.size(); ++i) {
             Value *Arg = CI->getArg(static_cast<unsigned>(i));
@@ -593,16 +548,15 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         }
     }
 
-    // ===== 3.3 累加器处理 =====
+    // 4.3 累加器路径用额外 PHI 保存递归层间状态，只在首个累加候选出现时创建。
     if (AccInst) {
         BinaryInst::Operation accOp = AccInst->getOp();
 
         if (!AccPhi) {
-            // 首次: 创建累加器 PHI
             AccPhi = new PhiInst(AccInst->getIRType());
             LoopHeader->pushFront(AccPhi);
 
-            // 初始值: ADD→0, MUL→1
+            // 4.3.1 首次输入使用 ADD 的 0 或 MUL 的 1，保持原递归结合链的单位元语义。
             Value *Identity = nullptr;
             if (accOp == BinaryInst::ADD) {
                 Identity = Value::makeZeroForType(
@@ -611,24 +565,21 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
                 Identity = Value::makeOneForType(
                     AccInst->getIRType());
             }
-            AccPhi->addIncoming(Identity, F.front()); // 来自 NewEntry
+            AccPhi->addIncoming(Identity, F.front());
 
-            // 可能已有不带累加器的尾递归点先被改成回边。新建 AccPhi
-            // 时必须为这些既有前驱补齐 incoming，语义是原样传递当前
-            // 累加值；否则会产生缺边的非法 PHI。
+            // 4.3.2 若早先已有无累加器回边，则为其补上 AccPhi 自转发输入，保证 PHI 与全部前驱一一对应。
             for (BasicBlock *Backedge : TailBackedgeBlocks) {
                 if (Backedge)
                     AccPhi->addIncoming(AccPhi, Backedge);
             }
         }
 
-        // 找累加器中非 call 的操作数
         Value *Op0 = nullptr;
         Value *Op1 = nullptr;
         if (!AccInst->getOperands(Op0, Op1)) return false;
         Value *OtherOperand = (Op0 == static_cast<Value *>(CI)) ? Op1 : Op0;
 
-        // 创建 AccPhi op OtherOperand, 插到 RI 之前
+        // 4.3.3 在 ret 前计算当前累加值，并将该值作为当前回边的 AccPhi 输入。
         auto *NewAcc = new BinaryInst(AccPhi, accOp, OtherOperand);
         {
             auto it = BB->begin();
@@ -636,20 +587,14 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
             it.insertBefore(NewAcc);
         }
 
-        // 将新的累加结果接到 AccPhi
         AccPhi->addIncoming(NewAcc, BB);
-        // 旧的 AccInst 不在这里手动删除。
-        // 当前 IR 的 Value 析构会沿 use 链级联删除 user，
-        // 若此处直接 delete 可能连带删掉 Ret，破坏 CFG。
-        // 无用指令交给后续 DCE 回收。
+        // 4.3.4 旧 AccInst 此时仍在 ret 的 use 链上，延后到断开 ret operand 后再删除，避免 Value 析构级联破坏 CFG。
     } else if (AccPhi) {
-        // 此尾递归点无累加器但全局已有: 传递 AccPhi 自身
+        // 4.3.5 全局已有累加器但当前站点无累加操作时，回边原样传递 AccPhi。
         AccPhi->addIncoming(AccPhi, BB);
     }
 
-    // ===== 3.4 收尾 =====
-
-    // 将 call..ret 间可移动指令移到 call 之前
+    // 4.4 提交控制流前，先将阶段 3 证明可前移的 call..ret 指令依原顺序放到 self-call 之前。
     {
         std::vector<Instruction *> toMove;
         for (Instruction *I = CI->getNext(); I && I != RI; I = I->getNext()) {
@@ -664,7 +609,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         }
     }
 
-    // 创建 Br 代替 Ret
+    // 4.5 在 ret 位置插入返回共享 LoopHeader 的无条件回边。
     {
         auto *NewBr = new BrInst(LoopHeader);
         auto it = BB->begin();
@@ -672,8 +617,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         it.insertBefore(NewBr);
     }
 
-    // 累加器模式下，旧 AccInst 仍引用 CI，若直接 delete CI 会触发 Value::~Value 级联删除用户。
-    // 先断开 RI->AccInst，再将旧 AccInst 从块中移除并销毁，避免悬垂/级联破坏 CFG。
+    // 4.6 累加器模式先用 undef 断开 ret→旧 AccInst，再脱链销毁 AccInst，保证删除 self-call 时不会级联删除用户。
     if (AccInst && AccInst->isInBlock(BB)) {
         if (RI->getOperand(0) == AccInst) {
             RI->replaceOperand(0, UndefValue::NewUndefValue(AccInst->getIRType()));
@@ -682,33 +626,26 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
         delete AccInst;
     }
 
-    // 删除旧的 Ret 和 Call
+    // 4.7 最后删除旧 ret 和 self-call，并记录该块为已建回边，供之后初始化累加器 PHI 补边。
     delete RI;
     delete CI;
 
     TailBackedgeBlocks.push_back(BB);
     return true;
 }
-
-
-// Pass 入口
 PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = false;
 
-    // 尾递归转循环会改变递归调用次数与栈帧边界。只要函数体中的任意
-    // 直接调用能够到达计时函数，就保守保留整段递归控制流。
+    // 1. 函数内任何可达计时调用都禁止本 pass：无论 tail 标志还是转循环，都可能改变调用序列或栈帧边界。
     if (F.mayReachTimingCall()) return PreservationStatus::all();
 
-    // 第1步: 标记非自递归的尾调用，打上tail标记，以便后端可以进行优化栈帧复用
+    // 1.1 先执行不改 CFG 的普通尾调用标记，使后端可复用调用者栈帧。
     changed |= markTailCalls(F);
 
-    // 第2步: 自递归尾递归消除
-    // 入口 alloca 会被搬到循环外并只分配一次。若其派生地址能逃逸，
-    // 原本逐递归帧独立的对象会被错误折叠为同一个对象，因此整函数
-    // 必须保守跳过 TRE；没有自递归时同样直接退出。
+    // 2. 真正 TRE 只在存在自递归且入口 alloca 地址均不逃逸时进入，因为这些对象会被搬到循环外并只分配一次。
     if (!hasSelfRecursion(F) || hasEscapingEntryAlloca(F)) {
         if (!changed) return PreservationStatus::all();
-        // 仅打 tail-call 标记，不改 CFG/内存访问关系。
+        // 6.1 若只改了 tail 元数据，CFG、支配、循环、别名和副作用结果仍全部有效。
         PreservationStatus PA;
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
@@ -717,18 +654,17 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
         PA.keep<SideEffectAnalysis>();
         return PA;
     }
-
-
-    // 跨多个尾递归点共享
+    // 3. 以下状态被函数内所有尾递归站点共享：唯一 LoopHeader、形参 PHI、可选累加器 PHI 和已建回边集合。
     BasicBlock *LoopHeader = nullptr;
     std::vector<PhiInst *> ArgPhis;
     PhiInst *AccPhi = nullptr;
-    BinaryInst::Operation accOp = BinaryInst::ADD; // 记录累加器操作类型
+    // 3.1 所有站点必须使用同一种累加操作，首个累加候选决定全函数的 ADD/MUL 模式。
+    BinaryInst::Operation accOp = BinaryInst::ADD;
     bool accOpInitialized = false;
     std::unordered_set<BasicBlock *> transformedBlocks;
     std::vector<BasicBlock *> TailBackedgeBlocks;
 
-    // 逐站点迭代处理：每次仅应用一个变换并重新扫描，避免收集阶段缓存悬垂指针。
+    // 3.2 每轮只提交一个站点并重新快照函数块，避免 CFG 改写后继续使用收集阶段的悬垂指针。
     bool progress = false;
     do {
         progress = false;
@@ -736,6 +672,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
         auto rollbackClonedArtifacts = [&](BasicBlock *BB,
                                           RetInst *ClonedRI,
                                           std::vector<Instruction *> &SupportInsts) {
+            // 3.2.1 跨块返回值解析失败时，只回滚候选块中新克隆的 ret/BitCast，原 CFG 尚未变更。
             if (ClonedRI && ClonedRI->isInBlock(BB)) {
                 ClonedRI->eraseFromParent();
             }
@@ -762,7 +699,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             BasicBlock *targetRetBB = nullptr;
             BrInst *BrTerm = nullptr;
 
-            // ---- 情况 1: 终结指令是无条件跳转 ----
+            // 3.3 候选可直接以 ret 结束，也可经唯一无条件边进入只含 PHI+ret 的共享返回块。
             if (term->instType == Instruction::BR) {
                 BrTerm = dynamic_cast<BrInst *>(term);
                 if (!BrTerm) continue;
@@ -776,7 +713,6 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
 
                 viaBranchRet = true;
 
-            // ---- 情况 2: 终结指令是 Ret ----
             } else if (auto *retInst = dynamic_cast<RetInst *>(term)) {
                 RI = retInst;
             } else {
@@ -789,6 +725,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             if (hasInterferingEarlierSelfCallInBlock(bb, CI, F, FAM))
                 continue;
 
+            // 3.4 直接 ret 路径当场完成 call..ret 安全性与累加器识别；跨块路径需先将 ret 特化到当前前驱。
             BinaryInst *AccInst = nullptr;
             if (!viaBranchRet) {
                 if (!analyzeCallRetRange(CI, RI, F, FAM, AccInst))
@@ -807,7 +744,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             RetInst *WorkRI = RI;
             std::vector<Instruction *> ClonedSupportInsts;
             if (viaBranchRet) {
-                // 在真正变换前再做一次形态校验。
+                // 3.5 克隆共享 ret 前重新核验无条件边和目标块，再按当前前驱解析 PHI/BitCast 返回值。
                 term = bb->back();
                 if (!term || term->instType != Instruction::BR)
                     continue;
@@ -844,7 +781,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                     bIt.insertBefore(ClonedRetInst);
                 }
 
-                // 跨块路径也复用 call..ret 分析逻辑，支持累加器识别。
+                // 3.5.1 特化 ret 插入候选块后复用同一 call..ret 证明；失败则完整删除克隆产物。
                 if (!analyzeCallRetRange(CI, ClonedRI, F, FAM, AccInst)) {
                     rollbackClonedArtifacts(bb, ClonedRI, ClonedSupportInsts);
                     continue;
@@ -879,16 +816,14 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
                 progress = true;
                 transformedBlocks.insert(bb);
 
-                // 下一轮还会继续查询别名、循环和跨函数副作用信息。
-                // 当前站点已经改写 CFG，必须先通过现有 FAM 接口失效
-                // 缓存，避免后续站点使用变换前的分析结果作合法性证明。
+                // 6. 单站点改写后 CFG、别名关系和调用摘要都可能过期，下一轮扫描前立即失效全部函数分析。
                 FAM.invalidate(F, PreservationStatus::none());
                 break;
             }
         }
     } while (progress);
 
-    // 累加器存在时修复所有剩余 Ret
+    // 5. 若建立了累加器 PHI，所有未转换的正常返回都要在 ret 前与 AccPhi 做最终 ADD/MUL 合并。
     if (AccPhi) {
         for (auto bb : F) {
             Instruction *term = bb->back();
@@ -897,10 +832,9 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
             if (!RI) continue;
 
             Value *OrigRetVal = RI->getReturnValue();
-            if (!OrigRetVal) continue; // void 返回
+            if (!OrigRetVal) continue;
             if (OrigRetVal == AccPhi) continue;
 
-            // Ret 之前插入 AccPhi op OrigRetVal
             auto *FinalAcc = new BinaryInst(AccPhi, accOp, OrigRetVal);
             {
                 auto it = bb->begin();
@@ -915,6 +849,7 @@ PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalys
         return PreservationStatus::all();
 
     PreservationStatus PA;
+    // 6.2 只要发生过自递归转循环，CFG、循环形状、别名与跨函数副作用分析均需重算。
     PA.discard<DominantAnalysis>();
     PA.discard<PostDominantAnalysis>();
     PA.discard<LoopAnalysis>();

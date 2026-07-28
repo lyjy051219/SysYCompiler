@@ -7,7 +7,9 @@ class BasicAAResult;
 class DominatorTree;
 class LoopInfo;
 
-// 单条指令化简器仅保存当前函数的分析上下文；算法实现统一留在 cpp。
+ 
+// 局部求解器通过去重工作表反复消费替换后暴露的用户；规则分为二元代数、
+// compare/select 规范化与 PHI 跨臂合并，并显式保护浮点、undef、内存和计时语义。
 class InstSimplifier {
 public:
 	InstSimplifier(DominatorTree *DT, Function *F,
@@ -16,7 +18,7 @@ public:
 	bool run(Function &F);
 
 private:
-	// 整数 min/max 选择模式的匹配结果。
+	 
 	enum class ExtremumKind {
 		None,
 		Minimum,
@@ -55,10 +57,12 @@ private:
 	Value *simplifyPhi(PhiInst *Phi);
 };
 
-// InstSimplifyPass:
-// 1) 以工作队列方式在函数内做局部指令化简
-// 2) 支持 Binary / Select / PHI 的常见等式和常量折叠
-// 3) 通过 RAUW 传播化简结果，并级联触发其用户重试
+ 
+ 
+ 
+ 
+// 流程：1. 获取支配/AA/循环信息；2. 初始化所有有用户指令；3. 生成等价值或新指令；
+// 4. 替换、删除并重新排队用户，直至工作表清空。
 class InstSimplifyPass : public PassDescriptor<InstSimplifyPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

@@ -11,21 +11,14 @@ class LoopInfo;
 class Loop;
 class SCEVResult;
 
-//别名分析：采用即时计算两个指针的关系
-//如果实现了select指令，那么需要补全aliasSelect函数
-
-// Alias 查询结果：两个指针之间的别名关系
+// AliasInfo 表示查询可证明的最强关系；任何证据不足都必须返回 MayAlias。
 enum class AliasInfo {
-    NoAlias,    // 一定不同
-    MayAlias,   // 可能相同，也可能没关系
-    MustAlias   // 一定相同
+    NoAlias,
+    MayAlias,
+    MustAlias
 };
 
-// A pointer together with the byte range touched through it.  Keeping the
-// access width in the query avoids conflating pointer identity with memory
-// overlap (for example, an i8 store next to an i32 load).  Unknown widths are
-// represented explicitly and simply fall back to the conservative pointer
-// query.
+// MemoryLocation 把指针与实际访问字节数绑定，避免把指针相等误当成区间重叠。
 struct MemoryLocation {
     Value *Pointer = nullptr;
     std::optional<std::size_t> Size;
@@ -37,8 +30,7 @@ struct MemoryLocation {
     static MemoryLocation get(const StoreInst *Store);
 };
 
-
-// BasicAAResult：别名分析结果
+// BasicAAResult 按需分解指针并缓存查询；可选 SCEV 只用于已证明不回绕的下标距离。
 class BasicAAResult {
 public:
     BasicAAResult();
@@ -51,7 +43,7 @@ public:
 
     void addObjectNoAliasFact(Value* V1, Value* V2);
 
-    //即时查询指针两者之间的别名关系
+    // 查询接口分为指针关系与显式内存区间关系，IndexRange 版本允许消费循环距离证明。
     AliasInfo alias(Value* V1, Value* V2, const LoopInfo& LI);
     AliasInfo aliasWithIndexRange(Value* V1, Value* V2, const LoopInfo& LI);
     AliasInfo alias(const MemoryLocation &L1, const MemoryLocation &L2,
@@ -59,10 +51,7 @@ public:
     AliasInfo aliasWithIndexRange(const MemoryLocation &L1,
                                   const MemoryLocation &L2,
                                   const LoopInfo &LI);
-    // Allocation-object disjointness deliberately ignores the immediate
-    // pointee-sized offsets used by alias().  It is the safe fallback for a
-    // dynamic-length memory intrinsic: two different elements of one array
-    // are not disjoint objects because an unknown byte range may span both.
+
     bool haveKnownDistinctUnderlyingObjects(Value *V1, Value *V2) const;
     bool callMayAliasPointer(CallInst *CI, Value *P, const LoopInfo &LI);
 
@@ -71,7 +60,6 @@ private:
 
     static constexpr long long I32Modulus = 1LL << 32;
 
-    // BasicAA 内部共用的溢出检查与指针来源判定。
     static bool checkedAdd(long long A, long long B, long long &Result);
     static bool checkedSub(long long A, long long B, long long &Result);
     static bool checkedMul(long long A, long long B, long long &Result);
@@ -82,6 +70,7 @@ private:
         std::size_t operator()(const std::pair<Value*, Value*>& P) const;
     };
 
+    // 内部规范形把 GEP 链拆为底层对象、常量字节偏移和 SSA 系数表。
     struct LinearGEP {
         Value* Base = nullptr;
         long long ConstantOffset = 0;
@@ -110,9 +99,7 @@ private:
 
     Value* stripBaseInst(Value* V) const;
     Value* getBaseAddress(Value* V) const;
-    // Unlike alias(), this answers an allocation-object question rather than
-    // whether the two immediate pointee-sized access ranges overlap.  Only
-    // facts proved here may be promoted to a callee-wide ObjectNoAlias fact.
+
     bool isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const;
     bool hasObjectNoAlias(Value* V1, Value* V2) const;
 
@@ -132,7 +119,6 @@ private:
     bool accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr) const;
     LinearGEP fillLinearGEP(Value* V) const;
 
-    //分析两个GEP的偏移量关系
     AliasInfo aliasGEP(Value* GEP1, Value* GEP2,
                        const LoopInfo& LI, bool UseIndexRange,
                        std::optional<std::size_t> AccessSize1 = std::nullopt,
@@ -151,14 +137,11 @@ private:
         long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const;
 };
 
-
-// 分析 Pass
+// Pass 入口构造即时查询器，并从全部直接调用点提炼形参对象互斥事实。
 class BasicAliasAnalysis : public AnalysisDescriptor<BasicAliasAnalysis> {
 public:
     using Result = BasicAAResult;
-    // The result may contain facts inferred from every direct call site of
-    // the analysed function.  A caller mutation can therefore invalidate a
-    // cached callee result even though the callee body itself did not change.
+
     static constexpr bool InvalidateAcrossIRUnits = true;
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 

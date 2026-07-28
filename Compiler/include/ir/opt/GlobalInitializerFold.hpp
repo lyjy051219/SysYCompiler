@@ -3,10 +3,12 @@
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 
-// Fold a full-object memcpy at the non-recursive main entry into the
-// destination global's static initializer.  The matcher deliberately accepts
-// only direct module globals and a side-effect-free entry prefix; it therefore
-// never needs to guess about aliases, constructors, or path coverage.
+ 
+ 
+ 
+ 
+// 流程：1. 排除递归 main；2. 在入口安全前缀识别完整全局对象 memcpy；
+// 3. 把源静态初值复制到目标初始化器；4. 统一删除已静态化的运行期调用。
 class GlobalInitializerFoldPass
     : public PassDescriptor<GlobalInitializerFoldPass> {
 public:

@@ -12,11 +12,12 @@
 #include <vector>
 
 bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
+    // 2.1 零次循环只能跳过控制流和无副作用纯计算；未知指令及 DCE 白名单外语义保留。
     if (!I) return false;
     if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
-    // Use the same observable-execution policy as DCE/ADCE.  Ordinary pure
-    // operations may disappear with a dead loop; future volatile/atomic or
-    // constrained instructions must opt out through this shared predicate.
+     
+     
+     
     if (dceInstructionMustBePreserved(I)) return false;
     if (dynamic_cast<BinaryInst *>(I)) return true;
     if (dynamic_cast<SelectInst *>(I) ||
@@ -32,14 +33,15 @@ bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     case Instruction::BITCAST:
         return true;
     default:
-        // Calls, memory operations, allocation and returns may be observable,
-        // trap, or fail to return.  The IR has no speculatable/willreturn
-        // attributes, so skipping them would be a guess.
+         
+         
+         
         return false;
     }
 }
 
 bool LoopDeletionPass::hasNoObservableLoopInstruction(Loop *L) {
+    // 2.2 非零死循环删除要求循环及所有子循环中的每条指令都可无观察地跳过。
     if (!L) return false;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
@@ -51,14 +53,16 @@ bool LoopDeletionPass::hasNoObservableLoopInstruction(Loop *L) {
     return true;
 }
 
-// A header-tested signed unit-stride loop with a strict bound is finite for
-// every pair of i32 inputs.  If Start < Bound, repeated +1 reaches Bound
-// before INT_MAX can be crossed; the decreasing case is symmetric.  This is
-// intentionally narrower than a general symbolic trip-count proof: it is
-// used only to remove a loop whose body and live-outs have independently
-// proved unobservable.
+ 
+ 
+ 
+ 
+ 
+ 
 bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
     SCEVResult &SE, const LoopTripCountInfo &TCI) {
+    // 1.1 运行期 trip count 只有在 header 以规范 i32 归纳变量、直接 ±1 更新和
+    // 对应严格 < 或 > 条件继续时才证明有限，排除回绕造成的无限循环。
     if (!TCI.Valid || !TCI.IsRuntime || !TCI.L || !TCI.Header ||
         TCI.ExitingBlock != TCI.Header || !TCI.ExitCmp || !TCI.IndVar) {
         return false;
@@ -77,8 +81,8 @@ bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
     };
     if (!IsI32(IV->Phi) || !IsI32(IV->StartValue)) return false;
 
-    // Accept only the literal SSA update.  An equal SCEV expression is not
-    // enough because it could contain an operation that wrapped earlier.
+     
+     
     auto *Update = dynamic_cast<BinaryInst *>(IV->UpdateValue);
     if (!Update) return false;
     Value *UpdateL = Update->getOperand(0);
@@ -114,13 +118,15 @@ bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
 Value *LoopDeletionPass::resolveZeroTripValue(
     Value *V, Loop *L, BasicBlock *PreHeader,
     std::unordered_set<Value *> &Active) {
+    // 3.1 零次路径上的循环内值只能经 header PHI 沿 preheader incoming 递归解析；
+    // 其他循环内定义和 PHI 环都没有合法的零次替代值。
     if (!V || !L || !PreHeader) return nullptr;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I || !I->getParent() || !L->contains(I->getParent())) return V;
 
-    // On the zero-trip edge only a header PHI has an unambiguous value: its
-    // preheader incoming.  Do not try to symbolically execute arbitrary
-    // header instructions here.
+     
+     
+     
     auto *Phi = dynamic_cast<PhiInst *>(I);
     if (!Phi || Phi->getParent() != L->getHeader()) return nullptr;
     ScopedActiveMark ActiveMark(Active, V);
@@ -131,6 +137,8 @@ Value *LoopDeletionPass::resolveZeroTripValue(
 
 bool LoopDeletionPass::planZeroTripPhiReplacements(
     Loop *L, const LoopTripCountInfo &TCI, PhiReplacementMap &Plan) {
+    // 3.2 为 exit 的每个 PHI 解析 exiting 边值在零次路径上的 preheader 值，
+    // 全部类型一致才提交计划，避免部分替换。
     if (!L || !TCI.PreHeader || !TCI.ExitingBlock || !TCI.ExitBlock)
         return false;
 
@@ -141,7 +149,7 @@ bool LoopDeletionPass::planZeroTripPhiReplacements(
         std::unordered_set<Value *> Active;
         Value *Replacement =
             resolveZeroTripValue(OnExit, L, TCI.PreHeader, Active);
-        // PHI替换必须保持完整类型形状，不能只凭相同存储字节数放行。
+         
         if (!Replacement ||
             !IRType::hasSameShape(Replacement->getIRType(),
                                   Phi->getIRType())) {
@@ -154,6 +162,8 @@ bool LoopDeletionPass::planZeroTripPhiReplacements(
 
 bool LoopDeletionPass::planDeadLoopPhiReplacements(
     Loop *L, BasicBlock *Exit, PhiReplacementMap &Plan) {
+    // 3.3 对无观察但会执行的死循环，exit PHI 的所有 incoming 必须相同且定义在
+    // 循环外；空 PHI 可替为 undef，否则无法删除产生该值的循环。
     if (!L || !Exit) return false;
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
         if (!Phi) return false;
@@ -183,6 +193,8 @@ bool LoopDeletionPass::planDeadLoopPhiReplacements(
 bool LoopDeletionPass::outsideUsesAreCovered(
     Loop *L, const std::vector<BasicBlock *> &Blocks,
     const PhiReplacementMap &Plan) {
+    // 3.4 循环内定义的每个循环外 user 都必须是已规划替换的 exit PHI，确保删块前
+    // 不会遗留普通跨循环 SSA use。
     if (!L) return false;
     for (BasicBlock *BB : Blocks) {
         if (!BB) return false;
@@ -214,6 +226,8 @@ bool LoopDeletionPass::deleteLoopCFG(
     Loop *L, Function &F, BasicBlock *PreHeader, BasicBlock *Exit,
     const std::vector<BasicBlock *> &LoopBlocks,
     const PhiReplacementMap &PhiPlan) {
+    // 4. 先把 preheader 的唯一入环边改到 exit，再应用已验证的 PHI 替换；至此循环
+    // 与剩余 CFG 断开，后续清空/删除块不会影响外部控制流。
     if (!L || !PreHeader || !Exit || LoopBlocks.empty()) return false;
     auto *OldTerm = PreHeader->getBranchTerminator();
     if (!BasicBlock::isUncondBr(OldTerm) ||
@@ -224,9 +238,11 @@ bool LoopDeletionPass::deleteLoopCFG(
     if (!PreHeader->replaceTerminator(new BrInst(Exit))) return false;
     applyPhiReplacements(PhiPlan);
 
-    // Tear down in three phases.  Deleting one BasicBlock while another loop
-    // terminator/PHI still names it would make Value::~Value recursively
-    // destroy that user and leave the remaining block list half-mutated.
+     
+     
+     
+    // 4.1 以 undef 断开异常残留值 use，分两轮先 clear 全部块再 delete，安全处理
+    // 循环内部互相引用和回边。
     for (BasicBlock *BB : LoopBlocks) {
         if (!BB || BB->getParent() != &F) continue;
         for (Instruction *I : *BB) {
@@ -249,12 +265,14 @@ bool LoopDeletionPass::deleteLoopCFG(
 
 PreservationStatus LoopDeletionPass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1. 获取循环树与 SCEV trip count，并按内到外顺序只考察无子循环、LCSSA 且
+    // 具有 preheader/latch 的规范循环。
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
     bool Changed = false;
-    // One CFG deletion invalidates every Loop* in the snapshot.  The enclosing
-    // bounded fixed point will rebuild analyses and find another candidate.
+     
+     
     for (Loop *L : LI.getLoopsInPostOrder(true)) {
         if (!L || !L->getHeader() || !L->getSubLoops().empty()) continue;
         if (L->getHeader()->getParent() != &F) continue;
@@ -272,11 +290,13 @@ PreservationStatus LoopDeletionPass::run(
             continue;
         }
 
-        // Deleting a side-effect-free loop still changes semantics if it may
-        // be infinite.  Positive constant counts need SCEV's no-wrap proof.
-        // Exact zero-trip header tests execute no recurrence update, while a
-        // symbolic strict unit-stride loop has the direct finiteness proof
-        // above and does not need an expanded arithmetic trip count.
+         
+         
+         
+         
+         
+        // 1.2 候选必须已证明有限：常量次数要求无回绕，运行期次数要求严格单位步长；
+        // 零次循环还要求退出测试位于 header，确保 body 从未执行。
         bool ZeroTrip = TCI->ConstantTripCount &&
                         *TCI->ConstantTripCount == 0;
         bool FiniteConstant = TCI->ConstantTripCount &&
@@ -292,10 +312,12 @@ PreservationStatus LoopDeletionPass::run(
         std::vector<BasicBlock *> Blocks = L->getBlocksInFunctionOrder();
         if (Blocks.empty()) continue;
 
+        // 2—3. 零次候选只检查 header 可跳过并解析零次 PHI；其他候选要求整个循环
+        // 无可观察行为并规划公共 exit 值。
         PhiReplacementMap PhiPlan;
         if (ZeroTrip) {
-            // A header-tested zero-trip loop still executes its header once.
-            // Only bypass it when that header has no observable/trapping work.
+             
+             
             bool HeaderSafe = true;
             for (Instruction *I : *L->getHeader())
                 if (!isSafeToSkipOnZeroTrip(I)) {
@@ -313,6 +335,7 @@ PreservationStatus LoopDeletionPass::run(
             }
         }
 
+        // 4. 所有外部 use 被计划覆盖后执行一次 CFG 删除；循环分析已陈旧，立即停止扫描。
         if (!outsideUsesAreCovered(L, Blocks, PhiPlan)) continue;
         if (!deleteLoopCFG(L, F, PreHeader, TCI->ExitBlock,
                            Blocks, PhiPlan)) {
@@ -322,6 +345,7 @@ PreservationStatus LoopDeletionPass::run(
         break;
     }
 
+    // 5. 删除基本块和边后所有函数分析均失效。
     if (!Changed) return PreservationStatus::all();
     return PreservationStatus::none();
 }

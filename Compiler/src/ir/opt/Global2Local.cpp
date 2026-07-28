@@ -15,6 +15,7 @@ Global2LocalPass::Global2LocalPass(bool RelaxScalarUses)
 
 bool Global2LocalPass::isRecursiveFrom(
 	Function *Root, const FunctionCallGraph &CallGraph) {
+	// 1.1 若 main 的调用闭包能回到 main，把全局状态改成单次栈对象会改变重入语义。
 	if (!Root) return false;
 
 	auto RootIt = CallGraph.find(Root);
@@ -28,9 +29,10 @@ bool Global2LocalPass::isRecursiveFrom(
 		});
 }
 
-// For scalar globals, only allow very simple load/store users in main.
-// Complex pointer/address-taken patterns are deferred to avoid downstream IR issues.
+ 
+ 
 bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
+	// 2.1 标量全局只允许作为直接 load/store 地址，不能把地址本身存出或参与其他运算。
 	if (!U || !GV) return false;
 	auto *UserI = dynamic_cast<Instruction *>(U->getUser());
 	if (!UserI) return false;
@@ -40,7 +42,7 @@ bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	}
 
 	if (auto *SI = dynamic_cast<StoreInst *>(UserI)) {
-		// Only allow direct stores where GV is the destination pointer.
+		 
 		return SI->getPointerOperand() == GV;
 	}
 
@@ -48,6 +50,7 @@ bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 }
 
 PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+	// 1. 该函数 pass 仅在活动模块的 main 上执行，并先用直接调用图排除递归重入。
 	Module *M = Module::getActiveModule();
 	if (!M) return PreservationStatus::all();
 
@@ -55,8 +58,8 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 
 	auto CallGraph = M->buildDirectCallGraph();
-	// A global has one shared instance across recursive invocations of main;
-	// replacing it with an alloca would create one instance per stack frame.
+	 
+	 
 	if (isRecursiveFrom(Main, CallGraph))
 		return PreservationStatus::all();
 
@@ -66,6 +69,8 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 	std::vector<Global2LocalCandidateInfo> WorkList;
 
+	// 2. 扫描小型可变全局：main 可达的其他函数不得引用候选；数组地址不得进入
+	// memcpy；标量 use 必须通过直接访问检查并遵守保守/宽松模式的循环限制。
 	for (auto &GVPtr : M->getGlobalVar()) {
 		auto *GV = GVPtr.get();
 		if (!GV) continue;
@@ -150,8 +155,10 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			CanPromote = false;
 		}
 
-		// 局部副本的初始化会被放到入口 PHI 之后；若原任一访问只能在
-		// 穿过计时屏障后到达，就不能把初始化工作移到计时区间之外。
+		 
+		 
+		// 2.2 候选的任一 main use 若可能位于计时屏障之后或跨回边越过屏障，
+		// 则入口初始化会改变计时区间内存成本，必须放弃局部化。
 		if (CanPromote && Main->mayReachTimingCall()) {
 			for (Use *U : MainUses) {
 				auto *UserI = dynamic_cast<Instruction *>(
@@ -178,6 +185,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	bool Changed = false;
 	Instruction *AllocaInsertTail = nullptr;
 
+	// 3. 为候选在 main 入口 PHI 区后连续插入 alloca，并紧随其后建立初始化。
 	for (auto &C : WorkList) {
 		auto *Alloca = new AllocaInst(C.ElemTy);
 		Alloca->setIdent(C.GV->getIdent() + ".l2g");
@@ -200,11 +208,12 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		Value *Init = C.GV->getUsee();
 		Instruction *LastInitInst = InsertPos;
 
+		// 3.1 数组用全尺寸 memcpy 从原全局初值复制；标量用显式初值或类型零值 store。
 		if (C.ElemTy->isArray()) {
 			const int ByteSize = static_cast<int>(C.ElemTy->getSize());
 			std::vector<Value *> Args;
 			Args.push_back(Alloca);
-			// 直接从原全局变量拷贝：有初始化值时复制初始化数据，无初始化值时复制 zeroinitializer。
+			 
 			Args.push_back(C.GV);
 			Args.push_back(ConstInt::newConstInt(ByteSize));
 			Args.push_back(ConstBool::newConstBool(false));
@@ -229,6 +238,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			LastInitInst = SI;
 		}
 
+		// 3.2 仅替换收集阶段确认的 main use；其他不可达函数中的引用仍指向原全局。
 		for (Use *U : C.MainUses) {
 			if (!U) continue;
 			U->replaceUseeWith(Alloca);
@@ -239,6 +249,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 
 	if (!Changed) return PreservationStatus::all();
 
+	// 4. CFG 未改，保留支配/后支配/循环；地址空间和内存访问变化使其余分析失效。
 	PreservationStatus PA = PreservationStatus::none();
 	PA.keep<LoopAnalysis>();
 	PA.keep<DominantAnalysis>();

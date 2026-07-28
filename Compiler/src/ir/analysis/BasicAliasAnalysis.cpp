@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-
 MemoryLocation::MemoryLocation() = default;
 
 MemoryLocation::MemoryLocation(Value *P, std::optional<std::size_t> S)
@@ -73,6 +72,7 @@ bool BasicAAResult::checkedMul(long long A, long long B, long long &Result) {
     return true;
 }
 
+// 防御性溯源只穿过透明指针节点；发现 undef、深度超限时禁止发布强别名结论。
 bool BasicAAResult::hasUndefPointerOrigin(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V)) return true;
@@ -147,9 +147,7 @@ bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
     for (unsigned I = 0; I < CI->getArgCount(); ++I) {
         Value *Arg = CI->getArg(I);
         if (!Arg || !Arg->isPointerValue()) continue;
-        // A call parameter describes an object-range access, not merely one
-        // pointee-sized access at the argument's immediate address.  Distinct
-        // GEP offsets into one array therefore remain potentially aliasing.
+
         if (!haveKnownDistinctUnderlyingObjects(P, Arg)) {
             return true;
         }
@@ -163,6 +161,7 @@ std::size_t BasicAAResult::getPointeeAccessSize(Value* V) const {
     return Pointee ? Pointee->getSize() : 0;
 }
 
+// 查询规范化只剥离零偏移 GEP 和单入 PHI，保留影响访问宽度的 BitCast。
 Value* BasicAAResult::stripBaseInst(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
@@ -185,11 +184,6 @@ Value* BasicAAResult::stripBaseInst(Value* V) const {
             continue;
         }
 
-        // Keep bitcasts in the query value.  Although getBaseAddress() and
-        // fillLinearGEP() may look through a cast to identify the allocation,
-        // aliasGEP must still see the cast result's pointee width.  Stripping
-        // it here can turn a wide access into the source's narrow access and
-        // manufacture NoAlias for overlapping byte ranges.
         if (dynamic_cast<BitCastInst*>(V)) return V;
 
         if (auto *Phi = dynamic_cast<PhiInst*>(V)) {
@@ -204,6 +198,7 @@ Value* BasicAAResult::stripBaseInst(Value* V) const {
     return V;
 }
 
+// 对象身份溯源穿过全部 GEP、BitCast 和单入 PHI，并用 visited 截断环。
 Value* BasicAAResult::getBaseAddress(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
@@ -262,10 +257,7 @@ bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
 
 bool BasicAAResult::isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const {
     (void)LI;
-    // Alias queries describe two SSA pointer values in the same execution.
-    // A loop-carried dependence question is a different analysis problem:
-    // weakening `alias(P, P)` merely because P is defined in a loop loses the
-    // fundamental reflexivity property and prevents safe local forwarding.
+
     return V1 == V2;
 }
 
@@ -285,6 +277,7 @@ std::pair<Value*, Value*> BasicAAResult::makeCanonicalPair(Value* A, Value* B) c
     return AddrA <= AddrB ? std::make_pair(A, B) : std::make_pair(B, A);
 }
 
+// GEP 线性化把每个类型化下标换算成字节系数；类型缺失或算术溢出立即失败。
 bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr) const {
     Value* BasePtr = GEP ? GEP->getBasePointer() : nullptr;
     if (!BasePtr || !BasePtr->getIRType()) {
@@ -326,6 +319,7 @@ bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr
     return true;
 }
 
+// 沿完整 GEP/BitCast 链累积线性表达式，最终 Base 必须是稳定对象。
 BasicAAResult::LinearGEP BasicAAResult::fillLinearGEP(Value* V) const {
     LinearGEP Expr;
     std::unordered_set<Value*> Visited;
@@ -454,6 +448,7 @@ bool BasicAAResult::isLoopInvariant(Value* V, const Loop* L) const {
     return !BB || !L->contains(BB);
 }
 
+// 循环距离辅助只接受 SCEV 证明有限、不回绕且正步长的规范归纳 PHI。
 std::optional<BasicAAResult::PositivePhiRecurrence>
 BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
                                         const LoopInfo& LI) const {
@@ -479,6 +474,7 @@ BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
                                  *Induction->ConstantStep, L};
 }
 
+// 下界证明把规范归纳更新与循环不变量起点配对；任意附加偏移不作无回绕猜测。
 std::optional<long long>
 BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
                               const LoopInfo& LI) const {
@@ -508,9 +504,6 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
         return std::nullopt;
     }
 
-    // A positive syntactic offset is not a signed lower bound when i32 ADD
-    // may wrap.  Consume only the exact canonical update covered by SCEV's
-    // finite/no-wrap proof; arbitrary `phi + C` remains unknown.
     if (Dec.Offset != 0 &&
         (Greater != Rec->Update || Dec.Offset != Rec->Step)) {
         return std::nullopt;
@@ -524,15 +517,12 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
     return LB;
 }
 
+// 变量下标距离查询先覆盖 i32 模环绕的显式差值，再尝试 SCEV 给出的非负距离下界。
 AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     const std::unordered_map<Value*, long long>& DiffVars,
     long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
-    // First handle an affine relation encoded directly in SSA, such as
-    //   j = i + 1;  A[j] versus A[i].
-    // This proof does not assume no-wrap.  For signed i32 ADD/SUB, `j - i`
-    // has at most two mathematical representatives: C and C +/- 2^32.  If
-    // both byte distances are outside the touched range, the accesses cannot
-    // overlap even on the wrapping execution.
+
+    // 1. 先识别两个 SSA 下标系数互为相反数的仿射差值，例如 A[i+1] 与 A[i]。
     if (DiffVars.size() == 2 && Threshold > 0 &&
         Threshold <= static_cast<std::size_t>(
                          std::numeric_limits<long long>::max())) {
@@ -562,10 +552,8 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
             auto BTy = B ? B->getIRType() : nullptr;
             if (Offset && IRType::hasIntegerBitWidth(Ty, 32) &&
                 IRType::hasIntegerBitWidth(BTy, 32)) {
-                // A chain of i32 additions can accumulate more than one full
-                // modulus in the mathematical decomposition.  Normalize it
-                // first; the signed difference of the two final i32 values
-                // is then either R or R-2^32 (only zero when R is zero).
+
+                // 1.1 把链式 i32 加减归一到模 2^32 的全部有符号代表，全部分离才返回 NoAlias。
                 long long Residue = *Offset % I32Modulus;
                 if (Residue < 0) Residue += I32Modulus;
                 std::vector<long long> Representatives{Residue};
@@ -588,10 +576,7 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
                 if (AllDisjoint) return AliasInfo::NoAlias;
             }
 
-            // When SCEV proves a finite canonical recurrence, its exact
-            // update has a mathematical lower bound relative to the invariant
-            // start.  This covers variable distances such as j=i+1 without
-            // treating every positive-looking i32 ADD as non-wrapping.
+            // 2. 模差值不足时，只消费 SCEV 已证明有限且不回绕的规范递推下界。
             if (auto Lower = lowerBoundDiff(A, B, LI)) {
                 long long Scaled = 0;
                 long long MinByteDiff = 0;
@@ -613,15 +598,16 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
         }
     }
 
-    // Integer ADD/SUB and PHI recurrences in this IR carry no no-wrap flag.
-    // Recurrences not covered by the explicit SCEV proof remain MayAlias.
+    // 3. 非仿射、可能回绕、距离不足或算术溢出的路径均保持 MayAlias。
     return AliasInfo::MayAlias;
 }
 
+// 同对象 GEP 查询相减两条线性表达式，并用真实访问宽度判定相等或分离。
 AliasInfo BasicAAResult::aliasGEP(
     Value* GEP1, Value* GEP2, const LoopInfo& LI, bool UseIndexRange,
     std::optional<std::size_t> AccessSize1,
     std::optional<std::size_t> AccessSize2) {
+    // 1. 线性化两侧并要求底层对象一致；无法精确分解时退化为 MayAlias。
     auto E1 = fillLinearGEP(GEP1);
     auto E2 = fillLinearGEP(GEP2);
 
@@ -632,6 +618,7 @@ AliasInfo BasicAAResult::aliasGEP(
         return AliasInfo::MayAlias;
     }
 
+    // 2. 相减常量和变量字节偏移，任何宿主整数溢出都会终止证明。
     std::unordered_map<Value*, long long> DiffVars = E1.VariableOffsets;
     for (auto &KV : E2.VariableOffsets) {
         long long Updated = 0;
@@ -653,9 +640,7 @@ AliasInfo BasicAAResult::aliasGEP(
 
     std::size_t Access1 = AccessSize1.value_or(getPointeeAccessSize(GEP1));
     std::size_t Access2 = AccessSize2.value_or(getPointeeAccessSize(GEP2));
-    // A zero size here means that the pointer's pointee width is unknown to
-    // this IR, not that every access through the pointer touches zero bytes.
-    // Equal offsets are still MustAlias, but distance cannot prove NoAlias.
+
     if (Access1 == 0 || Access2 == 0)
         return ConstDiff == 0 && DiffVars.empty() ? AliasInfo::MustAlias
                                                   : AliasInfo::MayAlias;
@@ -664,6 +649,7 @@ AliasInfo BasicAAResult::aliasGEP(
                         std::numeric_limits<long long>::max()))
         return AliasInfo::MayAlias;
 
+    // 3. 无变量项时直接比较字节区间；有变量项仅在显式启用范围证明时继续。
     if (!DiffVars.empty()) {
         if (UseIndexRange) {
             return aliasGEPByIndexDistance(DiffVars, ConstDiff, Threshold, LI);
@@ -677,9 +663,7 @@ AliasInfo BasicAAResult::aliasGEP(
 
     if (ConstDiff == std::numeric_limits<long long>::min())
         return AliasInfo::MayAlias;
-    // D = address(GEP1) - address(GEP2).  For unequal access widths the two
-    // separating distances are asymmetric: a positive D is compared against
-    // Access2, while a negative D is compared against Access1.
+
     if ((ConstDiff > 0 &&
          ConstDiff >= static_cast<long long>(Access2)) ||
         (ConstDiff < 0 &&
@@ -690,6 +674,7 @@ AliasInfo BasicAAResult::aliasGEP(
     return AliasInfo::MayAlias;
 }
 
+// PHI 查询按前驱语义配对 incoming；各路径结论不一致或结构异常时合并为 MayAlias。
 AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI,
                                   bool UseIndexRange) {
     if (!Phi) {
@@ -707,9 +692,6 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
                 return AliasInfo::MayAlias;
             }
 
-            // PHI incoming order is not semantic.  Pair values by predecessor
-            // block; matching by raw index can compare values from different
-            // control-flow edges and manufacture NoAlias/MustAlias.
             std::unordered_map<BasicBlock *, Value *> OtherByPred;
             if (!forEachPhiIncoming(
                     OtherPhi,
@@ -762,6 +744,7 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
     return Acc;
 }
 
+// Select 查询展开两条路径；条件相同的两个 Select 只比较对应分支并防止递归环。
 AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
                                      const LoopInfo &LI,
                                      bool UseIndexRange) {
@@ -777,9 +760,6 @@ AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
     if (!TrueValue || !FalseValue)
         return AliasInfo::MayAlias;
 
-    // Correlated selects with the same condition choose corresponding arms in
-    // every execution.  Pairing all four combinations would lose useful
-    // NoAlias/MustAlias facts and is unnecessarily pessimistic.
     if (auto *OtherSelect = dynamic_cast<SelectInst *>(Other)) {
         if (Select->getOperand(0) == OtherSelect->getOperand(0)) {
             AliasInfo OnTrue = aliasImpl(TrueValue,
@@ -806,15 +786,14 @@ AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
     return aliasImpl(V1, V2, LI, true);
 }
 
+// 区间查询在递归展开控制流指针时始终携带原访问宽度，并以 Active 集截断环。
 AliasInfo BasicAAResult::aliasLocationImpl(
     const MemoryLocation &L1, const MemoryLocation &L2,
     const LoopInfo &LI, bool UseIndexRange, unsigned Depth,
     std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> &Active) {
     auto NormalizeControlPointer = [](Value *P,
                                       const std::optional<std::size_t> &Size) {
-        // Once an explicit byte width is present, bitcasts and zero-offset
-        // GEPs no longer contribute access-width information.  Peel them so a
-        // wrapped select/phi is still expanded with that explicit width.
+
         if (!Size) return P;
         std::unordered_set<Value *> Seen;
         while (P && Seen.insert(P).second) {
@@ -837,12 +816,11 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         return P;
     };
 
+    // 1. 显式宽度允许剥离零偏移包装；缺失指针、过深递归或活动环均保守失败。
     Value *P1 = NormalizeControlPointer(L1.Pointer, L1.Size);
     Value *P2 = NormalizeControlPointer(L2.Pointer, L2.Size);
     if (!P1 || !P2 || Depth > 32) return AliasInfo::MayAlias;
 
-    // Equal SSA pointers start at the same byte even when their access widths
-    // differ.  Let aliasImpl retain its undef-origin safeguards.
     if (P1 == P2) return aliasImpl(P1, P2, LI, UseIndexRange);
 
     auto Key = makeCanonicalPair(P1, P2);
@@ -852,6 +830,7 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         return mergePhiAlias(A, B);
     };
 
+    // 2. 优先按控制流相关性展开 Select 和 PHI，分别求各可达来源的区间关系。
     auto *S1 = dynamic_cast<SelectInst *>(P1);
     auto *S2 = dynamic_cast<SelectInst *>(P2);
     if (S1 && S2 && S1->getOperand(0) == S2->getOperand(0)) {
@@ -941,13 +920,12 @@ AliasInfo BasicAAResult::aliasLocationImpl(
     if (Phi1) return ExpandPhi(Phi1, L2, true);
     if (Phi2) return ExpandPhi(Phi2, L1, false);
 
+    // 3. 普通指针交给核心查询；同对象 GEP 再用显式宽度覆盖名义 pointee 宽度。
     AliasInfo Result = aliasImpl(P1, P2, LI, UseIndexRange);
     if (L1.Size && L2.Size) {
         Value *V1 = stripBaseInst(P1);
         Value *V2 = stripBaseInst(P2);
-        // An explicit access width is more authoritative than the pointer's
-        // nominal pointee width.  Re-run same-object GEP queries even if the
-        // pointer-only query already returned NoAlias.
+
         if (V1 && V2 && getBaseAddress(V1) == getBaseAddress(V2) &&
             (dynamic_cast<GetElementPtrInst *>(V1) ||
              dynamic_cast<GetElementPtrInst *>(V2))) {
@@ -972,9 +950,10 @@ AliasInfo BasicAAResult::aliasWithIndexRange(
     return aliasLocationImpl(L1, L2, LI, true, 0, Active);
 }
 
+// 核心指针查询按“规范化与校验、对象区分、同对象分解、缓存结果”顺序求解。
 AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
                                    bool UseIndexRange) {
-    //1.进行初步剥离
+    // 1. 剥离透明包装并拒绝非指针、undef 来源或不稳定底层对象。
     V1 = stripBaseInst(V1);
     V2 = stripBaseInst(V2);
 
@@ -982,8 +961,6 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
         return AliasInfo::MayAlias;
     }
 
-    //2. An undef pointer is not a distinct allocation.  Treating it as
-    // NoAlias lets a client move/delete real memory operations across it.
     if (V1->isUndef() || V2->isUndef()) {
         return AliasInfo::MayAlias;
     }
@@ -993,29 +970,23 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     UndefActive.clear();
     if (hasUndefPointerOrigin(V2, UndefActive))
         return AliasInfo::MayAlias;
-    //3. Obtain the underlying roots before reflexivity.  A GEP/bitcast whose
-    // root is undef is not a stable object identity, even when the same
-    // derived SSA value appears on both sides of the query.
+
     Value* O1 = getBaseAddress(V1);
     Value* O2 = getBaseAddress(V2);
     if (!O1 || !O2 || O1->isUndef() || O2->isUndef())
         return AliasInfo::MayAlias;
 
-    //4.判断相等性
+    // 2. SSA 自反关系先得 MustAlias；Select 必须在对象身份判断前按路径展开。
     if (isEqualAlias(V1, V2, LI)) {
         return AliasInfo::MustAlias;
     }
 
-    // A select is a path-sensitive pointer union.  Resolve its arms before
-    // comparing underlying roots: the select instruction itself is not an
-    // allocation object and therefore cannot participate in the usual root
-    // distinction rule.
     if (auto *S1 = dynamic_cast<SelectInst *>(V1))
         return aliasSelect(S1, V2, LI, UseIndexRange);
     if (auto *S2 = dynamic_cast<SelectInst *>(V2))
         return aliasSelect(S2, V1, LI, UseIndexRange);
 
-    //5.如果底层对象不同
+    // 3. 底层对象不同只有在结构事实或调用点事实充分时才能返回 NoAlias。
     if (O1 != O2) {
         if (haveKnownDistinctUnderlyingObjects(O1, O2)) {
             return AliasInfo::NoAlias;
@@ -1024,6 +995,7 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
         return AliasInfo::MayAlias;
     }
 
+    // 4. 同对象普通查询先写入保守缓存占位，以截断递归 PHI 图。
     std::pair<Value*, Value*> Key;
     if (!UseIndexRange) {
         Key = makeCanonicalPair(V1, V2);
@@ -1034,13 +1006,12 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
         AliasCache[Key] = AliasInfo::MayAlias;
     }
 
+    // 5. 依次处理 GEP、PHI，未覆盖的同对象形态保持 MayAlias，再更新缓存。
     AliasInfo Result = AliasInfo::MayAlias;
     auto *G1 = dynamic_cast<GetElementPtrInst*>(V1);
     auto *G2 = dynamic_cast<GetElementPtrInst*>(V2);
     if (G1 || G2) {
-        // fillLinearGEP also accepts a plain pointer as a zero-offset
-        // expression, which lets BasicAA distinguish an object root from a
-        // constant non-zero GEP into that same object.
+
         Result = aliasGEP(V1, V2, LI, UseIndexRange);
     } else if (auto *P1 = dynamic_cast<PhiInst*>(V1)) {
         Result = aliasPHI(P1, V2, LI, UseIndexRange);
@@ -1056,7 +1027,9 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     return Result;
 }
 
+// BasicAA Pass 主流程从跨调用点的一致对象关系播种函数内查询器。
 BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
+    // 1. 获取 SCEV 作为可选距离证明，并收集函数的指针形参。
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     BasicAAResult Result(&SE);
 
@@ -1072,11 +1045,13 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
         return Result;
     }
 
+    // 2. 只有全部用途均为直接调用且存在调用点时，跨函数事实才可安全提升。
     std::vector<CallInst*> Calls = F.getDirectCallSites();
     if (!F.hasOnlyDirectCallUses() || Calls.empty()) {
         return Result;
     }
 
+    // 3. 对每对指针形参检查所有调用点；仅底层分配对象始终不同才记录 NoAlias。
     BasicAAResult SeedAA;
     for (unsigned I = 0; I < PointerParams.size(); ++I) {
         for (unsigned J = I + 1; J < PointerParams.size(); ++J) {
@@ -1086,10 +1061,7 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
             for (CallInst* CI : Calls) {
                 Value* ArgI = CI->getArg(PI);
                 Value* ArgJ = CI->getArg(PJ);
-                // A NoAlias answer for the immediate access ranges is not an
-                // allocation-object fact.  In particular, &a[0] and &a[1]
-                // are disjoint i32 accesses but p + 1 may still equal q in
-                // the callee.  Promote only structurally distinct objects.
+
                 if (!ArgI || !ArgJ ||
                     !SeedAA.haveKnownDistinctUnderlyingObjects(ArgI, ArgJ)) {
                     AllNoAlias = false;
@@ -1102,6 +1074,7 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
         }
     }
 
+    // 4. 同样验证每个指针形参与全局对象，随后封装完整结果。
     Module* M = Module::getActiveModule();
     if (!M) {
         return Result;

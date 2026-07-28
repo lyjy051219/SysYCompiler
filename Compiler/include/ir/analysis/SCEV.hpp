@@ -13,13 +13,7 @@
 #include <unordered_set>
 #include <vector>
 
-// A compact Scalar Evolution analysis tailored to this IR.
-//
-// The analysis recognizes the loop shapes produced by our LoopSimplify /
-// Mem2Reg pipeline and keeps the expression language deliberately small:
-// constants, unknown IR values, arithmetic trees, min/max, casts, and simple
-// loop recurrences.  Unknown is a first-class result instead of a failure.
-
+// SCEV 表达式语言覆盖常量、未知值、算术树和简单循环递推；无法证明的形态保留为 Unknown。
 enum class SCEVExprKind {
     Constant,
     Unknown,
@@ -44,6 +38,7 @@ enum class SCEVCastKind {
     BitCast
 };
 
+// 表达式节点由结构 Key 驻留共享，Operands 与 RecLoop 描述不可变的符号结构。
 struct SCEVExpr {
     SCEVExprKind Kind = SCEVExprKind::Unknown;
     SCEVCastKind CastKind = SCEVCastKind::BitCast;
@@ -93,6 +88,7 @@ enum class LoopExitComparePhase {
     BackedgeUpdate
 };
 
+// TripCountInfo 绑定规范循环形状、退出比较阶段、符号次数以及独立的无回绕证明。
 struct LoopTripCountInfo {
     const Loop *L = nullptr;
 
@@ -120,13 +116,12 @@ struct LoopTripCountInfo {
 
     bool IsRuntime = false;
     bool MayBeZeroTrip = true;
-    // True only when the recurrence values needed to reach the modeled exit
-    // are proved to stay within the signed i32 domain.  A mathematical trip
-    // count alone is not a termination proof for wrapping IR arithmetic.
+
     bool ProvenNoWrap = false;
     bool Valid = false;
 };
 
+// 余数摘要把总迭代数拆为主循环次数与余数次数，显式区分常量和运行时路径。
 struct LoopRemainderInfo {
     const Loop *L = nullptr;
     int64_t Factor = 1;
@@ -144,6 +139,7 @@ struct LoopRemainderInfo {
     bool Valid = false;
 };
 
+// 函数级结果按需构造并缓存 SCEV，同时向循环变换提供归纳、次数和有限性查询。
 class SCEVResult {
 public:
     SCEVResult();
@@ -153,6 +149,7 @@ public:
     SCEVResult(const SCEVResult &) = delete;
     SCEVResult &operator=(const SCEVResult &) = delete;
 
+    // 查询接口只在形状和算术安全性得到证明时返回结构化循环事实，否则返回空值或 Unknown。
     const SCEVExpr *getSCEV(Value *V);
     const SCEVExpr *getTripCount(const Loop *L);
     const SCEVExpr *getBackedgeTakenCount(const Loop *L);
@@ -162,9 +159,6 @@ public:
 
     const SCEVExpr *mod(const SCEVExpr *L, const SCEVExpr *R);
 
-    // Structured loop facts used by full/partial/runtime unroll and peeling.
-    // These helpers deliberately fail instead of guessing when the loop shape
-    // is outside the simplified SCEV model.
     std::optional<LoopTripCountInfo> analyzeLoopTripCount(const Loop *L);
     std::optional<int64_t> getSmallConstantTripCount(const Loop *L);
     std::optional<int64_t> getSmallConstantBackedgeTakenCount(const Loop *L);
@@ -173,20 +167,11 @@ public:
     std::optional<LoopRemainderInfo> getRemainderInfo(const Loop *L,
                                                       int64_t Factor);
     std::optional<InductionDescriptor> getCanonicalInduction(const Loop *L);
-    // Prove that every execution leaves L after finitely many iterations.
-    // Besides an explicit no-wrap trip-count proof, accept strict signed
-    // unit-step forms whose compared recurrence value reaches the bound
-    // before overflow.  This also covers a uniform continue-merge latch PHI.
+
     bool isKnownFiniteLoop(const Loop *L);
-    // True for the canonical header value and exact backedge update when the
-    // loop's finite-iteration proof also proves that recurrence cannot wrap
-    // before the modeled exit.  Consumers use this instead of inferring
-    // no-wrap from a syntactically positive ADD.
+
     bool isKnownNoWrapInductionValue(const Loop *L, Value *V);
-    // Contextual proof for a symbolic, header-tested unit-stride loop.  The
-    // mathematical SCEV count is usable only when both the recurrence and the
-    // eagerly expanded distance are proved not to wrap on every path reaching
-    // the preheader.
+
     bool proveRuntimeNoWrapAtPreheader(const LoopTripCountInfo &Info,
                                        RangeInfo &RI,
                                        DominatorTree &DT);
@@ -203,10 +188,11 @@ public:
     bool invalidate(Function &F, const PreservationStatus &PA);
 
 private:
-    // SCEV 构造前解析由 SSA 转发保证的精确整数常量。
+
     static std::optional<int64_t> getTrivialExactIntConstant(
         Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0);
 
+    // 构造阶段用活动值集合截断 SSA 环，并用 UpdateDelta 识别 Header PHI 的统一加法更新。
     struct UpdateDelta {
         bool SeenSelf = false;
         const SCEVExpr *Delta = nullptr;
@@ -281,6 +267,7 @@ private:
     PhiInst *findPhiForAffineRec(const Loop *L, const SCEVAffineInfo &Affine);
 };
 
+// Pass 入口获取循环树和支配树，表达式及循环事实随后按需生成。
 class SCEVAnalysis : public AnalysisDescriptor<SCEVAnalysis> {
 public:
     using Result = SCEVResult;

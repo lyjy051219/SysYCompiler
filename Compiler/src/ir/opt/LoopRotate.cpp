@@ -11,7 +11,6 @@ bool LoopRotatePass::isLCSSAPhi(PhiInst *Phi) {
     return Phi->getIdent().find(".lcssa") != std::string::npos;
 }
 
-//clone转发函数
 Instruction *LoopRotatePass::cloneInstructionWithMap(
     Instruction *I,
     const std::unordered_map<Value *, Value *> &VMap) {
@@ -25,8 +24,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     BasicBlock *Header = L.getHeader();
     if (!Header) return false;
 
-    // 循环旋转会把循环头指令复制到前置块，并改变各次迭代的执行位置。
-    // 若循环（含子循环）调用计时函数或其封装函数，则整个候选不可旋转。
+    // 2. 语义筛选：旋转会复制 Header 并改变求值位置，所以循环子树中任何可达计时调用都使候选失效。
     for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -35,13 +33,12 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         }
     }
 
-    // 条件1：LoopSimplify 形态
+    // 2.1 结构入口：取唯一 PreHeader 和 Latch，并拒绝 Latch 本身退出的尾测循环，避免对已旋转形态重复处理。
     BasicBlock *PreHeader = nullptr;
     BasicBlock *Latch = nullptr;
     if (!L.getLoopSimplifyForm(PreHeader, Latch)) return false;
     if (!PreHeader || !Latch) return false;
 
-    //防死循环检查
     bool latchIsExiting = false;
     for (BasicBlock *Succ : Latch->getSuccessors()) {
         if (!L.contains(Succ)) {
@@ -53,7 +50,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         return false;
     }
 
-    // 条件2：块数量、唯一出口、Header 必须是 ExitingBlock
+    // 2.2 只处理包含实际 Body 的多块头测循环：Header 的一个分支进入唯一 Exit，另一个进入循环体。
     std::vector<BasicBlock *> LoopBlocks;
     for (auto *BB : F) {
         if (L.contains(BB)) LoopBlocks.push_back(BB);
@@ -87,12 +84,13 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     }
 
     for (Instruction *OldI : HeaderNormalInsts) {
+        // 2.3 在破坏 PreHeader 终结指令之前试克隆每条 Header 计算，确认后续克隆路径可用。
         Instruction *Probe = cloneInstructionWithMap(OldI, {});
         if (!Probe) return false;
         delete Probe;
     }
 
-    // 条件3：Exit 前驱唯一且仅 Header；Latch 不是 Exiting；Body 前驱唯一且仅 Header
+    // 2.4 提交前锁定边形：Exit 和 Body 都只由 Header 到达，Latch 仅无条件回到 Header，因此后续可按固定前驱重建 PHI。
     auto ExitPreds = Exit->getPredecessors();
     if (ExitPreds.size() != 1 || ExitPreds.front() != Header) return false;
 
@@ -109,7 +107,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     BasicBlock *LatchDstCheck = LatchTermCheck->getTrueSuccessor();
     if (LatchDstCheck != Header) return false;
 
-    // 步骤5：Body PHI 折叠（保留 .lcssa）
+    // 3. 预处理 Body PHI：保留 LCSSA PHI，删除无使用节点，并将空输入或全相同输入折叠成单值。
     auto BodyPhis = Body->collectPhiNodes();
     for (PhiInst *Phi : BodyPhis) {
         if (!Phi) continue;
@@ -134,9 +132,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
             delete Phi;
         }
     }
-
-
-    // 步骤6：核心 Rotate1 - Header 指令 clone 到 PreHeader，并为 Body 建立对应 PHI
+    // 3.1 开始旋转提交：移除 PreHeader 的旧无条件分支，分别建立 Header→PreHeader 与 Header→Body 值映射。
     auto *PreHeaderTerm = dynamic_cast<BrInst *>(PreHeader->back());
     if (!PreHeaderTerm || PreHeaderTerm->isConditional()) return false;
     delete PreHeaderTerm;
@@ -146,6 +142,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     std::vector<PhiInst *> NewBodyPhis;
 
     for (PhiInst *OldPhi : HeaderPhis) {
+        // 3.2 每个 Header PHI 在 Body 中改造为两路合流：首次来自 PreHeader 初值，后续来自旧 Header 回边值。
         Value *InitV = nullptr;
         Value *IterV = nullptr;
         forEachPhiIncoming(
@@ -169,6 +166,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     }
 
     for (Instruction *OldI : HeaderNormalInsts) {
+        // 3.3 按原顺序把 Header 正文克隆到 PreHeader；若值在循环体中仍有使用，则在 Body 补一个首次/后续 PHI。
         Instruction *Cloned = cloneInstructionWithMap(OldI, HeaderToPreValue);
         if (!Cloned) return false;
         PreHeader->pushBack(Cloned);
@@ -194,7 +192,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         }
     }
 
-    // 步骤7：核心 Rotate2 - 更新 Uses
+    // 4. 分区改写使用：Header 和循环体内使用转向 Body 值，循环外使用则经 Exit LCSSA PHI 合流。
     std::unordered_map<Value *, PhiInst *> ExitLCSSA;
     for (auto &KV : HeaderToBodyValue) {
         Value *OldV = KV.first;
@@ -256,6 +254,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     }
 
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
+        // 4.1 旋转后 PreHeader 也能直接退出，因此为原有 LCSSA PHI 补齐该新前驱的首次计算值。
         if (!isLCSSAPhi(Phi)) continue;
         bool HasHeader = false;
         bool HasPreHeader = false;
@@ -276,7 +275,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         }
     }
 
-    // 步骤8：核心 Rotate3 - CFG 重连
+    // 5. 核心 CFG 旋转：PreHeader 执行克隆条件并选择 Body/Exit，同时删除 Header PHI 的旧 PreHeader 入边。
     Value *PreCond = HeaderCond;
     auto ItCond = HeaderToPreValue.find(HeaderCond);
     if (ItCond != HeaderToPreValue.end()) PreCond = ItCond->second;
@@ -305,7 +304,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
 
     L.Header = Body;
 
-    // 步骤9：常量折叠与 LoopSimplify 形态修复
+    // 5.1 规范化新入口：折叠常量首次条件；仍有零次旁路时插入专用 preheader 并同步 Body PHI 前驱。
     auto *PHBr = dynamic_cast<BrInst *>(PreHeader->back());
     if (!PHBr || !PHBr->isConditional()) {
         if (auto *OldTerm = PreHeader->back()) {
@@ -363,16 +362,15 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
         for (BasicBlock *Pred : MergePreds) {
             BasicBlock::redirectBranchTarget(Pred, Exit, DedicatedExit);
         }
-        // 更换为 LoopSimplifyPass 的接口
+        // 5.2 Header 与新 preheader 都可能退出时建立专用 Exit，复用 LoopSimplify 的合并前驱 PHI 重写。
         LoopSimplifyPass::rewritePhisForMergedPreds(Exit, MergePreds, DedicatedExit);
         DedicatedExit->genUnCondInst(Exit);
     }
 
-    // 步骤10：合并 Header 到 Latch
+    // 5.3 将旧 Header 的条件计算和分支整体搬到 Latch，使循环从头测试转为尾测试。
     auto *LatchTerm = dynamic_cast<BrInst *>(Latch->back());
     if (!LatchTerm || LatchTerm->isConditional()) return false;
 
-    // 当这一步执行完成，Header 里的条件分支（连同指向 Exit 的边）就正式转移到了 Latch 中。
     delete LatchTerm;
     std::vector<BasicBlock *> HeaderSuccs = Header->getSuccessors();
     while (Header->front() != nullptr) {
@@ -393,14 +391,14 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     }
     Header->eraseFromParent();
 
-    // 步骤11：返回 true，事务顺利结束。
+    // 5.4 把旧 Header 作为前驱的所有后继 PHI 改为 Latch，然后移除空 Header，单循环旋转完成。
     return true;
 }
 
 PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool Changed = false;
 
-    // LoopRotate级别不动点迭代：不断尝试，直到一整轮下来没有任何循环被旋转
+    // 1. pass 内执行局部固定点：一轮只旋转一个循环，直到完整一轮无变更。
     while (true) {
         auto &DT = FAM.getResult<DominantAnalysis>(F);
         auto &LI = FAM.getResult<LoopAnalysis>(F);
@@ -412,7 +410,7 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
 
             std::vector<Loop *> Loops = Top->getLoopsInPostOrder();
 
-            // 逆后序遍历，从最外层循环开始尝试旋转
+            // 1.1 将 post-order 逆置后从外向内尝试，使父循环先获得规范的尾测试形态。
             for (auto It = Loops.rbegin(); It != Loops.rend(); ++It) {
                 Loop *Cur = *It;
                 if (!Cur || !Cur->getHeader()) continue;
@@ -420,7 +418,8 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
                 if (runLoopRotate(F, *Cur, DT, LI)) {
                     Changed = true;
                     ChangedInRound = true;
-                    break; // CFG被修改，立刻打断遍历准备重建 Loop 树
+                    // 1.2 CFG 已变更，所有循环指针随即过期；立即结束本轮并重建分析。
+                    break;
                 }
             }
 
@@ -431,7 +430,7 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
             break;
         }
 
-        // 清除旧的分析数据缓存，准备重扫
+        // 1.3 每次成功后先失效支配树和循环树，下一轮必须在新 CFG 上重新获取。
         PreservationStatus RoundPA;
         RoundPA.discard<DominantAnalysis>();
         RoundPA.discard<LoopAnalysis>();
@@ -443,6 +442,7 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
     }
 
     PreservationStatus FinalPA;
+    // 6. 旋转同时改变 CFG、循环成员和指令求值位置，相关结构、别名与副作用分析全部失效。
     FinalPA.discard<DominantAnalysis>();
     FinalPA.discard<PostDominantAnalysis>();
     FinalPA.discard<LoopAnalysis>();

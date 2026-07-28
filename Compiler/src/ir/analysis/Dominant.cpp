@@ -1,7 +1,5 @@
 #include "ir/analysis/Dominant.hpp"
 
-// DominatorTree Implementation
-
 bool DominatorNode::isLeaf() const {
     return FirstChild == nullptr;
 }
@@ -25,6 +23,7 @@ BasicBlock* DominatorTree::getIDom(BasicBlock* BB) const {
     return node->IDom ? node->IDom->Block : nullptr;
 }
 
+// 查询辅助：以显式栈稳定地产生支配树后序，供循环发现等消费者使用。
 std::vector<DominatorNode *> DominatorTree::getNodesInPostOrder() const {
     std::vector<DominatorNode *> Order;
     if (!Root) return Order;
@@ -101,56 +100,46 @@ bool DominatorTree::dominates(BasicBlock* A, BasicBlock* B) const {
     DominatorNode* NodeA = getNode(A);
     DominatorNode* NodeB = getNode(B);
 
-    if (!NodeA || !NodeB) return false; // 不可达节点处理
+    if (!NodeA || !NodeB) return false;
 
-    // 核心优化：利用 DFS 时间戳进行 O(1) 判断
     return NodeA->DFSNumIn <= NodeB->DFSNumIn &&
            NodeA->DFSNumOut >= NodeB->DFSNumOut;
 }
 
+// 值级查询先处理常量和形参，再按跨块支配或同块指令次序完成判定。
 bool DominatorTree::dominatesValue(Value* DefVal, Value* UseVal) const {
     if (!DefVal || !UseVal) return false;
 
-    // 情况 1：如果 DefVal 是常量，认为它支配一切
     if (DefVal->isConst()) return true;
 
-    // 情况 2：如果 DefVal 是形参，认为它支配一切
     if (DefVal->isParam()) return true;
 
-    // 情况 3：将两个 Value 转换为 Instruction
     Instruction* DefInst = DefVal->as<Instruction>();
     Instruction* UseInst = UseVal->as<Instruction>();
 
-    // 如果 DefVal 不是 Instruction，返回 false
     if (!DefInst) return false;
 
-    // UseVal 可能不是 Instruction（比如是形参），如果是则无法支配关系
     if (!UseInst) return false;
 
-    // 获取两条指令所在的基本块
     BasicBlock* DefBB = DefInst->getParent();
     BasicBlock* UseBB = UseInst->getParent();
 
-    // 情况 4：不同基本块，使用基本块级的支配关系
     if (DefBB != UseBB) {
         return dominates(DefBB, UseBB);
     }
 
-    // 情况 5：同一基本块，比较指令在链表中的顺序
-    // 遍历 DefBB 中的指令，看 DefInst 是否在 UseInst 前面
     for (auto inst = DefBB->begin(); inst != DefBB->end(); ++inst) {
         Instruction* currInst = *inst;
         if (currInst == DefInst) {
-            // 找到 DefInst，说明它在 UseInst 前面
+
             return true;
         }
         if (currInst == UseInst) {
-            // 先找到 UseInst，说明 DefInst 在它后面
+
             return false;
         }
     }
 
-    // 不应该到这里，但以防万一
     return false;
 }
 
@@ -161,8 +150,7 @@ bool DominatorTree::invalidate(Function &F, const PreservationStatus &PA) {
         return true;
 }
 
-
-
+// 求解辅助：路径压缩始终保留并查集路径上半支配编号最小的 Label。
 void SemiNCAInfo::compress(unsigned v) {
     unsigned father = Infos[v].Father;
     if (Infos[father].Father != 0) {
@@ -186,9 +174,9 @@ void SemiNCAInfo::link(unsigned parent, unsigned child) {
     Infos[child].Father = parent;
 }
 
+// 1. 从入口迭代遍历可达 CFG，为块分配一基 DFS 编号并记录编号化前驱边。
 void SemiNCAInfo::runDFS(BasicBlock* entryBlock) {
-    //迭代法前序遍历
-    //{BasicBlock*,parentDFSNum}
+
     std::stack<std::pair<BasicBlock*, unsigned>> st;
     st.push({entryBlock, 0});
 
@@ -200,19 +188,17 @@ void SemiNCAInfo::runDFS(BasicBlock* entryBlock) {
         auto it = nodeToDFSNum.find(currBlock);
 
         if (it == nodeToDFSNum.end()) {
-            // 第一次访问：分配 DFS 序号
+
             currNum = ++lastNum;
             nodeToDFSNum[currBlock] = currNum;
             numToNode.push_back(currBlock);
 
-            // 扩展 Infos 数组
             Infos.emplace_back();
             Infos[currNum].DFSNum = currNum;
             Infos[currNum].SdomNum = currNum;
             Infos[currNum].Label = currNum;
             Infos[currNum].Parent = parentDFSNum;
 
-            // 将后继加入栈
             auto succs = currBlock->getSuccessors();
             for (auto sit = succs.rbegin(); sit != succs.rend(); ++sit) {
                 if (*sit) st.push({*sit, currNum});
@@ -221,16 +207,15 @@ void SemiNCAInfo::runDFS(BasicBlock* entryBlock) {
             currNum = it->second;
         }
 
-        // 处理前驱关系 (CFG edges)
         if (parentDFSNum != 0) {
             Infos[currNum].Predecessors.push_back(parentDFSNum);
         }
     }
 }
 
+// 2. 在编号图上运行 Semi-NCA：先逆序求半支配者，再正序收敛直接支配者。
 void SemiNCAInfo::runSemiNCA() {
-    // 1. 计算半支配节点
-    // 逆DFS序遍历
+    // 2.1 逆 DFS 序通过 eval/link 合并前驱信息，得到每个节点的半支配者。
     for (unsigned i = lastNum; i >= 2; --i) {
         for (unsigned pre : Infos[i].Predecessors) {
             if(pre == 0) continue;
@@ -242,8 +227,7 @@ void SemiNCAInfo::runSemiNCA() {
         link(Infos[i].Parent, i);
     }
 
-    // 2. 计算支配结点 -- SemiNCA
-    // 正DFS序遍历 -- 除了根节点
+    // 2.2 正 DFS 序沿已完成的 IDom 链回溯到半支配边界。
     for (unsigned i = 2; i <= lastNum; ++i) {
         unsigned runner = Infos[i].Parent;
         unsigned sdom = Infos[i].SdomNum;
@@ -254,24 +238,21 @@ void SemiNCAInfo::runSemiNCA() {
     }
 }
 
+// 3. 将编号结果封装为父子树，并计算欧拉区间以支持 O(1) 支配判定。
 void SemiNCAInfo::buildDominatorTree(DominatorTree& DT) {
     DT.clear();
     if (lastNum == 0) return;
 
-    // 1. 调整 DT 内部数组大小
     DT.Nodes.resize(lastNum + 1);
 
-    // 2. 填充基本信息 & 建立映射
     for (unsigned i = 1; i <= lastNum; ++i) {
         BasicBlock* BB = numToNode[i];
         DT.Nodes[i].Block = BB;
         DT.BlockToNode[BB] = i;
     }
 
-    // 设置根节点
     DT.Root = &DT.Nodes[1];
 
-    // 3. 构建树结构 (IDom 指针 和 Child 链表)
     for (unsigned i = 2; i <= lastNum; ++i) {
         unsigned idomIndex = Infos[i].IDomNum;
         DominatorNode* currNode = &DT.Nodes[i];
@@ -304,34 +285,39 @@ void SemiNCAInfo::buildDominatorTree(DominatorTree& DT) {
     }
 }
 
+// 支配分析主流程：清空一次性状态，完成 CFG 编号、Semi-NCA 求解和结果封装。
 DominatorTree SemiNCAInfo::calculate(Function* func) {
+    // 1. 重置编号表并保留 0 号哨兵；空函数直接返回空树。
     DominatorTree DT;
 
-    //0.初始化
     lastNum = 0;
     Infos.clear();
     numToNode.clear();
     nodeToDFSNum.clear();
-    // 0号占位 (DFS序从1开始)
+
     Infos.emplace_back();
     numToNode.push_back(nullptr);
 
     if (func->size() == 0) return DT;
     BasicBlock* entryBlock = func->front();
-    //1.DFS遍历，初始化数据+计算DFS序
+
+    // 2. 只从入口编号可达 CFG，不可达块不会进入支配树。
     runDFS(entryBlock);
-    //2.计算sdom->计算idom
+
+    // 3. 基于编号化前驱求出半支配者和直接支配者。
     runSemiNCA();
-    //3.构建支配树
+
+    // 4. 建立树链接和查询时间戳，作为最终分析结果返回。
     buildDominatorTree(DT);
 
     return DT;
 }
 
-
 PassID DominantAnalysis::Key;
 
 DominantAnalysis::Result DominantAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
+    // 1. 支配树没有其他分析依赖，创建一次性 Semi-NCA 求解器。
     SemiNCAInfo info;
+    // 2. 从函数入口完成可达 CFG 求解并直接返回封装后的树。
     return info.calculate(&F);
 }

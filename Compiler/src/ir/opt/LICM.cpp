@@ -21,11 +21,13 @@ std::size_t ExitValueKeyHash::operator()(const ExitValueKey &K) const {
 	return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
 }
 
-// 在同一基本块中，即使候选指令的块支配了所有 exit/latch，
-// 它前面仍可能有不返回的 call 或会 fault 的内存/除法指令。
-// 把候选移到 preheader 会让它在这些指令之前执行，所以这种
-// 情况不能仅凭基本块支配关系宣称 must-execute。
+ 
+ 
+ 
+ 
 bool LICMPass::hasSafeExecutionPrefix(const Instruction *Candidate) {
+	// 2.1 从块首到候选之间不得有写入、调用或可能陷阱/poison 的操作；这证明把原本
+	// 必经块中的候选提前执行不会越过更早的可观察或异常行为。
 	BasicBlock *BB = Candidate ? Candidate->getParent() : nullptr;
 	if (!BB) return false;
 
@@ -44,6 +46,8 @@ bool LICMPass::hasSafeExecutionPrefix(const Instruction *Candidate) {
 bool LICMPass::hasPreheaderDereferenceProof(
 	LoadInst *Load, const Loop &L, BasicAAResult &AA,
 	const LoopInfo &LI) {
+	// 2.2 顺序扫描 preheader，寻找尺寸覆盖且 MustAlias 的既有 load/store 作为地址
+	// 已可解引用证明；任一调用会清除该证明，避免跨未知控制点推测 load。
 	if (!Load) return false;
 	BasicBlock *PreHeader = nullptr;
 	BasicBlock *Latch = nullptr;
@@ -56,8 +60,8 @@ bool LICMPass::hasPreheaderDereferenceProof(
 		if (!I) return false;
 		if (dynamic_cast<BrInst *>(I) || dynamic_cast<RetInst *>(I)) break;
 		if (dynamic_cast<CallInst *>(I)) {
-			// An unknown call may invalidate a parameter-backed object.  A
-			// matching access after the call can establish the proof again.
+			 
+			 
 			Proven = false;
 			continue;
 		}
@@ -70,9 +74,9 @@ bool LICMPass::hasPreheaderDereferenceProof(
 		else
 			continue;
 
-		// Reaching the same address proves only the number of bytes touched by
-		// the earlier access.  Do not use a narrower byte/element access to
-		// speculate a wider load.
+		 
+		 
+		 
 		if (Candidate.Size && Existing.Size &&
 			*Existing.Size >= *Candidate.Size &&
 			AA.alias(Candidate, Existing, LI) == AliasInfo::MustAlias)
@@ -81,10 +85,11 @@ bool LICMPass::hasPreheaderDereferenceProof(
 	return Proven;
 }
 
-// 无 must-execute 证明时，只允许提前执行明确不会除零的
-// div/rem。signed div/rem 的 INT_MIN, -1 在不同 IR/目标
-// 语义下可能产生 poison 或 trap，因此保守拒绝 -1。
+ 
+ 
+ 
 bool LICMPass::isSpeculatableDivisionOrRemainder(Instruction *I) {
+	// 2.3 除数必须是非零常量；有符号除余还排除 -1，避免最小整数溢出情形。
 	auto *BI = dynamic_cast<BinaryInst *>(I);
 	Value *Dividend = nullptr;
 	Value *Divisor = nullptr;
@@ -101,18 +106,20 @@ bool LICMPass::isSpeculatableDivisionOrRemainder(Instruction *I) {
 	return true;
 }
 
-// Sinking a store removes all of its intermediate executions.  That is only
-// valid when the destination is known to be a non-faulting object and no
-// other instruction in the loop can observe or overwrite the location.  In
-// particular, checking only instructions *after* the store is insufficient:
-// a load before the store in iteration N+1 observes the store from iteration
-// N and creates a loop-carried memory dependence.
-//
-// This IR has no dereferenceable/inbounds attributes, so keep the
-// non-faulting proof deliberately narrow: a direct global/alloca object or a
-// structurally in-bounds, all-constant GEP rooted at one.  Casts, parameters
-// and symbolic indices are rejected instead of guessing object bounds.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool LICMPass::isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
+	// 3.1 下沉 store 仅接受全局/alloca 根上的全常量在界 GEP，并检查最终对象尺寸
+	// 覆盖写入值，保证在出口执行不会新增无效地址访问。
 	if (!Ptr || !StoredValue || !StoredValue->getIRType()) return false;
 	auto IsOwnedRoot = [](Value *V) {
 		if (V && V->isGlobal()) return true;
@@ -133,8 +140,8 @@ bool LICMPass::isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
 		int64_t I = CI->getVal();
 
 		if (auto PT = std::dynamic_pointer_cast<POINTERType>(Current)) {
-			// The root denotes one complete object, not an arbitrary C pointer
-			// range.  Only its zero-th object can be proven in-bounds.
+			 
+			 
 			if (I != 0) return false;
 			Current = PT->getPointerType();
 		} else if (auto AT = std::dynamic_pointer_cast<ARRAYType>(Current)) {
@@ -152,19 +159,21 @@ bool LICMPass::isNonFaultingStoreObject(Value *Ptr, Value *StoredValue) {
 		StoredValue->getIRType()->getSize() <= Current->getSize();
 }
 
-// A loop-invariant call may be evaluated lazily on the first iteration and
-// cached for later iterations without requiring willreturn/speculatable: the
-// first evaluation stays at the original program point.  Reusing the returned
-// value is nevertheless only valid when the call is deterministic with
-// respect to the loop.  SideEffectAnalysis supplies the memory summary; reject
-// unknown/builtin effects, all writes, and any read location that the loop may
-// modify.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool LICMPass::isReusableLoopInvariantCall(
 	CallInst *CI,
 	const std::vector<Instruction *> &LoopInsts,
 	BasicAAResult &AA,
 	const LoopInfo &LI,
 	FunctionAnalysisPassManager &FAM) {
+	// 2.4 可复用调用必须无计时行为、callee 副作用至多为已跟踪 Ref 且没有 Mod；
+	// 将 callee 的全局/指针形参读集映射到实参后，再证明循环内无人修改这些地址。
 	if (!CI || CI->mayReachTimingCall()) return false;
 	for (Instruction *I : LoopInsts) {
 		auto *LoopCall = dynamic_cast<CallInst *>(I);
@@ -211,23 +220,23 @@ bool LICMPass::isReusableLoopInvariantCall(
 	return true;
 }
 
-// Lazily evaluate CI at its original point on the first iteration, then carry
-// the value around the backedge and bypass the call on subsequent iterations:
-//
-//   header:
-//     first  = phi [true, preheader], [false, latch]
-//     cached = phi [undef, preheader], [value, latch]
-//   original-prefix:
-//     br first, compute, merge
-//   compute: value.first = call ...; br merge
-//   merge:
-//     value = phi [value.first, compute], [cached, original-prefix]
-//     original-suffix
-//
-// Unlike ordinary preheader hoisting this preserves zero-trip loops, the
-// ordering relative to every instruction before CI, and the behaviour of a
-// trapping or non-returning first call.  BB must dominate the unique latch so
-// every iteration that continues to the next one has produced ValuePhi.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool LICMPass::cacheLoopInvariantCall(
 	Function &F,
 	CallInst *CI,
@@ -235,9 +244,11 @@ bool LICMPass::cacheLoopInvariantCall(
 	BasicBlock *PreHeader,
 	BasicBlock *Latch,
 	const DominatorTree &DT) {
+	// 4.1 对不是每次必执行但结果循环不变的调用，构造“首轮计算、后续复用”CFG；
+	// 候选必须支配 latch、非 tail、非 void 且有用户。
 	if (!CI || !PreHeader || !Latch) return false;
-	// Splitting the call away from its original terminator would invalidate a
-	// tail-call marker even if the returned value itself were cacheable.
+	 
+	 
 	if (CI->isTailCall()) return false;
 	BasicBlock *BB = CI->getParent();
 	BasicBlock *Header = L.getHeader();
@@ -247,7 +258,7 @@ bool LICMPass::cacheLoopInvariantCall(
 		return false;
 	if (!CI->hasUses()) return false;
 
-	// A well-formed basic block must retain a terminator in the continuation.
+	 
 	std::vector<Instruction *> Tail;
 	bool SeenCall = false;
 	for (Instruction *I : collectInstructions(*BB)) {
@@ -266,7 +277,9 @@ bool LICMPass::cacheLoopInvariantCall(
 
 	std::vector<BasicBlock *> OldSuccessors = BB->getSuccessors();
 
-	auto *ComputeBB = new BasicBlock();
+	// 4.2 将调用后的块尾拆到 merge，调用移入 compute；先重写旧后继 PHI 的前驱，
+	// 保持原终结边从新的 merge 块发出。
+    auto *ComputeBB = new BasicBlock();
 	auto *MergeBB = new BasicBlock();
 	ComputeBB->setIdent(F.makeUniqueBlockIdent(
 		BB->getIdent() + ".licm.compute"));
@@ -282,10 +295,10 @@ bool LICMPass::cacheLoopInvariantCall(
 		MergeBB->pushBack(I);
 	}
 
-	// The old terminator now belongs to MergeBB, hence all of its successor
-	// PHIs must name MergeBB rather than the prefix block.  Do this before
-	// taking snapshots of CI's uses because rebuilding a PHI invalidates its
-	// old Use objects.
+	 
+	 
+	 
+	 
 	std::unordered_set<BasicBlock *> SeenSuccessors;
 	for (BasicBlock *Succ : OldSuccessors) {
 		if (!Succ || !SeenSuccessors.insert(Succ).second) continue;
@@ -294,6 +307,8 @@ bool LICMPass::cacheLoopInvariantCall(
 
 	auto OriginalUses = CI->getUses();
 
+	// 4.3 header 的 first/cached PHI 记录是否首轮及缓存值，merge 的 value PHI 在
+	// 首轮取调用结果、以后取缓存；最后把原调用用户统一改到 value PHI。
 	auto *ValuePhi = new PhiInst(CI->getIRType());
 	ValuePhi->setIdent(ValuePhi->getIdent() + ".licm.value");
 	ValuePhi->addIncoming(CI, ComputeBB);
@@ -325,7 +340,7 @@ bool LICMPass::cacheLoopInvariantCall(
 	return true;
 }
 
-// 1) 检查所有 user 是否都在循环外
+ 
 bool LICMPass::areAllUsersOutsideLoop(Instruction *I, const Loop &L) {
 	for (Use *U : I->getUses()) {
 		if (!U || U->getValue() != I) continue;
@@ -337,12 +352,13 @@ bool LICMPass::areAllUsersOutsideLoop(Instruction *I, const Loop &L) {
 	return true;
 }
 
-// 2)循环不变量
+ 
 bool LICMPass::isInvariant(
 	Instruction *I,
 	const Loop &L,
 	const DominatorTree &DT,
 	const std::unordered_set<Instruction *> &InvariantSet) {
+	// 1.1 每个操作数必须来自循环外，或已在本轮不变量集合中且其定义支配当前指令。
 	if (!I || !I->getParent()) return false;
 	return forEachOperand(
 		I, [&](size_t, Use *, Value *V) {
@@ -366,7 +382,7 @@ bool LICMPass::isInvariant(
 	});
 }
 
-// 3) 指令能否安全移动（基于别名/副作用 + 指令类别规则）
+ 
 bool LICMPass::isSafeToMove(
 	Instruction *I,
 	const Loop &L,
@@ -381,10 +397,12 @@ bool LICMPass::isSafeToMove(
 	FunctionAnalysisPassManager &FAM,
 	bool ForSink,
 	bool AggressiveHoist) {
+	// 2. 先按 opcode 排除控制、PHI、alloca 和不可安全推测的除余/转换/移位；
+	// 普通下沉当前只支持 store，普通提升再按指令类别继续验证。
 	if (!I) return false;
 	if (!I->getParent()) return false;
 
-	// 绝对不能移动
+	 
 	switch (I->instType) {
 		case Instruction::RET:
 		case Instruction::BR:
@@ -400,9 +418,9 @@ bool LICMPass::isSafeToMove(
 			if (!isSpeculatableDivisionOrRemainder(I)) return false;
 			break;
 		case Instruction::FPTOSI:
-			// Out-of-range/NaN conversion is not speculatable in this IR.
-			// Hoist it only when the original instruction executes on every
-			// loop path and no earlier instruction can trap or fail to return.
+			 
+			 
+			 
 			if (!AggressiveHoist || I->getParent() != L.getHeader() ||
 				!hasSafeExecutionPrefix(I)) return false;
 			break;
@@ -419,28 +437,30 @@ bool LICMPass::isSafeToMove(
 			break;
 	}
 
-	// Keep the sinking transform memory-specific.  Pure invariant SSA
-	// expressions are handled by hoisting below; cloning them into multiple
-	// exits needs full SSAUpdater support and the old ad-hoc bridge construction
-	// could create an exit PHI whose incoming value was defined in the exit
-	// block itself.
+	 
+	 
+	 
+	 
+	 
 	if (ForSink && !dynamic_cast<StoreInst *>(I)) return false;
 
-	// 普通 Binary（排除上面的四个危险算术）可移动
+	 
 	if (dynamic_cast<BinaryInst *>(I)) return true;
 
-	// select only chooses between already-computed SSA values and has no
-	// trapping behaviour of its own.  Treating it as immovable used to break
-	// otherwise-pure invariant chains such as max(0, trip-count): the compare
-	// could move, but the select and all of its quotient/remainder users stayed
-	// in an inner-loop preheader and were then recomputed by the parent loop.
+	 
+	 
+	 
+	 
+	 
 	if (dynamic_cast<SelectInst *>(I)) return true;
 
-	// LOAD：循环内任一指令若可能 Mod 该地址，则不可移动
+	 
+	// 2.5 load 只能提升：必须原本在每轮必执行的安全 header 前缀，或 preheader 已
+	// 解引用同一地址；再由 MemorySSA 或逐指令 AA 证明循环内无 clobber。
 	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
-		// 没有 dereferenceable/nonnull 属性时，load 不是可无条件
-		// 推测执行的指令。Sink 会消除原本可能发生的 fault；
-		// Hoist 则只在指令已证明 must-execute 时允许。
+		 
+		 
+		 
 		if (ForSink) return false;
 		const bool HeaderMustExecute =
 			AggressiveHoist && I->getParent() == L.getHeader() &&
@@ -451,12 +471,12 @@ bool LICMPass::isSafeToMove(
 		if (!Ptr) return false;
 		if (!HeaderMustExecute && !PreheaderAlreadyDereferenced) return false;
 
-		// A unique reaching memory state outside the loop proves that every
-		// dynamic execution of this load (including executions reached through
-		// a backedge) sees no in-loop clobber before it.  This is stronger than
-		// a flat instruction scan for transparent CFG cycles and remains
-		// conservative when paths disagree: the walker then returns a Phi or
-		// nullptr and we use the traditional scan below.
+		 
+		 
+		 
+		 
+		 
+		 
 		bool MSSAProvesNoLoopClobber = false;
 		if (MemorySSAUsable)
 		if (MemoryAccess *Clobber = MSSA.getClobberingAccess(
@@ -477,8 +497,8 @@ bool LICMPass::isSafeToMove(
 				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
 					Value *StorePtr = SI->getPointerOperand();
 					if (!StorePtr) return false;
-					// MemoryLocation carries the actual byte width, so the same
-					// index-distance proof is valid for integer and float loads.
+					 
+					 
 					AliasInfo Alias = AA.aliasWithIndexRange(
 						LoadLocation, MemoryLocation::get(SI), LI);
 					if (Alias == AliasInfo::NoAlias)
@@ -492,8 +512,10 @@ bool LICMPass::isSafeToMove(
 		return true;
 	}
 
-    // STORE：Hoist 直接禁止；Sink 需证明“最后一次写”
-	if (auto *SI = dynamic_cast<StoreInst *>(I)) {
+     
+	// 3.2 store 只能下沉：地址和值均循环不变，写入点支配所有退出和 latch，且循环内
+	// 不存在对该位置的其他 Mod/Ref；配合对象证明保证每个出口写一次等价。
+    if (auto *SI = dynamic_cast<StoreInst *>(I)) {
 		if (!ForSink) return false;
 		Value *Ptr = SI->getPointerOperand();
 		if (!isNonFaultingStoreObject(Ptr, SI->getValueOperand())) return false;
@@ -507,10 +529,10 @@ bool LICMPass::isSafeToMove(
 		BasicBlock *SBB = SI->getParent();
 		if (!SBB) return false;
 
-		// Every path which actually exits the loop must have executed this
-		// store.  Check exiting blocks rather than merely exit destinations;
-		// the latter can have additional predecessors in malformed/non-
-		// dedicated CFGs.
+		 
+		 
+		 
+		 
 		bool SawExitingBlock = false;
 		for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
 			if (!BB || !L.isExitingBlock(BB)) continue;
@@ -521,9 +543,9 @@ bool LICMPass::isSafeToMove(
 		for (BasicBlock *LatchBB : Latches)
 			if (!DT.dominates(SBB, LatchBB)) return false;
 
-		// Reject *every* competing Mod/Ref, including accesses before SI.
-		// This is the conservative MemorySSA-equivalent legality condition
-		// until the dedicated memory dependence graph is available.
+		 
+		 
+		 
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == SI) continue;
 
@@ -534,11 +556,12 @@ bool LICMPass::isSafeToMove(
 		return true;
 	}
 
-	// CALL：副作用分析 + ModRef + untracked + RefSet 逐点核对
+	 
+	// 2.6 调用只允许从 header 安全前缀直接提升；非必执行调用由缓存 CFG 路径处理。
 	if (auto *CI = dynamic_cast<CallInst *>(I)) {
-		// 目前 IR 没有 willreturn/nounwind/speculatable 属性。即使
-		// SideEffectAnalysis 证明 call 不写内存，它仍可能不返回。
-		// 因此不做 call sink，hoist 也必须是 must-execute。
+		 
+		 
+		 
 		if (ForSink) return false;
 		if (!AggressiveHoist || !hasSafeExecutionPrefix(I)) return false;
 		if (I->getParent() != L.getHeader()) return false;
@@ -546,9 +569,9 @@ bool LICMPass::isSafeToMove(
 		return isReusableLoopInvariantCall(CI, LoopInsts, AA, LI, FAM);
 	}
 
-	// Keep the fallback a pure-operation allowlist.  New instruction kinds
-	// must opt in with an explicit speculation rule instead of being hoisted
-	// by default.
+	 
+	 
+	 
 	if (dynamic_cast<GetElementPtrInst *>(I)) return true;
 	switch (I->instType) {
 		case Instruction::TRUNC:
@@ -564,35 +587,39 @@ bool LICMPass::isSafeToMove(
 }
 
 PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+	// 1. 获取支配、循环、AA 与 MemorySSA；一旦移动内存指令，旧 MemorySSA 不再用于
+	// 后续证明，避免以陈旧内存版本继续优化。
 	auto &DT = FAM.getResult<DominantAnalysis>(F);
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
 	auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
 	auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
-	// Store sinking clones a MemoryDef and deletes the original instruction.
-	// This compact MemorySSA has no incremental updater, so consumers in the
-	// remainder of this LICM invocation must stop dereferencing its snapshot
-	// after the first successful store sink.
+	 
+	 
+	 
+	 
 	bool MemorySSAUsable = true;
 	bool Changed = false;
 	bool CFGChanged = false;
 	std::unordered_map<ExitValueKey, PhiInst *, ExitValueKeyHash> ExitPhiCache;
 
+	// 1.2 递归按内到外处理循环。每个循环确认 LCSSA/LoopSimplify 形态；缺少标准
+	// preheader/latch 时只允许最保守的纯标量提升，store 下沉和调用缓存均关闭。
 	std::function<bool(Loop *)> processLoop = [&](Loop *L) -> bool {
 		if (!L) return false;
 		bool LocalChanged = false;
 
-		// 后序处理子循环
+		 
 		for (Loop *Sub : L->getSubLoops()) {
 			LocalChanged |= processLoop(Sub);
 			if (CFGChanged) return true;
 		}
 
-		// A rotated loop commonly has a unique guard predecessor whose second
-		// edge is the zero-trip bypass.  It is a valid insertion point for
-		// speculatable pure instructions, but getLoopSimplifyForm deliberately
-		// rejects it because it is not an unconditional preheader.  Keep the
-		// stronger form for sinking/CFG rewrites and use the weaker unique-entry
-		// shape for pure hoisting only.
+		 
+		 
+		 
+		 
+		 
+		 
 		bool InLCSSA = LCSSAPass::isLCSSAForm(L);
 		BasicBlock *PreHeader = nullptr;
 		BasicBlock *Latch = nullptr;
@@ -616,8 +643,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		if (!PreHeader || !Latch) return LocalChanged;
 		const bool CanSink = HasLoopSimplifyForm && InLCSSA;
 
-		// 循环代码移动会改变不同迭代中的执行次数；循环内只要存在
-		// 计时调用或其包装调用，就不能只按首次到达路径判断安全性。
+		 
+		 
+		// 1.3 循环内任何可能到达计时调用都会封锁本循环移动，防止改变计时边界。
 		for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
 			if (!LoopBB) continue;
 			for (Instruction *LoopI : *LoopBB) {
@@ -641,7 +669,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			return Insts;
 		};
 
-		// Sink：后序块 + 逆序指令
+		 
+		// 3. 下沉阶段按循环 RPO 逆序、块内逆序处理，使用户先移动；只处理所有用户均
+		// 在循环外的安全 store，并维护已确认不变量集合。
 		std::unordered_set<Instruction *> SinkInvariant;
 		auto SinkBlocksRPO = CanSink
 			? L->getBlocksInRPO()
@@ -669,8 +699,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						MemorySSAUsable,
 						LI,
 						FAM,
-						/*ForSink=*/true,
-						/*AggressiveHoist=*/false)) {
+						 true,
+						 false)) {
 					continue;
 				}
 
@@ -696,6 +726,8 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					}
 				}
 				if (CrossesTiming) continue;
+				// 3.3 在每个出口 PHI 区后克隆 store；若操作数仍来自循环，为该出口创建并
+				// 缓存 LCSSA bridge PHI。必须覆盖所有出口才能提交原指令删除。
 				std::unordered_map<BasicBlock *, Instruction *> ExitClone;
 
 				for (BasicBlock *ExitBB : ExitBlocks) {
@@ -785,7 +817,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			}
 		}
 
-		// Hoist：RPO 块 + 正序指令
+		 
+		// 4. 提升阶段按 RPO 正序处理，使操作数先进入 preheader；计算候选是否支配
+		// 全部出口/latch，以决定可否使用激进的必执行推测规则。
 		std::unordered_set<Instruction *> HoistInvariant;
 		auto HoistBlocksRPO = L->getBlocksInRPO();
 		for (BasicBlock *BB : HoistBlocksRPO) {
@@ -826,14 +860,16 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 						MemorySSAUsable,
 						LI,
 						FAM,
-						/*ForSink=*/false,
-						/*AggressiveHoist=*/Aggressive);
+						 false,
+						 Aggressive);
 
+				// 4.1 非必执行的不变量调用不能直接提前；在完整 LoopSimplify+LCSSA 形态下，
+				// 尝试改写为首轮按需计算、后续迭代复用的缓存 CFG。
 				if (!SafeToPreheader) {
-					// A pure invariant call in a per-iteration must-pass block may
-					// still be cached without speculating it into a zero-trip
-					// preheader.  Keep its first execution at the exact original
-					// point, then bypass it after the first backedge.
+					 
+					 
+					 
+					 
 					auto *CI = dynamic_cast<CallInst *>(I);
 					if (!HasLoopSimplifyForm || !InLCSSA ||
 						!CI || BB == L->getHeader() ||
@@ -859,6 +895,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				while (TermIt != PreHeader->end() && *TermIt != PreHeader->back()) ++TermIt;
 				if (TermIt == PreHeader->end()) continue;
 
+				// 4.4 普通候选从原块摘下并插到 preheader 终结指令前，记录为后续候选不变量。
 				I->eraseFromParent();
 				TermIt.insertBefore(I);
 				HoistInvariant.insert(I);
@@ -869,12 +906,14 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		return LocalChanged;
 	};
 
+	// 5. 每个顶层循环在未改 CFG 时最多再跑一轮，消费首轮移动暴露的不变量；
+	// 调用缓存改 CFG 后所有结构分析立即陈旧，因此停止整个遍历。
 	for (Loop *TopL : LI.getTopLevelLoops()) {
 		bool LocalChanged = processLoop(TopL);
 		Changed |= LocalChanged;
-		// The first round hoists invariant address/value producers.  A second
-		// bounded round lets store sinking consume those now-preheader values
-		// without manufacturing invalid exit PHIs for loop-local operands.
+		 
+		 
+		 
 		if (LocalChanged && !CFGChanged)
 			Changed |= processLoop(TopL);
 		if (CFGChanged) break;
@@ -883,6 +922,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 	if (!Changed) return PreservationStatus::all();
 	if (CFGChanged) return PreservationStatus::none();
 
+	// 6. 纯移动保留 CFG 分析但失效 AA/MemorySSA/副作用；缓存 CFG 改写则不保留分析。
 	PreservationStatus PA;
 	PA.keep<DominantAnalysis>();
 	PA.keep<PostDominantAnalysis>();

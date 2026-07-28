@@ -8,41 +8,43 @@
 #include <stack>
 #include <unordered_map>
 
-// =====================================================================
-// ConstraintElimination — 约束传播消除冗余分支
-//
-// 沿支配树 DFS 遍历，维护一个约束栈。
-// 进入由条件分支支配的块时，把分支条件 push 到约束栈。
-// 对块内的每个条件分支，检查其条件是否被约束栈蕴含。
-// 离开支配子树时 pop 约束。
-//
-// 和 RangeAwareSimplify 互补：
-// - RangeAwareSimplify 用"值的范围"判断比较结果
-// - ConstraintElimination 用"路径上的已知事实"判断比较结果
-//
-// 蕴含判定分两层：
-//   1) 单跳直接蕴含（implies）：同一个 val、同一个 bound（或常量可比）
-//      已知 x < A → 蕴含 x < B 当 A <= B
-//      已知 x < A → 蕴含 x <= B 当 A <= B+1
-//      已知 x >= A → 蕴含 x >= B 当 A >= B
-//      已知 x == A → 蕴含 x < B 当 A < B
-//      等等
-//   2) 两跳传递链（impliesTransitive）：引入一个中间值 m
-//      已知 x < m 且 m <= A(const) → 蕴含 x < A
-//      已知 x <= m 且 m <= A       → 蕴含 x <= A
-//      对"控制流里先 if (x < m) 再 if (m <= c)"这种嵌套判断有用
-//      （轻量传递链：O(stack^2) 而不是完整传递闭包）
-//
-// 约束来源：
-//   a) 控制流：唯一前驱的条件分支（true 分支 push op，false push negateOp）
-//   b) RangeAnalysis seed：对函数入口块的每个值注入 [min, max] 两条约束
-//      作为根基事实，帮助靠"范围+控制流"联合推理的场景
-//      （如 if (getch() < 100) 里，getch 范围 [-128,127]，控制流再加 <100 的约束）
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 
 bool ConstraintEliminationPass::isKnownNoWrapAddSub(
     BinaryInst *inst, BasicBlock *contextBlock, RangeInfo &RI,
     const DominatorTree &DT) {
+    // 1.1 用当前程序点的操作数区间证明 add/sub 的最小、最大结果均落在 i32；
+    // 只有无回绕时，后续才能把常量偏移跨过比较符号。
     if (!inst || !contextBlock) return false;
     if (inst->getOp() != BinaryInst::ADD &&
         inst->getOp() != BinaryInst::SUB)
@@ -55,8 +57,8 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
         return false;
 
-    // 必须使用比较所在块的上下文范围，而不是只检查常量或最终总偏移。
-    // 例如 (x + 1) - 1 的总偏移为 0，但第一层 x + 1 仍可能回绕。
+     
+     
     IntRange lhsRange = RI.query(lhs, contextBlock, DT);
     IntRange rhsRange = RI.query(rhs, contextBlock, DT);
     if (lhsRange.isBottom() || rhsRange.isBottom()) return false;
@@ -68,7 +70,7 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
                IRMath::addI32(lhsRange.max, rhsRange.max, resultMax);
     }
 
-    // SUB 的最小值来自 lhs.min-rhs.max，最大值来自 lhs.max-rhs.min。
+     
     return IRMath::addI32(lhsRange.min, -rhsRange.max, resultMin) &&
            IRMath::addI32(lhsRange.max, -rhsRange.min, resultMax);
 }
@@ -76,6 +78,8 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
 ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
     Value *V, BasicBlock *contextBlock, RangeInfo &RI,
     const DominatorTree &DT, int depth) {
+    // 1.2 有界剥离 x+C、C+x、x-C，累计为“基值 + 常量偏移”；任何未经证明
+    // 无回绕的算术都作为新的不可分基值，避免改变有符号比较语义。
     if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return {};
     if (depth <= 0)
@@ -92,8 +96,8 @@ ConstraintElimOffsetExpr ConstraintEliminationPass::decomposeOffset(
 
     if (BI->getOp() == BinaryInst::ADD) {
         if (auto *C = dynamic_cast<ConstInt *>(lhs)) {
-            // 当前 ADD 必须先有逐层无回绕证明；失败时把整条指令视为
-            // 不透明 base，保留原始比较，不利用源程序整数溢出。
+             
+             
             if (!isKnownNoWrapAddSub(BI, contextBlock, RI, DT))
                 return {V, 0, true};
             ConstraintElimOffsetExpr E =
@@ -130,6 +134,8 @@ bool ConstraintEliminationPass::rewriteOffsetConstraint(
     Value *lhs, Value *rhs, BinaryInst::Operation op,
     BasicBlock *contextBlock, RangeInfo &RI, const DominatorTree &DT,
     ConstraintElimConstraint &out) {
+    // 1.3 将两侧统一成 Base+Offset，只在偏移差为 0 或可用严格/非严格边界
+    // 等价吸收的 +/-1 时重写谓词，其余情况保持原比较。
     ConstraintElimOffsetExpr L =
         decomposeOffset(lhs, contextBlock, RI, DT);
     ConstraintElimOffsetExpr R =
@@ -179,27 +185,28 @@ bool ConstraintEliminationPass::rewriteOffsetConstraint(
     return true;
 }
 
-// 从 icmp 指令提取约束
-// 只处理整数比较：BinaryInst 的比较操作符在整数和浮点间复用，
-// 浮点比较的语义（NaN、inf）和整数不同，不能用整数约束推理。
-//
-// 仿射归一化（轻量的 expression normalization）：
-//   (x + c1) op c2  →  x op (c2 - c1)
-//   (x - c1) op c2  →  x op (c2 + c1)
-//   (c1 - x) op c2  →  x (反向 op) (c1 - c2)      —— x 搬到一侧要翻号
-//   x op (y + c)    →  (x - y) op c               —— 这步风险大先不做
-// 前三种除了要求常量结果必须落在 i32 范围内，还要求 RangeAnalysis
-// 在比较所在块证明实际 ADD/SUB 不会回绕；证据不足时退回原始形式。
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool ConstraintEliminationPass::extractConstraint(
     BinaryInst *cmp, bool negate, RangeInfo &RI, const DominatorTree &DT,
     ConstraintElimConstraint &out) {
+    // 1. 把条件比较规范化为 val op bound；走 false 边时先取反谓词，且只接受 i32。
     if (!cmp || !BinaryInst::isCompareOp(cmp->getOp())) return false;
     Value *lhs = nullptr;
     Value *rhs = nullptr;
     if (!cmp->getOperands(lhs, rhs)) return false;
 
-    // 仅整数比较
-    // 当前约束格与溢出证明均按 i32 构造；其他位宽保守跳过。
+     
+     
     if (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))
         return false;
@@ -209,9 +216,11 @@ bool ConstraintEliminationPass::extractConstraint(
     Value *bound = rhs;
     BasicBlock *contextBlock = cmp->getParent();
 
-    // —— 仿射归一化：仅当 RHS 是常量 + LHS 是 add/sub 且另一侧常量时生效 ——
-    // 避免了把非常量搬到 bound 侧引入新值。每一条实际算术指令都必须
-    // 先由 RangeAnalysis 证明无回绕，证据不足时保留原约束。
+     
+     
+     
+    // 1.4 对 (x+C) op K、(x-C) op K、(C-x) op K 做常量移项；要求原算术无回绕、
+    // 新边界仍在 i32，最后一种形态还需反转谓词方向。
     if (auto *rConst = dynamic_cast<ConstInt *>(rhs)) {
         if (auto *lBI = dynamic_cast<BinaryInst *>(lhs)) {
             Value *la = nullptr;
@@ -224,8 +233,8 @@ bool ConstraintEliminationPass::extractConstraint(
                     return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
                 };
 
-                // (x + c1) op c2 → x op (c2 - c1)
-                // (c1 + x) op c2 同构
+                 
+                 
                 if (lBI->getOp() == BinaryInst::ADD) {
                     ConstInt *cConst = dynamic_cast<ConstInt *>(la);
                     Value *xVal = lb;
@@ -236,8 +245,8 @@ bool ConstraintEliminationPass::extractConstraint(
                     if (cConst) {
                         int64_t newBound = c2 - (int64_t)cConst->getVal();
                         if (inI32(newBound)) {
-                            // 用 interned ConstInt 做 bound，保证"同值常量 = 同指针"，
-                            // 不会让 implies 的 sameBound 快速路径错判
+                             
+                             
                             out.val = xVal;
                             out.op = op;
                             out.bound = ConstInt::newConstInt((int)newBound);
@@ -248,12 +257,12 @@ bool ConstraintEliminationPass::extractConstraint(
                         }
                     }
                 }
-                // (x - c1) op c2 → x op (c2 + c1)
+                 
                 else if (lBI->getOp() == BinaryInst::SUB) {
                     auto *lbConst = dynamic_cast<ConstInt *>(lb);
                     auto *laConst = dynamic_cast<ConstInt *>(la);
                     if (lbConst) {
-                        // x - c1
+                         
                         int64_t newBound = c2 + (int64_t)lbConst->getVal();
                         if (inI32(newBound)) {
                             out.val = la;
@@ -265,10 +274,10 @@ bool ConstraintEliminationPass::extractConstraint(
                             return true;
                         }
                     } else if (laConst) {
-                        // c1 - x op c2  → x (反向 op) (c1 - c2)
+                         
                         int64_t newBound = (int64_t)laConst->getVal() - c2;
                         if (inI32(newBound)) {
-                            // 翻号：L↔G, LE↔GE, E 不变, NE 不变
+                             
                             BinaryInst::Operation flipped = BinaryInst::reversePredicate(op);
                             out.val = lb;
                             out.op = flipped;
@@ -284,6 +293,7 @@ bool ConstraintEliminationPass::extractConstraint(
         }
     }
 
+    // 1.5 若常量移项未命中，再尝试两侧偏移规范化；否则保留原始两值约束。
     if (rewriteOffsetConstraint(
             lhs, rhs, op, contextBlock, RI, DT, out))
         return true;
@@ -316,47 +326,49 @@ bool ConstraintEliminationPass::comparableBoundValues(
     return false;
 }
 
-// 检查已知约束 known 是否蕴含目标约束 target
-// 两个约束必须是关于同一个 val 和同一个 bound（或 bound 是常量可比较）
+ 
+ 
 bool ConstraintEliminationPass::implies(
     const ConstraintElimConstraint &known,
     const ConstraintElimConstraint &target) {
-    // 必须是同一个值
+    // 2.1 仅比较同一 val 且边界可换算的约束，按整数严格/非严格端点关系判断
+    // known 是否足以推出 target；等式可推出对应范围与不等式。
+     
     if (known.val != target.val) return false;
 
-    // 同一个 bound（或常量）允许携带不同偏移：x < y、x <= y+1
-    // 这类约束可以直接按偏移大小比较。
+     
+     
     int64_t kB = 0;
     int64_t tB = 0;
     bool comparableBound = comparableBoundValues(known, target, kB, tB);
     bool sameBound = comparableBound && kB == tB;
 
-    // 蕴含规则表：
-    // 已知 val < kB:
-    //   蕴含 val < tB 当 kB <= tB
-    //   蕴含 val <= tB 当 kB <= tB + 1 (即 kB - 1 <= tB)
-    //   蕴含 val != tB 当 kB <= tB
-    // 已知 val <= kB:
-    //   蕴含 val < tB 当 kB < tB (即 kB + 1 <= tB)
-    //   蕴含 val <= tB 当 kB <= tB
-    //   蕴含 val != tB 当 kB < tB
-    // 已知 val > kB:
-    //   蕴含 val > tB 当 kB >= tB
-    //   蕴含 val >= tB 当 kB >= tB - 1
-    //   蕴含 val != tB 当 kB >= tB
-    // 已知 val >= kB:
-    //   蕴含 val > tB 当 kB > tB
-    //   蕴含 val >= tB 当 kB >= tB
-    //   蕴含 val != tB 当 kB > tB
-    // 已知 val == kB:
-    //   蕴含任何可以从等式推出的关系
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
 
     if (sameBound && known.op == target.op) return true;
 
     if (!comparableBound) return false;
 
     switch (known.op) {
-        case BinaryInst::L: // val < kB
+        case BinaryInst::L:  
             switch (target.op) {
                 case BinaryInst::L:  return kB <= tB;
                 case BinaryInst::LE: return kB <= tB + 1;
@@ -364,7 +376,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::LE: // val <= kB
+        case BinaryInst::LE:  
             switch (target.op) {
                 case BinaryInst::L:  return kB < tB;
                 case BinaryInst::LE: return kB <= tB;
@@ -372,7 +384,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::G: // val > kB
+        case BinaryInst::G:  
             switch (target.op) {
                 case BinaryInst::G:  return kB >= tB;
                 case BinaryInst::GE: return kB >= tB - 1;
@@ -380,7 +392,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::GE: // val >= kB
+        case BinaryInst::GE:  
             switch (target.op) {
                 case BinaryInst::G:  return kB > tB;
                 case BinaryInst::GE: return kB >= tB;
@@ -388,7 +400,7 @@ bool ConstraintEliminationPass::implies(
                 default: break;
             }
             break;
-        case BinaryInst::E: // val == kB
+        case BinaryInst::E:  
             switch (target.op) {
                 case BinaryInst::E:  return kB == tB;
                 case BinaryInst::L:  return kB < tB;
@@ -405,10 +417,12 @@ bool ConstraintEliminationPass::implies(
     return false;
 }
 
-// 检查约束栈是否蕴含目标约束（单跳）
+ 
 bool ConstraintEliminationPass::isImplied(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
+    // 2.2 先检查栈内直接约束；对两个变量的零偏移比较，同时构造交换两侧并反转
+    // 谓词的等价形式，避免因条件书写方向不同漏掉证明。
     for (auto &known : stack) {
         if (implies(known, target)) return true;
         if (!known.boundIsConst && !target.boundIsConst &&
@@ -426,42 +440,44 @@ bool ConstraintEliminationPass::isImplied(
     return false;
 }
 
-// 两跳传递链：在栈里找中间值 m，使得"A -> m"和"m -> B"复合后蕴含 target。
-//   只覆盖 target.bound 是常量的情形（非常量 bound 链式判定容易假阳）
-//   只做一种跳跃模式：target 是 val < C，若栈里有 val < m 和 m <= C（m
-//   为同类型整数），则成立；其余不等号同理展开
-//
-// 复杂度：对每个 target，最多扫 stack 两遍，总共 O(stack^2)，而栈大小
-// 受支配树深度限制，实际很小。
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 bool ConstraintEliminationPass::impliesTransitive(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
+    // 2.3 对目标为常量边界的情况尝试一跳传递：val op1 mid 与 mid op2 const
+    // 合成为 val op const。仅组合同方向序关系或等式，其他谓词保守跳过。
     int64_t checkedTargetConst = 0;
     if (!target.boundIsConst ||
         !IRMath::addNoOverflow(target.boundVal, target.boundOffset, checkedTargetConst))
         return false;
     (void)checkedTargetConst;
 
-    // 先找所有"target.val op m"形式的约束，m 不是 target.bound
+     
     for (auto &k1 : stack) {
         if (k1.val != target.val) continue;
-        if (k1.boundIsConst) continue;          // 已在单跳里 cover
-        if (k1.bound == target.bound) continue; // 同一 bound 是单跳
+        if (k1.boundIsConst) continue;           
+        if (k1.bound == target.bound) continue;  
         Value *mid = k1.bound;
-        // 再在栈里找"m op' C"，且 C 是常量
+         
         for (auto &k2 : stack) {
             if (k2.val != mid) continue;
             if (!k2.boundIsConst) continue;
-            // 构造两条已知 -> 目标 的蕴含链
-            // 为避免写一堆 case，复用单跳 implies：先用 k1 把 target.val 替成 mid，
-            // 得到中间 target'，再用 k2 检查是否蕴含 target'
-            // 具体说：如果 k1 = (val op1 mid) 且 k2 蕴含 (mid op2 target.bound)，
-            // 那么 op1 ∘ op2 按下面表决定是否蕴含 target.op
-            //
-            // 这里枚举最常见的四种组合：<-<, <=-<=, >-> , >=->=
+             
+             
+             
+             
+             
+             
+             
             auto compose = [](BinaryInst::Operation a, BinaryInst::Operation b)
                 -> BinaryInst::Operation {
-                // a op b 的组合：两个同向不等号组合后仍保留最弱的那个
+                 
                 if ((a == BinaryInst::L  || a == BinaryInst::LE) &&
                     (b == BinaryInst::L  || b == BinaryInst::LE))
                     return (a == BinaryInst::L || b == BinaryInst::L)
@@ -475,7 +491,7 @@ bool ConstraintEliminationPass::impliesTransitive(
                 return BinaryInst::BinaryUnknown == 0 ? BinaryInst::NE : BinaryInst::NE;
             };
             BinaryInst::Operation combined = compose(k1.op, k2.op);
-            if (combined == BinaryInst::NE) continue; // 不兼容的组合
+            if (combined == BinaryInst::NE) continue;  
             ConstraintElimConstraint synthesized;
             synthesized.val = target.val;
             synthesized.op = combined;
@@ -490,7 +506,7 @@ bool ConstraintEliminationPass::impliesTransitive(
     return false;
 }
 
-// 综合判定：先试单跳，不行再试两跳链
+ 
 bool ConstraintEliminationPass::isImpliedChained(
     const std::vector<ConstraintElimConstraint> &stack,
     const ConstraintElimConstraint &target) {
@@ -507,6 +523,7 @@ bool ConstraintEliminationPass::isContradicted(
 
 PreservationStatus ConstraintEliminationPass::run(Function &F,
                                                    FunctionAnalysisPassManager &FAM) {
+    // 1. 获取支配树与范围分析，前者确定条件生效区域，后者证明偏移算术无回绕。
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     bool changed = false;
@@ -519,6 +536,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
 
     std::vector<ConstraintElimFoldCandidate> toFold;
 
+    // 2. 显式深度优先遍历支配树。每个 frame 记录进入节点前的约束栈深度，
+    // 回到兄弟子树时精确弹出只在上一条支配路径成立的条件。
     while (!dfsStack.empty()) {
         auto frame = dfsStack.top();
         dfsStack.pop();
@@ -527,12 +546,14 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
         BasicBlock *BB = node->Block;
         if (!BB) continue;
 
-        // 恢复约束栈到进入此子树时的状态
+         
         while ((int)constraintStack.size() > frame.constraintsBefore)
             constraintStack.pop_back();
 
-        // 从 BB 的唯一前驱（如果有）的分支条件中提取约束
-        // 只在 BB 有唯一前驱时才安全（否则条件不是所有路径都满足）
+         
+         
+        // 2.1 若当前块只有一个条件分支前驱，把所走 true/false 边对应的规范化条件
+        // 压栈；多前驱块不能假定某一条边条件必然成立。
         auto preds = BB->getPredecessors();
         if (preds.size() == 1) {
             BasicBlock *pred = preds[0];
@@ -541,8 +562,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                 if (br->isConditional()) {
                     BasicBlock *trueBB = br->getTrueSuccessor();
                     BasicBlock *falseBB = br->getFalseSuccessor();
-                    // 同一条件分支的两条边若汇入同一个块，进入该块并不能
-                    // 证明条件为真或为假；只有唯一命中的边才能提供路径事实。
+                     
+                     
                     if (trueBB && falseBB && trueBB != falseBB &&
                         (BB == trueBB || BB == falseBB)) {
                         Value *cond = br->getCondition();
@@ -560,9 +581,11 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             }
         }
 
-        // 对块内的每个条件分支，检查是否被约束栈蕴含
-        // 栈空时直接略过：没控制流约束的情况下再叠 range-seed 意义不大
-        // （range-only 的事实 RangeAwareSimplify 已经折过了）
+         
+         
+         
+        // 2.2 对当前条件分支提取目标约束，并临时加入 RangeAnalysis 给出的上下界；
+        // 依次尝试直接/一跳蕴含及其否定，记录可折叠的布尔结果。
         if (!constraintStack.empty()) {
             Instruction *term = BB->back();
             if (auto *br = dynamic_cast<BrInst *>(term)) {
@@ -572,16 +595,16 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
                         ConstraintElimConstraint target;
                         if (extractConstraint(
                                 cmpInst, false, RI, DT, target)) {
-                            // 把 target.val 的 RangeAnalysis 结果当成一对临时
-                            // 常量上下界约束 push 到栈尾；用完 pop 回去，
-                            // 不影响子树的 frame.constraintsBefore 记账
+                             
+                             
+                             
                             size_t savedSize = constraintStack.size();
                             if (target.val->getIRType() &&
                                 target.val->getIRType()->isInt()) {
                                 IntRange vr = RI.query(target.val, BB, DT);
                                 if (!vr.isTop() && !vr.isBottom()) {
-                                    // 用 interned ConstInt 当 bound，避免 bound=nullptr
-                                    // 让 implies 的 sameBound 快速路径错判"不同数值但指针同"
+                                     
+                                     
                                     ConstraintElimConstraint lo, hi;
                                     lo.val = target.val;
                                     lo.op = BinaryInst::GE;
@@ -614,7 +637,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             }
         }
 
-        // 推入子节点，记录当前约束栈深度
+         
+        // 2.3 将当前约束深度随子节点入栈，使该路径事实传播到整个支配子树。
         int curSize = (int)constraintStack.size();
         std::vector<DominatorNode *> children;
         for (DominatorNode *child = node->FirstChild; child; child = child->NextSibling)
@@ -623,9 +647,11 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
             dfsStack.push({*it, curSize});
     }
 
-    // 路径约束只证明当前分支上的条件值，不能把共享的比较指令全局替换。
-    // 循环克隆等变换可能让同一比较同时服务多个分支；逐个改写分支操作数
-    // 既允许各路径得到不同结论，也避免第一次删除比较后再次访问悬空指针。
+     
+     
+     
+    // 3. 遍历结束后再改写分支条件；重新校验候选仍是原条件，避免收集阶段修改 CFG
+    // 或条件 use，并把证明结果替换为布尔常量交给 CFGSimplify 清边。
     for (const auto &Candidate : toFold) {
         if (!Candidate.branch || !Candidate.condition ||
             !Candidate.branch->isConditional() ||
@@ -638,7 +664,8 @@ PreservationStatus ConstraintEliminationPass::run(Function &F,
 
     if (!changed) return PreservationStatus::all();
 
-    // 分支条件被折叠后，死分支和无用比较由后续 CFGSimplify/DCE 清理。
+     
+    // 4. 此处只替换条件值，CFG 尚未改变，因此保留支配树与循环树。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

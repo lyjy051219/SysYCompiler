@@ -17,10 +17,7 @@ class LoopInfo;
 class SCEVResult;
 struct SCEVExpr;
 
-// A deliberately small affine vocabulary for loop-memory reasoning.  Loop
-// coefficients are expressed in iteration coordinates (rather than raw PHI
-// values): an AddRec {Start,+,Step}<L> contributes Step to L and recursively
-// contributes Start to the remaining terms.
+// LoopAffineExpr 以迭代坐标表示常量、循环轴系数和循环不变量项；Exact 为假即不可用于证明。
 struct LoopAffineExpr {
     bool Exact = false;
     int64_t Constant = 0;
@@ -28,10 +25,7 @@ struct LoopAffineExpr {
     std::unordered_map<const SCEVExpr *, int64_t> InvariantTerms;
 };
 
-// One scalar load/store together with its typed GEP fingerprint.  Subscripts
-// and ByteStrides are parallel arrays.  Equal byte strides from adjacent GEPs
-// are folded into one typed coordinate, which preserves common split GEP
-// shapes such as row(A, i) followed by element(row, j).
+// LoopMemoryAccess 保存一次标量访存、底层对象以及并行的类型化下标和字节步长。
 struct LoopMemoryAccess {
     Instruction *Inst = nullptr;
     Value *Pointer = nullptr;
@@ -52,9 +46,6 @@ enum class LoopDependenceKind {
     Unknown
 };
 
-// Direction bits describe SinkIteration - SourceIteration.  An exact equality
-// therefore has only LoopDepSameIteration set, while an unresolved component
-// uses LoopDepAnyDirection.
 enum LoopDependenceDirection : uint8_t {
     LoopDepSinkEarlier = 1u << 0,
     LoopDepSameIteration = 1u << 1,
@@ -63,22 +54,18 @@ enum LoopDependenceDirection : uint8_t {
                           LoopDepSinkLater
 };
 
+// 依赖记录按外到内循环轴保存方向掩码，Unknown 方向不会被合法性查询忽略。
 struct LoopDependenceRecord {
     const LoopMemoryAccess *Source = nullptr;
     const LoopMemoryAccess *Sink = nullptr;
     LoopDependenceKind Kind = LoopDependenceKind::Unknown;
-    // Loops and DirectionMasks are parallel arrays, ordered outer-to-inner
-    // (preorder for an imperfect loop tree).
+
     std::vector<Loop *> Loops;
     std::vector<uint8_t> DirectionMasks;
     bool Exact = false;
 };
 
-// Function-scoped dependence information used by loop distribution and loop
-// interchange.  The analysis intentionally proves only a conservative core:
-// distinct locations through BasicAA, affine typed GEP coordinates, and axes
-// that address equality forces to the same iteration.  Unsupported pointer
-// arithmetic and calls become barriers instead of speculative dependences.
+// 函数级结果按循环惰性缓存摘要，并为交换、分布和调度提供保守合法性证明。
 class LoopDependenceInfo {
 public:
     using InstructionSet = std::unordered_set<Instruction *>;
@@ -95,36 +82,26 @@ public:
     const std::vector<LoopMemoryAccess> &getMemoryAccesses(Loop *L);
     const std::vector<LoopDependenceRecord> &getDependences(Loop *L);
 
-    // This compact legality rule accepts an interchange only when every
-    // potentially conflicting access pair is forced equal on at least one of
-    // the two exchanged axes.
     bool isInterchangeLegal(Loop *Outer, Loop *Inner);
 
-    // Splitting First before Second reverses only Second(i) -> First(j)
-    // relationships.  Such a conflict is safe here only when L is forced
-    // equal, so no cross-iteration relationship can be reversed.
     bool isDistributionLegal(Loop *L, const InstructionSet &First,
                              const InstructionSet &Second);
 
-    // 判断两个可能冲突的访问是否只能发生在 L 的同一次迭代中。
-    // 无写冲突或已经证明 NoAlias 时也返回 true。
     bool isConflictLocalToIteration(Instruction *A, Instruction *B,
                                     Loop *L);
 
-    // 仅供循环调度：在固定同一 Scope 外层实例时，证明不随
-    // VaryingLoop 变化的访问与该内层循环写访问始终不相交。
     bool isInvariantAccessDisjointFromLoopWrite(
         Instruction *Invariant, Instruction *Write,
         Loop *Scope, Loop *VaryingLoop);
 
-    // Signed byte displacement of I's pointer for one iteration of L.  Zero
-    // means loop-invariant; nullopt means non-affine or arithmetic overflow.
     std::optional<int64_t> getByteStride(Instruction *I, Loop *L);
 
     bool hasUnknownMemory(Loop *L);
     bool invalidate(Function &F, const PreservationStatus &PA);
 
 private:
+
+    // 单循环摘要同时保存访问、访问对依赖和无法精确建模的内存屏障标志。
     struct LoopSummary {
         std::vector<LoopMemoryAccess> Accesses;
         std::vector<LoopDependenceRecord> Dependences;
@@ -169,6 +146,7 @@ private:
                                 const LoopMemoryAccess &B);
 };
 
+// Pass 入口组合 LoopInfo、SCEV 与 BasicAA，具体循环摘要在查询时构建。
 class LoopDependenceAnalysis
     : public AnalysisDescriptor<LoopDependenceAnalysis> {
 public:

@@ -9,10 +9,11 @@
 
 #include <vector>
 
-// If-conversion executes both arm computations before the select.  Use an
-// allow-list rather than a side-effect deny-list so a newly-added instruction
-// cannot accidentally become speculatable by default.
+ 
+ 
+ 
 bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
+	// 2.1 白名单只接纳无副作用且不会新增陷阱/毒值的指令；移位还需常量位数合法。
 	if (!I) return false;
 	switch (I->instType) {
 		case Instruction::ADD:
@@ -39,18 +40,19 @@ bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 		case Instruction::SITOFP:
 		case Instruction::BITCAST:
 			return true;
-		// Loads/calls/stores can fault, diverge or expose memory effects.  All
-		// integer/FP divisions and remainders are also excluded: besides their
-		// latency, integer division may observe a zero divisor on the untaken
-		// arm.  FPTOSI is excluded because NaN/out-of-range inputs do not have a
-		// defined integer result; SITOFP remains safe for every i32.  Unknown/new
-		// opcodes remain non-speculatable by default.
+		 
+		 
+		 
+		 
+		 
+		 
 		default:
 			return false;
 	}
 }
 
 int IfConversionPass::instructionCost(const Instruction *I) {
+	// 2.2 用简化代价模型限制被无条件执行的工作量，浮点与转换操作提高权重。
 	if (!I) return 1000;
 	switch (I->instType) {
 		case Instruction::MUL:
@@ -97,9 +99,11 @@ bool IfConversionPass::checkBlockConvertible(BasicBlock *BB) {
 	return true;
 }
 
-// 仅允许候选块中的指令被本块内部或 Succ 的 PHI 使用，
-// 防止将分支内部计算无约束上提，造成性能/语义风险。
+ 
+ 
 bool IfConversionPass::usersAreSafeForHoist(BasicBlock *BB, BasicBlock *Succ) {
+	// 2.3 分支内定义只能在本分支继续使用，或作为汇合块 PHI 的 incoming；
+	// 这样把指令上提到控制块后不会产生跨区域的 SSA 可见性变化。
 	if (!BB || !Succ) return false;
 	for (Instruction *I : *BB) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
@@ -130,6 +134,8 @@ bool IfConversionPass::hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *
 }
 
 bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
+	// 1. 从候选臂反向识别 triangle/diamond：控制块条件跳转，两臂至多各一块，
+	// 且最终汇合块的前驱必须与该形态精确一致。
 	if (!TrueBB) return false;
 
 	auto Preds = TrueBB->getPredecessors();
@@ -139,11 +145,11 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	BasicBlock *Pred = Preds[0];
 	BasicBlock *Succ = Succs[0];
 	if (!Pred || !Succ) return false;
-	// A convertible triangle/diamond is an acyclic local region.  Allowing
-	// Succ == Pred would misclassify a loop backedge as the merge edge; moving
-	// the arm into Pred can then create a self-referential select and destroy
-	// the loop CFG.  The optional else block is checked against the same three
-	// blocks below, so this makes every region block pairwise distinct.
+	 
+	 
+	 
+	 
+	 
 	if (Pred == TrueBB || Succ == TrueBB || Succ == Pred) return false;
 
 	BrInst *PredBr = Pred->getBranchTerminator();
@@ -161,12 +167,12 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	bool HasElse = false;
 	bool CondTrueToTrueBB = false;
 
-	// 情况 1: 一个分支到 True，另一个直接到 Succ（无 else）。
+	 
 	if ((Dest0 == TrueBB && Dest1 == Succ) || (Dest1 == TrueBB && Dest0 == Succ)) {
 		CondTrueToTrueBB = (Dest0 == TrueBB);
 		HasElse = false;
 	} else {
-		// 情况 2: 一个分支到 True，另一个到 Else；Else 必须是单前驱单后继并指向同一个 Succ。
+		 
 		if (Dest0 == TrueBB && Dest1 != Succ) {
 			ElseBB = Dest1;
 			HasElse = true;
@@ -196,30 +202,33 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 		if (ElseBr->getSuccessor(0) != Succ) return false;
 	}
 
-	// 仅处理标准三角/菱形：Succ 不能有额外前驱（例如循环回边）。
+	 
 	if (HasElse) {
 		if (!hasExactPreds(Succ, TrueBB, ElseBB)) return false;
 	} else {
 		if (!hasExactPreds(Succ, TrueBB, Pred)) return false;
 	}
 
+	// 2. 验证两臂可安全推测执行、没有内部 PHI，且所有外部用户均由汇合 PHI 承接。
 	if (!checkBlockConvertible(TrueBB)) return false;
 	if (HasElse && !checkBlockConvertible(ElseBB)) return false;
 
-	// 按算法前提：候选块单前驱，规范 IR 下不应含 PHI。
-	// 这里作为结构化前置条件显式约束，避免后续搬移出现非法位置。
+	 
+	 
 	if (!TrueBB->collectPhiNodes().empty()) return false;
 	if (HasElse && !ElseBB->collectPhiNodes().empty()) return false;
 
 	if (!usersAreSafeForHoist(TrueBB, Succ)) return false;
 	if (HasElse && !usersAreSafeForHoist(ElseBB, Succ)) return false;
 
-	// 没有 PHI 的汇合块不做 IfConversion：收益低，且常引入无谓投机执行。
+	 
+	// 3. 汇合块必须确有二元 PHI，并且每个 incoming 都来自预期两条边且不在
+	// 汇合块内部定义；这些 PHI 将逐一转换成 select。
 	auto SuccPhis = Succ->collectPhiNodes();
 	if (SuccPhis.empty()) return false;
 
-	// 不为结构不完整的 PHI 凭空制造 undef。精确两前驱的
-	// diamond/triangle 中，每个 PHI 都必须每条边恰好一个 incoming。
+	 
+	 
 	BasicBlock *OtherArmBB = HasElse ? ElseBB : Pred;
 	for (PhiInst *Phi : SuccPhis) {
 		if (!Phi || Phi->getNumIncomingValues() != 2 ||
@@ -228,10 +237,10 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 		Value *TrueIncoming = Phi->getIncomingFromPred(TrueBB);
 		Value *OtherIncoming = Phi->getIncomingFromPred(OtherArmBB);
 		if (!TrueIncoming || !OtherIncoming) return false;
-		// A loop-carried PHI may refer to itself (or another PHI in the same
-		// header).  Replacing it with a select inserted in Pred would then make
-		// the select self-referential or fail to dominate the old header uses.
-		// Such values cannot occur in an acyclic if-region and are rejected.
+		 
+		 
+		 
+		 
 		auto IsDefinedInMerge = [Succ](Value *V) {
 			auto *I = dynamic_cast<Instruction *>(V);
 			return I && I->getParent() == Succ;
@@ -241,10 +250,11 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 			return false;
 	}
 
+	// 4. 最后应用代码尺寸与加权成本预算，避免消除分支却增加过多无条件计算。
 	int InstCnt = countCandidateInsts(TrueBB) + (HasElse ? countCandidateInsts(ElseBB) : 0);
 	if (InstCnt > 4) return false;
-	// PHI 原本是边上拷贝，转成 select 后是真实指令。将 select
-	// 也纳入成本，防止“空分支 + 大量 PHI”反而显著增加代码。
+	 
+	 
 	int WeightedCost = candidateCost(TrueBB) +
 		(HasElse ? candidateCost(ElseBB) : 0) +
 		static_cast<int>(SuccPhis.size());
@@ -262,6 +272,7 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 }
 
 bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
+	// 5. 先完成整套模式与合法性检查，之后的 CFG/SSA 改写不再允许部分失败。
 	IfConvMatch M;
 	if (!matchPattern(TrueBB, M)) return false;
 
@@ -279,7 +290,8 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 
 	auto Phis = M.Succ->collectPhiNodes();
 
-	// 删除 Pred 原条件分支后，按顺序拼接搬移指令和 select，最后补无条件跳转。
+	 
+	// 5.1 删除条件分支，把两臂的可推测指令按原有臂内顺序移到控制块。
 	delete M.PredBr;
 
 	for (Instruction *I : ToMove) {
@@ -287,15 +299,16 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 		M.Pred->pushBack(I);
 	}
 
+	// 5.2 根据条件边方向构造 select 替换汇合 PHI，随后建立直达汇合块的边。
 	for (PhiInst *Phi : Phis) {
 		if (!Phi) continue;
 
 		Value *VFromTrueBB = Phi->getIncomingFromPred(M.TrueBB);
 		BasicBlock *OtherArmBB = M.HasElse ? M.ElseBB : M.Pred;
 		Value *VFromOtherArm = Phi->getIncomingFromPred(OtherArmBB);
-		// matchPattern proved both incoming values exist; unlike the old path,
-		// malformed PHIs are rejected before any CFG mutation instead of being
-		// repaired with undef.
+		 
+		 
+		 
 
 		Value *SelTrueV = M.CondTrueToTrueBB ? VFromTrueBB : VFromOtherArm;
 		Value *SelFalseV = M.CondTrueToTrueBB ? VFromOtherArm : VFromTrueBB;
@@ -307,6 +320,7 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 
 	M.Pred->genUnCondInst(M.Succ);
 
+	// 5.3 SSA 用户已重连，安全删除失去入口的臂块及其旧终结指令。
 	M.TrueBB->eraseBlockSafely();
 	if (M.HasElse) {
 		M.ElseBB->eraseBlockSafely();
@@ -318,6 +332,7 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	(void)FAM;
 
+	// 1—5. 每轮只转换一个候选并重新快照 CFG，避免一次改写让后续块指针或前驱信息陈旧。
 	bool ChangedAny = false;
 	while (true) {
 		bool Changed = false;
@@ -338,6 +353,7 @@ PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManage
 
 	if (!ChangedAny) return PreservationStatus::all();
 
+	// 6. 分支、基本块和数据流均已变化，失效所有依赖 CFG/内存可达性的函数分析。
 	PreservationStatus PA;
 	PA.discard<DominantAnalysis>();
 	PA.discard<PostDominantAnalysis>();

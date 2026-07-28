@@ -5,7 +5,6 @@
 #include "ir/analysis/SideEffect.hpp"
 
 #include <unordered_set>
-
 MemoryAccess::MemoryAccess(Kind K, unsigned AccessID, BasicBlock *BB,
                            Instruction *I)
     : AccessKind(K), ID(AccessID), Block(BB), Inst(I) {}
@@ -105,6 +104,7 @@ MemoryAccess *MemorySSAResult::getBlockExit(BasicBlock *BB) const {
     return It == BlockExits.end() ? nullptr : It->second;
 }
 
+// Walker 的单步判定：Store 交给 BasicAA，Call 结合 ModRef 摘要；未知 Def 一律视为写。
 bool MemorySSAResult::mayClobber(
     MemoryAccess *Access, const MemoryLocation &Location,
     BasicAAResult &AA, const LoopInfo &LI,
@@ -114,6 +114,7 @@ bool MemorySSAResult::mayClobber(
     Instruction *I = Access->getInstruction();
     if (!I) return true;
 
+    // 1. Store 使用带访问宽度的别名查询，只有明确 NoAlias 才可跳过。
     if (auto *SI = dynamic_cast<StoreInst *>(I)) {
         Value *StorePtr = SI->getPointerOperand();
         return !StorePtr ||
@@ -121,20 +122,16 @@ bool MemorySSAResult::mayClobber(
                    AliasInfo::NoAlias;
     }
 
+    // 2. Call 使用 ModRef 摘要；递归 SCC 中暂时的 NoModRef 还需检查指针实参别名。
     if (auto *CI = dynamic_cast<CallInst *>(I)) {
         ModRefInfo MRI = getInstModRefInfo(Location, I, AA, LI, FAM);
         if (isModSet(MRI)) return true;
 
-        // Side-effect summaries can be temporarily incomplete for a call
-        // graph SCC.  Do not let a false NoModRef result make an aliasing
-        // pointer argument transparent.  A proven readonly call remains
-        // transparent because its result is Ref rather than NoModRef.
         return isNoModRef(MRI) && !CI->getBuiltinCallee() &&
                AA.callMayAliasPointer(CI, Ptr, LI);
     }
 
-    // The builder currently creates Defs only for stores and calls.  Keep the
-    // fallback conservative if the IR grows another memory-writing opcode.
+    // 3. 构建器尚未识别的新 MemoryDef 种类一律视作潜在写入。
     return true;
 }
 
@@ -168,6 +165,7 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
         MaxVisitedAccesses);
 }
 
+// 最近写查询从给定内存状态反向遍历 Def/Phi 图，并汇合各路径的首个潜在写。
 MemoryAccess *MemorySSAResult::getClobberingAccess(
     MemoryAccess *Start, const MemoryLocation &Location, BasicAAResult &AA,
     const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
@@ -176,6 +174,7 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
         return nullptr;
 
     std::vector<MemoryAccess *> Worklist{Start};
+    // 1. visited 同时截断图环；访问数超过预算时不发布部分证明。
     std::unordered_set<MemoryAccess *> Visited;
     std::unordered_set<MemoryAccess *> FirstClobbers;
     bool BudgetExhausted = false;
@@ -212,22 +211,22 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
             Worklist.push_back(Incoming.second);
     }
 
+    // 2. 所有路径汇到同一首写时返回该访问，否则以 Phi 表示路径分歧。
     if (BudgetExhausted) return nullptr;
     if (FirstClobbers.size() == 1)
         return *FirstClobbers.begin();
 
-    // Start itself may be a Def/Use when every predecessor walk diverges.
-    // Prefer its defining Phi when available so clients cannot mistake an
-    // unrelated transparent Def for the clobber.
     if (Start->isPhi()) return Start;
     MemoryAccess *Defining = Start->getDefiningAccess();
     return Defining && Defining->isPhi() ? Defining : nullptr;
 }
 
+// 冗余写查询把候选 Store 当作归纳边，要求每条非递归路径都落到相同值的完整覆盖写。
 bool MemorySSAResult::isStoreValueRedundant(
     StoreInst *Store, BasicAAResult &AA, const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM,
     std::size_t MaxVisitedAccesses) const {
+    // 1. 验证候选写入的指针、值和覆盖宽度，拒绝 undef 与缺失的 MemoryDef。
     if (!Store || MaxVisitedAccesses == 0 ||
         !storeFullyCoversItsPointer(Store))
         return false;
@@ -241,9 +240,7 @@ bool MemorySSAResult::isStoreValueRedundant(
     Value *PointerRoot = Value::stripPointerCastsAndGEP(Ptr);
     if (!PointerRoot || PointerRoot->isUndef()) return false;
 
-    // MemorySSA is not iteration-sensitive.  Consequently, recognizing the
-    // candidate on a loop backedge as an inductive same-value definition is
-    // legal only when both operands are stable across that loop's iterations.
+    // 2. 若候选位于循环，指针和值必须对所有包含它的循环保持不变。
     Loop *InnermostLoop = LI.getLoopFor(Store->getParent());
     for (Loop *L = InnermostLoop; L;
          L = L->getParentLoop()) {
@@ -252,6 +249,7 @@ bool MemorySSAResult::isStoreValueRedundant(
             return false;
     }
 
+    // 3. 沿 MemorySSA 反向展开 Phi；读和不相交写透明，未知写或别名不确定立即失败。
     std::vector<MemoryAccess *> Worklist{Candidate->getDefiningAccess()};
     std::unordered_set<MemoryAccess *> Visited;
     bool SawConcreteSameValueStore = false;
@@ -265,12 +263,9 @@ bool MemorySSAResult::isStoreValueRedundant(
         if (Current->isLiveOnEntry()) return false;
 
         if (Current == Candidate) {
-            // Only a cycle represented by LoopInfo may be treated as an
-            // induction edge.  In an irreducible/unrecognised CFG cycle there
-            // is no loop-invariance proof for the dynamic pointer/value, so a
-            // self-supported MemoryDef must fail conservatively.
+
             if (!InnermostLoop) return false;
-            // This is the induction edge.  It is not a base proof by itself.
+
             continue;
         }
 
@@ -299,8 +294,6 @@ bool MemorySSAResult::isStoreValueRedundant(
                 continue;
             }
 
-            // MayAlias is not an overwrite proof.  MustAlias still needs an
-            // exact full-width store and the identical SSA value.
             if (AI != AliasInfo::MustAlias ||
                 !storeFullyCoversItsPointer(PreviousStore) ||
                 PreviousStore->getValueOperand() != StoredValue)
@@ -317,16 +310,15 @@ bool MemorySSAResult::isStoreValueRedundant(
                 (isNoModRef(MRI) && !CI->getBuiltinCallee() &&
                  AA.callMayAliasPointer(CI, Ptr, LI)))
                 return false;
-            // Ref-only calls do not change the value being proved.
+
             Worklist.push_back(Current->getDefiningAccess());
             continue;
         }
 
-        // Unknown MemoryDef kind.
         return false;
     }
 
-    // Reject a self-supported loop with no concrete entry definition.
+    // 4. 自支撑回边不能充当基础事实，至少需要一条具体的同值前驱写。
     return SawConcreteSameValueStore;
 }
 
@@ -338,22 +330,22 @@ bool MemorySSAResult::invalidate(Function &F,
 
 PassID MemorySSAAnalysis::Key;
 
+// MemorySSA 主流程以 O(B+E+I) 构建统一内存状态图，不需要 CFG 固定点。
 MemorySSAResult MemorySSAAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
     (void)FAM;
     MemorySSAResult Result;
+    // 1. 创建 LiveOnEntry，并为每个基本块预建入口 MemoryPhi。
     Result.LiveOnEntry =
         Result.createAccess(MemoryAccess::Kind::LiveOnEntry);
 
-    // A block-entry Phi for every block avoids iterative construction and is
-    // still linear in the CFG size.  Trivial one-input Phis are intentionally
-    // retained: they are cheap and let clients use one uniform graph API.
     for (BasicBlock *BB : F) {
         if (!BB) continue;
         Result.BlockEntries[BB] =
             Result.createAccess(MemoryAccess::Kind::Phi, BB);
     }
 
+    // 2. 按块内顺序连接 Load Use 与 Store/Call Def，记录每个块的出口状态。
     for (BasicBlock *BB : F) {
         if (!BB) continue;
         MemoryAccess *Current = Result.BlockEntries[BB];
@@ -377,17 +369,12 @@ MemorySSAResult MemorySSAAnalysis::run(
         Result.BlockExits[BB] = Current;
     }
 
-    // All exits now exist, so CFG order (including backedges and irreducible
-    // SCCs) does not matter when wiring block-entry states.
+    // 3. 所有出口就绪后回填入口 Phi；入口块和无前驱块额外接入 LiveOnEntry。
     for (BasicBlock *BB : F) {
         if (!BB) continue;
         MemoryAccess *Entry = Result.BlockEntries[BB];
         std::vector<BasicBlock *> Preds = BB->getPredecessors();
-        // The function entry has an implicit predecessor representing the
-        // memory state at each invocation even when a CFG backedge targets
-        // the entry block.  Omitting that edge lets loop-carried stores
-        // incorrectly use one another as the only base proof.  Unreachable
-        // predecessor-free blocks likewise start from an unknown state.
+
         if (BB == F.front() || Preds.empty()) {
             Entry->IncomingAccesses.push_back({nullptr, Result.LiveOnEntry});
         }

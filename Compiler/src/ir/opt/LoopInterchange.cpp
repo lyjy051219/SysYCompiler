@@ -23,6 +23,7 @@
 
 namespace {
 
+// 2.2/3.1 递归检查循环域控制切片：规范 PHI 是回边边界，其起点、更新和退出比较仍须逐项排除 undef。
 bool controlSliceContainsUndef(
     Value *Root, const std::unordered_set<Value *> &CanonicalPhis,
     std::unordered_set<Value *> &Active,
@@ -76,9 +77,6 @@ bool loopDomainContainsUndef(Loop *L, SCEVResult &SE) {
         CanonicalPhis.insert(Desc->Phi);
     }
 
-    // 规范 PHI 作为已单独检查的递归边界；其起点、更新和退出比较仍逐一
-    // 追溯。这样既不会在合法回边上无限递归，也不会让 undef 来源穿过
-    // 循环控制链并在交换后获得不同的动态求值次数。
     std::unordered_set<Value *> Active;
     std::unordered_set<Value *> KnownSafe;
     for (const DomainControl &Domain : Domains) {
@@ -94,7 +92,7 @@ bool loopDomainContainsUndef(Loop *L, SCEVResult &SE) {
     return false;
 }
 
-} // 匿名命名空间
+}
 
 bool LoopInterchangePass::expressionKeysEqual(
     const SCEVExpr *A, const SCEVExpr *B) {
@@ -161,9 +159,7 @@ bool LoopInterchangePass::sameIterationDomain(
         return false;
     }
 
-    // Equal trip counts alone are not sufficient: two translated domains can
-    // have the same size but enumerate different IV values.  Match start and
-    // step as well, using SCEV's interned canonical spelling.
+    // 3.1 不只比较 trip count：还必须比较 SCEV 规范化后的起点和步长，防止长度相同但坐标平移的循环被错交换。
     if (!expressionKeysEqual(OuterDesc->Start, InnerDesc->Start) ||
         !expressionKeysEqual(OuterDesc->Step, InnerDesc->Step) ||
         !expressionKeysEqual(OuterTrip->TripCount, InnerTrip->TripCount) ||
@@ -201,9 +197,7 @@ bool LoopInterchangePass::hasUnsupportedDescendantDomain(
             !Trip->Bound || loopDomainContainsUndef(Sub, SE)) {
             return true;
         }
-        // 角色交换会改写整个内层子树中的归纳变量使用，后代循环依赖被交换轴
-        // 的起点或上界也会随之改写，因此三角域本身不是拒绝理由。这里只拒绝
-        // 无法由 SCEV 完整描述的后代域，最终合法性仍由循环依赖分析证明。
+        // 3.1 后代循环可以依赖待交换的轴；本阶段只要求其域能由 SCEV 完整表达，真正的次序合法性留给依赖分析。
         if (hasUnsupportedDescendantDomain(Sub, SE)) {
             return true;
         }
@@ -255,16 +249,13 @@ bool LoopInterchangePass::collectSinkablePrefix(Candidate &C) {
         C.SinkablePrefix.push_back(I);
     }
 
-    // Every value we sink must be private to the selected inner subtree (or
-    // feed another member of the same prefix).  Otherwise retaining the old
-    // computation and cloning a role-swapped copy would give two consumers
-    // different interpretations of the same source-level axis.
+    // 3.2 从内循环 preheader 收集依赖外 IV 的纯计算前缀，并限制克隆数量以控制代码增长。
+    // 3.2.1 每个下沉值只能流向同一前缀或选中的内循环子树，以保证旧计算与新角色不会同时被外部观察。
     for (Instruction *I : C.SinkablePrefix) {
         for (Use *U : I->getUses()) {
             auto *UserI = dynamic_cast<Instruction *>(U ? U->getUser() : nullptr);
             if (!UserI) return false;
-            // A header PHI consumes its outside value on the preheader edge;
-            // a clone inserted in the header body cannot dominate that use.
+            // 3.2.2 内循环头 PHI 在 preheader 边上消费值，插在头块正文的克隆无法支配该使用。
             if (dynamic_cast<PhiInst *>(UserI) &&
                 UserI->getParent() == C.Inner->getHeader()) {
                 return false;
@@ -289,8 +280,7 @@ bool LoopInterchangePass::collectRoleUses(Candidate &C) {
         if (SinkSet.count(UserI)) continue;
         if (!isInstructionInBlocks(UserI, C.InnerBlocks)) return false;
         if (C.InnerControl.count(UserI)) return false;
-        // An inner-header PHI consumes its outside incoming value on the
-        // preheader edge, where InnerIV is not available.
+        // 3.3 外 IV 的负载使用不能落在内头 PHI 的入边上，因为交换后的内 IV 在该边尚不可用。
         if (dynamic_cast<PhiInst *>(UserI) &&
             UserI->getParent() == C.Inner->getHeader()) {
             return false;
@@ -386,8 +376,7 @@ bool LoopInterchangePass::validateNestShape(
         return false;
     }
 
-    // Every progressing outer iteration must pass through the inner loop.
-    // The zero-trip edge of the outer loop is intentionally allowed.
+    // 3.4 结构门禁：每个真正进展的外层迭代都必须经过内循环，但保留外循环零次执行的旁路。
     if (!DT.dominates(C.Outer->getHeader(), C.Inner->getHeader()) ||
         !DT.dominates(C.Inner->getHeader(), OuterLatch) ||
         !PDT.isReachableToExit(C.Outer->getHeader()) ||
@@ -395,9 +384,7 @@ bool LoopInterchangePass::validateNestShape(
         return false;
     }
 
-    // Calls are barriers for this first implementation.  Direct outer-loop
-    // stores/loads would be statements outside the permuted inner domain and
-    // therefore make the nest imperfect in a semantically relevant way.
+    // 3.4.1 外层直属块不得有访存，整个嵌套不得有调用，避免交换改变不完美语句的执行次数或可观察顺序。
     for (BasicBlock *BB : C.Outer->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -434,9 +421,7 @@ bool LoopInterchangePass::applyCandidate(Function &F, Candidate &C) {
         VMap[OldI] = NewI;
     }
 
-    // Complete every fallible validation before attaching clones or changing
-    // uses.  The commit phase below is then infallible and cannot leave a
-    // partially interchanged loop while reporting unchanged.
+    // 3.5 预提交：克隆前缀保持游离，并重新核验值映射和 use 快照；任一检查失败都销毁全部游离指令。
     for (Instruction *OldI : C.SinkablePrefix) {
         auto It = VMap.find(OldI);
         if (It == VMap.end() ||
@@ -458,12 +443,10 @@ bool LoopInterchangePass::applyCandidate(Function &F, Candidate &C) {
         }
     }
 
-    // insertAfterPhiNodes always inserts at the front of the non-PHI range;
-    // inserting in reverse retains the prefix's dependency order.
+    // 3.6 提交克隆：insertAfterPhiNodes 总是放在非 PHI 区间首部，因此逆序插入才能保持前缀内的定义顺序。
     for (auto It = Clones.rbegin(); It != Clones.rend(); ++It) {
         if (!C.Inner->getHeader()->insertAfterPhiNodes(*It)) {
-            // No mutation other than already attached pure clones occurred.
-            // Detach/delete all of them before reporting failure.
+            // 3.6.1 此时只可能挂接了纯克隆；先全部脱链再统一销毁，恢复到提交前状态。
             for (Instruction *Clone : Clones) {
                 if (Clone && Clone->getParent()) Clone->eraseFromParent();
             }
@@ -482,21 +465,13 @@ bool LoopInterchangePass::applyCandidate(Function &F, Candidate &C) {
         }
     }
 
-    // The snapshots were taken before either replacement, so changing one
-    // IV's uses cannot pollute the worklist for the other IV.
+    // 3.7 使用预先快照的 use 集合交换两轴，避免第一轮替换污染第二轮工作列表。
     for (Use *U : C.OuterUses)
         U->replaceUseeWith(C.InnerIV);
     for (Use *U : C.InnerUses)
         U->replaceUseeWith(C.OuterIV);
 
-    // A valid role swap often needs no sinkable-prefix clone.  In that common
-    // case the old instruction-only suffix above left no observable
-    // provenance at all, so IR audits incorrectly reported that interchange
-    // never fired.  Mark the complete inner payload region after the
-    // infallible commit.  Loop rotation may replace either selected header,
-    // while at least one payload block must survive every semantics-preserving
-    // cleanup.  Function order keeps the chosen identifiers deterministic;
-    // identifiers themselves do not participate in CFG or SSA semantics.
+    // 3.8 提交后给内层负载块加确定性标记；即使无前缀需要克隆，也能记录角色交换已发生，标记不参与 CFG/SSA 语义。
     for (BasicBlock *BB : F) {
         if (!BB || !C.Inner->contains(BB)) continue;
         BB->setIdent(F.makeUniqueBlockIdent(
@@ -524,9 +499,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
     BasicBlock *OuterLatch = nullptr;
     BasicBlock *Prefix = nullptr;
     BasicBlock *InnerBody = nullptr;
-    // 外循环可能由零次执行保护边直接跳到唯一出口。此时保护块并非经典
-    // 单后继 preheader，出口也会多出保护块前驱，但头块仍必须只有一个
-    // 循环内回边和一个循环外入口；其余边形状在下方逐项核验。
+    // 2.1 允许 guard 直接跳过零次外循环，但外头仍必须恰好有一条入边和一条回边；随后再逐边匹配固定 CFG 骨架。
     auto getGuardedLoopForm = [](Loop *L, BasicBlock *&Entry,
                                  BasicBlock *&Latch) {
         Entry = nullptr;
@@ -708,9 +681,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
         return I != Terminator && I->comesBefore(Terminator);
     };
 
-    // 交换会让旧内层条件先于旧外层头执行，因此无论 SCEV 是否推断零次
-    // 迭代，都精确保留原外层的第一次首部比较。这里只接受直接使用头部
-    // PHI 的比较，避免用数学 trip count 代替固定位宽 IR 的真实谓词。
+    // 2.2 交换后旧内条件会先执行，因此要保留原外循环的首次头部比较；只接受直接比较外 IV 的固定位宽谓词。
     Value *CmpLHS = OuterTrip->ExitCmp->getOperand(0);
     Value *CmpRHS = OuterTrip->ExitCmp->getOperand(1);
     const bool PhiOnLHS = CmpLHS == OuterDesc->Phi;
@@ -737,9 +708,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
         return false;
     }
 
-    // 交换后旧内层头会成为新外层头，其中的控制计算从“每个外轴一次”
-    // 变为“每个内轴一次”。只接受无访存、不可观察且不会故障的控制指令，
-    // 并验证所有跨块定义在保护块处已可用，避免 CFG 重排制造 use-before-def。
+    // 2.3 验证将成为新外头的控制计算：它们必须纯、不故障，且所有跨块定义在 guard 处可用，以维持支配不变量。
     for (Instruction *I : *InnerHeader) {
         if (!I || dynamic_cast<PhiInst *>(I) ||
             dynamic_cast<BrInst *>(I)) {
@@ -771,8 +740,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
         }
     }
 
-    // 物理交换会改变循环体的执行次序，动态分配、调用和未知可观察
-    // 指令不能只依靠内存依赖摘要放行。
+    // 2.4 语义门禁：除已建模的 load/store 外，任何分配、调用、返回或未知可观察指令都拒绝物理重排。
     for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -816,8 +784,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
     }
     if (PrefixLoads.empty() || LD.hasUnknownMemory(Outer)) return false;
 
-    // Prefix 改为随新内层轴重复执行。它的定义只能供仍被 Prefix
-    // 支配的块使用，且同块定义必须保持先定义后使用。
+    // 2.5 Prefix 会随新内轴重复：其操作数必须在 guard 处可用，结果只能流向仍受 Prefix 支配的内体或外 latch。
     for (Instruction *I : *Prefix) {
         if (!I || dynamic_cast<BrInst *>(I)) continue;
         for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
@@ -878,8 +845,7 @@ bool LoopInterchangePass::buildRotatedNestCandidate(
                 InnerEqual =
                     Record.DirectionMasks[I] == LoopDepSameIteration;
         }
-        // Prefix 的区间不相交证明只说明固定旧外轴时重复读取稳定，
-        // 不能代替跨旧外轴的标准方向向量门禁。
+        // 2.6 区间不相交只证明 Prefix 读取对固定外轴稳定；跨外轴仍要求依赖方向在外轴或内轴上为同次迭代。
         if (!OuterEqual && !InnerEqual) return false;
     }
 
@@ -1009,9 +975,8 @@ bool LoopInterchangePass::applyRotatedNestCandidate(
     KPre->genUnCondInst(C.OuterHeader);
     JLatch->genUnCondInst(C.InnerHeader);
 
-    // 所有可失败的结构与索引检查均在新块挂接前完成。
-    // 提交阶段只替换已存在的边和 PHI 前驱，不重写起点、步长
-    // 或上界，因此两个归纳变量的实际坐标不会偏移。
+    // 2.7 预提交已完成全部边索引与 PHI 入边校验；挂接四个辅助块后只执行已证明的边重定向。
+    // 2.7.1 新 CFG 保留原外头首次检查，且只改 PHI 前驱，不改两轴的起点、步长和上界。
     F.pushBlock(FirstCheck);
     F.pushBlock(JPre);
     F.pushBlock(KPre);
@@ -1052,6 +1017,7 @@ bool LoopInterchangePass::applyRotatedNestCandidate(
 
 PassResult LoopInterchangePass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1. 函数级预算耗尽时直接退出；否则一次获取结构、标量和依赖分析。
     if (TransformCount[&F] >= MaxInterchangesPerFunction)
         return PassResult::unchanged();
 
@@ -1062,12 +1028,14 @@ PassResult LoopInterchangePass::run(
     auto &LD = FAM.getResult<LoopDependenceAnalysis>(F);
 
     for (Loop *Inner : LI.getLoopsInPostOrder()) {
+        // 1.1 从内向外枚举直接父子循环，跳过已处理的头块对。
         Loop *Outer = Inner ? Inner->getParentLoop() : nullptr;
         if (!Outer || !Outer->getHeader() || !Inner->getHeader()) continue;
         HeaderPair Key{Outer->getHeader(), Inner->getHeader()};
         if (Transformed.count(Key)) continue;
 
         RotatedNestCandidate Rotated;
+        // 2. 物理交换覆盖旋转后固定形态；它改写 CFG，成功后立即返回并使所有分析失效。
         if (buildRotatedNestCandidate(
                 Outer, Inner, LI, SE, DT, PDT, LD, Rotated) &&
             applyRotatedNestCandidate(F, Rotated)) {
@@ -1079,6 +1047,7 @@ PassResult LoopInterchangePass::run(
         }
 
         Candidate C;
+        // 3. 角色交换路径依次证明同域、规范 PHI、可表达的后代域与 LoopSimplify 形态。
         C.Outer = Outer;
         C.Inner = Inner;
         if (!sameIterationDomain(Outer, Inner, SE, C.OuterIV, C.InnerIV))
@@ -1124,6 +1093,7 @@ PassResult LoopInterchangePass::run(
 
         if (!validateNestShape(C, LI, DT, PDT))
             continue;
+        // 3.4 依赖和收益门禁：内存必须可完整建模且方向向量允许交换，局部性改善达到阈值后才提交。
         if (LD.hasUnknownMemory(Outer))
             continue;
         if (!LD.isInterchangeLegal(Outer, Inner))
@@ -1141,6 +1111,7 @@ PassResult LoopInterchangePass::run(
         ++TransformCount[&F];
 
         PreservationStatus PA;
+        // 5. 角色交换不动 CFG，因此保留支配、后支配和循环结构；值语义、别名、MemorySSA 与依赖结果全部重算。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();

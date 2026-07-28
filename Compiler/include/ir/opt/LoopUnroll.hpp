@@ -58,9 +58,9 @@ struct UnrollConfig {
     int MaxGuardedPeelCount = 1;
     int PeelThreshold = 64;
     int MaxPeelBlocks = 24;
-    // 不变 store 的动态收益按目标机上一条普通内存写的成本估算。
+    // 3.2 由不变 store 触发 peeling 时，动态收益按每次可删写操作的抽象成本估算。
     int PeelStoreCost = 2;
-    // 只有动态收益严格覆盖克隆成本并留出该余量时，才允许由 store 触发剥离。
+    // 3.2.1 只有动态删写收益覆盖静态克隆成本并留出该净收益时，store 才能触发 peeling。
     int PeelMinNetBenefit = 1;
 
     int SCEVExpansionBudget = 8;
@@ -76,7 +76,7 @@ struct UnrollDecision {
     bool NeedRemainder = false;
     bool IsRuntime = false;
     bool IsPeeling = false;
-    // 运行时展开在物化迭代次数前必须具备无回绕证明。
+    // 3.5 运行时展开只在 trip count 的固定位宽计算已证明无回绕时才会进入执行阶段。
     bool TripCountIsProven = false;
 };
 
@@ -133,7 +133,7 @@ struct HeaderState {
     bool BackedgeIsOriginalPhi = false;
 };
 
-// PHI 重写统一采用“先收集并校验、再整体提交”的计划，避免留下半更新状态。
+// 4.2 PHI 重写先收集全部入边并校验前驱/类型，再整体替换旧 PHI，避免计划阶段留下半更新 SSA。
 struct PhiRewritePlan {
     PhiInst *OldPhi = nullptr;
     std::vector<PhiInst::IncomingEdge> Incoming;
@@ -141,6 +141,14 @@ struct PhiRewritePlan {
     PhiInst *NewPhi = nullptr;
 };
 
+// LoopUnroll 的整体流程：
+// 1. 快照 pass 入口时的循环头，从内向外尝试，跳过已变换头并将每次调用的成功数限制为四个。
+// 2. 候选必须是 LoopSimplify + LCSSA、唯一出口/退出块且全部指令可克隆，循环子树不得到达计时调用。
+// 3. 按完全展开、peeling、整除部分展开、带常量余数展开、运行时展开的优先级评估成本、trip/no-wrap、SCEV 和收益。
+// 4. 执行前按迭代克隆循环块、去除克隆 Header PHI 并建值映射；未提交失败会断开 use 并销毁全部克隆。
+// 5. 各执行路径分别重连迭代副本、重建 Header/Exit PHI，带余数和 runtime 路径还要建主循环组计数与 tail 副本。
+// 6. peeling 将若干克隆接到原循环之前；未证明足够长时保留每个克隆退出检查，并同步出口 PHI。
+// 7. 任一成功变换后立即失效全部函数分析，下一候选在重建的 Loop/DT/SCEV/AA/Range 结果上继续。
 class LoopUnrollPass : public PassDescriptor<LoopUnrollPass> {
 public:
     explicit LoopUnrollPass(UnrollConfig Config = UnrollConfig());
@@ -213,12 +221,11 @@ public:
 private:
     UnrollConfig Config;
 
-    // 循环流水线是复用同一 pass 对象的有界固定点。记录已经变换的原始
-    // 循环头，避免外层清理再次运行时把部分展开从 4 倍继续放大到 16 倍。
+    // 1.1 记录已成功的原循环头标识，阻止复用同一 pass 对象的固定点将部分展开反复倍增。
     std::unordered_map<Function *, std::unordered_set<std::string>>
         TransformedLoopHeaders;
 
-    // 剥离合法性、收益估算与失败回滚的通用辅助函数。
+    // 3.2/4.1 peeling 的不变 store 收益、runtime no-wrap 证明以及未提交克隆清理辅助函数。
     static bool containsUndef(
         Value *V, std::unordered_set<Value *> &Active, int Depth = 0);
     static bool isStructurallyLoopInvariant(
@@ -250,6 +257,7 @@ private:
     static int localSCEVNodeCost(const SCEVExpr *E);
     static std::optional<LoopExecutionShape> getLoopExecutionShape(
         Loop *L, SCEVResult &SE);
+    // 4.1 构造展开/剥离副本与每迭代值映射，同时折叠克隆 Header PHI。
     static bool canCloneAllInstructions(
         const std::vector<BasicBlock *> &Blocks);
     static Value *mapValueAtIteration(
@@ -283,6 +291,7 @@ private:
     static bool rewriteOriginalHeaderPhisForPartial(
         UnrolledBodyCore &Core, int LastIter,
         std::unordered_map<PhiInst *, Value *> *Replacements = nullptr);
+    // 4.2 规划 peeling 后原 Header PHI 和出口 PHI 的新前驱，支持只验证不提交模式。
     static bool rewriteOriginalHeaderPhisAfterPeeling(
         PeeledBodyCore &Core, bool ValidateOnly = false,
         std::unordered_map<PhiInst *, Value *> *Replacements = nullptr);
@@ -319,6 +328,7 @@ private:
     static bool makeStraightLineMain(
         UnrolledBodyCore &Core, int MainCount, BasicBlock *FinalTarget,
         Value *ContinueCondition);
+    // 3.5/5.3 证明并物化 runtime trip-count SCEV，只在操作数可用且运算不会新增故障时上提。
     static Value *makeTypedIntConstant(
         int64_t V, std::shared_ptr<IRType> Ty);
     static bool isValueAvailableAtPreheader(
@@ -327,8 +337,7 @@ private:
     static bool canMaterializeSCEV(
         const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
         const DominatorTree &DT);
-    // SCEV 的 Div/Mod 只有在除数为通用安全常量时才允许搬到预头；
-    // 未证明的动态除数、零和 -1 都保留在原控制流中。
+    // 5.3.1 SCEV Div/Mod 只在除数是非 0/-1 常量时物化，禁止把动态故障或有符号溢出风险提前到 preheader。
     static bool hasSafeSCEVDivisor(const SCEVExpr *E);
     static Value *materializeSCEV(
         const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,

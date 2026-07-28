@@ -14,6 +14,7 @@
 class BlockInfo;
 struct AllocaInfo;
 
+// 显式支配树 DFS frame：记录下一个子节点及本块为每个 alloca 压入值栈的次数。
 struct Mem2RegRenameFrame {
     DominatorNode *Node = nullptr;
     DominatorNode *ChildIter = nullptr;
@@ -21,6 +22,9 @@ struct Mem2RegRenameFrame {
     bool Processed = false;
 };
 
+// 流程：1. 筛选直接标量 load/store 且不跨计时屏障的入口 alloca；
+// 2. 先走无 PHI 快速路径；3. 以活跃性裁剪 IDF 并放置 PHI；
+// 4. 沿支配树重命名 load/store；5. 删除内存指令并迭代折叠退化 PHI。
 class PromotePass : public PassDescriptor<PromotePass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -33,14 +37,14 @@ private:
     bool rewriteSingleStoreAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
     bool rewriteSingleBlockAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
 
-    // 计算 alloca 的 live-in 块集合（用于 pruned phi placement）
+     
     void computeLiveInBlocks(
         AllocaInst* AI,
         const std::set<BasicBlock*>& DefBlocks,
         std::set<BasicBlock*>& LiveInBlocks,
         const std::unordered_map<BasicBlock*, std::vector<BasicBlock*>>& PredMap);
 
-    // LLVM-style IDF: 优先队列 + 支配子树 DFS，无需预计算全局 DF
+     
     void computeIDF(
         const std::set<BasicBlock*>& DefBlocks,
         const std::set<BasicBlock*>& LiveInBlocks,
@@ -48,10 +52,11 @@ private:
         DominatorTree& DT,
         const std::unordered_map<DominatorNode*, unsigned>& DomLevels);
 
-    // 简化 trivial phi 结点
+     
     bool simplifyPhiNode(PhiInst* Phi);
 };
 
+// 单个 alloca 的访问摘要，供唯一 store 与单块快速路径判定。
 struct AllocaInfo{
     std::vector<BasicBlock*> StoreBlocks;
     std::vector<BasicBlock*> LoadBlocks;
@@ -64,6 +69,7 @@ struct AllocaInfo{
     void AnalyzeAlloca(AllocaInst*AI);
 };
 
+// 按需缓存块内 alloca load/store 的相对次序；删除指令时同步驱逐索引。
 class BlockInfo{
     std::map<const Instruction*,unsigned> InstNum;
 public:

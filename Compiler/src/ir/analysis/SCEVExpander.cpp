@@ -2,7 +2,6 @@
 #include "lib/IRUtils.hpp"
 
 #include <limits>
-
 SCEVExpander::SCEVExpander(const Loop *Scope, BasicBlock *InsertBlock,
                            const DominatorTree &DT, unsigned Budget)
     : Scope(Scope), InsertBlock(InsertBlock), DT(DT), Budget(Budget) {}
@@ -19,6 +18,7 @@ bool SCEVExpander::isAvailable(Value *V) const {
     return I && I->getParent() && DT.dominates(I->getParent(), InsertBlock);
 }
 
+// 预检递归验证循环不变性、值可用性和可支持节点，并计算实际新增指令数。
 int SCEVExpander::estimateCostImpl(
     const SCEVExpr *E,
     std::unordered_set<const SCEVExpr *> &Active) const {
@@ -65,9 +65,7 @@ int SCEVExpander::estimateCostImpl(
     }
     case SCEVExprKind::Div:
     case SCEVExprKind::Mod:
-        // The current SCEV node does not encode signedness or the precise
-        // source division poison conditions.  Keep expansion disabled until
-        // those semantics are represented explicitly.
+
         Cost = -1;
         break;
     case SCEVExprKind::AddRec:
@@ -123,6 +121,7 @@ Instruction *SCEVExpander::insert(Instruction *I) {
     return I;
 }
 
+// 物化阶段复用子表达式缓存，按后序创建操作数，再在终结指令前插入当前节点。
 Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
     auto It = Cache.find(E);
     if (It != Cache.end()) return It->second;
@@ -186,17 +185,20 @@ Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
     return Result;
 }
 
+// 展开主流程：预检预算后尝试物化；中途失败则删除本次新增指令并恢复计数与缓存。
 Value *SCEVExpander::expand(const SCEVExpr *E) {
+    // 1. 预检拒绝不可支配、递推、除余语义不明确或超预算的表达式。
     if (!canExpand(E)) return nullptr;
+
+    // 2. 保存事务边界并递归插入全部子表达式。
     const unsigned OldInserted = Inserted;
     const std::size_t OldCreatedSize = Created.size();
     auto OldCache = Cache;
+
     Value *Result = expandImpl(E);
     if (Result) return Result;
 
-    // Preflight makes failure unusual, but keep the utility transactional if
-    // the insertion block changes shape or a future instruction constructor
-    // rejects an expression after some children were emitted.
+    // 3. 失败时仅回滚本次调用新增的指令，保留此前成功物化的结果。
     for (std::size_t I = Created.size(); I > OldCreatedSize; --I)
         delete Created[I - 1];
     Created.resize(OldCreatedSize);

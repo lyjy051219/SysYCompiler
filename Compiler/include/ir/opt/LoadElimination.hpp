@@ -13,6 +13,8 @@ class DominatorTree;
 class LoopInfo;
 struct MemoryLocation;
 
+// 前驱数据流的五态结果：已知值、需合成 PHI、确定被破坏、预算/环导致未知，
+// 以及块内无定义需继续查询前驱。
 struct LoadElimQueryResult {
     enum Kind {
         KNOWN,
@@ -34,12 +36,15 @@ struct LoadElimQueryResult {
         std::vector<std::pair<BasicBlock *, Value *>> M);
 };
 
+// 流程：1. 用 MemorySSA 快速转发最近 MustAlias store；2. 解析计划依赖后批量删除；
+// 3. 按支配序对剩余 load 做块内逆扫、前驱递归和跨回边全路径证明；
+// 4. 各路径值不同但均已知时在汇合块合成 PHI。
 class LoadEliminationPass : public PassDescriptor<LoadEliminationPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    // 反向路径扫描同时记录当前块是否只扫描目标 load 之前的前缀。
+     
     struct PathScanState {
         BasicBlock *BB = nullptr;
         bool TargetPrefixOnly = false;

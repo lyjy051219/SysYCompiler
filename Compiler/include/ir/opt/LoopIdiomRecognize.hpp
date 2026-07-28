@@ -14,11 +14,14 @@ class SCEVResult;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
 
-// Recognize a deliberately small, fully-provable subset of scalar memory
-// loops.  Constant and guarded runtime copy/fill loops become memcpy/memset;
-// memmove is emitted only for an adjacent two-loop transaction through a
-// private temporary.  The pass never guesses general dependence facts and
-// keeps the original scalar loop as the fallback for dynamic short lengths.
+ 
+ 
+ 
+ 
+ 
+// 流程：1. 由 SCEV 匹配单位步长连续访问；2. 区分 memset、memcpy 与临时数组双复制；
+// 3. 证明对象边界、无额外副作用及 trip count 安全；4. 常量次数直接替换，
+// 运行期次数建立有收益/溢出 guard 的 intrinsic fast path 并保留原循环慢路径。
 class LoopIdiomRecognizePass
     : public PassDescriptor<LoopIdiomRecognizePass> {
 public:

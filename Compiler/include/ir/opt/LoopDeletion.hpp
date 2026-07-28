@@ -14,6 +14,8 @@ class SCEVResult;
 class Value;
 struct LoopTripCountInfo;
 
+// 流程：1. 在 LCSSA/LoopSimplify 循环中证明 trip count 有限；2. 验证循环无可观察行为；
+// 3. 规划并全量覆盖 exit PHI 与循环外 use；4. preheader 绕过循环后分两阶段删块。
 class LoopDeletionPass : public PassDescriptor<LoopDeletionPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -21,7 +23,7 @@ public:
 private:
 	using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;
 
-	// 删除 CFG 前先收集并验证全部替换计划，保证失败时 IR 不变。
+	 
 	static bool isSafeToSkipOnZeroTrip(Instruction *I);
 	static bool hasNoObservableLoopInstruction(Loop *L);
 	static bool isProvablyFiniteStrictUnitStepLoop(

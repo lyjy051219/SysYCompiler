@@ -13,6 +13,7 @@
 
 bool LoopUnrollPass::isStructurallyLoopInvariant(
     Value *V, Loop *L, std::unordered_set<Value *> &Active) {
+    // 3.2.1 peeling 收益只使用结构不变的纯值链：排除 undef、PHI、访存、调用、分配和可故障运算，并用 Active 拒绝环。
     if (!V || !L || Value::isUndef(V)) return false;
     std::unordered_set<Value *> UndefActive;
     if (containsUndef(V, UndefActive, 0)) return false;
@@ -63,6 +64,7 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
         return Result;
     }
 
+    // 3.2.2 不变 store 分析先要求所有非退出内部分支条件结构不变，且循环子树不含任何调用。
     for (BasicBlock *BB : L->getBlocks()) {
         if (!BB) return {};
         auto *Br = BB->getBranchTerminator();
@@ -85,8 +87,7 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
             auto *SI = dynamic_cast<StoreInst *>(I);
             if (!SI) continue;
 
-            // 只有支配回边的 store 才能按“每个已完成迭代至少执行一次”
-            // 计入动态收益，不能用恒真或恒假的未知循环不变条件猜测热度。
+            // 3.2.3 候选 store 必须支配 latch，才能按“每个已完成迭代执行一次”计收益，不使用未知分支猜测频率。
             if (!DT.dominates(BB, OuterLatch)) continue;
 
             std::unordered_set<Value *> Active;
@@ -100,6 +101,7 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
                 continue;
             }
 
+            // 3.2.4 store 的地址和写入值均须结构不变，且循环内不存在与该地址可能别名的其他 store。
             bool HasCompetingMod = false;
             for (BasicBlock *OtherBB : L->getBlocksIncludingSubLoops()) {
                 if (!OtherBB) {
@@ -146,6 +148,7 @@ bool LoopUnrollPass::containsUndef(
     return !NoOperandContainsUndef;
 }
 
+// 4.1 未提交克隆的回滚不依赖析构顺序：先将仍被外部引用的克隆值转成 undef，再清空指令和块。
 void LoopUnrollPass::discardUncommittedPeelClones(PeeledBodyCore &Core) {
     std::vector<BasicBlock *> Blocks;
     std::unordered_set<BasicBlock *> Seen;
@@ -226,8 +229,7 @@ std::string LoopUnrollPass::makePeelBlockIdent(Function *F,
 bool LoopUnrollPass::isSupportedCloneInstruction(Instruction *I) {
     if (!I) return false;
 
-    // 展开和剥离都会复制循环体。计时调用及其封装调用不能被复制，
-    // 此处作为所有克隆路径共享的最后一道合法性检查。
+    // 2.2 所有展开/剥离路径共享该克隆门禁：计时调用及封装、ret、alloca 和未知二元指令不得被复制。
     if (auto *CI = dynamic_cast<CallInst *>(I)) {
         if (CI->mayReachTimingCall()) return false;
     }
@@ -259,6 +261,7 @@ Value *LoopUnrollPass::stripSimpleCast(Value *V) {
 }
 
 std::optional<PeelPredicate> LoopUnrollPass::matchCompareWithIV(BinaryInst *Cmp, Value *IV) {
+    // 3.2.5 穿过简单整数 cast 将内部分支规范化为 IV op Constant，再将首轮特化谓词映射为 1 或 2 次 peeling。
     Value *RawLHS = nullptr;
     Value *RawRHS = nullptr;
     if (!Cmp || !IV || !Cmp->getOperands(RawLHS, RawRHS))
@@ -341,6 +344,7 @@ int LoopUnrollPass::chooseFactorBySize(int BodyCost, int SizeLimit, int MaxCount
 }
 
 int LoopUnrollPass::localSCEVNodeCost(const SCEVExpr *E) {
+    // 3.5.1 runtime 候选用抽象节点成本约束 trip-count SCEV 的物化规模，递推节点和除/模成本更高。
     if (!E) return 1000000;
 
     switch (E->Kind) {
@@ -370,6 +374,7 @@ int LoopUnrollPass::localSCEVNodeCost(const SCEVExpr *E) {
 
 std::optional<LoopExecutionShape>
 LoopUnrollPass::getLoopExecutionShape(Loop *L, SCEVResult &SE) {
+    // 2.1 统一提取 PreHeader/Header/Latch/Exiting/Exit，后续克隆和五种执行路径都使用同一 CFG 视图。
     if (!L) return std::nullopt;
 
     BasicBlock *PreHeader = nullptr;
@@ -392,6 +397,7 @@ LoopUnrollPass::getLoopExecutionShape(Loop *L, SCEVResult &SE) {
 }
 
 bool LoopUnrollPass::canCloneAllInstructions(const std::vector<BasicBlock *> &Blocks) {
+    // 2.2.1 在创建任何副本前对全部指令做试克隆，保证块克隆不会因单条不支持指令中途失败。
     std::unordered_map<Value *, Value *> VMap;
     for (BasicBlock *BB : Blocks) {
         if (BB) VMap[BB] = BB;
@@ -430,7 +436,7 @@ bool LoopUnrollPass::isDataValue(Value *V) {
 
 bool LoopUnrollPass::isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
     if (!Phi || !isDataValue(V)) return false;
-    // 展开后的PHI输入需要完整类型一致，避免等大小的异形类型混入SSA。
+    // 4.2.1 所有重建 PHI 输入必须具有完整同形类型，不允许仅存储大小相等的异形值混入 SSA。
     return IRType::hasSameShape(Phi->getIRType(), V->getIRType());
 }
 
@@ -497,6 +503,7 @@ bool LoopUnrollPass::rebuildPhiFromIncomingChecked(
         }
     }
 
+    // 4.2.2 校验全部输入后再一次性提交：零入边替换为 undef，单入边折叠，多入边重建新 PHI。
     Value *Result = nullptr;
     if (Incoming.empty()) {
         Result = UndefValue::NewUndefValue(Phi->getIRType());
@@ -539,6 +546,7 @@ bool LoopUnrollPass::replaceDataOperandsUsingMap(
 }
 
 bool LoopUnrollPass::removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
+    // 4.1.1 展开副本中的 Header PHI 不再是循环入口，用前一迭代映射后的回边值替换并记入 ValueMap。
     if (Iter <= 0 || Iter >= Core.Count) return false;
 
     BasicBlock *OrigHeader = Core.Headers.front();
@@ -571,6 +579,7 @@ bool LoopUnrollPass::removeClonedHeaderPhis(UnrolledBodyCore &Core, int Iter) {
 }
 
 bool LoopUnrollPass::removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
+    // 4.1.2 剥离副本的第 0 次 Header PHI 取原 preheader 初值，后续副本取上一剥离迭代的回边值。
     if (Iter < 0 || Iter >= Core.PeelCount) return false;
 
     BasicBlock *OrigHeader = Core.Shape.Header;
@@ -614,6 +623,7 @@ bool LoopUnrollPass::removePeeledHeaderPhis(PeeledBodyCore &Core, int Iter) {
 
 std::optional<UnrolledBodyCore>
 LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
+    // 4.1 展开核心保留第 0 迭代为原循环，为 1..Count-1 克隆完整最内层循环区域并保存逐迭代值映射。
     if (!L || Count < 2 || !L->isInnermost()) return std::nullopt;
 
     auto Shape = getLoopExecutionShape(L, SE);
@@ -641,6 +651,7 @@ LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
     Core.Latches[0] = Shape->Latch;
     Core.Exitings[0] = Shape->Exiting;
     auto Fail = [&]() -> std::optional<UnrolledBodyCore> {
+        // 4.1.3 任一副本缺失关键块或 Header PHI 无法折叠时，销毁所有已建的额外迭代，原循环保持不变。
         discardUncommittedUnrollClones(Core);
         return std::nullopt;
     };
@@ -673,6 +684,7 @@ LoopUnrollPass::cloneUnrolledBodyCore(Loop *L, int Count, SCEVResult &SE) {
 
 std::optional<PeeledBodyCore>
 LoopUnrollPass::clonePeeledIterations(Loop *L, int PeelCount, SCEVResult &SE) {
+    // 4.1.4 peeling 不复用原循环作为第 0 副本，而是克隆 PeelCount 组完整迭代，以便将它们接到残余原循环之前。
     if (!L || PeelCount <= 0) return std::nullopt;
 
     auto Shape = getLoopExecutionShape(L, SE);
@@ -739,6 +751,7 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisForPartial(UnrolledBodyCore &Core,
                                                : nullptr;
     if (!Header || !OrigLatch || !LastLatch || LastIter <= 0) return false;
 
+    // 4.2.3 部分展开后原 Header 的回边不再来自原 Latch，而来自末副本 Latch 与映射后的末迭代状态。
     auto HeaderPhis = Header->collectPhiNodes();
     std::vector<PhiRewritePlan> Plans;
     Plans.reserve(HeaderPhis.size());
@@ -828,6 +841,7 @@ bool LoopUnrollPass::rewriteOriginalHeaderPhisAfterPeeling(
         return false;
     }
 
+    // 4.2.4 peeling 后删除原 preheader 初值入边，用最后剥离 Latch 与其映射后回边值作为残余循环新初值。
     auto HeaderPhis = Header->collectPhiNodes();
     std::vector<PhiRewritePlan> Plans;
     Plans.reserve(HeaderPhis.size());
@@ -902,6 +916,7 @@ bool LoopUnrollPass::removeIncomingFromExitPhisForPeeledBlocks(
     BasicBlock *Exit = Core.Shape.Exit;
     if (!Exit) return false;
 
+    // 6.3 已证明循环长度大于 PeelCount 时，克隆退出检查会被删除，对应的 Exit PHI 入边也必须移除。
     std::unordered_set<BasicBlock *> RemovedPreds;
     for (BasicBlock *BB : Core.Exitings) {
         if (BB) RemovedPreds.insert(BB);
@@ -939,6 +954,7 @@ bool LoopUnrollPass::addIncomingToExitPhisForPeeledBlocks(
         return false;
     }
 
+    // 6.2 未证明长度时每个剥离副本都保留短路退出，因此为 Exit PHI 添加每个克隆 Exiting 与映射值。
     std::vector<PhiRewritePlan> Plans;
     for (PhiInst *Phi : Exit->collectPhiNodes()) {
         if (!Phi) return false;
@@ -991,6 +1007,7 @@ bool LoopUnrollPass::rewriteExitPhisForSingleExiting(UnrolledBodyCore &Core,
     BasicBlock *ActiveExiting = Core.Exitings[ActiveIter];
     if (!Exit || !OrigExiting || !ActiveExiting) return false;
 
+    // 5.1 完全展开或 latch-tested 部分展开只保留一个有效退出副本，出口 PHI 删除其余 Exiting 入边并映射到 ActiveIter。
     auto RemovedPreds = collectCoreExitings(Core);
     auto ExitPhis = Exit->collectPhiNodes();
     for (PhiInst *Phi : ExitPhis) {
@@ -1053,6 +1070,7 @@ std::vector<ExitRegionDataUse> LoopUnrollPass::collectExitRegionDataUsesFrom(
     const std::unordered_set<BasicBlock *> &StopBlocks,
     BasicBlock *Exiting,
     bool StopAtConditionalBranch) {
+    // 5.3.1 在 CFG 重连前快照出口可达区域中的非 PHI 数据 use，后续按真正退出迭代的 ValueMap 改写。
     std::vector<ExitRegionDataUse> Uses;
 
     for (BasicBlock *BB : collectExitRegionBlocksFrom(
@@ -1120,7 +1138,7 @@ bool LoopUnrollPass::replaceDataOperandsInReachableRegionFrom(
     const std::unordered_map<Value *, Value *> &Replacements) {
     for (BasicBlock *BB :
          collectExitRegionBlocksFrom(Start, StopBlocks,
-                                     /*StopAtConditionalBranch=*/false)) {
+                                     false)) {
         if (!BB) continue;
         for (Instruction *I : *BB) {
             if (!replaceDataOperandsUsingMap(I, Replacements)) {
@@ -1216,6 +1234,7 @@ bool LoopUnrollPass::hasSafeSCEVDivisor(const SCEVExpr *E) {
 
 bool LoopUnrollPass::canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
                         const DominatorTree &DT) {
+    // 5.3.2 runtime SCEV 只允许 preheader 可用的常量/未知值和可安全组合的算术、比较、Min/Max/Cast，不物化任何递推节点。
     if (!E) return false;
     switch (E->Kind) {
     case SCEVExprKind::Constant:
@@ -1255,6 +1274,7 @@ Value *LoopUnrollPass::materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *P
     auto Cached = Cache.find(E);
     if (Cached != Cache.end()) return Cached->second;
 
+    // 5.3.3 递归物化时用 Cache 共享子表达式，所有新指令都插在选定 preheader 的终结指令之前。
     Value *Result = nullptr;
     if (E->Kind == SCEVExprKind::Constant) {
         Result = makeTypedIntConstant(E->ConstValue, E->Ty);
@@ -1459,6 +1479,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.3 带 tail 的公共引擎同时服务常量余数和 runtime 展开：MainCount 个副本组成主循环，TailCopies 个副本处理余数。
     auto PreCloneShape = getLoopExecutionShape(L, SE);
     if (!PreCloneShape || !PreCloneShape->Exit) {
         return LoopUnrollResult::Unmodified;
@@ -1470,9 +1491,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     const bool PreCloneLatchExiting =
         PreCloneShape->Exiting && PreCloneShape->Latch &&
         PreCloneShape->Exiting == PreCloneShape->Latch;
-    // 单块循环的 header、latch 与 exiting 是同一块，但它先执行循环体再
-    // 沿回边继续，语义上必须归入 latch-tested。两类若同时置真，后续
-    // CFG 会按 latch 连接，而 tail PHI 却会错误地按 header 选择前驱。
+    // 5.3.1 退出形态互斥分类：单块循环虽然 Header==Latch==Exiting，但它先执行循环体，必须归入 latch-tested，不能同时按 header-tested 接 tail PHI。
     const bool PreCloneHeaderExiting =
         !PreCloneLatchExiting && PreCloneShape->Exiting &&
         PreCloneShape->Header &&
@@ -1483,6 +1502,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
                                       PreCloneShape->Exiting,
                                       PreCloneHeaderExiting);
 
+    // 5.3.2 先快照出口区域 use，再一次克隆主副本和 tail 副本；在原 SSA/CFG 提交前的形状失败可销毁全部额外副本。
     auto Core = cloneUnrolledBodyCore(L, MainCount + TailCopies, SE);
     if (!Core) {
         return LoopUnrollResult::Unmodified;
@@ -1508,6 +1528,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.3.3 为每个原 Header PHI 快照初值、回边值和主组末状态，然后将原回边统一改为主组最后副本。
     std::vector<HeaderState> HeaderStates;
     for (PhiInst *Phi : Header->collectPhiNodes()) {
         Value *Initial = Phi->getIncomingFromPred(PreHeader);
@@ -1553,6 +1574,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
                                       HeaderValueReplacements);
     }
 
+    // 5.3.4 TailEntry 是主循环与余数副本的分派/状态合流点；runtime 路径还在此合并“零个主组”和“完成主组”的 Header 状态。
     auto *TailEntry = new BasicBlock();
     std::string TailBase =
         Header->getIdent() +
@@ -1602,6 +1624,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         }
     }
 
+    // 5.3.5 GroupPhi 在原 Header 计数已完成的展开组，每组结尾的 NextGroup 决定继续主循环还是进入 TailEntry。
     auto *GroupPhi = new PhiInst(NumGroups->getIRType());
     Value *Zero = makeTypedIntConstant(0, NumGroups->getIRType());
     Value *One = makeTypedIntConstant(1, NumGroups->getIRType());
@@ -1615,6 +1638,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
     BasicBlock::insertBeforeTerminator(MainLast, NextGroup);
     GroupPhi->addIncoming(NextGroup, MainLast);
 
+    // 5.3.6 latch-tested 主组删除前 MainCount-1 个退出检查并直连下一副本；header-tested 主组则保留第一头检查作为组计数门禁。
     if (LatchExiting) {
         auto *MoreGroups =
             new BinaryInst(NextGroup, BinaryInst::L, NumGroups);
@@ -1660,6 +1684,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         }
     }
 
+    // 5.3.7 常量余数将 tail 副本全部直线连接；runtime 则在每个非末副本后比较 Remainder 决定继续或退出。
     for (int Tail = 0; Tail < TailCopies; ++Tail) {
         int Iter = MainCount + Tail;
         BasicBlock *TailExiting =
@@ -1709,6 +1734,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         }
     }
 
+    // 5.3.8 重建 Exit PHI：runtime 同时合流零主组、主组无 tail 和每个 tail 退出；常量余数只保留最后 tail 副本。
     auto RemovedPreds = collectCoreExitings(*Core);
     auto ExitPhis = Exit->collectPhiNodes();
     for (PhiInst *Phi : ExitPhis) {
@@ -1789,6 +1815,7 @@ LoopUnrollResult LoopUnrollPass::executeUnrollWithTail(
         }
     }
 
+    // 5.3.9 最后安装入口分派：runtime 先判断 NumGroups>0，TailEntry 再判断 Remainder!=0；常量余数则无条件进入第一 tail 副本。
     if (IsRuntime) {
         if (!RemainderValue) {
             return LoopUnrollResult::Unmodified;
@@ -1848,11 +1875,7 @@ const UnrollConfig &LoopUnrollPass::getConfig() const {
 PreservationStatus LoopUnrollPass::run(Function &F,
                                        FunctionAnalysisPassManager &FAM) {
     auto &AlreadyTransformed = TransformedLoopHeaders[&F];
-    // Capture only the loops present at pass entry.  A successful original
-    // header is remembered across invocations of this pass object, preventing
-    // an enclosing fixed point from multiplying one partial unroll again
-    // (4x -> 16x -> 32x).  Newly-created residual/remainder headers remain
-    // eligible in a later bounded round.
+    // 1. 只快照 pass 入口时存在且未记录的循环头；成功头跨调用保留，阻止 4x→16x 式重复倍增，新产生的残余头则留给后续有界轮次。
     std::vector<BasicBlock *> CandidateHeaders;
     {
         auto &InitialLI = FAM.getResult<LoopAnalysis>(F);
@@ -1865,19 +1888,12 @@ PreservationStatus LoopUnrollPass::run(Function &F,
 
     if (CandidateHeaders.empty()) return PreservationStatus::all();
 
-    // Keep whole-function code growth and analysis rebuild cost bounded.  A
-    // A function may contain dozens of individually profitable small loops;
-    // unrolling all of them in one pass can multiply compile time and IR
-    // size.  Four successful transforms per
-    // invocation still give broader coverage than the old one-loop limit,
-    // while the enclosing three-round pipeline retains a hard global budget.
+    // 1.1 每次调用最多成功四个循环，统一约束函数级代码增长和反复重建分析的编译成本。
     static constexpr size_t MaxTransformsPerRun = 4;
     size_t TransformCount = 0;
     bool Changed = false;
     for (BasicBlock *Header : CandidateHeaders) {
-        // An earlier full unroll of a containing loop may have erased this
-        // candidate.  Check membership using pointer identity only; never
-        // dereference a header until it is found in the live function list.
+        // 1.2 早先的外循环完全展开可能删除快照中的内头；在函数块列表中用指针身份确认存活前不解引它。
         bool HeaderIsLive = false;
         for (BasicBlock *BB : F) {
             if (BB == Header) {
@@ -1905,12 +1921,7 @@ PreservationStatus LoopUnrollPass::run(Function &F,
         ++TransformCount;
         SE.clear();
 
-        // The transform invalidates every Loop*/DT/SCEV reference above.
-        // Rebuild them before considering the next entry-snapshot loop.
-        // Cloning and rewiring CFG/memory invalidates every cached
-        // function analysis, including Range, BasicAA and MemorySSA.  Keeping
-        // any of them here would let the next candidate consume pre-clone
-        // facts.
+        // 7. 克隆和 CFG/内存改写使当前 Loop/DT/SCEV/Range/AA/MemorySSA 引用全部过期；处理下一个入口快照头前失效所有函数分析。
         FAM.invalidate(F, PreservationStatus::none());
 
         if (TransformCount >= MaxTransformsPerRun) break;
@@ -1930,8 +1941,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
         return LoopUnrollResult::Unmodified;
     }
 
-    // 循环展开会改变循环体静态副本数，剥离还会改变首轮执行位置。
-    // 计时调用（包括经用户函数间接到达的调用）所在循环一律不变换。
+    // 2. 单候选先扫描整个循环子树，任何直接或经用户函数可达的计时调用都禁止复制或改变首迭代位置。
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return LoopUnrollResult::Unmodified;
         for (Instruction *I : *BB) {
@@ -1942,6 +1952,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
         }
     }
 
+    // 2.1 依次证明规范 CFG/LCSSA、可用 trip-count 和全循环指令可克隆，再估算直属循环体成本。
     if (!isCanonicalLoop(L)) {
         return LoopUnrollResult::Unmodified;
     }
@@ -1965,6 +1976,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
     }
 
 
+    // 3. 决策完成后只分派到一条执行路径，执行阶段仍会重新核验与该路径相关的 trip/CFG 条件。
     switch (Decision.Kind) {
     case UnrollKind::Full:
         return executeFullUnroll(L, Decision, SE, LI, DT);
@@ -2095,7 +2107,7 @@ int LoopUnrollPass::estimateLoopBodyCost(Loop *L, LoopInfo &LI) const {
                 LocalCost = 1;
                 break;
             }
-            // 极大函数直接饱和到最大成本，避免成本累加发生有符号溢出。
+            // 2.3 代价以抽象指令单位饱和累加，防止超大循环的成本和发生有符号溢出。
             if (Cost > std::numeric_limits<int>::max() - LocalCost)
                 return std::numeric_limits<int>::max();
             Cost += LocalCost;
@@ -2212,10 +2224,12 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         return makeNoUnrollDecision();
     }
 
+    // 3. 决策器按固定优先级返回首个合法且资源受控的方案；调用和嵌套循环会限制后续部分/runtime 路径。
     bool HasCall = containsCall(L, LI);
     bool Nested = !L->isInnermost();
 
     if (Config.AllowFull && TCI.ProvenNoWrap && TCI.ConstantTripCount) {
+        // 3.1 完全展开优先：trip count 必须是已证 no-wrap 的小常量，展开总成本须在阈值内，有调用/嵌套时使用更严限制。
         int64_t TripCount = *TCI.ConstantTripCount;
         int64_t MaxCount = (BodyCost <= 4)
                                ? Config.TinyLoopFullUnrollMaxCount
@@ -2224,7 +2238,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         int FullLimit = Restricted ? Config.FullThreshold / 2
                                    : Config.FullThreshold;
 
-        // 先用统一的展开次数上限约束 trip count，再计算总代价，避免乘法溢出。
+        // 3.1.1 先用展开次数上限夹住 trip count，然后才计算 BodyCost*TripCount，避免代价乘法溢出。
         if (TripCount > 1 && TripCount <= MaxCount) {
             int64_t TotalCost =
                 static_cast<int64_t>(BodyCost) * TripCount;
@@ -2245,6 +2259,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     if (Config.AllowPeeling &&
         Config.PeelThreshold > 0 &&
         Config.MaxPeelBlocks > 0) {
+        // 3.2 peeling 次之：一方面匹配 IV==0/IV<1 等首轮特化谓词，另一方面统计剥离后可从残余循环删除的不变 store。
         auto IV = SE.getCanonicalInduction(L);
         int PeelCount =
             (IV && IV->Valid) ? detectPeelCount(L, *IV, Config) : 0;
@@ -2301,8 +2316,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
             PeelBlockCount <= Config.MaxPeelBlocks &&
             PeelCloneCost > 0 &&
             PeelCloneCost <= Config.PeelThreshold) {
-            // 当通用首轮谓词没有要求剥离时，仅允许已知精确迭代次数的
-            // 不变 store 收益触发一次剥离。未知迭代次数不作收益猜测。
+            // 3.2.1 若无首轮谓词需要 peeling，只有已证 no-wrap 的精确常量 trip count 才能用不变 store 动态收益触发一次剥离。
             if (PeelCount == 0 && TCI.ProvenNoWrap &&
                 TCI.ConstantTripCount &&
                 *TCI.ConstantTripCount > 1 &&
@@ -2328,8 +2342,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                         ResidualIterations * BenefitPerIteration;
                 }
 
-                // 克隆成本体现静态代码增长；store 收益只计算残余循环中
-                // 确实能够删除的动态写操作，二者使用统一成本单位比较。
+                // 3.2.2 静态克隆成本与残余迭代中确实可删的动态写收益使用同一成本单位，收益必须覆盖克隆并留出净余量。
                 const int64_t RequiredBenefit =
                     PeelCloneCost +
                     std::max(0, Config.PeelMinNetBenefit);
@@ -2361,12 +2374,14 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         }
     }
 
+    // 3.3 完全展开和 peeling 都未选中后，含调用或子循环的候选不再进入部分/runtime 展开。
     if (HasCall || Nested) {
         return makeNoUnrollDecision();
     }
 
     if (Config.AllowPartial && TCI.ProvenNoWrap && TCI.ConstantTripCount &&
         BodyCost <= Config.MaxLoopBodyCostForPartial) {
+        // 3.4 常量部分展开从代码大小选出 4/2 路候选，优先选能整除 trip count 的因子。
         int64_t TripCount = *TCI.ConstantTripCount;
         int Factor = chooseFactorBySize(BodyCost,
                                         Config.PartialThreshold,
@@ -2393,6 +2408,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         }
 
         if (Config.AllowRemainder) {
+            // 3.4.1 无法整除时，只在 SCEV 给出有效主次数/余数分解时选择带常量 tail 的部分展开。
             for (int Candidate : Factors) {
                 if (TripCount % Candidate == 0 ||
                     TripCount <= Candidate) {
@@ -2420,6 +2436,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         TCI.IsRuntime &&
         BodyCost <= Config.MaxLoopBodyCostForRuntime &&
         isCheapSCEV(TCI.TripCount, Config)) {
+        // 3.5 runtime 作为最后选项：trip-count SCEV 必须在扩展预算内，且已有 no-wrap 证明或能在 preheader 由 Range/SCEV 证明。
         const bool RuntimeTripCountIsProven =
             TCI.ProvenNoWrap ||
             proveRuntimeTripCountAtPreheader(SE, TCI, RI, DT);
@@ -2461,6 +2478,7 @@ LoopUnrollResult LoopUnrollPass::executeFullUnroll(
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
+    // 5.1 完全展开执行前重新确认已证 no-wrap 的常量次数与 Decision 完全一致，且退出测试位于 latch。
     auto TCI = SE.analyzeLoopTripCount(L);
     if (!TCI || !TCI->ProvenNoWrap || !TCI->ConstantTripCount ||
         *TCI->ConstantTripCount != Decision.Count ||
@@ -2477,6 +2495,7 @@ LoopUnrollResult LoopUnrollPass::executeFullUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.1.1 将全部迭代副本串成直线 CFG，仅末副本到 Exit，并把 Exit PHI 与原 Header PHI 分别折叠到末值和初值。
     if (!makeStraightLineMain(*Core, Decision.Count, Core->Shape.Exit,
                               nullptr)) {
         return LoopUnrollResult::Unmodified;
@@ -2505,6 +2524,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.2 整除部分展开重新验证 no-wrap 常量 trip count 能被 Factor 整除，且退出仅位于 Header 或 Latch。
     auto TCI = SE.analyzeLoopTripCount(L);
     if (!TCI || !TCI->ProvenNoWrap || !TCI->ConstantTripCount ||
         *TCI->ConstantTripCount % Decision.Count != 0 ||
@@ -2518,6 +2538,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.2.1 latch-tested 循环将前 Factor-1 个退出改为直连下一副本，末 Latch 回到首 Header，只保留末副本退出 PHI 值。
     if (hasLatchExitShape(*Core)) {
         BasicBlock *LastExiting = Core->Exitings.back();
         BasicBlock *ClonedHeader = Core->Headers.back();
@@ -2539,6 +2560,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
             return LoopUnrollResult::Unmodified;
         }
     } else if (Core->Shape.Exiting == Core->Shape.Header) {
+        // 5.2.2 header-tested 循环保留首 Header 的退出检查，删除后续副本头检查，并把各 Latch 依次连到下一 Header/首 Header。
         for (int Iter = 1; Iter < Decision.Count; ++Iter) {
             BasicBlock *Body =
                 getNonExitSuccessor(Core->Exitings[Iter], Core->Shape.Exit);
@@ -2566,6 +2588,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 5.2.3 两种形态最后都将原 Header PHI 回边改为组内末副本状态。
     if (!rewriteOriginalHeaderPhisForPartial(*Core,
                                              Decision.Count - 1)) {
         return LoopUnrollResult::Unmodified;
@@ -2587,6 +2610,7 @@ LoopUnrollResult LoopUnrollPass::executePartialWithRemainder(
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
+    // 5.3 常量余数路径要求 SCEV 给出非空主段和 0<Remainder<Factor，再将主段换算为展开组数交给共享 tail 引擎。
     auto RI = SE.getRemainderInfo(L, Decision.Count);
     if (!RI || !RI->Valid || !RI->NeedRemainderLoop) {
         return LoopUnrollResult::Unmodified;
@@ -2631,6 +2655,7 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
     if (!Decision.TripCountIsProven)
         return LoopUnrollResult::Unmodified;
 
+    // 5.4 runtime 执行再次要求 Decision 携带 no-wrap 证明、SCEV 余数信息有效，且 trip-count 表达式可在 preheader 安全物化。
     auto RI = SE.getRemainderInfo(L, Decision.Count);
     if (!RI || !RI->Valid || !RI->IsRuntimeRemainder) {
         return LoopUnrollResult::Unmodified;
@@ -2644,21 +2669,12 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
         return LoopUnrollResult::Unmodified;
     }
 
-    // Runtime-unroll bookkeeping belongs at the outermost loop preheader at
-    // which the trip-count expression is still available.  Materializing it
-    // unconditionally in the inner preheader makes an outer-invariant bound
-    // execute once per outer iteration.  LICM can normally repair that, but a
-    // max(0, N) SCEV contains a SelectInst and used to strand the whole chain
-    // in the parent loop.  Choosing the placement here is both cheaper and
-    // independent of a later cleanup pass.
+    // 5.4.1 向外层循环试探 trip-count SCEV 仍可用的最早入口，将组数/余数计算上提到该处，避免外循环不变边界在每个外迭代重复物化。
     Loop *ExpansionLoop = L;
     BasicBlock *ExpansionBlock = TCI->PreHeader;
     for (Loop *Ancestor = TCI->ProvenNoWrap ? L->getParentLoop() : nullptr;
          Ancestor; Ancestor = Ancestor->getParentLoop()) {
-        // A rotated parent may have a guard predecessor whose other edge is
-        // the zero-trip bypass.  Such a block is not a canonical preheader
-        // (it has two successors), but it is still the unique entry edge and
-        // is a valid placement for this non-trapping integer expression.
+        // 5.4.1.1 旋转后父循环可能由带零次旁路的 guard 唯一入边进入；即使它有两个后继，仍可作为无故障整数 SCEV 的上提点。
         BasicBlock *AncestorEntry = nullptr;
         bool AmbiguousEntry = false;
         for (BasicBlock *Pred : Ancestor->getHeader()->getPredecessors()) {
@@ -2691,10 +2707,7 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
     Value *Remainder = nullptr;
     Value *NumGroups = nullptr;
 
-    // runtime 决策只有在 trip count 的固定位宽计算已被证明无回绕后才会
-    // 到达这里。header-test 的 max(0, distance) 与 update-test 的
-    // max(0, distance)+1 都非负，因此二次幂因子可统一使用移位和掩码，
-    // 不必再依赖 exiting 块恰好同时也是 header 这一结构巧合。
+    // 5.4.2 已证 no-wrap 的 header-test/update-test trip count 都非负；Factor 为二次幂时用掩码和逻辑右移直接计算 Remainder/NumGroups。
     const bool CanUsePowerOfTwoForm =
         Decision.TripCountIsProven &&
         IRMath::isPowerOf2(Decision.Count);
@@ -2714,7 +2727,7 @@ LoopUnrollResult LoopUnrollPass::executeRuntimeUnroll(
         Remainder = RemainderInst;
         NumGroups = NumGroupsInst;
     } else {
-        // 非二次幂因子保留通用的有符号除法与取模路径。
+        // 5.4.3 非二次幂 Factor 使用通用 MOD、SUB、DIV 链计算余数和完整展开组数。
         Value *Factor = makeTypedIntConstant(
             Decision.Count, TripCount->getIRType());
         if (!Factor) return LoopUnrollResult::Unmodified;
@@ -2747,6 +2760,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
+    // 6. peeling 执行先固定唯一 Exit/唯一 Exiting 和有效 trip-count 形状，再克隆 Decision.Count 个前置迭代。
     int PeelCount = Decision.Count;
 
     std::vector<BasicBlock *> ExitBlocks = L->getExitBlocks();
@@ -2768,9 +2782,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     if (!TCI || !TCI->Valid) {
         return LoopUnrollResult::Unmodified;
     }
-    // A mathematical constant count without a no-wrap proof cannot justify
-    // deleting the cloned exit checks.  Peeling is still legal when every
-    // cloned iteration retains its original guard.
+    // 6.1 只有已证 no-wrap 的常量次数才能证明前 PeelCount 次一定执行并删除克隆退出检查；否则只允许少量 guarded peeling。
     const bool GuardedPeeling =
         !TCI->ConstantTripCount.has_value() || !TCI->ProvenNoWrap;
     if (GuardedPeeling) {
@@ -2787,8 +2799,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     }
 
-    // 与 remainder unroll 使用相同的互斥分类。单块循环若同时进入两种
-    // 处理路径，克隆退出边与原循环 PHI 的前驱会来自不同复制体。
+    // 6.1.1 与 tail 引擎一样互斥分类 latch-tested/header-tested，单块循环只归入 latch-tested，避免克隆退出边与 PHI 前驱选取不同副本。
     const bool LatchExiting = ShapeOpt->Exiting == ShapeOpt->Latch;
     const bool HeaderExiting =
         !LatchExiting && ShapeOpt->Exiting == ShapeOpt->Header;
@@ -2804,6 +2815,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     std::vector<StoreInst *> RedundantResidualStores =
         collectPeelRedundantStoreCandidates(L, LI, AA, DT);
 
+    // 6.2 克隆完成后在任何 CFG 提交前，以 ValidateOnly 模式预检原 Header PHI 与 guarded/已证长度两种 Exit PHI 方案。
     auto Core = clonePeeledIterations(L, PeelCount, SE);
     if (!Core) {
         return LoopUnrollResult::Unmodified;
@@ -2813,16 +2825,16 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         return LoopUnrollResult::Unmodified;
     };
     if (!rewriteOriginalHeaderPhisAfterPeeling(
-            *Core, /*ValidateOnly=*/true)) {
+            *Core, true)) {
         return FailUncommitted();
     }
     if (GuardedPeeling) {
         if (!addIncomingToExitPhisForPeeledBlocks(
-                *Core, /*ValidateOnly=*/true)) {
+                *Core, true)) {
             return FailUncommitted();
         }
     } else if (!removeIncomingFromExitPhisForPeeledBlocks(
-                   *Core, /*ValidateOnly=*/true)) {
+                   *Core, true)) {
         return FailUncommitted();
     }
 
@@ -2865,8 +2877,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
                 return FailUncommitted();
             }
             if (GuardedPeeling) {
-                // Preserve the short-trip/exit edge and retarget only the
-                // cloned backedge to the next peeled/original iteration.
+                // 6.3 guarded peeling 保留每个副本的短路退出，只把回边改为下一剥离副本或原残余循环。
                 if (!BasicBlock::redirectBranchTarget(
                         Core->Exitings[Iter], Core->Headers[Iter], Target)) {
                     return FailUncommitted();
@@ -2902,9 +2913,7 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         }
     }
 
-    // Exit PHIs must be made consistent before the new guarded exit edges
-    // become reachable.  For a proven-long constant trip those edges were
-    // removed and their cloned incoming entries must instead disappear.
+    // 6.4 在新克隆退出边连入 preheader 之前先提交 Exit PHI：guarded 方案添加克隆入边，已证长度方案移除已删退出检查的入边。
     if (GuardedPeeling) {
         if (!addIncomingToExitPhisForPeeledBlocks(*Core))
             return LoopUnrollResult::Unmodified;
@@ -2920,13 +2929,11 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     }
 
     if (!rewriteOriginalHeaderPhisAfterPeeling(
-            *Core, /*ValidateOnly=*/false)) {
+            *Core, false)) {
         return LoopUnrollResult::Unmodified;
     }
 
-    // 进入残余循环的路径都已经完成剥离迭代。候选 store 的控制条件、
-    // 地址和值均为循环不变量，且不存在可能别名的竞争写，因此残余
-    // 迭代只会重复相同写入；这里仅删除这些已证明冗余的写，保留 load。
+    // 6.5 所有进入残余循环的路径已完成剥离；阶段 3 证明控制、地址和写值不变且无竞争别名的 store 在残余迭代中仅重复同一写入，此处只删 store 不删 load。
     for (StoreInst *SI : RedundantResidualStores) {
         if (!SI || !SI->getParent() || !L->contains(SI->getParent()))
             continue;

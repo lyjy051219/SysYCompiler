@@ -14,11 +14,8 @@ struct MemoryLocation;
 class LoopInfo;
 class Loop;
 
-// A deliberately small, conservative MemorySSA for this IR.  It models one
-// unified memory state: stores and calls are MemoryDefs, loads are MemoryUses,
-// and every basic-block entry is represented by a MemoryPhi.  The latter is a
-// little denser than pruned SSA, but makes construction O(B + E + I), handles
-// irreducible CFGs without a fixed point, and keeps invalidation simple.
+// MemorySSA 使用单一内存状态：Load 为 Use，Store/Call 为 Def，块入口统一为 Phi。
+// 每个访问通过 DefiningAccess 或 IncomingAccesses 连到之前的内存状态。
 class MemoryAccess {
 public:
     enum class Kind { LiveOnEntry, Phi, Use, Def };
@@ -52,6 +49,7 @@ private:
     std::vector<std::pair<BasicBlock *, MemoryAccess *>> IncomingAccesses;
 };
 
+// 函数级结果拥有访问图，并提供最近潜在写和冗余写入证明查询。
 class MemorySSAResult {
 public:
     MemorySSAResult();
@@ -65,11 +63,7 @@ public:
     MemoryAccess *getBlockEntry(BasicBlock *BB) const;
     MemoryAccess *getBlockExit(BasicBlock *BB) const;
 
-    // Return the first access that may modify Ptr on every backwards path
-    // from At.  A returned Phi means that paths disagree or a transparent
-    // cycle has no single reaching definition.  nullptr means an invalid
-    // query or walker-budget exhaustion.  Clients must treat both cases
-    // conservatively; nullptr never means "no clobber".
+    // 反向查询在所有路径寻找首个可能写；分歧、环或预算耗尽均保守返回 Phi/空值。
     MemoryAccess *getClobberingAccess(
         Instruction *At, Value *Ptr, BasicAAResult &AA, const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM,
@@ -80,8 +74,6 @@ public:
         FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
 
-    // Same query starting at an already known memory state.  This is useful
-    // when a consumer walks several accesses in one block.
     MemoryAccess *getClobberingAccess(
         MemoryAccess *Start, Value *Ptr, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
@@ -92,12 +84,7 @@ public:
         FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
 
-    // Prove that Store writes the value already held by its destination on
-    // every path.  In a loop, a backedge reaching Store itself is handled as
-    // an inductive recurrence, but only for loop-invariant pointer/value
-    // operands and only when a non-recursive incoming path has a concrete
-    // same-value store.  Reads are transparent; every possible modification
-    // that is not a full same-value overwrite makes the query fail.
+    // 冗余存储证明要求所有路径已有同址、同宽、同 SSA 值写入，循环还需操作数不变。
     bool isStoreValueRedundant(
         StoreInst *Store, BasicAAResult &AA, const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM,
@@ -109,7 +96,6 @@ public:
 private:
     friend class MemorySSAAnalysis;
 
-    // MemorySSA 冗余存储判定使用的循环不变量与写入宽度检查。
     static bool isInvariantInLoop(Value *V, const Loop *L);
     static bool storeFullyCoversItsPointer(const StoreInst *SI);
 
@@ -127,6 +113,7 @@ private:
     std::unordered_map<BasicBlock *, MemoryAccess *> BlockExits;
 };
 
+// 构建流程先创建所有块入口，再线性连接块内访问，最后回填 CFG 入边。
 class MemorySSAAnalysis : public AnalysisDescriptor<MemorySSAAnalysis> {
 public:
     using Result = MemorySSAResult;

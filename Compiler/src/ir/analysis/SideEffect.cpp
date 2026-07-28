@@ -22,7 +22,6 @@ ModRefInfo unionModRef(ModRefInfo A, ModRefInfo B) {
     return ModRefInfo(unsigned(A) | unsigned(B));
 }
 
-// SideEffectInfo::invalidate
 bool SideEffectInfo::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(SideEffectAnalysis::ID())) return false;
     (void)F;
@@ -51,7 +50,6 @@ void SideEffectAnalysis::ensureInitialized(Value* V, BaseAddressInfoMap& Map) {
         Map[V].bases.insert(V);
 }
 
-
 void BaseAddressInfo::collectExternalBases(
     std::unordered_set<Value*>& Dest) const {
     for (auto* B : bases)
@@ -70,35 +68,36 @@ IntrinsicID getIntrinsicID(BuildInFunction* BIF) {
     return IntrinsicID::None;
 }
 
-// buildBaseAddressInfoMap：构建函数 F 中每个指针值的 BaseAddressInfoMap
+// 指针来源求解先播种参数与栈对象，再沿 GEP、BitCast、PHI 传播到固定点。
 BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
+    // 1. 参数和 Alloca 是已知基址，作为单调传播的初始种子。
     BaseAddressInfoMap Map;
-    //1.遍历所有形参，拿到所有指针，并创建它们的BaseAddressInfo
+
     for (auto& P : F.getParams()) {
         Value* V = P.get();
         if (!V || !V->isPointerValue()) continue;
         Map[V].bases.insert(V);
     }
-    //2.遍历函数内所有Alloca（局部变量）：创建它们的BaseAddressInfo
+
     for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt)
         for (auto IIt = (*BBIt)->begin(); IIt != (*BBIt)->end(); ++IIt)
             if (dynamic_cast<AllocaInst*>(*IIt))
                 Map[*IIt].bases.insert(*IIt);
 
-    //3.不动点迭代:处理函数中其他指令，更新指针值的BaseAddressInfo直到收敛
+    // 2. 反复扫描指针产生指令；未知生产者标记 untracked，PHI 合并全部可达来源。
     bool changed = true;
     while (changed) {
         changed = false;
-        //遍历函数内所有指令，更新每个指针值的BaseAddressInfo
+
         for (auto BBIt = F.begin(); BBIt != F.end(); ++BBIt) {
             for (auto IIt = (*BBIt)->begin(); IIt != (*BBIt)->end(); ++IIt) {
                 Instruction* I = *IIt;
-                //跳过Alloca：因为已经处理过了
+
                 if (dynamic_cast<AllocaInst*>(I)) continue;
                 if (!I || !I->isPointerValue()) continue;
 
                 BaseAddressInfo NewInfo;
-                //如果是GEP指令：获取他的基址指针
+
                 if (auto *GEP = dynamic_cast<GetElementPtrInst*>(I)) {
                     if (Value *Base = GEP->getBasePointer()) {
                         ensureInitialized(Base, Map);
@@ -106,7 +105,7 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                         if (it != Map.end()) NewInfo = it->second;
                         else                 NewInfo.untracked = true;
                     }
-                //如果是BitCast指令：获取他的源指针
+
                 } else if (auto *BC = dynamic_cast<BitCastInst*>(I)) {
                     if (Value *Src = BC->getUnaryOperand()) {
                         ensureInitialized(Src, Map);
@@ -114,22 +113,19 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                         if (it != Map.end()) NewInfo = it->second;
                         else                 NewInfo.untracked = true;
                     }
-                //如果是Phi指令：合并所有已计算的输入值的BaseAddressInfo
+
                 } else if (auto* Phi = dynamic_cast<PhiInst*>(I)) {
                     forEachPhiIncoming(
                         Phi, [&](unsigned, Value *V, BasicBlock *) {
                         ensureInitialized(V, Map);
                         auto it = Map.find(V);
                         if (it != Map.end()) {
-                            // V 已计算：将其完整潜在别名集合合并入 NewInfo
-                            // 这里也会传播 V 自身的 untracked（例如 V 是 LoadInst 结果）
+
                             NewInfo.merge(it->second);
                         }
-                        // V 不在 Map 中：视为 bottom（尚未计算），跳过
-                        // 不能设 untracked=true，否则会在 merge 中永久污染
+
                     });
-                    // PHI 使用替换而非合并：允许 untracked 状态在后续迭代中被纠正
-                    // （处理顺序导致的虚假 untracked=true 可以在 incoming 值计算后被清除）
+
                     {
                         auto& Existing = Map[I];
                         bool different = (Existing.untracked != NewInfo.untracked) ||
@@ -138,7 +134,7 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
                     }
                     continue;
                 } else {
-                    // LoadInst 返回指针、CallInst 返回指针等：来源不可追踪
+
                     NewInfo.untracked = true;
                 }
 
@@ -149,43 +145,36 @@ BaseAddressInfoMap SideEffectAnalysis::buildBaseAddressInfoMap(Function& F) {
     return Map;
 }
 
-//根据内置函数的类型进行分类
+// 内置函数分类只发布已知契约；无法识别的名字退化为 Untracked。
 FuncAttr classifyBuiltin(BuildInFunction* BIF) {
     if (!BIF) return FuncAttr::Untracked;
     const std::string& N = BIF->getIdent();
 
-    // 1. 计时函数本身不读写用户指针；其观测屏障由指令级查询单独保护
     if (BuildInFunction::isTimingName(N)) return FuncAttr::Sylib;
 
-    // 2. 标量 I/O 函数：完全没有指针参数，既不 Mod 也不 Ref
     if (BuildInFunction::isScalarIOName(N)) return FuncAttr::Sylib;
 
-    // 3. 数组输入函数：会写入（修改）传入的指针内存
     if (BuildInFunction::isArrayInputName(N)) return FuncAttr::MemWriteOnly;
 
-    // 4. 数组/格式化输出函数：只会读取传入的指针内存，绝不修改
     if (BuildInFunction::isArrayOutputName(N)) return FuncAttr::MemReadOnly;
 
-    // 5. 内存拷贝函数：既读又写
     if (BuildInFunction::isMemcpyName(N) ||
         BuildInFunction::isMemmoveName(N))
         return FuncAttr::MemReadWrite;
 
-    // 6. 内存填充函数：只写第一个指针实参。
     if (BuildInFunction::isMemsetName(N)) return FuncAttr::MemWriteOnly;
 
-    // 7. 兜底策略：未知的内置函数，保守退让
     return FuncAttr::Untracked;
 }
 
-//处理SysY运行时库函数和LLVM内置函数的调用，更新ModSet和RefSet
+// 内置调用摘要按参数角色把调用者基址映射到 ModSet/RefSet。
 void SideEffectAnalysis::processBuiltinCall(
     BuildInFunction* BIF,
     const std::vector<Value*>& Args,
     const BaseAddressInfoMap& CallerPtrMap,
     SideEffectInfo& Info)
 {
-    //1.Memcpy：目标地址被写，源地址被读
+
     if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
         getIntrinsicID(BIF) == IntrinsicID::Memmove) {
         auto addArgBases = [&](Value* Arg, std::unordered_set<Value*>& Dest) {
@@ -198,7 +187,7 @@ void SideEffectAnalysis::processBuiltinCall(
         if (Args.size() >= 2) addArgBases(Args[1], Info.RefSet);
         return;
     }
-    // memset：仅目标地址被写；填充值和长度均不访问内存。
+
     if (getIntrinsicID(BIF) == IntrinsicID::Memset) {
         if (!Args.empty() && Args[0]) {
             auto it = CallerPtrMap.find(Args[0]);
@@ -209,7 +198,7 @@ void SideEffectAnalysis::processBuiltinCall(
         }
         return;
     }
-    //2.获取内置函数属性，并处理内置函数的 Mod/Ref 影响
+
     FuncAttr Attr = classifyBuiltin(BIF);
 
     if (Attr == FuncAttr::Sylib)    { Info.hasBuiltin = true; return; }
@@ -234,7 +223,6 @@ void SideEffectAnalysis::processBuiltinCall(
         return;
     }
 
-    //处理Untracked的情况：标记为Mod和Ref
     for (auto* Arg : Args) {
         if (!Arg || !Arg->isPointerValue()) continue;
         auto it = CallerPtrMap.find(Arg);
@@ -249,15 +237,9 @@ void SideEffectAnalysis::processBuiltinCall(
     Info.hasBuiltin = true;
 }
 
-// SideEffectAnalysis::run
+// 跨函数副作用分析主流程显式求解可达调用图，避免递归查询分析缓存。
 SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    // Do not recursively ask FAM for a callee result here.  Analysis manager
-    // caches are populated only after run() returns, so direct recursion would
-    // recurse forever for a mutually-recursive SCC.  Instead, build local
-    // summaries for the call graph reachable from F and solve all transitive
-    // effects with a monotone fixed point.  This is equivalent to processing
-    // call-graph SCCs bottom-up, while keeping the implementation independent
-    // of a particular SCC numbering.
+    // 1. 广度发现 F 可达的直接调用图，并为每个函数收集局部 Load/Store/内置调用效果。
     std::unordered_map<Function*, SideEffectFunctionState> States;
     std::queue<Function*> WorkList;
     std::unordered_set<Function*> Enqueued;
@@ -273,9 +255,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
         SideEffectInfo &Info = State.Info;
         Info.ptrMap = buildBaseAddressInfoMap(*Current);
 
-        // First collect effects that are local to Current.  User-function
-        // calls are recorded as transfer edges and handled by the fixed point
-        // below.
+        // 1.1 用户调用只记录传递边；未知间接调用立即提升为保守屏障。
         for (auto BBIt = Current->begin(); BBIt != Current->end(); ++BBIt) {
             BasicBlock *BB = *BBIt;
             for (auto IIt = BB->begin(); IIt != BB->end(); ++IIt) {
@@ -324,9 +304,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                 } else if (BuildInFunction *BIF = CI->getBuiltinCallee()) {
                     processBuiltinCall(BIF, Args, Info.ptrMap, Info);
                 } else {
-                    // An indirect/unknown call can read and write arbitrary
-                    // externally visible memory.  hasBuiltin is the existing
-                    // conservative "unknown call effect" bit used by clients.
+
                     Info.hasBuiltin = true;
                 }
             }
@@ -345,6 +323,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
         return Changed;
     };
 
+    // 2. 单调固定点把被调函数的全局和形参效果映射回每个调用者。
     bool Changed = true;
     while (Changed) {
         Changed = false;
@@ -363,10 +342,8 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                 }
 
                 const SideEffectInfo &CalleeInfo = CalleeIt->second.Info;
-                // Caller and callee are the same object for a self-recursive
-                // edge.  Snapshot the current lattice value before mapping it
-                // back into the caller; inserting into an unordered_set while
-                // iterating that same set can rehash and invalidate iterators.
+
+                // 2.1 递归边先快照被调摘要，避免边遍历边扩容同一集合。
                 const std::vector<Value*> CalleeMods(
                     CalleeInfo.ModSet.begin(), CalleeInfo.ModSet.end());
                 const std::vector<Value*> CalleeRefs(
@@ -389,9 +366,7 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
                     if (ArgIt != CallerInfo.ptrMap.end()) {
                         bool LocalChanged =
                             insertExternalBases(ArgIt->second, Dest);
-                        // A pointer whose base cannot be tracked may designate
-                        // any external object.  Preserve soundness by upgrading
-                        // the caller summary to the conservative unknown state.
+
                         if (ArgIt->second.untracked &&
                             !CallerInfo.hasBuiltin) {
                             CallerInfo.hasBuiltin = true;
@@ -420,13 +395,10 @@ SideEffectInfo SideEffectAnalysis::run(Function &F, FunctionAnalysisPassManager 
         }
     }
 
+    // 3. 求解结束后批量发布伴随函数摘要，请求函数由管理器正常接收返回值。
     auto ResultIt = States.find(&F);
     if (ResultIt == States.end()) return SideEffectInfo{};
 
-    // The fixed point already computed every reachable callee.  Publish those
-    // companion summaries into FAM as one coherent generation; the requested
-    // function itself is returned to getResult(), which installs its cache
-    // entry after run() completes.
     for (auto &Entry : States) {
         if (Entry.first == &F) continue;
         FAM.setCachedResult<SideEffectAnalysis>(
@@ -446,12 +418,10 @@ std::optional<std::size_t> SideEffectAnalysis::getConstantMemoryIntrinsicLength(
     int32_t RawLength = 0;
     if (!Args[2]->tryGetIntConst(RawLength)) return std::nullopt;
 
-    // 内建函数长度是 i32 位模式而非有符号 C 计数，转换为宿主长度时保留完整的
-    // 无符号取值范围。
     return static_cast<std::size_t>(static_cast<uint32_t>(RawLength));
 }
 
-// 指令级副作用查询接口
+// 指令级 ModRef 流程：先构造区间重叠判定，再按 Load、Store、Call 分类求效果。
 ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                              BasicAAResult& AA, const LoopInfo& LI,
                              FunctionAnalysisPassManager& FAM)
@@ -460,9 +430,7 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
     if (!V || !I) return ModRefInfo::ModRef;
     ModRefInfo Result = ModRefInfo::NoModRef;
 
-    // Call summaries and ordinary pointer parameters describe an unknown
-    // range within the underlying object.  Different immediate GEP offsets
-    // cannot make those effects disjoint.
+    // 1. 已知长度使用完整字节区间；未知长度只接受底层对象不同这一强 NoAlias 证明。
     auto overlaps = [&](Value* Ptr) -> bool {
         return Ptr && !AA.haveKnownDistinctUnderlyingObjects(V, Ptr);
     };
@@ -474,10 +442,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                AliasInfo::NoAlias;
     };
 
-    // For a known byte count, compare the two complete ranges.  With a
-    // dynamic count, immediate GEP offsets cannot prove disjointness: the
-    // range may extend beyond either pointer's nominal pointee.  Only distinct
-    // allocation objects are a valid NoAlias proof in that case.
     auto overlapsMemoryIntrinsicRange =
         [&](Value *Start, const std::optional<std::size_t> &Length) -> bool {
         if (!Start) return true;
@@ -488,7 +452,7 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
         return !AA.haveKnownDistinctUnderlyingObjects(V, Start);
     };
 
-    //LOAD
+    // 2. Load/Store 直接与目标 Location 比较并累加 Ref 或 Mod。
     if (auto *Load = dynamic_cast<LoadInst *>(I)) {
         if (Value *Ptr = Load->getPointerOperand()) {
             if (overlapsLocation(MemoryLocation::get(Load)))
@@ -497,7 +461,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
         return Result;
     }
 
-    //STORE
     if (auto *SI = dynamic_cast<StoreInst *>(I)) {
         if (Value *Ptr = SI->getPointerOperand()) {
             if (overlapsLocation(MemoryLocation::get(SI)))
@@ -506,19 +469,17 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
         return Result;
     }
 
-    // CALL
+    // 3. Call 依次处理观测屏障、内存内建、用户函数摘要和未知被调目标。
     if (I->instType == Instruction::CALL) {
         auto *CI = dynamic_cast<CallInst *>(I);
         if (!CI) return ModRefInfo::ModRef;
 
-        // 计时调用及其包装调用是完整观测屏障，任何访存优化都不得穿越。
         if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
 
         std::vector<Value*> Args = CI->getArgs();
 
-        // 1. 内置函数
         if (auto* BIF = CI->getBuiltinCallee()) {
-            // 1a. memcpy：第0实参写，第1实参读
+
             if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
                 getIntrinsicID(BIF) == IntrinsicID::Memmove) {
                 if (Args.size() < 2 || !Args[0] || !Args[1])
@@ -541,7 +502,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                 return Result;
             }
 
-            // 1b. 常规内置函数
             FuncAttr Attr = classifyBuiltin(BIF);
             if (Attr == FuncAttr::Sylib || Attr == FuncAttr::NoModRef)
                 return ModRefInfo::NoModRef;
@@ -563,19 +523,15 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                 return Result;
             }
 
-            // Untracked 内置函数
             return ModRefInfo::ModRef;
         }
 
-        // 2. 用户定义函数
         if (auto* CalleeFunc = CI->getDirectCallee()) {
             const SideEffectInfo& SEI = FAM.getResult<SideEffectAnalysis>(*CalleeFunc);
 
-            // 含系统调用，保守返回 ModRef
             if (SEI.hasBuiltin)
                 return ModRefInfo::ModRef;
 
-            // 遍历 ModSet
             for (Value* MV : SEI.ModSet) {
                 if (!MV) continue;
                 if (MV->isGlobal()) {
@@ -591,7 +547,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
                 if (Result == ModRefInfo::ModRef) return Result;
             }
 
-            // 遍历 RefSet
             for (Value* RV : SEI.RefSet) {
                 if (!RV) continue;
                 if (RV->isGlobal()) {
@@ -610,7 +565,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
             return Result;
         }
 
-        // 3. Callee 无法识别，保守返回 ModRef
         return ModRefInfo::ModRef;
     }
 
@@ -620,14 +574,11 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
 ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
                              BasicAAResult& AA, const LoopInfo& LI,
                              FunctionAnalysisPassManager& FAM) {
-    // A bare pointer carries no access width.  Do not infer the pointee width:
-    // callers asking about an aggregate/range may intentionally pass its first
-    // element, and memory intrinsics can span beyond that nominal element.
+
     return getInstModRefInfo(
         SideEffectAnalysis::getUnknownSizeMemoryLocation(V), I, AA, LI, FAM);
 }
 
-// 函数级副作用查询接口
 ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI)
 {
     if (SEI.hasBuiltin)
@@ -652,6 +603,7 @@ ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI)
     return Result;
 }
 
+// 基本块查询逐条筛选不可移动操作，并对局部 Store 继续检查其后是否存在读取。
 bool BasicBlockSideEffect(BasicBlock* BB,
                                const Loop& L,
                                BasicAAResult& AA,
@@ -663,7 +615,6 @@ bool BasicBlockSideEffect(BasicBlock* BB,
         Instruction* I = *It;
         if (!I) continue;
 
-        // 按需求：RET/ALLOCA 直接视为有副作用
         if (I->instType == Instruction::RET || I->instType == Instruction::ALLOCA) {
             return true;
         }
@@ -696,7 +647,6 @@ bool BasicBlockSideEffect(BasicBlock* BB,
             if (!Ptr) return true;
             Value* Base = Value::stripPointerCastsAndGEP(Ptr);
 
-            // 按需求：只允许写局部变量（alloca）
             if (Base && (Base->isGlobal() || Base->isParam())) {
                 return true;
             }
@@ -704,7 +654,6 @@ bool BasicBlockSideEffect(BasicBlock* BB,
                 return true;
             }
 
-            // 沿 CFG 向下扫描：若后续有 Ref/ModRef 命中该指针，视为有副作用
             for (Instruction* Next = I->getNext(); Next != nullptr; Next = Next->getNext()) {
                 ModRefInfo MRI = getInstModRefInfo(
                     MemoryLocation::get(SI), Next, AA, LI, FAM);
@@ -737,6 +686,7 @@ bool BasicBlockSideEffect(BasicBlock* BB,
     return false;
 }
 
+// 循环查询展平子循环块；任一基本块失败即报告循环存在副作用。
 bool LoopSideEffect(const Loop& L,
                          BasicAAResult& AA,
                          const LoopInfo& LI,

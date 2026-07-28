@@ -28,6 +28,8 @@ bool FunctionMemoizationPass::isSupportedScalarType(
 
 bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     Instruction *Inst) {
+    // 1.1 缓存键与结果必须可重复：拒绝 undef、未知 opcode、不可控浮点转整数、
+    // 非标量 bitcast、零/危险除数及越界移位。
     if (!Inst) return true;
     for (const auto &OperandUse : Inst->getUserList()) {
         Value *Operand = OperandUse ? OperandUse->getValue() : nullptr;
@@ -38,7 +40,7 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     if (Inst->instType == Instruction::FPTOSI) return true;
     if (Inst->instType == Instruction::BITCAST) {
         Value *Source = Inst->getUnaryOperand();
-        // 记忆化缓存只编码精确的32位标量，不能用存储字节数代替真实类型。
+         
         return !Source ||
                !isSupportedScalarType(Source->getIRType()) ||
                !isSupportedScalarType(Inst->getIRType());
@@ -75,6 +77,8 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
 bool FunctionMemoizationPass::collectCandidate(
     Function &F, FunctionAnalysisPassManager &FAM,
     FunctionMemoizationCandidate &Candidate) {
+    // 1. 先检查签名、直接调用约束、参数个数与标量类型，并排除计时调用和带前驱/PHI
+    // 的原入口；这些条件保证可以安全在函数最前面插入 lookup 块。
     Candidate = FunctionMemoizationCandidate{};
     if (F.hasReservedSignature() || !F.front() ||
         !F.hasOnlyDirectCallUses() ||
@@ -84,8 +88,8 @@ bool FunctionMemoizationPass::collectCandidate(
         return false;
     }
 
-    // 计时调用及其包装函数绝不能缓存化；显式调用图门禁不依赖
-    // 副作用摘要的构建顺序，防止未来分析调整削弱这条约束。
+     
+     
     if (F.mayReachTimingCall()) return false;
 
     BasicBlock *OriginalEntry = F.front();
@@ -101,6 +105,8 @@ bool FunctionMemoizationPass::collectCandidate(
         }
     }
 
+    // 1.2 目标函数必须完全 NoModRef，且所有基本块均可达；逐条指令排除内存、指针、
+    // 不确定运算及非自递归调用，同时收集递归调用点和返回点。
     const SideEffectInfo &Effects =
         FAM.getResult<SideEffectAnalysis>(F);
     if (Effects.hasBuiltin ||
@@ -116,7 +122,7 @@ bool FunctionMemoizationPass::collectCandidate(
         for (Instruction *Inst : *Block) {
             if (hasUnsafeOrUndefinedOperation(Inst)) return false;
 
-            // 首版只处理纯 SSA 标量函数，避免把局部内存中的未初始化状态缓存化。
+             
             if (dynamic_cast<AllocaInst *>(Inst) ||
                 dynamic_cast<LoadInst *>(Inst) ||
                 dynamic_cast<StoreInst *>(Inst) ||
@@ -156,6 +162,8 @@ bool FunctionMemoizationPass::collectCandidate(
         }
     }
 
+    // 1.3 至少有两个递归调用才值得缓存，并要求存在函数外调用作为递归计算入口；
+    // 所有调用实参都必须已定义，避免把 undef 的任意取值固化进缓存。
     if (Candidate.RecursiveCalls.size() < 2 ||
         Candidate.Returns.empty()) {
         Candidate = FunctionMemoizationCandidate{};
@@ -179,6 +187,7 @@ bool FunctionMemoizationPass::collectCandidate(
 
 std::string FunctionMemoizationPass::makeUniqueGlobalName(
     Module &M, const std::string &Stem) {
+    // 2.1 同时避开模块中的函数名与全局名，为每组缓存生成稳定且唯一的符号。
     auto IsUsed = [&](const std::string &Name) {
         const std::string IRName = ".G." + Name;
         for (const auto &Global : M.getGlobalVar()) {
@@ -210,11 +219,12 @@ GetElementPtrInst *FunctionMemoizationPass::appendSlotPointer(
 
 Value *FunctionMemoizationPass::appendKeyBits(
     BasicBlock &Block, Value *Argument) {
+    // 2.2 整数直接作为 32 位键；float 按位 bitcast，区分不同 NaN 载荷和有符号零。
     if (!Argument || !Argument->getIRType()) return nullptr;
     if (Argument->getIRType()->isInt()) return Argument;
     if (!Argument->getIRType()->isFloat()) return nullptr;
 
-    // 浮点键按位解释，避免把正负零或不同的 NaN 位型合并。
+     
     auto *Bits = new BitCastInst(Argument, INTType::getInt32Ty());
     Block.pushBack(Bits);
     return Bits;
@@ -222,6 +232,7 @@ Value *FunctionMemoizationPass::appendKeyBits(
 
 Value *FunctionMemoizationPass::appendHashMix(
     BasicBlock &Block, Value *Hash, Value *KeyBits) {
+    // 2.3 每个参数按 XOR 后乘常量混入哈希，最终用 2 次幂容量掩码选择槽位。
     if (!Hash || !KeyBits) return nullptr;
     auto *Xor = new BinaryInst(Hash, BinaryInst::XOR, KeyBits);
     Block.pushBack(Xor);
@@ -234,6 +245,8 @@ Value *FunctionMemoizationPass::appendHashMix(
 bool FunctionMemoizationPass::transformCandidate(
     Module &M, const FunctionMemoizationCandidate &Candidate,
     unsigned CacheOrdinal) const {
+    // 2. 离线创建 lookup/hit 块：按参数生成键位、哈希与槽下标；任何构造失败都在
+    // 接入函数前删除临时块，因此不会留下部分 CFG。
     Function *F = Candidate.Target;
     if (!F || Module::getActiveModule() != &M || !F->front() ||
         Candidate.Returns.empty()) {
@@ -280,6 +293,7 @@ bool FunctionMemoizationPass::transformCandidate(
     auto ResultType = ARRAYType::NewArray(
         F->getIRType(), static_cast<int>(CacheEntries));
 
+    // 2.4 为有效位、每个参数键和结果分别创建同容量全局数组，并计算当前槽地址。
     auto *ValidCache = new Variable(
         Variable::GlobalVariable, ValidType,
         makeUniqueGlobalName(M, Prefix + ".valid"));
@@ -306,6 +320,8 @@ bool FunctionMemoizationPass::transformCandidate(
     GetElementPtrInst *ResultPointer =
         appendSlotPointer(*LookupBlock, ResultCache, SlotIndex);
 
+    // 2.5 命中条件要求 valid 且所有存储键逐一相等；命中块读取缓存结果并返回，
+    // 未命中边进入原函数入口执行正常递归计算。
     auto *ValidValue = new LoadInst(ValidPointer);
     LookupBlock->pushBack(ValidValue);
     auto *InitialHit = new BinaryInst(
@@ -314,7 +330,7 @@ bool FunctionMemoizationPass::transformCandidate(
     Value *IsHit = InitialHit;
 
     for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {
-        // 哈希只负责选槽；命中仍须逐字段比较完整键。
+         
         auto *StoredKey = new LoadInst(KeyPointers[Index]);
         LookupBlock->pushBack(StoredKey);
         auto *KeyMatches = new BinaryInst(
@@ -331,6 +347,7 @@ bool FunctionMemoizationPass::transformCandidate(
     HitBlock->pushBack(CachedResult);
     HitBlock->pushBack(new RetInst(CachedResult));
 
+    // 2.6 完整 lookup/hit CFG 构造完成后才接入函数，并撤销递归调用的 tail 标记。
     F->pushFront(LookupBlock);
     F->pushBlock(HitBlock);
 
@@ -338,12 +355,14 @@ bool FunctionMemoizationPass::transformCandidate(
         if (RecursiveCall) RecursiveCall->setTailCall(false);
     }
 
+    // 2.7 每个原返回点按“valid 清零 → 写全部键 → 写结果 → valid 置一”的顺序发布，
+    // 防止尚未完整更新的直接映射槽被后续递归命中。
     for (RetInst *Return : Candidate.Returns) {
         if (!Return || !Return->getParent()) continue;
         Value *Result = Return->getReturnValue();
         if (!Result) continue;
 
-        // 先清除有效位，完整写入精确键和值后再发布缓存项。
+         
         Return->insertBefore(new StoreInst(
             ConstInt::newConstInt(0), ValidPointer));
         for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {
@@ -363,6 +382,7 @@ PreservationStatus FunctionMemoizationPass::run(
     (void)MAM;
     bool Changed = false;
 
+    // 1. 先快照模块函数并完成全部候选验证，避免后续插入缓存 CFG 影响其他候选扫描。
     std::vector<Function *> Functions;
     Functions.reserve(M.getFunctions().size());
     for (const auto &FunctionPtr : M.getFunctions()) {
@@ -377,6 +397,8 @@ PreservationStatus FunctionMemoizationPass::run(
         Candidates.push_back(std::move(Candidate));
     }
 
+    // 2. 按模块总缓存预算依次变换候选；单个缓存大小由参数键数组、valid 数组和
+    // 结果数组共同估算，超过剩余预算的函数跳过。
     std::size_t UsedCacheBytes = 0;
     unsigned CacheOrdinal = 0;
     for (const FunctionMemoizationCandidate &Candidate : Candidates) {
@@ -391,6 +413,7 @@ PreservationStatus FunctionMemoizationPass::run(
         Changed = true;
     }
 
+    // 3. 新增全局状态和 CFG 后不保留任何模块/函数分析缓存。
     if (!Changed) return PreservationStatus::all();
     return PreservationStatus::none();
 }

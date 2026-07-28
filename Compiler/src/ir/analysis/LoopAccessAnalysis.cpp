@@ -5,7 +5,6 @@
 #include "ir/analysis/SCEV.hpp"
 
 #include <utility>
-
 LoopAccessInfo::LoopAccessInfo() = default;
 
 LoopAccessInfo::LoopAccessInfo(Function *F, LoopInfo *LoopInfoPtr,
@@ -98,6 +97,7 @@ bool LoopAccessInfo::isolateAxis(const LoopAffineExpr &Expression, Loop *Axis,
     return true;
 }
 
+// 对齐证明要求两侧均为完整混合基数地址，并且目标轴只在一个坐标带中以同向单位系数出现。
 bool LoopAccessInfo::equalityForcesAlignedIteration(
     const LoopMemoryAccess &First, Loop *FirstAxis,
     const LoopMemoryAccess &Second, Loop *SecondAxis) {
@@ -143,12 +143,15 @@ bool LoopAccessInfo::equalityForcesAlignedIteration(
     return FoundAxisBand;
 }
 
+// 摘要构建复用循环依赖访问记录，只补充变换关心的未知内存和写入汇总。
 std::unique_ptr<LoopAccessSummary>
 LoopAccessInfo::buildSummary(Loop *Scope) {
+    // 1. 先绑定查询作用域；缺少循环或底层依赖结果时保留 UnknownMemory。
     auto Summary = std::make_unique<LoopAccessSummary>();
     Summary->Scope = Scope;
     if (!Scope || !LD) return Summary;
 
+    // 2. 复用依赖分析中的稳定访问记录，并汇总是否存在写入。
     Summary->HasUnknownMemory = LD->hasUnknownMemory(Scope);
     const auto &Memory = LD->getMemoryAccesses(Scope);
     Summary->Accesses.reserve(Memory.size());
@@ -168,25 +171,27 @@ const LoopAccessSummary &LoopAccessInfo::getSummary(Loop *Scope) {
     return *Raw;
 }
 
+// 访问对分类流程先筛掉只读对，再尝试不同根 NoAlias 和同根迭代对齐证明。
 LoopAccessPairKind LoopAccessInfo::classifyPair(
     Loop *FirstScope, Loop *FirstAxis, const LoopMemoryAccess &First,
     Loop *SecondScope, Loop *SecondAxis,
     const LoopMemoryAccess &Second) const {
     (void)FirstScope;
     (void)SecondScope;
+    // 1. 没有写入的一对访问不会形成调度冲突。
     if (!isWriteConflict(First, Second))
         return LoopAccessPairKind::NoConflict;
+    // 2. 缺少基础分析或稳定根对象时不能发布强结论。
     if (!AA || !LI || !First.Root || !Second.Root)
         return LoopAccessPairKind::Unknown;
 
-    // A same-root BasicAA answer relates only the two current SSA executions;
-    // it cannot exclude a shifted loop-carried meeting.  Consume NoAlias only
-    // for distinct affine roots.
+    // 3. 不同根对象可消费 BasicAA 的 NoAlias；同根必须继续做跨迭代证明。
     if (First.Root != Second.Root &&
         AA->alias(First.Location, Second.Location, *LI) ==
             AliasInfo::NoAlias) {
         return LoopAccessPairKind::NoConflict;
     }
+    // 4. 地址相等若强制两个轴坐标相等，冲突只会出现在同一逻辑迭代。
     if (equalityForcesAlignedIteration(First, FirstAxis, Second,
                                        SecondAxis)) {
         return LoopAccessPairKind::SameIterationOnly;
@@ -194,11 +199,14 @@ LoopAccessPairKind LoopAccessInfo::classifyPair(
     return LoopAccessPairKind::Unknown;
 }
 
+// 迭代独立查询枚举全部潜在写冲突；未知内存、访问对预算耗尽或任一 Unknown 均失败。
 bool LoopAccessInfo::areIterationsIndependent(Loop *Scope, Loop *Axis) {
+    // 1. 验证轴属于作用域，并拒绝包含未知内存的摘要。
     if (!Scope || !Axis || !Scope->contains(Axis->getHeader())) return false;
     const LoopAccessSummary &Summary = getSummary(Scope);
     if (Summary.HasUnknownMemory) return false;
 
+    // 2. 枚举所有含写访问对；预算耗尽或任一 Unknown 都使证明失败。
     std::size_t Examined = 0;
     for (std::size_t I = 0; I < Summary.Accesses.size(); ++I) {
         for (std::size_t J = I; J < Summary.Accesses.size(); ++J) {
@@ -216,8 +224,10 @@ bool LoopAccessInfo::areIterationsIndependent(Loop *Scope, Loop *Axis) {
     return true;
 }
 
+// 融合查询交叉枚举两个循环的访问，并统计仅同次迭代发生的冲突和流依赖。
 LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
                                                      Loop *Second) {
+    // 1. 两个循环必须不同且都具有完整、无未知内存的访问摘要。
     LoopFusionAccessResult Result;
     if (!First || !Second || First == Second) {
         Result.Unknown = true;
@@ -230,6 +240,7 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
         return Result;
     }
 
+    // 2. 交叉枚举访问对并分类；遇到未知关系或预算耗尽立即保守退出。
     std::size_t Examined = 0;
     for (const LoopMemoryAccess *FirstAccess : A.Accesses) {
         for (const LoopMemoryAccess *SecondAccess : B.Accesses) {
@@ -254,6 +265,7 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
             }
         }
     }
+    // 3. 所有潜在冲突均已排除或限制在同次迭代，融合合法。
     Result.Legal = true;
     return Result;
 }
@@ -262,6 +274,7 @@ bool LoopAccessInfo::isFusionLegal(Loop *First, Loop *Second) {
     return analyzeFusion(First, Second).Legal;
 }
 
+// 矩形循环巢要求唯一父子关系、两层均有限且内层起点/步长/边界不依赖外层。
 bool LoopAccessInfo::isRectangularNest(Loop *Outer, Loop *Inner) {
     if (!Outer || !Inner || !SE || Inner->getParentLoop() != Outer ||
         Outer->getSubLoops().size() != 1 ||
@@ -286,6 +299,7 @@ LoopAccessInfo::getByteStride(Instruction *I, Loop *Scope, Loop *Axis) {
     return LD->getByteStride(I, Axis);
 }
 
+// 跨轴复用要求同一读取在复用轴步长为零、在另一轴步长非零。
 bool LoopAccessInfo::hasCrossAxisReuse(Loop *Scope, Loop *ReusedAxis,
                                        Loop *VaryingAxis) {
     if (!Scope || !ReusedAxis || !VaryingAxis ||
@@ -315,11 +329,14 @@ bool LoopAccessInfo::invalidate(Function &,
            !PA.isKept(LoopAnalysis::ID());
 }
 
+// Pass 主流程依次获取四项基础分析，并将其指针封装为函数级访问查询器。
 LoopAccessInfo LoopAccessAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
+    // 1. 按依赖关系取得循环、SCEV、别名和循环依赖四项基础结果。
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LD = FAM.getResult<LoopDependenceAnalysis>(F);
+    // 2. 封装惰性缓存查询器；具体循环摘要由首次查询触发构建。
     return LoopAccessInfo(&F, &LI, &SE, &AA, &LD);
 }

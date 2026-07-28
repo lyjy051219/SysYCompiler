@@ -8,11 +8,13 @@
 #include <utility>
 #include <vector>
 
-// main 通常由运行时只调用一次，但语法并没有阻止 main 直接
-// 或间接递归。一旦递归，把 alloca 换成全局对象就会让不同栈帧
-// 共享同一份存储。
+ 
+ 
+ 
 bool Local2GlobalPass::isRecursiveFrom(
 	Function *F, const FunctionCallGraph &CallGraph) {
+	// 1.1 从 main 的直接调用边出发检查能否回到自身；递归会让静态对象破坏每次调用
+	// 独立分配的语义，因此整个提升流程必须停止。
 	if (!F) return false;
 
 	auto RootIt = CallGraph.find(F);
@@ -29,6 +31,7 @@ bool Local2GlobalPass::isRecursiveFrom(
 PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;
 
+	// 1. 建立调用图并排除递归 main，确保入口 alloca 的生命周期等同于整次程序执行。
 	std::vector<std::pair<AllocaInst *, std::shared_ptr<IRType>>> WorkList;
 
 	Function *Main = M.getMainFunction();
@@ -39,11 +42,12 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 		return PreservationStatus::all();
 	}
 
-	// 只有程序入口 main 的生存期能在现有 IR 信息下可靠地
-	// 视为单次执行。普通函数即使非递归，也可能在循环中或多个
-	// 调用点重入，不能只凭“非递归”就全局化其局部对象。
-	// 同时只处理 entry block alloca，避免改变循环/分支内动态
-	// alloca 每次执行都创建新对象的语义。
+	 
+	 
+	 
+	 
+	 
+	// 2. 只考察 main 入口块中的大对象，并预先判断函数是否可能到达计时屏障。
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
 	const bool MainMayReachTiming = Main->mayReachTimingCall();
@@ -53,9 +57,11 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
 
-		// 全局化会把栈分配移到程序启动阶段。若入口到 alloca 之间，或
-		// 从该 alloca 绕回自身的循环路径上存在计时边界，就会把原本
-		// 计入测量区间的分配移出区间，因此保留原局部对象。
+		 
+		 
+		 
+		// 2.1 若 alloca 的动态执行位置可能跨越计时调用，则保留栈分配，避免改变
+		// 计时区间内的初始化/分配成本；其余对象按目标阈值进入工作表。
 		if (MainMayReachTiming &&
 			(Main->hasTimingBarrierOnPath(EntryBB, nullptr, AI) ||
 			 Main->hasTimingBarrierOnPath(AI, AI))) {
@@ -69,12 +75,13 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 
 	if (WorkList.empty()) return PreservationStatus::all();
 
+	// 3. 为每个候选创建同型全局量，先替换全部 use，再删除原 alloca。
 	for (auto &Entry : WorkList) {
 		AllocaInst *AI = Entry.first;
 		std::shared_ptr<IRType> ElemTy = Entry.second;
 		if (!AI || !ElemTy) continue;
 
-		// 复用 alloca 的标识符名创建全局变量。
+		 
 		auto *GV = new Variable(Variable::GlobalVariable, ElemTy, AI->getIdent());
 		AI->replaceAllUsesWith(GV);
 		delete AI;

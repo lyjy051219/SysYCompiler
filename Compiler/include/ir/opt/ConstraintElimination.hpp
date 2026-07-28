@@ -9,6 +9,7 @@ class DominatorNode;
 class DominatorTree;
 class RangeInfo;
 
+// 规范约束表示 val op (bound + boundOffset)，常量边界同时缓存在 boundVal 中。
 struct ConstraintElimConstraint {
     Value *val = nullptr;
     BinaryInst::Operation op = BinaryInst::E;
@@ -24,6 +25,7 @@ struct ConstraintElimOffsetExpr {
     bool Valid = false;
 };
 
+// 支配树 DFS frame 记录进入节点前的约束栈深度，用于兄弟子树间恢复路径事实。
 struct ConstraintElimStackFrame {
     DominatorNode *node = nullptr;
     int constraintsBefore = 0;
@@ -35,7 +37,9 @@ struct ConstraintElimFoldCandidate {
     bool result = false;
 };
 
-// 约束消除：沿支配树传播分支条件约束，消除被蕴含的冗余比较
+ 
+// 流程：1. 在无回绕证明下规范比较与常量偏移；2. 沿支配树维护路径约束栈；
+// 3. 结合范围上下界做直接/一跳蕴含和矛盾判断；4. 将已证明分支条件折为常量。
 class ConstraintEliminationPass : public PassDescriptor<ConstraintEliminationPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

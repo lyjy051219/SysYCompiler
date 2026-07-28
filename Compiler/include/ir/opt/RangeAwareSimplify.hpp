@@ -8,8 +8,10 @@ struct IntRange;
 class DominatorTree;
 class RangeInfo;
 
-// 基于整数范围分析的指令化简：
-// 强度削减（除法→移位、取模→位与）、常量折叠、比较折叠、死分支消除
+ 
+ 
+// 流程：1. 用范围与已知位补强局部表达式事实；2. 折叠单值和恒定比较；
+// 3. 化简比较/select 组合及 abs/min/max；4. 在非负证明下削减 2 次幂除余。
 class RangeAwareSimplifyPass : public PassDescriptor<RangeAwareSimplifyPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

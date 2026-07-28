@@ -13,64 +13,67 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// =====================================================================
-// GepCombine — 跨 GEP 优化
-//
-// 三大类优化：链式 GEP 合并、PHI 中 GEP 提取、循环内相邻 GEP 合并。
-//
-// 【链式 GEP 合并】
-//
-// 当一个 GEP 的基址是另一个 GEP 的结果时，两个 GEP 的索引序列可以拼接
-// 成一个 GEP，减少一条指令，也让后续别名分析更容易看到真实基址。
-//
-// 具体来说有三种场景可以合并：
-//
-// 首先，如果当前 GEP 的首索引是常量 0，说明它只做类型穿越不产生偏移，
-// 可以把 base GEP 的全部索引前置到当前 GEP 前面，去掉首索引 0。
-// 例如 gep(gep(arr, i1, i2), 0, i3) → gep(arr, i1, i2, i3)。
-//
-// 其次，如果 base GEP 的末索引是常量 0，说明 base GEP 最后一层只进入子类型，
-// 可以去掉 base 末索引后把两边索引拼起来。
-// 例如 gep(gep(arr, i1, 0), i2, i3) → gep(arr, i1, i2, i3)。
-//
-// 第三，如果交界处的两个索引都是常量（base 末索引和当前首索引），
-// 可以在编译期把它们加在一起，减少一个索引层级。
-// 例如 gep(gep(arr, i1, 3), 2, i3) → gep(arr, i1, 5, i3)。
-// 合并后如果非零索引数超过 1（首部零索引不算），不合并，
-// 防止合并后 GEP 比合并前更复杂。
-//
-// 以上三种场景都只在 base GEP 只有一个用户时才做，
-// 否则 base GEP 不能删，合并不减少指令数。
-//
-// 【PHI 中 GEP 提取】
-//
-// 如果 PHI 的所有 incoming value 都是结构相同的 GEP（共享同一个 base，
-// 只在一个索引位置不同），可以把 GEP 提到 merge 块里，
-// 不同的那个索引位置换成新的 PHI。
-// 例如 phi(gep(base, 0, i1), gep(base, 0, i2)) → gep(base, 0, phi(i1, i2))。
-// 如果所有 incoming GEP 完全相同，就 clone 一份到当前块
-// （不能直接用某个 incoming，因为它定义在前驱块不支配当前块的所有 uses）。
-// 只允许一个索引位置不同，多了不值得。PHI 必须只有一个用户才做。
-// 不折叠通过循环回边指向自身的 GEP，避免寄存器压力增大。
-//
-// 【循环内相邻 GEP 合并】
-//
-// 同一个块内如果有两个 GEP 除末索引外完全相同，末索引差一个常量，
-// 后一个可以改为从前一个结果出发加上常量偏移。
-// 例如 gep(arr, 0, i) 和 gep(arr, 0, i+1) → 后者改为 gep(前者, 1)。
-// 也处理两个索引都是 add(base, const) 形式、差值是常量的情况。
-// =====================================================================
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
 
-// =====================================================================
-// Part 1: 链式 GEP 合并
-// =====================================================================
+ 
+ 
+ 
 bool pointerIsProvablyWithinKnownObject(
     Value *Pointer, RangeInfo &RI, const DominatorTree &DT) {
+    // 1. 从目标指针反向收集同形 bitcast/GEP 链，并拒绝任何依赖 undef 的地址。
     if (!Pointer || valueMayDependOnUndef(Pointer)) return false;
 
     std::unordered_set<Value *> ActiveRanges;
     std::function<IntRange(Value *, BasicBlock *, unsigned)>
         queryDefinedIndexRange;
+    // 1.1 RangeAnalysis 无直接结论时，有界递归解释纯整数索引表达式；每一步都检查
+    // i32 运算不回绕，循环依赖、未知操作或预算耗尽均返回未知区间。
     queryDefinedIndexRange =
         [&](Value *Index, BasicBlock *Context, unsigned Depth) -> IntRange {
         if (!Index || !Context || Depth > 8 ||
@@ -181,11 +184,14 @@ bool pointerIsProvablyWithinKnownObject(
         break;
     }
 
+    // 1.2 链根必须是 alloca 或全局对象，未知参数/堆地址没有可用的对象边界。
     auto *RootGlobal = dynamic_cast<Variable *>(Current);
     if (!dynamic_cast<AllocaInst *>(Current) &&
         (!RootGlobal || !RootGlobal->isGlobal()))
         return false;
 
+    // 1.3 逐级验证首索引恒为零、后续索引落入当前数组维度，并校验最终元素类型；
+    // 只有整条链均在界内，调用方才能安全采用改变 GEP 分组方式的改写。
     for (GetElementPtrInst *Node : Chain) {
         Value *Base = Node->getBasePointer();
         BasicBlock *Context = Node->getParent();
@@ -208,8 +214,8 @@ bool pointerIsProvablyWithinKnownObject(
                    Range.max <= Maximum;
         };
 
-        // 已知 global/alloca 在当前 IR 中只代表一个完整对象。首索引必须
-        // 恒为 0；后续索引则由 TypeSystem 的数组层级逐维给出边界。
+         
+         
         if (!indexIsWithin(Node->getIndex(0), 0, 0))
             return false;
 
@@ -241,17 +247,19 @@ bool gepIsProvablyWithinKnownObject(
 }
 
 bool GepCombinePass::combineChainedGEPs(Function &F) {
+    // 2. 快照所有 GEP，寻找“当前 GEP 以单用户 GEP 为基址”的链式候选；
+    // 计时屏障会阻止合并，以免改变其两侧地址计算的执行位置。
     bool changed = false;
 
     auto geps = collectInstructions<GetElementPtrInst>(F);
 
-    // 延迟删除集合，避免遍历中 delete 导致悬空指针
+     
     std::unordered_set<GetElementPtrInst *> deleted;
-    // 收集待删除的 base GEP
+     
     std::vector<GetElementPtrInst *> toDelete;
 
     for (GetElementPtrInst *GEP : geps) {
-        // 跳过已删除的 GEP
+         
         if (deleted.count(GEP)) continue;
 
         if (GEP->getNumIndices() < 1) continue;
@@ -261,7 +269,7 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
         if (!BaseGEP) continue;
         if (deleted.count(BaseGEP)) continue;
 
-        // 单 use 检查：base GEP 必须只被当前 GEP 使用
+         
         if (BaseGEP->countUses() > 1) continue;
         if (F.hasTimingBarrierOnPath(BaseGEP, GEP)) continue;
 
@@ -271,7 +279,8 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
 
         bool merged = false;
 
-        // 首索引为 0 → 把 base 的全部索引前置
+         
+        // 2.1 交界处当前首索引为零时直接拼接；基址末索引为零时去掉该零再拼接。
         if (firstIdx && firstIdx->isConstIntZero()) {
             std::vector<Value *> newIndices = BaseGEP->getIndices();
             for (size_t i = 1; i < GEP->getNumIndices(); i++)
@@ -282,7 +291,7 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
             toDelete.push_back(BaseGEP);
             merged = true;
         }
-        // base 末索引为 0 → 合并（去掉 base 末索引）
+         
         else if (baseLastIdx && baseLastIdx->isConstIntZero()) {
             std::vector<Value *> newIndices = BaseGEP->getIndices();
             newIndices.pop_back();
@@ -295,14 +304,16 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
             toDelete.push_back(BaseGEP);
             merged = true;
         }
-        // 交界处两个常量索引相加
+         
+        // 2.2 两侧交界索引均为常量时，在 i32 无回绕前提下相加；合并后若出现
+        // 多个非零索引则放弃，避免得到比原地址更复杂的表达式。
         else {
             auto *CI1 = firstIdx ? firstIdx->as<ConstInt>() : nullptr;
             auto *CI2 = baseLastIdx ? baseLastIdx->as<ConstInt>() : nullptr;
             if (CI1 && CI2) {
                 int64_t checkedSum = 0;
-                // GEP 索引是 i32。宿主 C++ 加法和目标 i32 加法都必须无溢出，
-                // 否则不能把两级索引折叠为一个常量。
+                 
+                 
                 if (!IRMath::addI32(
                         CI1->getVal(), CI2->getVal(), checkedSum)) {
                     continue;
@@ -315,7 +326,7 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
                 for (size_t i = 1; i < GEP->getNumIndices(); i++)
                     newIndices.push_back(GEP->getIndex(i));
 
-                // 合并后非零索引数检查：超过 1 个非零索引就不合并
+                 
                 int nonZeroCount = 0;
                 for (size_t i = 0; i < newIndices.size(); i++) {
                     if (i == 0 && newIndices[i]->isConstIntZero()) continue;
@@ -333,7 +344,8 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
         if (merged) changed = true;
     }
 
-    // 统一删除
+     
+    // 2.3 所有用户都已原位重置后再统一删除旧基址 GEP，避免快照中悬空。
     for (auto *GEP : toDelete) {
         delete GEP;
     }
@@ -341,10 +353,12 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
     return changed;
 }
 
-// =====================================================================
-// Part 2: PHI 中 GEP 提取
-// =====================================================================
+ 
+ 
+ 
 bool GepCombinePass::foldGEPOfPhi(Function &F) {
+    // 3. 寻找单用户指针 PHI，其所有 incoming 都是同基址、同索引数的 GEP，
+    // 且最多只有同一个索引位置不同；自引用和跨计时屏障候选被排除。
     bool changed = false;
 
     for (BasicBlock *BB : F) {
@@ -355,13 +369,13 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
             if (!Phi->getIRType() || !Phi->getIRType()->isPointer()) continue;
             if (F.hasTimingBarrierOnPath(Phi, Phi)) continue;
 
-            // PHI 单 use 检查
+             
             if (Phi->countUses() > 1) continue;
 
             auto *FirstGEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0));
             if (!FirstGEP) continue;
 
-            // 不折叠自引用（循环回边的 GEP）
+             
             bool selfRef = !forEachPhiIncoming(
                 Phi, [Phi](unsigned, Value *Incoming, BasicBlock *) {
                     return Incoming != Phi;
@@ -401,10 +415,12 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
 
             if (!valid) continue;
 
+            // 3.1 incoming 地址完全相同时，在汇合块克隆一条 GEP；不能直接复用
+            // 某个前驱定义，否则该定义未必支配 PHI 的全部用户。
             if (diffIdx == -1) {
-                // 所有 incoming GEP 完全相同。
-                // 不能直接用 FirstGEP 替换，因为它在前驱块，不支配当前块的 uses。
-                // 正确做法：clone 一份到当前块。
+                 
+                 
+                 
                 std::vector<Value *> cloneIndices = FirstGEP->getIndices();
                 Value *base = FirstGEP->getBasePointer();
                 auto *clonedGEP = new GetElementPtrInst(base, cloneIndices);
@@ -413,8 +429,10 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                 Phi->replaceAllUsesWith(clonedGEP);
                 delete Phi;
                 changed = true;
+            // 3.2 仅一个索引变化时，先为该索引创建 PHI，再在 PHI 区之后生成公共 GEP，
+            // 用它替换原指针 PHI。
             } else {
-                // 在不同的索引位置创建新 PHI
+                 
                 Value *diffVal = FirstGEP->getIndex(static_cast<size_t>(diffIdx));
                 if (!diffVal->getIRType()) continue;
 
@@ -452,12 +470,13 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
     return changed;
 }
 
-// =====================================================================
-// Part 3: 循环内相邻 GEP 合并
-// =====================================================================
+ 
+ 
+ 
 bool GepCombinePass::isKnownNoWrapAdd(
     BinaryInst *Inst, BasicBlock *ContextBlock, RangeInfo &RI,
     const DominatorTree &DT) {
+    // 4.1 用操作数区间的两个端点证明 i32 加法不会回绕，这是相邻地址重基址的前提。
     if (!Inst || !ContextBlock || Inst->getOp() != BinaryInst::ADD)
         return false;
 
@@ -483,6 +502,7 @@ bool GepCombinePass::isKnownNoWrapAdd(
 
 bool GepCombinePass::combineLoopGEPs(
     Function &F, RangeInfo &RI, const DominatorTree &DT) {
+    // 4. 在每个基本块内按“除最后索引外的全部操作数”分组，保持程序顺序比较相邻 GEP。
     bool changed = false;
 
     for (BasicBlock *BB : F) {
@@ -537,7 +557,9 @@ bool GepCombinePass::combineLoopGEPs(
                 Value *prevLast = prevGEP->getIndex(prevGEP->getNumIndices() - 1);
                 Value *curLast = curGEP->getIndex(curGEP->getNumIndices() - 1);
 
-                // 检查 curLast = prevLast + C（直接 add 常量偏移）
+                 
+                // 4.2 若当前末索引等于前一末索引加常量且原加法无回绕，把当前 GEP
+                // 改为以前一地址为基址的常量步进。
                 if (auto *Bin = dynamic_cast<BinaryInst *>(curLast)) {
                     Value *lhs = nullptr;
                     Value *rhs = nullptr;
@@ -549,8 +571,8 @@ bool GepCombinePass::combineLoopGEPs(
 
                         if (offset &&
                             isKnownNoWrapAdd(Bin, BB, RI, DT)) {
-                            // 只有证明原 i32 加法不回绕后，才能把
-                            // gep(base, prev+C) 改写为 gep(gep(base, prev), C)。
+                             
+                             
                             std::vector<Value *> newIndices;
                             newIndices.push_back(ConstInt::newConstInt(offset->getVal()));
                             curGEP->reset(prevGEP, newIndices);
@@ -560,7 +582,9 @@ bool GepCombinePass::combineLoopGEPs(
                     }
                 }
 
-                // 检查两个都是 add(base, const) 形式，差值是常量
+                 
+                // 4.3 若两个末索引都是同一基值加常量，验证两次原加法及常量差均
+                // 不回绕后，以偏移差进行同样的重基址。
                 if (auto *PrevBin = dynamic_cast<BinaryInst *>(prevLast)) {
                     if (auto *CurBin = dynamic_cast<BinaryInst *>(curLast)) {
                         if (PrevBin->getOp() == BinaryInst::ADD &&
@@ -599,8 +623,8 @@ bool GepCombinePass::combineLoopGEPs(
                                     -static_cast<int64_t>(
                                         PrevOffset->getVal()),
                                     CheckedDiff)) {
-                                // 两个原始加法和常量差都经过 i32 检查，重基址
-                                // 不会把原来的回绕语义变成指针宽度算术。
+                                 
+                                 
                                 std::vector<Value *> newIndices;
                                 newIndices.push_back(
                                     ConstInt::newConstInt(
@@ -620,20 +644,24 @@ bool GepCombinePass::combineLoopGEPs(
 }
 
 PreservationStatus GepCombinePass::run(Function &F, FunctionAnalysisPassManager &FAM) {
+    // 1. 获取范围与支配证明；二者只服务合法性判断，不在改写过程中增量更新。
     bool changed = false;
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
+    // 2. 链式合并最多迭代四轮，使一轮暴露出的更长链继续收敛且限制编译时间。
     for (int iter = 0; iter < 4; iter++) {
         if (!combineChainedGEPs(F)) break;
         changed = true;
     }
 
+    // 3—4. 再做 PHI 外提与块内相邻地址重基址。
     changed |= foldGEPOfPhi(F);
     changed |= combineLoopGEPs(F, RI, DT);
 
     if (!changed) return PreservationStatus::all();
 
+    // 5. 不改 CFG，保留支配与循环结构；其余依赖值表达式的分析按默认规则失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();
