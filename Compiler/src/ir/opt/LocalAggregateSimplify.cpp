@@ -832,45 +832,11 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     std::vector<LoadInst *> DeadLoads;
 
     auto Instructions = collectInstructions(*BB);
-    Function *ParentF = BB->getParent();
-    // 2.2 若函数含计时语义，先收集该对象的全部访问并逐对检查屏障；固定预算
-    // 限制二次检查开销，任何可能跨屏障的转发都整体放弃。
-    if (ParentF && ParentF->mayReachTimingCall()) {
-        std::vector<Instruction *> Accesses;
-        for (Instruction *I : Instructions) {
-            Value *Pointer = nullptr;
-            if (auto *LI = dynamic_cast<LoadInst *>(I)) {
-                Pointer = LI->getPointerOperand();
-            } else if (auto *SI = dynamic_cast<StoreInst *>(I)) {
-                Pointer = SI->getPointerOperand();
-            } else if (auto *CI = dynamic_cast<CallInst *>(I);
-                       CI && CallInst::isMemcpyLike(CI) &&
-                       CI->getArgCount() >= 1) {
-                Pointer = CI->getArg(0);
-            }
-            if (Pointer && tracePointer(Pointer).Root == AI)
-                Accesses.push_back(I);
-        }
 
-        if (Accesses.size() > 128) return false;
-        for (Instruction *From : Accesses) {
-            for (Instruction *To : Accesses) {
-                if (ParentF->hasTimingBarrierOnPath(From, To))
-                    return false;
-            }
-        }
-    }
-
-    // 2.3 顺序解释同块指令：计时调用或不支持的写入使状态失效；完整常量
+    // 2.2 顺序解释同块指令：timer 不修改聚合对象，状态可以跨越；完整常量
     // memcpy 重置初值，常量路径 store 更新覆盖表，load 从覆盖或初值中转发。
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
-            if (CI->mayReachTimingCall()) {
-                StateValid = false;
-                InitialValue = nullptr;
-                Overwrites.clear();
-                continue;
-            }
             if (!CallInst::isMemcpyLike(CI) || CI->getArgCount() < 2) continue;
 
             LocalAggregatePointerPath Dest = tracePointer(CI->getArg(0));
@@ -1081,7 +1047,7 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
     return Result;
 }
 
-// 步骤 3 主流程先完整验证数组、索引、类型、计时顺序与代码增长收益，再为
+// 步骤 3 主流程先完整验证数组、索引、类型与代码增长收益，再为
 // 全部 load 构造替换值；任一失败都回滚所有新指令，成功后统一删除旧对象。
 bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     Function &F, AllocaInst *AI) {
@@ -1093,17 +1059,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     LocalAggregateReadOnlyConstantArrayPlan Plan;
     if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
         return false;
-    // 3.4 初始化和每个读取之间不得穿过计时屏障，否则消除内存访问可能改变
-    // 计时边界内的动态指令序列。
-    std::vector<Instruction *> TimingAccesses{Plan.InitCopy};
     for (LoadInst *LI : Plan.Loads) {
         if (!LI) return false;
-        TimingAccesses.push_back(LI);
-    }
-    for (Instruction *From : TimingAccesses) {
-        for (Instruction *To : TimingAccesses) {
-            if (F.hasTimingBarrierOnPath(From, To)) return false;
-        }
     }
 
     Value *FirstElement = Variable::getConstantElement(Plan.Source, {0});
@@ -1398,24 +1355,9 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
 
     if (SlotTypes.empty()) return false;
 
-    // 4.3 有初始化 memcpy 时，所有标量访问与初始化之间不得跨计时屏障；同块
-    // 访问必须位于 memcpy 之后，跨块访问只在初始化位于 alloca 块时接受。
+    // 4.3 有初始化 memcpy 时，同块访问必须位于 memcpy 之后，跨块访问只在
+    // 初始化位于 alloca 块时接受；timer 不访问对象，不参与内存次序判定。
     if (InitCopy) {
-        Function *ParentF = AI->getParent()
-                                ? AI->getParent()->getParent()
-                                : nullptr;
-        if (!ParentF) return false;
-        std::vector<Instruction *> TimingAccesses{InitCopy};
-        TimingAccesses.insert(TimingAccesses.end(), MemoryAccesses.begin(),
-                              MemoryAccesses.end());
-        for (Instruction *From : TimingAccesses) {
-            for (Instruction *To : TimingAccesses) {
-                if (!From || !To ||
-                    ParentF->hasTimingBarrierOnPath(From, To)) {
-                    return false;
-                }
-            }
-        }
         for (Instruction *Access : MemoryAccesses) {
             if (!Access) return false;
             if (Access->getParent() == InitCopy->getParent()) {

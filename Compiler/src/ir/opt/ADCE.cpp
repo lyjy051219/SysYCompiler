@@ -10,7 +10,11 @@
 #include <vector>
 
 bool ADCEPass::callHasObservableSideEffect(CallInst *CI) {
-    // 1.1 仅明确标为 NoModRef 的 builtin 可作为死根删除；普通函数和未知 callee
+    // 1.1 计时可观察性独立于程序内存 ModRef；即使 timer 不读写 SysY 对象，
+    // 其调用及可达封装仍必须作为活跃根保留。
+    if (CI && CI->mayReachTimingCall()) return true;
+
+    // 仅明确标为 NoModRef 的普通 builtin 可作为死根删除；普通函数和未知 callee
     // 还可能不返回或具有未被局部摘要覆盖的行为，统一视为可观察。
     Value *Callee = CI ? CI->getCallee() : nullptr;
     if (!Callee) return true;

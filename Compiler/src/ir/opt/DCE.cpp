@@ -54,6 +54,12 @@ bool DCEPass::isGuaranteedRemovableFunction(
 	}
 	Memo[&F] = ReturnProofState::Visiting;
 
+	// 计时函数及其封装即使没有程序内存效果也具有可观察行为，不能证明为可删除。
+	if (F.mayReachTimingCall()) {
+		Memo[&F] = ReturnProofState::Failed;
+		return false;
+	}
+
 	const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(F);
 	if (!isNoModRef(getFunctionModRefInfo(SEI)) ||
 		!hasAcyclicReturningCFG(F)) {

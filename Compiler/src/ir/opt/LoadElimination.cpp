@@ -44,26 +44,12 @@ bool LoadEliminationPass::mayModifyPointer(
     const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM)
 {
-    // 1.1 把计时调用视为完整屏障，再以 ModRef 为主判据；对摘要声称 NoModRef
-    // 的普通调用追加实参与目标地址的别名兜底，任何不确定写入都终止转发。
-    Value *P = Location.Pointer;
-    if (!P || !I) return true;
-
-    if (auto *CI = dynamic_cast<CallInst *>(I);
-        CI && CI->mayReachTimingCall()) {
-        return true;
-    }
+    // 1.1 以程序内存 ModRef 为主判据；timer 自身不读写 SysY 对象，因此不会
+    // 阻断值转发。跨函数固定点摘要已经包含未知指针来源，无需再按实参重复降级。
+    if (!Location.Pointer || !I) return true;
 
     ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
-    if (isModSet(MR)) return true;
-
-    if (auto *CI = dynamic_cast<CallInst *>(I)) {
-        if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
-            AA.callMayAliasPointer(CI, P, LI)) {
-            return true;
-        }
-    }
-    return false;
+    return isModSet(MR);
 }
 
 bool LoadEliminationPass::isUnmodifiedOnAllPaths(
@@ -208,20 +194,13 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
             }
         }
 
-        else if (auto *CI = dynamic_cast<CallInst *>(cur)) {
-            if (CI->mayReachTimingCall()) {
-                return LoadElimQueryResult::clobbered();
-            }
+        else if (dynamic_cast<CallInst *>(cur)) {
             ModRefInfo MR = getInstModRefInfo(
                 MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
             if (isModSet(MR)) {
                 return LoadElimQueryResult::clobbered();
             }
 
-            if (isNoModRef(MR) && !CI->getBuiltinCallee() &&
-                AA.callMayAliasPointer(CI, P, LI)) {
-                return LoadElimQueryResult::clobbered();
-            }
         }
 
         else {
@@ -446,7 +425,8 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
     // 2. 快速层：在查询预算内让 MemorySSA 找每个 load 的最近 clobber；只有该定义
-    // 是支配目标且无计时屏障的 MustAlias store，才计划用其存储值转发。
+    // 是支配目标的 MustAlias store 才计划转发。MemorySSA 保留 timer 调用节点，
+    // 但 walker 会依据程序内存摘要透明地越过它。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMSSAQueries = 512;
     constexpr std::size_t MaxMSSAWalk = 256;
@@ -469,7 +449,6 @@ PreservationStatus LoadEliminationPass::run(Function &F,
             if (Store->getParent() == BB &&
                 !Instruction::comesBefore(Store, Load))
                 continue;
-            if (F.hasTimingBarrierOnPath(Store, Load)) continue;
             if (AA.aliasWithIndexRange(MemoryLocation::get(Load),
                                        MemoryLocation::get(Store), LI) !=
                 AliasInfo::MustAlias)

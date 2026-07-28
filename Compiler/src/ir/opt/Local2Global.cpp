@@ -39,23 +39,15 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 		return PreservationStatus::all();
 	}
 
-	// 2. 只考察 main 入口块中的大对象，并预先判断函数是否可能到达计时屏障。
+	// 2. 只考察 main 入口块中的大对象。timer 不观察栈或全局存储位置，
+	// 因此对象表示转换不受计时边界限制。
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
-	const bool MainMayReachTiming = Main->mayReachTimingCall();
 
 	for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
 		std::shared_ptr<IRType> ElemTy =
 			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
-
-		// 2.1 若 alloca 的动态执行位置可能跨越计时调用，则保留栈分配，避免改变
-		// 计时区间内的初始化/分配成本；其余对象按目标阈值进入工作表。
-		if (MainMayReachTiming &&
-			(Main->hasTimingBarrierOnPath(EntryBB, nullptr, AI) ||
-			 Main->hasTimingBarrierOnPath(AI, AI))) {
-			continue;
-		}
 
 		if (ElemTy->getSize() > RISCVThreshold) {
 			WorkList.emplace_back(AI, ElemTy);

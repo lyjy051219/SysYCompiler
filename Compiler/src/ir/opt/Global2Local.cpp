@@ -152,21 +152,8 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 			CanPromote = false;
 		}
 
-		// 2.2 候选的任一 main use 若可能位于计时屏障之后或跨回边越过屏障，
-		// 则入口初始化会改变计时区间内存成本，必须放弃局部化。
-		if (CanPromote && Main->mayReachTimingCall()) {
-			for (Use *U : MainUses) {
-				auto *UserI = dynamic_cast<Instruction *>(
-					U ? U->getUser() : nullptr);
-				if (!UserI ||
-					Main->hasTimingBarrierOnPath(
-						MainEntry, nullptr, UserI) ||
-					Main->hasTimingBarrierOnPath(UserI, UserI)) {
-					CanPromote = false;
-					break;
-				}
-			}
-		}
+		// 2.2 局部化只改变对象存储表示；timer 不读取 SysY 程序对象的地址，
+		// 因此不把计时边界作为候选过滤条件。
 
 		if (!CanPromote || MainUses.empty()) continue;
 

@@ -122,13 +122,10 @@ bool MemorySSAResult::mayClobber(
                    AliasInfo::NoAlias;
     }
 
-    // 2. Call 使用 ModRef 摘要；递归 SCC 中暂时的 NoModRef 还需检查指针实参别名。
-    if (auto *CI = dynamic_cast<CallInst *>(I)) {
+    // 2. Call 使用跨函数固定点 ModRef 摘要；未知指针来源已在摘要中保守表示。
+    if (dynamic_cast<CallInst *>(I)) {
         ModRefInfo MRI = getInstModRefInfo(Location, I, AA, LI, FAM);
-        if (isModSet(MRI)) return true;
-
-        return isNoModRef(MRI) && !CI->getBuiltinCallee() &&
-               AA.callMayAliasPointer(CI, Ptr, LI);
+        return isModSet(MRI);
     }
 
     // 3. 构建器尚未识别的新 MemoryDef 种类一律视作潜在写入。
@@ -303,13 +300,10 @@ bool MemorySSAResult::isStoreValueRedundant(
             continue;
         }
 
-        if (auto *CI = dynamic_cast<CallInst *>(I)) {
+        if (dynamic_cast<CallInst *>(I)) {
             ModRefInfo MRI = getInstModRefInfo(
                 MemoryLocation::get(Store), I, AA, LI, FAM);
-            if (isModSet(MRI) ||
-                (isNoModRef(MRI) && !CI->getBuiltinCallee() &&
-                 AA.callMayAliasPointer(CI, Ptr, LI)))
-                return false;
+            if (isModSet(MRI)) return false;
 
             Worklist.push_back(Current->getDefiningAccess());
             continue;
@@ -345,7 +339,8 @@ MemorySSAResult MemorySSAAnalysis::run(
             Result.createAccess(MemoryAccess::Kind::Phi, BB);
     }
 
-    // 2. 按块内顺序连接 Load Use 与 Store/Call Def，记录每个块的出口状态。
+    // 2. 按块内顺序连接 Load Use 与 Store/Call Def。Call 节点保留调用顺序，
+    // walker 会通过精确 ModRef 将不访问程序内存的 timer 视为透明。
     for (BasicBlock *BB : F) {
         if (!BB) continue;
         MemoryAccess *Current = Result.BlockEntries[BB];

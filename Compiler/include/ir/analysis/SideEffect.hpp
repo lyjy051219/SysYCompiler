@@ -111,6 +111,10 @@ ModRefInfo getInstModRefInfo(Value* V, Instruction* I,
 // 聚合查询分别把函数、基本块和循环摘要转换成变换可消费的保守结论。
 ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI);
 
+// 返回调用对 SysY 程序内存的整体影响；可观察性和计时边界由 CFG 接口独立维护。
+ModRefInfo getCallProgramModRefInfo(
+    CallInst *CI, FunctionAnalysisPassManager &FAM);
+
 bool BasicBlockSideEffect(BasicBlock* BB,
                                const Loop& L,
                                BasicAAResult& AA,

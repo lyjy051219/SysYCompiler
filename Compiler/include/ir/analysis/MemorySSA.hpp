@@ -15,6 +15,7 @@ class LoopInfo;
 class Loop;
 
 // MemorySSA 使用单一内存状态：Load 为 Use，Store/Call 为 Def，块入口统一为 Phi。
+// Call 保留为 Def 以承载其他变换所需的调用顺序，walker 再用程序内存摘要跳过 timer。
 // 每个访问通过 DefiningAccess 或 IncomingAccesses 连到之前的内存状态。
 class MemoryAccess {
 public:

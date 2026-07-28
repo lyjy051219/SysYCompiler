@@ -571,28 +571,9 @@ bool GVNPRESolver::buildExpressionKey(Instruction *I, ExprKey &K) {
 }
 
 ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
-    // 2.7 builtin 按属性、普通函数按副作用摘要分类；计时、未知及未跟踪指针一律 ModRef。
-    if (!CI) return ModRefInfo::ModRef;
-    if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
-
-    if (auto *BIF = CI->getBuiltinCallee()) {
-        FuncAttr Attr = classifyBuiltin(BIF);
-        if (Attr == FuncAttr::Untracked)    return ModRefInfo::ModRef;
-        if (Attr == FuncAttr::NoModRef)     return ModRefInfo::NoModRef;
-        if (Attr == FuncAttr::MemReadOnly)  return ModRefInfo::Ref;
-        if (Attr == FuncAttr::MemWriteOnly) return ModRefInfo::Mod;
-        return ModRefInfo::ModRef;
-    }
-
-    if (auto *CalleeF = CI->getDirectCallee()) {
-        const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(*CalleeF);
-        for (const auto &KV : SEI.ptrMap) {
-            if (KV.second.untracked) return ModRefInfo::ModRef;
-        }
-        return getFunctionModRefInfo(SEI);
-    }
-
-    return ModRefInfo::ModRef;
+    // 2.7 统一复用 SideEffect 的程序内存摘要；timer 的可观察性和 CSE 禁止
+    // 由 isCallCSEEligible 单独维护，不再污染 ModRef。
+    return getCallProgramModRefInfo(CI, FAM);
 }
 
 bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
@@ -767,7 +748,6 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             bool Dominates = StoreBB && DT.dominates(StoreBB, BB) &&
                 (StoreBB != BB || Instruction::comesBefore(Store, LIst));
             if (Dominates && TypeCompatible(Store->getValueOperand()) &&
-                !F.hasTimingBarrierOnPath(Store, LIst) &&
                 AA.aliasWithIndexRange(Location,
                                        MemoryLocation::get(Store), LI) ==
                     AliasInfo::MustAlias) {
@@ -791,8 +771,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
                 !TypeCompatible(It->Load) ||
                 !DT.dominates(It->Block, BB) ||
                 (It->Block == BB &&
-                 !Instruction::comesBefore(It->Load, LIst)) ||
-                F.hasTimingBarrierOnPath(It->Load, LIst))
+                 !Instruction::comesBefore(It->Load, LIst)))
                 continue;
             if (AA.aliasWithIndexRange(Location, It->Location, LI) !=
                 AliasInfo::MustAlias)
@@ -812,8 +791,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         return false;
     };
 
-    // 2.13 最后沿唯一前驱链做有界逆向扫描，最近 MustAlias store/load 可转发，
-    // MayAlias 写、调用 Mod 或计时屏障终止；失败候选记入 clobber 版本缓存。
+    // 2.13 最后沿唯一前驱链做有界逆向扫描，最近 MustAlias store/load 可转发；
+    // MayAlias 写或调用 Mod 终止，timer 的调用节点按程序内存摘要透明越过。
     BasicBlock *ScanBB = BB;
     Instruction *StartI = I->getPrev();
 
@@ -855,14 +834,10 @@ bool GVNPRESolver::processLoad(Instruction *I) {
                 continue;
             }
 
-            if (auto *CI = dynamic_cast<CallInst *>(Cur)) {
-                if (CI->mayReachTimingCall()) return RememberAndFail();
+            if (dynamic_cast<CallInst *>(Cur)) {
                 ModRefInfo MRI = getInstModRefInfo(
                     Location, Cur, AA, LI, FAM);
-                if (isModSet(MRI) ||
-                    (isNoModRef(MRI) && !CI->getBuiltinCallee() &&
-                     AA.callMayAliasPointer(CI, Ptr, LI)))
-                    return RememberAndFail();
+                if (isModSet(MRI)) return RememberAndFail();
             }
         }
 
@@ -943,8 +918,8 @@ bool GVNPRESolver::processCall(Instruction *I) {
 }
 
 bool GVNPRESolver::runGVN() {
-    // 2. 先消除递归等价 PHI，再按 RPO 扫描可达指令；计时调用清空内存 load 缓存，
-    // 常量分支即时标记死块，load/call 使用专门的内存感知路径。
+    // 2. 先消除递归等价 PHI，再按 RPO 扫描可达指令；timer 不清空程序内存
+    // load 缓存，常量分支即时标记死块，load/call 使用专门的内存感知路径。
     bool Changed = eliminateCongruentPhis();
 
     for (BasicBlock *BB : RPO) {
@@ -955,12 +930,6 @@ bool GVNPRESolver::runGVN() {
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
             if (isDeadBlock(BB)) break;
-
-            if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && CI->mayReachTimingCall()) {
-
-                AvailableMemoryLoads.clear();
-            }
 
             if (I->instType == Instruction::PHI) {
                 continue;
@@ -1024,27 +993,12 @@ bool GVNPRESolver::runGVN() {
 }
 
 bool GVNPRESolver::eliminateCongruentPhis() {
-    // 2.16 在每个可达块中成对比较同型 PHI；含计时调用的循环整体跳过，并对候选
-    // 操作数图做有界跨屏障检查后才合并。
+    // 2.16 在每个可达块中成对比较同型 PHI；不因循环含 timer 整体放弃，
+    // 而是对候选操作数图做有界跨屏障检查后再合并。
     bool Changed = false;
 
     for (BasicBlock *BB : RPO) {
         if (!BB || isDeadBlock(BB)) continue;
-        if (Loop *L = LI.getLoopFor(BB)) {
-            bool HasTimingCall = false;
-            for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
-                if (!LoopBB) continue;
-                for (Instruction *LoopI : *LoopBB) {
-                    auto *CI = dynamic_cast<CallInst *>(LoopI);
-                    if (CI && CI->mayReachTimingCall()) {
-                        HasTimingCall = true;
-                        break;
-                    }
-                }
-                if (HasTimingCall) break;
-            }
-            if (HasTimingCall) continue;
-        }
         auto Phis = BB->collectPhiNodes();
         std::unordered_set<PhiInst *> Removed;
 

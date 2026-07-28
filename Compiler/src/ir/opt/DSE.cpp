@@ -76,9 +76,11 @@ bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
 }
 
 bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
-                                     const LoopInfo &LoopInfo) {
+                                     const LoopInfo &LoopInfo,
+                                     FunctionAnalysisPassManager &FAM) {
     // 1. 从块尾逆向维护“尚未被观察的后继 store”。load 会清除所有可能别名项；
-    // 当前 store 若被同覆盖范围的 MustAlias 后继 store 覆盖即可删除。
+    // 当前 store 若被同覆盖范围的 MustAlias 后继 store 覆盖即可删除。调用只按
+    // 程序内存 ModRef 清除冲突项；不访问程序内存的 timer 对该状态透明。
     if (BB == nullptr) {
         return false;
     }
@@ -98,8 +100,8 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                 continue;
             }
 
-            // 当前 store 本身会改变所有可能别名地址的待定状态；清除冲突项后，
-            // 再把它登记为向更早指令可见的最近写入。
+            // 当前 load 会观察所有可能别名地址，因此对应的后继 store 不能再用于
+            // 证明更早写入无效，需要从待定集合中清除。
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
                 Value *StorePtr = PendingIt->first;
@@ -164,8 +166,18 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
             continue;
         }
 
-        if (dynamic_cast<CallInst *>(I) != nullptr) {
-            pendingStores.clear();
+        if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            for (auto PendingIt = pendingStores.begin();
+                 PendingIt != pendingStores.end();) {
+                StoreInst *PendingStore = PendingIt->second;
+                ModRefInfo Effect = getInstModRefInfo(
+                    MemoryLocation::get(PendingStore), CI, AA, LoopInfo, FAM);
+                if (isRefSet(Effect) || isModSet(Effect)) {
+                    PendingIt = pendingStores.erase(PendingIt);
+                } else {
+                    ++PendingIt;
+                }
+            }
         }
     }
 
@@ -196,17 +208,6 @@ DSEBlockColor DSEPass::classifyFrom(
                     AliasInfo::MustAlias &&
                 storeFullyCoversPointer(P, SI)) {
                 return DSEBlockColor::Kill;
-            }
-        }
-
-        if (auto *CI = dynamic_cast<CallInst *>(I)) {
-
-            if (CI->mayReachTimingCall()) {
-                return DSEBlockColor::Clobber;
-            }
-            if (!CI->getBuiltinCallee() &&
-                AA.callMayAliasPointer(CI, P, LI)) {
-                return DSEBlockColor::Clobber;
             }
         }
 
@@ -313,22 +314,20 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-    // 2. 第一层在无计时调用的函数中，用 MemorySSA 有界查询删除“写入值本身已冗余”
-    // 的 store；先收集后删除，保持查询期间 MemorySSA 稳定。
+    // 2. 第一层用 MemorySSA 有界查询删除“写入值本身已冗余”的 store；timer
+    // 不访问 SysY 程序内存，walker 会越过其调用节点。先收集后删除以保持图稳定。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMemorySSAStoreQueries = 256;
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
     std::size_t queriedStores = 0;
 
-    if (!F.mayReachTimingCall()) {
-        for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
-            if (queriedStores >= MaxMemorySSAStoreQueries) break;
-            ++queriedStores;
-            if (MSSA.isStoreValueRedundant(
-                    SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
-                redundantValueStores.push_back(SI);
-            }
+    for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
+        if (queriedStores >= MaxMemorySSAStoreQueries) break;
+        ++queriedStores;
+        if (MSSA.isStoreValueRedundant(
+                SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
+            redundantValueStores.push_back(SI);
         }
     }
     for (StoreInst *SI : redundantValueStores) {
@@ -338,7 +337,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 
     // 3. 第二层逐块逆向消除被块内后继写入完整覆盖的 store。
     for (BasicBlock *BB : F) {
-        changed |= eliminateInBlockWithAA(BB, AA, LI);
+        changed |= eliminateInBlockWithAA(BB, AA, LI, FAM);
     }
 
     // 4. 第三层快照剩余 store，跨 CFG 证明所有路径在观察前均被覆盖，再统一删除。

@@ -14,8 +14,9 @@ struct Global2LocalCandidateInfo {
 	std::vector<Use *> MainUses;
 };
 
-// 流程：1. 仅在非递归 main 执行；2. 筛选小型、无跨函数可达引用且不跨计时屏障的全局；
+// 流程：1. 仅在非递归 main 执行；2. 筛选小型且无跨函数可达引用的全局；
 // 3. 在入口创建 alloca 和标量 store/数组 memcpy 初始化；4. 重连 main use。
+// timer 不读取对象存储位置，因此不限制全局与局部表示转换。
 class Global2LocalPass : public PassDescriptor<Global2LocalPass> {
 public:
 	explicit Global2LocalPass(bool RelaxScalarUses = false);

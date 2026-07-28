@@ -142,13 +142,9 @@ bool LICMPass::isReusableLoopInvariantCall(
 	BasicAAResult &AA,
 	const LoopInfo &LI,
 	FunctionAnalysisPassManager &FAM) {
-	// 2.4 可复用调用必须无计时行为、callee 副作用至多为已跟踪 Ref 且没有 Mod；
-	// 将 callee 的全局/指针形参读集映射到实参后，再证明循环内无人修改这些地址。
+	// 2.4 可复用调用本身必须无计时行为、callee 副作用至多为已跟踪 Ref 且没有
+	// Mod；是否跨越 timer 由最终插入位置的 CFG 路径检查判断，不封锁整个循环。
 	if (!CI || CI->mayReachTimingCall()) return false;
-	for (Instruction *I : LoopInsts) {
-		auto *LoopCall = dynamic_cast<CallInst *>(I);
-		if (LoopCall && LoopCall->mayReachTimingCall()) return false;
-	}
 	auto *CalleeFunc = CI->getDirectCallee();
 	if (!CalleeFunc || !CalleeFunc->front()) return false;
 
@@ -538,16 +534,6 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		}
 		if (!PreHeader || !Latch) return LocalChanged;
 		const bool CanSink = HasLoopSimplifyForm && InLCSSA;
-
-		// 1.3 循环内任何可能到达计时调用都会封锁本循环移动，防止改变计时边界。
-		for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
-			if (!LoopBB) continue;
-			for (Instruction *LoopI : *LoopBB) {
-				auto *LoopCall = dynamic_cast<CallInst *>(LoopI);
-				if (LoopCall && LoopCall->mayReachTimingCall())
-					return LocalChanged;
-			}
-		}
 
 		auto ExitBlocks = L->getExitBlocks();
 		if (ExitBlocks.empty()) return LocalChanged;

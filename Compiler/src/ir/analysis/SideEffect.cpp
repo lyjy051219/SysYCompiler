@@ -150,7 +150,8 @@ FuncAttr classifyBuiltin(BuildInFunction* BIF) {
     if (!BIF) return FuncAttr::Untracked;
     const std::string& N = BIF->getIdent();
 
-    if (BuildInFunction::isTimingName(N)) return FuncAttr::Sylib;
+    // timer 只访问运行时库私有状态；可观察性与移动边界不属于程序内存属性。
+    if (BuildInFunction::isTimingName(N)) return FuncAttr::NoModRef;
 
     if (BuildInFunction::isScalarIOName(N)) return FuncAttr::Sylib;
 
@@ -174,6 +175,9 @@ void SideEffectAnalysis::processBuiltinCall(
     const BaseAddressInfoMap& CallerPtrMap,
     SideEffectInfo& Info)
 {
+    // 计时函数只访问运行时库内部时钟状态，不读写任何 SysY 程序对象。
+    // 调用的可观察性和移动边界由 CallInst/Function 的 CFG 接口单独维护。
+    if (BIF && BuildInFunction::isTimingName(BIF->getIdent())) return;
 
     if (getIntrinsicID(BIF) == IntrinsicID::Memcpy ||
         getIntrinsicID(BIF) == IntrinsicID::Memmove) {
@@ -474,8 +478,6 @@ ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,
         auto *CI = dynamic_cast<CallInst *>(I);
         if (!CI) return ModRefInfo::ModRef;
 
-        if (CI->mayReachTimingCall()) return ModRefInfo::ModRef;
-
         std::vector<Value*> Args = CI->getArgs();
 
         if (auto* BIF = CI->getBuiltinCallee()) {
@@ -601,6 +603,31 @@ ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI)
     }
 
     return Result;
+}
+
+ModRefInfo getCallProgramModRefInfo(
+    CallInst *CI, FunctionAnalysisPassManager &FAM) {
+    // 调用级摘要只描述 SysY 程序内存，不承载 I/O 可观察性或计时代码移动语义。
+    if (!CI || !CI->getCallee()) return ModRefInfo::ModRef;
+
+    if (BuildInFunction *BIF = CI->getBuiltinCallee()) {
+        if (BuildInFunction::isTimingName(BIF->getIdent()))
+            return ModRefInfo::NoModRef;
+
+        FuncAttr Attr = classifyBuiltin(BIF);
+        if (Attr == FuncAttr::NoModRef) return ModRefInfo::NoModRef;
+        if (Attr == FuncAttr::MemReadOnly) return ModRefInfo::Ref;
+        if (Attr == FuncAttr::MemWriteOnly) return ModRefInfo::Mod;
+        return ModRefInfo::ModRef;
+    }
+
+    if (Function *Callee = CI->getDirectCallee()) {
+        const SideEffectInfo &Info =
+            FAM.getResult<SideEffectAnalysis>(*Callee);
+        return getFunctionModRefInfo(Info);
+    }
+
+    return ModRefInfo::ModRef;
 }
 
 // 基本块查询逐条筛选不可移动操作，并对局部 Store 继续检查其后是否存在读取。

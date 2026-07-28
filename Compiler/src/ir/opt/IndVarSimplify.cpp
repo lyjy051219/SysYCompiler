@@ -141,23 +141,10 @@ PassResult IndVarSimplifyPass::run(
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
     bool Changed = false;
-    // 1. 按内到外顺序寻找可规范化循环；含计时调用的循环拒绝删除或重排
-    // 每轮指令，以保持计时边界内的动态执行次数。
+    // 1. 按内到外顺序寻找可规范化循环。该 pass 只在原位置合并等价递推或
+    // 翻转比较操作数，不移动、复制或删除 timer 调用，因此无需封锁整个循环。
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L) continue;
-        bool HasTimingCall = false;
-        for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-            if (!BB) continue;
-            for (Instruction *I : *BB) {
-                auto *CI = dynamic_cast<CallInst *>(I);
-                if (CI && CI->mayReachTimingCall()) {
-                    HasTimingCall = true;
-                    break;
-                }
-            }
-            if (HasTimingCall) break;
-        }
-        if (HasTimingCall) continue;
         // 2—3. 先合并重复递推，否则规范退出比较；提交首个变化后立刻停止。
         if (mergeExactRecurrences(L, SE) || orientExitComparison(L, SE)) {
             Changed = true;

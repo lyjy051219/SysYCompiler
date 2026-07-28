@@ -22,9 +22,10 @@ struct Mem2RegRenameFrame {
     bool Processed = false;
 };
 
-// 流程：1. 筛选直接标量 load/store 且不跨计时屏障的入口 alloca；
+// 流程：1. 筛选只被直接标量 load/store 使用的入口 alloca；
 // 2. 先走无 PHI 快速路径；3. 以活跃性裁剪 IDF 并放置 PHI；
 // 4. 沿支配树重命名 load/store；5. 删除内存指令并迭代折叠退化 PHI。
+// timer 不访问 SysY 程序对象，因此不会阻止纯 SSA 表示提升。
 class PromotePass : public PassDescriptor<PromotePass> {
 public:
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
@@ -32,8 +33,6 @@ private:
     bool promoteMemoryToRegister(Function& F, DominatorTree& dominant);
     bool isAllocaPromotable(const AllocaInst* AI);
     bool areAllocaUsersReachable(const AllocaInst* AI, DominatorTree& DT);
-    static bool allocaCrossesTimingBarrier(
-        const AllocaInst *AI, const Function &F);
     bool rewriteSingleStoreAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
     bool rewriteSingleBlockAlloca(AllocaInfo &info, AllocaInst* AI, DominatorTree& DT, BlockInfo &blockInfo);
 

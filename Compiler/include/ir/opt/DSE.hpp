@@ -28,7 +28,8 @@ private:
                                         const StoreInst *Store);
     static bool isNonEscapingLocalStackPointer(Value *Pointer);
     static bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
-                                       const LoopInfo &LI);
+                                       const LoopInfo &LI,
+                                       FunctionAnalysisPassManager &FAM);
     static bool eliminateInBlock(BasicBlock *BB);
     static DSEBlockColor classifyFrom(
         Instruction *First, const MemoryLocation &Location, BasicAAResult &AA,

@@ -8,7 +8,6 @@
 #include <queue>
 #include <set>
 #include <stack>
-#include <unordered_set>
 
 void AllocaInfo::clean() {
     StoreBlocks.clear();
@@ -86,32 +85,6 @@ bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
         }
     }
     return true;
-}
-
-bool PromotePass::allocaCrossesTimingBarrier(
-    const AllocaInst *AI, const Function &F) {
-    // 1.3 对访问点做有界两两可达检查；任意访问顺序可能跨计时屏障时保留内存形态，
-    // 避免提升改变计时区间内实际执行的 load/store。
-    if (!AI || !F.mayReachTimingCall()) return false;
-
-    std::vector<Instruction *> Accesses;
-    std::unordered_set<Instruction *> Seen;
-    for (Use *U : AI->getUses()) {
-        auto *I = dynamic_cast<Instruction *>(
-            U ? U->getUser() : nullptr);
-        if (!I) return true;
-        if (Seen.insert(I).second) Accesses.push_back(I);
-    }
-
-    constexpr std::size_t MaxTimingCheckedAccesses = 128;
-    if (Accesses.size() > MaxTimingCheckedAccesses) return true;
-    for (Instruction *From : Accesses) {
-        for (Instruction *To : Accesses) {
-
-            if (F.hasTimingBarrierOnPath(From, To)) return true;
-        }
-    }
-    return false;
 }
 
 void AllocaInfo::AnalyzeAlloca(AllocaInst* AI) {
@@ -330,8 +303,8 @@ void PromotePass::computeIDF(
 }
 
 bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
-    // 1. 每轮重新收集入口 alloca，过滤不可提升、不可达及跨计时屏障的对象；循环执行
-    // 是为了让本轮删除和 PHI 化简暴露的新快速路径在下一轮继续处理。
+    // 1. 每轮重新收集入口 alloca，过滤不可提升和不可达对象；timer 不访问程序内存，
+    // 不阻止 SSA 表示提升。循环执行让本轮删除和 PHI 化简暴露的新快速路径继续处理。
     bool changed = false;
     BasicBlock* EntryBB = F.front();
     if (!EntryBB) return false;
@@ -344,8 +317,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
 
     for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
 
-        if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT) &&
-            !allocaCrossesTimingBarrier(AI, F))
+        if (isAllocaPromotable(AI) && areAllocaUsersReachable(AI, DT))
             Allocas.push_back(AI);
     }
 
