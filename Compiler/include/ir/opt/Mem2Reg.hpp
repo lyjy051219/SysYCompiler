@@ -7,7 +7,6 @@
 #include <utility>
 #include <map>
 #include <set>
-#include <queue>
 #include <stack>
 #include <unordered_map>
 
@@ -41,13 +40,6 @@ private:
         const std::set<BasicBlock*>& DefBlocks,
         std::set<BasicBlock*>& LiveInBlocks,
         const std::unordered_map<BasicBlock*, std::vector<BasicBlock*>>& PredMap);
-
-    void computeIDF(
-        const std::set<BasicBlock*>& DefBlocks,
-        const std::set<BasicBlock*>& LiveInBlocks,
-        std::set<BasicBlock*>& PhiBlocks,
-        DominatorTree& DT,
-        const std::unordered_map<DominatorNode*, unsigned>& DomLevels);
 
     bool simplifyPhiNode(PhiInst* Phi);
 };

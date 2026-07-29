@@ -83,6 +83,9 @@ public:
     std::vector<Loop*> getLoopsInPostOrder(
         bool ReverseSiblingOrder = false) const;
 
+    // 仅按 SSA 定义位置判断循环不变性：常量、参数、全局值和循环外定义均不变。
+    static bool isLoopInvariant(Value *V, const Loop *L);
+
     bool invalidate(Function &F, const PreservationStatus &PA);
 };
 

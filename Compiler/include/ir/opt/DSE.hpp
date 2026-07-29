@@ -14,8 +14,8 @@ enum class DSEBlockColor {
     Transparent,
 };
 
-// 流程：1. MemorySSA 删除重复值写入；2. 块内逆扫删除被后继 store 覆盖的写；
-// 3. 对剩余 store 有界遍历全部后继路径；4. 仅当每条路径观察前均被 Kill 才删除。
+// 流程：1. MemorySSA 正向证明所有路径覆盖写；2. 重建内存图后删除重复值写入；
+// 3. 块内逆扫和有界CFG遍历作为保守后备，继续处理不可观察栈对象等特殊情况。
 class DSEPass : public PassDescriptor<DSEPass> {
 public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

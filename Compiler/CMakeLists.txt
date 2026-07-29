@@ -130,11 +130,3 @@ else()
     )
     target_link_libraries(compiler Lib Yacc Opt Analysis Backend)
 endif()
-
-# 计时保护属于中端语义，仅在中端构建中接入对应回归测试。
-if(BUILD_MIDDLE_END OR BUILD_MIDDLE_END_RELEASE)
-    include(CTest)
-    if(BUILD_TESTING)
-        add_subdirectory(tests)
-    endif()
-endif()

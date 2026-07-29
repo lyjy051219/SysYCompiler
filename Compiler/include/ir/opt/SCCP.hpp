@@ -6,6 +6,10 @@
 #include <vector>
 #include <set>
 #include <variant>
+class BasicAAResult;
+class LoopInfo;
+class MemorySSAResult;
+
 // SCCP 使用单调三态格：Top 表示尚无可执行路径提供信息，Constant 表示所有
 // 已知可行路径给出同一常量，Bottom 表示过定义。合并只能沿
 // Top -> Constant -> Bottom 下降，因此工作队列必然收敛。
@@ -42,6 +46,8 @@ public:
 class SCCPSolver {
 public:
     SCCPSolver();
+    SCCPSolver(Function &F, MemorySSAResult &MSSA, BasicAAResult &AA,
+               const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
 
     void markBlockExecutable(BasicBlock* BB);
 
@@ -68,9 +74,18 @@ private:
     std::vector<BasicBlock*> BBWorkList;
     std::vector<Instruction*> InstWorkList;
 
+    // Load 只有在每条MemorySSA路径的首个写均为“同址、完整覆盖、同一SSA值”
+    // 的Store时才进入稀疏常量内存模型；反向表负责在写入值退化时重访Load。
+    std::unordered_map<LoadInst *, Value *> LoadStoredValues;
+    std::unordered_map<StoreInst *, std::vector<LoadInst *>>
+        StoreLoadDependents;
+
     LatticeValue& getValueState(Value* V);
 
     void pushUsersToWorkList(Value* V);
+    void initializeMemoryDependencies(
+        Function &F, MemorySSAResult &MSSA, BasicAAResult &AA,
+        const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
 
     // 服务求解步骤 1—2：各访问器只根据当前可行边和操作数格值产生更低的
     // 格值或新可行边，不直接修改 IR。

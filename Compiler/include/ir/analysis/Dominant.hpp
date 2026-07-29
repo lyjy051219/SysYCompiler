@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+#include <set>
 #include <stack>
 #include <algorithm>
 
@@ -50,7 +51,7 @@ public:
     DominatorTree calculate(Function* func);
 };
 
-// 支配树节点同时维护父子链和欧拉时间戳，供常数时间的支配查询。
+// 支配树节点同时维护父子链、层级和欧拉时间戳，供IDF与常数时间支配查询复用。
 class DominatorNode {
 public:
     BasicBlock* Block = nullptr;
@@ -59,13 +60,15 @@ public:
     DominatorNode* FirstChild = nullptr;
     DominatorNode* NextSibling = nullptr;
 
+    // 根节点层级为 0；子节点层级等于直接支配者层级加一。
+    unsigned Level = 0;
     unsigned DFSNumIn = 0;
     unsigned DFSNumOut = 0;
 
     bool isLeaf() const;
 };
 
-// 函数级分析结果拥有所有树节点，并提供块级、值级和遍历顺序查询。
+// 函数级分析结果拥有所有树节点，并提供块级、值级、遍历顺序和迭代支配边界查询。
 class DominatorTree {
     friend class SemiNCAInfo;
 public:
@@ -92,6 +95,12 @@ public:
     std::vector<DominatorNode *> getChildNodes(DominatorNode *Node) const;
     std::vector<BasicBlock *> getBlocksInPreOrder() const;
     std::vector<BasicBlock *> getChildren(BasicBlock *BB) const;
+
+    // 计算定义块集合的迭代支配边界；提供 LiveInBlocks 时执行 pruned IDF，
+    // 否则返回完整 IDF。不可达块不会进入结果。
+    std::set<BasicBlock *> getIteratedDominanceFrontier(
+        const std::set<BasicBlock *> &DefBlocks,
+        const std::set<BasicBlock *> *LiveInBlocks = nullptr) const;
 
     bool dominatesValue(Value* DefVal, Value* UseVal) const;
 

@@ -11,6 +11,7 @@
 class BasicAAResult;
 class DominatorTree;
 class LoopInfo;
+class MemoryAccess;
 struct MemoryLocation;
 
 // 前驱数据流的五态结果：已知值、需合成 PHI、确定被破坏、预算/环导致未知，
@@ -36,7 +37,9 @@ struct LoadElimQueryResult {
         std::vector<std::pair<BasicBlock *, Value *>> M);
 };
 
-// 流程：1. 用 MemorySSA 快速转发最近 MustAlias store；2. 解析计划依赖后批量删除；
+// 流程：1. 用 MemorySSA 汇总各路径最近 MustAlias store，并筛选clobber集合相同的
+// 支配load；后者还需通过CFG全路径无写证明；
+// 2. 解析计划依赖后批量删除；
 // 3. 按支配序对剩余 load 做块内逆扫、前驱递归和跨回边全路径证明；
 // 4. 各路径值不同但均已知时在汇合块合成 PHI。
 class LoadEliminationPass : public PassDescriptor<LoadEliminationPass> {
@@ -44,6 +47,12 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+
+    struct MSSALoadRecord {
+        LoadInst *Load = nullptr;
+        BasicBlock *Block = nullptr;
+        std::vector<MemoryAccess *> Clobbers;
+    };
 
     struct PathScanState {
         BasicBlock *BB = nullptr;
@@ -56,6 +65,7 @@ private:
     static constexpr int MaxPathScanBlocks = 64;
     static constexpr int MaxPathScanInstructions = 2048;
     static constexpr int MaxDominatingQueriesPerFunction = 64;
+    static constexpr std::size_t MaxMSSALoadComparisons = 128;
     static bool isTypeCompatible(Value *Source, LoadInst *TargetLoad);
     static bool mayModifyPointer(
         const MemoryLocation &Location, Instruction *I, BasicAAResult &AA,

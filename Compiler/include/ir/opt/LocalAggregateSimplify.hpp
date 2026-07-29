@@ -10,6 +10,11 @@
 #include <unordered_set>
 #include <vector>
 
+class BasicAAResult;
+class DominatorTree;
+class LoopInfo;
+class MemorySSAResult;
+
 struct LocalAggregatePointerPath {
     AllocaInst *Root = nullptr;
     std::vector<int> Indices;
@@ -52,7 +57,8 @@ struct LocalAggregateSynthExpression {
 // 1. 折叠只读全局的常量下标 load，并把完整定义域可综合的动态查表替换为
 //    更便宜的整数表达式；
 // 2. 在单块内转发“整表常量 memcpy + 常量下标覆盖”后的 load；
-// 3. 将只读常量 memcpy 初始化的小数组 load 展开为表达式或极小 select 链；
+// 3. 经支配与MemorySSA证明后，将只读常量memcpy初始化的小数组load跨块展开为
+//    表达式或极小select链；
 // 4. 把仅按常量路径访问的局部聚合拆成独立标量槽；
 // 5. 删除只有写入、地址未逃逸且从未被观察的聚合对象。
 // 每阶段都重新快照剩余 alloca，前一阶段的清理结果自然成为下一阶段输入。
@@ -127,13 +133,18 @@ private:
     static bool indexTypeCanSelectAll(Value *Index, int Count);
     static bool collectReadOnlyConstantArrayUses(
         Function &F, AllocaInst *AI,
-        LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count);
+        LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count,
+        const DominatorTree &DT, const MemorySSAResult &MSSA,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
     static Value *buildConstantArrayLookup(
         Variable *Source, int Count, Value *Index,
         Instruction *InsertBefore,
         std::vector<Instruction *> &Created);
     static bool expandReadOnlyConstantArrayLoads(
-        Function &F, AllocaInst *AI);
+        Function &F, AllocaInst *AI, const DominatorTree &DT,
+        const MemorySSAResult &MSSA, BasicAAResult &AA,
+        const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
     // 服务步骤 4：递归收集所有常量标量路径与透明派生 GEP；同一路径类型必须
     // 一致，且总槽位数不超过固定代码增长预算。
     static bool addScalarSlot(

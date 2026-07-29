@@ -1033,22 +1033,6 @@ BasicAAResult::getAdditiveOffsetFrom(Value* V, Value* Base) const {
     return std::nullopt;
 }
 
-bool BasicAAResult::isLoopInvariant(Value* V, const Loop* L) const {
-    if (!V || !L) {
-        return true;
-    }
-    if (V->isConst()) {
-        return true;
-    }
-    if (V->isParam() || V->isGlobal()) return true;
-    auto *I = dynamic_cast<Instruction*>(V);
-    if (!I) {
-        return true;
-    }
-    BasicBlock* BB = I->getParent();
-    return !BB || !L->contains(BB);
-}
-
 // 循环距离辅助只接受 SCEV 证明有限、不回绕且正步长的规范归纳 PHI。
 std::optional<BasicAAResult::PositivePhiRecurrence>
 BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
@@ -1096,7 +1080,7 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
         return std::nullopt;
     }
 
-    if (!isLoopInvariant(Lesser, Rec->L)) {
+    if (!LoopInfo::isLoopInvariant(Lesser, Rec->L)) {
         return std::nullopt;
     }
 

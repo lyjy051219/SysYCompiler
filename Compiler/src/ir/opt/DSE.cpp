@@ -308,15 +308,49 @@ bool DSEPass::isStoreDead(
 }
 
 PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-    // 1. 获取 AA、LoopInfo 与 MemorySSA，为覆盖判定、索引范围和到达定义提供依据。
+    // 1. 获取AA、LoopInfo与MemorySSA，为覆盖判定、索引范围和正反向内存图证明提供依据。
     bool changed = false;
 
-    auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    BasicAAResult *AA = &FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
+    MemorySSAResult *MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
 
-    // 2. 第一层用 MemorySSA 有界查询删除“写入值本身已冗余”的 store；timer
-    // 不访问 SysY 程序内存，walker 会越过其调用节点。先收集后删除以保持图稳定。
-    auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
+    // 2. 第一层由MemorySSA统一内存语义并沿CFG证明候选写在所有路径首次读取前
+    //均被完整覆盖。先收集后删除保持图稳定；不同值的分支覆盖也能删除汇合前旧写。
+    constexpr std::size_t MaxMemorySSAOverwriteQueries = 256;
+    constexpr std::size_t MaxVisitedForwardAccesses = 512;
+    std::vector<StoreInst *> overwrittenStores;
+    std::size_t overwriteQueries = 0;
+    for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
+        if (overwriteQueries >= MaxMemorySSAOverwriteQueries) break;
+        ++overwriteQueries;
+        if (MSSA->isStoreOverwrittenOnAllPaths(
+                SI, *AA, LI, FAM, MaxVisitedForwardAccesses)) {
+            overwrittenStores.push_back(SI);
+        }
+    }
+    for (StoreInst *SI : overwrittenStores) {
+        delete SI;
+        changed = true;
+    }
+
+    // 2.1 删除MemoryDef后旧图不再可查询；在Pass内部精确失效并重建AA/MemorySSA，
+    //避免同时删除“前写被后写覆盖”和“后写依赖前写同值”的相互证明。
+    if (!overwrittenStores.empty()) {
+        PreservationStatus RebuildPA;
+        RebuildPA.keep<DominantAnalysis>();
+        RebuildPA.keep<PostDominantAnalysis>();
+        RebuildPA.keep<LoopAnalysis>();
+        RebuildPA.discard<SideEffectAnalysis>();
+        RebuildPA.discard<BasicAliasAnalysis>();
+        RebuildPA.discard<MemorySSAAnalysis>();
+        FAM.invalidate(F, std::move(RebuildPA));
+        AA = &FAM.getResult<BasicAliasAnalysis>(F);
+        MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
+    }
+
+    // 3. 第二层反向删除“写入值本身已冗余”的store；timer不访问SysY程序内存，
+    //walker会越过其调用节点。该阶段同样先收集后删除以保持查询快照稳定。
     constexpr std::size_t MaxMemorySSAStoreQueries = 256;
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;
@@ -325,8 +359,8 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
         if (queriedStores >= MaxMemorySSAStoreQueries) break;
         ++queriedStores;
-        if (MSSA.isStoreValueRedundant(
-                SI, AA, LI, FAM, MaxVisitedMemoryAccesses)) {
+        if (MSSA->isStoreValueRedundant(
+                SI, *AA, LI, FAM, MaxVisitedMemoryAccesses)) {
             redundantValueStores.push_back(SI);
         }
     }
@@ -335,17 +369,32 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         changed = true;
     }
 
-    // 3. 第二层逐块逆向消除被块内后继写入完整覆盖的 store。
-    for (BasicBlock *BB : F) {
-        changed |= eliminateInBlockWithAA(BB, AA, LI, FAM);
+    // 3.1 后备扫描仍要使用与当前IR一致的AA；重复值删除后只需重建AA，
+    //后续不再消费MemorySSA。
+    if (!redundantValueStores.empty()) {
+        PreservationStatus RebuildPA;
+        RebuildPA.keep<DominantAnalysis>();
+        RebuildPA.keep<PostDominantAnalysis>();
+        RebuildPA.keep<LoopAnalysis>();
+        RebuildPA.discard<SideEffectAnalysis>();
+        RebuildPA.discard<BasicAliasAnalysis>();
+        RebuildPA.discard<MemorySSAAnalysis>();
+        FAM.invalidate(F, std::move(RebuildPA));
+        AA = &FAM.getResult<BasicAliasAnalysis>(F);
     }
 
-    // 4. 第三层快照剩余 store，跨 CFG 证明所有路径在观察前均被覆盖，再统一删除。
+    // 4. 第三层逐块逆向消除被块内后继写入完整覆盖的store，作为预算耗尽、
+    //不可观察栈对象和尚未纳入正向图证明场景的保守后备。
+    for (BasicBlock *BB : F) {
+        changed |= eliminateInBlockWithAA(BB, *AA, LI, FAM);
+    }
+
+    // 5. 第四层快照剩余store，保留原有CFG遍历后备，再统一删除。
     auto allStores = collectInstructions<StoreInst>(F);
 
     std::vector<StoreInst *> toDelete;
     for (StoreInst *SI : allStores) {
-        if (isStoreDead(SI, AA, LI, FAM)) {
+        if (isStoreDead(SI, *AA, LI, FAM)) {
             toDelete.push_back(SI);
         }
     }
@@ -359,7 +408,7 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         return PreservationStatus::all();
     }
 
-    // 5. 删除 store 不改变 CFG；内存版本、别名和副作用结论必须重新计算。
+    // 6. 删除store不改变CFG；内存版本、别名和副作用结论必须重新计算。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

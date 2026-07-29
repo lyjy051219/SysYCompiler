@@ -123,12 +123,28 @@ private:
 	std::unordered_map<BasicBlock *, AvailSet> AvailOut;
 
 	struct MemoryLoadRecord {
-		MemoryAccess *Clobber = nullptr;
+		std::vector<MemoryAccess *> Clobbers;
 		MemoryLocation Location;
 		LoadInst *Load = nullptr;
 		BasicBlock *Block = nullptr;
 	};
+
+	// 只读调用签名按每个实际读取位置记录全部路径上的首个潜在写。
+	struct MemoryReadClobber {
+		MemoryLocation Location;
+		std::vector<MemoryAccess *> Clobbers;
+
+		bool operator==(const MemoryReadClobber &Other) const;
+	};
+
+	struct MemoryCallRecord {
+		CallInst *Call = nullptr;
+		BasicBlock *Block = nullptr;
+		std::vector<MemoryReadClobber> Signature;
+	};
+
 	std::vector<MemoryLoadRecord> AvailableMemoryLoads;
+	std::vector<MemoryCallRecord> AvailableMemoryCalls;
 	std::size_t MemorySSAQueries = 0;
 	bool MemorySSAValid = true;
 
@@ -140,6 +156,8 @@ private:
 	static constexpr std::size_t kMaxMemorySSAQueries = 512;
 	static constexpr std::size_t kMaxMemoryLoadRecords = 512;
 	static constexpr std::size_t kMaxMemoryLoadComparisons = 64;
+	static constexpr std::size_t kMaxMemoryCallRecords = 256;
+	static constexpr std::size_t kMaxMemoryCallComparisons = 64;
 
 	bool runGVNFixedPoint();
 	bool runPREFixedPoint();
@@ -168,6 +186,8 @@ private:
 	bool isCallCSEEligible(CallInst *CI);
 	std::vector<Value *> collectCallReadPtrs(CallInst *CI);
 	static bool identicalCall(CallInst *A, CallInst *B);
+	bool buildReadOnlyCallSignature(
+		CallInst *CI, std::vector<MemoryReadClobber> &Signature);
 
 	void markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc);
 	void processBranchForDeadBlocks(Instruction *I);

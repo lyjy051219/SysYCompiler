@@ -1,6 +1,11 @@
 #include "ir/opt/LocalAggregateSimplify.hpp"
+#include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/MemorySSA.hpp"
+#include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
+#include "ir/analysis/SideEffect.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
 
@@ -921,11 +926,14 @@ bool LocalAggregateSimplifyPass::indexTypeCanSelectAll(
 }
 
 // 步骤 3.2：构造只读局部数组展开计划。alloca 只能有一次完整常量 memcpy
-// 初始化和若干直接元素 GEP；每个 GEP 只能被 load，初始化还须在所有 load
-// 的控制流位置之前满足当前实现的入口/同块顺序约束。
+// 初始化和若干直接元素 GEP；每个 GEP 只能被有界数量的load使用。跨块初始化
+// 必须支配load，并由MemorySSA证明初始化状态到load之间没有对该元素的其他写入。
 bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
     Function &F, AllocaInst *AI,
-    LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count) {
+    LocalAggregateReadOnlyConstantArrayPlan &Plan, int Count,
+    const DominatorTree &DT, const MemorySSAResult &MSSA,
+    BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM) {
     if (!AI || Count <= 0) return false;
 
     std::set<GetElementPtrInst *> SeenGEPs;
@@ -974,6 +982,7 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
             int OperandIndex = I->getUserIndex(U);
             if (auto *LI = dynamic_cast<LoadInst *>(I);
                 LI && OperandIndex == 0) {
+                if (Plan.Loads.size() >= 256) return false;
                 Plan.Loads.push_back(LI);
                 continue;
             }
@@ -985,11 +994,25 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
 
     BasicBlock *InitBB = Plan.InitCopy->getParent();
     if (!InitBB || InitBB != AI->getParent()) return false;
-    BasicBlock *Entry = F.front();
-    for (LoadInst *LI : Plan.Loads) {
-        if (LI->getParent() == InitBB) {
-            if (!Instruction::comesBefore(Plan.InitCopy, LI)) return false;
-        } else if (InitBB != Entry) {
+    MemoryAccess *InitAccess = MSSA.getMemoryAccess(Plan.InitCopy);
+    if (InitBB->getParent() != &F ||
+        !InitAccess || !InitAccess->isDef()) {
+        return false;
+    }
+    for (LoadInst *Load : Plan.Loads) {
+        BasicBlock *LoadBB = Load ? Load->getParent() : nullptr;
+        if (!LoadBB || LoadBB->getParent() != &F) return false;
+        if (LoadBB == InitBB) {
+            if (!Instruction::comesBefore(Plan.InitCopy, Load))
+                return false;
+            continue;
+        }
+
+        MemoryAccess *LoadAccess = MSSA.getMemoryAccess(Load);
+        if (!LoadAccess || !DT.dominates(InitBB, LoadBB) ||
+            MSSA.hasClobberBetween(
+                Plan.InitCopy, LoadAccess, MemoryLocation::get(Load),
+                AA, LI, FAM, 256)) {
             return false;
         }
     }
@@ -1050,14 +1073,17 @@ Value *LocalAggregateSimplifyPass::buildConstantArrayLookup(
 // 步骤 3 主流程先完整验证数组、索引、类型与代码增长收益，再为
 // 全部 load 构造替换值；任一失败都回滚所有新指令，成功后统一删除旧对象。
 bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
-    Function &F, AllocaInst *AI) {
+    Function &F, AllocaInst *AI, const DominatorTree &DT,
+    const MemorySSAResult &MSSA, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
     constexpr int kMaxDynamicSelectArrayElements = 2;
 
     int Count = getOneDimScalarArrayCount(AI);
     if (Count <= 0) return false;
 
     LocalAggregateReadOnlyConstantArrayPlan Plan;
-    if (!collectReadOnlyConstantArrayUses(F, AI, Plan, Count))
+    if (!collectReadOnlyConstantArrayUses(
+            F, AI, Plan, Count, DT, MSSA, AA, LI, FAM))
         return false;
     for (LoadInst *LI : Plan.Loads) {
         if (!LI) return false;
@@ -1143,7 +1169,8 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     }
 
     // 3.7 所有构造均成功后提交：替换并删除 load、初始化 memcpy、无用元素
-    // GEP，最后仅在 alloca 已无 use 时删除根对象。
+    // GEP，最后仅在 alloca 已无 use 时删除根对象；若仍有保守保留的派生use，
+    // 前面的替换仍然已经提交，必须返回changed以触发分析失效。
     for (auto &Replacement : Replacements) {
         Replacement.first->replaceAllUsesWith(Replacement.second);
         delete Replacement.first;
@@ -1155,7 +1182,7 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
         if (!(*It)->hasUses()) delete *It;
     }
 
-    if (AI->hasUses()) return false;
+    if (AI->hasUses()) return true;
     delete AI;
     return true;
 }
@@ -1533,9 +1560,47 @@ LocalAggregateSimplifyPass::run(Function &F,
     // 2. 转发同块内由完整常量拷贝和常量覆盖确定的元素 load。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= forwardConstantLoads(AI);
-    // 3. 将只读常量初始化的小数组整体展开并删除内存对象。
-    for (AllocaInst *AI : collectArrayAllocas(F))
-        Changed |= expandReadOnlyConstantArrayLoads(F, AI);
+
+    // 3. 在数组查询预算内整体展开只读常量初始化的小数组。前两阶段或前一个
+    // 数组一旦改写IR，就先精确失效旧AA/MemorySSA，再为下一个数组重建快照。
+    DominatorTree *DT = nullptr;
+    BasicAAResult *AA = nullptr;
+    LoopInfo *LI = nullptr;
+    MemorySSAResult *MSSA = nullptr;
+    auto InvalidateMemoryAnalyses = [&]() {
+        PreservationStatus PA;
+        PA.keep<DominantAnalysis>();
+        PA.keep<PostDominantAnalysis>();
+        PA.keep<LoopAnalysis>();
+        PA.discard<BasicAliasAnalysis>();
+        PA.discard<MemorySSAAnalysis>();
+        PA.discard<SideEffectAnalysis>();
+        FAM.invalidate(F, std::move(PA));
+        DT = nullptr;
+        AA = nullptr;
+        LI = nullptr;
+        MSSA = nullptr;
+    };
+    std::vector<AllocaInst *> ReadOnlyArrays = collectArrayAllocas(F);
+    if (!ReadOnlyArrays.empty() && Changed)
+        InvalidateMemoryAnalyses();
+    constexpr std::size_t MaxMemorySSAArrayQueries = 64;
+    std::size_t QueriedArrays = 0;
+    for (AllocaInst *AI : ReadOnlyArrays) {
+        if (QueriedArrays++ >= MaxMemorySSAArrayQueries) break;
+        if (!DT) {
+            DT = &FAM.getResult<DominantAnalysis>(F);
+            AA = &FAM.getResult<BasicAliasAnalysis>(F);
+            LI = &FAM.getResult<LoopAnalysis>(F);
+            MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
+        }
+        if (!expandReadOnlyConstantArrayLoads(
+                F, AI, *DT, *MSSA, *AA, *LI, FAM)) {
+            continue;
+        }
+        Changed = true;
+        InvalidateMemoryAnalyses();
+    }
     // 4. 把剩余仅有常量路径访问的聚合拆成标量槽。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= scalarizeConstantIndexedAggregate(AI);

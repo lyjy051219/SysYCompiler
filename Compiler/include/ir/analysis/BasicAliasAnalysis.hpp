@@ -208,7 +208,6 @@ private:
     std::optional<long long> getAdditiveOffsetFrom(Value* V, Value* Base) const;
     std::optional<PositivePhiRecurrence> getPositivePhiRecurrence(PhiInst* Phi,
                                                                   const LoopInfo& LI) const;
-    bool isLoopInvariant(Value* V, const Loop* L) const;
     std::optional<long long> lowerBoundDiff(Value* Greater, Value* Lesser,
                                             const LoopInfo& LI) const;
     AliasInfo aliasGEPByIndexDistance(

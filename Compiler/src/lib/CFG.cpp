@@ -1909,6 +1909,15 @@ Value* StoreInst::getPointerOperand() const {
     return getOperand(1);
 }
 
+bool StoreInst::fullyCoversItsPointer() const {
+    Value *Pointer = getPointerOperand();
+    Value *StoredValue = getValueOperand();
+    std::shared_ptr<IRType> Pointee =
+        Pointer ? Pointer->getPointeeType() : nullptr;
+    return Pointee && StoredValue && StoredValue->getIRType() &&
+           Pointee->hasSameShape(*StoredValue->getIRType());
+}
+
 void StoreInst::dumpIR(){
   std::cout << "store ";
   for (auto &i : userList) {

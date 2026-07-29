@@ -254,6 +254,7 @@ void GVNPRESolver::clearIterationState() {
     PhiTranslateTable.clear();
     AvailOut.clear();
     AvailableMemoryLoads.clear();
+    AvailableMemoryCalls.clear();
     MemorySSAQueries = 0;
 }
 
@@ -665,6 +666,69 @@ bool GVNPRESolver::identicalCall(CallInst *A, CallInst *B) {
         });
 }
 
+bool GVNPRESolver::MemoryReadClobber::operator==(
+    const MemoryReadClobber &Other) const {
+    return Location.Pointer == Other.Location.Pointer &&
+           Location.Size == Other.Location.Size &&
+           Clobbers == Other.Clobbers;
+}
+
+bool GVNPRESolver::buildReadOnlyCallSignature(
+    CallInst *CI, std::vector<MemoryReadClobber> &Signature) {
+    Signature.clear();
+    if (!CI || !MemorySSAValid) return false;
+
+    //只接纳目标、读写角色和顺序语义全部明确的纯只读调用；跨对象访问即使角色
+    //是Ref也缺少可靠区间，不能构造逐位置内存版本签名。
+    CallEffectSummary Effects = getCallEffectSummary(CI, FAM);
+    if (Effects.HasUnknownMemory || Effects.HasObservableEffect ||
+        Effects.HasOrderingBarrier || Effects.MayCrossObjectBounds ||
+        Effects.ProgramMemory.empty()) {
+        return false;
+    }
+
+    for (const CallMemoryEffect &Effect : Effects.ProgramMemory) {
+        if (Effect.ModRef != ModRefInfo::Ref ||
+            !Effect.Location.Pointer ||
+            MemorySSAQueries >= kMaxMemorySSAQueries) {
+            Signature.clear();
+            return false;
+        }
+        ++MemorySSAQueries;
+        MemoryClobberResult Clobber = MSSA.getClobberingAccesses(
+            CI, Effect.Location, AA, LI, FAM, 256);
+        if (!Clobber.Complete || Clobber.Clobbers.empty()) {
+            Signature.clear();
+            return false;
+        }
+        Signature.push_back(
+            {Effect.Location, std::move(Clobber.Clobbers)});
+    }
+
+    //摘要集合本身不承诺遍历顺序；规范化后相同调用才能逐项比较签名。
+    std::sort(
+        Signature.begin(), Signature.end(),
+        [](const MemoryReadClobber &LHS,
+           const MemoryReadClobber &RHS) {
+            if (LHS.Location.Pointer != RHS.Location.Pointer) {
+                return std::less<Value *>{}(
+                    LHS.Location.Pointer, RHS.Location.Pointer);
+            }
+            if (LHS.Location.Size != RHS.Location.Size)
+                return LHS.Location.Size < RHS.Location.Size;
+            if (LHS.Clobbers.size() != RHS.Clobbers.size())
+                return LHS.Clobbers.size() < RHS.Clobbers.size();
+            for (std::size_t Index = 0;
+                 Index < LHS.Clobbers.size(); ++Index) {
+                unsigned LHSID = LHS.Clobbers[Index]->getID();
+                unsigned RHSID = RHS.Clobbers[Index]->getID();
+                if (LHSID != RHSID) return LHSID < RHSID;
+            }
+            return false;
+        });
+    return true;
+}
+
 void GVNPRESolver::markDeadBranchBlocks(BasicBlock *BrBB, BasicBlock *DeadSucc) {
     // 2.10 从常量分支未取后继收集候选区域，再迭代剔除仍有区域外前驱的块；剩余块
     // 才真正只由死边可达，可从本轮值编号与 PRE 路径中排除。
@@ -718,8 +782,8 @@ void GVNPRESolver::processBranchForDeadBlocks(Instruction *I) {
 }
 
 bool GVNPRESolver::processLoad(Instruction *I) {
-    // 2.11 load 消除先查询有预算的 MemorySSA clobber：若最近定义是支配目标的
-    // MustAlias store，直接转发其值。
+    // 2.11 load消除先查询有预算的MemorySSA完整clobber集合：若每条路径均由
+    // MustAlias完整Store写入同一个支配值，直接转发；否则保留集合用于load CSE。
     auto *LIst = dynamic_cast<LoadInst *>(I);
     if (!LIst) return false;
     Value *Ptr = LIst->getPointerOperand();
@@ -734,39 +798,58 @@ bool GVNPRESolver::processLoad(Instruction *I) {
     };
 
     MemoryLocation Location = MemoryLocation::get(LIst);
-    MemoryAccess *Clobber = nullptr;
+    std::vector<MemoryAccess *> Clobbers;
     if (MemorySSAValid && MemorySSAQueries < kMaxMemorySSAQueries) {
         ++MemorySSAQueries;
-        Clobber = MSSA.getClobberingAccess(
+        MemoryClobberResult Result = MSSA.getClobberingAccesses(
             LIst, Location, AA, LI, FAM, 256);
+        if (Result.Complete)
+            Clobbers = std::move(Result.Clobbers);
     }
 
-    if (Clobber && Clobber->isDef()) {
-        if (auto *Store = dynamic_cast<StoreInst *>(
-                Clobber->getInstruction())) {
-            BasicBlock *StoreBB = Store->getParent();
-            bool Dominates = StoreBB && DT.dominates(StoreBB, BB) &&
-                (StoreBB != BB || Instruction::comesBefore(Store, LIst));
-            if (Dominates && TypeCompatible(Store->getValueOperand()) &&
-                AA.aliasWithIndexRange(Location,
-                                       MemoryLocation::get(Store), LI) ==
-                    AliasInfo::MustAlias) {
-                I->replaceAllUsesWith(Store->getValueOperand());
-                forgetInstruction(I);
-                delete I;
-                return true;
-            }
+    Value *CommonStoredValue = nullptr;
+    bool AllSameValueStores = !Clobbers.empty();
+    for (MemoryAccess *Clobber : Clobbers) {
+        auto *Store = Clobber && Clobber->isDef()
+                          ? dynamic_cast<StoreInst *>(
+                                Clobber->getInstruction())
+                          : nullptr;
+        Value *Stored = Store ? Store->getValueOperand() : nullptr;
+        MemoryLocation StoreLocation = MemoryLocation::get(Store);
+        if (!Store || !Stored || Stored->isUndef() ||
+            !Store->fullyCoversItsPointer() ||
+            !StoreLocation.Size || !Location.Size ||
+            *StoreLocation.Size < *Location.Size ||
+            !TypeCompatible(Stored) ||
+            AA.aliasWithIndexRange(Location, StoreLocation, LI) !=
+                AliasInfo::MustAlias) {
+            AllSameValueStores = false;
+            break;
+        }
+        if (!CommonStoredValue)
+            CommonStoredValue = Stored;
+        else if (CommonStoredValue != Stored) {
+            AllSameValueStores = false;
+            break;
         }
     }
+    if (AllSameValueStores && CommonStoredValue &&
+        DT.dominatesValue(CommonStoredValue, LIst)) {
+        I->replaceAllUsesWith(CommonStoredValue);
+        forgetInstruction(I);
+        delete I;
+        return true;
+    }
 
-    // 2.12 否则在相同 clobber 版本下复用支配的 MustAlias load；共同 clobber
-    // 证明两次读取之间没有改变该位置的内存定义。
-    if (Clobber) {
+    // 2.12 相同完整clobber集合只用于筛选支配的MustAlias load；循环回边会让
+    // 不同迭代到达同一批静态MemoryDef，因此还要从当前状态反向证明每条路径
+    // 都能无写到达候选load消费的内存边界。
+    if (!Clobbers.empty()) {
         std::size_t Compared = 0;
         for (auto It = AvailableMemoryLoads.rbegin();
              It != AvailableMemoryLoads.rend() &&
              Compared < kMaxMemoryLoadComparisons; ++It, ++Compared) {
-            if (It->Clobber != Clobber || !It->Load || !It->Block ||
+            if (It->Clobbers != Clobbers || !It->Load || !It->Block ||
                 !It->Load->getParent() ||
                 !TypeCompatible(It->Load) ||
                 !DT.dominates(It->Block, BB) ||
@@ -776,6 +859,11 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             if (AA.aliasWithIndexRange(Location, It->Location, LI) !=
                 AliasInfo::MustAlias)
                 continue;
+            MemoryAccess *LoadAccess = MSSA.getMemoryAccess(LIst);
+            if (!LoadAccess ||
+                MSSA.hasClobberBetween(
+                    It->Load, LoadAccess, Location, AA, LI, FAM, 256))
+                continue;
             I->replaceAllUsesWith(It->Load);
             forgetInstruction(I);
             delete I;
@@ -784,9 +872,10 @@ bool GVNPRESolver::processLoad(Instruction *I) {
     }
 
     auto RememberAndFail = [&]() {
-        if (Clobber &&
+        if (!Clobbers.empty() &&
             AvailableMemoryLoads.size() < kMaxMemoryLoadRecords) {
-            AvailableMemoryLoads.push_back({Clobber, Location, LIst, BB});
+            AvailableMemoryLoads.push_back(
+                {Clobbers, Location, LIst, BB});
         }
         return false;
     };
@@ -849,8 +938,9 @@ bool GVNPRESolver::processLoad(Instruction *I) {
 }
 
 bool GVNPRESolver::processCall(Instruction *I) {
-    // 2.14 对 Ref-only 调用沿唯一前驱链寻找实参与 callee 完全相同的先前调用；
-    // 两者之间对任一读地址的 store/call 写入都会阻断复用。
+    // 2.14 对Ref-only调用先用逐读取位置的MemorySSA clobber签名筛选支配调用，
+    // 再逐位置证明两次调用之间所有路径均无写；查询不可用时沿唯一前驱链执行
+    // 原有保守扫描。静态签名相同本身不能区分循环中的不同动态迭代。
     auto *CI = dynamic_cast<CallInst *>(I);
     if (!CI) return false;
 
@@ -861,7 +951,62 @@ bool GVNPRESolver::processCall(Instruction *I) {
     BasicBlock *BB = I->getParent();
     if (!BB) return false;
 
+    std::vector<MemoryReadClobber> Signature;
+    if (buildReadOnlyCallSignature(CI, Signature)) {
+        std::size_t Compared = 0;
+        for (auto It = AvailableMemoryCalls.rbegin();
+             It != AvailableMemoryCalls.rend() &&
+             Compared < kMaxMemoryCallComparisons; ++It, ++Compared) {
+            CallInst *Previous = It->Call;
+            if (!Previous || !It->Block ||
+                !Previous->isInBlock(It->Block) ||
+                It->Signature != Signature ||
+                !identicalCall(CI, Previous) ||
+                !DT.dominates(It->Block, BB) ||
+                (It->Block == BB &&
+                 !Instruction::comesBefore(Previous, CI)) ||
+                F.hasTimingBarrierOnPath(Previous, CI)) {
+                continue;
+            }
+
+            MemoryAccess *CallAccess = MSSA.getMemoryAccess(CI);
+            bool Unmodified = CallAccess != nullptr;
+            for (const MemoryReadClobber &Read : Signature) {
+                if (!Unmodified ||
+                    MemorySSAQueries >= kMaxMemorySSAQueries) {
+                    Unmodified = false;
+                    break;
+                }
+                ++MemorySSAQueries;
+                if (MSSA.hasClobberBetween(
+                        Previous, CallAccess, Read.Location,
+                        AA, LI, FAM, 256)) {
+                    Unmodified = false;
+                    break;
+                }
+            }
+            if (!Unmodified) continue;
+
+            I->replaceAllUsesWith(Previous);
+            forgetInstruction(I);
+            //删除MemoryUse不会改变定义链，但旧图仍持有该Use的指令指针；后续
+            //不再进行MemorySSA查询，避免未来正向walker观察悬空节点。
+            MemorySSAValid = false;
+            AvailableMemoryLoads.clear();
+            AvailableMemoryCalls.clear();
+            delete I;
+            return true;
+        }
+
+        if (AvailableMemoryCalls.size() < kMaxMemoryCallRecords)
+            AvailableMemoryCalls.push_back(
+                {CI, BB, std::move(Signature)});
+    }
+
     auto ReadPtrs = collectCallReadPtrs(CI);
+    //Ref摘要若不能完整映射到调用点的实际读取位置，唯一前驱扫描也无法判断
+    //Store是否干扰该调用，必须保守放弃而不能把所有Store视作透明。
+    if (ReadPtrs.empty()) return false;
 
     BasicBlock *ScanBB = BB;
     Instruction *StartI = I->getPrev();
@@ -894,6 +1039,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
 
                     MemorySSAValid = false;
                     AvailableMemoryLoads.clear();
+                    AvailableMemoryCalls.clear();
                     delete I;
                     return true;
                 }
@@ -983,6 +1129,7 @@ bool GVNPRESolver::runGVN() {
             if (dynamic_cast<CallInst *>(I)) {
                 MemorySSAValid = false;
                 AvailableMemoryLoads.clear();
+                AvailableMemoryCalls.clear();
             }
             delete I;
             Changed = true;

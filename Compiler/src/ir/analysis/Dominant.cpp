@@ -1,5 +1,7 @@
 #include "ir/analysis/Dominant.hpp"
 
+#include <queue>
+
 bool DominatorNode::isLeaf() const {
     return FirstChild == nullptr;
 }
@@ -87,6 +89,62 @@ std::vector<BasicBlock *> DominatorTree::getChildren(BasicBlock *BB) const {
         if (Child->Block) Children.push_back(Child->Block);
     }
     return Children;
+}
+
+std::set<BasicBlock *> DominatorTree::getIteratedDominanceFrontier(
+    const std::set<BasicBlock *> &DefBlocks,
+    const std::set<BasicBlock *> *LiveInBlocks) const {
+    // 1. 按支配树深度从内向外处理定义根；不可达定义块没有支配树节点，
+    // 不参与可达 CFG 的 PHI 放置。
+    std::priority_queue<std::pair<unsigned, DominatorNode *>> WorkQueue;
+    std::set<DominatorNode *> QueuedRoots;
+    std::set<DominatorNode *> PlacedPhis;
+    std::set<BasicBlock *> PhiBlocks;
+
+    for (BasicBlock *BB : DefBlocks) {
+        DominatorNode *Node = getNode(BB);
+        if (!Node || !QueuedRoots.insert(Node).second) continue;
+        WorkQueue.push({Node->Level, Node});
+    }
+
+    // 2. 对每个定义根遍历其支配子树。离开该子树且支配层级不更深的 CFG
+    // 后继就是当前根的支配边界；新 PHI 也视作定义，继续求 IDF 闭包。
+    while (!WorkQueue.empty()) {
+        unsigned RootLevel = WorkQueue.top().first;
+        DominatorNode *RootNode = WorkQueue.top().second;
+        WorkQueue.pop();
+
+        std::vector<DominatorNode *> NodeWorklist{RootNode};
+        std::set<DominatorNode *> LocalVisited{RootNode};
+        while (!NodeWorklist.empty()) {
+            DominatorNode *Node = NodeWorklist.back();
+            NodeWorklist.pop_back();
+
+            for (BasicBlock *Succ : Node->Block->getSuccessors()) {
+                DominatorNode *SuccNode = getNode(Succ);
+                if (!SuccNode || SuccNode->Level > RootLevel)
+                    continue;
+                if (LiveInBlocks && !LiveInBlocks->count(Succ))
+                    continue;
+
+                if (!PlacedPhis.insert(SuccNode).second)
+                    continue;
+                PhiBlocks.insert(Succ);
+
+                if (!DefBlocks.count(Succ) &&
+                    QueuedRoots.insert(SuccNode).second)
+                    WorkQueue.push({SuccNode->Level, SuccNode});
+            }
+
+            for (DominatorNode *Child = Node->FirstChild; Child;
+                 Child = Child->NextSibling) {
+                if (LocalVisited.insert(Child).second)
+                    NodeWorklist.push_back(Child);
+            }
+        }
+    }
+
+    return PhiBlocks;
 }
 
 DominatorNode* DominatorTree::getNode(BasicBlock* BB) const {
@@ -272,6 +330,7 @@ void SemiNCAInfo::buildDominatorTree(DominatorTree& DT) {
         if (node->DFSNumIn == 0) {
             node->DFSNumIn = ++time;
             for (DominatorNode* child = node->FirstChild; child; child = child->NextSibling) {
+                child->Level = node->Level + 1;
                 stack.push_back(child);
             }
         } else {

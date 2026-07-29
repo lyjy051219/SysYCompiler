@@ -1121,7 +1121,7 @@ SCEVResult::findAdditiveDeltaImpl(
     if (V == Self) return UpdateDelta{true, makeConstant(0, Self->getIRType())};
     if (Depth > 64) return std::nullopt;
 
-    if (isLoopInvariant(V, L))
+    if (LoopInfo::isLoopInvariant(V, L))
         return UpdateDelta{false, getSCEV(V)};
 
     if (auto *Merge = dynamic_cast<PhiInst *>(V)) {
@@ -1230,29 +1230,19 @@ const SCEVExpr *SCEVResult::trySimpleMulDivRec(PhiInst *Self, Value *Update,
     if (!A || !B) return nullptr;
 
     if (BI->getOp() == BinaryInst::MUL) {
-        if (A == Self && isLoopInvariant(B, L))
+        if (A == Self && LoopInfo::isLoopInvariant(B, L))
             return makeRec(SCEVExprKind::MulRec, L, getSCEV(Start), getSCEV(B),
                            Self->getIRType());
-        if (B == Self && isLoopInvariant(A, L))
+        if (B == Self && LoopInfo::isLoopInvariant(A, L))
             return makeRec(SCEVExprKind::MulRec, L, getSCEV(Start), getSCEV(A),
                            Self->getIRType());
     }
     if (BI->getOp() == BinaryInst::DIV &&
-        A == Self && isLoopInvariant(B, L)) {
+        A == Self && LoopInfo::isLoopInvariant(B, L)) {
         return makeRec(SCEVExprKind::DivRec, L, getSCEV(Start), getSCEV(B),
                        Self->getIRType());
     }
     return nullptr;
-}
-
-bool SCEVResult::isLoopInvariant(Value *V, const Loop *L) const {
-    if (!V || !L) return true;
-    if (V->isConst()) return true;
-    if (V->isParam() || V->isGlobal()) return true;
-    auto *I = dynamic_cast<Instruction *>(V);
-    if (!I) return true;
-    BasicBlock *BB = I->getParent();
-    return !BB || !L->contains(BB);
 }
 
 bool SCEVResult::isLoopInvariantExpr(const SCEVExpr *E,
@@ -1274,7 +1264,7 @@ bool SCEVResult::isLoopInvariantExpr(const SCEVExpr *E,
         if (!IsAncestorRecurrence) return false;
     }
     if (E->Kind == SCEVExprKind::Unknown)
-        return isLoopInvariant(E->RawValue, L);
+        return LoopInfo::isLoopInvariant(E->RawValue, L);
     for (const SCEVExpr *Op : E->Operands)
         if (!isLoopInvariantExpr(Op, L)) return false;
     return true;

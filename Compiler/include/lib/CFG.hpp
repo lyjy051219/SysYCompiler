@@ -483,6 +483,8 @@ class StoreInst : public Instruction{
     StoreInst(std::shared_ptr<IRType> irtype);
     Value* getValueOperand() const;
     Value* getPointerOperand() const;
+    // 写入值类型与指针所指类型同形时，Store 完整覆盖该 pointee。
+    bool fullyCoversItsPointer() const;
     void dumpIR() override;
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 

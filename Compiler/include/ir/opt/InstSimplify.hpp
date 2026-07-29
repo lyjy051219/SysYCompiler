@@ -6,13 +6,15 @@
 class BasicAAResult;
 class DominatorTree;
 class LoopInfo;
+class MemorySSAResult;
 
 // 局部求解器通过去重工作表反复消费替换后暴露的用户；规则分为二元代数、
 // compare/select 规范化与 PHI 跨臂合并，并显式保护浮点、undef、内存和计时语义。
 class InstSimplifier {
 public:
 	InstSimplifier(DominatorTree *DT, Function *F,
-		FunctionAnalysisPassManager *FAM, BasicAAResult *AA, LoopInfo *LI);
+		FunctionAnalysisPassManager *FAM, BasicAAResult *AA, LoopInfo *LI,
+		MemorySSAResult *MSSA);
 
 	bool run(Function &F);
 
@@ -29,6 +31,8 @@ private:
 	FunctionAnalysisPassManager *FAM = nullptr;
 	BasicAAResult *AA = nullptr;
 	LoopInfo *LI = nullptr;
+	MemorySSAResult *MSSA = nullptr;
+	bool MemorySSAUsable = true;
 
 	bool isLoadSuitableForSinking(LoadInst *L) const;
 	Value *foldPhiOfBinary(PhiInst *Phi);
@@ -56,8 +60,8 @@ private:
 	Value *simplifyPhi(PhiInst *Phi);
 };
 
-// 流程：1. 获取支配/AA/循环信息；2. 初始化所有有用户指令；3. 生成等价值或新指令；
-// 4. 替换、删除并重新排队用户，直至工作表清空。
+// 流程：1. 获取支配/AA/循环/MemorySSA；2. 初始化所有有用户指令；
+// 3. 生成等价值或新指令；4. 替换、删除并重新排队用户，直至工作表清空。
 class InstSimplifyPass : public PassDescriptor<InstSimplifyPass> {
 public:
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);

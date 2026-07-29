@@ -7,6 +7,7 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "lib/IRUtils.hpp"
 
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -420,45 +421,122 @@ bool LoadEliminationPass::processFunction(
 PreservationStatus LoadEliminationPass::run(Function &F,
                                             FunctionAnalysisPassManager &FAM) {
     // 1. 获取别名、循环、支配和 MemorySSA，分别服务内存冲突、回边与定义链证明。
-    auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    BasicAAResult *AA = &FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
 
-    // 2. 快速层：在查询预算内让 MemorySSA 找每个 load 的最近 clobber；只有该定义
-    // 是支配目标的 MustAlias store 才计划转发。MemorySSA 保留 timer 调用节点，
-    // 但 walker 会依据程序内存摘要透明地越过它。
+    // 2. 快速层：在查询预算内让MemorySSA汇总每条路径的最近clobber。若这些定义
+    // 全是MustAlias完整覆盖Store且写入同一个支配值，则直接计划转发；否则保留
+    // 完整clobber签名来筛选支配load，再通过CFG区间证明确认可复用。查询阶段
+    // 不修改IR，MemorySSA walker会依据程序内存摘要透明越过timer。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMSSAQueries = 512;
     constexpr std::size_t MaxMSSAWalk = 256;
     std::vector<std::pair<LoadInst *, Value *>> MSSAReplacements;
+    std::vector<MSSALoadRecord> MSSALoadRecords;
     std::size_t QueryCount = 0;
     for (LoadInst *Load : collectInstructions<LoadInst>(F)) {
-            if (QueryCount++ >= MaxMSSAQueries) break;
-            BasicBlock *BB = Load->getParent();
-            if (!BB) continue;
+        if (QueryCount++ >= MaxMSSAQueries) break;
+        BasicBlock *BB = Load->getParent();
+        if (!BB) continue;
 
-            MemoryAccess *Clobber = MSSA.getClobberingAccess(
-                Load, MemoryLocation::get(Load), AA, LI, FAM,
-                MaxMSSAWalk);
+        MemoryClobberResult ClobberResult = MSSA.getClobberingAccesses(
+            Load, MemoryLocation::get(Load), *AA, LI, FAM,
+            MaxMSSAWalk);
+        if (!ClobberResult.Complete ||
+            ClobberResult.Clobbers.empty())
+            continue;
+        MSSALoadRecords.push_back(
+            {Load, BB, std::move(ClobberResult.Clobbers)});
+    }
+
+    for (const MSSALoadRecord &Record : MSSALoadRecords) {
+        LoadInst *Load = Record.Load;
+        BasicBlock *BB = Record.Block;
+        if (!Load || !BB || Load->getParent() != BB) continue;
+        MemoryLocation LoadLocation = MemoryLocation::get(Load);
+
+        // 2.1 MemoryPhi后的不同路径可以由不同Store定义；只要所有首个写均完整
+        // 覆盖同一位置、写入同一个SSA值，并且该值支配load，就无需让任一Store
+        // 自身支配汇合块。
+        Value *CommonStoredValue = nullptr;
+        bool AllClobbersAreSameValueStores = true;
+        for (MemoryAccess *Clobber : Record.Clobbers) {
             auto *Store = Clobber && Clobber->isDef()
                               ? dynamic_cast<StoreInst *>(
                                     Clobber->getInstruction())
                               : nullptr;
-            if (!Store || !Store->getParent()) continue;
-            if (!DT.dominates(Store->getParent(), BB)) continue;
-            if (Store->getParent() == BB &&
-                !Instruction::comesBefore(Store, Load))
+            Value *Stored = Store ? Store->getValueOperand() : nullptr;
+            if (!Store || !Store->getParent() ||
+                !Store->fullyCoversItsPointer() ||
+                !isTypeCompatible(Stored, Load) ||
+                AA->aliasWithIndexRange(
+                    LoadLocation, MemoryLocation::get(Store), LI) !=
+                    AliasInfo::MustAlias) {
+                AllClobbersAreSameValueStores = false;
+                break;
+            }
+            if (!CommonStoredValue) {
+                CommonStoredValue = Stored;
+            } else if (CommonStoredValue != Stored) {
+                AllClobbersAreSameValueStores = false;
+                break;
+            }
+        }
+
+        if (AllClobbersAreSameValueStores && CommonStoredValue &&
+            DT.dominatesValue(CommonStoredValue, Load)) {
+            MSSAReplacements.push_back({Load, CommonStoredValue});
+            continue;
+        }
+
+        // 2.2 相同clobber集合只说明两个load反向可达同一批静态MemoryDef；
+        // 循环中同一Store节点可能分别代表上一轮与当前轮写入，因此它只是候选筛选，
+        // 还必须证明从支配load到当前load的每条CFG路径都没有相关写入。
+        // 同块要求严格指令顺序并扫描中间指令，跨块复用已有全路径证明。
+        std::size_t Compared = 0;
+        for (auto It = MSSALoadRecords.rbegin();
+             It != MSSALoadRecords.rend(); ++It) {
+            LoadInst *Candidate = It->Load;
+            BasicBlock *CandidateBB = It->Block;
+            if (!Candidate || Candidate == Load || !CandidateBB ||
+                Candidate->getParent() != CandidateBB ||
+                It->Clobbers != Record.Clobbers ||
+                !isTypeCompatible(Candidate, Load) ||
+                !DT.dominates(CandidateBB, BB) ||
+                (CandidateBB == BB &&
+                 !Instruction::comesBefore(Candidate, Load)))
                 continue;
-            if (AA.aliasWithIndexRange(MemoryLocation::get(Load),
-                                       MemoryLocation::get(Store), LI) !=
+            if (Compared++ >= MaxMSSALoadComparisons) break;
+            if (AA->aliasWithIndexRange(
+                    LoadLocation, MemoryLocation::get(Candidate), LI) !=
                 AliasInfo::MustAlias)
                 continue;
-            Value *Stored = Store->getValueOperand();
-            if (!isTypeCompatible(Stored, Load)) continue;
-            MSSAReplacements.push_back({Load, Stored});
+
+            bool Unmodified = true;
+            if (CandidateBB == BB) {
+                Instruction *Cursor = Candidate->getNext();
+                for (; Cursor && Cursor != Load; Cursor = Cursor->getNext()) {
+                    if (mayModifyPointer(
+                            LoadLocation, Cursor, *AA, LI, FAM)) {
+                        Unmodified = false;
+                        break;
+                    }
+                }
+                if (Cursor != Load) Unmodified = false;
+            } else {
+                Unmodified = isUnmodifiedOnAllPaths(
+                    Candidate, Load, LoadLocation.Pointer,
+                    DT, *AA, LI, FAM);
+            }
+            if (!Unmodified) continue;
+
+            MSSAReplacements.push_back({Load, Candidate});
+            break;
+        }
     }
 
-    // 2.1 先解析计划之间的传递依赖并检测环，再批量替换 use、批量删除 load，
+    // 2.3 先解析计划之间的传递依赖并检测环，再批量替换use、批量删除load，
     // 避免先删一个 load 后让另一条计划持有悬空替换值。
     std::unordered_map<LoadInst *, Value *> Planned;
     for (const auto &Replacement : MSSAReplacements)
@@ -499,8 +577,22 @@ PreservationStatus LoadEliminationPass::run(Function &F,
         changed = true;
     }
 
+    // 2.4 快速层删除load后，旧AA缓存和MemorySSA节点仍引用修改前的Value/use图；
+    // 在进入后备扫描前精确失效并重建AA，结构分析因CFG未变可以继续保留。
+    if (changed) {
+        PreservationStatus RebuildPA;
+        RebuildPA.keep<DominantAnalysis>();
+        RebuildPA.keep<PostDominantAnalysis>();
+        RebuildPA.keep<LoopAnalysis>();
+        RebuildPA.discard<BasicAliasAnalysis>();
+        RebuildPA.discard<MemorySSAAnalysis>();
+        RebuildPA.discard<SideEffectAnalysis>();
+        FAM.invalidate(F, std::move(RebuildPA));
+        AA = &FAM.getResult<BasicAliasAnalysis>(F);
+    }
+
     // 3—5. 对快速层未覆盖的 load 运行块内、前驱数据流与跨回边支配证明。
-    changed |= processFunction(F, DT, AA, LI, FAM);
+    changed |= processFunction(F, DT, *AA, LI, FAM);
 
     if (!changed) {
         return PreservationStatus::all();

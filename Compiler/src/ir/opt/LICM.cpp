@@ -381,7 +381,8 @@ bool LICMPass::isSafeToMove(
 	if (dynamic_cast<SelectInst *>(I)) return true;
 
 	// 2.5 load 只能提升：必须原本在每轮必执行的安全 header 前缀，或 preheader 已
-	// 解引用同一地址；再由 MemorySSA 或逐指令 AA 证明循环内无 clobber。
+	// 解引用同一地址；优先复用 MemorySSA 的稀疏访问图检查整个循环，旧图失效后
+	// 再退回逐指令 AA，证明没有任何迭代会改写该位置。
 	if (auto *LIst = dynamic_cast<LoadInst *>(I)) {
 
 		if (ForSink) return false;
@@ -394,42 +395,34 @@ bool LICMPass::isSafeToMove(
 		if (!Ptr) return false;
 		if (!HeaderMustExecute && !PreheaderAlreadyDereferenced) return false;
 
-		bool MSSAProvesNoLoopClobber = false;
-		if (MemorySSAUsable)
-		if (MemoryAccess *Clobber = MSSA.getClobberingAccess(
-				LIst, MemoryLocation::get(LIst), AA, LI, FAM, 256)) {
-			if (Clobber->isLiveOnEntry()) {
-				MSSAProvesNoLoopClobber = true;
-			} else if (Clobber->isDef()) {
-				Instruction *DefI = Clobber->getInstruction();
-				BasicBlock *DefBB = DefI ? DefI->getParent() : nullptr;
-				MSSAProvesNoLoopClobber = DefBB && !L.contains(DefBB);
-			}
+		MemoryLocation LoadLocation = MemoryLocation::get(LIst);
+		if (MemorySSAUsable) {
+			return !MSSA.hasInterferingAccessInLoop(
+				LoadLocation, L, LIst, false, AA, LI, FAM);
 		}
-		if (MSSAProvesNoLoopClobber) return true;
 
-			MemoryLocation LoadLocation = MemoryLocation::get(LIst);
-			for (Instruction *J : LoopInsts) {
-				if (!J || J == I) continue;
-				if (auto *SI = dynamic_cast<StoreInst *>(J)) {
-					Value *StorePtr = SI->getPointerOperand();
-					if (!StorePtr) return false;
+		for (Instruction *J : LoopInsts) {
+			if (!J || J == I) continue;
+			if (auto *SI = dynamic_cast<StoreInst *>(J)) {
+				Value *StorePtr = SI->getPointerOperand();
+				if (!StorePtr) return false;
 
-					AliasInfo Alias = AA.aliasWithIndexRange(
-						LoadLocation, MemoryLocation::get(SI), LI);
-					if (Alias == AliasInfo::NoAlias)
-						continue;
-					return false;
-				}
-				ModRefInfo MRI = getInstModRefInfo(
-					LoadLocation, J, AA, LI, FAM);
+				AliasInfo Alias = AA.aliasWithIndexRange(
+					LoadLocation, MemoryLocation::get(SI), LI);
+				if (Alias == AliasInfo::NoAlias)
+					continue;
+				return false;
+			}
+			ModRefInfo MRI = getInstModRefInfo(
+				LoadLocation, J, AA, LI, FAM);
 			if (isModSet(MRI)) return false;
 		}
 		return true;
 	}
 
 	// 3.2 store 只能下沉：地址和值均循环不变，写入点支配所有退出和 latch，且循环内
-	// 不存在对该位置的其他 Mod/Ref；配合对象证明保证每个出口写一次等价。
+	// 不存在对该位置的其他 Mod/Ref；优先通过 MemorySSA 稀疏节点检查，旧图失效后
+	// 再逐指令查询；配合对象证明保证每个出口写一次等价。
     if (auto *SI = dynamic_cast<StoreInst *>(I)) {
 		if (!ForSink) return false;
 		Value *Ptr = SI->getPointerOperand();
@@ -454,11 +447,17 @@ bool LICMPass::isSafeToMove(
 		for (BasicBlock *LatchBB : Latches)
 			if (!DT.dominates(SBB, LatchBB)) return false;
 
+		MemoryLocation StoreLocation = MemoryLocation::get(SI);
+		if (MemorySSAUsable) {
+			return !MSSA.hasInterferingAccessInLoop(
+				StoreLocation, L, SI, true, AA, LI, FAM);
+		}
+
 		for (Instruction *J : LoopInsts) {
 			if (!J || J == SI) continue;
 
-				ModRefInfo MRI = getInstModRefInfo(
-					MemoryLocation::get(SI), J, AA, LI, FAM);
+			ModRefInfo MRI = getInstModRefInfo(
+				StoreLocation, J, AA, LI, FAM);
 			if (isModSet(MRI) || isRefSet(MRI)) return false;
 		}
 		return true;
@@ -757,6 +756,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
 					if (cacheLoopInvariantCall(
 							F, CI, *L, PreHeader, Latch, DT)) {
+						// 调用节点已经被移入新块，MemoryAccess中的Block和定义链随即陈旧。
+						if (MSSA.getMemoryAccess(CI))
+							MemorySSAUsable = false;
 						CFGChanged = true;
 						LocalChanged = true;
 						return true;
@@ -771,8 +773,12 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				if (TermIt == PreHeader->end()) continue;
 
 				// 4.4 普通候选从原块摘下并插到 preheader 终结指令前，记录为后续候选不变量。
+				const bool MovesMemoryAccess =
+					MemorySSAUsable && MSSA.getMemoryAccess(I);
 				I->eraseFromParent();
 				TermIt.insertBefore(I);
+				// MemorySSA 不做增量更新；移动 load/只读 call 后禁止后续候选读取旧图。
+				if (MovesMemoryAccess) MemorySSAUsable = false;
 				HoistInvariant.insert(I);
 				LocalChanged = true;
 			}

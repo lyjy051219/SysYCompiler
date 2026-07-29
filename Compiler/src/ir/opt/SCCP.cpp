@@ -2,6 +2,7 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
@@ -73,6 +74,94 @@ bool LatticeValue::mergeIn(const LatticeValue &Other) {
 }
 
 SCCPSolver::SCCPSolver() = default;
+
+SCCPSolver::SCCPSolver(
+    Function &F, MemorySSAResult &MSSA, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
+    initializeMemoryDependencies(F, MSSA, AA, LI, FAM);
+}
+
+// 内存依赖预处理只接受可以完整证明的Load：
+// 1. MemorySSA必须完成所有反向路径的首写查询；
+// 2. 每个首写都必须是与Load位置MustAlias且完整覆盖的Store；
+// 3. 所有Store必须写入同一个、类型兼容的SSA值。
+// 任一LiveOnEntry、Call、MayAlias、部分覆盖、不同值或查询预算耗尽都会使
+// 尚未建模的Load保持过定义。
+void SCCPSolver::initializeMemoryDependencies(
+    Function &F, MemorySSAResult &MSSA, BasicAAResult &AA,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
+    constexpr std::size_t MaxMemoryLoadQueries = 512;
+    std::size_t QueriedLoads = 0;
+    for (BasicBlock *BB : F) {
+        if (!BB) continue;
+        for (Instruction *I : *BB) {
+            auto *Load = I ? I->as<LoadInst>() : nullptr;
+            if (!Load) continue;
+            if (QueriedLoads++ >= MaxMemoryLoadQueries) return;
+
+            MemoryLocation LoadLocation = MemoryLocation::get(Load);
+            if (!LoadLocation.Pointer || !LoadLocation.Size)
+                continue;
+
+            MemoryClobberResult ClobberResult =
+                MSSA.getClobberingAccesses(
+                    Load, LoadLocation, AA, LI, FAM, 256);
+            if (!ClobberResult.Complete ||
+                ClobberResult.Clobbers.empty())
+                continue;
+
+            Value *CommonValue = nullptr;
+            std::vector<StoreInst *> ReachingStores;
+            bool Proven = true;
+
+            for (MemoryAccess *Clobber : ClobberResult.Clobbers) {
+                Instruction *ClobberInst =
+                    Clobber && Clobber->isDef()
+                        ? Clobber->getInstruction()
+                        : nullptr;
+                auto *Store =
+                    ClobberInst
+                        ? ClobberInst->as<StoreInst>()
+                        : nullptr;
+                Value *StoredValue =
+                    Store ? Store->getValueOperand() : nullptr;
+                MemoryLocation StoreLocation =
+                    MemoryLocation::get(Store);
+
+                if (!Store || !StoredValue ||
+                    StoredValue->isUndef() ||
+                    !Store->fullyCoversItsPointer() ||
+                    !StoreLocation.Pointer || !StoreLocation.Size ||
+                    *StoreLocation.Size < *LoadLocation.Size ||
+                    !IRType::hasSameShape(
+                        StoredValue->getIRType(),
+                        Load->getIRType()) ||
+                    AA.aliasWithIndexRange(
+                        LoadLocation, StoreLocation, LI) !=
+                        AliasInfo::MustAlias) {
+                    Proven = false;
+                    break;
+                }
+
+                if (!CommonValue) {
+                    CommonValue = StoredValue;
+                } else if (CommonValue != StoredValue) {
+                    Proven = false;
+                    break;
+                }
+                ReachingStores.push_back(Store);
+            }
+
+            if (!Proven || !CommonValue ||
+                ReachingStores.empty())
+                continue;
+
+            LoadStoredValues[Load] = CommonValue;
+            for (StoreInst *Store : ReachingStores)
+                StoreLoadDependents[Store].push_back(Load);
+        }
+    }
+}
 
 // 求解步骤 1.1：按需初始化格值。字面常量直接为 Constant，全局地址因运行时
 // 可观察而设为 Bottom，其余 SSA 定义从 Top 开始等待可行路径传播。
@@ -423,15 +512,28 @@ void SCCPSolver::visitBranchInst(BrInst* Br) {
 void SCCPSolver::visitRetInst(RetInst*) {
 }
 
-// 内存、调用和地址结果尚未纳入稀疏常量内存模型：有返回值的此类指令均
-// 视为过定义，store/ret 因不产生 SSA 结果无需更新格值。
+// Load只传播MemorySSA证明的共同到达写入值；该值仍为Top时继续等待，
+// 已知常量或Bottom则沿SCCP格正常下降。无法完成内存证明的Load保持过定义。
 void SCCPSolver::visitLoadInst(LoadInst* LI) {
-    mergeInValue(LI, LatticeValue::getBottom());
+    auto It = LoadStoredValues.find(LI);
+    if (It == LoadStoredValues.end()) {
+        mergeInValue(LI, LatticeValue::getBottom());
+        return;
+    }
+    mergeInValue(LI, getValueState(It->second));
 }
 
-void SCCPSolver::visitStoreInst(StoreInst*) {
+// Store不产生SSA结果；其写入值的格一旦下降，Store会作为普通SSA使用者被
+// 调度到这里，再把所有由该写支撑的Load压回工作队列。
+void SCCPSolver::visitStoreInst(StoreInst* SI) {
+    auto It = StoreLoadDependents.find(SI);
+    if (It == StoreLoadDependents.end()) return;
+    InstWorkList.insert(
+        InstWorkList.end(), It->second.begin(), It->second.end());
 }
 
+// 调用和地址结果尚未纳入稀疏常量内存模型：有返回值的此类指令均
+// 视为过定义，store/ret 因不产生 SSA 结果无需更新格值。
 void SCCPSolver::visitCallInst(CallInst* CI) {
     if (CI->getIRType() && !CI->getIRType()->isVoid()) {
         mergeInValue(CI, LatticeValue::getBottom());
@@ -680,22 +782,27 @@ bool SCCPSolver::rewriteConstants(Function& F, bool &CfgChanged) {
 // Pass 主流程：初始化入口与参数边界，运行双工作队列求解到不动点，再一次性
 // 将结果写回 IR。
 PreservationStatus SCCPPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-    SCCPSolver Solver;
-
     // 1. 入口块是初始唯一可执行块。
     BasicBlock* entry = F.front();
     if (!entry) return PreservationStatus::all();
+
+    // 2. 复用MemorySSA的全路径首写查询和BasicAA的区间别名结论，预建
+    // Store到Load的稀疏内存依赖；求解阶段只传播已经完整证明的共同写入值。
+    auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
+    auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+    SCCPSolver Solver(F, MSSA, AA, LI, FAM);
     Solver.markBlockExecutable(entry);
 
-    // 2. 函数参数由调用者决定，初始设为过定义。
+    // 3. 函数参数由调用者决定，初始设为过定义。
     for (auto& param : F.getParams()) {
         Solver.mergeInValue(param.get(), LatticeValue::getBottom());
     }
 
-    // 3. 交替传播可行边和数值格，直到两者均不再变化。
+    // 4. 交替传播可行边和数值格，直到两者均不再变化。
     Solver.solve();
 
-    // 4. 提交常量替换、死块删除与分支折叠。
+    // 5. 提交常量替换、死块删除与分支折叠。
     bool cfgChanged = false;
     bool changed = Solver.rewriteConstants(F, cfgChanged);
 
@@ -704,12 +811,13 @@ PreservationStatus SCCPPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 
     PreservationStatus PA;
     if (!cfgChanged) {
-        // 5. 纯 SSA 改写保留 CFG 分析；GEP、指针 PHI 或内存指令变化仍可能
-        // 改变别名和传递副作用答案。
+        // 6. 纯 SSA 改写保留 CFG 分析；Load常量化会删除MemoryUse，
+        // GEP、指针PHI或内存指令变化仍可能改变别名和传递副作用答案。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
         PA.discard<BasicAliasAnalysis>();
+        PA.discard<MemorySSAAnalysis>();
         PA.discard<SideEffectAnalysis>();
     }
     // 删除基本块或折叠分支时保持空保留集，使所有依赖 CFG 的分析重新计算。

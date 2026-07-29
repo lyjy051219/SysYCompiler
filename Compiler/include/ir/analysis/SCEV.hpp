@@ -318,7 +318,6 @@ private:
     const SCEVExpr *trySimpleMulDivRec(PhiInst *Self, Value *Update,
                                        Value *Start, const Loop *L);
 
-    bool isLoopInvariant(Value *V, const Loop *L) const;
     bool isLoopInvariantExpr(const SCEVExpr *E, const Loop *L) const;
     bool isPolynomialAddRec(const SCEVExpr *E, const Loop *L) const;
     bool isSafeToDiscard(const SCEVExpr *E) const;

@@ -4620,9 +4620,40 @@ https://gemini.google.com/app/2937246d3292e3d5
 
 ##### MemorySSA
 
-标记每一处内存写入点和内存读取点，构建内存图
+将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
 
+使用MemorySSA的TransformPass：
 
+1. LoadElimination：查询 Load 最近的相关 Store，执行跨块 Store-to-Load Forwarding
+2. GVNPRE：使用Store 转发；用相同 clobber 判断两次 Load 读取同一内存版本
+3. LICM：证明 Load 的最近相关写入位于循环外，从而提升 Load
+4. DSE：证明所有到达路径都已经写入同一个值，删除后续冗余 Store
+5. InstSimplify
+6. SCCP
+7. LocalAggregateSimplify
+
+- 内存状态结点：
+
+  - LiveOnEntry：函数入口时未知的初始内存状态，**无对应IR**，无任何对应，每个函数只创建一个
+
+  - Phi：多个CFG前驱的内存状态汇合，**对应IR在每个基本块入口**
+
+    incoming:(PredBB1, PredBB1Status)记录每个前驱CFG的内存节点状态
+
+  - Use：读取内存但不产生新内存版本,**对应IR：Load**
+
+  - Def：可能修改内存，产生新内存版本，**对应IR：Store/Call**
+
+- 内存状态图：
+
+  1. 每个函数入口对应一个LiveOnEntry
+  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
+  3. 每个store/call产生一个新内存状态
+  4. 每个load使用当前内存状态，但不产生新状态
+
+![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
+
+参考资料：https://zhuanlan.zhihu.com/p/715818784
 
 
 

@@ -5,7 +5,6 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
-#include <queue>
 #include <set>
 #include <stack>
 
@@ -234,74 +233,6 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     return true;
 }
 
-void PromotePass::computeIDF(
-    const std::set<BasicBlock*>& DefBlocks,
-    const std::set<BasicBlock*>& LiveInBlocks,
-    std::set<BasicBlock*>& PhiBlocks,
-    DominatorTree& DT,
-    const std::unordered_map<DominatorNode*, unsigned>& DomLevels)
-{
-    // 3.2 从定义块按支配深度处理迭代支配边界，只在变量 live-in 的汇合块放 PHI；
-    // 新 PHI 块若不是原定义块会重新入队，使 IDF 闭包完整。
-
-    using DTNPair = std::pair<unsigned, DominatorNode*>;
-    std::priority_queue<DTNPair> PQ;
-
-    std::set<DominatorNode*> VisitedWorkList;
-
-    std::set<DominatorNode*> VisitedPHI;
-
-    for (BasicBlock* BB : DefBlocks) {
-        DominatorNode* node = DT.getNode(BB);
-        if (!node) continue;
-        auto it = DomLevels.find(node);
-        if (it != DomLevels.end()) {
-            PQ.push({it->second, node});
-            VisitedWorkList.insert(node);
-        }
-    }
-
-    while (!PQ.empty()) {
-        auto [rootLevel, root] = PQ.top();
-        PQ.pop();
-
-        std::stack<DominatorNode*> WorkList;
-        std::set<DominatorNode*> LocalVisited;
-        WorkList.push(root);
-        LocalVisited.insert(root);
-
-        while (!WorkList.empty()) {
-            DominatorNode* node = WorkList.top();
-            WorkList.pop();
-
-            for (BasicBlock* succ : node->Block->getSuccessors()) {
-                DominatorNode* succNode = DT.getNode(succ);
-                if (!succNode) continue;
-
-                auto succLevelIt = DomLevels.find(succNode);
-                if (succLevelIt == DomLevels.end()) continue;
-
-                if (succLevelIt->second > rootLevel) continue;
-
-                if (!LiveInBlocks.count(succ)) continue;
-
-                if (VisitedPHI.insert(succNode).second) {
-                    PhiBlocks.insert(succ);
-
-                    if (!DefBlocks.count(succ) && VisitedWorkList.insert(succNode).second) {
-                        PQ.push({succLevelIt->second, succNode});
-                    }
-                }
-            }
-
-            for (auto* child = node->FirstChild; child; child = child->NextSibling) {
-                if (LocalVisited.insert(child).second)
-                    WorkList.push(child);
-            }
-        }
-    }
-}
-
 bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     // 1. 每轮重新收集入口 alloca，过滤不可提升和不可达对象；timer 不访问程序内存，
     // 不阻止 SSA 表示提升。循环执行让本轮删除和 PHI 化简暴露的新快速路径继续处理。
@@ -364,29 +295,12 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         continue;
     }
 
-    // 3. 为剩余对象一次性建立前驱表与支配树层级，供活跃性和 IDF 计算共享。
+    // 3. 为剩余对象一次性建立前驱表，供活跃性计算共享；pruned IDF
+    // 直接复用 DominatorTree 的通用迭代支配边界接口。
     std::unordered_map<BasicBlock*, std::vector<BasicBlock*>> PredMap;
     for (auto bb : F) {
         for (BasicBlock* succ : bb->getSuccessors()) {
             PredMap[succ].push_back(bb);
-        }
-    }
-
-    std::unordered_map<DominatorNode*, unsigned> DomLevels;
-    {
-        DominatorNode* root = DT.getNode(F.front());
-        if (root) {
-            std::queue<DominatorNode*> q;
-            q.push(root);
-            DomLevels[root] = 0;
-            while (!q.empty()) {
-                auto* nd = q.front(); q.pop();
-                unsigned lvl = DomLevels[nd];
-                for (auto* ch = nd->FirstChild; ch; ch = ch->NextSibling) {
-                    DomLevels[ch] = lvl + 1;
-                    q.push(ch);
-                }
-            }
         }
     }
 
@@ -413,8 +327,9 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
         std::set<BasicBlock*> LiveInBlocks;
         computeLiveInBlocks(AI, DefBlocks[i], LiveInBlocks,PredMap);
 
-        std::set<BasicBlock*> phiBlocks;
-        computeIDF(DefBlocks[i], LiveInBlocks, phiBlocks, DT, DomLevels);
+        std::set<BasicBlock*> phiBlocks =
+            DT.getIteratedDominanceFrontier(
+                DefBlocks[i], &LiveInBlocks);
 
         for (BasicBlock* Y : phiBlocks) {
             PhiInst* phi = new PhiInst(allocType);

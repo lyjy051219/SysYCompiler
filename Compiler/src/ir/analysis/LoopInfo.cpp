@@ -52,6 +52,15 @@ Loop *LoopInfo::getLoopFor(BasicBlock *BB) const {
     return It != BBToLoop.end() ? It->second : nullptr;
 }
 
+bool LoopInfo::isLoopInvariant(Value *V, const Loop *L) {
+    if (!V || !L) return true;
+    if (V->isConst()) return true;
+    if (V->isParam() || V->isGlobal()) return true;
+    auto *I = dynamic_cast<Instruction *>(V);
+    BasicBlock *BB = I ? I->getParent() : nullptr;
+    return !BB || !L->contains(BB);
+}
+
 const std::vector<Loop *> &LoopInfo::getTopLevelLoops() const {
     return TopLevelLoops;
 }

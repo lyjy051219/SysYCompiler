@@ -3,6 +3,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
@@ -66,8 +67,8 @@ bool InstSimplifyPass::matchYMinusX(Value *MaybeSub, Value *X, Value *&Y) {
 
 InstSimplifier::InstSimplifier(
 	DominatorTree *DT, Function *F, FunctionAnalysisPassManager *FAM,
-	BasicAAResult *AA, LoopInfo *LI)
-	: DT(DT), F(F), FAM(FAM), AA(AA), LI(LI) {}
+	BasicAAResult *AA, LoopInfo *LI, MemorySSAResult *MSSA)
+	: DT(DT), F(F), FAM(FAM), AA(AA), LI(LI), MSSA(MSSA) {}
 
 bool InstSimplifier::run(Function &F) {
 	// 1. 用去重工作表驱动到局部不动点。初始只加入有用户指令，替换后重新排队
@@ -118,8 +119,9 @@ bool InstSimplifier::run(Function &F) {
 }
 
 bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
-	// 5.1 验证分支 load 能否下沉到汇合块：原块中 load 之后不得有 Mod/计时屏障，
-	// 同时过滤无需下沉的未逃逸直接 alloca 和全常量 GEP 地址。
+	// 5.1 验证分支 load 能否下沉到汇合块：优先比较该load点与所在前驱BlockExit
+	// 的目标位置clobber，只有每条反向路径都透明才接受；旧MemorySSA失效或不能
+	// 完成证明时退回逐指令ModRef，同时始终保留timer顺序屏障检查。
 	if (!L || !FAM || !AA || !LI) return false;
 
 	Value *Ptr = L->getPointerOperand();
@@ -127,19 +129,31 @@ bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
 	BasicBlock *BB = L->getParent();
 	if (!BB) return false;
 
+	MemoryLocation LoadLocation = MemoryLocation::get(L);
+	bool MemorySSAProvesTransparent = false;
+	if (MemorySSAUsable && MSSA) {
+		MemoryAccess *BlockExit = MSSA->getBlockExit(BB);
+		MemorySSAProvesTransparent =
+			BlockExit &&
+			!MSSA->hasClobberBetween(
+				L, BlockExit, LoadLocation, *AA, *LI, *FAM, 256);
+	}
+
 	bool SeenLoad = false;
 	for (auto *I : *BB) {
 		if (!SeenLoad) {
 			SeenLoad = (I == L);
 			continue;
 		}
-		ModRefInfo MRI = getInstModRefInfo(
-			MemoryLocation::get(L), I, *AA, *LI, *FAM);
 		if (auto *CI = dynamic_cast<CallInst *>(I);
 			CI && CI->mayReachTimingCall()) {
 			return false;
 		}
-		if (isModSet(MRI)) return false;
+		if (!MemorySSAProvesTransparent) {
+			ModRefInfo MRI = getInstModRefInfo(
+				LoadLocation, I, *AA, *LI, *FAM);
+			if (isModSet(MRI)) return false;
+		}
 	}
 
 	if (auto *Alloca = dynamic_cast<AllocaInst *>(Ptr)) {
@@ -406,6 +420,8 @@ Value *InstSimplifier::foldPhiOfLoad(PhiInst *Phi) {
 		delete MergedLoad;
 		return nullptr;
 	}
+	// 新load没有增量写入旧MemorySSA；后续PHI-of-load候选统一退回逐指令检查。
+	MemorySSAUsable = false;
 	return MergedLoad;
 }
 
@@ -1221,13 +1237,14 @@ Value *InstSimplifier::simplifyPhi(PhiInst *Phi) {
 }
 
 PreservationStatus InstSimplifyPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-	// 1. 获取支配、别名和循环分析，供 PHI 可用性及 load 下沉的内存合法性判断。
+	// 1. 获取支配、别名、循环和MemorySSA，供PHI可用性及load下沉的内存合法性判断。
 	DominatorTree *DT = nullptr;
 	DT = &FAM.getResult<DominantAnalysis>(F);
 	BasicAAResult *AA = &FAM.getResult<BasicAliasAnalysis>(F);
 	LoopInfo *LI = &FAM.getResult<LoopAnalysis>(F);
+	MemorySSAResult *MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
 
-	InstSimplifier Simplifier(DT, &F, &FAM, AA, LI);
+	InstSimplifier Simplifier(DT, &F, &FAM, AA, LI, MSSA);
 	bool Changed = Simplifier.run(F);
 
 	if (!Changed) return PreservationStatus::all();
@@ -1238,6 +1255,7 @@ PreservationStatus InstSimplifyPass::run(Function &F, FunctionAnalysisPassManage
 	PA.keep<PostDominantAnalysis>();
 	PA.keep<LoopAnalysis>();
 	PA.discard<BasicAliasAnalysis>();
+	PA.discard<MemorySSAAnalysis>();
 	PA.discard<SideEffectAnalysis>();
 	return PA;
 }
