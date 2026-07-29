@@ -2,6 +2,7 @@
 
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
+#include "ir/analysis/SideEffect.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -120,8 +121,10 @@ LoopDependenceInfo::LoopDependenceInfo() = default;
 
 LoopDependenceInfo::LoopDependenceInfo(Function *F, LoopInfo *LoopInfoPtr,
                                        SCEVResult *SCEV,
-                                       BasicAAResult *AliasAnalysis)
-    : Func(F), LI(LoopInfoPtr), SE(SCEV), AA(AliasAnalysis) {}
+                                       BasicAAResult *AliasAnalysis,
+                                       FunctionAnalysisPassManager *AnalysisManager)
+    : Func(F), LI(LoopInfoPtr), SE(SCEV), AA(AliasAnalysis),
+      FAM(AnalysisManager) {}
 
 LoopDependenceInfo::~LoopDependenceInfo() = default;
 LoopDependenceInfo::LoopDependenceInfo(LoopDependenceInfo &&) noexcept =
@@ -222,8 +225,16 @@ LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
 
     case SCEVExprKind::Div:
     case SCEVExprKind::Mod:
+    case SCEVExprKind::Shl:
+    case SCEVExprKind::LShr:
+    case SCEVExprKind::AShr:
+    case SCEVExprKind::BitAnd:
+    case SCEVExprKind::BitOr:
+    case SCEVExprKind::BitXor:
+    case SCEVExprKind::Binomial:
     case SCEVExprKind::Min:
     case SCEVExprKind::Max:
+    case SCEVExprKind::Select:
     case SCEVExprKind::Compare:
     case SCEVExprKind::MulRec:
     case SCEVExprKind::DivRec:
@@ -232,32 +243,24 @@ LoopAffineExpr LoopDependenceInfo::buildAffine(const SCEVExpr *E,
     return Result;
 }
 
-// 访存建模沿类型化 GEP 链收集同字节步长的下标带，并验证根对象在循环内稳定。
-bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
-                                           std::size_t Order,
-                                           LoopMemoryAccess &Access) const {
-    // 1. 识别 Load/Store 的读写角色和真实访问区间，其他指令不形成标量访问。
-    if (!I || !Scope || !SE) return false;
-
-    if (auto *Load = dynamic_cast<LoadInst *>(I)) {
-        Access.Inst = I;
-        Access.Pointer = Load->getPointerOperand();
-        Access.Location = MemoryLocation::get(Load);
-        Access.Reads = true;
-    } else if (auto *Store = dynamic_cast<StoreInst *>(I)) {
-        Access.Inst = I;
-        Access.Pointer = Store->getPointerOperand();
-        Access.Location = MemoryLocation::get(Store);
-        Access.Writes = true;
-    } else {
+// 指针访问建模沿类型化 GEP 链收集同字节步长的下标带，并验证根对象在循环内稳定。
+bool LoopDependenceInfo::buildPointerAccess(
+    Instruction *I, Value *Pointer, const MemoryLocation &Location,
+    bool Reads, bool Writes, Loop *Scope, std::size_t Order,
+    LoopMemoryAccess &Access) const {
+    if (!I || !Pointer || !Scope || !SE || (!Reads && !Writes))
         return false;
-    }
-    Access.Order = Order;
-    if (!Access.Pointer) return false;
 
-    // 2. 逆向穿过 GEP/BitCast，把相同步长的分段 GEP 下标合并为一个坐标带。
+    Access.Inst = I;
+    Access.Pointer = Pointer;
+    Access.Location = Location;
+    Access.Reads = Reads;
+    Access.Writes = Writes;
+    Access.Order = Order;
+
+    // 1. 逆向穿过 GEP/BitCast，把相同步长的分段 GEP 下标合并为一个坐标带。
     std::map<int64_t, LoopAffineExpr, std::greater<int64_t>> Bands;
-    Value *Current = Access.Pointer;
+    Value *Current = Pointer;
     std::unordered_set<Value *> Visited;
     unsigned Depth = 0;
     unsigned IndexTerms = 0;
@@ -325,7 +328,7 @@ bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
         if (RootBB && Scope->contains(RootBB)) Exact = false;
     }
 
-    // 3. 发布根、下标和步长；环、深度预算、未知类型或循环内动态根都会使地址不精确。
+    // 2. 发布根、下标和步长；环、深度预算、未知类型或循环内动态根都会使地址不精确。
     Access.Subscripts.reserve(Bands.size());
     Access.ByteStrides.reserve(Bands.size());
     for (auto &Band : Bands) {
@@ -335,6 +338,26 @@ bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
     }
     Access.AddressExact = Exact && Access.Root;
     return Access.AddressExact;
+}
+
+// 标量 Load/Store 只负责提取真实指针、访问宽度和读写角色，地址求解与调用复用同一路径。
+bool LoopDependenceInfo::buildMemoryAccess(Instruction *I, Loop *Scope,
+                                           std::size_t Order,
+                                           LoopMemoryAccess &Access) const {
+    if (!I || !Scope) return false;
+    if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+        Value *Pointer = Load->getPointerOperand();
+        return buildPointerAccess(
+            I, Pointer, MemoryLocation::get(Load), true, false,
+            Scope, Order, Access);
+    }
+    if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+        Value *Pointer = Store->getPointerOperand();
+        return buildPointerAccess(
+            I, Pointer, MemoryLocation::get(Store), false, true,
+            Scope, Order, Access);
+    }
+    return false;
 }
 
 bool LoopDependenceInfo::isWriteConflict(const LoopMemoryAccess &A,
@@ -425,21 +448,53 @@ std::unique_ptr<LoopDependenceInfo::LoopSummary>
 LoopDependenceInfo::buildSummary(Loop *L) {
     // 1. 验证依赖分析齐备，并按外到内顺序收集当前循环树的轴。
     auto Summary = std::make_unique<LoopSummary>();
-    if (!L || !Func || !LI || !SE || !AA) {
+    if (!L || !Func || !LI || !SE || !AA || !FAM) {
         Summary->UnknownMemory = true;
         return Summary;
     }
 
     collectLoopsPreorder(L, Summary->Loops);
 
-    // 2. 按函数稳定顺序扫描循环体；Call、预算超限或非仿射地址设置 UnknownMemory。
+    // 2. 按函数稳定顺序扫描循环体；调用先映射为实际对象访问，只有未知
+    // 程序内存才设置 UnknownMemory，可观察调用另外记录顺序屏障。
     std::size_t Order = 0;
     for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
         if (!BB) continue;
         for (Instruction *I : *BB) {
             const std::size_t ThisOrder = Order++;
-            if (dynamic_cast<CallInst *>(I)) {
-                Summary->UnknownMemory = true;
+            if (auto *Call = dynamic_cast<CallInst *>(I)) {
+                CallEffectSummary Effects =
+                    getCallEffectSummary(Call, *FAM);
+                Summary->UnknownMemory =
+                    Summary->UnknownMemory || Effects.HasUnknownMemory ||
+                    Effects.MayCrossObjectBounds;
+                Summary->ObservableEffect =
+                    Summary->ObservableEffect ||
+                    Effects.HasObservableEffect;
+                Summary->OrderingBarrier =
+                    Summary->OrderingBarrier ||
+                    Effects.HasOrderingBarrier;
+
+                for (const CallMemoryEffect &Effect :
+                     Effects.ProgramMemory) {
+                    if (isNoModRef(Effect.ModRef)) continue;
+                    if (Summary->Accesses.size() >=
+                        MaxMemoryAccesses) {
+                        Summary->UnknownMemory = true;
+                        break;
+                    }
+                    LoopMemoryAccess Access;
+                    const bool Reads = isRefSet(Effect.ModRef);
+                    const bool Writes = isModSet(Effect.ModRef);
+                    if (!buildPointerAccess(
+                            Call, Effect.Location.Pointer,
+                            Effect.Location, Reads, Writes, L,
+                            ThisOrder, Access)) {
+                        Summary->UnknownMemory = true;
+                        continue;
+                    }
+                    Summary->Accesses.push_back(std::move(Access));
+                }
                 continue;
             }
             if (!dynamic_cast<LoadInst *>(I) &&
@@ -451,8 +506,10 @@ LoopDependenceInfo::buildSummary(Loop *L) {
                 continue;
             }
             LoopMemoryAccess Access;
-            if (!buildMemoryAccess(I, L, ThisOrder, Access))
+            if (!buildMemoryAccess(I, L, ThisOrder, Access)) {
                 Summary->UnknownMemory = true;
+                continue;
+            }
             Summary->Accesses.push_back(std::move(Access));
         }
     }
@@ -522,7 +579,20 @@ LoopDependenceInfo::getDependences(Loop *L) {
 }
 
 bool LoopDependenceInfo::hasUnknownMemory(Loop *L) {
-    return !L || getOrBuildSummary(L).UnknownMemory;
+    if (!L) return true;
+    const LoopSummary &Summary = getOrBuildSummary(L);
+    // 兼容只查询 UnknownMemory 的既有消费者：可观察调用和严格顺序屏障
+    // 虽不等于未知程序内存，也都不能被循环重排或并行化跨越。
+    return Summary.UnknownMemory || Summary.ObservableEffect ||
+           Summary.OrderingBarrier;
+}
+
+bool LoopDependenceInfo::hasObservableEffect(Loop *L) {
+    return L && getOrBuildSummary(L).ObservableEffect;
+}
+
+bool LoopDependenceInfo::hasOrderingBarrier(Loop *L) {
+    return L && getOrBuildSummary(L).OrderingBarrier;
 }
 
 // 交换查询要求每个潜在冲突至少在两个交换轴之一被证明局限于同次迭代。
@@ -533,7 +603,9 @@ bool LoopDependenceInfo::isInterchangeLegal(Loop *Outer, Loop *Inner) {
     }
 
     LoopSummary &Summary = getOrBuildSummary(Outer);
-    if (Summary.UnknownMemory) return false;
+    if (Summary.UnknownMemory || Summary.ObservableEffect ||
+        Summary.OrderingBarrier)
+        return false;
 
     for (const LoopDependenceRecord &Record : Summary.Dependences) {
         bool OuterEqual = false;
@@ -558,7 +630,9 @@ bool LoopDependenceInfo::isDistributionLegal(
     Loop *L, const InstructionSet &First, const InstructionSet &Second) {
     if (!L) return false;
     LoopSummary &Summary = getOrBuildSummary(L);
-    if (Summary.UnknownMemory) return false;
+    if (Summary.UnknownMemory || Summary.ObservableEffect ||
+        Summary.OrderingBarrier)
+        return false;
 
     for (const LoopMemoryAccess &SecondAccess : Summary.Accesses) {
         if (!Second.count(SecondAccess.Inst)) continue;
@@ -589,21 +663,30 @@ bool LoopDependenceInfo::isConflictLocalToIteration(
     Instruction *A, Instruction *B, Loop *L) {
     if (!A || !B || !L) return false;
     LoopSummary &Summary = getOrBuildSummary(L);
-    if (Summary.UnknownMemory) return false;
+    if (Summary.UnknownMemory || Summary.ObservableEffect ||
+        Summary.OrderingBarrier)
+        return false;
 
-    const LoopMemoryAccess *First = nullptr;
-    const LoopMemoryAccess *Second = nullptr;
+    std::vector<const LoopMemoryAccess *> FirstAccesses;
+    std::vector<const LoopMemoryAccess *> SecondAccesses;
     for (const LoopMemoryAccess &Access : Summary.Accesses) {
-        if (Access.Inst == A) First = &Access;
-        if (Access.Inst == B) Second = &Access;
+        if (Access.Inst == A) FirstAccesses.push_back(&Access);
+        if (Access.Inst == B) SecondAccesses.push_back(&Access);
     }
-    if (!First || !Second) return false;
-    if (!isWriteConflict(*First, *Second) ||
-        areNoAlias(*First, *Second)) {
-        return true;
-    }
+    if (FirstAccesses.empty() || SecondAccesses.empty()) return false;
 
-    return areForcedEqual(*First, *Second, L);
+    // 一个调用可映射到多个实际对象；只有每一对潜在写冲突都被证明局限在
+    // 同次迭代，才能把整条指令对视为局部冲突。
+    for (const LoopMemoryAccess *First : FirstAccesses) {
+        for (const LoopMemoryAccess *Second : SecondAccesses) {
+            if (!isWriteConflict(*First, *Second) ||
+                areNoAlias(*First, *Second)) {
+                continue;
+            }
+            if (!areForcedEqual(*First, *Second, L)) return false;
+        }
+    }
+    return true;
 }
 
 // 调度专用查询只处理外层不变读取与有限内层写，并由范围别名证明覆盖完整内层域。
@@ -629,35 +712,54 @@ bool LoopDependenceInfo::isInvariantAccessDisjointFromLoopWrite(
     }
 
     LoopSummary &Summary = getOrBuildSummary(Scope);
-    if (Summary.UnknownMemory) return false;
+    if (Summary.UnknownMemory || Summary.ObservableEffect ||
+        Summary.OrderingBarrier)
+        return false;
 
-    const LoopMemoryAccess *First = nullptr;
-    const LoopMemoryAccess *Second = nullptr;
+    std::vector<const LoopMemoryAccess *> FirstAccesses;
+    std::vector<const LoopMemoryAccess *> SecondAccesses;
     for (const LoopMemoryAccess &Access : Summary.Accesses) {
-        if (Access.Inst == Invariant) First = &Access;
-        if (Access.Inst == Write) Second = &Access;
+        if (Access.Inst == Invariant) FirstAccesses.push_back(&Access);
+        if (Access.Inst == Write) SecondAccesses.push_back(&Access);
     }
-    if (!First || !Second || !First->Reads || First->Writes ||
-        !Second->Writes) {
+    if (FirstAccesses.empty() || SecondAccesses.empty()) {
         return false;
     }
-    for (const LoopAffineExpr &Subscript : First->Subscripts) {
-        auto It = Subscript.LoopCoefficients.find(VaryingLoop);
-        if (It != Subscript.LoopCoefficients.end() && It->second != 0)
-            return false;
-    }
 
-    return AA->aliasWithIndexRange(
-               First->Location, Second->Location, *LI) ==
-           AliasInfo::NoAlias;
+    for (const LoopMemoryAccess *First : FirstAccesses) {
+        if (!First->Reads || First->Writes) return false;
+        for (const LoopAffineExpr &Subscript : First->Subscripts) {
+            auto It = Subscript.LoopCoefficients.find(VaryingLoop);
+            if (It != Subscript.LoopCoefficients.end() &&
+                It->second != 0) {
+                return false;
+            }
+        }
+    }
+    for (const LoopMemoryAccess *Second : SecondAccesses)
+        if (!Second->Writes) return false;
+
+    for (const LoopMemoryAccess *First : FirstAccesses) {
+        for (const LoopMemoryAccess *Second : SecondAccesses) {
+            if (AA->aliasWithIndexRange(
+                    First->Location, Second->Location, *LI) !=
+                AliasInfo::NoAlias) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 std::optional<int64_t>
 LoopDependenceInfo::getByteStride(Instruction *I, Loop *L) {
     if (!I || !L) return std::nullopt;
     LoopSummary &Summary = getOrBuildSummary(L);
+    std::optional<int64_t> CommonStride;
+    bool Found = false;
     for (const LoopMemoryAccess &Access : Summary.Accesses) {
         if (Access.Inst != I) continue;
+        Found = true;
         if (!Access.AddressExact ||
             Access.Subscripts.size() != Access.ByteStrides.size()) {
             return std::nullopt;
@@ -678,9 +780,10 @@ LoopDependenceInfo::getByteStride(Instruction *I, Loop *L) {
             }
             Total = Updated;
         }
-        return Total;
+        if (CommonStride && *CommonStride != Total) return std::nullopt;
+        CommonStride = Total;
     }
-    return std::nullopt;
+    return Found ? CommonStride : std::nullopt;
 }
 
 bool LoopDependenceInfo::invalidate(Function &,
@@ -688,16 +791,18 @@ bool LoopDependenceInfo::invalidate(Function &,
     return !PA.isKept(LoopDependenceAnalysis::ID()) ||
            !PA.isKept(LoopAnalysis::ID()) ||
            !PA.isKept(SCEVAnalysis::ID()) ||
-           !PA.isKept(BasicAliasAnalysis::ID());
+           !PA.isKept(BasicAliasAnalysis::ID()) ||
+           !PA.isKept(SideEffectAnalysis::ID());
 }
 
-// Pass 入口依次取得循环、标量演化和别名结果，再返回按需构建的依赖查询器。
+// Pass 入口依次取得循环、标量演化、别名和调用效果结果，再返回按需构建的依赖查询器。
 LoopDependenceInfo LoopDependenceAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
-    // 1. 依赖建模依次取得循环树、标量演化和基础别名结果。
+    // 1. 构造期显式请求 SideEffect，确保分析管理器记录依赖和跨函数失效关系。
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
+    (void)FAM.getResult<SideEffectAnalysis>(F);
     // 2. 返回函数级惰性查询器，每个 LoopSummary 在首次请求时构造并缓存。
-    return LoopDependenceInfo(&F, &LI, &SE, &AA);
+    return LoopDependenceInfo(&F, &LI, &SE, &AA, &FAM);
 }

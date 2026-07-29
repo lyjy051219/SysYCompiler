@@ -7,8 +7,49 @@
 #include <sstream>
 #include <unordered_set>
 
+// SCEV 常量只有在结果能够由其 IR 整数类型精确表示时才折叠。循环次数等
+// 数学量仍可显式构造为宽常量，但不能借一次有限位宽 IR 运算产生这种常量。
+static std::optional<unsigned>
+getSCEVIntegerBitWidth(const std::shared_ptr<IRType> &Ty) {
+    if (!Ty || !Ty->isInt()) return std::nullopt;
+    const int Bits = Ty->getIntegerBitWidth(0);
+    if (Bits <= 0 || Bits > 64) return std::nullopt;
+    return static_cast<unsigned>(Bits);
+}
+
+static bool isSCEVSignedValueRepresentable(
+    __int128 Value, const std::shared_ptr<IRType> &Ty) {
+    auto Bits = getSCEVIntegerBitWidth(Ty);
+    if (!Bits) return false;
+    if (*Bits == 1)
+        return Value == 0 || Value == 1;
+    const __int128 Minimum =
+        -static_cast<__int128>(uint64_t{1} << (*Bits - 1));
+    const __int128 Maximum =
+        static_cast<__int128>(uint64_t{1} << (*Bits - 1)) - 1;
+    return Value >= Minimum && Value <= Maximum;
+}
+
+static std::optional<int64_t>
+getSCEVSignedMinimum(const std::shared_ptr<IRType> &Ty) {
+    auto Bits = getSCEVIntegerBitWidth(Ty);
+    if (!Bits || *Bits == 1) return std::nullopt;
+    if (*Bits == 64) return std::numeric_limits<int64_t>::min();
+    return -static_cast<int64_t>(uint64_t{1} << (*Bits - 1));
+}
+
 bool SCEVExpr::isConstant(int64_t V) const {
     return Kind == SCEVExprKind::Constant && ConstValue == V;
+}
+
+unsigned SCEVAddRecInfo::getDegree() const {
+    return Coefficients.empty()
+        ? 0
+        : static_cast<unsigned>(Coefficients.size() - 1);
+}
+
+bool SCEVAddRecInfo::isAffine() const {
+    return Coefficients.size() == 2;
 }
 
 SCEVResult::SCEVResult() = default;
@@ -74,8 +115,16 @@ const char *SCEVExpr::kindName(SCEVExprKind K) {
     case SCEVExprKind::Mul: return "mul";
     case SCEVExprKind::Div: return "div";
     case SCEVExprKind::Mod: return "mod";
+    case SCEVExprKind::Shl: return "shl";
+    case SCEVExprKind::LShr: return "lshr";
+    case SCEVExprKind::AShr: return "ashr";
+    case SCEVExprKind::BitAnd: return "and";
+    case SCEVExprKind::BitOr: return "or";
+    case SCEVExprKind::BitXor: return "xor";
+    case SCEVExprKind::Binomial: return "binomial";
     case SCEVExprKind::Min: return "min";
     case SCEVExprKind::Max: return "max";
+    case SCEVExprKind::Select: return "select";
     case SCEVExprKind::Cast: return "cast";
     case SCEVExprKind::Compare: return "cmp";
     case SCEVExprKind::AddRec: return "addrec";
@@ -130,6 +179,10 @@ std::string SCEVResult::typeKey(std::shared_ptr<IRType> Ty) const {
 
 const SCEVExpr *SCEVResult::makeConstant(int64_t V, std::shared_ptr<IRType> Ty) {
     if (!Ty) Ty = INTType::getInt32Ty();
+    // SCEV 对 i1 统一采用 ConstBool 的逻辑 0/1 表示；位模式的符号解释只在
+    // 具体 signed 操作内完成，不能让同一个 true 同时以 1 和 -1 驻留。
+    if (auto Bits = getSCEVIntegerBitWidth(Ty); Bits && *Bits == 1)
+        V = V == 0 ? 0 : 1;
     auto E = std::make_unique<SCEVExpr>();
     E->Kind = SCEVExprKind::Constant;
     E->ConstValue = V;
@@ -151,22 +204,149 @@ const SCEVExpr *SCEVResult::makeBinary(SCEVExprKind K, const SCEVExpr *L,
                                        const SCEVExpr *R,
                                        std::shared_ptr<IRType> Ty) {
     if (!L || !R) return nullptr;
-    if ((K == SCEVExprKind::Add || K == SCEVExprKind::Mul ||
-         K == SCEVExprKind::Min || K == SCEVExprKind::Max) &&
+    const bool IsCommutative =
+        K == SCEVExprKind::Add || K == SCEVExprKind::Mul ||
+        K == SCEVExprKind::Min || K == SCEVExprKind::Max ||
+        K == SCEVExprKind::BitAnd || K == SCEVExprKind::BitOr ||
+        K == SCEVExprKind::BitXor;
+    if (IsCommutative &&
         L->Key > R->Key) {
         std::swap(L, R);
     }
-    if ((K == SCEVExprKind::Min || K == SCEVExprKind::Max) && sameExpr(L, R))
+
+    if (sameExpr(L, R)) {
+        if (K == SCEVExprKind::Min || K == SCEVExprKind::Max ||
+            K == SCEVExprKind::BitAnd || K == SCEVExprKind::BitOr) {
+            return L;
+        }
+        if (K == SCEVExprKind::BitXor &&
+            isSafeToDiscard(L))
+            return makeConstant(0, Ty ? Ty : L->Ty);
+    }
+
+    if ((K == SCEVExprKind::Shl || K == SCEVExprKind::LShr ||
+         K == SCEVExprKind::AShr) &&
+        R->isConstant(0)) {
         return L;
+    }
+    if ((K == SCEVExprKind::BitOr || K == SCEVExprKind::BitXor) &&
+        (L->isConstant(0) || R->isConstant(0))) {
+        return L->isConstant(0) ? R : L;
+    }
+    if (K == SCEVExprKind::BitAnd &&
+        (L->isConstant(0) || R->isConstant(0))) {
+        const SCEVExpr *Discarded =
+            L->isConstant(0) ? R : L;
+        if (isSafeToDiscard(Discarded)) {
+            return makeConstant(
+                0, Ty ? Ty : (L->Ty ? L->Ty : R->Ty));
+        }
+    }
+
     if ((K == SCEVExprKind::Min || K == SCEVExprKind::Max)) {
         if (auto LC = asConstant(L)) {
             if (auto RC = asConstant(R)) {
-                int64_t V = K == SCEVExprKind::Min ? std::min(*LC, *RC)
-                                                   : std::max(*LC, *RC);
-                return makeConstant(V, Ty ? Ty : (L->Ty ? L->Ty : R->Ty));
+                std::shared_ptr<IRType> ResultTy =
+                    Ty ? Ty : (L->Ty ? L->Ty : R->Ty);
+                auto ResultBits = getSCEVIntegerBitWidth(ResultTy);
+                // i1 的 true 在 SCEV 中保存为逻辑 1，而 signed i1 位模式代表
+                // -1；在缺少显式谓词时不能把它交给宿主整数 min/max。
+                if (ResultBits && *ResultBits != 1 &&
+                    isSCEVSignedValueRepresentable(*LC, ResultTy) &&
+                    isSCEVSignedValueRepresentable(*RC, ResultTy)) {
+                    int64_t V =
+                        K == SCEVExprKind::Min
+                            ? std::min(*LC, *RC)
+                            : std::max(*LC, *RC);
+                    return makeConstant(V, ResultTy);
+                }
             }
         }
     }
+
+    // 位运算常量折叠严格按 IR 整数位宽进行；非法移位量只保留符号节点，
+    // 不能把潜在未定义行为转化成任意常量。
+    if (auto LC = asConstant(L)) {
+        if (auto RC = asConstant(R)) {
+            std::shared_ptr<IRType> ResultTy =
+                Ty ? Ty : (L->Ty ? L->Ty : R->Ty);
+            const int Bits =
+                ResultTy && ResultTy->isInt()
+                    ? ResultTy->getIntegerBitWidth(32)
+                    : 0;
+            if (Bits > 0 && Bits <= 64) {
+                const uint64_t Mask =
+                    Bits == 64 ? ~uint64_t{0}
+                               : ((uint64_t{1} << Bits) - 1);
+                const uint64_t LRaw =
+                    static_cast<uint64_t>(*LC) & Mask;
+                const uint64_t RRaw =
+                    static_cast<uint64_t>(*RC) & Mask;
+                uint64_t ResultRaw = 0;
+                bool Folded = true;
+                switch (K) {
+                case SCEVExprKind::BitAnd:
+                    ResultRaw = LRaw & RRaw;
+                    break;
+                case SCEVExprKind::BitOr:
+                    ResultRaw = LRaw | RRaw;
+                    break;
+                case SCEVExprKind::BitXor:
+                    ResultRaw = LRaw ^ RRaw;
+                    break;
+                case SCEVExprKind::Shl:
+                    if (*RC < 0 || static_cast<uint64_t>(*RC) >=
+                                       static_cast<uint64_t>(Bits)) {
+                        Folded = false;
+                    } else {
+                        ResultRaw =
+                            (LRaw << static_cast<unsigned>(*RC)) & Mask;
+                    }
+                    break;
+                case SCEVExprKind::LShr:
+                    if (*RC < 0 || static_cast<uint64_t>(*RC) >=
+                                       static_cast<uint64_t>(Bits)) {
+                        Folded = false;
+                    } else {
+                        ResultRaw =
+                            LRaw >> static_cast<unsigned>(*RC);
+                    }
+                    break;
+                case SCEVExprKind::AShr:
+                    if (*RC < 0 || static_cast<uint64_t>(*RC) >=
+                                       static_cast<uint64_t>(Bits)) {
+                        Folded = false;
+                    } else {
+                        const unsigned Shift =
+                            static_cast<unsigned>(*RC);
+                        ResultRaw = LRaw >> Shift;
+                        const uint64_t SignBit =
+                            uint64_t{1} << (Bits - 1);
+                        if ((LRaw & SignBit) != 0 && Shift != 0) {
+                            ResultRaw |=
+                                (~uint64_t{0} << (Bits - Shift));
+                        }
+                        ResultRaw &= Mask;
+                    }
+                    break;
+                default:
+                    Folded = false;
+                    break;
+                }
+                if (Folded) {
+                    if (Bits == 1)
+                        return makeConstant(
+                            ResultRaw == 0 ? 0 : 1, ResultTy);
+                    int64_t Result = 0;
+                    std::memcpy(&Result, &ResultRaw, sizeof(Result));
+                    return makeConstant(
+                        IRMath::normalizeSignedToWidth(Result, Bits),
+                        ResultTy);
+                }
+            }
+        }
+    }
+
     auto E = std::make_unique<SCEVExpr>();
     E->Kind = K;
     E->Ty = Ty ? Ty : (L->Ty ? L->Ty : R->Ty);
@@ -208,8 +388,11 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
                     break;
                 }
                 const uint64_t Raw = SourceRaw & Mask(TargetBits);
-                V = IRMath::normalizeSignedToWidth(
-                    SignedFromRaw(Raw), TargetBits);
+                // i1 常量在 SCEV 内保持逻辑 0/1，不把 true 规范成 signed -1。
+                V = TargetBits == 1
+                    ? (Raw == 0 ? 0 : 1)
+                    : IRMath::normalizeSignedToWidth(
+                          SignedFromRaw(Raw), TargetBits);
                 break;
             }
             case SCEVCastKind::ZExt:
@@ -226,8 +409,11 @@ const SCEVExpr *SCEVResult::makeCast(SCEVCastKind K, const SCEVExpr *Op,
                 break;
             case SCEVCastKind::BitCast:
                 if (TargetBits != SourceBits) Folded = false;
-                else V = IRMath::normalizeSignedToWidth(
-                         SignedFromRaw(SourceRaw), TargetBits);
+                else if (TargetBits == 1)
+                    V = SourceRaw == 0 ? 0 : 1;
+                else
+                    V = IRMath::normalizeSignedToWidth(
+                        SignedFromRaw(SourceRaw), TargetBits);
                 break;
             }
             if (Folded) return makeConstant(V, Ty);
@@ -263,17 +449,32 @@ const SCEVExpr *SCEVResult::makeCompare(BinaryInst::Operation Pred,
     if (!L || !R) return nullptr;
     if (auto LC = asConstant(L)) {
         if (auto RC = asConstant(R)) {
-            bool Res = false;
-            switch (Pred) {
-            case BinaryInst::E:  Res = *LC == *RC; break;
-            case BinaryInst::NE: Res = *LC != *RC; break;
-            case BinaryInst::GE: Res = *LC >= *RC; break;
-            case BinaryInst::L:  Res = *LC <  *RC; break;
-            case BinaryInst::LE: Res = *LC <= *RC; break;
-            case BinaryInst::G:  Res = *LC >  *RC; break;
-            default: break;
+            const bool SameScalarType =
+                L->Ty && R->Ty &&
+                L->Ty->hasSameScalarType(*R->Ty);
+            auto OperandBits = getSCEVIntegerBitWidth(L->Ty);
+            const bool IsEquality =
+                Pred == BinaryInst::E || Pred == BinaryInst::NE;
+            // i1 true 以逻辑 1 保存，但 signed icmp 应把其位模式解释为 -1。
+            // 等值比较与表示无关；顺序比较保留节点，避免以宿主 0/1 排序。
+            const bool CanFoldPredicate =
+                !OperandBits || *OperandBits != 1 || IsEquality;
+            if (SameScalarType && CanFoldPredicate &&
+                isSCEVSignedValueRepresentable(*LC, L->Ty) &&
+                isSCEVSignedValueRepresentable(*RC, R->Ty)) {
+                bool Res = false;
+                switch (Pred) {
+                case BinaryInst::E:  Res = *LC == *RC; break;
+                case BinaryInst::NE: Res = *LC != *RC; break;
+                case BinaryInst::GE: Res = *LC >= *RC; break;
+                case BinaryInst::L:  Res = *LC <  *RC; break;
+                case BinaryInst::LE: Res = *LC <= *RC; break;
+                case BinaryInst::G:  Res = *LC >  *RC; break;
+                default: break;
+                }
+                return makeConstant(
+                    Res ? 1 : 0, INTType::getBoolTy());
             }
-            return makeConstant(Res ? 1 : 0, INTType::getBoolTy());
         }
     }
     auto E = std::make_unique<SCEVExpr>();
@@ -286,12 +487,138 @@ const SCEVExpr *SCEVResult::makeCompare(BinaryInst::Operation Pred,
     return intern(std::move(E));
 }
 
+const SCEVExpr *SCEVResult::makeSelect(
+    const SCEVExpr *Cond, const SCEVExpr *TrueExpr,
+    const SCEVExpr *FalseExpr, std::shared_ptr<IRType> Ty) {
+    if (!Cond || !TrueExpr || !FalseExpr) return nullptr;
+    if (sameExpr(TrueExpr, FalseExpr) &&
+        isSafeToDiscard(Cond)) {
+        return TrueExpr;
+    }
+    if (auto C = asConstant(Cond))
+        return *C != 0 ? TrueExpr : FalseExpr;
+
+    auto E = std::make_unique<SCEVExpr>();
+    E->Kind = SCEVExprKind::Select;
+    E->Ty = Ty ? Ty : (TrueExpr->Ty ? TrueExpr->Ty : FalseExpr->Ty);
+    E->Operands = {Cond, TrueExpr, FalseExpr};
+    E->Key = std::string("select:") + typeKey(E->Ty) + "(" +
+             Cond->Key + "," + TrueExpr->Key + "," + FalseExpr->Key + ")";
+    return intern(std::move(E));
+}
+
+// Binomial(n,k) 表示精确的组合数而不是有限位宽乘除序列；只有结果能够
+// 放入 int64_t 时才折叠常量，其他情况继续保留不可物化的符号节点。
+const SCEVExpr *SCEVResult::makeBinomial(
+    const SCEVExpr *N, unsigned K, std::shared_ptr<IRType> Ty) {
+    if (!N || K > MaxAddRecDegree) return nullptr;
+    std::shared_ptr<IRType> ResultTy = Ty ? Ty : N->Ty;
+    if (K == 0) return makeConstant(1, ResultTy);
+    if (K == 1) return N;
+
+    if (auto NC = asConstant(N)) {
+        if (*NC >= 0) {
+            const uint64_t UnsignedN = static_cast<uint64_t>(*NC);
+            if (static_cast<uint64_t>(K) > UnsignedN)
+                return makeConstant(0, ResultTy);
+
+            __int128 Result = 1;
+            bool Fits = true;
+            for (unsigned I = 1; I <= K; ++I) {
+                Result =
+                    (Result *
+                     static_cast<__int128>(UnsignedN - I + 1)) /
+                    static_cast<__int128>(I);
+                if (Result >
+                    static_cast<__int128>(
+                        std::numeric_limits<int64_t>::max())) {
+                    Fits = false;
+                    break;
+                }
+            }
+            if (Fits &&
+                isSCEVSignedValueRepresentable(Result, ResultTy))
+                return makeConstant(static_cast<int64_t>(Result), ResultTy);
+        }
+    }
+
+    const SCEVExpr *Degree =
+        makeConstant(static_cast<int64_t>(K),
+                     N->Ty ? N->Ty : INTType::getInt32Ty());
+    auto E = std::make_unique<SCEVExpr>();
+    E->Kind = SCEVExprKind::Binomial;
+    E->Ty = ResultTy;
+    E->Operands = {N, Degree};
+    E->Key = std::string("binomial:") + typeKey(ResultTy) + "(" +
+             N->Key + "," + std::to_string(K) + ")";
+    return intern(std::move(E));
+}
+
+// AddRec 的每个系数都必须对本循环不变；这样系数向量才能稳定表示离散
+// 多项式，且旧的二操作数 affine 消费者不会把高阶节点误判成普通步长。
+const SCEVExpr *SCEVResult::makeAddRec(
+    const Loop *L, const std::vector<const SCEVExpr *> &Coefficients,
+    std::shared_ptr<IRType> Ty) {
+    if (!L || Coefficients.empty()) return nullptr;
+
+    std::vector<const SCEVExpr *> Normalized = Coefficients;
+    while (Normalized.size() > 1 && Normalized.back() &&
+           Normalized.back()->isConstant(0)) {
+        Normalized.pop_back();
+    }
+    if (Normalized.size() == 1) return Normalized.front();
+    if (Normalized.size() - 1 > MaxAddRecDegree) return nullptr;
+
+    for (const SCEVExpr *Coefficient : Normalized) {
+        if (!Coefficient || !isLoopInvariantExpr(Coefficient, L))
+            return nullptr;
+    }
+
+    auto E = std::make_unique<SCEVExpr>();
+    E->Kind = SCEVExprKind::AddRec;
+    E->RecLoop = L;
+    E->Ty = Ty ? Ty : Normalized.front()->Ty;
+    E->Operands = Normalized;
+
+    std::ostringstream Key;
+    Key << "addrec@" << IRKey::pointer(L) << ":" << typeKey(E->Ty) << "(";
+    for (std::size_t I = 0; I < Normalized.size(); ++I) {
+        if (I != 0) Key << ",";
+        Key << Normalized[I]->Key;
+    }
+    Key << ")";
+    E->Key = Key.str();
+    return intern(std::move(E));
+}
+
+// 若每轮增量自身是同循环多项式 D(n)，离散求和只需把 D 的系数整体
+// 右移一阶：sum C(n,j) = C(n,j+1)。非多项式循环变量一律拒绝。
+const SCEVExpr *SCEVResult::makeAddRecFromDelta(
+    const Loop *L, const SCEVExpr *Base, const SCEVExpr *Delta,
+    std::shared_ptr<IRType> Ty) {
+    if (!L || !Base || !Delta || !isLoopInvariantExpr(Base, L))
+        return nullptr;
+
+    std::vector<const SCEVExpr *> Coefficients;
+    Coefficients.push_back(Base);
+    if (isPolynomialAddRec(Delta, L)) {
+        Coefficients.insert(Coefficients.end(),
+                            Delta->Operands.begin(), Delta->Operands.end());
+    } else if (isLoopInvariantExpr(Delta, L)) {
+        Coefficients.push_back(Delta);
+    } else {
+        return nullptr;
+    }
+    return makeAddRec(L, Coefficients, Ty);
+}
+
 const SCEVExpr *SCEVResult::makeRec(SCEVExprKind K, const Loop *L,
                                     const SCEVExpr *Base,
                                     const SCEVExpr *Step,
                                     std::shared_ptr<IRType> Ty) {
     if (!L || !Base || !Step) return nullptr;
-    if (K == SCEVExprKind::AddRec && Step->isConstant(0)) return Base;
+    if (K == SCEVExprKind::AddRec)
+        return makeAddRec(L, {Base, Step}, Ty);
     if ((K == SCEVExprKind::MulRec || K == SCEVExprKind::DivRec) &&
         Step->isConstant(1)) {
         return Base;
@@ -321,28 +648,162 @@ const SCEVExpr *SCEVResult::neg(const SCEVExpr *E) {
     return mul(makeConstant(-1, E ? E->Ty : nullptr), E);
 }
 
+std::optional<int64_t> SCEVResult::getBinomialProductFactor(
+    unsigned LeftDegree, unsigned RightDegree,
+    unsigned ResultDegree) const {
+    if (ResultDegree < std::max(LeftDegree, RightDegree) ||
+        ResultDegree > LeftDegree + RightDegree ||
+        ResultDegree > MaxAddRecDegree) {
+        return std::nullopt;
+    }
+
+    auto Factorial = [](unsigned N) -> __int128 {
+        __int128 Result = 1;
+        for (unsigned I = 2; I <= N; ++I)
+            Result *= static_cast<__int128>(I);
+        return Result;
+    };
+
+    const unsigned Shared =
+        LeftDegree + RightDegree - ResultDegree;
+    const unsigned LeftOnly = ResultDegree - RightDegree;
+    const unsigned RightOnly = ResultDegree - LeftDegree;
+    const __int128 Denominator =
+        Factorial(Shared) * Factorial(LeftOnly) *
+        Factorial(RightOnly);
+    if (Denominator == 0) return std::nullopt;
+
+    const __int128 Factor =
+        Factorial(ResultDegree) / Denominator;
+    if (Factor <= 0 ||
+        Factor >
+            static_cast<__int128>(
+                std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<int64_t>(Factor);
+}
+
+const SCEVExpr *SCEVResult::scaleAddRec(
+    const SCEVExpr *Rec, const SCEVExpr *Factor) {
+    if (!Rec || Rec->Kind != SCEVExprKind::AddRec || !Rec->RecLoop ||
+        !Factor || !isLoopInvariantExpr(Factor, Rec->RecLoop)) {
+        return nullptr;
+    }
+
+    std::vector<const SCEVExpr *> Coefficients;
+    Coefficients.reserve(Rec->Operands.size());
+    for (const SCEVExpr *Coefficient : Rec->Operands) {
+        const SCEVExpr *Scaled = mul(Coefficient, Factor);
+        if (!Scaled) return nullptr;
+        Coefficients.push_back(Scaled);
+    }
+    return makeAddRec(Rec->RecLoop, Coefficients, Rec->Ty);
+}
+
+// 二项式基底的乘法使用整数恒等式展开，避免先转成幂基底再引入有理数。
+// 超过固定阶数预算时保持普通 Mul 节点，不制造不完整的递推摘要。
+const SCEVExpr *SCEVResult::multiplyAddRecs(
+    const SCEVExpr *L, const SCEVExpr *R) {
+    if (!L || !R || L->Kind != SCEVExprKind::AddRec ||
+        R->Kind != SCEVExprKind::AddRec ||
+        !L->RecLoop || L->RecLoop != R->RecLoop ||
+        L->Operands.empty() || R->Operands.empty()) {
+        return nullptr;
+    }
+
+    const unsigned LeftDegree =
+        static_cast<unsigned>(L->Operands.size() - 1);
+    const unsigned RightDegree =
+        static_cast<unsigned>(R->Operands.size() - 1);
+    if (LeftDegree + RightDegree > MaxAddRecDegree)
+        return nullptr;
+
+    std::shared_ptr<IRType> Ty = L->Ty ? L->Ty : R->Ty;
+    std::vector<const SCEVExpr *> Coefficients(
+        LeftDegree + RightDegree + 1, makeConstant(0, Ty));
+
+    for (unsigned I = 0; I <= LeftDegree; ++I) {
+        for (unsigned J = 0; J <= RightDegree; ++J) {
+            const SCEVExpr *Product =
+                mul(L->Operands[I], R->Operands[J]);
+            if (!Product) return nullptr;
+
+            for (unsigned Degree = std::max(I, J);
+                 Degree <= I + J; ++Degree) {
+                auto Factor =
+                    getBinomialProductFactor(I, J, Degree);
+                if (!Factor) return nullptr;
+                const SCEVExpr *Term = Product;
+                if (*Factor != 1) {
+                    Term = mul(
+                        Term, makeConstant(*Factor, Ty));
+                }
+                if (!Term) return nullptr;
+                Coefficients[Degree] =
+                    add(Coefficients[Degree], Term);
+                if (!Coefficients[Degree]) return nullptr;
+            }
+        }
+    }
+    return makeAddRec(L->RecLoop, Coefficients, Ty);
+}
+
 const SCEVExpr *SCEVResult::add(const SCEVExpr *L, const SCEVExpr *R) {
     if (!L || !R) return nullptr;
     if (L->isConstant(0)) return R;
     if (R->isConstant(0)) return L;
     if (auto LC = asConstant(L)) {
-        if (auto RC = asConstant(R))
-            return makeConstant(*LC + *RC, L->Ty ? L->Ty : R->Ty);
+        if (auto RC = asConstant(R)) {
+            const __int128 Sum =
+                static_cast<__int128>(*LC) +
+                static_cast<__int128>(*RC);
+            std::shared_ptr<IRType> ResultTy =
+                L->Ty ? L->Ty : R->Ty;
+            if (isSCEVSignedValueRepresentable(Sum, ResultTy)) {
+                return makeConstant(
+                    static_cast<int64_t>(Sum), ResultTy);
+            }
+        }
     }
 
     if (L->Kind == SCEVExprKind::AddRec && R->Kind == SCEVExprKind::AddRec &&
         L->RecLoop == R->RecLoop) {
-        return makeRec(SCEVExprKind::AddRec, L->RecLoop,
-                       add(L->Operands[0], R->Operands[0]),
-                       add(L->Operands[1], R->Operands[1]), L->Ty);
+        const std::size_t Count =
+            std::max(L->Operands.size(), R->Operands.size());
+        std::vector<const SCEVExpr *> Coefficients;
+        Coefficients.reserve(Count);
+        for (std::size_t I = 0; I < Count; ++I) {
+            const SCEVExpr *LC =
+                I < L->Operands.size()
+                    ? L->Operands[I]
+                    : makeConstant(0, L->Ty);
+            const SCEVExpr *RC =
+                I < R->Operands.size()
+                    ? R->Operands[I]
+                    : makeConstant(0, R->Ty);
+            const SCEVExpr *Sum = add(LC, RC);
+            if (!Sum) return nullptr;
+            Coefficients.push_back(Sum);
+        }
+        return makeAddRec(L->RecLoop, Coefficients,
+                          L->Ty ? L->Ty : R->Ty);
     }
-    if (L->Kind == SCEVExprKind::AddRec && !R->isRecurrence()) {
-        return makeRec(SCEVExprKind::AddRec, L->RecLoop,
-                       add(L->Operands[0], R), L->Operands[1], L->Ty);
+    if (L->Kind == SCEVExprKind::AddRec &&
+        isLoopInvariantExpr(R, L->RecLoop)) {
+        std::vector<const SCEVExpr *> Coefficients = L->Operands;
+        Coefficients[0] = add(Coefficients[0], R);
+        return Coefficients[0]
+            ? makeAddRec(L->RecLoop, Coefficients, L->Ty)
+            : nullptr;
     }
-    if (R->Kind == SCEVExprKind::AddRec && !L->isRecurrence()) {
-        return makeRec(SCEVExprKind::AddRec, R->RecLoop,
-                       add(R->Operands[0], L), R->Operands[1], R->Ty);
+    if (R->Kind == SCEVExprKind::AddRec &&
+        isLoopInvariantExpr(L, R->RecLoop)) {
+        std::vector<const SCEVExpr *> Coefficients = R->Operands;
+        Coefficients[0] = add(Coefficients[0], L);
+        return Coefficients[0]
+            ? makeAddRec(R->RecLoop, Coefficients, R->Ty)
+            : nullptr;
     }
 
     return makeBinary(SCEVExprKind::Add, L, R);
@@ -350,39 +811,77 @@ const SCEVExpr *SCEVResult::add(const SCEVExpr *L, const SCEVExpr *R) {
 
 const SCEVExpr *SCEVResult::sub(const SCEVExpr *L, const SCEVExpr *R) {
     if (!L || !R) return nullptr;
-    if (sameExpr(L, R)) return makeConstant(0, L->Ty);
+    if (sameExpr(L, R) && isSafeToDiscard(L))
+        return makeConstant(0, L->Ty);
     if (R->isConstant(0)) return L;
     if (auto LC = asConstant(L)) {
-        if (auto RC = asConstant(R))
-            return makeConstant(*LC - *RC, L->Ty ? L->Ty : R->Ty);
+        if (auto RC = asConstant(R)) {
+            const __int128 Difference =
+                static_cast<__int128>(*LC) -
+                static_cast<__int128>(*RC);
+            std::shared_ptr<IRType> ResultTy =
+                L->Ty ? L->Ty : R->Ty;
+            if (isSCEVSignedValueRepresentable(
+                    Difference, ResultTy)) {
+                return makeConstant(
+                    static_cast<int64_t>(Difference), ResultTy);
+            }
+        }
     }
     if (R->Kind == SCEVExprKind::AddRec)
         return add(L, neg(R));
-    if (L->Kind == SCEVExprKind::AddRec && !R->isRecurrence()) {
-        return makeRec(SCEVExprKind::AddRec, L->RecLoop,
-                       sub(L->Operands[0], R), L->Operands[1], L->Ty);
+    if (L->Kind == SCEVExprKind::AddRec &&
+        isLoopInvariantExpr(R, L->RecLoop)) {
+        std::vector<const SCEVExpr *> Coefficients = L->Operands;
+        Coefficients[0] = sub(Coefficients[0], R);
+        return Coefficients[0]
+            ? makeAddRec(L->RecLoop, Coefficients, L->Ty)
+            : nullptr;
     }
     return makeBinary(SCEVExprKind::Sub, L, R);
 }
 
 const SCEVExpr *SCEVResult::mul(const SCEVExpr *L, const SCEVExpr *R) {
     if (!L || !R) return nullptr;
-    if (L->isConstant(0) || R->isConstant(0))
-        return makeConstant(0, L->Ty ? L->Ty : R->Ty);
+    if (L->isConstant(0) || R->isConstant(0)) {
+        const SCEVExpr *Discarded =
+            L->isConstant(0) ? R : L;
+        if (isSafeToDiscard(Discarded)) {
+            return makeConstant(
+                0, L->Ty ? L->Ty : R->Ty);
+        }
+    }
     if (L->isConstant(1)) return R;
     if (R->isConstant(1)) return L;
     if (auto LC = asConstant(L)) {
-        if (auto RC = asConstant(R))
-            return makeConstant(*LC * *RC, L->Ty ? L->Ty : R->Ty);
+        if (auto RC = asConstant(R)) {
+            const __int128 Product =
+                static_cast<__int128>(*LC) *
+                static_cast<__int128>(*RC);
+            std::shared_ptr<IRType> ResultTy =
+                L->Ty ? L->Ty : R->Ty;
+            if (isSCEVSignedValueRepresentable(Product, ResultTy)) {
+                return makeConstant(
+                    static_cast<int64_t>(Product), ResultTy);
+            }
+        }
     }
 
-    if (L->Kind == SCEVExprKind::AddRec && asConstant(R)) {
-        return makeRec(SCEVExprKind::AddRec, L->RecLoop,
-                       mul(L->Operands[0], R), mul(L->Operands[1], R), L->Ty);
+    if (L->Kind == SCEVExprKind::AddRec &&
+        R->Kind == SCEVExprKind::AddRec &&
+        L->RecLoop == R->RecLoop) {
+        if (const SCEVExpr *Product = multiplyAddRecs(L, R))
+            return Product;
     }
-    if (R->Kind == SCEVExprKind::AddRec && asConstant(L)) {
-        return makeRec(SCEVExprKind::AddRec, R->RecLoop,
-                       mul(R->Operands[0], L), mul(R->Operands[1], L), R->Ty);
+    if (L->Kind == SCEVExprKind::AddRec &&
+        isLoopInvariantExpr(R, L->RecLoop)) {
+        if (const SCEVExpr *Scaled = scaleAddRec(L, R))
+            return Scaled;
+    }
+    if (R->Kind == SCEVExprKind::AddRec &&
+        isLoopInvariantExpr(L, R->RecLoop)) {
+        if (const SCEVExpr *Scaled = scaleAddRec(R, L))
+            return Scaled;
     }
 
     if (L->Key > R->Key) std::swap(L, R);
@@ -391,12 +890,19 @@ const SCEVExpr *SCEVResult::mul(const SCEVExpr *L, const SCEVExpr *R) {
 
 const SCEVExpr *SCEVResult::div(const SCEVExpr *L, const SCEVExpr *R) {
     if (!L || !R) return nullptr;
-    if (sameExpr(L, R)) return makeConstant(1, L->Ty);
-    if (L->isConstant(0)) return L;
     if (R->isConstant(1)) return L;
     if (auto LC = asConstant(L)) {
         if (auto RC = asConstant(R)) {
-            if (*RC != 0) return makeConstant(*LC / *RC, L->Ty ? L->Ty : R->Ty);
+            std::shared_ptr<IRType> ResultTy =
+                L->Ty ? L->Ty : R->Ty;
+            auto SignedMinimum = getSCEVSignedMinimum(ResultTy);
+            if (*RC != 0 && SignedMinimum &&
+                !(*LC == *SignedMinimum && *RC == -1) &&
+                isSCEVSignedValueRepresentable(*LC, ResultTy) &&
+                isSCEVSignedValueRepresentable(*RC, ResultTy)) {
+                return makeConstant(
+                    *LC / *RC, ResultTy);
+            }
         }
     }
     return makeBinary(SCEVExprKind::Div, L, R);
@@ -404,11 +910,21 @@ const SCEVExpr *SCEVResult::div(const SCEVExpr *L, const SCEVExpr *R) {
 
 const SCEVExpr *SCEVResult::mod(const SCEVExpr *L, const SCEVExpr *R) {
     if (!L || !R) return nullptr;
-    if (R->isConstant(0)) return nullptr;
-    if (L->isConstant(0)) return makeConstant(0, L->Ty ? L->Ty : R->Ty);
+    if (R->isConstant(1) && isSafeToDiscard(L))
+        return makeConstant(0, L->Ty ? L->Ty : R->Ty);
     if (auto LC = asConstant(L)) {
-        if (auto RC = asConstant(R))
-            return makeConstant(*LC % *RC, L->Ty ? L->Ty : R->Ty);
+        if (auto RC = asConstant(R)) {
+            std::shared_ptr<IRType> ResultTy =
+                L->Ty ? L->Ty : R->Ty;
+            auto SignedMinimum = getSCEVSignedMinimum(ResultTy);
+            if (*RC != 0 && SignedMinimum &&
+                !(*LC == *SignedMinimum && *RC == -1) &&
+                isSCEVSignedValueRepresentable(*LC, ResultTy) &&
+                isSCEVSignedValueRepresentable(*RC, ResultTy)) {
+                return makeConstant(
+                    *LC % *RC, ResultTy);
+            }
+        }
     }
     return makeBinary(SCEVExprKind::Mod, L, R);
 }
@@ -466,15 +982,34 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
     if (!LHS || !RHS) return makeUnknown(BI);
 
     BinaryInst::Operation Op = BI->getOp();
-    if (BinaryInst::isCompareOp(Op)) return makeCompare(Op, getSCEV(LHS), getSCEV(RHS));
+    // 当前 SCEV 算术域只定义整数位向量语义；浮点运算不能借同名
+    // BinaryInst 操作码进入整数常量折叠。
+    if (!LHS->getIRType() || !RHS->getIRType() ||
+        !LHS->getIRType()->isInt() ||
+        !RHS->getIRType()->isInt()) {
+        return makeUnknown(BI);
+    }
+    if (BinaryInst::isCompareOp(Op))
+        return makeCompare(Op, getSCEV(LHS), getSCEV(RHS));
 
     if (Op == BinaryInst::SHL) {
         if (auto *CI = dynamic_cast<ConstInt *>(RHS)) {
-            int Shift = CI->getVal();
-            if (Shift >= 0 && Shift < 31)
-                return mul(getSCEV(LHS), makeConstant(1LL << Shift, LHS->getIRType()));
+            const int64_t Shift = CI->getVal();
+            const int Bits = LHS->getIRType() && LHS->getIRType()->isInt()
+                ? LHS->getIRType()->getIntegerBitWidth(32)
+                : 0;
+            // 只有 2^Shift 能由该有符号 IR 类型直接表示时才改写为乘法；
+            // 符号位移位仍保留 Shl 节点，避免制造越界的 typed constant。
+            if (Shift >= 0 && Shift < Bits - 1 && Shift < 63) {
+                return mul(
+                    getSCEV(LHS),
+                    makeConstant(
+                        static_cast<int64_t>(uint64_t{1} << Shift),
+                        LHS->getIRType()));
+            }
         }
-        return makeUnknown(BI);
+        return makeBinary(SCEVExprKind::Shl, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
     }
 
     switch (Op) {
@@ -483,6 +1018,21 @@ const SCEVExpr *SCEVResult::createFromBinary(BinaryInst *BI) {
     case BinaryInst::MUL: return mul(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::DIV: return div(getSCEV(LHS), getSCEV(RHS));
     case BinaryInst::MOD: return mod(getSCEV(LHS), getSCEV(RHS));
+    case BinaryInst::LSHR:
+        return makeBinary(SCEVExprKind::LShr, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
+    case BinaryInst::ASHR:
+        return makeBinary(SCEVExprKind::AShr, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
+    case BinaryInst::AND:
+        return makeBinary(SCEVExprKind::BitAnd, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
+    case BinaryInst::OR:
+        return makeBinary(SCEVExprKind::BitOr, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
+    case BinaryInst::XOR:
+        return makeBinary(SCEVExprKind::BitXor, getSCEV(LHS),
+                          getSCEV(RHS), BI->getIRType());
 
     case BinaryInst::UDIV:
     case BinaryInst::UREM: return makeUnknown(BI);
@@ -548,8 +1098,8 @@ const SCEVExpr *SCEVResult::tryHeaderPhi(PhiInst *Phi, const Loop *L) {
 
     if (auto Delta = findAdditiveDelta(Phi, Update, L)) {
         if (Delta->SeenSelf && Delta->Delta) {
-            return makeRec(SCEVExprKind::AddRec, L, getSCEV(Start),
-                           Delta->Delta, Phi->getIRType());
+            return makeAddRecFromDelta(
+                L, getSCEV(Start), Delta->Delta, Phi->getIRType());
         }
     }
 
@@ -575,6 +1125,16 @@ SCEVResult::findAdditiveDeltaImpl(
         return UpdateDelta{false, getSCEV(V)};
 
     if (auto *Merge = dynamic_cast<PhiInst *>(V)) {
+        // 另一个 Header PHI 可以作为当前递推的多项式增量。仅接受已经
+        // 成功表示为同循环 AddRec 的值，互相递归的 PHI 会因活动值保护
+        // 退化为 Unknown，不会被错误积分。
+        if (Merge != Self && Merge->getParent() == L->getHeader()) {
+            const SCEVExpr *OtherRec = getSCEV(Merge);
+            if (isPolynomialAddRec(OtherRec, L))
+                return UpdateDelta{false, OtherRec};
+            return std::nullopt;
+        }
+
         if (!Merge->getParent() || !L->contains(Merge->getParent()) ||
             !Active.insert(Merge).second) {
             return std::nullopt;
@@ -637,13 +1197,23 @@ SCEVResult::findAdditiveDeltaImpl(
 
     if (!DA->SeenSelf && !DB->SeenSelf) {
         if (Op == BinaryInst::MUL) return UpdateDelta{false, mul(DA->Delta, DB->Delta)};
-        if (Op == BinaryInst::DIV || Op == BinaryInst::UDIV)
+        if (Op == BinaryInst::DIV)
             return UpdateDelta{false, div(DA->Delta, DB->Delta)};
         if (Op == BinaryInst::SHL) {
             if (auto *CI = dynamic_cast<ConstInt *>(B)) {
-                int Shift = CI->getVal();
-                if (Shift >= 0 && Shift < 31)
-                    return UpdateDelta{false, mul(DA->Delta, makeConstant(1LL << Shift))};
+                const int64_t Shift = CI->getVal();
+                const int Bits =
+                    A->getIRType() && A->getIRType()->isInt()
+                        ? A->getIRType()->getIntegerBitWidth(0)
+                        : 0;
+                if (Shift >= 0 && Bits > 0 && Shift < Bits) {
+                    const SCEVExpr *ShiftExpr =
+                        getSCEV(V);
+                    if (ShiftExpr &&
+                        isLoopInvariantExpr(ShiftExpr, L)) {
+                        return UpdateDelta{false, ShiftExpr};
+                    }
+                }
             }
         }
     }
@@ -667,7 +1237,7 @@ const SCEVExpr *SCEVResult::trySimpleMulDivRec(PhiInst *Self, Value *Update,
             return makeRec(SCEVExprKind::MulRec, L, getSCEV(Start), getSCEV(A),
                            Self->getIRType());
     }
-    if ((BI->getOp() == BinaryInst::DIV || BI->getOp() == BinaryInst::UDIV) &&
+    if (BI->getOp() == BinaryInst::DIV &&
         A == Self && isLoopInvariant(B, L)) {
         return makeRec(SCEVExprKind::DivRec, L, getSCEV(Start), getSCEV(B),
                        Self->getIRType());
@@ -688,11 +1258,95 @@ bool SCEVResult::isLoopInvariant(Value *V, const Loop *L) const {
 bool SCEVResult::isLoopInvariantExpr(const SCEVExpr *E,
                                      const Loop *L) const {
     if (!E || !L) return true;
-    if (E->isRecurrence() && E->RecLoop == L) return false;
+    if (E->isRecurrence()) {
+        if (E->RecLoop == L) return false;
+
+        // 只有祖先循环的递推值在一次内层循环执行期间保持不变；
+        // 后代或兄弟循环的未求值递推不能被当作当前循环系数。
+        bool IsAncestorRecurrence = false;
+        for (const Loop *Parent = L->getParentLoop();
+             Parent; Parent = Parent->getParentLoop()) {
+            if (Parent == E->RecLoop) {
+                IsAncestorRecurrence = true;
+                break;
+            }
+        }
+        if (!IsAncestorRecurrence) return false;
+    }
     if (E->Kind == SCEVExprKind::Unknown)
         return isLoopInvariant(E->RawValue, L);
     for (const SCEVExpr *Op : E->Operands)
         if (!isLoopInvariantExpr(Op, L)) return false;
+    return true;
+}
+
+bool SCEVResult::isPolynomialAddRec(const SCEVExpr *E,
+                                    const Loop *L) const {
+    if (!E || !L || E->Kind != SCEVExprKind::AddRec ||
+        E->RecLoop != L || E->Operands.size() < 2 ||
+        E->Operands.size() - 1 > MaxAddRecDegree) {
+        return false;
+    }
+    for (const SCEVExpr *Coefficient : E->Operands)
+        if (!Coefficient || !isLoopInvariantExpr(Coefficient, L))
+            return false;
+    return true;
+}
+
+bool SCEVResult::isSafeToDiscard(const SCEVExpr *E) const {
+    std::unordered_set<const SCEVExpr *> Active;
+    return isSafeToDiscardImpl(E, Active, 0);
+}
+
+// 只有不会因除零、带符号最小值除 -1 或非法移位而产生未定义结果的
+// 子树才能被 x-x、0*x、x^x 等恒等式完全丢弃。
+bool SCEVResult::isSafeToDiscardImpl(
+    const SCEVExpr *E,
+    std::unordered_set<const SCEVExpr *> &Active,
+    unsigned Depth) const {
+    if (!E || Depth > 64) return false;
+    ScopedActiveMark ActiveMark(Active, E);
+    if (!ActiveMark.inserted()) return false;
+
+    if (E->Kind == SCEVExprKind::Constant)
+        return true;
+    if (E->Kind == SCEVExprKind::Unknown) {
+        if (!E->RawValue || Value::isUndef(E->RawValue))
+            return false;
+        auto *Binary = dynamic_cast<BinaryInst *>(E->RawValue);
+        if (!Binary) return true;
+        return Binary->getOp() != BinaryInst::UDIV &&
+               Binary->getOp() != BinaryInst::UREM;
+    }
+
+    if (E->Kind == SCEVExprKind::Div ||
+        E->Kind == SCEVExprKind::Mod) {
+        if (E->Operands.size() != 2) return false;
+        auto Divisor = asConstant(E->Operands[1]);
+        if (!Divisor || *Divisor == 0 || *Divisor == -1)
+            return false;
+    }
+
+    if (E->Kind == SCEVExprKind::Shl ||
+        E->Kind == SCEVExprKind::LShr ||
+        E->Kind == SCEVExprKind::AShr) {
+        if (E->Operands.size() != 2) return false;
+        auto Shift = asConstant(E->Operands[1]);
+        const int Bits =
+            E->Ty && E->Ty->isInt()
+                ? E->Ty->getIntegerBitWidth(32)
+                : 0;
+        if (!Shift || *Shift < 0 || Bits <= 0 ||
+            *Shift >= Bits) {
+            return false;
+        }
+    }
+
+    for (const SCEVExpr *Operand : E->Operands)
+        if (!isSafeToDiscardImpl(
+                Operand, Active, Depth + 1)) {
+            return false;
+        }
     return true;
 }
 
@@ -715,14 +1369,19 @@ const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
 
     const SCEVExpr *TE = getSCEV(TrueV);
     const SCEVExpr *FE = getSCEV(FalseV);
-    if (sameExpr(TE, FE)) return TE;
+    if (sameExpr(TE, FE) &&
+        isSafeToDiscard(getSCEV(Cond))) {
+        return TE;
+    }
 
     auto *Cmp = dynamic_cast<BinaryInst *>(Cond);
-    if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp())) return makeUnknown(Sel);
+    if (!Cmp || !BinaryInst::isCompareOp(Cmp->getOp()))
+        return makeSelect(getSCEV(Cond), TE, FE, Sel->getIRType());
 
     Value *A = nullptr;
     Value *B = nullptr;
-    if (!Cmp->getOperands(A, B)) return makeUnknown(Sel);
+    if (!Cmp->getOperands(A, B))
+        return makeSelect(getSCEV(Cond), TE, FE, Sel->getIRType());
 
     const bool TrueIsA = sameExpr(TE, getSCEV(A));
     const bool TrueIsB = sameExpr(TE, getSCEV(B));
@@ -747,7 +1406,7 @@ const SCEVExpr *SCEVResult::createFromSelect(SelectInst *Sel) {
     default:
         break;
     }
-    return makeUnknown(Sel);
+    return makeSelect(getSCEV(Cond), TE, FE, Sel->getIRType());
 }
 
 const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
@@ -756,18 +1415,30 @@ const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
 
     const SCEVExpr *Result = getSCEV(Base);
     std::shared_ptr<IRType> CurType = Base->getIRType();
-    int64_t ConstantOffset = 0;
+    __int128 ConstantOffset = 0;
 
     for (size_t I = 0; I < GEP->getNumIndices(); ++I) {
         CurType = CurType ? CurType->getIndexableElementType() : nullptr;
         if (!CurType) return makeUnknown(GEP);
         std::size_t Stride = CurType->getSize();
+        if (Stride >
+            static_cast<std::size_t>(
+                std::numeric_limits<int64_t>::max())) {
+            return makeUnknown(GEP);
+        }
 
         Value *Idx = GEP->getIndex(I);
         if (!Idx) return makeUnknown(GEP);
         if (auto *CI = dynamic_cast<ConstInt *>(Idx)) {
-            ConstantOffset += static_cast<int64_t>(CI->getVal()) *
-                              static_cast<int64_t>(Stride);
+            ConstantOffset +=
+                static_cast<__int128>(CI->getVal()) *
+                static_cast<__int128>(Stride);
+            if (ConstantOffset <
+                    std::numeric_limits<int64_t>::min() ||
+                ConstantOffset >
+                    std::numeric_limits<int64_t>::max()) {
+                return makeUnknown(GEP);
+            }
         } else {
             const SCEVExpr *Scaled = mul(getSCEV(Idx),
                                          makeConstant(static_cast<int64_t>(Stride),
@@ -778,7 +1449,9 @@ const SCEVExpr *SCEVResult::createFromGEP(GetElementPtrInst *GEP) {
 
     if (ConstantOffset != 0)
         Result = add(
-            Result, makeConstant(ConstantOffset, INTType::getInt32Ty()));
+            Result,
+            makeConstant(static_cast<int64_t>(ConstantOffset),
+                         INTType::getInt32Ty()));
     return Result ? Result : makeUnknown(GEP);
 }
 
@@ -795,6 +1468,25 @@ std::optional<SCEVAffineInfo> SCEVResult::getAffine(const SCEVExpr *E) const {
     Info.Step = E->Operands[1];
     Info.ConstantStart = asConstant(Info.Start);
     Info.ConstantStep = asConstant(Info.Step);
+    return Info;
+}
+
+std::optional<SCEVAddRecInfo>
+SCEVResult::getAddRecurrence(Value *V) {
+    return getAddRecurrence(getSCEV(V));
+}
+
+std::optional<SCEVAddRecInfo>
+SCEVResult::getAddRecurrence(const SCEVExpr *E) const {
+    if (!E || E->Kind != SCEVExprKind::AddRec || !E->RecLoop ||
+        E->Operands.size() < 2 ||
+        E->Operands.size() - 1 > MaxAddRecDegree) {
+        return std::nullopt;
+    }
+
+    SCEVAddRecInfo Info;
+    Info.RecLoop = E->RecLoop;
+    Info.Coefficients = E->Operands;
     return Info;
 }
 
@@ -938,6 +1630,275 @@ bool SCEVResult::isKnownFiniteLoop(const Loop *L) {
     return Trip->ComparePhase == LoopExitComparePhase::HeaderPhi ||
            (Trip->ComparePhase == LoopExitComparePhase::BackedgeUpdate &&
             isBackedgeUpdateStartSafe(L, *Induction, *Trip));
+}
+
+// Range 辅助有限性证明只接受直接 affine 更新。证明同时要求严格进展方向、
+// 匹配的退出谓词，以及最坏末次更新仍位于 i32 域内，因此不会把“step>0”
+// 单独误用为无回绕或必终止事实。
+bool SCEVResult::isKnownFiniteLoop(
+    const Loop *L, RangeInfo &RI, DominatorTree &DomTree) {
+    if (isKnownFiniteLoop(L)) return true;
+    if (!L) return false;
+
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    BasicBlock *Header = L->getHeader();
+    if (!Header ||
+        !L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return false;
+    }
+
+    // 1. 与基础次数分析保持相同的单退出形状，并要求退出测试支配锁存块。
+    BasicBlock *Exiting = nullptr;
+    BasicBlock *Exit = nullptr;
+    bool ContinueOnTrue = true;
+    for (BasicBlock *BB : collectDirectLoopBlocks(L)) {
+        bool HasOutsideSuccessor = false;
+        for (BasicBlock *Successor : BB->getSuccessors()) {
+            if (Successor && !L->contains(Successor)) {
+                HasOutsideSuccessor = true;
+                break;
+            }
+        }
+        if (!HasOutsideSuccessor) continue;
+        if (Exiting && Exiting != BB) return false;
+
+        BrInst *Branch = BB->getBranchTerminator();
+        if (!BasicBlock::isCondBr(Branch)) return false;
+        BasicBlock *TrueBlock = Branch->getTrueSuccessor();
+        BasicBlock *FalseBlock = Branch->getFalseSuccessor();
+        const bool TrueInside = TrueBlock && L->contains(TrueBlock);
+        const bool FalseInside = FalseBlock && L->contains(FalseBlock);
+        if (TrueInside == FalseInside) return false;
+
+        BasicBlock *CurrentExit =
+            TrueInside ? FalseBlock : TrueBlock;
+        if (!CurrentExit || L->contains(CurrentExit) ||
+            (Exit && Exit != CurrentExit)) {
+            return false;
+        }
+        Exiting = BB;
+        Exit = CurrentExit;
+        ContinueOnTrue = TrueInside;
+    }
+    if (!Exiting || !DomTree.dominates(Exiting, Latch))
+        return false;
+
+    BrInst *Branch = Exiting->getBranchTerminator();
+    auto *Compare =
+        dynamic_cast<BinaryInst *>(Branch->getCondition());
+    if (!Compare || !BinaryInst::isCompareOp(Compare->getOp()))
+        return false;
+
+    // 2. 将当前循环的 affine 值定向到左侧，另一侧必须对循环不变。
+    BinaryInst::Operation Predicate =
+        ContinueOnTrue
+            ? Compare->getOp()
+            : BinaryInst::negatePredicate(Compare->getOp());
+    Value *ComparedValue = Compare->getOperand(0);
+    Value *BoundValue = Compare->getOperand(1);
+    if (!ComparedValue || !BoundValue) return false;
+
+    const SCEVExpr *ComparedExpr = getSCEV(ComparedValue);
+    const SCEVExpr *BoundExpr = getSCEV(BoundValue);
+    auto ComparedAffine = getAffine(ComparedExpr);
+    if (!ComparedAffine || ComparedAffine->RecLoop != L) {
+        if (!isLoopInvariantExpr(ComparedExpr, L))
+            return false;
+        auto BoundAffine = getAffine(BoundExpr);
+        if (!BoundAffine || BoundAffine->RecLoop != L)
+            return false;
+        std::swap(ComparedValue, BoundValue);
+        std::swap(ComparedExpr, BoundExpr);
+        ComparedAffine = BoundAffine;
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (!ComparedAffine || ComparedAffine->RecLoop != L ||
+        !isLoopInvariantExpr(BoundExpr, L)) {
+        return false;
+    }
+
+    // 3. 比较值只能是 Header PHI 本身或该 PHI 的唯一直接回边更新。
+    PhiInst *InductionPhi =
+        dynamic_cast<PhiInst *>(ComparedValue);
+    if (InductionPhi &&
+        InductionPhi->getParent() != Header) {
+        return false;
+    }
+
+    if (!InductionPhi) {
+        for (Instruction *InstructionValue : *Header) {
+            auto *Candidate =
+                dynamic_cast<PhiInst *>(InstructionValue);
+            if (!Candidate) break;
+
+            bool HasComparedUpdate = false;
+            bool InvalidIncoming = false;
+            forEachPhiIncoming(
+                Candidate,
+                [&](unsigned, Value *Incoming,
+                    BasicBlock *Predecessor) {
+                    if (!Incoming || !Predecessor) {
+                        InvalidIncoming = true;
+                        return false;
+                    }
+                    if (L->contains(Predecessor) &&
+                        Incoming == ComparedValue) {
+                        if (HasComparedUpdate) {
+                            InvalidIncoming = true;
+                            return false;
+                        }
+                        HasComparedUpdate = true;
+                    }
+                    return true;
+                });
+            if (InvalidIncoming || !HasComparedUpdate)
+                continue;
+            if (InductionPhi && InductionPhi != Candidate)
+                return false;
+            InductionPhi = Candidate;
+        }
+    }
+    if (!InductionPhi) return false;
+    if (!IRType::hasIntegerBitWidth(
+            InductionPhi->getIRType(), 32) ||
+        !IRType::hasIntegerBitWidth(
+            BoundValue->getIRType(), 32)) {
+        return false;
+    }
+
+    Value *StartValue = nullptr;
+    Value *UpdateValue = nullptr;
+    bool InvalidIncoming = false;
+    forEachPhiIncoming(
+        InductionPhi,
+        [&](unsigned, Value *Incoming,
+            BasicBlock *Predecessor) {
+            if (!Incoming || !Predecessor) {
+                InvalidIncoming = true;
+                return false;
+            }
+            if (L->contains(Predecessor)) {
+                if (Predecessor != Latch ||
+                    (UpdateValue && UpdateValue != Incoming)) {
+                    InvalidIncoming = true;
+                    return false;
+                }
+                UpdateValue = Incoming;
+            } else {
+                if (StartValue && StartValue != Incoming) {
+                    InvalidIncoming = true;
+                    return false;
+                }
+                StartValue = Incoming;
+            }
+            return true;
+        });
+    if (InvalidIncoming || !StartValue || !UpdateValue ||
+        (ComparedValue != InductionPhi &&
+         ComparedValue != UpdateValue)) {
+        return false;
+    }
+    if (!IRType::hasIntegerBitWidth(StartValue->getIRType(), 32) ||
+        !IRType::hasIntegerBitWidth(UpdateValue->getIRType(), 32)) {
+        return false;
+    }
+
+    const bool ComparesUpdate = ComparedValue == UpdateValue;
+    if ((!ComparesUpdate &&
+         (Exiting != Header || Header == Latch)) ||
+        (ComparesUpdate && Exiting != Latch)) {
+        return false;
+    }
+
+    // 4. 仅接受 phi +/- loop-invariant-step 的直接更新，并核对其 SCEV 步长。
+    auto *Update = dynamic_cast<BinaryInst *>(UpdateValue);
+    if (!Update) return false;
+    Value *LeftValue = Update->getOperand(0);
+    Value *RightValue = Update->getOperand(1);
+    const SCEVExpr *DirectStep = nullptr;
+    if (Update->getOp() == BinaryInst::ADD) {
+        if (LeftValue == InductionPhi)
+            DirectStep = getSCEV(RightValue);
+        else if (RightValue == InductionPhi)
+            DirectStep = getSCEV(LeftValue);
+    } else if (Update->getOp() == BinaryInst::SUB &&
+               LeftValue == InductionPhi) {
+        DirectStep = neg(getSCEV(RightValue));
+    }
+    auto PhiAffine = getAffine(InductionPhi);
+    if (!DirectStep || !PhiAffine ||
+        PhiAffine->RecLoop != L ||
+        !sameExpr(DirectStep, PhiAffine->Step) ||
+        !isLoopInvariantExpr(DirectStep, L)) {
+        return false;
+    }
+
+    auto StepInfo = analyzeAffineStepRange(
+        InductionPhi, PreHeader, RI, DomTree);
+    if (!StepInfo || !StepInfo->Valid)
+        return false;
+    const bool Increasing =
+        StepInfo->Sign == SCEVStepSign::StrictlyPositive;
+    const bool Decreasing =
+        StepInfo->Sign == SCEVStepSign::StrictlyNegative;
+    if (!Increasing && !Decreasing) return false;
+
+    if ((Increasing &&
+         Predicate != BinaryInst::L &&
+         Predicate != BinaryInst::LE) ||
+        (Decreasing &&
+         Predicate != BinaryInst::G &&
+         Predicate != BinaryInst::GE)) {
+        return false;
+    }
+
+    IntRange StartRange =
+        RI.query(StartValue, PreHeader, DomTree);
+    IntRange BoundRange =
+        RI.query(BoundValue, PreHeader, DomTree);
+    if (StartRange.isBottom() || BoundRange.isBottom() ||
+        StepInfo->Range.isBottom()) {
+        return false;
+    }
+
+    // 5. 以宽整数检查最坏末次更新。Header 比较只在条件成立后更新；
+    // BackedgeUpdate 还必须单独覆盖第一次无条件更新。
+    if (Increasing) {
+        const __int128 LargestCompared =
+            static_cast<__int128>(BoundRange.max) -
+            (Predicate == BinaryInst::L ? 1 : 0);
+        const __int128 LargestUpdate =
+            LargestCompared +
+            static_cast<__int128>(StepInfo->Range.max);
+        if (LargestUpdate > IntRange::I32_MAX)
+            return false;
+        if (ComparesUpdate) {
+            const __int128 FirstUpdate =
+                static_cast<__int128>(StartRange.max) +
+                static_cast<__int128>(StepInfo->Range.max);
+            if (FirstUpdate > IntRange::I32_MAX)
+                return false;
+        }
+    } else {
+        const __int128 SmallestCompared =
+            static_cast<__int128>(BoundRange.min) +
+            (Predicate == BinaryInst::G ? 1 : 0);
+        const __int128 SmallestUpdate =
+            SmallestCompared +
+            static_cast<__int128>(StepInfo->Range.min);
+        if (SmallestUpdate < IntRange::I32_MIN)
+            return false;
+        if (ComparesUpdate) {
+            const __int128 FirstUpdate =
+                static_cast<__int128>(StartRange.min) +
+                static_cast<__int128>(StepInfo->Range.min);
+            if (FirstUpdate < IntRange::I32_MIN)
+                return false;
+        }
+    }
+    return true;
 }
 
 bool SCEVResult::isKnownNoWrapInductionValue(const Loop *L, Value *V) {
@@ -1176,6 +2137,139 @@ bool SCEVResult::proveRuntimeNoWrapAtPreheader(
            FinalMax <= IntRange::I32_MAX;
 }
 
+std::optional<IntRange> SCEVResult::evaluateRangeForDirection(
+    const SCEVExpr *E, BasicBlock *Context, RangeInfo &RI,
+    DominatorTree &DomTree,
+    std::unordered_set<const SCEVExpr *> &Active,
+    unsigned Depth) const {
+    if (!E || Depth > 64) return std::nullopt;
+    ScopedActiveMark ActiveMark(Active, E);
+    if (!ActiveMark.inserted()) return std::nullopt;
+
+    if (E->Kind == SCEVExprKind::Constant) {
+        if (E->ConstValue < IntRange::I32_MIN ||
+            E->ConstValue > IntRange::I32_MAX) {
+            return std::nullopt;
+        }
+        return IntRange(E->ConstValue);
+    }
+    if (E->Kind == SCEVExprKind::Unknown) {
+        if (!E->RawValue || !Context) return std::nullopt;
+        return RI.query(E->RawValue, Context, DomTree);
+    }
+
+    if (E->Kind == SCEVExprKind::Select) {
+        if (E->Operands.size() != 3) return std::nullopt;
+        auto TrueRange = evaluateRangeForDirection(
+            E->Operands[1], Context, RI, DomTree, Active, Depth + 1);
+        auto FalseRange = evaluateRangeForDirection(
+            E->Operands[2], Context, RI, DomTree, Active, Depth + 1);
+        if (!TrueRange || !FalseRange) return std::nullopt;
+        return TrueRange->unionWith(*FalseRange);
+    }
+
+    if (E->Kind == SCEVExprKind::Compare)
+        return IntRange(0, 1);
+
+    if (E->Operands.size() != 2) return std::nullopt;
+    auto Left = evaluateRangeForDirection(
+        E->Operands[0], Context, RI, DomTree, Active, Depth + 1);
+    auto Right = evaluateRangeForDirection(
+        E->Operands[1], Context, RI, DomTree, Active, Depth + 1);
+    if (!Left || !Right) return std::nullopt;
+
+    switch (E->Kind) {
+    case SCEVExprKind::Add:
+        return Left->add(*Right);
+    case SCEVExprKind::Sub:
+        return Left->sub(*Right);
+    case SCEVExprKind::Mul:
+        return Left->mul(*Right);
+    case SCEVExprKind::Div:
+        return Left->sdiv(*Right);
+    case SCEVExprKind::Mod:
+        return Left->srem(*Right);
+    case SCEVExprKind::Shl:
+        return Left->shl(*Right);
+    case SCEVExprKind::LShr:
+        return Left->lshr(*Right);
+    case SCEVExprKind::AShr:
+        return Left->ashr(*Right);
+    case SCEVExprKind::BitAnd:
+        return Left->band(*Right);
+    case SCEVExprKind::BitOr:
+        return Left->bor(*Right);
+    case SCEVExprKind::Min:
+        return IntRange(std::min(Left->min, Right->min),
+                        std::min(Left->max, Right->max));
+    case SCEVExprKind::Max:
+        return IntRange(std::max(Left->min, Right->min),
+                        std::max(Left->max, Right->max));
+    default:
+        return std::nullopt;
+    }
+}
+
+SCEVStepSign SCEVResult::classifyStepSign(
+    const IntRange &Range) const {
+    if (Range.isBottom() || Range.isTop())
+        return SCEVStepSign::Unknown;
+    if (Range.min == 0 && Range.max == 0)
+        return SCEVStepSign::Zero;
+    if (Range.min > 0)
+        return SCEVStepSign::StrictlyPositive;
+    if (Range.max < 0)
+        return SCEVStepSign::StrictlyNegative;
+    if (Range.min >= 0)
+        return SCEVStepSign::NonNegative;
+    if (Range.max <= 0)
+        return SCEVStepSign::NonPositive;
+    return SCEVStepSign::Unknown;
+}
+
+// 此接口只消费调用者已有的 RangeInfo，不把 RangeAnalysis 注册为 SCEV 的
+// 依赖；方向证据与无回绕证明保持正交，防止“step>0”被误当成循环必终止。
+std::optional<SCEVStepRangeInfo>
+SCEVResult::analyzeAffineStepRange(
+    const SCEVExpr *E, BasicBlock *Context, RangeInfo &RI,
+    DominatorTree &DomTree) const {
+    auto Affine = getAffine(E);
+    if (!Affine || !Affine->RecLoop || !Affine->Step)
+        return std::nullopt;
+
+    if (!Context) {
+        BasicBlock *PreHeader = nullptr;
+        BasicBlock *Latch = nullptr;
+        if (!Affine->RecLoop->getLoopSimplifyForm(PreHeader, Latch) ||
+            !PreHeader) {
+            return std::nullopt;
+        }
+        Context = PreHeader;
+    }
+
+    std::unordered_set<const SCEVExpr *> Active;
+    auto StepRange = evaluateRangeForDirection(
+        Affine->Step, Context, RI, DomTree, Active, 0);
+    if (!StepRange || StepRange->isBottom())
+        return std::nullopt;
+
+    SCEVStepRangeInfo Info;
+    Info.RecLoop = Affine->RecLoop;
+    Info.Step = Affine->Step;
+    Info.Range = *StepRange;
+    Info.Sign = classifyStepSign(*StepRange);
+    Info.Valid = true;
+    return Info;
+}
+
+std::optional<SCEVStepRangeInfo>
+SCEVResult::analyzeAffineStepRange(
+    Value *V, BasicBlock *Context, RangeInfo &RI,
+    DominatorTree &DomTree) {
+    return analyzeAffineStepRange(
+        getSCEV(V), Context, RI, DomTree);
+}
+
 // 比较求解器负责定向归纳变量、构造距离和次数、绑定精确 SSA 阶段并证明常量递推安全。
 bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
     // 1. 把循环递推统一放到比较左侧，右侧必须对当前循环不变。
@@ -1255,7 +2349,21 @@ bool SCEVResult::fillTripCountFromComparison(LoopTripCountInfo &Info) {
             if (*D < 0 || (*D % AbsStep) != 0) return false;
             TC = makeConstant(*D / AbsStep, Distance->Ty);
         } else {
-            TC = makeConstant(IRMath::ceilDivPositive(*D, AbsStep), Distance->Ty);
+            __int128 ExactTripCount = 0;
+            if (*D > 0) {
+                ExactTripCount =
+                    (static_cast<__int128>(*D) +
+                     static_cast<__int128>(AbsStep) - 1) /
+                    static_cast<__int128>(AbsStep);
+            }
+            if (ExactTripCount >
+                static_cast<__int128>(
+                    std::numeric_limits<int64_t>::max())) {
+                return false;
+            }
+            TC = makeConstant(
+                static_cast<int64_t>(ExactTripCount),
+                Distance->Ty);
         }
     } else {
 
@@ -1596,7 +2704,8 @@ SCEVResult::getCanonicalInduction(const Loop *L) {
     return Desc.Valid ? std::optional<InductionDescriptor>(Desc) : std::nullopt;
 }
 
-// 指定迭代展开递归替换目标循环的 AddRec；不支持的乘除递推保持符号节点。
+// 指定迭代展开使用二项式基底求值高阶 AddRec；Binomial 节点保持精确
+// 组合数语义，不把闭式伪装成可能中间回绕的普通乘除表达式。
 const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
                                                const SCEVExpr *Iter,
                                                const Loop *L) {
@@ -1611,6 +2720,12 @@ const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
     case SCEVExprKind::Mul:
     case SCEVExprKind::Div:
     case SCEVExprKind::Mod:
+    case SCEVExprKind::Shl:
+    case SCEVExprKind::LShr:
+    case SCEVExprKind::AShr:
+    case SCEVExprKind::BitAnd:
+    case SCEVExprKind::BitOr:
+    case SCEVExprKind::BitXor:
     case SCEVExprKind::Min:
     case SCEVExprKind::Max: {
         if (E->Operands.size() != 2) return nullptr;
@@ -1623,6 +2738,13 @@ const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
         case SCEVExprKind::Mul: return mul(LHS, RHS);
         case SCEVExprKind::Div: return div(LHS, RHS);
         case SCEVExprKind::Mod: return mod(LHS, RHS);
+        case SCEVExprKind::Shl:
+        case SCEVExprKind::LShr:
+        case SCEVExprKind::AShr:
+        case SCEVExprKind::BitAnd:
+        case SCEVExprKind::BitOr:
+        case SCEVExprKind::BitXor:
+            return makeBinary(E->Kind, LHS, RHS, E->Ty);
         case SCEVExprKind::Min:
         case SCEVExprKind::Max:
             return makeBinary(E->Kind, LHS, RHS, E->Ty);
@@ -1630,6 +2752,24 @@ const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
             return nullptr;
         }
     }
+    case SCEVExprKind::Binomial: {
+        if (E->Operands.size() != 2) return nullptr;
+        auto Degree = asConstant(E->Operands[1]);
+        if (!Degree || *Degree < 0 ||
+            static_cast<uint64_t>(*Degree) > MaxAddRecDegree) {
+            return nullptr;
+        }
+        const SCEVExpr *N =
+            getSCEVAtIteration(E->Operands[0], Iter, L);
+        return makeBinomial(
+            N, static_cast<unsigned>(*Degree), E->Ty);
+    }
+    case SCEVExprKind::Select:
+        if (E->Operands.size() != 3) return nullptr;
+        return makeSelect(
+            getSCEVAtIteration(E->Operands[0], Iter, L),
+            getSCEVAtIteration(E->Operands[1], Iter, L),
+            getSCEVAtIteration(E->Operands[2], Iter, L), E->Ty);
     case SCEVExprKind::Cast:
         if (E->Operands.size() != 1) return nullptr;
         return makeCast(E->CastKind,
@@ -1639,15 +2779,50 @@ const SCEVExpr *SCEVResult::getSCEVAtIteration(const SCEVExpr *E,
         return makeCompare(E->Predicate,
                            getSCEVAtIteration(E->Operands[0], Iter, L),
                            getSCEVAtIteration(E->Operands[1], Iter, L));
-    case SCEVExprKind::AddRec:
-        if (E->Operands.size() != 2) return nullptr;
-        if (E->RecLoop != L) return E;
+    case SCEVExprKind::AddRec: {
+        if (!E->RecLoop || E->Operands.size() < 2 ||
+            E->Operands.size() - 1 > MaxAddRecDegree) {
+            return nullptr;
+        }
+
+        if (E->RecLoop != L) {
+            std::vector<const SCEVExpr *> Coefficients;
+            Coefficients.reserve(E->Operands.size());
+            for (const SCEVExpr *Coefficient : E->Operands) {
+                const SCEVExpr *AtIteration =
+                    getSCEVAtIteration(Coefficient, Iter, L);
+                if (!AtIteration) return nullptr;
+                Coefficients.push_back(AtIteration);
+            }
+            return makeAddRec(E->RecLoop, Coefficients, E->Ty);
+        }
+
         if (!Iter) return nullptr;
-        return add(getSCEVAtIteration(E->Operands[0], Iter, L),
-                   mul(Iter, getSCEVAtIteration(E->Operands[1], Iter, L)));
+        const SCEVExpr *Result =
+            makeConstant(0, E->Ty ? E->Ty : Iter->Ty);
+        for (std::size_t Degree = 0;
+             Degree < E->Operands.size(); ++Degree) {
+            const SCEVExpr *Coefficient =
+                getSCEVAtIteration(E->Operands[Degree], Iter, L);
+            const SCEVExpr *Choose = makeBinomial(
+                Iter, static_cast<unsigned>(Degree), Iter->Ty);
+            if (!Coefficient || !Choose) return nullptr;
+            const SCEVExpr *Term = mul(Coefficient, Choose);
+            Result = add(Result, Term);
+            if (!Result) return nullptr;
+        }
+        return Result;
+    }
     case SCEVExprKind::MulRec:
-    case SCEVExprKind::DivRec:
-        return E;
+    case SCEVExprKind::DivRec: {
+        if (E->Operands.size() != 2) return nullptr;
+        if (E->RecLoop == L) return E;
+        const SCEVExpr *Base =
+            getSCEVAtIteration(E->Operands[0], Iter, L);
+        const SCEVExpr *Step =
+            getSCEVAtIteration(E->Operands[1], Iter, L);
+        return makeRec(E->Kind, E->RecLoop, Base, Step, E->Ty);
+    }
     }
     return nullptr;
 }
@@ -1738,10 +2913,35 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
         return "(" + format(E->Operands[0]) + " / " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Mod:
         return "(" + format(E->Operands[0]) + " % " + format(E->Operands[1]) + ")";
+    case SCEVExprKind::Shl:
+        return "(" + format(E->Operands[0]) + " << " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::LShr:
+        return "lshr(" + format(E->Operands[0]) + ", " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::AShr:
+        return "ashr(" + format(E->Operands[0]) + ", " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::BitAnd:
+        return "(" + format(E->Operands[0]) + " & " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::BitOr:
+        return "(" + format(E->Operands[0]) + " | " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::BitXor:
+        return "(" + format(E->Operands[0]) + " ^ " +
+               format(E->Operands[1]) + ")";
+    case SCEVExprKind::Binomial:
+        return "C(" + format(E->Operands[0]) + ", " +
+               format(E->Operands[1]) + ")";
     case SCEVExprKind::Min:
         return "min(" + format(E->Operands[0]) + ", " + format(E->Operands[1]) + ")";
     case SCEVExprKind::Max:
         return "max(" + format(E->Operands[0]) + ", " + format(E->Operands[1]) + ")";
+    case SCEVExprKind::Select:
+        return "select(" + format(E->Operands[0]) + ", " +
+               format(E->Operands[1]) + ", " +
+               format(E->Operands[2]) + ")";
     case SCEVExprKind::Cast:
         return std::string(SCEVExpr::castName(E->CastKind)) + "(" +
                format(E->Operands[0]) + ")";
@@ -1750,11 +2950,20 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
                SCEVExpr::predicateName(E->Predicate) +
                " " + format(E->Operands[1]) + ")";
     case SCEVExprKind::AddRec:
-        return "{" + format(E->Operands[0]) + ",+, " + format(E->Operands[1]) +
-               "}<" + (E->RecLoop && E->RecLoop->getHeader()
-                            ? E->RecLoop->getHeader()->getIdent()
-                            : "?") +
-               ">";
+    {
+        std::ostringstream OS;
+        OS << "{";
+        for (std::size_t I = 0; I < E->Operands.size(); ++I) {
+            if (I != 0) OS << ",+, ";
+            OS << format(E->Operands[I]);
+        }
+        OS << "}<"
+           << (E->RecLoop && E->RecLoop->getHeader()
+                   ? E->RecLoop->getHeader()->getIdent()
+                   : "?")
+           << ">";
+        return OS.str();
+    }
     case SCEVExprKind::MulRec:
         return "{" + format(E->Operands[0]) + ",*, " + format(E->Operands[1]) +
                "}<" + (E->RecLoop && E->RecLoop->getHeader()

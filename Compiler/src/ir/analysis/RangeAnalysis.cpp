@@ -11,9 +11,11 @@
 // 整数格运算在数学结果可能越过 i32 或无法用单区间表示时返回 Top，绝不使用饱和端点。
 int IntRange::trailingZerosOf(int64_t v) {
     if (v == 0) return 31;
-    uint64_t u = static_cast<uint64_t>(v < 0 ? -v : v);
+    // 二补码值直接转成无符号位模式即可统计低位零，避免对 INT64_MIN
+    // 求负触发宿主 C++ 的有符号溢出。
+    uint64_t u = static_cast<uint64_t>(v);
     int n = 0;
-    while (((u >> n) & 1ULL) == 0 && n < 31) n++;
+    while (n < 31 && ((u >> n) & 1ULL) == 0) n++;
     return n;
 }
 
@@ -26,15 +28,13 @@ IntRange::IntRange(int64_t val)
 IntRange::IntRange(int64_t lo, int64_t hi)
     : min(lo), max(hi), knownTrailingZeros(0) {}
 
-namespace {
-
-bool isModeledIntegerRangeType(const Value *V) {
+static bool isModeledIntegerRangeType(const Value *V) {
     auto Ty = V ? V->getIRType() : nullptr;
     return IRType::hasIntegerBitWidth(Ty, 1) ||
            IRType::hasIntegerBitWidth(Ty, 32);
 }
 
-IntRange conservativeIntegerRangeForValue(const Value *V) {
+static IntRange conservativeIntegerRangeForValue(const Value *V) {
     if (!V || !V->getIRType() || !V->getIRType()->isInt())
         return IntRange();
     if (V->getIRType()->hasIntegerBitWidth(1))
@@ -43,6 +43,52 @@ IntRange conservativeIntegerRangeForValue(const Value *V) {
     return IntRange();
 }
 
+static UIntRange conservativeUnsignedRangeForValue(const Value *V) {
+    if (!V || !V->getIRType() || !V->getIRType()->isInt())
+        return UIntRange();
+    if (V->getIRType()->hasIntegerBitWidth(1))
+        return UIntRange(0, 1);
+    return UIntRange();
+}
+
+static IntRange signedRangeForConstant(const ConstInt *CI) {
+    if (!CI || !CI->getIRType()) return IntRange();
+    if (IRType::hasIntegerBitWidth(CI->getIRType(), 1))
+        return IntRange(CI->getVal() == 0 ? 0 : 1);
+    if (IRType::hasIntegerBitWidth(CI->getIRType(), 32))
+        return IntRange(static_cast<int32_t>(CI->getVal()));
+    // 当前整数抽象域只建模 SysY 的 i1/i32；辅助 ABI 使用的 i64 常量
+    // 不能被误投影成 i32 单点。
+    return conservativeIntegerRangeForValue(CI);
+}
+
+static UIntRange unsignedRangeForConstant(const ConstInt *CI) {
+    if (!CI || !CI->getIRType()) return UIntRange();
+    if (IRType::hasIntegerBitWidth(CI->getIRType(), 1))
+        return UIntRange(CI->getVal() == 0 ? 0 : 1);
+    if (IRType::hasIntegerBitWidth(CI->getIRType(), 32))
+        return UIntRange(static_cast<uint32_t>(
+            static_cast<int32_t>(CI->getVal())));
+    return conservativeUnsignedRangeForValue(CI);
+}
+
+// ConstBool 与 ConstInt 属于两套驻留常量类型。RangeAnalysis 在入口统一
+// 归一化二者，避免布尔常量在 PHI、分支和 Select 中退化成 [0,1]。
+static bool getIntegerConstantRanges(const Value *V,
+                                     IntRange &Signed,
+                                     UIntRange &Unsigned) {
+    if (auto *CB = dynamic_cast<const ConstBool *>(V)) {
+        uint64_t Bit = CB->getVal() ? 1 : 0;
+        Signed = IntRange(static_cast<int64_t>(Bit));
+        Unsigned = UIntRange(Bit);
+        return true;
+    }
+    if (auto *CI = dynamic_cast<const ConstInt *>(V)) {
+        Signed = signedRangeForConstant(CI);
+        Unsigned = unsignedRangeForConstant(CI);
+        return true;
+    }
+    return false;
 }
 
 bool IntRange::isTop() const {
@@ -159,6 +205,13 @@ IntRange IntRange::srem(const IntRange &rhs) const {
     if (isBottom() || rhs.isBottom()) return bottom();
     if (rhs.min <= 0 && rhs.max >= 0) return IntRange();
 
+    // i32 的 INT_MIN % -1 在 LLVM/C 整数语义下不能作为普通确定值使用。
+    // 只要两个区间仍允许这组操作数，就保守返回 Top，禁止后续优化借此
+    // 折叠控制流或利用源程序中的未定义行为。
+    if (min <= I32_MIN && max >= I32_MIN &&
+        rhs.min <= -1 && rhs.max >= -1)
+        return IntRange();
+
     int64_t absMax = std::max(std::abs(rhs.min), std::abs(rhs.max)) - 1;
     if (min >= 0) return IntRange(0, std::min(max, absMax));
     if (max <= 0) return IntRange(std::max(min, -absMax), 0);
@@ -232,6 +285,144 @@ IntRange IntRange::band(const IntRange &rhs) const {
     IntRange r;
     r.knownTrailingZeros = std::min(tz, 31);
     return r;
+}
+
+// 无符号区间只覆盖 i32 位模式空间；运算结果一旦跨越 0xffffffff->0 的
+// 回绕点，就无法由单个闭区间安全表示，因此统一返回 Top。
+UIntRange::UIntRange() : min(U32_MIN), max(U32_MAX) {}
+
+UIntRange::UIntRange(uint64_t val)
+    : min(val <= U32_MAX ? val : U32_MIN),
+      max(val <= U32_MAX ? val : U32_MAX) {}
+
+UIntRange::UIntRange(uint64_t lo, uint64_t hi)
+    : min(lo), max(hi) {
+    if (lo <= hi && hi > U32_MAX) {
+        min = U32_MIN;
+        max = U32_MAX;
+    }
+}
+
+bool UIntRange::isTop() const {
+    return min == U32_MIN && max == U32_MAX;
+}
+
+bool UIntRange::isBottom() const {
+    return min > max;
+}
+
+bool UIntRange::isSingleValue() const {
+    return min == max && !isBottom();
+}
+
+UIntRange UIntRange::unionWith(const UIntRange &other) const {
+    if (isBottom()) return other;
+    if (other.isBottom()) return *this;
+    return UIntRange(std::min(min, other.min), std::max(max, other.max));
+}
+
+UIntRange UIntRange::intersectWith(const UIntRange &other) const {
+    return UIntRange(std::max(min, other.min), std::min(max, other.max));
+}
+
+bool UIntRange::operator==(const UIntRange &o) const {
+    return min == o.min && max == o.max;
+}
+
+bool UIntRange::operator!=(const UIntRange &o) const {
+    return !(*this == o);
+}
+
+UIntRange UIntRange::add(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    uint64_t lo = min + rhs.min;
+    uint64_t hi = max + rhs.max;
+    if (hi > U32_MAX) return UIntRange();
+    return UIntRange(lo, hi);
+}
+
+UIntRange UIntRange::sub(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    if (min < rhs.max) return UIntRange();
+    return UIntRange(min - rhs.max, max - rhs.min);
+}
+
+UIntRange UIntRange::mul(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    uint64_t hi = max * rhs.max;
+    if (hi > U32_MAX) return UIntRange();
+    return UIntRange(min * rhs.min, hi);
+}
+
+UIntRange UIntRange::udiv(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    if (rhs.min == 0) return UIntRange();
+    return UIntRange(min / rhs.max, max / rhs.min);
+}
+
+UIntRange UIntRange::urem(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    if (rhs.min == 0) return UIntRange();
+    if (max < rhs.min) return *this;
+    return UIntRange(0, std::min(max, rhs.max - 1));
+}
+
+UIntRange UIntRange::shl(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    if (!rhs.isSingleValue() || rhs.min >= 32) return UIntRange();
+    unsigned shift = static_cast<unsigned>(rhs.min);
+    if (shift == 0) return *this;
+    if (max > (U32_MAX >> shift)) return UIntRange();
+    return UIntRange(min << shift, max << shift);
+}
+
+UIntRange UIntRange::lshr(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    if (!rhs.isSingleValue() || rhs.min >= 32) return UIntRange();
+    unsigned shift = static_cast<unsigned>(rhs.min);
+    return UIntRange(min >> shift, max >> shift);
+}
+
+UIntRange UIntRange::band(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    return UIntRange(0, std::min(max, rhs.max));
+}
+
+UIntRange UIntRange::bor(const UIntRange &rhs) const {
+    if (isBottom() || rhs.isBottom()) return bottom();
+    return UIntRange(std::max(min, rhs.min), U32_MAX);
+}
+
+IntRange UIntRange::toIntRange() const {
+    if (isBottom()) return IntRange::bottom();
+    if (max <= static_cast<uint64_t>(IntRange::I32_MAX))
+        return IntRange(static_cast<int64_t>(min),
+                        static_cast<int64_t>(max));
+    if (min >= 0x80000000ULL) {
+        int64_t lo = static_cast<int32_t>(static_cast<uint32_t>(min));
+        int64_t hi = static_cast<int32_t>(static_cast<uint32_t>(max));
+        return IntRange(lo, hi);
+    }
+    return IntRange();
+}
+
+UIntRange UIntRange::fromIntRange(const IntRange &range) {
+    if (range.isBottom()) return bottom();
+    if (range.min < IntRange::I32_MIN ||
+        range.max > IntRange::I32_MAX)
+        return UIntRange();
+    if (range.min >= 0)
+        return UIntRange(static_cast<uint64_t>(range.min),
+                         static_cast<uint64_t>(range.max));
+    if (range.max < 0)
+        return UIntRange(
+            static_cast<uint32_t>(static_cast<int32_t>(range.min)),
+            static_cast<uint32_t>(static_cast<int32_t>(range.max)));
+    return UIntRange();
+}
+
+UIntRange UIntRange::bottom() {
+    return UIntRange(1, 0);
 }
 
 // KnownBits 传播只保留逐位可证明事实，冲突表示不可达并在更新阶段被保守忽略。
@@ -390,6 +581,116 @@ IntRange KnownBits::toIntRange() const {
     IntRange r;
     r.knownTrailingZeros = getTrailingZeros();
     return r;
+}
+
+UIntRange KnownBits::toUIntRange() const {
+    if (isConflict()) return UIntRange::bottom();
+    uint32_t unknown = ~(zero | one);
+    return UIntRange(static_cast<uint64_t>(one),
+                     static_cast<uint64_t>(one | unknown));
+}
+
+KnownBits KnownBits::fromUIntRange(const UIntRange &range) {
+    if (range.isBottom() || range.isTop()) return KnownBits::top();
+    uint32_t lo = static_cast<uint32_t>(range.min);
+    uint32_t hi = static_cast<uint32_t>(range.max);
+    uint32_t different = lo ^ hi;
+    uint32_t commonMask = 0xFFFFFFFFu;
+    if (different != 0) {
+        unsigned highestDifferent = 31u;
+        while (((different >> highestDifferent) & 1u) == 0u)
+            --highestDifferent;
+        if (highestDifferent == 31u)
+            commonMask = 0;
+        else
+            commonMask = ~((1u << (highestDifferent + 1u)) - 1u);
+    }
+    return KnownBits((~lo) & commonMask, lo & commonMask);
+}
+
+// 约化积只交换三种域都能无歧义表达的事实。符号断点两侧形成的非凸集合
+// 不强行压成单区间；若任意投影产生矛盾，则把数值域标记为不可达。
+void reduceIntegerRangeProduct(IntRange &signedRange,
+                               UIntRange &unsignedRange,
+                               KnownBits &bits) {
+    if (signedRange.isBottom() || unsignedRange.isBottom() ||
+        bits.isConflict()) {
+        signedRange = IntRange::bottom();
+        unsignedRange = UIntRange::bottom();
+        bits = KnownBits::top();
+        return;
+    }
+
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        IntRange oldSigned = signedRange;
+        UIntRange oldUnsigned = unsignedRange;
+        KnownBits oldBits = bits;
+
+        IntRange signedFromBits = bits.toIntRange();
+        IntRange narrowedSigned =
+            signedRange.intersectWith(signedFromBits);
+        if (narrowedSigned.isBottom()) {
+            signedRange = IntRange::bottom();
+            unsignedRange = UIntRange::bottom();
+            bits = KnownBits::top();
+            return;
+        }
+        signedRange = narrowedSigned;
+
+        UIntRange unsignedFromBits = bits.toUIntRange();
+        UIntRange narrowedUnsigned =
+            unsignedRange.intersectWith(unsignedFromBits);
+        if (narrowedUnsigned.isBottom()) {
+            signedRange = IntRange::bottom();
+            unsignedRange = UIntRange::bottom();
+            bits = KnownBits::top();
+            return;
+        }
+        unsignedRange = narrowedUnsigned;
+
+        UIntRange unsignedFromSigned =
+            UIntRange::fromIntRange(signedRange);
+        if (!unsignedFromSigned.isTop()) {
+            narrowedUnsigned =
+                unsignedRange.intersectWith(unsignedFromSigned);
+            if (narrowedUnsigned.isBottom()) {
+                signedRange = IntRange::bottom();
+                unsignedRange = UIntRange::bottom();
+                bits = KnownBits::top();
+                return;
+            }
+            unsignedRange = narrowedUnsigned;
+        }
+
+        IntRange signedFromUnsigned = unsignedRange.toIntRange();
+        if (!signedFromUnsigned.isTop()) {
+            narrowedSigned =
+                signedRange.intersectWith(signedFromUnsigned);
+            if (narrowedSigned.isBottom()) {
+                signedRange = IntRange::bottom();
+                unsignedRange = UIntRange::bottom();
+                bits = KnownBits::top();
+                return;
+            }
+            signedRange = narrowedSigned;
+        }
+
+        KnownBits intervalBits = KnownBits::fromUIntRange(unsignedRange);
+        KnownBits combined(bits.zero | intervalBits.zero,
+                           bits.one | intervalBits.one);
+        if (combined.isConflict()) {
+            signedRange = IntRange::bottom();
+            unsignedRange = UIntRange::bottom();
+            bits = KnownBits::top();
+            return;
+        }
+        bits = combined;
+
+        if (signedRange == oldSigned &&
+            unsignedRange == oldUnsigned &&
+            bits == oldBits)
+            break;
+    }
 }
 
 IntRange IntRange::bor(const IntRange &rhs) const {
@@ -658,36 +959,63 @@ void RangeInfo::setLoopInduction(Value *v,
     LoopInductions[v] = info;
 }
 
-// 整数查询流程：常量或不支持位宽先处理，再将全局范围与支配链、精确块提示依次取交。
+// 整数查询流程：常量或不支持位宽先处理，再完整遍历 IDom 链叠加路径事实，
+// 最后把 signed、unsigned、KnownBits 三个域做约减。支配深度不再影响语义精度。
 IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
                           const DominatorTree &DT) const {
 
     // 1. 常量可直接得到单点范围；未建模的整数位宽退化为该类型的完整范围。
-    if (auto *CI = dynamic_cast<ConstInt *>(val))
-        return IntRange(CI->getVal());
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    if (getIntegerConstantRanges(
+            val, constantSigned, constantUnsigned))
+        return constantSigned;
     if (!isModeledIntegerRangeType(val))
         return conservativeIntegerRangeForValue(val);
 
-    // 2. 以固定点求出的全局范围为基线；没有结果时保持类型完整范围，不凭空制造精度。
+    // 2. 以固定点求出的三个全局域为基线；缺失事实等价于对应类型的 Top。
     IntRange range = conservativeIntegerRangeForValue(val);
+    UIntRange unsignedRange = conservativeUnsignedRangeForValue(val);
+    KnownBits bits = KnownBits::top();
     auto gIt = GlobalRanges.find(val);
     if (gIt != GlobalRanges.end())
         range = gIt->second;
+    auto uIt = GlobalUnsignedRanges.find(val);
+    if (uIt != GlobalUnsignedRanges.end())
+        unsignedRange = uIt->second;
+    auto kIt = GlobalBits.find(val);
+    if (kIt != GlobalBits.end())
+        bits = kIt->second;
 
-    // 3. 查询点存在时，沿有限深度 IDom 链叠加支配事实，最后再叠加当前块精确提示。
+    // 3. 查询点存在时沿完整 IDom 链叠加支配事实。Seen 只防御损坏的支配树，
+    // 不设置任意深度上限。
     if (ctxBlock) {
         auto cIt = ContextualRanges.find(val);
-        if (cIt != ContextualRanges.end()) {
-            auto &blockMap = cIt->second;
-
-            BasicBlock *runner = ctxBlock;
-            for (int depth = 0; depth < 8 && runner; depth++) {
+        auto cuIt = ContextualUnsignedRanges.find(val);
+        auto ckIt = ContextualBits.find(val);
+        BasicBlock *runner = ctxBlock;
+        std::unordered_set<BasicBlock *> seen;
+        while (runner && seen.insert(runner).second) {
+            if (cIt != ContextualRanges.end()) {
+                const auto &blockMap = cIt->second;
                 auto bIt = blockMap.find(runner);
-                if (bIt != blockMap.end()) {
+                if (bIt != blockMap.end())
                     range = range.intersectWith(bIt->second);
-                }
-                runner = DT.getIDom(runner);
             }
+            if (cuIt != ContextualUnsignedRanges.end()) {
+                const auto &blockMap = cuIt->second;
+                auto bIt = blockMap.find(runner);
+                if (bIt != blockMap.end())
+                    unsignedRange =
+                        unsignedRange.intersectWith(bIt->second);
+            }
+            if (ckIt != ContextualBits.end()) {
+                const auto &blockMap = ckIt->second;
+                auto bIt = blockMap.find(runner);
+                if (bIt != blockMap.end())
+                    bits = bits.intersectWith(bIt->second);
+            }
+            runner = DT.getIDom(runner);
         }
 
         auto lIt = BlockLocalRanges.find(val);
@@ -696,9 +1024,117 @@ IntRange RangeInfo::query(Value *val, BasicBlock *ctxBlock,
             if (bIt != lIt->second.end())
                 range = range.intersectWith(bIt->second);
         }
+        auto luIt = BlockLocalUnsignedRanges.find(val);
+        if (luIt != BlockLocalUnsignedRanges.end()) {
+            auto bIt = luIt->second.find(ctxBlock);
+            if (bIt != luIt->second.end())
+                unsignedRange =
+                    unsignedRange.intersectWith(bIt->second);
+        }
     }
 
+    // Select 的全局固定点不读取求解期上下文；查询阶段面对的上下文已经由
+    // 最终全局格重建，因此可以安全地重新计算两条虚拟臂并取并集。这样既
+    // 隔离临时循环出口事实，又保留 Select 所在块的稳定支配条件精度。
+    if (auto *select = dynamic_cast<SelectInst *>(val)) {
+        IntRange stableSelectRange = queryOnSelectArm(
+            select, select, true, DT).unionWith(
+                queryOnSelectArm(select, select, false, DT));
+        range = range.intersectWith(stableSelectRange);
+    }
+
+    reduceIntegerRangeProduct(range, unsignedRange, bits);
     return range;
+}
+
+IntRange RangeInfo::query(Value *val, Instruction *ctxInst,
+                          const DominatorTree &DT) const {
+    return query(val, ctxInst ? ctxInst->getParent() : nullptr, DT);
+}
+
+UIntRange RangeInfo::queryUnsigned(Value *val, BasicBlock *ctxBlock,
+                                   const DominatorTree &DT) const {
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    if (getIntegerConstantRanges(
+            val, constantSigned, constantUnsigned))
+        return constantUnsigned;
+    if (!isModeledIntegerRangeType(val))
+        return conservativeUnsignedRangeForValue(val);
+
+    IntRange signedRange = conservativeIntegerRangeForValue(val);
+    UIntRange unsignedRange = conservativeUnsignedRangeForValue(val);
+    KnownBits bits = KnownBits::top();
+
+    auto sIt = GlobalRanges.find(val);
+    if (sIt != GlobalRanges.end()) signedRange = sIt->second;
+    auto uIt = GlobalUnsignedRanges.find(val);
+    if (uIt != GlobalUnsignedRanges.end()) unsignedRange = uIt->second;
+    auto kIt = GlobalBits.find(val);
+    if (kIt != GlobalBits.end()) bits = kIt->second;
+
+    if (ctxBlock) {
+        auto csIt = ContextualRanges.find(val);
+        auto cuIt = ContextualUnsignedRanges.find(val);
+        auto ckIt = ContextualBits.find(val);
+        BasicBlock *runner = ctxBlock;
+        std::unordered_set<BasicBlock *> seen;
+        while (runner && seen.insert(runner).second) {
+            if (csIt != ContextualRanges.end()) {
+                auto bIt = csIt->second.find(runner);
+                if (bIt != csIt->second.end())
+                    signedRange =
+                        signedRange.intersectWith(bIt->second);
+            }
+            if (cuIt != ContextualUnsignedRanges.end()) {
+                auto bIt = cuIt->second.find(runner);
+                if (bIt != cuIt->second.end())
+                    unsignedRange =
+                        unsignedRange.intersectWith(bIt->second);
+            }
+            if (ckIt != ContextualBits.end()) {
+                auto bIt = ckIt->second.find(runner);
+                if (bIt != ckIt->second.end())
+                    bits = bits.intersectWith(bIt->second);
+            }
+            runner = DT.getIDom(runner);
+        }
+
+        auto lsIt = BlockLocalRanges.find(val);
+        if (lsIt != BlockLocalRanges.end()) {
+            auto bIt = lsIt->second.find(ctxBlock);
+            if (bIt != lsIt->second.end())
+                signedRange =
+                    signedRange.intersectWith(bIt->second);
+        }
+        auto luIt = BlockLocalUnsignedRanges.find(val);
+        if (luIt != BlockLocalUnsignedRanges.end()) {
+            auto bIt = luIt->second.find(ctxBlock);
+            if (bIt != luIt->second.end())
+                unsignedRange =
+                    unsignedRange.intersectWith(bIt->second);
+        }
+    }
+
+    // 与 signed 查询保持同一分层：只在求解完成后的只读查询中消费稳定块
+    // 上下文，重新汇合 Select 两臂的 unsigned 区间。
+    if (auto *select = dynamic_cast<SelectInst *>(val)) {
+        UIntRange stableSelectRange = queryUnsignedOnSelectArm(
+            select, select, true, DT).unionWith(
+                queryUnsignedOnSelectArm(
+                    select, select, false, DT));
+        unsignedRange =
+            unsignedRange.intersectWith(stableSelectRange);
+    }
+
+    reduceIntegerRangeProduct(signedRange, unsignedRange, bits);
+    return unsignedRange;
+}
+
+UIntRange RangeInfo::queryUnsigned(Value *val, Instruction *ctxInst,
+                                   const DominatorTree &DT) const {
+    return queryUnsigned(
+        val, ctxInst ? ctxInst->getParent() : nullptr, DT);
 }
 
 FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
@@ -717,7 +1153,8 @@ FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
         if (cIt != FloatContextualRanges.end()) {
             auto &blockMap = cIt->second;
             BasicBlock *runner = ctxBlock;
-            for (int depth = 0; depth < 8 && runner; depth++) {
+            std::unordered_set<BasicBlock *> seen;
+            while (runner && seen.insert(runner).second) {
                 auto bIt = blockMap.find(runner);
                 if (bIt != blockMap.end()) {
                     range = range.intersectWith(bIt->second);
@@ -734,10 +1171,16 @@ FloatRange RangeInfo::queryFloat(Value *val, BasicBlock *ctxBlock,
 IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
                                  BasicBlock *succBB,
                                  const DominatorTree &DT) const {
-    if (auto *CI = dynamic_cast<ConstInt *>(val)) return IntRange(CI->getVal());
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    if (getIntegerConstantRanges(
+            val, constantSigned, constantUnsigned))
+        return constantSigned;
     if (!isModeledIntegerRangeType(val))
         return conservativeIntegerRangeForValue(val);
     IntRange R = query(val, predBB, DT);
+    UIntRange U = queryUnsigned(val, predBB, DT);
+    KnownBits KB = queryBits(val, predBB, DT);
     if (!predBB || !succBB) return R;
     auto VIt = EdgeRanges.find(val);
     if (VIt != EdgeRanges.end()) {
@@ -748,7 +1191,217 @@ IntRange RangeInfo::queryOnEdge(Value *val, BasicBlock *predBB,
                 R = R.intersectWith(SIt->second);
         }
     }
+    auto UVIt = EdgeUnsignedRanges.find(val);
+    if (UVIt != EdgeUnsignedRanges.end()) {
+        auto PIt = UVIt->second.find(predBB);
+        if (PIt != UVIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                U = U.intersectWith(SIt->second);
+        }
+    }
+    auto KVIt = EdgeBits.find(val);
+    if (KVIt != EdgeBits.end()) {
+        auto PIt = KVIt->second.find(predBB);
+        if (PIt != KVIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                KB = KB.intersectWith(SIt->second);
+        }
+    }
+    reduceIntegerRangeProduct(R, U, KB);
     return R;
+}
+
+UIntRange RangeInfo::queryUnsignedOnEdge(
+    Value *val, BasicBlock *predBB, BasicBlock *succBB,
+    const DominatorTree &DT) const {
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    if (getIntegerConstantRanges(
+            val, constantSigned, constantUnsigned))
+        return constantUnsigned;
+    if (!isModeledIntegerRangeType(val))
+        return conservativeUnsignedRangeForValue(val);
+
+    IntRange R = query(val, predBB, DT);
+    UIntRange U = queryUnsigned(val, predBB, DT);
+    KnownBits KB = queryBits(val, predBB, DT);
+    if (!predBB || !succBB) return U;
+
+    auto SVIt = EdgeRanges.find(val);
+    if (SVIt != EdgeRanges.end()) {
+        auto PIt = SVIt->second.find(predBB);
+        if (PIt != SVIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                R = R.intersectWith(SIt->second);
+        }
+    }
+    auto UVIt = EdgeUnsignedRanges.find(val);
+    if (UVIt != EdgeUnsignedRanges.end()) {
+        auto PIt = UVIt->second.find(predBB);
+        if (PIt != UVIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                U = U.intersectWith(SIt->second);
+        }
+    }
+    auto KVIt = EdgeBits.find(val);
+    if (KVIt != EdgeBits.end()) {
+        auto PIt = KVIt->second.find(predBB);
+        if (PIt != KVIt->second.end()) {
+            auto SIt = PIt->second.find(succBB);
+            if (SIt != PIt->second.end())
+                KB = KB.intersectWith(SIt->second);
+        }
+    }
+    reduceIntegerRangeProduct(R, U, KB);
+    return U;
+}
+
+static IntRange constrainSignedRangeByComparison(
+    Value *target, BinaryInst *compare, bool conditionIsTrue,
+    const IntRange &targetRange, const IntRange &lhsRange,
+    const IntRange &rhsRange) {
+    if (!target || !compare) return targetRange;
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!compare->getOperands(lhs, rhs)) return targetRange;
+
+    BinaryInst::Operation predicate = conditionIsTrue
+        ? compare->getOp()
+        : BinaryInst::negatePredicate(compare->getOp());
+
+    // L/LE/G/GE 会被打印为有符号 icmp。i1 的位模式 1 在这种比较中代表
+    // -1，而本分析为条件值保存的是逻辑域 [0,1]；两种序不能混用。因此
+    // 只有 i32 才应用有符号顺序约束，i1 仍可安全使用 E/NE。
+    bool isOrderingPredicate =
+        predicate == BinaryInst::L ||
+        predicate == BinaryInst::LE ||
+        predicate == BinaryInst::G ||
+        predicate == BinaryInst::GE;
+    if (isOrderingPredicate &&
+        (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
+         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32)))
+        return targetRange;
+
+    IntRange other;
+    if (target == lhs) {
+        other = rhsRange;
+    } else if (target == rhs) {
+        predicate = BinaryInst::reversePredicate(predicate);
+        other = lhsRange;
+    } else {
+        return targetRange;
+    }
+
+    IntRange constraint;
+    switch (predicate) {
+        case BinaryInst::L:
+            constraint =
+                IntRange(IntRange::I32_MIN, other.max - 1);
+            break;
+        case BinaryInst::LE:
+            constraint =
+                IntRange(IntRange::I32_MIN, other.max);
+            break;
+        case BinaryInst::G:
+            constraint =
+                IntRange(other.min + 1, IntRange::I32_MAX);
+            break;
+        case BinaryInst::GE:
+            constraint =
+                IntRange(other.min, IntRange::I32_MAX);
+            break;
+        case BinaryInst::E:
+            constraint = other;
+            break;
+        case BinaryInst::NE:
+        default:
+            return targetRange;
+    }
+    return targetRange.intersectWith(constraint);
+}
+
+static bool selectArmIsExecutable(const RangeInfo &info,
+                                  SelectInst *select, bool trueArm,
+                                  const DominatorTree &DT) {
+    if (!select || !select->getCondition()) return true;
+    Value *condition = select->getCondition();
+    bool constantTruth = false;
+    if (condition->tryGetBoolConst(constantTruth))
+        return constantTruth == trueArm;
+    IntRange conditionRange =
+        info.query(condition, select->getParent(), DT);
+    if (!conditionRange.isSingleValue()) return true;
+    return (conditionRange.min != 0) == trueArm;
+}
+
+// Select 臂查询把比较条件当成一条虚拟边，只在被选中的值或比较操作数上
+// 叠加事实；该过程不创建基本块，也不修改任何 IR。
+IntRange RangeInfo::queryOnSelectArm(
+    Value *val, SelectInst *select, bool trueArm,
+    const DominatorTree &DT) const {
+    if (!select) return query(val, static_cast<BasicBlock *>(nullptr), DT);
+    if (!selectArmIsExecutable(*this, select, trueArm, DT))
+        return IntRange::bottom();
+
+    Value *target = val == select
+        ? (trueArm ? select->getTrueValue() : select->getFalseValue())
+        : val;
+    IntRange targetRange = query(target, select->getParent(), DT);
+    auto *compare =
+        dynamic_cast<BinaryInst *>(select->getCondition());
+    if (!compare ||
+        !BinaryInst::isCompareOp(compare->getOp()))
+        return targetRange;
+
+    Value *lhs = nullptr;
+    Value *rhs = nullptr;
+    if (!compare->getOperands(lhs, rhs))
+        return targetRange;
+    IntRange lhsRange = query(lhs, select->getParent(), DT);
+    IntRange rhsRange = query(rhs, select->getParent(), DT);
+    return constrainSignedRangeByComparison(
+        target, compare, trueArm, targetRange, lhsRange, rhsRange);
+}
+
+UIntRange RangeInfo::queryUnsignedOnSelectArm(
+    Value *val, SelectInst *select, bool trueArm,
+    const DominatorTree &DT) const {
+    if (!select)
+        return queryUnsigned(
+            val, static_cast<BasicBlock *>(nullptr), DT);
+    if (!selectArmIsExecutable(*this, select, trueArm, DT))
+        return UIntRange::bottom();
+
+    Value *target = val == select
+        ? (trueArm ? select->getTrueValue() : select->getFalseValue())
+        : val;
+    IntRange signedRange = query(target, select->getParent(), DT);
+    UIntRange unsignedRange =
+        queryUnsigned(target, select->getParent(), DT);
+    KnownBits bits = queryBits(target, select->getParent(), DT);
+
+    auto *compare =
+        dynamic_cast<BinaryInst *>(select->getCondition());
+    if (compare && BinaryInst::isCompareOp(compare->getOp())) {
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        if (compare->getOperands(lhs, rhs)) {
+            IntRange lhsRange =
+                query(lhs, select->getParent(), DT);
+            IntRange rhsRange =
+                query(rhs, select->getParent(), DT);
+            signedRange = constrainSignedRangeByComparison(
+                target, compare, trueArm, signedRange,
+                lhsRange, rhsRange);
+        }
+    }
+
+    reduceIntegerRangeProduct(signedRange, unsignedRange, bits);
+    return unsignedRange;
 }
 
 KnownBits RangeInfo::queryBits(Value *val) const {
@@ -758,8 +1411,15 @@ KnownBits RangeInfo::queryBits(Value *val) const {
     if (auto *CI = dynamic_cast<ConstInt *>(val))
         return KnownBits::fromConst(CI->getVal());
     auto it = GlobalBits.find(val);
-    if (it != GlobalBits.end()) return it->second;
-    return KnownBits::top();
+    KnownBits bits =
+        it != GlobalBits.end() ? it->second : KnownBits::top();
+    auto uIt = GlobalUnsignedRanges.find(val);
+    if (uIt == GlobalUnsignedRanges.end()) return bits;
+    KnownBits intervalBits =
+        KnownBits::fromUIntRange(uIt->second);
+    KnownBits combined(bits.zero | intervalBits.zero,
+                       bits.one | intervalBits.one);
+    return combined.isConflict() ? bits : combined;
 }
 
 KnownBits RangeInfo::queryBits(Value *val, BasicBlock *ctxBlock,
@@ -779,7 +1439,8 @@ KnownBits RangeInfo::queryBits(Value *val, BasicBlock *ctxBlock,
         if (cIt != ContextualBits.end()) {
             auto &blockMap = cIt->second;
             BasicBlock *runner = ctxBlock;
-            for (int depth = 0; depth < 8 && runner; depth++) {
+            std::unordered_set<BasicBlock *> seen;
+            while (runner && seen.insert(runner).second) {
                 auto bIt = blockMap.find(runner);
                 if (bIt != blockMap.end()) {
                     kb = kb.intersectWith(bIt->second);
@@ -788,6 +1449,12 @@ KnownBits RangeInfo::queryBits(Value *val, BasicBlock *ctxBlock,
             }
         }
     }
+
+    UIntRange U = queryUnsigned(val, ctxBlock, DT);
+    KnownBits intervalBits = KnownBits::fromUIntRange(U);
+    KnownBits combined(kb.zero | intervalBits.zero,
+                       kb.one | intervalBits.one);
+    if (!combined.isConflict()) kb = combined;
     return kb;
 }
 
@@ -810,6 +1477,11 @@ KnownBits RangeInfo::queryBitsOnEdge(Value *val, BasicBlock *predBB,
                 KB = KB.intersectWith(SIt->second);
         }
     }
+    UIntRange U = queryUnsignedOnEdge(val, predBB, succBB, DT);
+    KnownBits intervalBits = KnownBits::fromUIntRange(U);
+    KnownBits combined(KB.zero | intervalBits.zero,
+                       KB.one | intervalBits.one);
+    if (!combined.isConflict()) KB = combined;
     return KB;
 }
 
@@ -833,9 +1505,27 @@ bool RangeInfo::invalidate(Function &F, const PreservationStatus &PA) {
 IntRange &RangeSolver::getRange(Value *V) {
 
     auto It = ValueRanges.find(V);
-    if (It == ValueRanges.end())
-        It = ValueRanges.emplace(
-            V, conservativeIntegerRangeForValue(V)).first;
+    if (It == ValueRanges.end()) {
+        IntRange constantSigned;
+        UIntRange constantUnsigned;
+        IntRange initial = getIntegerConstantRanges(
+            V, constantSigned, constantUnsigned)
+            ? constantSigned
+            : conservativeIntegerRangeForValue(V);
+        It = ValueRanges.emplace(V, initial).first;
+    }
+    return It->second;
+}
+
+UIntRange RangeSolver::getUnsignedRange(Value *V) {
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    if (getIntegerConstantRanges(
+            V, constantSigned, constantUnsigned))
+        return constantUnsigned;
+    auto It = UnsignedValueRanges.find(V);
+    if (It == UnsignedValueRanges.end())
+        return conservativeUnsignedRangeForValue(V);
     return It->second;
 }
 
@@ -851,14 +1541,85 @@ KnownBits RangeSolver::getBits(Value *V) {
 IntRange RangeSolver::getRangeInBlock(Value *V, BasicBlock *BB) {
     if (!isModeledIntegerRangeType(V))
         return conservativeIntegerRangeForValue(V);
-    IntRange r = getRange(V);
-    if (!BB) return r;
-    auto it = ContextualRanges.find(V);
-    if (it != ContextualRanges.end()) {
-        auto it2 = it->second.find(BB);
-        if (it2 != it->second.end()) r = r.intersectWith(it2->second);
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    IntRange r = getIntegerConstantRanges(
+        V, constantSigned, constantUnsigned)
+        ? constantSigned : getRange(V);
+    UIntRange u = getUnsignedRange(V);
+    KnownBits kb = getBits(V);
+    if (!BB) {
+        reduceIntegerRangeProduct(r, u, kb);
+        return r;
     }
+
+    auto sIt = ContextualRanges.find(V);
+    auto uIt = ContextualUnsignedRanges.find(V);
+    auto kIt = ContextualBits.find(V);
+    BasicBlock *runner = BB;
+    std::unordered_set<BasicBlock *> seen;
+    while (runner && seen.insert(runner).second) {
+        if (sIt != ContextualRanges.end()) {
+            auto it = sIt->second.find(runner);
+            if (it != sIt->second.end())
+                r = r.intersectWith(it->second);
+        }
+        if (uIt != ContextualUnsignedRanges.end()) {
+            auto it = uIt->second.find(runner);
+            if (it != uIt->second.end())
+                u = u.intersectWith(it->second);
+        }
+        if (kIt != ContextualBits.end()) {
+            auto it = kIt->second.find(runner);
+            if (it != kIt->second.end())
+                kb = kb.intersectWith(it->second);
+        }
+        if (!DomTree) break;
+        runner = DomTree->getIDom(runner);
+    }
+    reduceIntegerRangeProduct(r, u, kb);
     return r;
+}
+
+UIntRange RangeSolver::getUnsignedRangeInBlock(
+    Value *V, BasicBlock *BB) {
+    if (!isModeledIntegerRangeType(V))
+        return conservativeUnsignedRangeForValue(V);
+    IntRange constantSigned;
+    UIntRange constantUnsigned;
+    bool isConstant = getIntegerConstantRanges(
+        V, constantSigned, constantUnsigned);
+    IntRange r = isConstant ? constantSigned : getRange(V);
+    UIntRange u = isConstant
+        ? constantUnsigned : getUnsignedRange(V);
+    KnownBits kb = getBits(V);
+
+    auto sIt = ContextualRanges.find(V);
+    auto uIt = ContextualUnsignedRanges.find(V);
+    auto kIt = ContextualBits.find(V);
+    BasicBlock *runner = BB;
+    std::unordered_set<BasicBlock *> seen;
+    while (runner && seen.insert(runner).second) {
+        if (sIt != ContextualRanges.end()) {
+            auto it = sIt->second.find(runner);
+            if (it != sIt->second.end())
+                r = r.intersectWith(it->second);
+        }
+        if (uIt != ContextualUnsignedRanges.end()) {
+            auto it = uIt->second.find(runner);
+            if (it != uIt->second.end())
+                u = u.intersectWith(it->second);
+        }
+        if (kIt != ContextualBits.end()) {
+            auto it = kIt->second.find(runner);
+            if (it != kIt->second.end())
+                kb = kb.intersectWith(it->second);
+        }
+        if (!DomTree) break;
+        runner = DomTree->getIDom(runner);
+    }
+    reduceIntegerRangeProduct(r, u, kb);
+    return u;
 }
 
 KnownBits RangeSolver::getBitsInBlock(Value *V, BasicBlock *BB) {
@@ -867,13 +1628,34 @@ KnownBits RangeSolver::getBitsInBlock(Value *V, BasicBlock *BB) {
         return KnownBits::top();
     if (auto *CI = dynamic_cast<ConstInt *>(V))
         return KnownBits::fromConst(CI->getVal());
+    IntRange r = getRange(V);
+    UIntRange u = getUnsignedRange(V);
     KnownBits kb = ValueBits[V];
-    if (!BB) return kb;
-    auto it = ContextualBits.find(V);
-    if (it != ContextualBits.end()) {
-        auto it2 = it->second.find(BB);
-        if (it2 != it->second.end()) kb = kb.intersectWith(it2->second);
+    auto sIt = ContextualRanges.find(V);
+    auto uIt = ContextualUnsignedRanges.find(V);
+    auto kIt = ContextualBits.find(V);
+    BasicBlock *runner = BB;
+    std::unordered_set<BasicBlock *> seen;
+    while (runner && seen.insert(runner).second) {
+        if (sIt != ContextualRanges.end()) {
+            auto it = sIt->second.find(runner);
+            if (it != sIt->second.end())
+                r = r.intersectWith(it->second);
+        }
+        if (uIt != ContextualUnsignedRanges.end()) {
+            auto it = uIt->second.find(runner);
+            if (it != uIt->second.end())
+                u = u.intersectWith(it->second);
+        }
+        if (kIt != ContextualBits.end()) {
+            auto it = kIt->second.find(runner);
+            if (it != kIt->second.end())
+                kb = kb.intersectWith(it->second);
+        }
+        if (!DomTree) break;
+        runner = DomTree->getIDom(runner);
     }
+    reduceIntegerRangeProduct(r, u, kb);
     return kb;
 }
 
@@ -913,12 +1695,57 @@ void RangeSolver::updateBitsContextual(Value *V, BasicBlock *block,
     enqueueInstructionUsers(V);
 }
 
-IntRange RangeSolver::tightenWithBits(Value *V, const IntRange &newRange) {
-    KnownBits kb = getBits(V);
-    if (kb.isTop()) return newRange;
-    IntRange fromKB = kb.toIntRange();
-    if (fromKB.isBottom()) return IntRange::bottom();
-    return newRange.intersectWith(fromKB);
+bool RangeSolver::updateUnsignedRange(
+    Value *V, const UIntRange &newRange) {
+    if (!isModeledIntegerRangeType(V)) {
+        UIntRange full = conservativeUnsignedRangeForValue(V);
+        auto it = UnsignedValueRanges.find(V);
+        if (it != UnsignedValueRanges.end() && it->second == full)
+            return false;
+        UnsignedValueRanges[V] = full;
+        return true;
+    }
+
+    if (NarrowingMode) {
+        UIntRange &current = UnsignedValueRanges[V];
+        UIntRange intersected = current.intersectWith(newRange);
+        if (intersected.isBottom() || intersected == current)
+            return false;
+        current = intersected;
+        enqueueInstructionUsers(V);
+        return true;
+    }
+
+    if (UnsignedWidened.count(V)) return false;
+    UIntRange &current = UnsignedValueRanges[V];
+    if (current == newRange) return false;
+
+    int &count = UnsignedEnqueueCount[V];
+    ++count;
+    if (count >= MAX_ENQUEUE) {
+        current = UIntRange();
+        UnsignedWidened.insert(V);
+    } else {
+        current = newRange;
+    }
+    enqueueInstructionUsers(V);
+    return true;
+}
+
+bool RangeSolver::updateIntegerFacts(
+    Value *V, const IntRange &newSignedRange,
+    const UIntRange &newUnsignedRange,
+    const KnownBits &newBits) {
+    IntRange signedRange = newSignedRange;
+    UIntRange unsignedRange = newUnsignedRange;
+    KnownBits bits = newBits;
+    reduceIntegerRangeProduct(signedRange, unsignedRange, bits);
+
+    bool changed = false;
+    changed = updateBits(V, bits) || changed;
+    changed = updateUnsignedRange(V, unsignedRange) || changed;
+    changed = updateRange(V, signedRange) || changed;
+    return changed;
 }
 
 // 核心更新不变量：前向阶段超过次数预算即锁为 Top，narrowing 阶段只取交且不引入 Bottom。
@@ -997,16 +1824,39 @@ void RangeSolver::updateContextual(Value *V, BasicBlock *block,
 
     if (range.isTop()) {
 
-        if (it == ContextualRanges[V].end()) return;
-        ContextualRanges[V].erase(it);
-
-        enqueueInstructionUsers(V);
+        if (it != ContextualRanges[V].end()) {
+            ContextualRanges[V].erase(it);
+            enqueueInstructionUsers(V);
+        }
+        updateUnsignedContextual(V, block, UIntRange());
         return;
     }
 
     IntRange &cur = ContextualRanges[V][block];
-    if (range == cur) return;
+    if (range == cur) {
+        updateUnsignedContextual(
+            V, block, UIntRange::fromIntRange(range));
+        return;
+    }
     cur = range;
+    updateUnsignedContextual(
+        V, block, UIntRange::fromIntRange(range));
+    enqueueInstructionUsers(V);
+}
+
+void RangeSolver::updateUnsignedContextual(
+    Value *V, BasicBlock *block, const UIntRange &range) {
+    auto it = ContextualUnsignedRanges[V].find(block);
+    if (range.isTop()) {
+        if (it == ContextualUnsignedRanges[V].end()) return;
+        ContextualUnsignedRanges[V].erase(it);
+        enqueueInstructionUsers(V);
+        return;
+    }
+
+    UIntRange &current = ContextualUnsignedRanges[V][block];
+    if (range == current) return;
+    current = range;
     enqueueInstructionUsers(V);
 }
 
@@ -1092,8 +1942,14 @@ void RangeSolver::applySCEVContextHints(SCEVResult *SCEV) {
                     cur = bit->second;
             }
             IntRange narrowed = cur.intersectWith(activeRange);
-            if (!narrowed.isBottom())
+            if (!narrowed.isBottom()) {
                 BlockLocalRanges[V][BB] = narrowed;
+                UIntRange unsignedHint =
+                    UIntRange::fromIntRange(narrowed);
+                if (!unsignedHint.isTop())
+                    BlockLocalUnsignedRanges[V][BB] =
+                        unsignedHint;
+            }
         }
     }
 }
@@ -1123,8 +1979,10 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     }
     if (phiTy && phiTy->isInt() &&
         !isModeledIntegerRangeType(Phi)) {
-        updateBits(Phi, KnownBits::top());
-        updateRange(Phi, conservativeIntegerRangeForValue(Phi));
+        updateIntegerFacts(
+            Phi, conservativeIntegerRangeForValue(Phi),
+            conservativeUnsignedRangeForValue(Phi),
+            KnownBits::top());
         return;
     }
 
@@ -1132,37 +1990,49 @@ void RangeSolver::visitPhi(PhiInst *Phi) {
     if (ScevInductions) {
         auto it = ScevInductions->find(Phi);
         if (it != ScevInductions->end()) {
-            updateRange(Phi, rangeFromInduction(it->second));
+            IntRange inductionRange =
+                rangeFromInduction(it->second);
+            UIntRange unsignedInduction =
+                UIntRange::fromIntRange(inductionRange);
+            KnownBits inductionBits =
+                KnownBits::fromUIntRange(unsignedInduction);
+            updateIntegerFacts(Phi, inductionRange,
+                               unsignedInduction, inductionBits);
             return;
         }
     }
 
     // 3. 普通整数 PHI 只汇合可行入边，同时合并区间与 KnownBits，再用位信息收紧区间。
     IntRange result = IntRange::bottom();
+    UIntRange unsignedResult = UIntRange::bottom();
     KnownBits kbResult;
     bool firstKB = true;
     BasicBlock *phiBB = Phi->getParent();
     forEachPhiIncoming(
-        Phi, [this, phiBB, &result, &kbResult, &firstKB](
+        Phi, [this, phiBB, &result, &unsignedResult,
+              &kbResult, &firstKB](
                  unsigned, Value *inVal, BasicBlock *pred) {
         if (!FeasibleEdges.count({pred, phiBB})) return;
         IntRange inRange;
         KnownBits inKB;
         if (auto *CI = dynamic_cast<ConstInt *>(inVal)) {
-            inRange = IntRange(CI->getVal());
+            inRange = signedRangeForConstant(CI);
             inKB = KnownBits::fromConst(CI->getVal());
+            unsignedResult = unsignedResult.unionWith(
+                unsignedRangeForConstant(CI));
         } else {
 
             inRange = getRange(inVal);
             inKB = getBits(inVal);
+            unsignedResult =
+                unsignedResult.unionWith(getUnsignedRange(inVal));
         }
         result = result.unionWith(inRange);
         kbResult = firstKB ? inKB : kbResult.unionWith(inKB);
         firstKB = false;
         });
-    updateBits(Phi, kbResult);
-    result = tightenWithBits(Phi, result);
-    updateRange(Phi, result);
+    reduceIntegerRangeProduct(result, unsignedResult, kbResult);
+    updateIntegerFacts(Phi, result, unsignedResult, kbResult);
 }
 
 // 二元指令先按类型前向计算结果格；整数 KnownBits 并行传播，narrowing 时再反推 ADD/SUB 操作数。
@@ -1197,22 +2067,27 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
 
     // 3. 比较结果固定在 [0, 1]；不支持位宽则保留完整类型范围和未知位信息。
     if (BinaryInst::isCompareOp(BI->getOp())) {
-        updateBits(BI, KnownBits::top());
-        updateRange(BI, IntRange(0, 1));
+        updateIntegerFacts(
+            BI, IntRange(0, 1), UIntRange(0, 1),
+            KnownBits::top());
         return;
     }
     if (resultTy && resultTy->isInt() &&
         !isModeledIntegerRangeType(BI)) {
-        updateBits(BI, KnownBits::top());
-        updateRange(BI, conservativeIntegerRangeForValue(BI));
+        updateIntegerFacts(
+            BI, conservativeIntegerRangeForValue(BI),
+            conservativeUnsignedRangeForValue(BI),
+            KnownBits::top());
         return;
     }
 
     // 4. 使用操作数的全局格值做前向传递，避免把某一分支的上下文事实泄漏到其他路径。
     IntRange lRange = dynamic_cast<ConstInt *>(lhs) ?
-        IntRange(dynamic_cast<ConstInt *>(lhs)->getVal()) : getRange(lhs);
+        signedRangeForConstant(dynamic_cast<ConstInt *>(lhs)) : getRange(lhs);
     IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
-        IntRange(dynamic_cast<ConstInt *>(rhs)->getVal()) : getRange(rhs);
+        signedRangeForConstant(dynamic_cast<ConstInt *>(rhs)) : getRange(rhs);
+    UIntRange lUnsigned = getUnsignedRange(lhs);
+    UIntRange rUnsigned = getUnsignedRange(rhs);
 
     const int ResultBitWidth = resultTy && resultTy->isInt()
         ? resultTy->getIntegerBitWidth(0)
@@ -1227,20 +2102,78 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
     };
 
     IntRange result;
+    UIntRange unsignedResult;
     switch (BI->getOp()) {
-        case BinaryInst::ADD:  result = IsModeledI32 ? lRange.add(rRange) : IntRange();  break;
-        case BinaryInst::SUB:  result = IsModeledI32 ? lRange.sub(rRange) : IntRange();  break;
-        case BinaryInst::MUL:  result = IsModeledI32 ? lRange.mul(rRange) : IntRange();  break;
-        case BinaryInst::DIV:  result = IsModeledI32 ? lRange.sdiv(rRange) : IntRange(); break;
-        case BinaryInst::MOD:  result = IsModeledI32 ? lRange.srem(rRange) : IntRange(); break;
-
-        case BinaryInst::SHL:  result = HasModeledShiftAmount() ? lRange.shl(rRange) : IntRange();  break;
-        case BinaryInst::ASHR: result = HasModeledShiftAmount() ? lRange.ashr(rRange) : IntRange(); break;
-        case BinaryInst::LSHR: result = HasModeledShiftAmount() ? lRange.lshr(rRange) : IntRange(); break;
-        case BinaryInst::AND:  result = lRange.band(rRange); break;
-        case BinaryInst::OR:   result = lRange.bor(rRange);  break;
-
-        default: result = IntRange(); break;
+        case BinaryInst::ADD:
+            result = IsModeledI32
+                ? lRange.add(rRange) : IntRange();
+            unsignedResult = IsModeledI32
+                ? lUnsigned.add(rUnsigned) : UIntRange();
+            break;
+        case BinaryInst::SUB:
+            result = IsModeledI32
+                ? lRange.sub(rRange) : IntRange();
+            unsignedResult = IsModeledI32
+                ? lUnsigned.sub(rUnsigned) : UIntRange();
+            break;
+        case BinaryInst::MUL:
+            result = IsModeledI32
+                ? lRange.mul(rRange) : IntRange();
+            unsignedResult = IsModeledI32
+                ? lUnsigned.mul(rUnsigned) : UIntRange();
+            break;
+        case BinaryInst::DIV:
+            result = IsModeledI32
+                ? lRange.sdiv(rRange) : IntRange();
+            unsignedResult = UIntRange::fromIntRange(result);
+            break;
+        case BinaryInst::UDIV:
+            unsignedResult = IsModeledI32
+                ? lUnsigned.udiv(rUnsigned) : UIntRange();
+            result = unsignedResult.toIntRange();
+            break;
+        case BinaryInst::MOD:
+            result = IsModeledI32
+                ? lRange.srem(rRange) : IntRange();
+            unsignedResult = UIntRange::fromIntRange(result);
+            break;
+        case BinaryInst::UREM:
+            unsignedResult = IsModeledI32
+                ? lUnsigned.urem(rUnsigned) : UIntRange();
+            result = unsignedResult.toIntRange();
+            break;
+        case BinaryInst::SHL:
+            result = HasModeledShiftAmount()
+                ? lRange.shl(rRange) : IntRange();
+            unsignedResult = HasModeledShiftAmount()
+                ? lUnsigned.shl(rUnsigned) : UIntRange();
+            break;
+        case BinaryInst::ASHR:
+            result = HasModeledShiftAmount()
+                ? lRange.ashr(rRange) : IntRange();
+            unsignedResult = UIntRange::fromIntRange(result);
+            break;
+        case BinaryInst::LSHR:
+            unsignedResult = HasModeledShiftAmount()
+                ? lUnsigned.lshr(rUnsigned) : UIntRange();
+            result = unsignedResult.toIntRange();
+            break;
+        case BinaryInst::AND:
+            result = lRange.band(rRange);
+            unsignedResult = lUnsigned.band(rUnsigned);
+            break;
+        case BinaryInst::OR:
+            result = lRange.bor(rRange);
+            unsignedResult = lUnsigned.bor(rUnsigned);
+            break;
+        case BinaryInst::XOR:
+            result = IntRange();
+            unsignedResult = UIntRange();
+            break;
+        default:
+            result = IntRange();
+            unsignedResult = UIntRange();
+            break;
     }
 
     // 5. KnownBits 与区间并行传播；位传递完成后再把确定的位模式投影回结果区间。
@@ -1279,10 +2212,8 @@ void RangeSolver::visitBinary(BinaryInst *BI) {
         }
         default: break;
     }
-    updateBits(BI, resKB);
-
-    result = tightenWithBits(BI, result);
-    updateRange(BI, result);
+    reduceIntegerRangeProduct(result, unsignedResult, resKB);
+    updateIntegerFacts(BI, result, unsignedResult, resKB);
 
     // 6. 仅在 Narrowing 且结果为已建模 i32 时反推 ADD/SUB 操作数，其他运算保持保守。
     if (NarrowingMode && IsModeledI32) {
@@ -1299,21 +2230,29 @@ const IntRange &rRange) {
 
     if (ty->isInt()) {
         IntRange zR = getRange(BI);
+        auto narrowSignedValue =
+            [this](Value *value, const IntRange &candidate) {
+                UIntRange unsignedRange =
+                    getUnsignedRange(value);
+                KnownBits bits = getBits(value);
+                updateIntegerFacts(
+                    value, candidate, unsignedRange, bits);
+            };
         switch (BI->getOp()) {
             case BinaryInst::ADD: {
                 if (lRange.add(rRange).isTop()) break;
                 if (!dynamic_cast<ConstInt *>(lhs))
-                    updateRange(lhs, zR.sub(rRange));
+                    narrowSignedValue(lhs, zR.sub(rRange));
                 if (!dynamic_cast<ConstInt *>(rhs))
-                    updateRange(rhs, zR.sub(lRange));
+                    narrowSignedValue(rhs, zR.sub(lRange));
                 break;
             }
             case BinaryInst::SUB: {
                 if (lRange.sub(rRange).isTop()) break;
                 if (!dynamic_cast<ConstInt *>(lhs))
-                    updateRange(lhs, zR.add(rRange));
+                    narrowSignedValue(lhs, zR.add(rRange));
                 if (!dynamic_cast<ConstInt *>(rhs))
-                    updateRange(rhs, lRange.sub(zR));
+                    narrowSignedValue(rhs, lRange.sub(zR));
                 break;
             }
 
@@ -1340,6 +2279,15 @@ void RangeSolver::visitBranch(BrInst *Br) {
     BasicBlock *fromBB = Br->getParent();
 
     if (!trueBB || !falseBB) return;
+
+    // BaseManager 统一识别 ConstBool/ConstInt 常量。常量条件只激活真实后继，
+    // 防止不可执行分支中的 PHI incoming 污染全局范围。
+    bool constantTruth = false;
+    if (cond && cond->tryGetBoolConst(constantTruth)) {
+        markEdgeFeasible(
+            fromBB, constantTruth ? trueBB : falseBB);
+        return;
+    }
 
     // 2. 只有唯一入边目标可在求解期写块上下文，浮点含 NaN 时放弃数值收窄。
     bool trueSinglePred = (trueBB->getPredecessors().size() == 1);
@@ -1439,10 +2387,11 @@ void RangeSolver::visitBranch(BrInst *Br) {
             }
 
             // 3. 整数比较生成真假两侧区间，并为等值和符号测试补充 KnownBits。
-            IntRange lRange = dynamic_cast<ConstInt *>(lhs) ?
-                IntRange(dynamic_cast<ConstInt *>(lhs)->getVal()) : getRange(lhs);
-            IntRange rRange = dynamic_cast<ConstInt *>(rhs) ?
-                IntRange(dynamic_cast<ConstInt *>(rhs)->getVal()) : getRange(rhs);
+            IntRange lRange = getRange(lhs);
+            IntRange rRange = getRange(rhs);
+            bool hasI32SignedOrdering =
+                IRType::hasIntegerBitWidth(lhs->getIRType(), 32) &&
+                IRType::hasIntegerBitWidth(rhs->getIRType(), 32);
 
             if (lRange.isBottom() || rRange.isBottom()) {
                 if (trueSinglePred) {
@@ -1462,7 +2411,8 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 return;
             }
 
-            if (op == BinaryInst::L) {
+            if (hasI32SignedOrdering &&
+                op == BinaryInst::L) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
                         IntRange(IntRange::I32_MIN, rRange.max - 1));
@@ -1477,7 +2427,8 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 }
             }
 
-            else if (op == BinaryInst::LE) {
+            else if (hasI32SignedOrdering &&
+                     op == BinaryInst::LE) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
                         IntRange(IntRange::I32_MIN, rRange.max));
@@ -1492,7 +2443,8 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 }
             }
 
-            else if (op == BinaryInst::G) {
+            else if (hasI32SignedOrdering &&
+                     op == BinaryInst::G) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
                         IntRange(rRange.min + 1, IntRange::I32_MAX));
@@ -1507,7 +2459,8 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 }
             }
 
-            else if (op == BinaryInst::GE) {
+            else if (hasI32SignedOrdering &&
+                     op == BinaryInst::GE) {
                 if (trueSinglePred) {
                     updateContextual(lhs, trueBB,
                         IntRange(rRange.min, IntRange::I32_MAX));
@@ -1552,16 +2505,18 @@ void RangeSolver::visitBranch(BrInst *Br) {
                 else          kb.zero |= 0x80000000u;
                 updateBitsContextual(x, succ, kb);
             };
-            if (auto *rC = dynamic_cast<ConstInt *>(rhs)) {
-                int rv = rC->getVal();
-                if (rv == 0) {
+            if (hasI32SignedOrdering) {
+                if (auto *rC = dynamic_cast<ConstInt *>(rhs)) {
+                    int rv = rC->getVal();
+                    if (rv == 0) {
 
-                    if (op == BinaryInst::L) {
-                        applySignBitKB(lhs, trueBB,  true,  trueSinglePred);
-                        applySignBitKB(lhs, falseBB, false, falseSinglePred);
-                    } else if (op == BinaryInst::GE) {
-                        applySignBitKB(lhs, trueBB,  false, trueSinglePred);
-                        applySignBitKB(lhs, falseBB, true,  falseSinglePred);
+                        if (op == BinaryInst::L) {
+                            applySignBitKB(lhs, trueBB,  true,  trueSinglePred);
+                            applySignBitKB(lhs, falseBB, false, falseSinglePred);
+                        } else if (op == BinaryInst::GE) {
+                            applySignBitKB(lhs, trueBB,  false, trueSinglePred);
+                            applySignBitKB(lhs, falseBB, true,  falseSinglePred);
+                        }
                     }
                 }
             }
@@ -1573,7 +2528,9 @@ void RangeSolver::visitBranch(BrInst *Br) {
     markEdgeFeasible(fromBB, falseBB);
 }
 
-// 调用结果只精确建模已知输入内建；用户函数和未知被调目标因缺少可靠跨函数失效机制返回 Top。
+// 调用结果只依据 BuildInFunction 身份和官方 SysY ABI 建模。普通用户函数即使
+// 名字相同也不参与匹配；getarray/getfarray 的库契约不检查容量，返回值不得
+// 按实参数组大小收窄。
 void RangeSolver::visitCall(CallInst *CI) {
     Value *callee = CI->getCallee();
     if (!callee) return;
@@ -1581,24 +2538,34 @@ void RangeSolver::visitCall(CallInst *CI) {
     auto SetTopForResultType = [&]() {
         auto Ty = CI->getIRType();
         if (!Ty) return;
-        if (Ty->isInt()) updateRange(CI, IntRange());
+        if (Ty->isInt())
+            updateIntegerFacts(
+                CI, conservativeIntegerRangeForValue(CI),
+                conservativeUnsignedRangeForValue(CI),
+                KnownBits::top());
         else if (Ty->isFloat())
             updateFloatRange(CI, FloatRange());
     };
 
-    if (auto *BIF = dynamic_cast<BuildInFunction *>(callee)) {
-        std::string name = BIF->getIdent();
+    if (auto *BIF = CI->getBuiltinCallee()) {
+        const std::string &name = BIF->getIdent();
         if (name == "getch") {
-
-            updateRange(CI, IntRange(-128, 127));
+            // 仓库主机 runtime 把 char 以 sext i8 返回，而 RISC-V ABI 的
+            // plain char 可为 unsigned。未发布显式 ABI signedness 前取两类
+            // 扩展字节实现的并集；其无符号位模式是非凸集合，只能保持 Top。
+            updateIntegerFacts(
+                CI, IntRange(-128, 255), UIntRange(),
+                KnownBits::top());
             return;
         }
-        if (name == "getint") {
-
-            updateRange(CI, IntRange());
+        if (name == "getint" ||
+            BuildInFunction::isArrayInputName(name)) {
+            // getint 是任意 i32；数组输入返回输入流给出的元素个数，规范明确
+            // 不按目标数组容量检查，因此二者均保持完整 i32。
+            SetTopForResultType();
             return;
         }
-
+        // getfloat、输出、计时和内存内建均按签名返回类型保守初始化。
         SetTopForResultType();
         return;
     }
@@ -1611,7 +2578,11 @@ void RangeSolver::visitCall(CallInst *CI) {
     SetTopForResultType();
 }
 
-// Select 不建立 CFG 上下文，只对两臂的整数/浮点结果取并集。
+// Select 把条件比较视为两条“虚拟臂”：分别在真假条件下收窄直接参与比较的
+// 候选值，再汇合结果。全局传递函数只读取已经进入全局格的事实，不能消费
+// 求解过程中尚会扩宽的临时块上下文；稳定的块/分臂事实由 RangeInfo 查询接口
+// 在求解完成后叠加。否则循环出口早期的窄事实会被固化进 Select 的全局结果，
+// 而 narrowing 阶段只能取交、无法再把错误单点扩回正确包络。
 void RangeSolver::visitSelect(SelectInst *SI) {
     Value *tv = SI->getTrueValue();
     Value *fv = SI->getFalseValue();
@@ -1619,17 +2590,91 @@ void RangeSolver::visitSelect(SelectInst *SI) {
     auto ty = SI->getIRType();
     if (!ty) return;
 
+    bool trueExecutable = true;
+    bool falseExecutable = true;
+    Value *condition = SI->getCondition();
+    bool constantTruth = false;
+    if (condition && condition->tryGetBoolConst(constantTruth)) {
+        trueExecutable = constantTruth;
+        falseExecutable = !trueExecutable;
+    } else if (condition &&
+               isModeledIntegerRangeType(condition)) {
+        IntRange conditionRange = getRange(condition);
+        if (conditionRange.isSingleValue()) {
+            trueExecutable = conditionRange.min != 0;
+            falseExecutable = !trueExecutable;
+        }
+    }
+
     if (ty->isInt()) {
         if (!isModeledIntegerRangeType(SI)) {
-            updateRange(SI, conservativeIntegerRangeForValue(SI));
-            updateBits(SI, KnownBits::top());
+            updateIntegerFacts(
+                SI, conservativeIntegerRangeForValue(SI),
+                conservativeUnsignedRangeForValue(SI),
+                KnownBits::top());
             return;
         }
-        IntRange tr = dynamic_cast<ConstInt *>(tv) ?
-            IntRange(dynamic_cast<ConstInt *>(tv)->getVal()) : getRange(tv);
-        IntRange fr = dynamic_cast<ConstInt *>(fv) ?
-            IntRange(dynamic_cast<ConstInt *>(fv)->getVal()) : getRange(fv);
-        updateRange(SI, tr.unionWith(fr));
+
+        auto *compare = dynamic_cast<BinaryInst *>(condition);
+        Value *lhs = nullptr;
+        Value *rhs = nullptr;
+        bool hasIntegerCompare =
+            compare && BinaryInst::isCompareOp(compare->getOp()) &&
+            compare->getOperands(lhs, rhs) && lhs && rhs &&
+            lhs->getIRType() && rhs->getIRType() &&
+            lhs->getIRType()->isInt() &&
+            rhs->getIRType()->isInt();
+        IntRange lhsRange;
+        IntRange rhsRange;
+        if (hasIntegerCompare) {
+            lhsRange = getRange(lhs);
+            rhsRange = getRange(rhs);
+        }
+
+        auto collectArm =
+            [&](Value *value, bool trueArm,
+                IntRange &signedRange, UIntRange &unsignedRange,
+                KnownBits &bits) {
+                signedRange = getRange(value);
+                unsignedRange = getUnsignedRange(value);
+                bits = getBits(value);
+                if (hasIntegerCompare) {
+                    signedRange = constrainSignedRangeByComparison(
+                        value, compare, trueArm, signedRange,
+                        lhsRange, rhsRange);
+                }
+                reduceIntegerRangeProduct(
+                    signedRange, unsignedRange, bits);
+            };
+
+        IntRange result = IntRange::bottom();
+        UIntRange unsignedResult = UIntRange::bottom();
+        KnownBits resultBits;
+        bool firstBits = true;
+        if (trueExecutable) {
+            IntRange armRange;
+            UIntRange armUnsigned;
+            KnownBits armBits;
+            collectArm(tv, true, armRange, armUnsigned, armBits);
+            result = result.unionWith(armRange);
+            unsignedResult =
+                unsignedResult.unionWith(armUnsigned);
+            resultBits = armBits;
+            firstBits = false;
+        }
+        if (falseExecutable) {
+            IntRange armRange;
+            UIntRange armUnsigned;
+            KnownBits armBits;
+            collectArm(fv, false, armRange, armUnsigned, armBits);
+            result = result.unionWith(armRange);
+            unsignedResult =
+                unsignedResult.unionWith(armUnsigned);
+            resultBits = firstBits
+                ? armBits : resultBits.unionWith(armBits);
+        }
+        updateIntegerFacts(
+            SI, result, unsignedResult, resultBits);
     } else if (ty->isFloat()) {
         FloatRange tr = dynamic_cast<ConstFloat *>(tv) ?
             FloatRange((double)dynamic_cast<ConstFloat *>(tv)->getVal()) :
@@ -1637,7 +2682,14 @@ void RangeSolver::visitSelect(SelectInst *SI) {
         FloatRange fr = dynamic_cast<ConstFloat *>(fv) ?
             FloatRange((double)dynamic_cast<ConstFloat *>(fv)->getVal()) :
             FloatValueRanges[fv];
-        updateFloatRange(SI, tr.unionWith(fr));
+        if (trueExecutable && falseExecutable)
+            updateFloatRange(SI, tr.unionWith(fr));
+        else if (trueExecutable)
+            updateFloatRange(SI, tr);
+        else if (falseExecutable)
+            updateFloatRange(SI, fr);
+        else
+            updateFloatRange(SI, FloatRange::bottom());
     }
 }
 
@@ -1659,12 +2711,14 @@ void RangeSolver::visitCast(Instruction *I) {
 
         if (srcTy == IR_INT && SourceBits == 1 &&
             DestinationBits == 32) {
-            updateRange(I, IntRange(0, 1));
-
-            updateBits(I, KnownBits(0xFFFFFFFEu, 0));
+            updateIntegerFacts(
+                I, IntRange(0, 1), UIntRange(0, 1),
+                KnownBits(0xFFFFFFFEu, 0));
         } else if (dstTy == IR_INT) {
-            updateRange(I, conservativeIntegerRangeForValue(I));
-            updateBits(I, KnownBits::top());
+            updateIntegerFacts(
+                I, conservativeIntegerRangeForValue(I),
+                conservativeUnsignedRangeForValue(I),
+                KnownBits::top());
         }
         return;
     }
@@ -1672,35 +2726,40 @@ void RangeSolver::visitCast(Instruction *I) {
 
         if (srcTy == IR_INT && SourceBits == 1 &&
             DestinationBits == 32) {
-            updateRange(I, IntRange(-1, 0));
-
+            updateIntegerFacts(
+                I, IntRange(-1, 0), UIntRange(),
+                KnownBits::top());
         } else if (dstTy == IR_INT) {
-            updateRange(I, conservativeIntegerRangeForValue(I));
-            updateBits(I, KnownBits::top());
+            updateIntegerFacts(
+                I, conservativeIntegerRangeForValue(I),
+                conservativeUnsignedRangeForValue(I),
+                KnownBits::top());
         }
         return;
     }
     if (dynamic_cast<TruncInst *>(I)) {
 
         if (dstTy == IR_INT && DestinationBits == 1) {
-            updateRange(I, IntRange(0, 1));
-
             KnownBits srcKB = getBits(src);
             uint32_t z = 0xFFFFFFFEu;
             uint32_t o = 0;
             if (srcKB.zero & 1u) z |= 1u;
             if (srcKB.one  & 1u) o |= 1u;
-            updateBits(I, KnownBits(z, o));
+            updateIntegerFacts(
+                I, IntRange(0, 1), UIntRange(0, 1),
+                KnownBits(z, o));
         } else if (dstTy == IR_INT) {
-            updateRange(I, conservativeIntegerRangeForValue(I));
-            updateBits(I, KnownBits::top());
+            updateIntegerFacts(
+                I, conservativeIntegerRangeForValue(I),
+                conservativeUnsignedRangeForValue(I),
+                KnownBits::top());
         }
         return;
     }
     if (dynamic_cast<SITOFPInst *>(I)) {
 
         IntRange r = dynamic_cast<ConstInt *>(src) ?
-            IntRange(dynamic_cast<ConstInt *>(src)->getVal()) : getRange(src);
+            signedRangeForConstant(dynamic_cast<ConstInt *>(src)) : getRange(src);
         if (r.isBottom()) { updateFloatRange(I, FloatRange::bottom()); return; }
 
         if (r.isSingleValue()) {
@@ -1715,8 +2774,10 @@ void RangeSolver::visitCast(Instruction *I) {
     }
     if (dynamic_cast<FPTOSIInst *>(I)) {
         if (DestinationBits != 32) {
-            updateRange(I, conservativeIntegerRangeForValue(I));
-            updateBits(I, KnownBits::top());
+            updateIntegerFacts(
+                I, conservativeIntegerRangeForValue(I),
+                conservativeUnsignedRangeForValue(I),
+                KnownBits::top());
             return;
         }
 
@@ -1724,21 +2785,40 @@ void RangeSolver::visitCast(Instruction *I) {
             FloatRange((double)dynamic_cast<ConstFloat *>(src)->getVal()) :
             FloatValueRanges[src];
         if (r.isBottom() || !r.hasNumericValues() || r.mayContainNaN()) {
-            updateRange(I, IntRange());
+            updateIntegerFacts(
+                I, IntRange(), UIntRange(),
+                KnownBits::top());
             return;
         }
         double lo = std::trunc(r.min);
         double hi = std::trunc(r.max);
-        if (!std::isfinite(lo) || !std::isfinite(hi)) { updateRange(I, IntRange()); return; }
+        if (!std::isfinite(lo) || !std::isfinite(hi)) {
+            updateIntegerFacts(
+                I, IntRange(), UIntRange(),
+                KnownBits::top());
+            return;
+        }
 
         if (lo < (double)IntRange::I32_MIN || hi > (double)IntRange::I32_MAX) {
-            updateRange(I, IntRange());
+            updateIntegerFacts(
+                I, IntRange(), UIntRange(),
+                KnownBits::top());
             return;
         }
         int64_t iLo = (int64_t)lo;
         int64_t iHi = (int64_t)hi;
-        if (iLo > iHi) { updateRange(I, IntRange()); return; }
-        updateRange(I, IntRange(iLo, iHi));
+        if (iLo > iHi) {
+            updateIntegerFacts(
+                I, IntRange(), UIntRange(),
+                KnownBits::top());
+            return;
+        }
+        IntRange result(iLo, iHi);
+        UIntRange unsignedResult =
+            UIntRange::fromIntRange(result);
+        updateIntegerFacts(
+            I, result, unsignedResult,
+            KnownBits::fromUIntRange(unsignedResult));
         return;
     }
 
@@ -1761,7 +2841,11 @@ void RangeSolver::visitInstruction(Instruction *I) {
         visitCast(I);
     } else if (dynamic_cast<LoadInst *>(I)) {
 
-        updateRange(I, IntRange());
+        if (I->getIRType() && I->getIRType()->isInt())
+            updateIntegerFacts(
+                I, conservativeIntegerRangeForValue(I),
+                conservativeUnsignedRangeForValue(I),
+                KnownBits::top());
     }
 
 }
@@ -1831,14 +2915,19 @@ bool RangeSolver::runNarrowing(Function &F) {
 void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
     // 3.1 丢弃求解期随可行边增量生成的临时事实，避免残留过时 CFG 约束。
     ContextualRanges.clear();
+    ContextualUnsignedRanges.clear();
     ContextualBits.clear();
     EdgeRanges.clear();
+    EdgeUnsignedRanges.clear();
     EdgeBits.clear();
 
     // 3.2 后续闭包统一读取最终全局格，并只记录非 Top、非冲突且可安全落块的事实。
     auto FinalRange = [&](Value *V) -> IntRange {
-        if (auto *CI = dynamic_cast<ConstInt *>(V))
-            return IntRange(CI->getVal());
+        IntRange constantSigned;
+        UIntRange constantUnsigned;
+        if (getIntegerConstantRanges(
+                V, constantSigned, constantUnsigned))
+            return constantSigned;
         auto It = ValueRanges.find(V);
         return It == ValueRanges.end() ? IntRange() : It->second;
     };
@@ -1847,6 +2936,16 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
             return KnownBits::fromConst(CI->getVal());
         auto It = ValueBits.find(V);
         return It == ValueBits.end() ? KnownBits::top() : It->second;
+    };
+    auto FinalUnsigned = [&](Value *V) -> UIntRange {
+        IntRange constantSigned;
+        UIntRange constantUnsigned;
+        if (getIntegerConstantRanges(
+                V, constantSigned, constantUnsigned))
+            return constantUnsigned;
+        auto It = UnsignedValueRanges.find(V);
+        return It == UnsignedValueRanges.end()
+            ? UIntRange() : It->second;
     };
     auto HasUniqueIncomingEdge = [](BasicBlock *Pred, BasicBlock *Succ) {
         if (!Pred || !Succ) return false;
@@ -1891,6 +2990,51 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                 else BlockMap[Succ] = Combined;
             }
         }
+
+        UIntRange UnsignedFact =
+            UIntRange::fromIntRange(Fact);
+        if (UnsignedFact.isTop() ||
+            UnsignedFact.isBottom())
+            return;
+        UnsignedFact =
+            FinalUnsigned(V).intersectWith(UnsignedFact);
+        if (UnsignedFact.isTop() ||
+            UnsignedFact.isBottom())
+            return;
+        auto &UnsignedEdgeMap =
+            EdgeUnsignedRanges[V][Pred];
+        auto UExisting = UnsignedEdgeMap.find(Succ);
+        if (UExisting != UnsignedEdgeMap.end()) {
+            UnsignedFact =
+                UExisting->second.intersectWith(UnsignedFact);
+            if (UnsignedFact.isBottom()) {
+                UnsignedEdgeMap.erase(UExisting);
+                if (HasUniqueIncomingEdge(Pred, Succ)) {
+                    auto CIt =
+                        ContextualUnsignedRanges.find(V);
+                    if (CIt !=
+                        ContextualUnsignedRanges.end())
+                        CIt->second.erase(Succ);
+                }
+                return;
+            }
+        }
+        UnsignedEdgeMap[Succ] = UnsignedFact;
+        if (HasUniqueIncomingEdge(Pred, Succ)) {
+            auto &BlockMap =
+                ContextualUnsignedRanges[V];
+            auto BIt = BlockMap.find(Succ);
+            if (BIt == BlockMap.end()) {
+                BlockMap[Succ] = UnsignedFact;
+            } else {
+                UIntRange Combined =
+                    BIt->second.intersectWith(UnsignedFact);
+                if (Combined.isBottom())
+                    BlockMap.erase(BIt);
+                else
+                    BlockMap[Succ] = Combined;
+            }
+        }
     };
 
     auto RecordBits = [&](Value *V, BasicBlock *Pred, BasicBlock *Succ,
@@ -1929,9 +3073,15 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
         IntRange L = FinalRange(LHS);
         IntRange R = FinalRange(RHS);
         if (L.isBottom() || R.isBottom()) continue;
+        bool HasI32SignedOrdering =
+            IRType::hasIntegerBitWidth(
+                LHS->getIRType(), 32) &&
+            IRType::hasIntegerBitWidth(
+                RHS->getIRType(), 32);
 
         switch (Cmp->getOp()) {
             case BinaryInst::L:
+                if (!HasI32SignedOrdering) break;
                 RecordRange(LHS, Pred, TrueBB,
                             IntRange(IntRange::I32_MIN, R.max - 1));
                 RecordRange(RHS, Pred, TrueBB,
@@ -1942,6 +3092,7 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                             IntRange(IntRange::I32_MIN, L.max));
                 break;
             case BinaryInst::LE:
+                if (!HasI32SignedOrdering) break;
                 RecordRange(LHS, Pred, TrueBB,
                             IntRange(IntRange::I32_MIN, R.max));
                 RecordRange(RHS, Pred, TrueBB,
@@ -1952,6 +3103,7 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                             IntRange(IntRange::I32_MIN, L.max - 1));
                 break;
             case BinaryInst::G:
+                if (!HasI32SignedOrdering) break;
                 RecordRange(LHS, Pred, TrueBB,
                             IntRange(R.min + 1, IntRange::I32_MAX));
                 RecordRange(RHS, Pred, TrueBB,
@@ -1962,6 +3114,7 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                             IntRange(L.min, IntRange::I32_MAX));
                 break;
             case BinaryInst::GE:
+                if (!HasI32SignedOrdering) break;
                 RecordRange(LHS, Pred, TrueBB,
                             IntRange(R.min, IntRange::I32_MAX));
                 RecordRange(RHS, Pred, TrueBB,
@@ -1987,18 +3140,20 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
                 break;
         }
 
-        if (auto *RC = dynamic_cast<ConstInt *>(RHS)) {
-            if (RC->getVal() == 0) {
-                if (Cmp->getOp() == BinaryInst::L) {
-                    RecordBits(LHS, Pred, TrueBB,
-                               KnownBits(0, 0x80000000u));
-                    RecordBits(LHS, Pred, FalseBB,
-                               KnownBits(0x80000000u, 0));
-                } else if (Cmp->getOp() == BinaryInst::GE) {
-                    RecordBits(LHS, Pred, TrueBB,
-                               KnownBits(0x80000000u, 0));
-                    RecordBits(LHS, Pred, FalseBB,
-                               KnownBits(0, 0x80000000u));
+        if (HasI32SignedOrdering) {
+            if (auto *RC = dynamic_cast<ConstInt *>(RHS)) {
+                if (RC->getVal() == 0) {
+                    if (Cmp->getOp() == BinaryInst::L) {
+                        RecordBits(LHS, Pred, TrueBB,
+                                   KnownBits(0, 0x80000000u));
+                        RecordBits(LHS, Pred, FalseBB,
+                                   KnownBits(0x80000000u, 0));
+                    } else if (Cmp->getOp() == BinaryInst::GE) {
+                        RecordBits(LHS, Pred, TrueBB,
+                                   KnownBits(0x80000000u, 0));
+                        RecordBits(LHS, Pred, FalseBB,
+                                   KnownBits(0, 0x80000000u));
+                    }
                 }
             }
         }
@@ -2006,9 +3161,11 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
 }
 
 // RangeAnalysis 主求解流程严格分阶段运行；任何 narrowing 截断都会丢弃部分下近似。
-RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
+RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV,
+                             const DominatorTree *DT) {
     // 1. 从入口启动可达性与前向传播，更新次数预算保证循环最终扩宽收敛。
     CurFunc = &F;
+    DomTree = DT;
 
     markBlockExecutable(F.front());
     runForward();
@@ -2018,16 +3175,20 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
 
     if (!NarrowingComplete) {
         ValueRanges.clear();
+        UnsignedValueRanges.clear();
         FloatValueRanges.clear();
         ValueBits.clear();
         BlockLocalRanges.clear();
+        BlockLocalUnsignedRanges.clear();
     }
 
     // 3. 丢弃求解期上下文，并仅在 narrowing 完成后从最终 CFG 重建路径事实。
     ContextualRanges.clear();
+    ContextualUnsignedRanges.clear();
     FloatContextualRanges.clear();
     ContextualBits.clear();
     EdgeRanges.clear();
+    EdgeUnsignedRanges.clear();
     EdgeBits.clear();
     if (NarrowingComplete)
         rebuildIntegerContextualFacts(F);
@@ -2039,9 +3200,17 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
     // 5. 移交各格、上下文和归纳摘要，形成只读分析结果。
     RangeInfo info;
     info.GlobalRanges = std::move(ValueRanges);
+    info.GlobalUnsignedRanges =
+        std::move(UnsignedValueRanges);
     info.ContextualRanges = std::move(ContextualRanges);
+    info.ContextualUnsignedRanges =
+        std::move(ContextualUnsignedRanges);
     info.EdgeRanges = std::move(EdgeRanges);
+    info.EdgeUnsignedRanges =
+        std::move(EdgeUnsignedRanges);
     info.BlockLocalRanges = std::move(BlockLocalRanges);
+    info.BlockLocalUnsignedRanges =
+        std::move(BlockLocalUnsignedRanges);
     info.FloatGlobalRanges = std::move(FloatValueRanges);
     info.FloatContextualRanges = std::move(FloatContextualRanges);
     info.GlobalBits = std::move(ValueBits);
@@ -2052,14 +3221,13 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV) {
     return info;
 }
 
-PassID RangeAnalysis::Key;
-
 // Pass 入口取得 SCEV 后创建一次性求解器，并返回封装好的范围信息。
 RangeAnalysis::Result RangeAnalysis::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) const {
-    // 1. 获取循环次数与归纳范围提示所需的 SCEV 结果。
+    // 1. 获取循环次数提示和完整支配上下文；依赖关系由新 PassManager 自动记录。
     auto &SCEV = FAM.getResult<SCEVAnalysis>(F);
+    auto &DT = FAM.getResult<DominantAnalysis>(F);
     // 2. 创建一次性求解器，运行五阶段流程并返回只读范围结果。
     RangeSolver solver;
-    return solver.solve(F, &SCEV);
+    return solver.solve(F, &SCEV, &DT);
 }

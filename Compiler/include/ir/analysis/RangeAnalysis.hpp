@@ -60,9 +60,45 @@ struct IntRange {
     static IntRange nonNegative();
 };
 
-struct IntRange;
+// UIntRange 独立描述 i32 的无符号位模式区间；跨越回绕点而无法用单区间
+// 表示时退化为 Top，不能把有符号端点直接当成无符号端点使用。
+struct UIntRange {
+    uint64_t min;
+    uint64_t max;
 
-// KnownBits 与 IntRange 并行保存确定为零/一的位，并可反向收紧整数区间。
+    static constexpr uint64_t U32_MIN = 0;
+    static constexpr uint64_t U32_MAX = UINT32_MAX;
+
+    UIntRange();
+    explicit UIntRange(uint64_t val);
+    UIntRange(uint64_t lo, uint64_t hi);
+
+    bool isTop() const;
+    bool isBottom() const;
+    bool isSingleValue() const;
+
+    UIntRange unionWith(const UIntRange &other) const;
+    UIntRange intersectWith(const UIntRange &other) const;
+
+    bool operator==(const UIntRange &o) const;
+    bool operator!=(const UIntRange &o) const;
+
+    UIntRange add(const UIntRange &rhs) const;
+    UIntRange sub(const UIntRange &rhs) const;
+    UIntRange mul(const UIntRange &rhs) const;
+    UIntRange udiv(const UIntRange &rhs) const;
+    UIntRange urem(const UIntRange &rhs) const;
+    UIntRange shl(const UIntRange &rhs) const;
+    UIntRange lshr(const UIntRange &rhs) const;
+    UIntRange band(const UIntRange &rhs) const;
+    UIntRange bor(const UIntRange &rhs) const;
+
+    IntRange toIntRange() const;
+    static UIntRange fromIntRange(const IntRange &range);
+    static UIntRange bottom();
+};
+
+// KnownBits 与 signed/unsigned 区间并行保存确定为零/一的位，并可双向收紧。
 struct KnownBits {
     uint32_t zero = 0;
     uint32_t one  = 0;
@@ -105,7 +141,16 @@ struct KnownBits {
     KnownBits mul(const KnownBits &o) const;
 
     IntRange toIntRange() const;
+    UIntRange toUIntRange() const;
+
+    static KnownBits fromUIntRange(const UIntRange &range);
 };
+
+// 三个整数抽象域在同一值上组成约化积。该函数只做保守交叉投影：
+// 任一投影无法用单区间表达时不收窄，事实矛盾时统一返回 Bottom。
+void reduceIntegerRangeProduct(IntRange &signedRange,
+                               UIntRange &unsignedRange,
+                               KnownBits &bits);
 
 // FloatRange 用数值包络加 NaN 和有符号零标志描述 f32，避免实数区间丢失 IEEE 状态。
 struct FloatRange {
@@ -232,14 +277,23 @@ class RangeInfo {
 public:
 
     std::unordered_map<Value*, IntRange> GlobalRanges;
+    std::unordered_map<Value*, UIntRange> GlobalUnsignedRanges;
 
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> ContextualRanges;
+    std::unordered_map<Value*, std::unordered_map<BasicBlock*, UIntRange>>
+        ContextualUnsignedRanges;
 
     std::unordered_map<
         Value*, std::unordered_map<
             BasicBlock*, std::unordered_map<BasicBlock*, IntRange>>> EdgeRanges;
+    std::unordered_map<
+        Value*, std::unordered_map<
+            BasicBlock*, std::unordered_map<BasicBlock*, UIntRange>>>
+        EdgeUnsignedRanges;
 
     std::unordered_map<Value*, std::unordered_map<BasicBlock*, IntRange>> BlockLocalRanges;
+    std::unordered_map<Value*, std::unordered_map<BasicBlock*, UIntRange>>
+        BlockLocalUnsignedRanges;
 
     std::unordered_map<Value*, FloatRange> FloatGlobalRanges;
 
@@ -255,13 +309,31 @@ public:
 
     // 查询接口先读取全局格，再叠加受支配块或精确入边上的约束；缺失事实等价于 Top。
     IntRange query(Value *val, BasicBlock *ctxBlock, const DominatorTree &DT) const;
+    IntRange query(Value *val, Instruction *ctxInst,
+                   const DominatorTree &DT) const;
+
+    UIntRange queryUnsigned(Value *val, BasicBlock *ctxBlock,
+                            const DominatorTree &DT) const;
+    UIntRange queryUnsigned(Value *val, Instruction *ctxInst,
+                            const DominatorTree &DT) const;
 
     FloatRange queryFloat(Value *val, BasicBlock *ctxBlock, const DominatorTree &DT) const;
 
     IntRange queryOnEdge(Value *val, BasicBlock *predBB, BasicBlock *succBB,
                          const DominatorTree &DT) const;
+    UIntRange queryUnsignedOnEdge(Value *val, BasicBlock *predBB,
+                                  BasicBlock *succBB,
+                                  const DominatorTree &DT) const;
     FloatRange queryFloatOnEdge(Value *val, BasicBlock *predBB, BasicBlock *succBB,
                                 const DominatorTree &DT) const;
+
+    // Select 的条件不会形成真实 CFG 边，因此按真假臂显式查询比较条件产生的
+    // 指令级事实；不可执行的臂返回 Bottom。
+    IntRange queryOnSelectArm(Value *val, SelectInst *select,
+                              bool trueArm, const DominatorTree &DT) const;
+    UIntRange queryUnsignedOnSelectArm(
+        Value *val, SelectInst *select, bool trueArm,
+        const DominatorTree &DT) const;
 
     KnownBits queryBits(Value *val) const;
     KnownBits queryBits(Value *val, BasicBlock *ctxBlock,
@@ -284,18 +356,27 @@ public:
     std::vector<Instruction *> InstWorkList;
 
     std::unordered_map<Value *, IntRange> ValueRanges;
+    std::unordered_map<Value *, UIntRange> UnsignedValueRanges;
     std::unordered_map<Value *, FloatRange> FloatValueRanges;
 
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>>
         ContextualRanges;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, UIntRange>>
+        ContextualUnsignedRanges;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, IntRange>>
         BlockLocalRanges;
+    std::unordered_map<Value *, std::unordered_map<BasicBlock *, UIntRange>>
+        BlockLocalUnsignedRanges;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, FloatRange>>
         FloatContextualRanges;
     std::unordered_map<
         Value *, std::unordered_map<
             BasicBlock *, std::unordered_map<BasicBlock *, IntRange>>>
         EdgeRanges;
+    std::unordered_map<
+        Value *, std::unordered_map<
+            BasicBlock *, std::unordered_map<BasicBlock *, UIntRange>>>
+        EdgeUnsignedRanges;
 
     std::unordered_map<Value *, KnownBits> ValueBits;
     std::unordered_map<Value *, std::unordered_map<BasicBlock *, KnownBits>>
@@ -307,27 +388,37 @@ public:
 
     static constexpr int MAX_ENQUEUE = 32;
     std::unordered_map<Value *, int> EnqueueCount;
+    std::unordered_map<Value *, int> UnsignedEnqueueCount;
     std::unordered_set<Value *> Widened;
+    std::unordered_set<Value *> UnsignedWidened;
     Function *CurFunc = nullptr;
     bool NarrowingMode = false;
     const std::unordered_map<Value *, LoopInductionInfo> *ScevInductions =
         nullptr;
+    const DominatorTree *DomTree = nullptr;
 
     IntRange &getRange(Value *V);
+    UIntRange getUnsignedRange(Value *V);
     KnownBits getBits(Value *V);
     IntRange getRangeInBlock(Value *V, BasicBlock *BB);
+    UIntRange getUnsignedRangeInBlock(Value *V, BasicBlock *BB);
     KnownBits getBitsInBlock(Value *V, BasicBlock *BB);
     void enqueueInstructionUsers(Value *V);
     bool updateBits(Value *V, const KnownBits &NewBits);
     void updateBitsContextual(Value *V, BasicBlock *Block,
                               const KnownBits &Bits);
-    IntRange tightenWithBits(Value *V, const IntRange &NewRange);
+    bool updateUnsignedRange(Value *V, const UIntRange &NewRange);
+    bool updateIntegerFacts(Value *V, const IntRange &NewSignedRange,
+                            const UIntRange &NewUnsignedRange,
+                            const KnownBits &NewBits);
 
     // 更新接口在前向阶段允许扩宽并设置收敛锁，在 narrowing 阶段仅允许取交变窄。
     bool updateRange(Value *V, const IntRange &NewRange);
     bool updateFloatRange(Value *V, const FloatRange &NewRange);
     void updateContextual(Value *V, BasicBlock *Block,
                           const IntRange &Range);
+    void updateUnsignedContextual(Value *V, BasicBlock *Block,
+                                  const UIntRange &Range);
     void updateFloatContextual(Value *V, BasicBlock *Block,
                                const FloatRange &Range);
     void markBlockExecutable(BasicBlock *BB);
@@ -348,10 +439,11 @@ public:
     void runForward();
     bool runNarrowing(Function &F);
     void rebuildIntegerContextualFacts(Function &F);
-    RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr);
+    RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr,
+                    const DominatorTree *DT = nullptr);
 };
 
-// Pass 入口获取 SCEV，随后运行完整 RangeSolver 流程。
+// Pass 入口获取 SCEV 与 DominatorTree，随后运行完整 RangeSolver 流程。
 class RangeAnalysis : public AnalysisDescriptor<RangeAnalysis> {
 public:
     using Result = RangeInfo;
@@ -359,5 +451,5 @@ public:
 
 private:
     friend AnalysisDescriptor<RangeAnalysis>;
-    static PassID Key;
+    inline static PassID Key;
 };

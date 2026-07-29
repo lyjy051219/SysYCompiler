@@ -56,11 +56,39 @@ using BaseAddressInfoMap = std::unordered_map<Value*, BaseAddressInfo>;
 struct SideEffectInfo {
     std::unordered_set<Value*> ModSet;
     std::unordered_set<Value*> RefSet;
+    // hasBuiltin 兼容既有消费者，表示摘要中含运行时、未知指针或其他不可按普通
+    // 用户函数处理的行为；程序内存未知性与可观察性分别由下面两个字段表达。
     bool hasBuiltin = false;
+    bool hasUnknownMemory = false;
+    bool hasObservableEffect = false;
+    bool hasOrderingBarrier = false;
+    // SysY 数组运行时不校验调用者容量；该标志禁止用底层对象不同排除越界触及。
+    bool mayCrossObjectBounds = false;
+    // 越过对象边界时仍保留已知的读/写角色，避免一律退化成 ModRef。
+    ModRefInfo crossObjectModRef = ModRefInfo::NoModRef;
 
     BaseAddressInfoMap ptrMap;
 
     bool invalidate(Function &F, const PreservationStatus &PA);
+};
+
+// CallMemoryEffect 把一次调用对某个实际指针对象的程序内存效果独立发布。
+// Size 缺失表示对象可映射但访问长度未知，不能据此假设运行时数组容量。
+struct CallMemoryEffect {
+    MemoryLocation Location;
+    ModRefInfo ModRef = ModRefInfo::NoModRef;
+};
+
+// CallEffectSummary 将程序内存、外部可观察行为和严格顺序屏障分离。
+// HasUnknownMemory 只表示程序内存目标或读写角色无法可靠映射。
+struct CallEffectSummary {
+    std::vector<CallMemoryEffect> ProgramMemory;
+    bool HasUnknownMemory = false;
+    bool HasObservableEffect = false;
+    bool HasOrderingBarrier = false;
+    // 目标指针和读写角色已知，但访问长度可能越过该指针所属对象。
+    bool MayCrossObjectBounds = false;
+    ModRefInfo CrossObjectModRef = ModRefInfo::NoModRef;
 };
 
 // 固定点状态把本地摘要与尚待映射的直接调用边分开保存。
@@ -89,7 +117,7 @@ public:
 
 private:
     friend AnalysisDescriptor<SideEffectAnalysis>;
-    static PassID Key;
+    inline static PassID Key;
     static void ensureInitialized(Value *V, BaseAddressInfoMap &Map);
     static BaseAddressInfoMap buildBaseAddressInfoMap(Function &F);
     static void processBuiltinCall(
@@ -113,6 +141,10 @@ ModRefInfo getFunctionModRefInfo(const SideEffectInfo& SEI);
 
 // 返回调用对 SysY 程序内存的整体影响；可观察性和计时边界由 CFG 接口独立维护。
 ModRefInfo getCallProgramModRefInfo(
+    CallInst *CI, FunctionAnalysisPassManager &FAM);
+
+// 返回调用的只读效果摘要；不会修改调用、被调函数或任何 IR 元数据。
+CallEffectSummary getCallEffectSummary(
     CallInst *CI, FunctionAnalysisPassManager &FAM);
 
 bool BasicBlockSideEffect(BasicBlock* BB,

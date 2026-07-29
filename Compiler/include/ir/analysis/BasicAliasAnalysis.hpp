@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
+#include <vector>
 
 class LoopInfo;
 class Loop;
@@ -28,6 +29,29 @@ struct MemoryLocation {
 
     static MemoryLocation get(const LoadInst *Load);
     static MemoryLocation get(const StoreInst *Store);
+};
+
+// 指针来源摘要把“成对别名查询”所需的底层事实提升为可复用结果。
+// 偏移区间只在所有来源路径都能以常量字节偏移表示时有效；未知来源不会被
+// 伪装成一个普通基址。
+struct PointerProvenanceInfo {
+    std::unordered_set<Value *> Bases;
+    std::optional<long long> MinByteOffset;
+    std::optional<long long> MaxByteOffset;
+    std::optional<std::size_t> ObjectSize;
+    std::size_t KnownAlignment = 1;
+    bool HasUnknownBase = true;
+    bool MayBeStack = false;
+    bool MayBeGlobal = false;
+    bool MayBeParameter = false;
+
+    bool hasUniqueBase() const;
+    Value *getUniqueBase() const;
+    bool hasExactByteOffset() const;
+    std::optional<long long> getExactByteOffset() const;
+    bool isMustStack() const;
+    bool isMustGlobal() const;
+    bool isMustParameter() const;
 };
 
 // BasicAAResult 按需分解指针并缓存查询；可选 SCEV 只用于已证明不回绕的下标距离。
@@ -55,10 +79,22 @@ public:
     bool haveKnownDistinctUnderlyingObjects(Value *V1, Value *V2) const;
     bool callMayAliasPointer(CallInst *CI, Value *P, const LoopInfo &LI);
 
+    // 单指针查询与成对 Alias 查询共享同一套 GEP/PHI/Select 溯源规则。
+    const PointerProvenanceInfo &getPointerProvenance(Value *V) const;
+    std::vector<Value *> getUnderlyingObjects(Value *V) const;
+    Value *getUniqueUnderlyingObject(Value *V) const;
+    std::optional<long long> getConstantByteOffset(Value *V) const;
+    std::optional<std::size_t> getObjectSize(Value *V) const;
+    std::size_t getKnownAlignment(Value *V) const;
+
 private:
     friend class BasicAliasAnalysis;
 
     static constexpr long long I32Modulus = 1LL << 32;
+    static constexpr unsigned MaxProvenanceDepth = 64;
+    static constexpr std::size_t MaxProvenanceBases = 64;
+    static constexpr std::size_t MaxProvenanceQueryNodes = 4096;
+    static constexpr std::size_t MaxIntegerMultipleQueryNodes = 4096;
 
     static bool checkedAdd(long long A, long long B, long long &Result);
     static bool checkedSub(long long A, long long B, long long &Result);
@@ -68,6 +104,27 @@ private:
 
     struct ValuePairHash {
         std::size_t operator()(const std::pair<Value*, Value*>& P) const;
+    };
+
+    // 单次来源查询把活动环与已完成节点分开记录；只有不依赖活动环的
+    // 子结果才能记忆化，避免共享 SSA DAG 被重复指数展开。
+    struct ProvenanceQueryState {
+        std::unordered_set<Value *> Active;
+        std::unordered_map<Value *, PointerProvenanceInfo> Completed;
+        std::size_t VisitedNodes = 0;
+        bool BudgetExceeded = false;
+    };
+
+    struct ProvenanceBuildResult {
+        PointerProvenanceInfo Info;
+        bool DependsOnActiveCycle = false;
+    };
+
+    struct IntegerMultipleQueryState {
+        std::unordered_set<Value *> Active;
+        std::unordered_map<Value *, std::size_t> Completed;
+        std::size_t VisitedNodes = 0;
+        bool BudgetExceeded = false;
     };
 
     // 内部规范形把 GEP 链拆为底层对象、常量字节偏移和 SSA 系数表。
@@ -81,6 +138,7 @@ private:
     std::unordered_map<std::pair<Value*, Value*>, AliasInfo, ValuePairHash> AliasCache;
     std::unordered_set<std::pair<Value*, Value*>, ValuePairHash> ObjectNoAlias;
     std::unordered_set<std::pair<Value*, Value*>, ValuePairHash> ActiveSelectQueries;
+    mutable std::unordered_map<Value *, PointerProvenanceInfo> ProvenanceCache;
 
     struct AdditiveDecomposition {
         Value* Base = nullptr;
@@ -99,6 +157,27 @@ private:
 
     Value* stripBaseInst(Value* V) const;
     Value* getBaseAddress(Value* V) const;
+    ProvenanceBuildResult buildPointerProvenance(
+        Value *V, ProvenanceQueryState &State, unsigned Depth) const;
+    PointerProvenanceInfo mergePointerProvenance(
+        const PointerProvenanceInfo &First,
+        const PointerProvenanceInfo &Second) const;
+    static bool isEmptyCycleProvenance(const PointerProvenanceInfo &Info);
+    static bool addOffsetToProvenance(PointerProvenanceInfo &Info,
+                                      long long Offset);
+    static std::size_t baseObjectAlignment(Value *Base);
+    static std::optional<std::size_t> baseObjectSize(Value *Base);
+    static std::size_t greatestPowerOfTwoDivisor(std::uint64_t Value);
+    static std::size_t multiplyAlignmentFactors(std::size_t First,
+                                                std::size_t Second);
+    std::size_t getKnownIntegerMultiple(
+        Value *V, IntegerMultipleQueryState &State,
+        unsigned Depth) const;
+    std::size_t getGEPOffsetAlignment(GetElementPtrInst *GEP) const;
+    bool isLocationKnownWithinObject(const MemoryLocation &Location) const;
+    AliasInfo enforceLocationObjectBounds(
+        AliasInfo Result, const MemoryLocation &First,
+        const MemoryLocation &Second) const;
 
     bool isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const;
     bool hasObjectNoAlias(Value* V1, Value* V2) const;

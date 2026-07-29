@@ -65,7 +65,14 @@ int SCEVExpander::estimateCostImpl(
     }
     case SCEVExprKind::Div:
     case SCEVExprKind::Mod:
-
+    case SCEVExprKind::Shl:
+    case SCEVExprKind::LShr:
+    case SCEVExprKind::AShr:
+    case SCEVExprKind::BitAnd:
+    case SCEVExprKind::BitOr:
+    case SCEVExprKind::BitXor:
+    case SCEVExprKind::Binomial:
+    case SCEVExprKind::Select:
         Cost = -1;
         break;
     case SCEVExprKind::AddRec:

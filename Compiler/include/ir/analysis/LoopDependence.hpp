@@ -72,7 +72,8 @@ public:
 
     LoopDependenceInfo();
     LoopDependenceInfo(Function *F, LoopInfo *LI, SCEVResult *SE,
-                       BasicAAResult *AA);
+                       BasicAAResult *AA,
+                       FunctionAnalysisPassManager *FAM);
     ~LoopDependenceInfo();
     LoopDependenceInfo(LoopDependenceInfo &&) noexcept;
     LoopDependenceInfo &operator=(LoopDependenceInfo &&) noexcept;
@@ -97,6 +98,8 @@ public:
     std::optional<int64_t> getByteStride(Instruction *I, Loop *L);
 
     bool hasUnknownMemory(Loop *L);
+    bool hasObservableEffect(Loop *L);
+    bool hasOrderingBarrier(Loop *L);
     bool invalidate(Function &F, const PreservationStatus &PA);
 
 private:
@@ -107,6 +110,8 @@ private:
         std::vector<LoopDependenceRecord> Dependences;
         std::vector<Loop *> Loops;
         bool UnknownMemory = false;
+        bool ObservableEffect = false;
+        bool OrderingBarrier = false;
     };
 
     static constexpr std::size_t MaxMemoryAccesses = 512;
@@ -121,6 +126,7 @@ private:
     LoopInfo *LI = nullptr;
     SCEVResult *SE = nullptr;
     BasicAAResult *AA = nullptr;
+    FunctionAnalysisPassManager *FAM = nullptr;
     std::unordered_map<Loop *, std::unique_ptr<LoopSummary>> Cache;
 
     static bool checkedAdd(int64_t A, int64_t B, int64_t &Result);
@@ -138,6 +144,11 @@ private:
     LoopAffineExpr buildAffine(const SCEVExpr *E, Loop *Scope) const;
     bool buildMemoryAccess(Instruction *I, Loop *Scope, std::size_t Order,
                            LoopMemoryAccess &Access) const;
+    bool buildPointerAccess(Instruction *I, Value *Pointer,
+                            const MemoryLocation &Location,
+                            bool Reads, bool Writes, Loop *Scope,
+                            std::size_t Order,
+                            LoopMemoryAccess &Access) const;
     bool areForcedEqual(const LoopMemoryAccess &A,
                         const LoopMemoryAccess &B, Loop *Axis) const;
     bool areNoAlias(const LoopMemoryAccess &A,

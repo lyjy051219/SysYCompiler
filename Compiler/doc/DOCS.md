@@ -4612,6 +4612,20 @@ https://gemini.google.com/app/2937246d3292e3d5
 
 #### AnalysisPass
 
+##### Dominant支配树
+
+##### PostDominant后支配树
+
+##### LoopInfo/LoopAnalysis循环分析
+
+##### MemorySSA
+
+标记每一处内存写入点和内存读取点，构建内存图
+
+
+
+
+
 
 
 
