@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 630" role="img" aria-labelledby="title desc">
+  <title id="title">LoopDependence构建的循环访存依赖图</title>
+  <desc id="desc">左侧把循环IR归一化为访存节点，右侧以依赖类型和方向向量连接可能冲突的访问。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .code{fill:#f1f5f9;stroke:#64748b;stroke-width:2}
+      .write{fill:#fee2e2;stroke:#dc2626;stroke-width:2}
+      .read{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .safe{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .record{fill:#fef3c7;stroke:#d97706;stroke-width:2}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .mono{font:600 13px "JetBrains Mono",Consolas,monospace;fill:#0f172a}
+      .dep{fill:none;stroke:#d97706;stroke-width:3;marker-end:url(#arrow)}
+      .map{fill:none;stroke:#64748b;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#arrow)}
+      .noedge{fill:none;stroke:#16a34a;stroke-width:2;stroke-dasharray:6 5}
+    </style>
+  </defs>
+  <rect width="1000" height="630" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">LoopDependence：循环访存 → 有向依赖图</text>
+  <rect x="28" y="58" width="410" height="510" rx="14" class="panel"/>
+  <rect x="458" y="58" width="514" height="510" rx="14" class="panel"/>
+  <text x="233" y="88" class="label" text-anchor="middle">IR访问归一化</text>
+  <text x="715" y="88" class="label" text-anchor="middle">依赖节点与方向边</text>
+  <rect x="60" y="116" width="346" height="178" rx="12" class="code"/>
+  <text x="82" y="150" class="mono">for i = 1 .. N-1:</text>
+  <text x="82" y="186" class="mono">S1: store ..., A[i]</text>
+  <text x="82" y="222" class="mono">S2: %x = load A[i]</text>
+  <text x="82" y="258" class="mono">S3: store ..., B[i]</text>
+  <rect x="60" y="328" width="346" height="174" rx="12" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="233" y="357" class="text">每个访问节点记录</text>
+  <text x="233" y="386" class="small">Root + Read/Write角色 + 指令顺序</text>
+  <text x="233" y="413" class="small">仿射Subscript + 每一维ByteStride</text>
+  <text x="233" y="440" class="small">例如 A[i] = Base A + 4×i</text>
+  <text x="233" y="477" class="small">Load / Store / 可映射Call成为图节点</text>
+  <path d="M406 416 L488 416" class="map"/>
+  <rect x="516" y="126" width="190" height="76" rx="10" class="write"/>
+  <text x="611" y="153" class="text">S1：Write A[i]</text>
+  <text x="611" y="180" class="small">Root A，stride(L)=4</text>
+  <rect x="742" y="272" width="190" height="76" rx="10" class="read"/>
+  <text x="837" y="299" class="text">S2：Read A[i]</text>
+  <text x="837" y="326" class="small">Root A，stride(L)=4</text>
+  <rect x="516" y="416" width="190" height="76" rx="10" class="safe"/>
+  <text x="611" y="443" class="text">S3：Write B[i]</text>
+  <text x="611" y="470" class="small">Root B，stride(L)=4</text>
+  <path d="M674 202 C716 226 746 250 770 272" class="dep"/>
+  <rect x="500" y="254" width="218" height="108" rx="10" class="record"/>
+  <text x="609" y="282" class="text">Flow依赖 S1 → S2</text>
+  <text x="609" y="309" class="small">Direction[L] = SameIteration</text>
+  <text x="609" y="335" class="small">地址相等强制 iₛ = iₜ</text>
+  <text x="644" y="392" class="small">A与B为独立底层对象：NoAlias，不建边</text>
+  <text x="715" y="530" class="small">边类型：Flow / Anti / Output（Unknown为预留）；图中为清晰省略写访问的自依赖</text>
+  <text x="500" y="606" class="small">当前实现只能证明SameIteration，否则记录AnyDirection；无法建模的访问置UnknownMemory</text>
+</svg>

@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" role="img" aria-labelledby="title desc">
+  <title id="title">RangeAnalysis构建的控制流敏感范围事实层</title>
+  <desc id="desc">左侧展示分支如何把全局范围拆成边事实和块上下文事实，右侧展示整数范围事实的乘积抽象域。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .node{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .true{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .false{fill:#fee2e2;stroke:#dc2626;stroke-width:2}
+      .merge{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}
+      .fact{fill:#ecfeff;stroke:#0891b2;stroke-width:2}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .mono{font:600 14px "JetBrains Mono",Consolas,monospace;fill:#0f172a;text-anchor:middle}
+      .edge{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
+      .tedge{fill:none;stroke:#16a34a;stroke-width:2.5;marker-end:url(#arrow)}
+      .fedge{fill:none;stroke:#dc2626;stroke-width:2.5;marker-end:url(#arrow)}
+      .reduce{fill:none;stroke:#0891b2;stroke-width:2;stroke-dasharray:6 5;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1000" height="620" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">RangeAnalysis：CFG → 控制流敏感事实层</text>
+  <rect x="28" y="58" width="596" height="500" rx="14" class="panel"/>
+  <rect x="644" y="58" width="328" height="500" rx="14" class="panel"/>
+  <text x="326" y="88" class="label" text-anchor="middle">分支拆分、块内查询与汇合</text>
+  <text x="808" y="88" class="label" text-anchor="middle">一个整数事实</text>
+  <rect x="220" y="108" width="212" height="66" rx="10" class="node"/>
+  <text x="326" y="133" class="mono">%x ∈ [0, 20]</text>
+  <text x="326" y="155" class="mono">icmp slt %x, 10</text>
+  <path d="M290 174 L190 238" class="tedge"/>
+  <path d="M362 174 L462 238" class="fedge"/>
+  <text x="222" y="211" class="small">True edge</text>
+  <text x="429" y="211" class="small">False edge</text>
+  <rect x="82" y="238" width="216" height="78" rx="10" class="true"/>
+  <rect x="354" y="238" width="216" height="78" rx="10" class="false"/>
+  <text x="190" y="265" class="text">Then 块上下文</text>
+  <text x="190" y="291" class="mono">%x ∈ [0, 9]</text>
+  <text x="462" y="265" class="text">Else 块上下文</text>
+  <text x="462" y="291" class="mono">%x ∈ [10, 20]</text>
+  <path d="M190 316 L278 384" class="edge"/>
+  <path d="M462 316 L374 384" class="edge"/>
+  <rect x="220" y="384" width="212" height="74" rx="10" class="merge"/>
+  <text x="326" y="411" class="text">Merge：不叠加任一EdgeFact</text>
+  <text x="326" y="437" class="mono">Global(%x) = [0, 20]</text>
+  <rect x="76" y="486" width="500" height="42" rx="9" class="fact"/>
+  <text x="326" y="512" class="small">Global + Edge + Dominated/BlockLocal事实共同回答当前位置的查询</text>
+  <rect x="690" y="116" width="236" height="74" rx="10" class="true"/>
+  <text x="808" y="143" class="text">SignedRange</text>
+  <text x="808" y="169" class="mono">[0, 20]</text>
+  <rect x="690" y="224" width="236" height="74" rx="10" class="node"/>
+  <text x="808" y="251" class="text">UnsignedRange</text>
+  <text x="808" y="277" class="mono">[0, 20]</text>
+  <rect x="690" y="332" width="236" height="74" rx="10" class="merge"/>
+  <text x="808" y="359" class="text">KnownBits</text>
+  <text x="808" y="385" class="mono">zero / one masks</text>
+  <path d="M808 190 L808 224" class="reduce"/>
+  <path d="M808 298 L808 332" class="reduce"/>
+  <text x="808" y="430" class="small">三者执行有限轮交叉约化</text>
+  <text x="808" y="451" class="small">事实提前稳定时立即结束</text>
+  <rect x="690" y="476" width="236" height="52" rx="9" class="fact"/>
+  <text x="808" y="498" class="text">FloatRange</text>
+  <text x="808" y="518" class="small">数值包络 + NaN + ±0（当前仅全局）</text>
+  <text x="500" y="596" class="small">工作列表求前向不动点；预算化变窄与SCEV提示进一步收紧，无法证明时回退为Top</text>
+</svg>

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 650" role="img" aria-labelledby="title desc">
+  <title id="title">SCEV构建的符号表达式有向无环图</title>
+  <desc id="desc">左侧是循环中的归纳变量IR，右侧是驻留共享的SCEV表达式DAG及循环次数摘要。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .ir{fill:#f1f5f9;stroke:#64748b;stroke-width:2}
+      .rec{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .op{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .leaf{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}
+      .summary{fill:#fef3c7;stroke:#d97706;stroke-width:2}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .mono{font:600 13px "JetBrains Mono",Consolas,monospace;fill:#0f172a}
+      .edge{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
+      .map{fill:none;stroke:#0891b2;stroke-width:2.5;stroke-dasharray:7 5;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1000" height="650" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">SCEV：标量SSA → 驻留共享的表达式DAG</text>
+  <rect x="28" y="58" width="368" height="526" rx="14" class="panel"/>
+  <rect x="416" y="58" width="556" height="526" rx="14" class="panel"/>
+  <text x="212" y="88" class="label" text-anchor="middle">循环中的IR</text>
+  <text x="694" y="88" class="label" text-anchor="middle">SCEV表达式与循环摘要</text>
+  <rect x="60" y="108" width="304" height="252" rx="12" class="ir"/>
+  <text x="82" y="137" class="mono">Loop L:  %base : i32</text>
+  <text x="82" y="166" class="mono">%i = phi [0, Entry],</text>
+  <text x="82" y="188" class="mono">         [%next, Latch]</text>
+  <text x="82" y="220" class="mono">%cont = icmp slt %i, 10</text>
+  <text x="82" y="244" class="mono">br %cont, Body, Exit</text>
+  <text x="82" y="276" class="mono">%value = add %base,</text>
+  <text x="82" y="298" class="mono">            mul %i, 4</text>
+  <text x="82" y="330" class="mono">%next = add %i, 1</text>
+  <rect x="72" y="390" width="280" height="126" rx="10" class="summary"/>
+  <text x="212" y="419" class="text">按需查询</text>
+  <text x="212" y="449" class="small">getSCEV(%i) / getSCEV(%value)</text>
+  <text x="212" y="476" class="small">getTripCount(L)</text>
+  <text x="212" y="503" class="small">首次查询创建并驻留相关表达式节点</text>
+  <path d="M352 453 L474 453" class="map"/>
+  <rect x="642" y="114" width="116" height="52" rx="9" class="op"/>
+  <text x="700" y="146" class="text">Add</text>
+  <rect x="500" y="216" width="140" height="58" rx="9" class="leaf"/>
+  <text x="570" y="241" class="text">Unknown</text>
+  <text x="570" y="260" class="small">%base</text>
+  <rect x="730" y="216" width="116" height="58" rx="9" class="op"/>
+  <text x="788" y="251" class="text">Mul</text>
+  <rect x="650" y="338" width="154" height="62" rx="9" class="rec"/>
+  <text x="727" y="364" class="text">AddRec&lt;L&gt;</text>
+  <text x="727" y="385" class="small">{0,+,1}</text>
+  <rect x="846" y="338" width="82" height="62" rx="9" class="leaf"/>
+  <text x="887" y="375" class="text">4</text>
+  <rect x="612" y="474" width="74" height="52" rx="9" class="leaf"/>
+  <rect x="768" y="474" width="74" height="52" rx="9" class="leaf"/>
+  <text x="649" y="506" class="text">0</text>
+  <text x="805" y="506" class="text">1</text>
+  <path d="M676 166 L596 216" class="edge"/>
+  <path d="M724 166 L770 216" class="edge"/>
+  <path d="M770 274 L742 338" class="edge"/>
+  <path d="M806 274 L872 338" class="edge"/>
+  <path d="M704 400 L666 474" class="edge"/>
+  <path d="M750 400 L790 474" class="edge"/>
+  <rect x="456" y="116" width="136" height="78" rx="10" class="summary"/>
+  <text x="524" y="143" class="text">Loop L摘要</text>
+  <text x="524" y="165" class="small">TripCount = 10</text>
+  <text x="524" y="184" class="small">Backedge = 9</text>
+  <text x="694" y="554" class="small">边表示操作数关系；Constant、Unknown和Recurrence节点可被多个表达式共享</text>
+  <text x="500" y="626" class="small">不能安全建模的SSA值形成Unknown叶子，不会用猜测的代数关系替代真实IR语义</text>
+</svg>

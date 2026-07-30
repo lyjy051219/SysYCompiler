@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" role="img" aria-labelledby="title desc">
+  <title id="title">Dominant分析构建的支配树</title>
+  <desc id="desc">左侧是菱形控制流图，右侧是对应的直接支配树。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .node{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .node2{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .text{font:600 15px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:14px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .edge{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
+      .idom{fill:none;stroke:#16a34a;stroke-width:2.5;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1000" height="540" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">Dominant：可达CFG → DominatorTree</text>
+  <rect x="28" y="58" width="444" height="420" rx="14" class="panel"/>
+  <rect x="492" y="58" width="480" height="420" rx="14" class="panel"/>
+  <text x="250" y="88" class="label" text-anchor="middle">原始CFG</text>
+  <text x="732" y="88" class="label" text-anchor="middle">直接支配树</text>
+  <path d="M250 144 L155 190" class="edge"/>
+  <path d="M250 144 L345 190" class="edge"/>
+  <path d="M155 234 L250 286" class="edge"/>
+  <path d="M345 234 L250 286" class="edge"/>
+  <path d="M250 330 L250 374" class="edge"/>
+  <rect x="195" y="100" width="110" height="44" rx="9" class="node"/>
+  <rect x="100" y="190" width="110" height="44" rx="9" class="node"/>
+  <rect x="290" y="190" width="110" height="44" rx="9" class="node"/>
+  <rect x="195" y="286" width="110" height="44" rx="9" class="node"/>
+  <rect x="195" y="374" width="110" height="44" rx="9" class="node"/>
+  <text x="250" y="127" class="text">Entry</text>
+  <text x="155" y="217" class="text">Then</text>
+  <text x="345" y="217" class="text">Else</text>
+  <text x="250" y="313" class="text">Merge</text>
+  <text x="250" y="401" class="text">Exit</text>
+  <path d="M732 144 L590 198" class="idom"/>
+  <path d="M732 144 L732 198" class="idom"/>
+  <path d="M732 144 L874 198" class="idom"/>
+  <path d="M874 242 L874 318" class="idom"/>
+  <rect x="677" y="100" width="110" height="44" rx="9" class="node2"/>
+  <rect x="535" y="198" width="110" height="44" rx="9" class="node2"/>
+  <rect x="677" y="198" width="110" height="44" rx="9" class="node2"/>
+  <rect x="819" y="198" width="110" height="44" rx="9" class="node2"/>
+  <rect x="819" y="318" width="110" height="44" rx="9" class="node2"/>
+  <text x="732" y="127" class="text">Entry</text>
+  <text x="590" y="225" class="text">Then</text>
+  <text x="732" y="225" class="text">Else</text>
+  <text x="874" y="225" class="text">Merge</text>
+  <text x="874" y="345" class="text">Exit</text>
+  <text x="732" y="395" class="small">每条树边满足 parent = IDom(child)</text>
+  <text x="500" y="515" class="small">每个入口可达BasicBlock对应一个树节点；不可达块不进入结果</text>
+</svg>

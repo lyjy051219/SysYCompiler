@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 660" role="img" aria-labelledby="title desc">
+  <title id="title">LoopAccess构建的循环迭代域访问足迹</title>
+  <desc id="desc">把二维循环的逻辑迭代坐标映射到字节地址，并汇总为访问维度、半开字节区间和变换判定。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .domain{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .formula{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}
+      .foot{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .decision{fill:#fef3c7;stroke:#d97706;stroke-width:2}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .mono{font:600 13px "JetBrains Mono",Consolas,monospace;fill:#0f172a;text-anchor:middle}
+      .edge{fill:none;stroke:#475569;stroke-width:2.5;marker-end:url(#arrow)}
+      .axis{stroke:#93c5fd;stroke-width:1}
+    </style>
+  </defs>
+  <rect width="1000" height="660" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">LoopAccess：迭代坐标 → 地址足迹 → 变换判定</text>
+  <rect x="28" y="58" width="286" height="516" rx="14" class="panel"/>
+  <rect x="334" y="58" width="286" height="516" rx="14" class="panel"/>
+  <rect x="640" y="58" width="332" height="516" rx="14" class="panel"/>
+  <text x="171" y="88" class="label" text-anchor="middle">矩形迭代域</text>
+  <text x="477" y="88" class="label" text-anchor="middle">仿射地址映射</text>
+  <text x="806" y="88" class="label" text-anchor="middle">完整访问足迹</text>
+  <rect x="68" y="122" width="206" height="206" rx="8" class="domain"/>
+  <path d="M120 122 V328 M171 122 V328 M223 122 V328" class="axis"/>
+  <path d="M68 191 H274 M68 260 H274" class="axis"/>
+  <text x="171" y="356" class="mono">(i,j), 0≤i&lt;3, 0≤j&lt;4</text>
+  <text x="171" y="384" class="small">外层轴 Lᵢ：TripCount 3</text>
+  <text x="171" y="409" class="small">内层轴 Lⱼ：TripCount 4</text>
+  <rect x="62" y="446" width="218" height="76" rx="10" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="171" y="474" class="text">访问：A[i][j]</text>
+  <text x="171" y="501" class="small">每个逻辑点执行一次4字节访问</text>
+  <path d="M280 484 L354 484" class="edge"/>
+  <rect x="366" y="132" width="222" height="100" rx="10" class="formula"/>
+  <text x="477" y="163" class="text">字节偏移函数</text>
+  <text x="477" y="194" class="mono">4 × (i × 4 + j)</text>
+  <rect x="366" y="270" width="222" height="86" rx="10" class="domain"/>
+  <text x="477" y="299" class="text">Dimension Lᵢ</text>
+  <text x="477" y="327" class="mono">Trip=3, Stride=16</text>
+  <rect x="366" y="390" width="222" height="86" rx="10" class="domain"/>
+  <text x="477" y="419" class="text">Dimension Lⱼ</text>
+  <text x="477" y="447" class="mono">Trip=4, Stride=4</text>
+  <text x="477" y="518" class="small">SCEV给次数，LoopDependence给仿射访问</text>
+  <path d="M588 182 L674 182" class="edge"/>
+  <rect x="674" y="122" width="264" height="140" rx="10" class="foot"/>
+  <text x="806" y="151" class="text">LoopAccessFootprint</text>
+  <text x="806" y="181" class="mono">Base = A</text>
+  <text x="806" y="207" class="mono">Bytes = [0, 48)</text>
+  <text x="806" y="233" class="small">ElementSize=4, Alignment=4</text>
+  <rect x="674" y="298" width="264" height="104" rx="10" class="foot"/>
+  <text x="806" y="327" class="text">形状结论</text>
+  <text x="806" y="355" class="small">Exact · Consecutive · FullAccess</text>
+  <text x="806" y="382" class="small">有限、无洞、地址不回绕</text>
+  <rect x="674" y="438" width="264" height="86" rx="10" class="decision"/>
+  <text x="806" y="467" class="text">访问对分类</text>
+  <text x="806" y="495" class="small">NoConflict / SameIterationOnly / Unknown</text>
+  <text x="500" y="612" class="small">足迹不是简单的“首尾地址”：只有次数、步长、必执行和无回绕均获证明时，才标记为Exact</text>
+  <text x="500" y="638" class="small">LoopFusion与UnrollAndJam消费LoopAccess的访问关系及轴步长/形状查询；证据不足时返回Unknown</text>
+</svg>

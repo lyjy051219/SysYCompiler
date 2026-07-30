@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 590" role="img" aria-labelledby="title desc">
+  <title id="title">BasicAA按需构建的指针来源模型和别名表</title>
+  <desc id="desc">左侧展示指针SSA值到底层对象及偏移的来源模型，右侧展示查询得到的别名矩阵。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .root{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}
+      .ptr{fill:#dbeafe;stroke:#2563eb;stroke-width:2}
+      .query{fill:#ecfeff;stroke:#0891b2;stroke-width:2}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .edge{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
+      .grid{stroke:#94a3b8;stroke-width:1}
+      .must{fill:#dcfce7}.no{fill:#dbeafe}.may{fill:#fee2e2}
+    </style>
+  </defs>
+  <rect width="1000" height="590" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">BasicAA：按需来源摘要 + Alias查询结果</text>
+  <rect x="28" y="58" width="540" height="472" rx="14" class="panel"/>
+  <rect x="588" y="58" width="384" height="472" rx="14" class="panel"/>
+  <text x="298" y="90" class="label" text-anchor="middle">指针来源与字节偏移</text>
+  <text x="780" y="90" class="label" text-anchor="middle">MemoryLocation查询结果</text>
+  <rect x="72" y="122" width="170" height="54" rx="10" class="root"/>
+  <rect x="354" y="122" width="170" height="54" rx="10" class="root"/>
+  <text x="157" y="145" class="text">%A = alloca [16 x i8]</text>
+  <text x="157" y="163" class="small">Base A, Size 16</text>
+  <text x="439" y="145" class="text">@G = global i32</text>
+  <text x="439" y="163" class="small">Base G, Size 4</text>
+  <rect x="58" y="250" width="180" height="58" rx="10" class="ptr"/>
+  <rect x="264" y="250" width="180" height="58" rx="10" class="ptr"/>
+  <rect x="368" y="372" width="170" height="58" rx="10" class="ptr"/>
+  <text x="148" y="274" class="text">%p = byte_offset(%A,+0)</text>
+  <text x="148" y="294" class="small">Base A, Offset 0</text>
+  <text x="354" y="274" class="text">%q = byte_offset(%A,+8)</text>
+  <text x="354" y="294" class="small">Base A, Offset 8</text>
+  <text x="453" y="396" class="text">%r = select %p, %q</text>
+  <text x="453" y="416" class="small">Bases {A}, Offset [0,8]</text>
+  <path d="M157 176 L148 250" class="edge"/>
+  <path d="M157 176 L354 250" class="edge"/>
+  <path d="M148 308 L416 372" class="edge"/>
+  <path d="M354 308 L470 372" class="edge"/>
+  <text x="226" y="220" class="small">来源摘要合并offset/alignment</text>
+  <rect x="620" y="126" width="320" height="250" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <path d="M780 126 V376 M860 126 V376" class="grid"/>
+  <path d="M620 176 H940 M620 226 H940 M620 276 H940 M620 326 H940" class="grid"/>
+  <text x="700" y="158" class="text">Location pair</text>
+  <text x="820" y="158" class="text">Result</text>
+  <text x="900" y="158" class="text">Proof</text>
+  <text x="700" y="208" class="text">%p[4] vs %p[4]</text>
+  <rect x="782" y="178" width="76" height="46" class="must"/><text x="820" y="207" class="text">Must</text>
+  <text x="900" y="208" class="small">same ptr</text>
+  <text x="700" y="258" class="text">%p[4] vs %q[4]</text>
+  <rect x="782" y="228" width="76" height="46" class="no"/><text x="820" y="257" class="text">No</text>
+  <text x="900" y="258" class="small">disjoint</text>
+  <text x="700" y="308" class="text">%r[4] vs %p[4]</text>
+  <rect x="782" y="278" width="76" height="46" class="may"/><text x="820" y="307" class="text">May</text>
+  <text x="900" y="308" class="small">select</text>
+  <text x="700" y="358" class="text">%r[4] vs @G[4]</text>
+  <rect x="782" y="328" width="76" height="46" class="no"/><text x="820" y="357" class="text">No</text>
+  <text x="900" y="358" class="small">bases</text>
+  <rect x="635" y="410" width="290" height="78" rx="10" class="query"/>
+  <text x="780" y="438" class="text">不是预先构建全函数别名图</text>
+  <text x="780" y="462" class="small">首次查询建立并缓存Provenance摘要</text>
+  <text x="500" y="565" class="small">相关来源、距离或对象内边界证明失败时，无法发布的强结论回退为MayAlias</text>
+</svg>

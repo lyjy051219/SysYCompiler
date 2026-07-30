@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" role="img" aria-labelledby="title desc">
+  <title id="title">SideEffect在调用图上传播函数效果摘要</title>
+  <desc id="desc">被调函数的读写集合沿调用边映射回调用者实参并迭代到固定点。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <marker id="up" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#ea580c"/>
+    </marker>
+    <style>
+      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
+      .func{fill:#ffedd5;stroke:#ea580c;stroke-width:2}
+      .summary{fill:#dcfce7;stroke:#16a34a;stroke-width:2}
+      .text{font:600 15px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .call{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
+      .prop{fill:none;stroke:#ea580c;stroke-width:2.5;stroke-dasharray:7 4;marker-end:url(#up)}
+    </style>
+  </defs>
+  <rect width="1000" height="600" fill="#ffffff"/>
+  <text x="500" y="34" class="title" text-anchor="middle">SideEffect：调用图上的效果摘要固定点</text>
+  <rect x="35" y="62" width="930" height="475" rx="14" class="panel"/>
+  <text x="500" y="92" class="text">正向发现直接调用边；反向把callee效果映射回caller</text>
+  <rect x="100" y="150" width="220" height="100" rx="12" class="func"/>
+  <rect x="390" y="150" width="220" height="100" rx="12" class="func"/>
+  <rect x="680" y="150" width="220" height="100" rx="12" class="func"/>
+  <text x="210" y="178" class="text">main</text>
+  <text x="210" y="203" class="small">call foo(&amp;G)</text>
+  <text x="210" y="225" class="small">局部效果：无</text>
+  <text x="500" y="178" class="text">foo(ptr %p)</text>
+  <text x="500" y="203" class="small">store %p；call bar()</text>
+  <text x="500" y="225" class="small">局部：Mod {%p}</text>
+  <text x="790" y="178" class="text">bar</text>
+  <text x="790" y="203" class="small">load @A</text>
+  <text x="790" y="225" class="small">局部：Ref {@A}</text>
+  <path d="M320 185 L390 185" class="call"/>
+  <path d="M610 185 L680 185" class="call"/>
+  <text x="355" y="170" class="small">call</text>
+  <text x="645" y="170" class="small">call</text>
+  <path d="M680 235 C640 315 600 315 555 250" class="prop"/>
+  <path d="M390 235 C350 345 300 345 255 250" class="prop"/>
+  <text x="620" y="318" class="small">Ref {@A} 传播到 foo</text>
+  <text x="335" y="355" class="small">%p映射为实参 @G</text>
+  <rect x="115" y="395" width="770" height="100" rx="12" class="summary"/>
+  <text x="500" y="424" class="text">最终返回 SideEffectInfo(main)</text>
+  <text x="500" y="452" class="text">ModSet = {@G}　 RefSet = {@A}</text>
+  <text x="500" y="478" class="small">ptrMap支撑来源映射；Builtin / Unknown / Observable / Ordering / CrossObject独立保存</text>
+  <text x="500" y="570" class="small">递归调用通过调用图上的单调固定点统一求解</text>
+</svg>
