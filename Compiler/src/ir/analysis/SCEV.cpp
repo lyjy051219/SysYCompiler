@@ -2970,7 +2970,7 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
     return "<bad-scev>";
 }
 
-// Pass 主流程获取 LoopInfo 与 DominatorTree，并返回惰性 SCEV 查询上下文。
+//构建SCEV入口
 SCEVAnalysis::Result
 SCEVAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
     // 1. 循环递推识别依赖 LoopInfo，退出形状验证依赖 DominatorTree。

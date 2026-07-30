@@ -2,69 +2,31 @@
 #include <stack>
 #include <queue>
 #include <algorithm>
+//一些基本接口
 Loop::Loop() = default;
-
-BasicBlock *Loop::getHeader() const {
-    return Header;
+BasicBlock *Loop::getHeader() const {return Header;}
+Loop *Loop::getParentLoop() const {return ParentLoop;}
+const std::vector<Loop *> &Loop::getSubLoops() const {return SubLoops;}
+const std::vector<BasicBlock *> &Loop::getBlocks() const {return Blocks;}
+const std::vector<BasicBlock *> &Loop::getBackedgeSrcs() const {return BackedgeSrcs;}
+LoopInfo::LoopInfo() = default;
+LoopInfo::LoopInfo(LoopInfo &&) = default;
+LoopInfo &LoopInfo::operator=(LoopInfo &&) = default;
+void LoopInfo::clear() {
+    Loops.clear();
+    TopLevelLoops.clear();
+    BBToLoop.clear();
 }
-
-Loop *Loop::getParentLoop() const {
-    return ParentLoop;
-}
-
-const std::vector<Loop *> &Loop::getSubLoops() const {
-    return SubLoops;
-}
-
-const std::vector<BasicBlock *> &Loop::getBlocks() const {
-    return Blocks;
-}
-
-const std::vector<BasicBlock *> &Loop::getBackedgeSrcs() const {
-    return BackedgeSrcs;
-}
-
+//从当前循环开始，沿着父循环向上计算深度（表层循环深度为1）
 unsigned Loop::getDepth() const {
     unsigned Depth = 1;
     for (Loop *Parent = ParentLoop; Parent; Parent = Parent->ParentLoop)
         ++Depth;
     return Depth;
 }
-
-bool Loop::isInnermost() const {
-    return SubLoops.empty();
-}
-
-LoopInfo::LoopInfo() = default;
-
-LoopInfo::LoopInfo(LoopInfo &&) = default;
-
-LoopInfo &LoopInfo::operator=(LoopInfo &&) = default;
-
-void LoopInfo::clear() {
-    Loops.clear();
-    TopLevelLoops.clear();
-    BBToLoop.clear();
-}
-
-Loop *LoopInfo::getLoopFor(BasicBlock *BB) const {
-    auto It = BBToLoop.find(BB);
-    return It != BBToLoop.end() ? It->second : nullptr;
-}
-
-bool LoopInfo::isLoopInvariant(Value *V, const Loop *L) {
-    if (!V || !L) return true;
-    if (V->isConst()) return true;
-    if (V->isParam() || V->isGlobal()) return true;
-    auto *I = dynamic_cast<Instruction *>(V);
-    BasicBlock *BB = I ? I->getParent() : nullptr;
-    return !BB || !L->contains(BB);
-}
-
-const std::vector<Loop *> &LoopInfo::getTopLevelLoops() const {
-    return TopLevelLoops;
-}
-
+//判断当前循环是否是最内层循环
+bool Loop::isInnermost() const {return SubLoops.empty();}
+//检查目标基本块是否存在于当前或者内层循环中
 bool Loop::contains(BasicBlock* BB) const {
     for (BasicBlock* b : Blocks)
         if (b == BB) return true;
@@ -72,8 +34,26 @@ bool Loop::contains(BasicBlock* BB) const {
         if (sub->contains(BB)) return true;
     return false;
 }
-
-// 查询流程：先展平当前循环树的内部块，再扫描离开该集合的 CFG 边并去重出口。
+//返回当前循环及其所有子循环所有基本块
+std::vector<BasicBlock*> Loop::getBlocksIncludingSubLoops() const {
+    std::vector<BasicBlock*> Result;
+    std::unordered_set<BasicBlock*> Seen;
+    std::vector<const Loop*> Stack{this};
+    while (!Stack.empty()) {
+        const Loop *Current = Stack.back();
+        Stack.pop_back();
+        if (!Current) continue;
+        for (BasicBlock *BB : Current->getBlocks()) {
+            if (BB && Seen.insert(BB).second) Result.push_back(BB);
+        }
+        for (Loop *Sub : Current->getSubLoops()) {
+            if (Sub) Stack.push_back(Sub);
+        }
+    }
+    return Result;
+}
+//获取该循环所有出口块：先获得当前循环及所有子循环基本块
+//然后遍历这些块的后继，若后继不在当前循环及子循环中，则是出口块
 std::vector<BasicBlock*> Loop::getExitBlocks() const {
     std::vector<BasicBlock*> exitBlocks;
     std::unordered_set<BasicBlock*> allInternalBlocks;
@@ -106,25 +86,7 @@ std::vector<BasicBlock*> Loop::getExitBlocks() const {
 
     return exitBlocks;
 }
-
-std::vector<BasicBlock*> Loop::getBlocksIncludingSubLoops() const {
-    std::vector<BasicBlock*> Result;
-    std::unordered_set<BasicBlock*> Seen;
-    std::vector<const Loop*> Stack{this};
-    while (!Stack.empty()) {
-        const Loop *Current = Stack.back();
-        Stack.pop_back();
-        if (!Current) continue;
-        for (BasicBlock *BB : Current->getBlocks()) {
-            if (BB && Seen.insert(BB).second) Result.push_back(BB);
-        }
-        for (Loop *Sub : Current->getSubLoops()) {
-            if (Sub) Stack.push_back(Sub);
-        }
-    }
-    return Result;
-}
-
+//按照所属函数中的基本块顺序返回当前循环所有基本块
 std::vector<BasicBlock*> Loop::getBlocksInFunctionOrder() const {
     std::vector<BasicBlock*> Result;
     Function *F = Header ? Header->getParent() : nullptr;
@@ -134,8 +96,7 @@ std::vector<BasicBlock*> Loop::getBlocksInFunctionOrder() const {
     }
     return Result;
 }
-
-// 顺序查询只遍历当前循环直接拥有的块，子循环由循环树查询单独处理。
+//RPO：对CFG后序遍历，然后反转结果得到RPO，只获得当前循环层的基本块
 std::vector<BasicBlock*> Loop::getBlocksInRPO() const {
     std::vector<BasicBlock*> PostOrder;
     std::unordered_set<BasicBlock*> InLoop;
@@ -170,7 +131,7 @@ std::vector<BasicBlock*> Loop::getBlocksInRPO() const {
     std::reverse(PostOrder.begin(), PostOrder.end());
     return PostOrder;
 }
-
+//后序遍历返回当前循环及其所有子循环
 std::vector<Loop*> Loop::getLoopsInPostOrder(
     bool ReverseSiblingOrder) const {
     std::vector<Loop*> Result;
@@ -196,7 +157,7 @@ std::vector<Loop*> Loop::getLoopsInPostOrder(
     }
     return Result;
 }
-
+//判断该基本块是否是该循环的退出块：即该基本块有后继不在该循环中
 bool Loop::isExitingBlock(BasicBlock *BB) const {
     if (!BB || !contains(BB)) return false;
     for (BasicBlock *Succ : BB->getSuccessors()) {
@@ -204,8 +165,7 @@ bool Loop::isExitingBlock(BasicBlock *BB) const {
     }
     return false;
 }
-
-// 形状查询依次验证唯一循环内前驱、唯一循环外前驱、专用预头和专用出口。
+//检查当前循环是否具有唯一 preheader、唯一 latch 和专用出口，并在成功时返回 preheader 与 latch
 bool Loop::getLoopSimplifyForm(BasicBlock* &PreHeader, BasicBlock* &Latch) const {
     PreHeader = nullptr;
     Latch = nullptr;
@@ -235,18 +195,28 @@ bool Loop::getLoopSimplifyForm(BasicBlock* &PreHeader, BasicBlock* &Latch) const
             if (!contains(Pred)) return false;
         }
     }
-
     return true;
 }
-
-bool LoopInfo::invalidate(Function &F, const PreservationStatus &PA) {
-    if (PA.isKept(LoopAnalysis::ID()))
-        return false;
-    return true;
+//返回给定基本块直接属于的最内层循环
+Loop *LoopInfo::getLoopFor(BasicBlock *BB) const {
+    auto It = BBToLoop.find(BB);
+    return It != BBToLoop.end() ? It->second : nullptr;
 }
-
-std::vector<Loop*> LoopInfo::getLoopsInPostOrder(
-    bool ReverseSiblingOrder) const {
+//返回循环森林中所有顶层循环
+const std::vector<Loop *> &LoopInfo::getTopLevelLoops() const {
+    return TopLevelLoops;
+}
+//是否是循环不变值：常量、参数、全局值和定义在循环外的指令
+bool LoopInfo::isLoopInvariant(Value *V, const Loop *L) {
+    if (!V || !L) return true;
+    if (V->isConst()) return true;
+    if (V->isParam() || V->isGlobal()) return true;
+    auto *I = dynamic_cast<Instruction *>(V);
+    BasicBlock *BB = I ? I->getParent() : nullptr;
+    return !BB || !L->contains(BB);
+}
+//后序遍历返回所有循环
+std::vector<Loop*> LoopInfo::getLoopsInPostOrder(bool ReverseSiblingOrder) const {
     std::vector<Loop*> Result;
     if (ReverseSiblingOrder) {
         for (auto It = TopLevelLoops.rbegin(); It != TopLevelLoops.rend(); ++It) {
@@ -263,18 +233,21 @@ std::vector<Loop*> LoopInfo::getLoopsInPostOrder(
     }
     return Result;
 }
+bool LoopInfo::invalidate(Function &F, const PreservationStatus &PA) {
+    if (PA.isKept(LoopAnalysis::ID()))
+        return false;
+    return true;
+}
 
-// 1. 后序扫描支配树，把 Header 支配其前驱的边识别为回边并创建循环对象。
+//1.获得循环头
 void LoopInfoBuilder::discoverLoopHeaders(Function &F, const DominatorTree &DT,
                                           LoopInfo &LI,
                                           std::vector<Loop*>& RPOLoops) {
-
+    //1.1使用支配树后序遍历
     std::vector<DominatorNode*> postorder = DT.getNodesInPostOrder();
-
     for (DominatorNode* dtNode : postorder) {
-
+        //1.2检查每个基本块的前驱，若有前驱被该基本块支配，则是回边源，当前基本块是循环头
         BasicBlock* header = dtNode->Block;
-
         std::vector<BasicBlock*> backedges;
         auto predecessors = header->getPredecessors();
         for (BasicBlock* pred : predecessors) {
@@ -282,61 +255,50 @@ void LoopInfoBuilder::discoverLoopHeaders(Function &F, const DominatorTree &DT,
                 backedges.push_back(pred);
             }
         }
-
         if (backedges.empty()) continue;
-
+        //1.3发现循环头，创建 Loop 对象并记录循环头和回边源
         auto loop = std::make_unique<Loop>();
         loop->Header = header;
         loop->BackedgeSrcs = std::move(backedges);
-
         Loop* loopPtr = loop.get();
         LI.Loops.push_back(std::move(loop));
+        //1.4记录RPO顺序，后序第三步使用
         RPOLoops.push_back(loopPtr);
     }
 }
 
-// 2. 按内层优先顺序从回边源逆向走 CFG，确定直接块归属并连接父子循环。
+//2.从每个循环回边源按照CFG反向遍历到循环头，构建循环体和嵌套关系
 void LoopInfoBuilder::LoopsCFG(LoopInfo &LI, const DominatorTree &DT) {
-    // 2.1 每个循环以全部回边源为种子，向前驱方向扩展到 Header。
+    //2.1先遍历内层循环后遍历外层循环
     for (auto& loopUPtr : LI.Loops) {
         Loop* L = loopUPtr.get();
         BasicBlock* header = L->Header;
         std::stack<BasicBlock*> worklist;
-
         for (BasicBlock* src : L->BackedgeSrcs) {
             worklist.push(src);
         }
-
+        //2.2遍历所有回边源
         while (!worklist.empty()) {
             BasicBlock* bb = worklist.top();
             worklist.pop();
-
-            // 2.2 未归属块加入当前循环；已归属块代表内层循环，只越过其入口继续搜索。
             Loop* subloop = LI.getLoopFor(bb);
-
+            //2.3该块未归属任何循环，直接映射到当前循环，然后将前驱加入工作栈
             if (subloop == nullptr) {
-
                 LI.BBToLoop[bb] = L;
-
                 if (bb == header) continue;
-
                 for (BasicBlock* pred : bb->getPredecessors()) {
                     worklist.push(pred);
                 }
+            //2.4该块已经归属某个循环，建立子循环与父循环嵌套关系
             } else {
-
                 while (subloop->ParentLoop != nullptr && subloop->ParentLoop != L) {
                     subloop = subloop->ParentLoop;
                 }
-
                 if (subloop == L) continue;
-
                 subloop->ParentLoop = L;
                 L->SubLoops.push_back(subloop);
-
                 BasicBlock* innerHeader = subloop->Header;
                 for (BasicBlock* pred : innerHeader->getPredecessors()) {
-
                     if (!DT.dominates(innerHeader, pred)) {
                         worklist.push(pred);
                     }
@@ -346,7 +308,7 @@ void LoopInfoBuilder::LoopsCFG(LoopInfo &LI, const DominatorTree &DT) {
     }
 }
 
-// 3. 逆转发现顺序得到外层优先次序，收集顶层循环并填充每个循环的直接块列表。
+//3.RPO
 void LoopInfoBuilder::LoopsDFS(LoopInfo &LI, const std::vector<Loop*>& RPOLoops) {
 
     for (int i = (int)RPOLoops.size() - 1; i >= 0; --i) {
@@ -370,37 +332,33 @@ void LoopInfoBuilder::LoopsDFS(LoopInfo &LI, const std::vector<Loop*>& RPOLoops)
     }
 }
 
-// 自然循环分析主流程：以支配回边为入口，构建循环森林及块到最内层循环的映射。
+//LoopInfo分析主流程:
 LoopInfo LoopInfoBuilder::build(Function &F, const DominatorTree &DT) {
-    // 1. 缺少可达入口或支配树时返回空结果。
+    //1.
     LoopInfo LI;
-
     if (F.size() == 0 || DT.Root == nullptr)
         return LI;
 
-    // 2. 发现所有自然循环头，并保留内层优先的发现顺序。
+    //2.发现所有自然循环头，填充Header和BackedgeSrcs，并记录RPO顺序
     std::vector<Loop*> RPOLoops;
     discoverLoopHeaders(F, DT, LI, RPOLoops);
-
     if (LI.Loops.empty())
         return LI;
 
-    // 3. 逆向 CFG 填充归属关系，同时建立循环嵌套。
+    //3.构建循环体和循环嵌套，填充ParentLoop、SubLoops
     LoopsCFG(LI,DT);
 
-    // 4. 整理顶层循环和直接块列表，完成结果封装。
+    //4.填充LoopInfo中TopLevelLoops，BBToLoop，以及Blocks直接块
     LoopsDFS(LI, RPOLoops);
 
     return LI;
 }
 
 PassID LoopAnalysis::Key;
-
 LoopAnalysis::Result LoopAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    // 1. 自然循环的回边判定依赖支配关系，先取得当前函数的支配树。
+    //1.依赖支配树
     const DominatorTree &DT = FAM.getResult<DominantAnalysis>(F);
-
-    // 2. 运行三阶段构建器，返回循环森林和最内层块归属映射。
+    //2.构建循环森林
     LoopInfoBuilder builder;
     return builder.build(F, DT);
 }

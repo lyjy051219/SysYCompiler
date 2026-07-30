@@ -952,56 +952,6 @@ https://zhuanlan.zhihu.com/p/655369292
 https://zhuanlan.zhihu.com/p/365912693
 https://zhuanlan.zhihu.com/p/1955319335347290919
 
-##### LoopInfo
-
-**我们在进行LoopInfoAnlysis的时候，得到的分析结果是Loop森林，即Loop是按照森林的形式存储的**
-
-参考LLVM经典算法--即**Tarjan 自然循环识别算法**实现，但对LLVM算法做了一些修改
-
-与llvm算法的区别主要在第三次遍历，在llvm中使用的是针对Loop局部遍历（后序遍历+反转），我这里使用的是全局RPO遍历
-
-相比llvm算法，这个改进更加清晰，并且实现简单，并且能达到同样的遍历效果
-
-并且我们在第一步就直接计算出RPO顺序供第三步使用，进一步降低了工作量，简化了代码
-
-- 算法流程
-
-  1. 获取支配树分析结果
-
-  2. 循环1：**后序遍历支配树**，找到所有循环头和回边
-
-     回边的判定：某个节点被循环头支配，同时这个结点在BasicBlock中又是循环头的前驱
-
-     循环头的判定：循环头一定有回边指向它
-
-     循环流程：先假设目前节点是循环头，然后检查是否存在回边，然后判定是不是循环头
-
-     **主要目的：确定循环头，建立循环Loop对象**
-
-  3. 循环2：**反向遍历CFG**--即从循环尾向上遍历CFG中的每个结点--**建立循环树的过程**
-
-     在每个循环中，从每个循环的回边起点开始在CFG中反向遍历
-
-     对于遇到的每个BasicBlock：
-
-     ​    如果该块没有被任何Loop认领：
-
-     ​       a) 如果块是新的，将其分配给当前循环L
-
-     ​       b) 如果块是循环头，停止向前遍历（否则会跑到循环外面）（循环头一定是该循环在CFG反向中的最后一站了）
-
-     ​    如果该块已经被其他Loop认领：
-
-     ​	说明遇到了更加内层的循环（为什么内层：因为我们第一步是后序遍历的，永远是处理最内层的循环再向外遍历）
-
-     ​	 那么我们将内层循环所有BasicBlock与外层循环建立联系
-
-     **主要目的：建立子循环与父循环的连接**
-
-  4. 循环3：**RPO遍历**（CFG后序遍历结果反转之后得到的序列）：--**填补循环树的过程**
-
-     **主要目的：建立父循环与子循环的连接**
-
 ##### BasicAliasAnalysis
 
 采用**即时计算别名分析**实现
@@ -4618,6 +4568,10 @@ https://gemini.google.com/app/2937246d3292e3d5
 
 ##### LoopInfo/LoopAnalysis循环分析
 
+建立循环森林
+
+![Generated image 1](assets/Generated image 1.png)
+
 ##### MemorySSA
 
 将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
@@ -4629,8 +4583,7 @@ https://gemini.google.com/app/2937246d3292e3d5
 3. LICM：证明 Load 的最近相关写入位于循环外，从而提升 Load
 4. DSE：证明所有到达路径都已经写入同一个值，删除后续冗余 Store
 5. InstSimplify
-6. SCCP
-7. LocalAggregateSimplify
+6. SCCPLocalAggregateSimplify
 
 - 内存状态结点：
 
@@ -4655,7 +4608,9 @@ https://gemini.google.com/app/2937246d3292e3d5
 
 参考资料：https://zhuanlan.zhihu.com/p/715818784
 
+##### SCEV标量演化分析
 
+依赖AnalysisPass：
 
 
 
