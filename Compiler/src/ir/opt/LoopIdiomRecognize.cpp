@@ -1,5 +1,4 @@
 #include "ir/opt/LoopIdiomRecognize.hpp"
-
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -8,66 +7,12 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/GepOpt.hpp"
 #include "lib/IRUtils.hpp"
-
 #include <cstring>
 #include <limits>
 #include <unordered_set>
-
-bool LoopIdiomRecognizePass::matchLinearAccess(
-    GetElementPtrInst *GEP, PhiInst *IndVar, Loop *L,
-    LinearAccess &Access) {
-    // 1.1 将地址规范为循环外基址加索引列；恰有一个索引必须是归纳变量，其余均为
-    // 常量，并验证该维步长等于 4 字节标量元素，保证每次迭代访问相邻元素。
-    Access = {};
-    if (!GEP || !IndVar || !L) return false;
-
-    Value *Base = nullptr;
-    std::vector<Value *> Indices;
-    if (!GEP->getBaseAndIndices(Base, Indices) || !Base || Indices.empty())
-        return false;
-    if (auto *BaseI = dynamic_cast<Instruction *>(Base)) {
-        BasicBlock *BaseBB = BaseI->getParent();
-        if (BaseBB && L->contains(BaseBB)) return false;
-    }
-
-    size_t DynamicIndex = 0;
-    unsigned DynamicCount = 0;
-    for (size_t I = 0; I < Indices.size(); ++I) {
-        if (Indices[I] == IndVar) {
-            DynamicIndex = I;
-            ++DynamicCount;
-            continue;
-        }
-        int ConstantIndex = 0;
-        if (!Value::tryGetIntIndex(Indices[I], ConstantIndex)) return false;
-    }
-    if (DynamicCount != 1) return false;
-
-    auto ElementTy = IRType::getPointeeType(GEP->getIRType());
-
-    if (!ElementTy ||
-        (!ElementTy->hasIntegerBitWidth(32) && !ElementTy->isFloat()))
-        return false;
-
-    std::vector<int64_t> Strides;
-    int64_t FinalStride = 0;
-    if (!GetElementPtrInst::getIndexStrides(Base, Indices, Strides,
-                                            FinalStride) ||
-        DynamicIndex >= Strides.size() ||
-        Strides[DynamicIndex] != static_cast<int64_t>(ElementTy->getSize()) ||
-        FinalStride != static_cast<int64_t>(ElementTy->getSize()))
-        return false;
-
-    Access.GEP = GEP;
-    Access.Base = Base;
-    Access.Indices = std::move(Indices);
-    Access.InductionIndex = DynamicIndex;
-    Access.ElementTy = ElementTy;
-    return true;
-}
-
+//剥离地址转换并返回可用于不相交证明的对象根
 Value *LoopIdiomRecognizePass::getDisjointObjectRoot(Value *V) {
-    // 1.2 剥离 GEP/bitcast 后只承认不同的全局或 alloca 根为确定不相交对象。
+    //1.2 剥离 GEP/bitcast 后只承认不同的全局或 alloca 根为确定不相交对象。
     std::unordered_set<Value *> Seen;
     while (V && Seen.insert(V).second) {
         if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {
@@ -88,16 +33,16 @@ Value *LoopIdiomRecognizePass::getDisjointObjectRoot(Value *V) {
     }
     return dynamic_cast<AllocaInst *>(V) ? V : nullptr;
 }
-
+//判断两个线性访问是否来自不同的确定对象
 bool LoopIdiomRecognizePass::areProvablyDisjoint(
     const LinearAccess &A, const LinearAccess &B) {
     Value *ARoot = getDisjointObjectRoot(A.Base);
     Value *BRoot = getDisjointObjectRoot(B.Base);
     return ARoot && BRoot && ARoot != BRoot;
 }
-
+//提取可由memset表示的重复字节常量
 bool LoopIdiomRecognizePass::getRepeatedByte(Value *V, uint8_t &Byte) {
-    // 1.3 将 i32/float 常量按位查看，四个字节完全相同才可用单字节 memset 表示。
+    //1.3 将 i32/float 常量按位查看，四个字节完全相同才可用单字节 memset 表示。
     uint32_t Bits = 0;
     if (auto *CI = dynamic_cast<ConstInt *>(V)) {
         Bits = static_cast<uint32_t>(CI->getVal());
@@ -108,7 +53,6 @@ bool LoopIdiomRecognizePass::getRepeatedByte(Value *V, uint8_t &Byte) {
     } else {
         return false;
     }
-
     uint8_t B0 = static_cast<uint8_t>(Bits & 0xffu);
     if (static_cast<uint8_t>((Bits >> 8) & 0xffu) != B0 ||
         static_cast<uint8_t>((Bits >> 16) & 0xffu) != B0 ||
@@ -117,26 +61,74 @@ bool LoopIdiomRecognizePass::getRepeatedByte(Value *V, uint8_t &Byte) {
     Byte = B0;
     return true;
 }
-
+//匹配由单个归纳索引驱动的连续同型GEP访问
+bool LoopIdiomRecognizePass::matchLinearAccess(
+    GetElementPtrInst *GEP, PhiInst *IndVar, Loop *L,
+    LinearAccess &Access) {
+    //1.1 先清空输出并拆分基址与索引；失败时不留下半匹配状态
+    Access = {};
+    if (!GEP || !IndVar || !L) return false;
+    Value *Base = nullptr;
+    std::vector<Value *> Indices;
+    if (!GEP->getBaseAndIndices(Base, Indices) || !Base || Indices.empty())
+        return false;
+    //1.2 基址必须定义在循环外，否则intrinsic首地址无法安全前移到preheader
+    if (auto *BaseI = dynamic_cast<Instruction *>(Base)) {
+        BasicBlock *BaseBB = BaseI->getParent();
+        if (BaseBB && L->contains(BaseBB)) return false;
+    }
+    //1.3 恰有一个索引等于规范归纳PHI，其余索引必须是循环不变常量
+    size_t DynamicIndex = 0;
+    unsigned DynamicCount = 0;
+    for (size_t I = 0; I < Indices.size(); ++I) {
+        if (Indices[I] == IndVar) {
+            DynamicIndex = I;
+            ++DynamicCount;
+            continue;
+        }
+        int ConstantIndex = 0;
+        if (!Value::tryGetIntIndex(Indices[I], ConstantIndex)) return false;
+    }
+    if (DynamicCount != 1) return false;
+    auto ElementTy = IRType::getPointeeType(GEP->getIRType());
+    if (!ElementTy ||
+        (!ElementTy->hasIntegerBitWidth(32) && !ElementTy->isFloat()))
+        return false;
+    //1.4 动态维步长与最终元素步长都必须等于元素大小，保证迭代间地址严格连续
+    std::vector<int64_t> Strides;
+    int64_t FinalStride = 0;
+    if (!GetElementPtrInst::getIndexStrides(Base, Indices, Strides,
+                                            FinalStride) ||
+        DynamicIndex >= Strides.size() ||
+        Strides[DynamicIndex] != static_cast<int64_t>(ElementTy->getSize()) ||
+        FinalStride != static_cast<int64_t>(ElementTy->getSize()))
+        return false;
+    //1.5 所有证明完成后一次性提交匹配结果，任何保守回退都保持输出为空
+    Access.GEP = GEP;
+    Access.Base = Base;
+    Access.Indices = std::move(Indices);
+    Access.InductionIndex = DynamicIndex;
+    Access.ElementTy = ElementTy;
+    return true;
+}
+//证明循环仅含惯用法替换允许的指令
 bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     Loop *L, const LoopTripCountInfo &TCI,
     const InductionDescriptor &IV, StoreInst *Store,
     GetElementPtrInst *DestGEP, LoadInst *SourceLoad,
     GetElementPtrInst *SourceGEP, DominatorTree &DT) {
-    // 2.1 循环体只能包含归纳更新、唯一退出比较、地址、单次 load/store 和分支；
-    // store 必须支配 latch，且这些关键值不能在循环外另有用户。
+    //2.1 循环体只能包含归纳更新、唯一退出比较、地址、单次 load/store 和分支；
+    //store 必须支配 latch，且这些关键值不能在循环外另有用户。
     if (!L || !Store || !DestGEP || !IV.Phi || !IV.UpdateValue ||
         !TCI.ExitCmp || !TCI.Latch || !TCI.ExitingBlock)
         return false;
     if (!DT.dominates(Store->getParent(), TCI.Latch)) return false;
-
     std::unordered_set<Instruction *> Allowed{
         IV.Phi, dynamic_cast<Instruction *>(IV.UpdateValue), TCI.ExitCmp,
         DestGEP, Store};
     if (SourceLoad) Allowed.insert(SourceLoad);
     if (SourceGEP) Allowed.insert(SourceGEP);
     if (Allowed.count(nullptr)) Allowed.erase(nullptr);
-
     unsigned ConditionalBranches = 0;
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
     for (BasicBlock *BB : LoopBlocks)
@@ -153,7 +145,6 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
         return Allowed.count(I) != 0;
     })) return false;
     if (ConditionalBranches != 1) return false;
-
     for (Instruction *I : Allowed) {
         if (!I) continue;
         for (Use *U : I->getUses()) {
@@ -165,26 +156,23 @@ bool LoopIdiomRecognizePass::hasOnlyAllowedLoopInstructions(
     }
     return true;
 }
-
+//在循环preheader中物化线性访问的首元素地址
 GetElementPtrInst *LoopIdiomRecognizePass::materializeStartPointer(
     const LinearAccess &Access, PhiInst *IndVar, int64_t Start,
     BasicBlock *PreHeader) {
-    // 3.1 用常量起始值替换线性地址中的归纳索引，并在 preheader 终结指令前生成
-    // intrinsic 所需首元素指针。
+    //3.1 用常量起始值替换线性地址中的归纳索引，并在 preheader 终结指令前生成
+    //intrinsic 所需首元素指针。
     if (!Access.Base || !IndVar || !PreHeader ||
         Access.InductionIndex >= Access.Indices.size() ||
         Start < std::numeric_limits<int32_t>::min() ||
         Start > std::numeric_limits<int32_t>::max())
         return nullptr;
-
     std::vector<Value *> Indices = Access.Indices;
     Value *StartValue = Value::makeIntegerLike(
         Indices[Access.InductionIndex], static_cast<int32_t>(Start));
     if (!StartValue) return nullptr;
     Indices[Access.InductionIndex] = StartValue;
-
     auto *StartGEP = new GetElementPtrInst(Access.Base, Indices);
-
     StartGEP->updateType();
     if (!PreHeader->insertBeforeTerminator(StartGEP)) {
         delete StartGEP;
@@ -192,22 +180,20 @@ GetElementPtrInst *LoopIdiomRecognizePass::materializeStartPointer(
     }
     return StartGEP;
 }
-
+//匹配可参与临时数组双复制消除的简单连续复制循环
 bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
     Loop *L, SCEVResult &SE, DominatorTree &DT,
     CopyLoopMatch &Match) {
-    // 4.1 识别单位正步长的最内层复制循环；常量次数必须正且无回绕，运行期形态
-    // 必须是 header 中 iv < bound，并记录 preheader/exit/起点与边界。
+    //4.1 识别单位正步长的最内层复制循环；常量次数必须正且无回绕，运行期形态
+    //必须是 header 中 iv < bound，并记录 preheader/exit/起点与边界。
     Match = {};
     if (!L || !L->isInnermost()) return false;
-
     auto TCI = SE.analyzeLoopTripCount(L);
     auto IV = SE.getCanonicalInduction(L);
     if (!TCI || !TCI->Valid || !IV || !IV->Valid ||
         !IV->ConstantStart || !IV->ConstantStep ||
         *IV->ConstantStep != 1 || TCI->IndVar != IV->Phi)
         return false;
-
     Match.L = L;
     Match.PreHeader = TCI->PreHeader;
     Match.Header = TCI->Header;
@@ -216,7 +202,6 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
     Match.Start = *IV->ConstantStart;
     if (!Match.PreHeader || !Match.Header || !Match.ExitBlock)
         return false;
-
     if (TCI->ConstantTripCount) {
         if (!TCI->ProvenNoWrap || *TCI->ConstantTripCount <= 0)
             return false;
@@ -241,9 +226,8 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
         Match.IsRuntime = true;
         Match.RuntimeBound = Bound;
     }
-
-    // 4.2 要求恰好一条 load feeding 唯一 store，二者地址均为同型连续线性访问，
-    // 并通过允许指令集合检查排除额外计算、调用和条件控制。
+    //4.2 要求恰好一条 load feeding 唯一 store，二者地址均为同型连续线性访问，
+    //并通过允许指令集合检查排除额外计算、调用和条件控制。
     std::vector<LoadInst *> Loads;
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
     if (!forEachInstructionInBlocks(
@@ -262,12 +246,10 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
         Match.Store->getValueOperand() != Loads.front())
         return false;
     Match.Load = Loads.front();
-
     if (TCI->ExitingBlock == TCI->Header &&
         (Match.Store->getParent() == TCI->Header ||
          Match.Load->getParent() == TCI->Header))
         return false;
-
     auto *DestGEP = dynamic_cast<GetElementPtrInst *>(
         Match.Store->getPointerOperand());
     auto *SourceGEP = dynamic_cast<GetElementPtrInst *>(
@@ -282,13 +264,13 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
         return false;
     return true;
 }
-
+//把经临时数组衔接的两段连续复制合并为memmove
 bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     Function &F, const CopyLoopMatch &First,
     const CopyLoopMatch &Second, DominatorTree &DT, RangeInfo &RI,
     bool &CFGChanged) {
-    // 4. 从已匹配复制循环中寻找 source→temporary 与 temporary→destination 的相邻
-    // 二段复制；起点、次数/运行期边界及桥接 CFG 必须完全一致。
+    //4. 从已匹配复制循环中寻找 source→temporary 与 temporary→destination 的相邻
+    //二段复制；起点、次数/运行期边界及桥接 CFG 必须完全一致。
     if (!First.L || !Second.L || First.L == Second.L ||
         First.ExitBlock != Second.PreHeader ||
         First.Start != Second.Start ||
@@ -303,7 +285,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
                    std::numeric_limits<int32_t>::max() / 4) {
         return false;
     }
-
     BasicBlock *Bridge = First.ExitBlock;
     if (!Bridge || !Bridge->getBranchTerminator() ||
         Bridge->getBranchTerminator()->isConditional() ||
@@ -312,23 +293,20 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         return false;
     for (Instruction *I : *Bridge)
         if (I != Bridge->getBranchTerminator()) return false;
-
-    // 4.3 中间对象必须是只被两条对应 GEP 使用的数组 alloca，读写索引形状一致；
-    // 这证明临时数组可消去并将两段复制合成为 memmove。
+    //4.3 中间对象必须是只被两条对应 GEP 使用的数组 alloca，读写索引形状一致；
+    //这证明临时数组可消去并将两段复制合成为 memmove。
     auto *Temporary = dynamic_cast<AllocaInst *>(First.Destination.Base);
     if (!Temporary || Second.Source.Base != Temporary ||
         !AllocaInst::isArrayAllocation(Temporary) ||
         !First.Source.ElementTy->hasSameStorageType(
             *Second.Destination.ElementTy))
         return false;
-
     GetElementPtrInst *TempWrite = First.Destination.GEP;
     GetElementPtrInst *TempRead = Second.Source.GEP;
     if (!TempWrite || !TempRead || TempWrite == TempRead ||
         TempWrite->getBasePointer() != Temporary ||
         TempRead->getBasePointer() != Temporary)
         return false;
-
     if (First.Destination.Indices.size() !=
             Second.Source.Indices.size() ||
         First.Destination.InductionIndex !=
@@ -344,7 +322,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
             WriteIndex != ReadIndex)
             return false;
     }
-
     std::unordered_set<Value *> TempPointerUses;
     for (Use *U : Temporary->getUses()) {
         if (!U || U->getValue() != Temporary) continue;
@@ -365,8 +342,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         }
         if (Uses != 1) return false;
     }
-
-    // 4.4 源、最终目标和运行期边界必须在第一段 preheader 可用，才能把合并调用前移。
+    //4.4 源、最终目标和运行期边界必须在第一段 preheader 可用，才能把合并调用前移。
     auto AvailableAt = [&](Value *V, BasicBlock *Where) {
         auto *I = dynamic_cast<Instruction *>(V);
         if (!I) return true;
@@ -381,8 +357,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     if (First.IsRuntime &&
         !AvailableAt(First.RuntimeBound, First.PreHeader))
         return false;
-
-    // 4.5 先物化两端首地址，并用范围/对象边界证明整条 GEP 链在已知对象内。
+    //4.5 先物化两端首地址，并用范围/对象边界证明整条 GEP 链在已知对象内。
     GetElementPtrInst *SourceStart = materializeStartPointer(
         First.Source, First.IndVar, First.Start, First.PreHeader);
     if (!SourceStart ||
@@ -399,13 +374,12 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         delete DestStart;
         return false;
     }
-
     Value *ByteCount = nullptr;
     Value *RuntimeGuard = nullptr;
     BasicBlock *FastBlock = nullptr;
     std::vector<Instruction *> RuntimeValues;
-    // 4.6 常量次数直接生成字节数；运行期次数构造有工作量、收益阈值及字节乘法
-    // 不溢出的 guard，并离线创建 fast block，失败路径统一回滚临时指令。
+    //4.6 常量次数直接生成字节数；运行期次数构造有工作量、收益阈值及字节乘法
+    //不溢出的 guard，并离线创建 fast block，失败路径统一回滚临时指令。
     if (!First.IsRuntime) {
         ByteCount = ConstInt::newConstInt(
             static_cast<int32_t>(First.TripCount * 4));
@@ -426,7 +400,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
             }
             break;
         }
-
         Value *Bound = First.RuntimeBound;
         Value *Start = Value::makeIntegerLike(Bound,
                                                static_cast<int32_t>(First.Start));
@@ -470,7 +443,6 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
             First.PreHeader->getIdent() + ".memmove"));
         F.pushBlock(FastBlock);
     }
-
     {
         std::vector<Value *> Args{
             DestStart, SourceStart, ByteCount,
@@ -486,9 +458,8 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         if (Module *M = Module::getActiveModule())
             M->registerBuiltin(BuildInFunction::getDefaultMemmoveName());
     }
-
-    // 4.7 运行期版本保留原两循环为慢路径，fast block 直达第二段出口；常量版本
-    // 直接删除两段 load/store/GEP 及失去 use 的临时 alloca。
+    //4.7 运行期版本保留原两循环为慢路径，fast block 直达第二段出口；常量版本
+    //直接删除两段 load/store/GEP 及失去 use 的临时 alloca。
     if (FastBlock) {
         delete First.PreHeader->getBranchTerminator();
         First.PreHeader->genCondInst(RuntimeGuard, FastBlock, First.Header);
@@ -509,9 +480,8 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         if (!Temporary->hasUses()) delete Temporary;
     }
     return true;
-
 PairFailure:
-    // 4.8 接入 CFG 前失败时按创建逆序删除 fast block、guard 与首地址，保持原循环不变。
+    //4.8 接入 CFG 前失败时按创建逆序删除 fast block、guard 与首地址，保持原循环不变。
     if (FastBlock) {
         FastBlock->eraseFromParent();
         delete FastBlock;
@@ -522,33 +492,30 @@ PairFailure:
     delete SourceStart;
     return false;
 }
-
+//把单个连续填充或复制循环替换为memset或memcpy
 bool LoopIdiomRecognizePass::transformLoop(
     Function &F, Loop *L, SCEVResult &SE, DominatorTree &DT,
     RangeInfo &RI,
     bool &CFGChanged) {
-    // 2. 仅处理 LoopSimplify 形态的最内层单位正步长循环，要求常量 trip count
-    // 正且无回绕；运行期合法性稍后结合退出谓词验证。
+    //2. 仅处理 LoopSimplify 形态的最内层单位正步长循环，要求常量 trip count
+    //正且无回绕；运行期合法性稍后结合退出谓词验证。
     if (!L || !L->isInnermost()) return false;
     BasicBlock *PreHeader = nullptr;
     BasicBlock *Latch = nullptr;
     if (!L->getLoopSimplifyForm(PreHeader, Latch) || !PreHeader ||
         !PreHeader->hasTerminator())
         return false;
-
     auto TCI = SE.analyzeLoopTripCount(L);
     auto IV = SE.getCanonicalInduction(L);
     if (!TCI || !TCI->Valid || !IV || !IV->Valid ||
         !IV->ConstantStart || !IV->ConstantStep ||
         *IV->ConstantStep != 1 || TCI->IndVar != IV->Phi)
         return false;
-
     const bool IsConstant = TCI->ConstantTripCount.has_value();
     if (IsConstant && (!TCI->ProvenNoWrap ||
                        *TCI->ConstantTripCount <= 0))
         return false;
-
-    // 2.2 扫描循环体，要求唯一 store、无调用，并收集 load；目标必须是连续线性地址。
+    //2.2 扫描循环体，要求唯一 store、无调用，并收集 load；目标必须是连续线性地址。
     StoreInst *Store = nullptr;
     std::vector<LoadInst *> Loads;
     auto LoopBlocks = L->getBlocksIncludingSubLoops();
@@ -565,17 +532,14 @@ bool LoopIdiomRecognizePass::transformLoop(
         return true;
     })) return false;
     if (!Store) return false;
-
     auto *DestGEP = dynamic_cast<GetElementPtrInst *>(
         Store->getPointerOperand());
     LinearAccess DestAccess;
     if (!matchLinearAccess(DestGEP, IV->Phi, L, DestAccess))
         return false;
-
     if (TCI->ExitingBlock == TCI->Header &&
         Store->getParent() == TCI->Header)
         return false;
-
     int64_t TripCount = 0;
     int32_t ConstantByteCount = 0;
     if (IsConstant) {
@@ -584,13 +548,12 @@ bool LoopIdiomRecognizePass::transformLoop(
             return false;
         ConstantByteCount = static_cast<int32_t>(TripCount * 4);
     }
-
     LoadInst *SourceLoad = nullptr;
     GetElementPtrInst *SourceGEP = nullptr;
     LinearAccess SourceAccess;
     uint8_t FillByte = 0;
-    // 2.3 store 常量若能表示为重复字节则匹配 memset 且不得有 load；否则必须是
-    // 唯一 load feeding store，源/目标同存储类型且由不同对象根证明不重叠，匹配 memcpy。
+    //2.3 store 常量若能表示为重复字节则匹配 memset 且不得有 load；否则必须是
+    //唯一 load feeding store，源/目标同存储类型且由不同对象根证明不重叠，匹配 memcpy。
     bool IsMemset = getRepeatedByte(Store->getValueOperand(), FillByte);
     if (IsMemset) {
         if (!Loads.empty()) return false;
@@ -605,16 +568,13 @@ bool LoopIdiomRecognizePass::transformLoop(
             !areProvablyDisjoint(DestAccess, SourceAccess))
             return false;
     }
-
     if (TCI->ExitingBlock == TCI->Header && SourceLoad &&
         SourceLoad->getParent() == TCI->Header)
         return false;
-
     if (!hasOnlyAllowedLoopInstructions(
             L, *TCI, *IV, Store, DestGEP, SourceLoad, SourceGEP, DT))
         return false;
-
-    // 3. 物化目标及可选源首地址，并证明它们位于已知 alloca/global 对象边界内。
+    //3. 物化目标及可选源首地址，并证明它们位于已知 alloca/global 对象边界内。
     auto *DestStart = materializeStartPointer(
         DestAccess, IV->Phi, *IV->ConstantStart, PreHeader);
     if (!DestStart ||
@@ -622,7 +582,6 @@ bool LoopIdiomRecognizePass::transformLoop(
         delete DestStart;
         return false;
     }
-
     GetElementPtrInst *SourceStart = nullptr;
     if (!IsMemset) {
         SourceStart = materializeStartPointer(
@@ -634,19 +593,16 @@ bool LoopIdiomRecognizePass::transformLoop(
             return false;
         }
     }
-
     Value *ByteCount = nullptr;
     BasicBlock *CallBlock = PreHeader;
     BasicBlock *FastBlock = nullptr;
     Value *RuntimeGuard = nullptr;
     std::vector<Instruction *> RuntimeValues;
-
-    // 3.2 常量次数直接计算 4*tripCount；运行期仅接受 iv < bound，且 bound 在
-    // preheader 可用。构造 count、最小收益和最大安全字节数 guard 以及 fast block。
+    //3.2 常量次数直接计算 4*tripCount；运行期仅接受 iv < bound，且 bound 在
+    //preheader 可用。构造 count、最小收益和最大安全字节数 guard 以及 fast block。
     if (IsConstant) {
         ByteCount = ConstInt::newConstInt(ConstantByteCount);
     } else {
-
         if (TCI->ExitingBlock != TCI->Header ||
             *IV->ConstantStart < 0 ||
             *IV->ConstantStart > std::numeric_limits<int32_t>::max()) {
@@ -654,7 +610,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             delete DestStart;
             return false;
         }
-
         BinaryInst::Operation Pred = TCI->ContinueOnTrue
                                          ? TCI->ExitCmp->getOp()
                                          : BinaryInst::negatePredicate(
@@ -684,7 +639,6 @@ bool LoopIdiomRecognizePass::transformLoop(
                 return false;
             }
         }
-
         if (!PreHeader->getBranchTerminator() ||
             PreHeader->getBranchTerminator()->isConditional() ||
             PreHeader->getSuccessors().size() != 1 ||
@@ -701,7 +655,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             }
             break;
         }
-
         Value *StartValue = Value::makeIntegerLike(
             Bound, static_cast<int32_t>(*IV->ConstantStart));
         Value *ZeroValue = Value::makeIntegerLike(Bound, 0);
@@ -715,7 +668,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             delete DestStart;
             return false;
         }
-
         auto InsertRuntime = [&](Instruction *I) -> bool {
             if (!I || !PreHeader->insertBeforeTerminator(I)) {
                 delete I;
@@ -724,7 +676,6 @@ bool LoopIdiomRecognizePass::transformLoop(
             RuntimeValues.push_back(I);
             return true;
         };
-
         auto *HasIterations = new BinaryInst(Bound, BinaryInst::G,
                                              StartValue);
         auto *Difference = new BinaryInst(Bound, BinaryInst::SUB,
@@ -764,15 +715,13 @@ bool LoopIdiomRecognizePass::transformLoop(
         }
         RuntimeGuard = UseFastPath;
         ByteCount = Bytes;
-
         FastBlock = new BasicBlock();
         FastBlock->setIdent(F.makeUniqueBlockIdent(
             PreHeader->getIdent() + ".memidiom"));
         F.pushBlock(FastBlock);
         CallBlock = FastBlock;
     }
-
-    // 3.3 根据模式生成 memset/memcpy 参数并注册 builtin；所有离线构造成功后才接入。
+    //3.3 根据模式生成 memset/memcpy 参数并注册 builtin；所有离线构造成功后才接入。
     std::vector<Value *> Args;
     const char *IntrinsicName = nullptr;
     if (IsMemset) {
@@ -803,9 +752,8 @@ bool LoopIdiomRecognizePass::transformLoop(
         return false;
     }
     if (Module *M = Module::getActiveModule()) M->registerBuiltin(IntrinsicName);
-
-    // 3.4 运行期用 guard 在 intrinsic fast path 与原循环 slow path 间选择；常量版本
-    // 不改 CFG，只删除被调用完全取代且已无用户的循环内内存指令。
+    //3.4 运行期用 guard 在 intrinsic fast path 与原循环 slow path 间选择；常量版本
+    //不改 CFG，只删除被调用完全取代且已无用户的循环内内存指令。
     if (FastBlock) {
         BrInst *OldBranch = PreHeader->getBranchTerminator();
         delete OldBranch;
@@ -820,25 +768,23 @@ bool LoopIdiomRecognizePass::transformLoop(
     }
     return true;
 }
-
+//遍历函数内循环并提交安全的内存惯用法替换
 PreservationStatus LoopIdiomRecognizePass::run(
     Function &F, FunctionAnalysisPassManager &FAM) {
-    // 1. 获取支配、循环、范围与 SCEV，并按内到外顺序快照循环，后续改 CFG 时停止。
+    //1. 获取支配、循环、范围与 SCEV，并按内到外顺序快照循环，后续改 CFG 时停止。
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
-
     bool Changed = false;
     bool CFGChanged = false;
     std::vector<Loop *> Loops = LI.getLoopsInPostOrder(true);
-
-    // 4. 优先预匹配全部简单复制循环并尝试消除相邻临时数组复制对；该变换跨两个循环，
-    // 成功后直接使全部分析失效并返回。
+    //4. 优先预匹配全部简单复制循环并尝试消除相邻临时数组复制对；该变换跨两个循环，
+    //成功后直接使全部分析失效并返回。
     std::vector<CopyLoopMatch> Copies;
     Copies.reserve(Loops.size());
-    // 2—3. 未命中成对模式时逐循环识别 memset/memcpy；首次运行期 fast path 改 CFG
-    // 后立即停止，避免继续使用陈旧 LoopInfo/SCEV。
+    //2—3. 未命中成对模式时逐循环识别 memset/memcpy；首次运行期 fast path 改 CFG
+    //后立即停止，避免继续使用陈旧 LoopInfo/SCEV。
     for (Loop *L : Loops) {
         CopyLoopMatch Match;
         if (matchSimpleCopyLoop(L, SE, DT, Match))
@@ -848,22 +794,17 @@ PreservationStatus LoopIdiomRecognizePass::run(
         for (const CopyLoopMatch &Second : Copies) {
             if (transformTemporaryCopyPair(
                     F, First, Second, DT, RI, CFGChanged)) {
-
                 return PreservationStatus::none();
             }
         }
     }
-
     for (Loop *L : Loops) {
         Changed |= transformLoop(F, L, SE, DT, RI, CFGChanged);
-
         if (CFGChanged) break;
     }
     if (!Changed) return PreservationStatus::all();
-
     if (CFGChanged) return PreservationStatus::none();
-
-    // 5. 常量次数版本不改 CFG，可保留支配/循环；地址和值变化使 AA/Range/SCEV/副作用失效。
+    //5. 常量次数版本不改 CFG，可保留支配/循环；地址和值变化使 AA/Range/SCEV/副作用失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

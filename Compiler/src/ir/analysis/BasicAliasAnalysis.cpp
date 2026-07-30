@@ -3,7 +3,6 @@
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
 #include "lib/Target.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -12,51 +11,212 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+//构造空内存位置
 MemoryLocation::MemoryLocation() = default;
-
+//使用给定指针和访问字节数构造内存位置
 MemoryLocation::MemoryLocation(Value *P, std::optional<std::size_t> S)
     : Pointer(P), Size(S) {}
-
+//从Load指令提取读取位置和读取字节数
+MemoryLocation MemoryLocation::get(const LoadInst *Load) {
+    if (!Load) return {};
+    std::shared_ptr<IRType> Ty = Load->getIRType();
+    return {Load->getPointerOperand(),
+            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
+}
+//从Store指令提取写入位置和写入字节数
+MemoryLocation MemoryLocation::get(const StoreInst *Store) {
+    if (!Store) return {};
+    Value *Stored = Store->getValueOperand();
+    std::shared_ptr<IRType> Ty = Stored ? Stored->getIRType() : nullptr;
+    return {Store->getPointerOperand(),
+            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
+}
+//判断来源是否恰好包含一个已知底层对象
 bool PointerProvenanceInfo::hasUniqueBase() const {
     return !HasUnknownBase && Bases.size() == 1;
 }
-
+//返回唯一底层对象，不唯一或含未知来源时返回空
 Value *PointerProvenanceInfo::getUniqueBase() const {
     return hasUniqueBase() ? *Bases.begin() : nullptr;
 }
-
+//判断最小和最大字节偏移是否构成同一个精确偏移
 bool PointerProvenanceInfo::hasExactByteOffset() const {
     return MinByteOffset && MaxByteOffset &&
            *MinByteOffset == *MaxByteOffset;
 }
-
+//返回精确字节偏移，无法确定时返回空
 std::optional<long long> PointerProvenanceInfo::getExactByteOffset() const {
     return hasExactByteOffset() ? MinByteOffset : std::nullopt;
 }
-
+//判断该指针是否确定只来源于栈对象
 bool PointerProvenanceInfo::isMustStack() const {
     return !HasUnknownBase && !Bases.empty() && MayBeStack &&
            !MayBeGlobal && !MayBeParameter;
 }
-
+//判断该指针是否确定只来源于全局对象
 bool PointerProvenanceInfo::isMustGlobal() const {
     return !HasUnknownBase && !Bases.empty() && MayBeGlobal &&
            !MayBeStack && !MayBeParameter;
 }
-
+//判断该指针是否确定只来源于函数形参
 bool PointerProvenanceInfo::isMustParameter() const {
     return !HasUnknownBase && !Bases.empty() && MayBeParameter &&
            !MayBeStack && !MayBeGlobal;
 }
-
+//构造不使用SCEV距离证明的空分析结果
 BasicAAResult::BasicAAResult() = default;
-
+//构造使用给定SCEV结果辅助距离证明的分析结果
 BasicAAResult::BasicAAResult(SCEVResult *SCEV) : SE(SCEV) {}
-
+//移动构造分析结果
 BasicAAResult::BasicAAResult(BasicAAResult &&) = default;
-
+//移动赋值分析结果
 BasicAAResult &BasicAAResult::operator=(BasicAAResult &&) = default;
-
+//根据保留状态判断结果是否失效并清理查询缓存
+bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
+    if (PA.isKept(BasicAliasAnalysis::ID()) &&
+        (!SE || PA.isKept(SCEVAnalysis::ID()))) {
+        return false;
+    }
+    (void)F;
+    AliasCache.clear();
+    ProvenanceCache.clear();
+    return true;
+}
+//记录两个底层对象在当前函数中确定互不别名
+void BasicAAResult::addObjectNoAliasFact(Value* V1, Value* V2) {
+    if (!V1 || !V2 || V1 == V2) {
+        return;
+    }
+    ObjectNoAlias.insert(makeCanonicalPair(V1, V2));
+}
+//查询两个指针的基础别名关系
+AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
+    return aliasImpl(V1, V2, LI, false);
+}
+//查询两个指针的别名关系并允许使用循环下标距离证明
+AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
+                                             const LoopInfo& LI) {
+    return aliasImpl(V1, V2, LI, true);
+}
+//查询两个显式内存区间的基础别名关系
+AliasInfo BasicAAResult::alias(const MemoryLocation &L1,
+                               const MemoryLocation &L2,
+                               const LoopInfo &LI) {
+    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
+    return enforceLocationObjectBounds(
+        aliasLocationImpl(L1, L2, LI, false, 0, Active), L1, L2);
+}
+//查询两个显式内存区间的别名关系并允许使用循环下标距离证明
+AliasInfo BasicAAResult::aliasWithIndexRange(
+    const MemoryLocation &L1, const MemoryLocation &L2,
+    const LoopInfo &LI) {
+    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
+    return enforceLocationObjectBounds(
+        aliasLocationImpl(L1, L2, LI, true, 0, Active), L1, L2);
+}
+//返回指针的完整来源摘要并复用缓存
+const PointerProvenanceInfo &
+BasicAAResult::getPointerProvenance(Value *V) const {
+    auto It = ProvenanceCache.find(V);
+    if (It != ProvenanceCache.end()) return It->second;
+    ProvenanceQueryState State;
+    ProvenanceBuildResult Built =
+        buildPointerProvenance(V, State, 0);
+    PointerProvenanceInfo Result = std::move(Built.Info);
+    if (isEmptyCycleProvenance(Result)) Result = PointerProvenanceInfo{};
+    Result.KnownAlignment =
+        std::max<std::size_t>(1, Result.KnownAlignment);
+    return ProvenanceCache.emplace(V, std::move(Result)).first->second;
+}
+//按稳定顺序返回指针所有已知底层对象
+std::vector<Value *>
+BasicAAResult::getUnderlyingObjects(Value *V) const {
+    const PointerProvenanceInfo &Info = getPointerProvenance(V);
+    std::vector<Value *> Result(Info.Bases.begin(), Info.Bases.end());
+    std::sort(Result.begin(), Result.end(),
+              [](Value *First, Value *Second) {
+                  return std::less<Value *>{}(First, Second);
+              });
+    return Result;
+}
+//返回指针唯一的已知底层对象
+Value *BasicAAResult::getUniqueUnderlyingObject(Value *V) const {
+    return getPointerProvenance(V).getUniqueBase();
+}
+//返回指针相对底层对象的常量字节偏移
+std::optional<long long>
+BasicAAResult::getConstantByteOffset(Value *V) const {
+    return getPointerProvenance(V).getExactByteOffset();
+}
+//返回指针底层对象的已知字节数
+std::optional<std::size_t>
+BasicAAResult::getObjectSize(Value *V) const {
+    return getPointerProvenance(V).ObjectSize;
+}
+//返回指针至少满足的已知字节对齐
+std::size_t BasicAAResult::getKnownAlignment(Value *V) const {
+    return getPointerProvenance(V).KnownAlignment;
+}
+//判断两个指针的所有已知底层对象是否两两互斥
+bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
+                                                        Value* V2) const {
+    auto AreDistinctRoots = [&](Value *O1, Value *O2) {
+        if (!O1 || !O2 || O1 == O2 || O1->isUndef() || O2->isUndef())
+            return false;
+        auto *Var1 = dynamic_cast<Variable *>(O1);
+        auto *Var2 = dynamic_cast<Variable *>(O2);
+        const bool IsAlloca1 = dynamic_cast<AllocaInst *>(O1) != nullptr;
+        const bool IsAlloca2 = dynamic_cast<AllocaInst *>(O2) != nullptr;
+        const bool IsParam1 = O1->isParam();
+        const bool IsParam2 = O2->isParam();
+        const bool IsGlobal1 =
+            Var1 && (Var1->vartag == Variable::GlobalVariable ||
+                     Var1->vartag == Variable::GlobalConstant);
+        const bool IsGlobal2 =
+            Var2 && (Var2->vartag == Variable::GlobalVariable ||
+                     Var2->vartag == Variable::GlobalConstant);
+        if (IsAlloca1 && IsAlloca2) return true;
+        if (IsGlobal1 && IsGlobal2) return true;
+        if ((IsParam1 && IsAlloca2) || (IsParam2 && IsAlloca1))
+            return true;
+        if ((IsAlloca1 && IsGlobal2) || (IsAlloca2 && IsGlobal1))
+            return true;
+        return hasObjectNoAlias(O1, O2);
+    };
+    //多来源PHI/Select只有在笛卡尔积中的每对对象都互斥时才发布NoAlias
+    const PointerProvenanceInfo &First = getPointerProvenance(V1);
+    const PointerProvenanceInfo &Second = getPointerProvenance(V2);
+    if (!First.HasUnknownBase && !Second.HasUnknownBase &&
+        !First.Bases.empty() && !Second.Bases.empty()) {
+        bool AllDistinct = true;
+        for (Value *O1 : First.Bases) {
+            for (Value *O2 : Second.Bases) {
+                if (!AreDistinctRoots(O1, O2)) {
+                    AllDistinct = false;
+                    break;
+                }
+            }
+            if (!AllDistinct) break;
+        }
+        if (AllDistinct) return true;
+    }
+    return AreDistinctRoots(getBaseAddress(V1), getBaseAddress(V2));
+}
+//判断调用指令的任一指针实参是否可能与目标指针别名
+bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
+                                        const LoopInfo &LI) {
+    if (!CI || !P) return false;
+    (void)LI;
+    for (unsigned I = 0; I < CI->getArgCount(); ++I) {
+        Value *Arg = CI->getArg(I);
+        if (!Arg || !Arg->isPointerValue()) continue;
+        if (!haveKnownDistinctUnderlyingObjects(P, Arg)) {
+            return true;
+        }
+    }
+    return false;
+}
+//计算一对Value指针的组合哈希
 std::size_t BasicAAResult::ValuePairHash::operator()(
     const std::pair<Value *, Value *> &P) const {
     auto H1 = static_cast<std::size_t>(
@@ -65,7 +225,7 @@ std::size_t BasicAAResult::ValuePairHash::operator()(
         reinterpret_cast<std::uintptr_t>(P.second));
     return H1 ^ (H2 + 0x9e3779b97f4a7c15ULL + (H1 << 6) + (H1 >> 2));
 }
-
+//执行带溢出检查的有符号加法
 bool BasicAAResult::checkedAdd(long long A, long long B, long long &Result) {
     if ((B > 0 && A > std::numeric_limits<long long>::max() - B) ||
         (B < 0 && A < std::numeric_limits<long long>::min() - B))
@@ -73,7 +233,7 @@ bool BasicAAResult::checkedAdd(long long A, long long B, long long &Result) {
     Result = A + B;
     return true;
 }
-
+//执行带溢出检查的有符号减法
 bool BasicAAResult::checkedSub(long long A, long long B, long long &Result) {
     if (B == std::numeric_limits<long long>::min()) {
         if (A >= 0) return false;
@@ -82,7 +242,7 @@ bool BasicAAResult::checkedSub(long long A, long long B, long long &Result) {
     }
     return checkedAdd(A, -B, Result);
 }
-
+//执行带溢出检查的有符号乘法
 bool BasicAAResult::checkedMul(long long A, long long B, long long &Result) {
     if (A == 0 || B == 0) {
         Result = 0;
@@ -107,13 +267,13 @@ bool BasicAAResult::checkedMul(long long A, long long B, long long &Result) {
     Result = A * B;
     return true;
 }
-
+//判断来源摘要是否仅表示正在求解的活动环
 bool BasicAAResult::isEmptyCycleProvenance(
     const PointerProvenanceInfo &Info) {
     return Info.Bases.empty() && !Info.HasUnknownBase &&
            Info.KnownAlignment == 0;
 }
-
+//把常量字节偏移安全地累加到来源偏移区间
 bool BasicAAResult::addOffsetToProvenance(PointerProvenanceInfo &Info,
                                            long long Offset) {
     if (!Info.MinByteOffset || !Info.MaxByteOffset) {
@@ -133,7 +293,7 @@ bool BasicAAResult::addOffsetToProvenance(PointerProvenanceInfo &Info,
     Info.MaxByteOffset = NewMax;
     return true;
 }
-
+//返回底层对象由DataLayout确定的ABI对齐
 std::size_t BasicAAResult::baseObjectAlignment(Value *Base) {
     if (!Base) return 1;
     const DataLayout &Layout = TargetInfo::get().getDataLayout();
@@ -148,11 +308,11 @@ std::size_t BasicAAResult::baseObjectAlignment(Value *Base) {
         return std::max<std::size_t>(
             1, Layout.getABITypeAlign(ObjectType));
     } catch (const std::overflow_error &) {
-        // 非法或宿主无法表示的聚合类型不能让分析阶段终止编译。
+        //非法或宿主无法表示的聚合类型不能让分析阶段终止编译
         return 1;
     }
 }
-
+//返回底层对象由DataLayout确定的分配字节数
 std::optional<std::size_t> BasicAAResult::baseObjectSize(Value *Base) {
     if (!Base) return std::nullopt;
     const DataLayout &Layout = TargetInfo::get().getDataLayout();
@@ -166,14 +326,14 @@ std::optional<std::size_t> BasicAAResult::baseObjectSize(Value *Base) {
     if (!ObjectType) return std::nullopt;
     try {
         const std::size_t Size = Layout.getTypeAllocSize(ObjectType);
-        // 未定长对象在 DataLayout 中以零表示，不能把它误当成确定的空对象。
+        //未定长对象在DataLayout中以零表示，不能把它误当成确定的空对象
         return Size == 0 ? std::nullopt
                          : std::optional<std::size_t>(Size);
     } catch (const std::overflow_error &) {
         return std::nullopt;
     }
 }
-
+//返回无符号整数可整除的最大二次幂
 std::size_t BasicAAResult::greatestPowerOfTwoDivisor(
     std::uint64_t Value) {
     if (Value == 0) return 0;
@@ -183,10 +343,10 @@ std::size_t BasicAAResult::greatestPowerOfTwoDivisor(
                << (std::numeric_limits<std::size_t>::digits - 1U);
     return static_cast<std::size_t>(LowBit);
 }
-
+//组合两个已知二次幂因子并处理宿主整数溢出
 std::size_t BasicAAResult::multiplyAlignmentFactors(
     std::size_t First, std::size_t Second) {
-    // 零表示值本身恒为零；零乘任意值仍然不限制可整除的二次幂。
+    //零表示值本身恒为零，零乘任意值仍然不限制可整除的二次幂
     if (First == 0 || Second == 0) return 0;
     if (First > std::numeric_limits<std::size_t>::max() / Second)
         return std::size_t{1}
@@ -194,8 +354,7 @@ std::size_t BasicAAResult::multiplyAlignmentFactors(
     const std::size_t Product = First * Second;
     return greatestPowerOfTwoDivisor(Product);
 }
-
-// 整数倍数查询只追踪“至少被哪个二次幂整除”，不猜测值域或运行时输入。
+//整数倍数查询只追踪至少被哪个二次幂整除，不猜测值域或运行时输入
 std::size_t BasicAAResult::getKnownIntegerMultiple(
     Value *V, IntegerMultipleQueryState &State, unsigned Depth) const {
     if (!V || Depth > MaxProvenanceDepth) return 1;
@@ -206,7 +365,6 @@ std::size_t BasicAAResult::getKnownIntegerMultiple(
         return 1;
     }
     ++State.VisitedNodes;
-
     if (auto *CI = dynamic_cast<ConstInt *>(V)) {
         const int64_t Signed = CI->getVal();
         const std::uint64_t Magnitude =
@@ -218,10 +376,8 @@ std::size_t BasicAAResult::getKnownIntegerMultiple(
         State.Completed.emplace(V, Result);
         return Result;
     }
-
     ScopedActiveMark ActiveMark(State.Active, V);
     if (!ActiveMark.inserted()) return 1;
-
     std::size_t Result = 1;
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
         std::size_t Common = 0;
@@ -245,7 +401,6 @@ std::size_t BasicAAResult::getKnownIntegerMultiple(
             getKnownIntegerMultiple(LHS, State, Depth + 1);
         const std::size_t Right =
             getKnownIntegerMultiple(RHS, State, Depth + 1);
-
         switch (BI->getOp()) {
         case BinaryInst::ADD:
         case BinaryInst::SUB:
@@ -282,13 +437,11 @@ std::size_t BasicAAResult::getKnownIntegerMultiple(
             break;
         }
     }
-
-    // 活动环带来的 1 是保守下界，缓存它不会制造更强的对齐事实。
+    //活动环带来的1是保守下界，缓存它不会制造更强的对齐事实
     State.Completed.emplace(V, Result);
     return Result;
 }
-
-// GEP 偏移对齐综合类型步长与下标的已知低零位，完全复用 CFG 的类型化步长接口。
+//GEP偏移对齐综合类型步长与下标的已知低零位
 std::size_t BasicAAResult::getGEPOffsetAlignment(
     GetElementPtrInst *GEP) const {
     if (!GEP) return 1;
@@ -303,7 +456,6 @@ std::size_t BasicAAResult::getGEPOffsetAlignment(
         return 1;
     }
     (void)FinalPointeeStride;
-
     std::size_t OffsetMultiple = 0;
     IntegerMultipleQueryState State;
     for (std::size_t I = 0; I < Indices.size(); ++I) {
@@ -323,7 +475,7 @@ std::size_t BasicAAResult::getGEPOffsetAlignment(
     }
     return OffsetMultiple;
 }
-
+//合并两条控制流来源的指针摘要
 PointerProvenanceInfo BasicAAResult::mergePointerProvenance(
     const PointerProvenanceInfo &First,
     const PointerProvenanceInfo &Second) const {
@@ -331,14 +483,13 @@ PointerProvenanceInfo BasicAAResult::mergePointerProvenance(
         isEmptyCycleProvenance(Second)) {
         PointerProvenanceInfo Result =
             isEmptyCycleProvenance(First) ? Second : First;
-        // 合流边回到正在求解的指针时，环外来源仍然有效，但本次迭代
-        // 可能改变偏移和对齐，不能沿用入口边的精确数值事实。
+        //合流边回到正在求解的指针时保留环外来源
+        //本次迭代可能改变偏移和对齐，不能沿用入口边的精确数值事实
         Result.MinByteOffset.reset();
         Result.MaxByteOffset.reset();
         Result.KnownAlignment = 1;
         return Result;
     }
-
     PointerProvenanceInfo Result;
     Result.HasUnknownBase = First.HasUnknownBase || Second.HasUnknownBase;
     Result.MayBeStack = First.MayBeStack || Second.MayBeStack;
@@ -351,7 +502,6 @@ PointerProvenanceInfo BasicAAResult::mergePointerProvenance(
         Result.Bases.clear();
         Result.HasUnknownBase = true;
     }
-
     if (First.MinByteOffset && First.MaxByteOffset &&
         Second.MinByteOffset && Second.MaxByteOffset) {
         Result.MinByteOffset =
@@ -363,7 +513,6 @@ PointerProvenanceInfo BasicAAResult::mergePointerProvenance(
         *First.ObjectSize == *Second.ObjectSize) {
         Result.ObjectSize = First.ObjectSize;
     }
-
     if (First.KnownAlignment == 0)
         Result.KnownAlignment = Second.KnownAlignment;
     else if (Second.KnownAlignment == 0)
@@ -374,9 +523,7 @@ PointerProvenanceInfo BasicAAResult::mergePointerProvenance(
     if (Result.KnownAlignment == 0) Result.KnownAlignment = 1;
     return Result;
 }
-
-// 来源构建穿过 GEP、BitCast、PHI 和 Select；活动环本身不制造未知基址，
-// 只有环外仍找不到真实来源时才退化为 unknown。
+//来源构建穿过GEP、BitCast、PHI和Select，只有找不到真实来源时才退化为未知
 BasicAAResult::ProvenanceBuildResult
 BasicAAResult::buildPointerProvenance(
     Value *V, ProvenanceQueryState &State, unsigned Depth) const {
@@ -385,7 +532,6 @@ BasicAAResult::buildPointerProvenance(
         Depth > MaxProvenanceDepth) {
         return {std::move(Unknown), false};
     }
-
     auto Cached = ProvenanceCache.find(V);
     if (Cached != ProvenanceCache.end())
         return {Cached->second, false};
@@ -397,7 +543,6 @@ BasicAAResult::buildPointerProvenance(
         return {std::move(Unknown), false};
     }
     ++State.VisitedNodes;
-
     ScopedActiveMark ActiveMark(State.Active, V);
     if (!ActiveMark.inserted()) {
         PointerProvenanceInfo Cycle;
@@ -405,7 +550,6 @@ BasicAAResult::buildPointerProvenance(
         Cycle.KnownAlignment = 0;
         return {std::move(Cycle), true};
     }
-
     auto Finish = [&](PointerProvenanceInfo Info,
                       bool DependsOnCycle) {
         if (!DependsOnCycle && !isEmptyCycleProvenance(Info))
@@ -413,7 +557,6 @@ BasicAAResult::buildPointerProvenance(
         return ProvenanceBuildResult{
             std::move(Info), DependsOnCycle};
     };
-
     if (dynamic_cast<AllocaInst *>(V) || dynamic_cast<Variable *>(V) ||
         dynamic_cast<Param *>(V)) {
         PointerProvenanceInfo Root;
@@ -428,29 +571,24 @@ BasicAAResult::buildPointerProvenance(
         Root.MayBeParameter = dynamic_cast<Param *>(V) != nullptr;
         return Finish(std::move(Root), false);
     }
-
     if (auto *BitCast = dynamic_cast<BitCastInst *>(V)) {
         ProvenanceBuildResult Operand = buildPointerProvenance(
             BitCast->getUnaryOperand(), State, Depth + 1);
         return Finish(std::move(Operand.Info),
                       Operand.DependsOnActiveCycle);
     }
-
     if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {
         ProvenanceBuildResult BaseResult = buildPointerProvenance(
             GEP->getBasePointer(), State, Depth + 1);
         PointerProvenanceInfo Result = std::move(BaseResult.Info);
-        // 指针归纳的回边形如 p.next = gep p, step。这里把“尚未走到
-        // 环外根”继续向上传递，由 PHI 在看到入口来源后完成保守合流。
+        //指针归纳回边继续向上传递，由PHI在看到入口来源后完成保守合流
         if (isEmptyCycleProvenance(Result))
             return {std::move(Result), true};
-
         const std::size_t OffsetAlignment = getGEPOffsetAlignment(GEP);
         if (OffsetAlignment != 0)
             Result.KnownAlignment =
                 std::gcd(std::max<std::size_t>(1, Result.KnownAlignment),
                          OffsetAlignment);
-
         Value *Base = nullptr;
         std::vector<Value *> Indices;
         std::vector<int64_t> Strides;
@@ -483,9 +621,8 @@ BasicAAResult::buildPointerProvenance(
             Result.MaxByteOffset.reset();
         }
         if (BaseResult.DependsOnActiveCycle) {
-            // 从回边更新节点本身开始查询时，当前这次 GEP 只是递推中的
-            // 一步，并不代表 PHI 在所有迭代上的固定偏移。显式清除数值
-            // 事实，保证查询顺序不会把 root+step 缓存成整个递推的偏移。
+            //从回边更新节点查询时，当前GEP只是递推中的一步
+            //清除数值事实，避免把单步偏移缓存成整个递推的固定偏移
             Result.MinByteOffset.reset();
             Result.MaxByteOffset.reset();
             Result.KnownAlignment = 1;
@@ -493,7 +630,6 @@ BasicAAResult::buildPointerProvenance(
         return Finish(std::move(Result),
                       BaseResult.DependsOnActiveCycle);
     }
-
     if (auto *Phi = dynamic_cast<PhiInst *>(V)) {
         PointerProvenanceInfo Result;
         Result.HasUnknownBase = false;
@@ -528,7 +664,6 @@ BasicAAResult::buildPointerProvenance(
             return Finish(std::move(Unknown), DependsOnCycle);
         return Finish(std::move(Result), DependsOnCycle);
     }
-
     if (auto *Select = dynamic_cast<SelectInst *>(V)) {
         if (Select->getTrueValue() == Select->getFalseValue()) {
             ProvenanceBuildResult Arm = buildPointerProvenance(
@@ -555,57 +690,11 @@ BasicAAResult::buildPointerProvenance(
     }
     return Finish(std::move(Unknown), false);
 }
-
-const PointerProvenanceInfo &
-BasicAAResult::getPointerProvenance(Value *V) const {
-    auto It = ProvenanceCache.find(V);
-    if (It != ProvenanceCache.end()) return It->second;
-    ProvenanceQueryState State;
-    ProvenanceBuildResult Built =
-        buildPointerProvenance(V, State, 0);
-    PointerProvenanceInfo Result = std::move(Built.Info);
-    if (isEmptyCycleProvenance(Result)) Result = PointerProvenanceInfo{};
-    Result.KnownAlignment =
-        std::max<std::size_t>(1, Result.KnownAlignment);
-    return ProvenanceCache.emplace(V, std::move(Result)).first->second;
-}
-
-std::vector<Value *>
-BasicAAResult::getUnderlyingObjects(Value *V) const {
-    const PointerProvenanceInfo &Info = getPointerProvenance(V);
-    std::vector<Value *> Result(Info.Bases.begin(), Info.Bases.end());
-    std::sort(Result.begin(), Result.end(),
-              [](Value *First, Value *Second) {
-                  return std::less<Value *>{}(First, Second);
-              });
-    return Result;
-}
-
-Value *BasicAAResult::getUniqueUnderlyingObject(Value *V) const {
-    return getPointerProvenance(V).getUniqueBase();
-}
-
-std::optional<long long>
-BasicAAResult::getConstantByteOffset(Value *V) const {
-    return getPointerProvenance(V).getExactByteOffset();
-}
-
-std::optional<std::size_t>
-BasicAAResult::getObjectSize(Value *V) const {
-    return getPointerProvenance(V).ObjectSize;
-}
-
-std::size_t BasicAAResult::getKnownAlignment(Value *V) const {
-    return getPointerProvenance(V).KnownAlignment;
-}
-
-// 对象内证明只消费来源分析已经发布的完整偏移区间；动态下标、未知访问
-// 宽度或未定长形参都保持未知，不能借“不同对象”隐式利用越界行为。
+//对象内证明只消费来源分析已经发布的完整偏移区间
 bool BasicAAResult::isLocationKnownWithinObject(
     const MemoryLocation &Location) const {
     if (!Location.Pointer || !Location.Size) return false;
     if (*Location.Size == 0) return true;
-
     const PointerProvenanceInfo &Info =
         getPointerProvenance(Location.Pointer);
     if (Info.HasUnknownBase || Info.Bases.empty() || !Info.ObjectSize ||
@@ -615,7 +704,6 @@ bool BasicAAResult::isLocationKnownWithinObject(
         *Location.Size > *Info.ObjectSize) {
         return false;
     }
-
     const unsigned long long MaxOffset =
         static_cast<unsigned long long>(*Info.MaxByteOffset);
     if (MaxOffset >
@@ -626,7 +714,7 @@ bool BasicAAResult::isLocationKnownWithinObject(
     return static_cast<std::size_t>(MaxOffset) <=
            *Info.ObjectSize - *Location.Size;
 }
-
+//只保留不依赖潜在越界对象身份的NoAlias结论
 AliasInfo BasicAAResult::enforceLocationObjectBounds(
     AliasInfo Result, const MemoryLocation &First,
     const MemoryLocation &Second) const {
@@ -635,16 +723,14 @@ AliasInfo BasicAAResult::enforceLocationObjectBounds(
         (Second.Size && *Second.Size == 0)) {
         return Result;
     }
-
     const PointerProvenanceInfo &FirstInfo =
         getPointerProvenance(First.Pointer);
     const PointerProvenanceInfo &SecondInfo =
         getPointerProvenance(Second.Pointer);
     Value *FirstBase = FirstInfo.getUniqueBase();
     Value *SecondBase = SecondInfo.getUniqueBase();
-
-    // 同一唯一对象内的常量/范围距离证明不依赖对象身份；只有不同或
-    // 多来源对象带来的 NoAlias 才必须额外证明两次访问都在对象内。
+    //同一唯一对象内的距离证明不依赖对象身份
+    //不同或多来源对象的NoAlias必须额外证明两次访问均在对象内
     if (FirstBase && FirstBase == SecondBase) return Result;
     if (isLocationKnownWithinObject(First) &&
         isLocationKnownWithinObject(Second)) {
@@ -652,13 +738,11 @@ AliasInfo BasicAAResult::enforceLocationObjectBounds(
     }
     return AliasInfo::MayAlias;
 }
-
-// 防御性溯源只穿过透明指针节点；发现 undef、深度超限时禁止发布强别名结论。
+//防御性溯源只穿过透明指针节点，发现undef或深度超限时禁止发布强结论
 bool BasicAAResult::hasUndefPointerOrigin(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V)) return true;
     if (Depth > 32) return true;
-
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return false;
     const bool TransparentPointerProducer =
@@ -669,7 +753,6 @@ bool BasicAAResult::hasUndefPointerOrigin(
     if (!TransparentPointerProducer) return false;
     ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return false;
-
     bool HasUndefOrigin = false;
     forEachOperand(
         I, [&](size_t, Use *, Value *Operand) {
@@ -681,76 +764,26 @@ bool BasicAAResult::hasUndefPointerOrigin(
         });
     return HasUndefOrigin;
 }
-
-MemoryLocation MemoryLocation::get(const LoadInst *Load) {
-    if (!Load) return {};
-    std::shared_ptr<IRType> Ty = Load->getIRType();
-    return {Load->getPointerOperand(),
-            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
-}
-
-MemoryLocation MemoryLocation::get(const StoreInst *Store) {
-    if (!Store) return {};
-    Value *Stored = Store->getValueOperand();
-    std::shared_ptr<IRType> Ty = Stored ? Stored->getIRType() : nullptr;
-    return {Store->getPointerOperand(),
-            Ty ? std::optional<std::size_t>(Ty->getSize()) : std::nullopt};
-}
-
-bool BasicAAResult::invalidate(Function &F, const PreservationStatus &PA) {
-    if (PA.isKept(BasicAliasAnalysis::ID()) &&
-        (!SE || PA.isKept(SCEVAnalysis::ID()))) {
-        return false;
-    }
-    (void)F;
-    AliasCache.clear();
-    ProvenanceCache.clear();
-    return true;
-}
-
-void BasicAAResult::addObjectNoAliasFact(Value* V1, Value* V2) {
-    if (!V1 || !V2 || V1 == V2) {
-        return;
-    }
-    ObjectNoAlias.insert(makeCanonicalPair(V1, V2));
-}
-
+//判断已播种的对象互斥事实中是否包含给定对象对
 bool BasicAAResult::hasObjectNoAlias(Value* V1, Value* V2) const {
     if (!V1 || !V2 || V1 == V2) {
         return false;
     }
     return ObjectNoAlias.find(makeCanonicalPair(V1, V2)) != ObjectNoAlias.end();
 }
-
-bool BasicAAResult::callMayAliasPointer(CallInst *CI, Value *P,
-                                        const LoopInfo &LI) {
-    if (!CI || !P) return false;
-    (void)LI;
-    for (unsigned I = 0; I < CI->getArgCount(); ++I) {
-        Value *Arg = CI->getArg(I);
-        if (!Arg || !Arg->isPointerValue()) continue;
-
-        if (!haveKnownDistinctUnderlyingObjects(P, Arg)) {
-            return true;
-        }
-    }
-    return false;
-}
-
+//返回指针类型指向元素的名义访问字节数
 std::size_t BasicAAResult::getPointeeAccessSize(Value* V) const {
     std::shared_ptr<IRType> Pointee =
         V && V->getIRType() ? V->getIRType()->getPointeeType() : nullptr;
     return Pointee ? Pointee->getSize() : 0;
 }
-
-// 查询规范化只剥离零偏移 GEP 和单入 PHI，保留影响访问宽度的 BitCast。
+//查询规范化只剥离零偏移GEP和单入PHI，保留影响访问宽度的BitCast
 Value* BasicAAResult::stripBaseInst(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
         if (!V->isPointerValue()) {
             return V;
         }
-
         if (auto *GEP = dynamic_cast<GetElementPtrInst*>(V)) {
             bool AllZero = true;
             for (Value *Idx : GEP->getIndices()) {
@@ -765,22 +798,18 @@ Value* BasicAAResult::stripBaseInst(Value* V) const {
             V = GEP->getBasePointer();
             continue;
         }
-
         if (dynamic_cast<BitCastInst*>(V)) return V;
-
         if (auto *Phi = dynamic_cast<PhiInst*>(V)) {
             if (Phi->getNumIncomingValues() == 1) {
                 V = Phi->getIncomingValue(0);
                 continue;
             }
         }
-
         return V;
     }
     return V;
 }
-
-// 对象身份溯源穿过全部 GEP、BitCast 和单入 PHI，并用 visited 截断环。
+//对象身份溯源穿过GEP、BitCast和单入PHI，并用访问集合截断环
 Value* BasicAAResult::getBaseAddress(Value* V) const {
     std::unordered_set<Value*> Visited;
     while (V && Visited.insert(V).second) {
@@ -788,80 +817,26 @@ Value* BasicAAResult::getBaseAddress(Value* V) const {
             V = GEP->getBasePointer();
             continue;
         }
-
         if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
             V = BC->getUnaryOperand();
             continue;
         }
-
         if (auto *Phi = dynamic_cast<PhiInst*>(V)) {
             if (Phi->getNumIncomingValues() == 1) {
                 V = Phi->getIncomingValue(0);
                 continue;
             }
         }
-
         return V;
     }
     return V;
 }
-
-bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
-                                                        Value* V2) const {
-    auto AreDistinctRoots = [&](Value *O1, Value *O2) {
-        if (!O1 || !O2 || O1 == O2 || O1->isUndef() || O2->isUndef())
-            return false;
-
-        auto *Var1 = dynamic_cast<Variable *>(O1);
-        auto *Var2 = dynamic_cast<Variable *>(O2);
-        const bool IsAlloca1 = dynamic_cast<AllocaInst *>(O1) != nullptr;
-        const bool IsAlloca2 = dynamic_cast<AllocaInst *>(O2) != nullptr;
-        const bool IsParam1 = O1->isParam();
-        const bool IsParam2 = O2->isParam();
-        const bool IsGlobal1 =
-            Var1 && (Var1->vartag == Variable::GlobalVariable ||
-                     Var1->vartag == Variable::GlobalConstant);
-        const bool IsGlobal2 =
-            Var2 && (Var2->vartag == Variable::GlobalVariable ||
-                     Var2->vartag == Variable::GlobalConstant);
-
-        if (IsAlloca1 && IsAlloca2) return true;
-        if (IsGlobal1 && IsGlobal2) return true;
-        if ((IsParam1 && IsAlloca2) || (IsParam2 && IsAlloca1))
-            return true;
-        if ((IsAlloca1 && IsGlobal2) || (IsAlloca2 && IsGlobal1))
-            return true;
-        return hasObjectNoAlias(O1, O2);
-    };
-
-    // 多来源 PHI/Select 只有在笛卡尔积中的每一对对象都互斥时才发布
-    // NoAlias；任何未知来源都会阻止强结论。
-    const PointerProvenanceInfo &First = getPointerProvenance(V1);
-    const PointerProvenanceInfo &Second = getPointerProvenance(V2);
-    if (!First.HasUnknownBase && !Second.HasUnknownBase &&
-        !First.Bases.empty() && !Second.Bases.empty()) {
-        bool AllDistinct = true;
-        for (Value *O1 : First.Bases) {
-            for (Value *O2 : Second.Bases) {
-                if (!AreDistinctRoots(O1, O2)) {
-                    AllDistinct = false;
-                    break;
-                }
-            }
-            if (!AllDistinct) break;
-        }
-        if (AllDistinct) return true;
-    }
-
-    return AreDistinctRoots(getBaseAddress(V1), getBaseAddress(V2));
-}
-
+//判断两个规范化指针是否为同一个SSA值
 bool BasicAAResult::isEqualAlias(Value* V1, Value* V2, const LoopInfo& LI) const {
     (void)LI;
-
     return V1 == V2;
 }
-
+//合并两条控制流路径上的别名结论
 AliasInfo BasicAAResult::mergePhiAlias(AliasInfo A, AliasInfo B) const {
     if (A == B) {
         return A;
@@ -871,26 +846,23 @@ AliasInfo BasicAAResult::mergePhiAlias(AliasInfo A, AliasInfo B) const {
     }
     return AliasInfo::MayAlias;
 }
-
+//按地址顺序构造与参数顺序无关的规范化指针对
 std::pair<Value*, Value*> BasicAAResult::makeCanonicalPair(Value* A, Value* B) const {
     return std::less<Value *>{}(B, A)
         ? std::make_pair(B, A)
         : std::make_pair(A, B);
 }
-
-// GEP 线性化把每个类型化下标换算成字节系数；类型缺失或算术溢出立即失败。
+//GEP线性化把每个类型化下标换算成字节系数
 bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr) const {
     Value* BasePtr = GEP ? GEP->getBasePointer() : nullptr;
     if (!BasePtr || !BasePtr->getIRType()) {
         return false;
     }
-
     std::shared_ptr<IRType> CurType = BasePtr->getIRType();
     for (size_t i = 0; i < GEP->getNumIndices(); ++i) {
         CurType = CurType ? CurType->getIndexableElementType() : nullptr;
         if (!CurType) return false;
         std::size_t Stride = CurType->getSize();
-
         Value* Idx = GEP->getIndex(i);
         if (auto *CI = dynamic_cast<ConstInt*>(Idx)) {
             if (Stride > static_cast<std::size_t>(
@@ -916,15 +888,12 @@ bool BasicAAResult::accumulateGEPIndices(GetElementPtrInst* GEP, LinearGEP& Expr
             return false;
         }
     }
-
     return true;
 }
-
-// 沿完整 GEP/BitCast 链累积线性表达式，最终 Base 必须是稳定对象。
+//沿完整GEP和BitCast链累积线性表达式
 BasicAAResult::LinearGEP BasicAAResult::fillLinearGEP(Value* V) const {
     LinearGEP Expr;
     std::unordered_set<Value*> Visited;
-
     while (V && Visited.insert(V).second) {
         if (auto *GEP = dynamic_cast<GetElementPtrInst*>(V)) {
             if (!accumulateGEPIndices(GEP, Expr)) {
@@ -934,44 +903,37 @@ BasicAAResult::LinearGEP BasicAAResult::fillLinearGEP(Value* V) const {
             V = GEP->getBasePointer();
             continue;
         }
-
         if (auto *BC = dynamic_cast<BitCastInst*>(V)) {
             V = BC->getUnaryOperand();
             continue;
         }
-
         if (auto *Phi = dynamic_cast<PhiInst*>(V)) {
             if (Phi->getNumIncomingValues() == 1) {
                 V = Phi->getIncomingValue(0);
                 continue;
             }
         }
-
         Expr.Base = V;
         return Expr;
     }
-
     Expr.Valid = false;
     return Expr;
 }
-
+//把整数加减链分解为SSA基值和常量偏移
 BasicAAResult::AdditiveDecomposition
 BasicAAResult::decomposeAdditive(Value* V) const {
     AdditiveDecomposition Result;
     Result.Base = V;
     std::unordered_set<Value*> Visited;
-
     while (Result.Base && Visited.insert(Result.Base).second) {
         auto *BI = dynamic_cast<BinaryInst*>(Result.Base);
         if (!BI) {
             return Result;
         }
-
         Value* LHS = BI->getOperand(0);
         Value* RHS = BI->getOperand(1);
         auto *LC = dynamic_cast<ConstInt*>(LHS);
         auto *RC = dynamic_cast<ConstInt*>(RHS);
-
         if (BI->getOp() == BinaryInst::ADD) {
             if (RC) {
                 long long Updated = 0;
@@ -1006,14 +968,12 @@ BasicAAResult::decomposeAdditive(Value* V) const {
             Result.Base = LHS;
             continue;
         }
-
         return Result;
     }
-
     Result.Valid = false;
     return Result;
 }
-
+//返回整数值相对指定SSA基值的常量偏移
 std::optional<long long>
 BasicAAResult::getAdditiveOffsetFrom(Value* V, Value* Base) const {
     if (!V || !Base) {
@@ -1022,7 +982,6 @@ BasicAAResult::getAdditiveOffsetFrom(Value* V, Value* Base) const {
     if (V == Base) {
         return 0;
     }
-
     auto Dec = decomposeAdditive(V);
     if (!Dec.Valid) {
         return std::nullopt;
@@ -1032,20 +991,17 @@ BasicAAResult::getAdditiveOffsetFrom(Value* V, Value* Base) const {
     }
     return std::nullopt;
 }
-
-// 循环距离辅助只接受 SCEV 证明有限、不回绕且正步长的规范归纳 PHI。
+//循环距离辅助只接受SCEV证明有限、不回绕且正步长的规范归纳PHI
 std::optional<BasicAAResult::PositivePhiRecurrence>
 BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
                                         const LoopInfo& LI) const {
     if (!Phi || !Phi->getParent()) {
         return std::nullopt;
     }
-
     Loop* L = LI.getLoopFor(Phi->getParent());
     if (!L || L->getHeader() != Phi->getParent()) {
         return std::nullopt;
     }
-
     if (!SE) return std::nullopt;
     auto Induction = SE->getCanonicalInduction(L);
     if (!Induction || !Induction->Valid || Induction->Phi != Phi ||
@@ -1058,42 +1014,34 @@ BasicAAResult::getPositivePhiRecurrence(PhiInst* Phi,
                                  Induction->UpdateValue,
                                  *Induction->ConstantStep, L};
 }
-
-// 下界证明把规范归纳更新与循环不变量起点配对；任意附加偏移不作无回绕猜测。
+//下界证明把规范归纳更新与循环不变量起点配对
 std::optional<long long>
 BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
                               const LoopInfo& LI) const {
     if (!Greater || !Lesser) {
         return std::nullopt;
     }
-
     if (Greater == Lesser) return 0;
-
     auto Dec = decomposeAdditive(Greater);
     if (!Dec.Valid) {
         return std::nullopt;
     }
-
     auto *Phi = dynamic_cast<PhiInst*>(Dec.Base);
     auto Rec = getPositivePhiRecurrence(Phi, LI);
     if (!Rec) {
         return std::nullopt;
     }
-
     if (!LoopInfo::isLoopInvariant(Lesser, Rec->L)) {
         return std::nullopt;
     }
-
     auto StartOff = getAdditiveOffsetFrom(Rec->Start, Lesser);
     if (!StartOff || *StartOff != 0) {
         return std::nullopt;
     }
-
     if (Dec.Offset != 0 &&
         (Greater != Rec->Update || Dec.Offset != Rec->Step)) {
         return std::nullopt;
     }
-
     long long LB = 0;
     if (!checkedAdd(*StartOff, Dec.Offset, LB)) return std::nullopt;
     if (LB < 0) {
@@ -1101,13 +1049,11 @@ BasicAAResult::lowerBoundDiff(Value* Greater, Value* Lesser,
     }
     return LB;
 }
-
-// 变量下标距离查询先覆盖 i32 模环绕的显式差值，再尝试 SCEV 给出的非负距离下界。
+//变量下标距离查询先覆盖i32模环绕差值，再尝试SCEV给出的距离下界
 AliasInfo BasicAAResult::aliasGEPByIndexDistance(
     const std::unordered_map<Value*, long long>& DiffVars,
     long long ConstDiff, std::size_t Threshold, const LoopInfo& LI) const {
-
-    // 1. 先识别两个 SSA 下标系数互为相反数的仿射差值，例如 A[i+1] 与 A[i]。
+    //1.识别两个SSA下标系数互为相反数的仿射差值
     if (DiffVars.size() == 2 && Threshold > 0 &&
         Threshold <= static_cast<std::size_t>(
                          std::numeric_limits<long long>::max())) {
@@ -1124,7 +1070,6 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
                 Scale = -Scale;
                 std::swap(A, B);
             }
-
             std::optional<long long> Offset = getAdditiveOffsetFrom(A, B);
             if (!Offset) {
                 if (auto Reverse = getAdditiveOffsetFrom(B, A);
@@ -1132,19 +1077,16 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
                     *Reverse != std::numeric_limits<long long>::min())
                     Offset = -*Reverse;
             }
-
             auto Ty = A ? A->getIRType() : nullptr;
             auto BTy = B ? B->getIRType() : nullptr;
             if (Offset && IRType::hasIntegerBitWidth(Ty, 32) &&
                 IRType::hasIntegerBitWidth(BTy, 32)) {
-
-                // 1.1 把链式 i32 加减归一到模 2^32 的全部有符号代表，全部分离才返回 NoAlias。
+                //1.1把链式i32加减归一到模2^32的全部有符号代表
                 long long Residue = *Offset % I32Modulus;
                 if (Residue < 0) Residue += I32Modulus;
                 std::vector<long long> Representatives{Residue};
                 if (Residue != 0)
                     Representatives.push_back(Residue - I32Modulus);
-
                 bool AllDisjoint = true;
                 for (long long IndexDiff : Representatives) {
                     long long Scaled = 0;
@@ -1160,8 +1102,7 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
                 }
                 if (AllDisjoint) return AliasInfo::NoAlias;
             }
-
-            // 2. 模差值不足时，只消费 SCEV 已证明有限且不回绕的规范递推下界。
+            //2.模差值不足时只消费SCEV证明有限且不回绕的规范递推下界
             if (auto Lower = lowerBoundDiff(A, B, LI)) {
                 long long Scaled = 0;
                 long long MinByteDiff = 0;
@@ -1182,28 +1123,24 @@ AliasInfo BasicAAResult::aliasGEPByIndexDistance(
             }
         }
     }
-
-    // 3. 非仿射、可能回绕、距离不足或算术溢出的路径均保持 MayAlias。
+    //3.非仿射、可能回绕、距离不足或算术溢出均保持MayAlias
     return AliasInfo::MayAlias;
 }
-
-// 同对象 GEP 查询相减两条线性表达式，并用真实访问宽度判定相等或分离。
+//同对象GEP查询相减两条线性表达式并用真实访问宽度判定关系
 AliasInfo BasicAAResult::aliasGEP(
     Value* GEP1, Value* GEP2, const LoopInfo& LI, bool UseIndexRange,
     std::optional<std::size_t> AccessSize1,
     std::optional<std::size_t> AccessSize2) {
-    // 1. 线性化两侧并要求底层对象一致；无法精确分解时退化为 MayAlias。
+    //1.线性化两侧并要求底层对象一致
     auto E1 = fillLinearGEP(GEP1);
     auto E2 = fillLinearGEP(GEP2);
-
     if (!E1.Valid || !E2.Valid) {
         return AliasInfo::MayAlias;
     }
     if (E1.Base != E2.Base) {
         return AliasInfo::MayAlias;
     }
-
-    // 2. 相减常量和变量字节偏移，任何宿主整数溢出都会终止证明。
+    //2.相减常量和变量字节偏移，任何宿主整数溢出都会终止证明
     std::unordered_map<Value*, long long> DiffVars = E1.VariableOffsets;
     for (auto &KV : E2.VariableOffsets) {
         long long Updated = 0;
@@ -1218,14 +1155,11 @@ AliasInfo BasicAAResult::aliasGEP(
             ++It;
         }
     }
-
     long long ConstDiff = 0;
     if (!checkedSub(E1.ConstantOffset, E2.ConstantOffset, ConstDiff))
         return AliasInfo::MayAlias;
-
     std::size_t Access1 = AccessSize1.value_or(getPointeeAccessSize(GEP1));
     std::size_t Access2 = AccessSize2.value_or(getPointeeAccessSize(GEP2));
-
     if (Access1 == 0 || Access2 == 0)
         return ConstDiff == 0 && DiffVars.empty() ? AliasInfo::MustAlias
                                                   : AliasInfo::MayAlias;
@@ -1233,22 +1167,18 @@ AliasInfo BasicAAResult::aliasGEP(
     if (Threshold > static_cast<std::size_t>(
                         std::numeric_limits<long long>::max()))
         return AliasInfo::MayAlias;
-
-    // 3. 无变量项时直接比较字节区间；有变量项仅在显式启用范围证明时继续。
+    //3.无变量项时直接比较字节区间，有变量项时按需使用范围证明
     if (!DiffVars.empty()) {
         if (UseIndexRange) {
             return aliasGEPByIndexDistance(DiffVars, ConstDiff, Threshold, LI);
         }
         return AliasInfo::MayAlias;
     }
-
     if (ConstDiff == 0) {
         return AliasInfo::MustAlias;
     }
-
     if (ConstDiff == std::numeric_limits<long long>::min())
         return AliasInfo::MayAlias;
-
     if ((ConstDiff > 0 &&
          ConstDiff >= static_cast<long long>(Access2)) ||
         (ConstDiff < 0 &&
@@ -1258,8 +1188,7 @@ AliasInfo BasicAAResult::aliasGEP(
     }
     return AliasInfo::MayAlias;
 }
-
-// PHI 查询按前驱语义配对 incoming；各路径结论不一致或结构异常时合并为 MayAlias。
+//PHI查询按前驱语义配对来源并合并各路径结论
 AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI,
                                   bool UseIndexRange) {
     if (!Phi) {
@@ -1269,14 +1198,12 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
     if (N == 0) {
         return AliasInfo::MayAlias;
     }
-
     if (auto *OtherPhi = dynamic_cast<PhiInst*>(Other)) {
         if (OtherPhi->getParent() == Phi->getParent()) {
             unsigned M = OtherPhi->getNumIncomingValues();
             if (M == 0 || M != N) {
                 return AliasInfo::MayAlias;
             }
-
             std::unordered_map<BasicBlock *, Value *> OtherByPred;
             if (!forEachPhiIncoming(
                     OtherPhi,
@@ -1286,7 +1213,6 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
                     })) {
                 return AliasInfo::MayAlias;
             }
-
             std::unordered_set<BasicBlock *> SeenPreds;
             AliasInfo Acc = AliasInfo::MayAlias;
             bool First = true;
@@ -1302,7 +1228,6 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
                         InvalidIncoming = true;
                         return false;
                     }
-
                     AliasInfo Cur = aliasImpl(Incoming, OtherIt->second, LI,
                                               UseIndexRange);
                     if (First) {
@@ -1317,7 +1242,6 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
             return Acc;
         }
     }
-
     AliasInfo Acc = aliasImpl(Phi->getIncomingValue(0), Other, LI, UseIndexRange);
     for (unsigned i = 1; i < N; ++i) {
         AliasInfo Cur = aliasImpl(Phi->getIncomingValue(i), Other, LI, UseIndexRange);
@@ -1328,23 +1252,19 @@ AliasInfo BasicAAResult::aliasPHI(PhiInst* Phi, Value* Other, const LoopInfo& LI
     }
     return Acc;
 }
-
-// Select 查询展开两条路径；条件相同的两个 Select 只比较对应分支并防止递归环。
+//Select查询展开两条路径并在条件相同时只比较对应分支
 AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
                                      const LoopInfo &LI,
                                      bool UseIndexRange) {
     if (!Select || !Other) return AliasInfo::MayAlias;
-
     auto Key = makeCanonicalPair(Select, Other);
     ScopedActiveMark ActiveMark(ActiveSelectQueries, Key);
     if (!ActiveMark.inserted())
         return AliasInfo::MayAlias;
-
     Value *TrueValue = Select->getOperand(1);
     Value *FalseValue = Select->getOperand(2);
     if (!TrueValue || !FalseValue)
         return AliasInfo::MayAlias;
-
     if (auto *OtherSelect = dynamic_cast<SelectInst *>(Other)) {
         if (Select->getOperand(0) == OtherSelect->getOperand(0)) {
             AliasInfo OnTrue = aliasImpl(TrueValue,
@@ -1356,29 +1276,17 @@ AliasInfo BasicAAResult::aliasSelect(SelectInst *Select, Value *Other,
             return mergePhiAlias(OnTrue, OnFalse);
         }
     }
-
     AliasInfo OnTrue = aliasImpl(TrueValue, Other, LI, UseIndexRange);
     AliasInfo OnFalse = aliasImpl(FalseValue, Other, LI, UseIndexRange);
     return mergePhiAlias(OnTrue, OnFalse);
 }
-
-AliasInfo BasicAAResult::alias(Value* V1, Value* V2, const LoopInfo& LI) {
-    return aliasImpl(V1, V2, LI, false);
-}
-
-AliasInfo BasicAAResult::aliasWithIndexRange(Value* V1, Value* V2,
-                                             const LoopInfo& LI) {
-    return aliasImpl(V1, V2, LI, true);
-}
-
-// 区间查询在递归展开控制流指针时始终携带原访问宽度，并以 Active 集截断环。
+//区间查询递归展开控制流指针时携带原访问宽度并截断环
 AliasInfo BasicAAResult::aliasLocationImpl(
     const MemoryLocation &L1, const MemoryLocation &L2,
     const LoopInfo &LI, bool UseIndexRange, unsigned Depth,
     std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> &Active) {
     auto NormalizeControlPointer = [](Value *P,
                                       const std::optional<std::size_t> &Size) {
-
         if (!Size) return P;
         std::unordered_set<Value *> Seen;
         while (P && Seen.insert(P).second) {
@@ -1400,22 +1308,18 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         }
         return P;
     };
-
-    // 1. 显式宽度允许剥离零偏移包装；缺失指针、过深递归或活动环均保守失败。
+    //1.使用显式宽度剥离零偏移包装并检查递归状态
     Value *P1 = NormalizeControlPointer(L1.Pointer, L1.Size);
     Value *P2 = NormalizeControlPointer(L2.Pointer, L2.Size);
     if (!P1 || !P2 || Depth > 32) return AliasInfo::MayAlias;
-
     if (P1 == P2) return aliasImpl(P1, P2, LI, UseIndexRange);
-
     auto Key = makeCanonicalPair(P1, P2);
     ScopedActiveMark ActiveMark(Active, Key);
     if (!ActiveMark.inserted()) return AliasInfo::MayAlias;
     auto Merge = [&](AliasInfo A, AliasInfo B) {
         return mergePhiAlias(A, B);
     };
-
-    // 2. 优先按控制流相关性展开 Select 和 PHI，分别求各可达来源的区间关系。
+    //2.按控制流相关性展开Select和PHI并查询各可达来源
     auto *S1 = dynamic_cast<SelectInst *>(P1);
     auto *S2 = dynamic_cast<SelectInst *>(P2);
     if (S1 && S2 && S1->getOperand(0) == S2->getOperand(0)) {
@@ -1445,7 +1349,6 @@ AliasInfo BasicAAResult::aliasLocationImpl(
             Depth + 1, Active);
         return Merge(OnTrue, OnFalse);
     }
-
     auto *Phi1 = dynamic_cast<PhiInst *>(P1);
     auto *Phi2 = dynamic_cast<PhiInst *>(P2);
     if (Phi1 && Phi2 && Phi1->getParent() == Phi2->getParent() &&
@@ -1480,7 +1383,6 @@ AliasInfo BasicAAResult::aliasLocationImpl(
         if (InvalidIncoming) return AliasInfo::MayAlias;
         return Result;
     }
-
     auto ExpandPhi = [&](PhiInst *Phi, const MemoryLocation &Other,
                          bool PhiIsFirst) {
         if (!Phi || Phi->getNumIncomingValues() == 0)
@@ -1504,13 +1406,11 @@ AliasInfo BasicAAResult::aliasLocationImpl(
     };
     if (Phi1) return ExpandPhi(Phi1, L2, true);
     if (Phi2) return ExpandPhi(Phi2, L1, false);
-
-    // 3. 普通指针交给核心查询；同对象 GEP 再用显式宽度覆盖名义 pointee 宽度。
+    //3.普通指针交给核心查询，同对象GEP使用显式访问宽度
     AliasInfo Result = aliasImpl(P1, P2, LI, UseIndexRange);
     if (L1.Size && L2.Size) {
         Value *V1 = stripBaseInst(P1);
         Value *V2 = stripBaseInst(P2);
-
         if (V1 && V2 && getBaseAddress(V1) == getBaseAddress(V2) &&
             (dynamic_cast<GetElementPtrInst *>(V1) ||
              dynamic_cast<GetElementPtrInst *>(V2))) {
@@ -1520,34 +1420,15 @@ AliasInfo BasicAAResult::aliasLocationImpl(
     }
     return Result;
 }
-
-AliasInfo BasicAAResult::alias(const MemoryLocation &L1,
-                               const MemoryLocation &L2,
-                               const LoopInfo &LI) {
-    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
-    return enforceLocationObjectBounds(
-        aliasLocationImpl(L1, L2, LI, false, 0, Active), L1, L2);
-}
-
-AliasInfo BasicAAResult::aliasWithIndexRange(
-    const MemoryLocation &L1, const MemoryLocation &L2,
-    const LoopInfo &LI) {
-    std::unordered_set<std::pair<Value *, Value *>, ValuePairHash> Active;
-    return enforceLocationObjectBounds(
-        aliasLocationImpl(L1, L2, LI, true, 0, Active), L1, L2);
-}
-
-// 核心指针查询按“规范化与校验、对象区分、同对象分解、缓存结果”顺序求解。
+//核心指针查询依次完成规范化、对象区分、同对象分解和结果缓存
 AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
                                    bool UseIndexRange) {
-    // 1. 剥离透明包装并拒绝非指针、undef 来源或不稳定底层对象。
+    //1.剥离透明包装并拒绝非指针、undef来源或不稳定底层对象
     V1 = stripBaseInst(V1);
     V2 = stripBaseInst(V2);
-
     if (!V1 || !V2 || !V1->isPointerValue() || !V2->isPointerValue()) {
         return AliasInfo::MayAlias;
     }
-
     if (V1->isUndef() || V2->isUndef()) {
         return AliasInfo::MayAlias;
     }
@@ -1557,18 +1438,13 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
     UndefActive.clear();
     if (hasUndefPointerOrigin(V2, UndefActive))
         return AliasInfo::MayAlias;
-
-    // 2. SSA 自反关系先得 MustAlias；控制流合流指针必须在对象身份判断前
-    // 按路径展开，否则多入 PHI 会被自身误当成一个未知底层对象。
+    //2.SSA自反关系先得MustAlias，控制流合流指针随后按路径展开
     if (isEqualAlias(V1, V2, LI)) {
         return AliasInfo::MustAlias;
     }
-
-    // 多来源控制流指针只有在来源笛卡尔积中的每一对对象都互斥时才
-    // 提前返回 NoAlias；这也让带回边的指针 PHI 消费来源固定点结果。
+    //多来源控制流指针仅在所有对象对互斥时提前返回NoAlias
     if (haveKnownDistinctUnderlyingObjects(V1, V2))
         return AliasInfo::NoAlias;
-
     if (auto *S1 = dynamic_cast<SelectInst *>(V1))
         return aliasSelect(S1, V2, LI, UseIndexRange);
     if (auto *S2 = dynamic_cast<SelectInst *>(V2))
@@ -1585,22 +1461,18 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
         if (!ActiveMark.inserted()) return AliasInfo::MayAlias;
         return aliasPHI(P2, V1, LI, UseIndexRange);
     }
-
     Value* O1 = getBaseAddress(V1);
     Value* O2 = getBaseAddress(V2);
     if (!O1 || !O2 || O1->isUndef() || O2->isUndef())
         return AliasInfo::MayAlias;
-
-    // 3. 底层对象不同只有在结构事实或调用点事实充分时才能返回 NoAlias。
+    //3.底层对象不同且证据充分时返回NoAlias
     if (O1 != O2) {
         if (haveKnownDistinctUnderlyingObjects(O1, O2)) {
             return AliasInfo::NoAlias;
         }
-
         return AliasInfo::MayAlias;
     }
-
-    // 4. 同对象普通查询先写入保守缓存占位，以截断递归 PHI 图。
+    //4.同对象普通查询先写入保守缓存占位以截断递归PHI图
     std::pair<Value*, Value*> Key;
     if (!UseIndexRange) {
         Key = makeCanonicalPair(V1, V2);
@@ -1610,30 +1482,25 @@ AliasInfo BasicAAResult::aliasImpl(Value* V1, Value* V2, const LoopInfo& LI,
         }
         AliasCache[Key] = AliasInfo::MayAlias;
     }
-
-    // 5. 同对象 GEP 继续比较字节表达式；其他未覆盖形态保持 MayAlias。
+    //5.同对象GEP比较字节表达式，其他未覆盖形态保持MayAlias
     AliasInfo Result = AliasInfo::MayAlias;
     auto *G1 = dynamic_cast<GetElementPtrInst*>(V1);
     auto *G2 = dynamic_cast<GetElementPtrInst*>(V2);
     if (G1 || G2) {
-
         Result = aliasGEP(V1, V2, LI, UseIndexRange);
     } else if (V1 == V2) {
         Result = AliasInfo::MayAlias;
     }
-
     if (!UseIndexRange) {
         AliasCache[Key] = Result;
     }
     return Result;
 }
-
-// BasicAA Pass 主流程从跨调用点的一致对象关系播种函数内查询器。
+//BasicAA Pass主流程从跨调用点的一致对象关系播种函数内查询器
 BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    // 1. 获取 SCEV 作为可选距离证明，并收集函数的指针形参。
+    //1.获取SCEV作为距离证明并收集函数的指针形参
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     BasicAAResult Result(&SE);
-
     std::vector<unsigned> PointerParams;
     PointerParams.reserve(F.getParamCount());
     for (unsigned I = 0; I < F.getParamCount(); ++I) {
@@ -1645,14 +1512,12 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
     if (PointerParams.empty()) {
         return Result;
     }
-
-    // 2. 只有全部用途均为直接调用且存在调用点时，跨函数事实才可安全提升。
+    //2.只有全部用途均为直接调用且存在调用点时才提升跨函数事实
     std::vector<CallInst*> Calls = F.getDirectCallSites();
     if (!F.hasOnlyDirectCallUses() || Calls.empty()) {
         return Result;
     }
-
-    // 3. 对每对指针形参检查所有调用点；仅底层分配对象始终不同才记录 NoAlias。
+    //3.检查每对指针形参在全部调用点上的底层对象关系
     BasicAAResult SeedAA;
     for (unsigned I = 0; I < PointerParams.size(); ++I) {
         for (unsigned J = I + 1; J < PointerParams.size(); ++J) {
@@ -1662,7 +1527,6 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
             for (CallInst* CI : Calls) {
                 Value* ArgI = CI->getArg(PI);
                 Value* ArgJ = CI->getArg(PJ);
-
                 if (!ArgI || !ArgJ ||
                     !SeedAA.haveKnownDistinctUnderlyingObjects(ArgI, ArgJ)) {
                     AllNoAlias = false;
@@ -1674,8 +1538,7 @@ BasicAAResult BasicAliasAnalysis::run(Function &F, FunctionAnalysisPassManager &
             }
         }
     }
-
-    // 4. 同样验证每个指针形参与全局对象，随后封装完整结果。
+    //4.验证每个指针形参与全局对象的关系并返回完整结果
     Module* M = Module::getActiveModule();
     if (!M) {
         return Result;

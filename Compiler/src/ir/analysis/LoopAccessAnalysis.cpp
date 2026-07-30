@@ -1,19 +1,18 @@
 #include "ir/analysis/LoopAccessAnalysis.hpp"
-
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
-
 #include <algorithm>
 #include <limits>
 #include <numeric>
 #include <unordered_set>
 #include <utility>
+//构造一个尚未绑定任何基础分析的空访问分析结果
 LoopAccessInfo::LoopAccessInfo() = default;
-
+//使用函数及各项基础分析构造循环访问查询器
 LoopAccessInfo::LoopAccessInfo(Function *F, LoopInfo *LoopInfoPtr,
                                SCEVResult *SCEV,
                                BasicAAResult *AliasAnalysis,
@@ -22,12 +21,126 @@ LoopAccessInfo::LoopAccessInfo(Function *F, LoopInfo *LoopInfoPtr,
                                DominatorTree *DomTree)
     : Func(F), LI(LoopInfoPtr), SE(SCEV), AA(AliasAnalysis), LD(Dependence),
       RI(RangeAnalysis), DT(DomTree) {}
-
+//移动构造访问分析结果并转移惰性摘要缓存
 LoopAccessInfo::LoopAccessInfo(LoopAccessInfo &&) noexcept = default;
-
+//移动赋值访问分析结果并转移惰性摘要缓存
 LoopAccessInfo &LoopAccessInfo::operator=(LoopAccessInfo &&) noexcept =
     default;
-
+//返回循环作用域的访问摘要并在首次查询时构建缓存
+const LoopAccessSummary &LoopAccessInfo::getSummary(Loop *Scope) {
+    auto It = Cache.find(Scope);
+    if (It != Cache.end()) return *It->second;
+    auto Summary = buildSummary(Scope);
+    LoopAccessSummary *Raw = Summary.get();
+    Cache.emplace(Scope, std::move(Summary));
+    return *Raw;
+}
+//返回指定稳定访问记录在循环作用域中的足迹
+const LoopAccessFootprint *LoopAccessInfo::getFootprint(
+    Loop *Scope, const LoopMemoryAccess &Access) {
+    const LoopAccessSummary &Summary = getSummary(Scope);
+    for (const LoopAccessFootprint &Footprint : Summary.Footprints) {
+        if (Footprint.Access == &Access) return &Footprint;
+    }
+    return nullptr;
+}
+//返回指定指令在循环作用域中对应的全部访问足迹
+std::vector<const LoopAccessFootprint *> LoopAccessInfo::getFootprints(
+    Loop *Scope, Instruction *I) {
+    std::vector<const LoopAccessFootprint *> Result;
+    if (!I) return Result;
+    const LoopAccessSummary &Summary = getSummary(Scope);
+    for (const LoopAccessFootprint &Footprint : Summary.Footprints) {
+        if (Footprint.Access && Footprint.Access->Inst == I)
+            Result.push_back(&Footprint);
+    }
+    return Result;
+}
+//判断指定指令沿给定循环轴的全部访问是否连续
+bool LoopAccessInfo::isConsecutiveAccess(
+    Loop *Scope, Instruction *I, Loop *Axis) {
+    if (!Scope || !I || !Axis) return false;
+    std::vector<const LoopAccessFootprint *> Footprints =
+        getFootprints(Scope, I);
+    if (Footprints.empty()) return false;
+    bool FoundAxis = false;
+    for (const LoopAccessFootprint *Footprint : Footprints) {
+        if (!Footprint || !Footprint->Exact || Footprint->IsEmpty)
+            return false;
+        bool FoundInFootprint = false;
+        for (const LoopAccessDimension &Dimension :
+             Footprint->Dimensions) {
+            if (Dimension.Axis != Axis) continue;
+            FoundInFootprint = true;
+            FoundAxis = true;
+            if (!Dimension.IsFinite || !Dimension.IsUnitStride)
+                return false;
+            break;
+        }
+        if (!FoundInFootprint) return false;
+    }
+    return FoundAxis;
+}
+//判断两个循环是否满足访问层面的融合合法性
+bool LoopAccessInfo::isFusionLegal(Loop *First, Loop *Second) {
+    return analyzeFusion(First, Second).Legal;
+}
+//判断两个循环是否形成次数独立且有限的矩形循环巢
+bool LoopAccessInfo::isRectangularNest(Loop *Outer, Loop *Inner) {
+    if (!Outer || !Inner || !SE || Inner->getParentLoop() != Outer ||
+        Outer->getSubLoops().size() != 1 ||
+        Outer->getSubLoops().front() != Inner ||
+        !isKnownFinite(Outer) || !isKnownFinite(Inner)) {
+        return false;
+    }
+    auto InnerTrip = SE->analyzeLoopTripCount(Inner);
+    if (!InnerTrip || !InnerTrip->Valid || !InnerTrip->Start ||
+        !InnerTrip->Step || !InnerTrip->Bound) {
+        return false;
+    }
+    return !InnerTrip->Start->mentionsLoop(Outer) &&
+           !InnerTrip->Step->mentionsLoop(Outer) &&
+           !InnerTrip->Bound->mentionsLoop(Outer);
+}
+//返回指定指令沿给定循环轴的已知字节步长
+std::optional<std::int64_t>
+LoopAccessInfo::getByteStride(Instruction *I, Loop *Scope, Loop *Axis) {
+    if (!I || !Scope || !Axis || !LD || !Scope->contains(Axis->getHeader()))
+        return std::nullopt;
+    return LD->getByteStride(I, Axis);
+}
+//判断同一读取是否在一个循环轴复用并在另一轴变化
+bool LoopAccessInfo::hasCrossAxisReuse(Loop *Scope, Loop *ReusedAxis,
+                                       Loop *VaryingAxis) {
+    if (!Scope || !ReusedAxis || !VaryingAxis ||
+        ReusedAxis == VaryingAxis || !LD) {
+        return false;
+    }
+    const LoopAccessSummary &Summary = getSummary(Scope);
+    if (Summary.HasUnknownMemory) return false;
+    for (const LoopMemoryAccess *Access : Summary.Accesses) {
+        if (!Access || !Access->Reads || !Access->Inst) continue;
+        auto ReusedStride = getByteStride(Access->Inst, Scope, ReusedAxis);
+        auto VaryingStride = getByteStride(Access->Inst, Scope, VaryingAxis);
+        if (ReusedStride && VaryingStride && *ReusedStride == 0 &&
+            *VaryingStride != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+//根据本Pass及其依赖分析的保留状态判断结果是否失效
+bool LoopAccessInfo::invalidate(Function &,
+                                const PreservationStatus &PA) {
+    return !PA.isKept(LoopAccessAnalysis::ID()) ||
+           !PA.isKept(LoopDependenceAnalysis::ID()) ||
+           !PA.isKept(BasicAliasAnalysis::ID()) ||
+           !PA.isKept(SCEVAnalysis::ID()) ||
+           !PA.isKept(RangeAnalysis::ID()) ||
+           !PA.isKept(DominantAnalysis::ID()) ||
+           !PA.isKept(LoopAnalysis::ID());
+}
+//执行带溢出检查的有符号加法
 bool LoopAccessInfo::checkedAdd(std::int64_t First, std::int64_t Second,
                                 std::int64_t &Result) {
     const __int128 Wide = static_cast<__int128>(First) +
@@ -39,7 +152,7 @@ bool LoopAccessInfo::checkedAdd(std::int64_t First, std::int64_t Second,
     Result = static_cast<std::int64_t>(Wide);
     return true;
 }
-
+//执行带溢出检查的有符号乘法
 bool LoopAccessInfo::checkedMul(std::int64_t First, std::int64_t Second,
                                 std::int64_t &Result) {
     const __int128 Wide = static_cast<__int128>(First) *
@@ -51,23 +164,19 @@ bool LoopAccessInfo::checkedMul(std::int64_t First, std::int64_t Second,
     Result = static_cast<std::int64_t>(Wide);
     return true;
 }
-
+//返回有符号整数绝对值对应的无符号幅值并处理最小值
 std::uint64_t LoopAccessInfo::absoluteMagnitude(std::int64_t Value) {
     return Value < 0
         ? static_cast<std::uint64_t>(-(Value + 1)) + 1U
         : static_cast<std::uint64_t>(Value);
 }
-
-// 常量步长先走 SCEV 自身证明；符号步长仅在 Range 给出严格方向且
-// SCEV 同时证明退出方向和最坏更新不回绕时，才标记为有限。
+//判断循环轴是否已由SCEV及可选范围事实证明有限
 bool LoopAccessInfo::isKnownFinite(Loop *Axis) const {
     if (!SE || !Axis) return false;
     if (SE->isKnownFiniteLoop(Axis)) return true;
     return RI && DT && SE->isKnownFiniteLoop(Axis, *RI, *DT);
 }
-
-// Gate 必须出现在全部回边之前；除循环头的零次退出外，其他提前退出也
-// 必须经过 Gate。这样条件块中的访存不会被误当成每次迭代都执行。
+//判断指定门控块是否支配循环轴所有有效迭代路径
 bool LoopAccessInfo::dominatesIterationPaths(
     BasicBlock *Gate, Loop *Axis) const {
     if (!Gate || !Axis || !DT || !Axis->contains(Gate) ||
@@ -76,8 +185,8 @@ bool LoopAccessInfo::dominatesIterationPaths(
     }
     if (Gate == Axis->getHeader() &&
         Axis->isExitingBlock(Axis->getHeader())) {
-        // 头部退出循环中，Header 指令的执行次数通常是 TripCount+1，
-        // 当前足迹表达式尚不能表示这一额外的条件检查。
+        //头部退出循环中，Header指令的执行次数通常是TripCount+1，
+        //当前足迹表达式尚不能表示这一额外的条件检查。
         return false;
     }
     for (BasicBlock *Backedge : Axis->getBackedgeSrcs()) {
@@ -93,9 +202,7 @@ bool LoopAccessInfo::dominatesIterationPaths(
     }
     return true;
 }
-
-// 相邻两轴只有在内层入口无旁路且次数表达式不依赖外层坐标时，才能
-// 作为一个笛卡尔积维度。兄弟循环不会参与当前访问的轴链。
+//判断直接父子循环轴是否构成次数不依赖外层的矩形维度
 bool LoopAccessInfo::isRectangularAxisPair(
     Loop *Outer, Loop *Inner) const {
     if (!Outer || !Inner || !SE || Inner->getParentLoop() != Outer ||
@@ -111,14 +218,13 @@ bool LoopAccessInfo::isRectangularAxisPair(
            !Trip->Step->mentionsLoop(Outer) &&
            !Trip->Bound->mentionsLoop(Outer);
 }
-
+//判断内存访问是否在足迹覆盖的每个逻辑迭代中必定执行
 bool LoopAccessInfo::isMustExecuteInIterationDomain(
     const LoopMemoryAccess &Access,
     const std::vector<LoopAccessDimension> &Dimensions) const {
     BasicBlock *AccessBlock =
         Access.Inst ? Access.Inst->getParent() : nullptr;
     if (!AccessBlock || Dimensions.empty()) return false;
-
     Loop *Innermost = Dimensions.back().Axis;
     if (!Innermost ||
         !dominatesIterationPaths(AccessBlock, Innermost)) {
@@ -135,13 +241,11 @@ bool LoopAccessInfo::isMustExecuteInIterationDomain(
     }
     return true;
 }
-
-// LoopDependence 的仿射式描述数学系数，但 i32 中间表达式可能先回绕。
-// 这里用指令上下文范围重新验证每个加减乘节点，任何证据不足都阻止
-// Exact/FullAccess，避免把源语言未定义行为当成优化前提。
+//递归证明整数地址表达式在指令上下文中不会发生有符号回绕
 bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
     Value *Expression, Instruction *Context,
     AddressNoWrapQueryState &State, unsigned Depth) const {
+    //1.拒绝缺少上下文、未定义值、递归过深和节点预算耗尽的查询。
     if (!Expression || !Context || !RI || !DT || !SE || !LI ||
         Value::isUndef(Expression) || Depth > 64) {
         return false;
@@ -152,19 +256,17 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
     if (State.VisitedNodes >= MaxAddressNoWrapQueryNodes)
         return false;
     ++State.VisitedNodes;
-
     if (dynamic_cast<ConstInt *>(Expression)) {
         State.Completed.emplace(Expression, true);
         return true;
     }
-
+    //2.递归处理PHI与整数扩展，循环PHI直接消费SCEV无回绕证明。
     ScopedActiveMark Mark(State.Active, Expression);
     if (!Mark.inserted()) return false;
     auto Finish = [&](bool Result) {
         State.Completed.emplace(Expression, Result);
         return Result;
     };
-
     if (auto *Phi = dynamic_cast<PhiInst *>(Expression)) {
         Loop *RecLoop = Phi->getParent()
             ? LI->getLoopFor(Phi->getParent()) : nullptr;
@@ -180,7 +282,6 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
         }
         return Finish(true);
     }
-
     if (auto *ZExt = dynamic_cast<ZextInst *>(Expression)) {
         Value *Operand = ZExt->getOperand(0);
         IntRange Range = RI->query(Operand, Context, *DT);
@@ -195,9 +296,9 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
     }
     if (dynamic_cast<TruncInst *>(Expression))
         return Finish(false);
-
     auto *Binary = dynamic_cast<BinaryInst *>(Expression);
     if (!Binary) return Finish(true);
+    //3.只接受32位整数加减乘，并先证明两个操作数的完整计算链。
     if (!IRType::hasIntegerBitWidth(Binary->getIRType(), 32))
         return Finish(false);
     if (Binary->getOp() != BinaryInst::ADD &&
@@ -205,7 +306,6 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
         Binary->getOp() != BinaryInst::MUL) {
         return Finish(false);
     }
-
     Value *LeftValue = Binary->getOperand(0);
     Value *RightValue = Binary->getOperand(1);
     if (!isIntegerAddressExpressionNoWrap(
@@ -214,12 +314,11 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
             RightValue, Context, State, Depth + 1)) {
         return Finish(false);
     }
-
     IntRange Left = RI->query(LeftValue, Context, *DT);
     IntRange Right = RI->query(RightValue, Context, *DT);
     if (Left.isBottom() || Right.isBottom())
         return Finish(false);
-
+    //4.在宽整数域中计算结果极值，确认整个范围仍落在i32内。
     __int128 Minimum = 0;
     __int128 Maximum = 0;
     if (Binary->getOp() == BinaryInst::ADD) {
@@ -245,7 +344,7 @@ bool LoopAccessInfo::isIntegerAddressExpressionNoWrap(
         Minimum >= IntRange::I32_MIN &&
         Maximum <= IntRange::I32_MAX);
 }
-
+//判断内存访问完整地址计算链是否已证明不回绕
 bool LoopAccessInfo::isAddressArithmeticKnownNoWrap(
     const LoopMemoryAccess &Access) const {
     if (!Access.Pointer || !Access.Inst) return false;
@@ -273,7 +372,7 @@ bool LoopAccessInfo::isAddressArithmeticKnownNoWrap(
     }
     return Current != nullptr;
 }
-
+//按嵌套顺序收集作用域及其所有子循环轴
 void LoopAccessInfo::collectLoopAxes(Loop *Scope,
                                      std::vector<Loop *> &Axes) {
     if (!Scope) return;
@@ -281,8 +380,7 @@ void LoopAccessInfo::collectLoopAxes(Loop *Scope,
     for (Loop *SubLoop : Scope->getSubLoops())
         collectLoopAxes(SubLoop, Axes);
 }
-
-// 地址的总字节步长是各类型化下标带中“轴系数×带步长”的精确和。
+//计算一个内存访问沿指定循环轴的总字节步长
 std::optional<std::int64_t>
 LoopAccessInfo::computeAccessByteStride(
     const LoopMemoryAccess &Access, Loop *Axis) {
@@ -306,8 +404,7 @@ LoopAccessInfo::computeAccessByteStride(
     }
     return Result;
 }
-
-// 常量起始偏移只接受没有循环外符号项的仿射地址，避免把未知参数当成零。
+//计算仿射访问地址中不含符号项的常量起始偏移
 std::optional<std::int64_t>
 LoopAccessInfo::computeConstantStartOffset(
     const LoopMemoryAccess &Access) {
@@ -330,14 +427,14 @@ LoopAccessInfo::computeConstantStartOffset(
     }
     return Result;
 }
-
+//判断两个内存访问是否至少包含一个写入并可能形成冲突
 bool LoopAccessInfo::isWriteConflict(const LoopMemoryAccess &First,
                                      const LoopMemoryAccess &Second) {
     return (First.Writes || Second.Writes) &&
            (First.Reads || First.Writes) &&
            (Second.Reads || Second.Writes);
 }
-
+//判断两个仿射表达式的循环外符号项及其系数是否相同
 bool LoopAccessInfo::sameInvariantTerms(const LoopAffineExpr &First,
                                         const LoopAffineExpr &Second) {
     if (First.InvariantTerms.size() != Second.InvariantTerms.size())
@@ -349,7 +446,7 @@ bool LoopAccessInfo::sameInvariantTerms(const LoopAffineExpr &First,
     }
     return true;
 }
-
+//在映射两个目标循环轴后判断其余循环项及系数是否相同
 bool LoopAccessInfo::sameLoopTermsWithAxisMapping(
     const LoopAffineExpr &First, Loop *FirstAxis,
     const LoopAffineExpr &Second, Loop *SecondAxis) {
@@ -375,7 +472,7 @@ bool LoopAccessInfo::sameLoopTermsWithAxisMapping(
     }
     return true;
 }
-
+//判断内存访问是否满足完整混合基数地址布局约束
 bool LoopAccessInfo::isMixedRadixAccess(const LoopMemoryAccess &Access) {
     if (!Access.AddressExact || !Access.Root || !Access.Location.Size ||
         *Access.Location.Size == 0 || Access.ByteStrides.empty() ||
@@ -396,7 +493,7 @@ bool LoopAccessInfo::isMixedRadixAccess(const LoopMemoryAccess &Access) {
     }
     return true;
 }
-
+//判断仿射表达式是否仅包含目标循环轴并返回其非零系数
 bool LoopAccessInfo::isolateAxis(const LoopAffineExpr &Expression, Loop *Axis,
                                  std::int64_t &Coefficient) {
     if (!Expression.Exact || !Axis) return false;
@@ -409,8 +506,7 @@ bool LoopAccessInfo::isolateAxis(const LoopAffineExpr &Expression, Loop *Axis,
     Coefficient = It->second;
     return true;
 }
-
-// 对齐证明要求两侧均为完整混合基数地址，并且目标轴只在一个坐标带中以同向单位系数出现。
+//判断两个访问地址相等是否强制两个循环轴位于相同逻辑迭代
 bool LoopAccessInfo::equalityForcesAlignedIteration(
     const LoopMemoryAccess &First, Loop *FirstAxis,
     const LoopMemoryAccess &Second, Loop *SecondAxis) {
@@ -421,7 +517,6 @@ bool LoopAccessInfo::equalityForcesAlignedIteration(
         !isMixedRadixAccess(First) || !isMixedRadixAccess(Second)) {
         return false;
     }
-
     bool FoundAxisBand = false;
     for (std::size_t Index = 0; Index < First.Subscripts.size(); ++Index) {
         const LoopAffineExpr &A = First.Subscripts[Index];
@@ -430,7 +525,6 @@ bool LoopAccessInfo::equalityForcesAlignedIteration(
             !sameLoopTermsWithAxisMapping(A, FirstAxis, B, SecondAxis)) {
             return false;
         }
-
         const auto AAxis = A.LoopCoefficients.find(FirstAxis);
         const auto BAxis = B.LoopCoefficients.find(SecondAxis);
         const bool AContainsAxis =
@@ -440,7 +534,6 @@ bool LoopAccessInfo::equalityForcesAlignedIteration(
         if (AContainsAxis != BContainsAxis) return false;
         if (!AContainsAxis) continue;
         if (FoundAxisBand) return false;
-
         std::int64_t ACoefficient = 0;
         std::int64_t BCoefficient = 0;
         if (!isolateAxis(A, FirstAxis, ACoefficient) ||
@@ -455,16 +548,14 @@ bool LoopAccessInfo::equalityForcesAlignedIteration(
     }
     return FoundAxisBand;
 }
-
-// 足迹构建把依赖分析的仿射地址、SCEV 次数和 BasicAA 来源事实约减为
-// 一个只读摘要；任一证据不足都只清除对应字段，不影响其他已证明事实。
+//为单个稳定内存访问构建完整迭代域上的访问足迹
 LoopAccessFootprint LoopAccessInfo::buildFootprint(
     Loop *Scope, const LoopMemoryAccess &Access) {
+    //1.归一化访问元素大小、底层对象、对象大小和对齐事实。
     LoopAccessFootprint Result;
     Result.Access = &Access;
     Result.ElementSize =
         Access.Location.Size ? *Access.Location.Size : 0;
-
     const PointerProvenanceInfo *PointerProvenance = nullptr;
     if (AA && Access.Pointer) {
         PointerProvenance =
@@ -477,7 +568,6 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
                 1, PointerProvenance->KnownAlignment);
     }
     if (!Result.Base) Result.Base = Access.Root;
-
     std::vector<Loop *> Axes;
     collectLoopAxes(Scope, Axes);
     std::unordered_set<const Loop *> AccessAxes;
@@ -487,9 +577,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
         if (Axis && AccessBlock && Axis->contains(AccessBlock))
             AccessAxes.insert(Axis);
     }
-
-    // 查询一个子循环或兄弟循环时，作用域外递推在当前循环内虽是不变量，
-    // 但其运行时最终值不是逻辑迭代零；不能把该项静默当成零偏移。
+    //2.检查是否存在作用域外递推，避免把运行时最终值静默当成零偏移。
     bool HasOutsideLoopTerm = false;
     for (const LoopAffineExpr &Subscript : Access.Subscripts) {
         for (const auto &Term : Subscript.LoopCoefficients) {
@@ -501,8 +589,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
         if (HasOutsideLoopTerm) break;
     }
     if (!HasOutsideLoopTerm) {
-        // 指针本身若已有完整常量偏移，优先使用它；否则把
-        // “Root 到底层对象”和“访问到 Root”两个坐标系显式相加。
+        //3.优先使用指针完整偏移，否则合并Root偏移与访问相对偏移。
         if (PointerProvenance && Result.Base &&
             PointerProvenance->getUniqueBase() == Result.Base) {
             Result.StartByteOffset =
@@ -531,17 +618,14 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
             }
         }
     }
-
     Result.Dimensions.reserve(Axes.size());
     bool AllDimensionsExact = !HasOutsideLoopTerm;
     for (Loop *Axis : Axes) {
-        // 当前作用域可能含有多个兄弟子循环；一个具体访问只属于覆盖其
-        // 指令块的轴链，不能把兄弟循环的次数误乘进该访问的足迹。
+        //4.只收集覆盖访问指令的循环轴，排除同一作用域中的兄弟循环。
         BasicBlock *AccessBlock =
             Access.Inst ? Access.Inst->getParent() : nullptr;
         if (!AccessBlock || !Axis || !Axis->contains(AccessBlock))
             continue;
-
         LoopAccessDimension Dimension;
         Dimension.Axis = Axis;
         if (SE && Axis) {
@@ -562,7 +646,6 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
             Dimension.IsFinite && Dimension.TripCount;
         Result.Dimensions.push_back(Dimension);
     }
-
     const bool MustExecute =
         isMustExecuteInIterationDomain(Access, Result.Dimensions);
     const bool AddressNoWrap =
@@ -576,8 +659,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
         }
     }
     Result.IsEmpty = HasNoIteration;
-
-    // 最内层发生变化的维度若每步恰好跨一个元素，则该维内部为连续访问。
+    //5.最内层变化维度每步恰好跨一个元素时发布连续访问事实。
     for (auto It = Result.Dimensions.rbegin();
          It != Result.Dimensions.rend(); ++It) {
         if (!It->ByteStride || *It->ByteStride == 0) continue;
@@ -587,8 +669,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
     Result.IsConsecutive =
         Result.IsConsecutive && MustExecute && AddressNoWrap &&
         !HasNoIteration;
-
-    // 常量次数下可发布精确半开区间；零次循环不声称存在任何访问。
+    //6.在常量次数下计算足迹的精确最小偏移和半开区间右端点。
     if (MustExecute && AddressNoWrap && !HasNoIteration &&
         Result.StartByteOffset && Result.ElementSize != 0) {
         std::int64_t MinOffset = *Result.StartByteOffset;
@@ -634,9 +715,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
             }
         }
     }
-
-    // 单层运行时次数同样能表达完整连续区间；多层情况只有常量混合基数
-    // 完全吻合时才发布 IsFullAccess。
+    //7.单层运行时次数或常量混合基数完全吻合时发布完整连续足迹。
     std::vector<const LoopAccessDimension *> Varying;
     for (const LoopAccessDimension &Dimension : Result.Dimensions) {
         if (Dimension.ByteStride && *Dimension.ByteStride != 0)
@@ -674,10 +753,7 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
         }
         Result.IsFullAccess = Full;
     }
-
-    // 已知分配对象不能借源语言越界行为发布强足迹结论。常量区间必须
-    // 完整落在 [0, ObjectSize) 内；若只有符号次数而暂时证明不了对象内，
-    // 仍可保留“单位字节步长”这一局部事实，但不得标成 Exact/FullAccess。
+    //8.用已知分配对象边界约束强足迹结论并撤销越界常量区间。
     bool ObjectBoundsProven = true;
     bool ConstantFootprintOutOfBounds = false;
     if (Result.ObjectSize && !HasNoIteration) {
@@ -701,7 +777,6 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
         Result.MinByteOffset.reset();
         Result.MaxByteOffsetExclusive.reset();
     }
-
     Result.Exact = Access.AddressExact && Result.Base &&
                    Result.StartByteOffset &&
                    Result.ElementSize != 0 && AllDimensionsExact &&
@@ -709,16 +784,14 @@ LoopAccessFootprint LoopAccessInfo::buildFootprint(
                    ObjectBoundsProven;
     return Result;
 }
-
-// 摘要构建复用循环依赖访问记录，只补充变换关心的未知内存和写入汇总。
+//为循环作用域构建访问记录及其足迹摘要
 std::unique_ptr<LoopAccessSummary>
 LoopAccessInfo::buildSummary(Loop *Scope) {
-    // 1. 先绑定查询作用域；缺少循环或底层依赖结果时保留 UnknownMemory。
+    //1.先绑定查询作用域；缺少循环或底层依赖结果时保留UnknownMemory。
     auto Summary = std::make_unique<LoopAccessSummary>();
     Summary->Scope = Scope;
     if (!Scope || !LD) return Summary;
-
-    // 2. 复用依赖分析中的稳定访问记录，并汇总是否存在写入。
+    //2.复用依赖分析中的稳定访问记录，并汇总是否存在写入。
     Summary->HasUnknownMemory = LD->hasUnknownMemory(Scope);
     const auto &Memory = LD->getMemoryAccesses(Scope);
     Summary->Accesses.reserve(Memory.size());
@@ -730,98 +803,39 @@ LoopAccessInfo::buildSummary(Loop *Scope) {
     }
     return Summary;
 }
-
-const LoopAccessSummary &LoopAccessInfo::getSummary(Loop *Scope) {
-    auto It = Cache.find(Scope);
-    if (It != Cache.end()) return *It->second;
-    auto Summary = buildSummary(Scope);
-    LoopAccessSummary *Raw = Summary.get();
-    Cache.emplace(Scope, std::move(Summary));
-    return *Raw;
-}
-
-const LoopAccessFootprint *LoopAccessInfo::getFootprint(
-    Loop *Scope, const LoopMemoryAccess &Access) {
-    const LoopAccessSummary &Summary = getSummary(Scope);
-    for (const LoopAccessFootprint &Footprint : Summary.Footprints) {
-        if (Footprint.Access == &Access) return &Footprint;
-    }
-    return nullptr;
-}
-
-std::vector<const LoopAccessFootprint *> LoopAccessInfo::getFootprints(
-    Loop *Scope, Instruction *I) {
-    std::vector<const LoopAccessFootprint *> Result;
-    if (!I) return Result;
-    const LoopAccessSummary &Summary = getSummary(Scope);
-    for (const LoopAccessFootprint &Footprint : Summary.Footprints) {
-        if (Footprint.Access && Footprint.Access->Inst == I)
-            Result.push_back(&Footprint);
-    }
-    return Result;
-}
-
-bool LoopAccessInfo::isConsecutiveAccess(
-    Loop *Scope, Instruction *I, Loop *Axis) {
-    if (!Scope || !I || !Axis) return false;
-    std::vector<const LoopAccessFootprint *> Footprints =
-        getFootprints(Scope, I);
-    if (Footprints.empty()) return false;
-    bool FoundAxis = false;
-    for (const LoopAccessFootprint *Footprint : Footprints) {
-        if (!Footprint || !Footprint->Exact || Footprint->IsEmpty)
-            return false;
-        bool FoundInFootprint = false;
-        for (const LoopAccessDimension &Dimension :
-             Footprint->Dimensions) {
-            if (Dimension.Axis != Axis) continue;
-            FoundInFootprint = true;
-            FoundAxis = true;
-            if (!Dimension.IsFinite || !Dimension.IsUnitStride)
-                return false;
-            break;
-        }
-        if (!FoundInFootprint) return false;
-    }
-    return FoundAxis;
-}
-
-// 访问对分类流程先筛掉只读对，再尝试不同根 NoAlias 和同根迭代对齐证明。
+//分类两个循环轴上的内存访问是否冲突或仅同次迭代冲突
 LoopAccessPairKind LoopAccessInfo::classifyPair(
     Loop *FirstScope, Loop *FirstAxis, const LoopMemoryAccess &First,
     Loop *SecondScope, Loop *SecondAxis,
     const LoopMemoryAccess &Second) const {
     (void)FirstScope;
     (void)SecondScope;
-    // 1. 没有写入的一对访问不会形成调度冲突。
+    //1.没有写入的一对访问不会形成调度冲突。
     if (!isWriteConflict(First, Second))
         return LoopAccessPairKind::NoConflict;
-    // 2. 缺少基础分析或稳定根对象时不能发布强结论。
+    //2.缺少基础分析或稳定根对象时不能发布强结论。
     if (!AA || !LI || !First.Root || !Second.Root)
         return LoopAccessPairKind::Unknown;
-
-    // 3. 不同根对象可消费 BasicAA 的 NoAlias；同根必须继续做跨迭代证明。
+    //3.不同根对象消费BasicAA的NoAlias，同根继续做跨迭代证明。
     if (First.Root != Second.Root &&
         AA->alias(First.Location, Second.Location, *LI) ==
             AliasInfo::NoAlias) {
         return LoopAccessPairKind::NoConflict;
     }
-    // 4. 地址相等若强制两个轴坐标相等，冲突只会出现在同一逻辑迭代。
+    //4.地址相等若强制两个轴坐标相等，冲突只会出现在同一逻辑迭代。
     if (equalityForcesAlignedIteration(First, FirstAxis, Second,
                                        SecondAxis)) {
         return LoopAccessPairKind::SameIterationOnly;
     }
     return LoopAccessPairKind::Unknown;
 }
-
-// 迭代独立查询枚举全部潜在写冲突；未知内存、访问对预算耗尽或任一 Unknown 均失败。
+//判断作用域内各次指定轴迭代之间是否不存在未知写冲突
 bool LoopAccessInfo::areIterationsIndependent(Loop *Scope, Loop *Axis) {
-    // 1. 验证轴属于作用域，并拒绝包含未知内存的摘要。
+    //1.验证轴属于作用域，并拒绝包含未知内存的摘要。
     if (!Scope || !Axis || !Scope->contains(Axis->getHeader())) return false;
     const LoopAccessSummary &Summary = getSummary(Scope);
     if (Summary.HasUnknownMemory) return false;
-
-    // 2. 枚举所有含写访问对；预算耗尽或任一 Unknown 都使证明失败。
+    //2.枚举所有含写访问对，预算耗尽或任一Unknown都使证明失败。
     std::size_t Examined = 0;
     for (std::size_t I = 0; I < Summary.Accesses.size(); ++I) {
         for (std::size_t J = I; J < Summary.Accesses.size(); ++J) {
@@ -838,11 +852,10 @@ bool LoopAccessInfo::areIterationsIndependent(Loop *Scope, Loop *Axis) {
     }
     return true;
 }
-
-// 融合查询交叉枚举两个循环的访问，并统计仅同次迭代发生的冲突和流依赖。
+//分析两个循环的访问关系并生成融合合法性摘要
 LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
                                                      Loop *Second) {
-    // 1. 两个循环必须不同且都具有完整、无未知内存的访问摘要。
+    //1.两个循环必须不同且都具有完整、无未知内存的访问摘要。
     LoopFusionAccessResult Result;
     if (!First || !Second || First == Second) {
         Result.Unknown = true;
@@ -854,8 +867,7 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
         Result.Unknown = true;
         return Result;
     }
-
-    // 2. 交叉枚举访问对并分类；遇到未知关系或预算耗尽立即保守退出。
+    //2.交叉枚举访问对并分类，遇到未知关系或预算耗尽立即保守退出。
     std::size_t Examined = 0;
     for (const LoopMemoryAccess *FirstAccess : A.Accesses) {
         for (const LoopMemoryAccess *SecondAccess : B.Accesses) {
@@ -880,82 +892,20 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
             }
         }
     }
-    // 3. 所有潜在冲突均已排除或限制在同次迭代，融合合法。
+    //3.所有潜在冲突均已排除或限制在同次迭代，融合合法。
     Result.Legal = true;
     return Result;
 }
-
-bool LoopAccessInfo::isFusionLegal(Loop *First, Loop *Second) {
-    return analyzeFusion(First, Second).Legal;
-}
-
-// 矩形循环巢要求唯一父子关系、两层均有限且内层起点/步长/边界不依赖外层。
-bool LoopAccessInfo::isRectangularNest(Loop *Outer, Loop *Inner) {
-    if (!Outer || !Inner || !SE || Inner->getParentLoop() != Outer ||
-        Outer->getSubLoops().size() != 1 ||
-        Outer->getSubLoops().front() != Inner ||
-        !isKnownFinite(Outer) || !isKnownFinite(Inner)) {
-        return false;
-    }
-    auto InnerTrip = SE->analyzeLoopTripCount(Inner);
-    if (!InnerTrip || !InnerTrip->Valid || !InnerTrip->Start ||
-        !InnerTrip->Step || !InnerTrip->Bound) {
-        return false;
-    }
-    return !InnerTrip->Start->mentionsLoop(Outer) &&
-           !InnerTrip->Step->mentionsLoop(Outer) &&
-           !InnerTrip->Bound->mentionsLoop(Outer);
-}
-
-std::optional<std::int64_t>
-LoopAccessInfo::getByteStride(Instruction *I, Loop *Scope, Loop *Axis) {
-    if (!I || !Scope || !Axis || !LD || !Scope->contains(Axis->getHeader()))
-        return std::nullopt;
-    return LD->getByteStride(I, Axis);
-}
-
-// 跨轴复用要求同一读取在复用轴步长为零、在另一轴步长非零。
-bool LoopAccessInfo::hasCrossAxisReuse(Loop *Scope, Loop *ReusedAxis,
-                                       Loop *VaryingAxis) {
-    if (!Scope || !ReusedAxis || !VaryingAxis ||
-        ReusedAxis == VaryingAxis || !LD) {
-        return false;
-    }
-    const LoopAccessSummary &Summary = getSummary(Scope);
-    if (Summary.HasUnknownMemory) return false;
-    for (const LoopMemoryAccess *Access : Summary.Accesses) {
-        if (!Access || !Access->Reads || !Access->Inst) continue;
-        auto ReusedStride = getByteStride(Access->Inst, Scope, ReusedAxis);
-        auto VaryingStride = getByteStride(Access->Inst, Scope, VaryingAxis);
-        if (ReusedStride && VaryingStride && *ReusedStride == 0 &&
-            *VaryingStride != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool LoopAccessInfo::invalidate(Function &,
-                                const PreservationStatus &PA) {
-    return !PA.isKept(LoopAccessAnalysis::ID()) ||
-           !PA.isKept(LoopDependenceAnalysis::ID()) ||
-           !PA.isKept(BasicAliasAnalysis::ID()) ||
-           !PA.isKept(SCEVAnalysis::ID()) ||
-           !PA.isKept(RangeAnalysis::ID()) ||
-           !PA.isKept(DominantAnalysis::ID()) ||
-           !PA.isKept(LoopAnalysis::ID());
-}
-
-// Pass 主流程取得循环、范围、别名和依赖事实，并将其封装为函数级查询器。
+//构建函数级LoopAccessInfo并绑定所需基础分析结果
 LoopAccessInfo LoopAccessAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
-    // 1. Range 已依赖 SCEV；在这里显式消费二者，避免 SCEV 反向注册 Range。
+    //1.显式取得循环、SCEV、范围、支配、别名和依赖分析结果。
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     auto &LD = FAM.getResult<LoopDependenceAnalysis>(F);
-    // 2. 封装惰性缓存查询器；具体循环摘要由首次查询触发构建。
+    //2.封装惰性缓存查询器，具体循环摘要由首次查询触发构建。
     return LoopAccessInfo(&F, &LI, &SE, &AA, &LD, &RI, &DT);
 }

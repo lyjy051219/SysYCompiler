@@ -1,15 +1,27 @@
 #include "ir/analysis/SCEVExpander.hpp"
 #include "lib/IRUtils.hpp"
-
 #include <limits>
+//构造绑定循环作用域、插入块、支配树和指令预算的表达式展开器
 SCEVExpander::SCEVExpander(const Loop *Scope, BasicBlock *InsertBlock,
                            const DominatorTree &DT, unsigned Budget)
     : Scope(Scope), InsertBlock(InsertBlock), DT(DT), Budget(Budget) {}
-
+//返回当前展开器已经成功插入的全部指令
 const std::vector<Instruction *> &SCEVExpander::createdInstructions() const {
     return Created;
 }
-
+//估算展开给定表达式需要新增的IR指令数
+int SCEVExpander::estimateCost(const SCEVExpr *E) const {
+    std::unordered_set<const SCEVExpr *> Active;
+    return estimateCostImpl(E, Active);
+}
+//判断给定表达式是否能够在当前插入点和剩余预算内展开
+bool SCEVExpander::canExpand(const SCEVExpr *E) const {
+    int Cost = estimateCost(E);
+    return InsertBlock && InsertBlock->hasTerminator() && Cost >= 0 &&
+           Inserted <= Budget &&
+           static_cast<unsigned>(Cost) <= Budget - Inserted;
+}
+//判断给定原始IR值是否在当前插入点可用
 bool SCEVExpander::isAvailable(Value *V) const {
     if (!V || Value::isUndef(V) || !InsertBlock) return false;
     if (V->isConst()) return true;
@@ -17,15 +29,13 @@ bool SCEVExpander::isAvailable(Value *V) const {
     auto *I = dynamic_cast<Instruction *>(V);
     return I && I->getParent() && DT.dominates(I->getParent(), InsertBlock);
 }
-
-// 预检递归验证循环不变性、值可用性和可支持节点，并计算实际新增指令数。
+//递归验证表达式形状并估算实际新增指令数
 int SCEVExpander::estimateCostImpl(
     const SCEVExpr *E,
     std::unordered_set<const SCEVExpr *> &Active) const {
     if (!E || (Scope && E->mentionsLoop(Scope))) return -1;
     ScopedActiveMark ActiveMark(Active, E);
     if (!ActiveMark.inserted()) return -1;
-
     int Cost = 0;
     switch (E->Kind) {
     case SCEVExprKind::Constant:
@@ -81,22 +91,9 @@ int SCEVExpander::estimateCostImpl(
         Cost = -1;
         break;
     }
-
     return Cost;
 }
-
-int SCEVExpander::estimateCost(const SCEVExpr *E) const {
-    std::unordered_set<const SCEVExpr *> Active;
-    return estimateCostImpl(E, Active);
-}
-
-bool SCEVExpander::canExpand(const SCEVExpr *E) const {
-    int Cost = estimateCost(E);
-    return InsertBlock && InsertBlock->hasTerminator() && Cost >= 0 &&
-           Inserted <= Budget &&
-           static_cast<unsigned>(Cost) <= Budget - Inserted;
-}
-
+//将SCEV整数常量转换为对应类型的IR常量
 Value *SCEVExpander::makeConstant(const SCEVExpr *E) const {
     if (!E || E->Kind != SCEVExprKind::Constant) {
         return nullptr;
@@ -112,7 +109,7 @@ Value *SCEVExpander::makeConstant(const SCEVExpr *E) const {
         return nullptr;
     return ConstInt::newConstIntForType(E->ConstValue, IntegerType);
 }
-
+//在目标块终结指令前插入新指令并更新预算记录
 Instruction *SCEVExpander::insert(Instruction *I) {
     if (!I) return nullptr;
     if (!InsertBlock || Inserted >= Budget) {
@@ -127,12 +124,10 @@ Instruction *SCEVExpander::insert(Instruction *I) {
     Created.push_back(I);
     return I;
 }
-
-// 物化阶段复用子表达式缓存，按后序创建操作数，再在终结指令前插入当前节点。
+//递归物化给定SCEV表达式并复用已经展开的子表达式
 Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
     auto It = Cache.find(E);
     if (It != Cache.end()) return It->second;
-
     Value *Result = nullptr;
     if (E->Kind == SCEVExprKind::Constant) {
         Result = makeConstant(E);
@@ -166,7 +161,6 @@ Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
         Value *LHS = expandImpl(E->Operands[0]);
         Value *RHS = expandImpl(E->Operands[1]);
         if (!LHS || !RHS) return nullptr;
-
         if (E->Kind == SCEVExprKind::Min ||
             E->Kind == SCEVExprKind::Max) {
             auto Pred = E->Kind == SCEVExprKind::Min
@@ -187,25 +181,20 @@ Value *SCEVExpander::expandImpl(const SCEVExpr *E) {
             Result = insert(new BinaryInst(LHS, Op, RHS));
         }
     }
-
     if (Result) Cache[E] = Result;
     return Result;
 }
-
-// 展开主流程：预检预算后尝试物化；中途失败则删除本次新增指令并恢复计数与缓存。
+//事务式展开给定表达式并在失败时回滚本次新增指令
 Value *SCEVExpander::expand(const SCEVExpr *E) {
-    // 1. 预检拒绝不可支配、递推、除余语义不明确或超预算的表达式。
+    //1.预检拒绝不可支配、递推、除余语义不明确或超预算的表达式
     if (!canExpand(E)) return nullptr;
-
-    // 2. 保存事务边界并递归插入全部子表达式。
+    //2.保存事务边界并递归插入全部子表达式
     const unsigned OldInserted = Inserted;
     const std::size_t OldCreatedSize = Created.size();
     auto OldCache = Cache;
-
     Value *Result = expandImpl(E);
     if (Result) return Result;
-
-    // 3. 失败时仅回滚本次调用新增的指令，保留此前成功物化的结果。
+    //3.失败时仅回滚本次调用新增的指令，保留此前成功物化的结果
     for (std::size_t I = Created.size(); I > OldCreatedSize; --I)
         delete Created[I - 1];
     Created.resize(OldCreatedSize);

@@ -2,14 +2,12 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "lib/IRUtils.hpp"
-
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-// 步骤 3.1：沿支配树向上折叠全部使用块，得到能覆盖整组使用的公共支配块。
+//步骤 3.1：沿支配树向上折叠全部使用块，得到能覆盖整组使用的公共支配块。
 BasicBlock *ConstantHoistPass::foldCommonDominator(
     const DominatorTree &DT,
     const std::vector<ConstantHoistUseSite> &uses) {
@@ -18,7 +16,6 @@ BasicBlock *ConstantHoistPass::foldCommonDominator(
     if (!acc) return nullptr;
     std::unordered_set<BasicBlock*> accAncestors;
     for (BasicBlock *p = acc; p; p = DT.getIDom(p)) accAncestors.insert(p);
-
     for (size_t i = 1; i < uses.size(); ++i) {
         BasicBlock *B = uses[i].block;
         if (!B) return nullptr;
@@ -35,9 +32,8 @@ BasicBlock *ConstantHoistPass::foldCommonDominator(
     }
     return acc;
 }
-
-// 步骤 3.2：公共块位于循环内时，把一次性物化移到最外层规范循环的预头；
-// 缺少规范预头时退回函数入口，确保生成的基值仍支配全部使用点。
+//步骤 3.2：公共块位于循环内时，把一次性物化移到最外层规范循环的预头；
+//缺少规范预头时退回函数入口，确保生成的基值仍支配全部使用点。
 BasicBlock *ConstantHoistPass::pickInsertionBlock(
     BasicBlock *common, BasicBlock *entry, const LoopInfo &LI) {
     if (!common) return entry;
@@ -49,43 +45,37 @@ BasicBlock *ConstantHoistPass::pickInsertionBlock(
         return preHeader;
     return entry;
 }
-
-// 步骤 1.1：判定操作数是否必须保留字面量形态。GEP 索引、调用参数、
-// select 操作数以及目标相关算术均不参与提升，避免遮蔽后续专用匹配。
+//步骤 1.1：判定操作数是否必须保留字面量形态。GEP 索引、调用参数、
+//select 操作数以及目标相关算术均不参与提升，避免遮蔽后续专用匹配。
 bool ConstantHoistPass::isLiteralSensitiveUse(
     const Instruction *User, size_t OperandIndex) {
     if (!User) return true;
-
-    // GEP 的首操作数是基地址；其余操作数是应由地址选择直接消费的索引。
+    //GEP 的首操作数是基地址；其余操作数是应由地址选择直接消费的索引。
     if (dynamic_cast<const GetElementPtrInst *>(User))
         return OperandIndex > 0;
-
-    // 调用约定和条件选择都可能依赖常量形态或路径局部性，统一保守排除。
+    //调用约定和条件选择都可能依赖常量形态或路径局部性，统一保守排除。
     if (dynamic_cast<const CallInst *>(User)) return true;
-
     if (dynamic_cast<const SelectInst *>(User)) return true;
-
     if (auto *BI = dynamic_cast<const BinaryInst *>(User)) {
         BinaryInst::Operation Op = BI->getOp();
         if (BinaryInst::isCompareOp(Op)) return true;
-
         switch (Op) {
         case BinaryInst::DIV:
         case BinaryInst::UDIV:
         case BinaryInst::MOD:
         case BinaryInst::UREM:
-            // 保留常量除数，供除余强度削弱识别。
+            //保留常量除数，供除余强度削弱识别。
             return OperandIndex == 1;
         case BinaryInst::SHL:
         case BinaryInst::LSHR:
         case BinaryInst::ASHR:
-            // 移位量通常由目标立即数字段直接编码。
+            //移位量通常由目标立即数字段直接编码。
             return OperandIndex == 1;
         case BinaryInst::MUL:
         case BinaryInst::AND:
         case BinaryInst::OR:
         case BinaryInst::XOR:
-            // 乘常量及位掩码具有独立的后端匹配规则。
+            //乘常量及位掩码具有独立的后端匹配规则。
             return true;
         case BinaryInst::ADD:
         case BinaryInst::SUB:
@@ -94,13 +84,11 @@ bool ConstantHoistPass::isLiteralSensitiveUse(
             return true;
         }
     }
-
-    // 当前仅明确允许 store 的值操作数；未知指令种类默认不改写。
+    //当前仅明确允许 store 的值操作数；未知指令种类默认不改写。
     return User->instType != Instruction::STORE;
 }
-
-// 步骤 1.2：遍历全部非 PHI 操作数，按值为可提升的大 i32 常量建桶，同时
-// 记录使用点和最大循环深度；这些信息分别服务支配性检查和动态收益估计。
+//步骤 1.2：遍历全部非 PHI 操作数，按值为可提升的大 i32 常量建桶，同时
+//记录使用点和最大循环深度；这些信息分别服务支配性检查和动态收益估计。
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
     Function &F, const LoopInfo &LI) {
     ConstantHoistCollectResult R;
@@ -108,19 +96,19 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
         F, [&](BasicBlock *BB, Instruction *I) {
         unsigned depth = 0;
         if (Loop *L = LI.getLoopFor(BB)) depth = L->getDepth();
-        // PHI 的值定义在对应入边，不能使用普通块内插入点统一替换。
+        //PHI 的值定义在对应入边，不能使用普通块内插入点统一替换。
         if (dynamic_cast<PhiInst *>(I)) return;
         forEachOperand(
             I, [&](size_t OperandIndex, Use *u, Value *v) {
                 if (!u) return;
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
                     if (isLiteralSensitiveUse(I, OperandIndex)) return;
-                    // 重组表达式固定使用 i32，小于目标立即数阈值的值无需物化。
+                    //重组表达式固定使用 i32，小于目标立即数阈值的值无需物化。
                     if (!IRType::hasIntegerBitWidth(
                             ci->getIRType(), 32))
                         return;
                     const int32_t val = static_cast<int32_t>(ci->getVal());
-                    // 在 i64 中计算绝对值，避免 i32 最小值取负溢出。
+                    //在 i64 中计算绝对值，避免 i32 最小值取负溢出。
                     const int64_t wideVal = static_cast<int64_t>(val);
                     const int64_t magnitude = wideVal < 0 ? -wideVal : wideVal;
                     if (magnitude < ImmediateThreshold) return;
@@ -133,8 +121,7 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
     });
     return R;
 }
-
-// 步骤 2.2：完成一个窗口的收益筛选，并以使用次数最多的成员作为公共基值。
+//步骤 2.2：完成一个窗口的收益筛选，并以使用次数最多的成员作为公共基值。
 void ConstantHoistPass::closeGroup(
     ConstantHoistGroup &cur, std::vector<ConstantHoistGroup> &groups) {
     if (cur.members.empty()) return;
@@ -150,18 +137,15 @@ void ConstantHoistPass::closeGroup(
     if ((int)totalUses >= UseThreshold)
         groups.push_back(std::move(cur));
 }
-
-// 步骤 2.1：按常量值排序后构造半径受限的连续窗口。窗口最大值与最小值
-// 之差小于阈值，因此无论选择哪个成员作基值，所有偏移都可直接编码。
+//步骤 2.1：按常量值排序后构造半径受限的连续窗口。窗口最大值与最小值
+//之差小于阈值，因此无论选择哪个成员作基值，所有偏移都可直接编码。
 std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
     std::vector<ConstantHoistCandidate> &sorted) {
     std::vector<ConstantHoistGroup> groups;
     if (sorted.empty()) return groups;
-
     ConstantHoistGroup cur;
     cur.members.push_back(std::move(sorted[0]));
     int64_t windowMin = cur.members[0].value;
-
     for (size_t i = 1; i < sorted.size(); ++i) {
         int64_t diff = (int64_t)sorted[i].value - windowMin;
         if (diff < ImmediateThreshold) {
@@ -176,24 +160,20 @@ std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
     closeGroup(cur, groups);
     return groups;
 }
-
-// 步骤 4：在公共支配块生成一次基值；基值成员直接复用，其余成员按使用块
-// 在最早使用前各生成一条 rebase，避免无谓扩大偏移值的活跃范围。
+//步骤 4：在公共支配块生成一次基值；基值成员直接复用，其余成员按使用块
+//在最早使用前各生成一条 rebase，避免无谓扩大偏移值的活跃范围。
 bool ConstantHoistPass::materializeGroup(
     ConstantHoistGroup &G, BasicBlock *insertBB) {
     if (G.members.empty()) return false;
     int32_t baseValue = G.members[G.baseIdx].value;
-
     auto *baseSSA = new BinaryInst(
         ConstInt::newConstInt(0), BinaryInst::ADD,
         ConstInt::newConstInt(baseValue));
     insertBB->insertAfterPhiNodes(baseSSA);
-
     bool anyChange = false;
     for (size_t i = 0; i < G.members.size(); ++i) {
         ConstantHoistCandidate &m = G.members[i];
         int64_t offset = (int64_t)m.value - (int64_t)baseValue;
-
         if (offset == 0) {
             for (ConstantHoistUseSite &us : m.uses) {
                 us.u->replaceUseeWith(baseSSA);
@@ -201,19 +181,15 @@ bool ConstantHoistPass::materializeGroup(
             }
             continue;
         }
-
-        // 不同基本块分别物化偏移，块内的同值使用共享同一条加法。
+        //不同基本块分别物化偏移，块内的同值使用共享同一条加法。
         std::unordered_map<BasicBlock*, std::vector<ConstantHoistUseSite*>> byBlock;
         for (ConstantHoistUseSite &us : m.uses) byBlock[us.block].push_back(&us);
-
         for (auto &kv : byBlock) {
             BasicBlock *B = kv.first;
             auto &useList = kv.second;
             if (useList.empty() || !B) continue;
-
             std::unordered_set<Instruction*> userSet;
             for (ConstantHoistUseSite *us : useList) userSet.insert(us->inst);
-
             Instruction *earliest = nullptr;
             forEachInstruction(*B, [&](Instruction *I) {
                 if (!userSet.count(I)) return true;
@@ -221,7 +197,6 @@ bool ConstantHoistPass::materializeGroup(
                 return false;
             });
             if (!earliest) continue;
-
             auto *matInst = new BinaryInst(
                 baseSSA, BinaryInst::ADD,
                 ConstInt::newConstInt((int32_t)offset));
@@ -233,20 +208,17 @@ bool ConstantHoistPass::materializeGroup(
     }
     return anyChange;
 }
-
+//收集、分组并物化函数中可共享的大整数常量。
 PreservationStatus ConstantHoistPass::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) {
     if (F.size() == 0) return PreservationStatus::all();
     BasicBlock *entry = F.front();
     if (!entry) return PreservationStatus::all();
-
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
-
-    // 1. 发现候选：过滤字面量敏感位置，并按大整数值汇总使用点。
+    //1.发现候选：过滤字面量敏感位置，并按大整数值汇总使用点。
     ConstantHoistCollectResult R = collectCandidates(F, LI);
-
-    // 2. 合并候选：排序后按可编码偏移分组，剔除总使用次数不足的窗口。
+    //2.合并候选：排序后按可编码偏移分组，剔除总使用次数不足的窗口。
     std::vector<ConstantHoistCandidate> intSorted;
     intSorted.reserve(R.intBuckets.size());
     for (auto &kv : R.intBuckets) intSorted.push_back(std::move(kv.second));
@@ -255,7 +227,6 @@ PreservationStatus ConstantHoistPass::run(Function &F,
                   return a.value < b.value;
               });
     std::vector<ConstantHoistGroup> intGroups = groupByBaseOffset(intSorted);
-
     bool changed = false;
     for (ConstantHoistGroup &G : intGroups) {
         unsigned maxDepth = 0;
@@ -264,23 +235,20 @@ PreservationStatus ConstantHoistPass::run(Function &F,
             if (m.maxDepth > maxDepth) maxDepth = m.maxDepth;
             totalUses += m.uses.size();
         }
-        // 2.1 直线代码需要更多复用才抵消基值物化成本；循环内复用按动态
-        // 执行收益放宽到通用阈值。
+        //2.1 直线代码需要更多复用才抵消基值物化成本；循环内复用按动态
+        //执行收益放宽到通用阈值。
         if (maxDepth == 0 &&
             (int)totalUses < StraightLineUseThreshold)
             continue;
-
         std::vector<ConstantHoistUseSite> allUses;
         for (auto &m : G.members)
             for (auto &u : m.uses) allUses.push_back(u);
-
-        // 3. 合法性验证：选择支配所有 use 的插入块，并确保提前物化不会跨越
-        // 计时屏障或改变计时循环中的动态执行关系。
+        //3.合法性验证：选择支配所有 use 的插入块，并确保提前物化不会跨越
+        //计时屏障或改变计时循环中的动态执行关系。
         BasicBlock *common = foldCommonDominator(DT, allUses);
         BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);
         if (!insertBB) insertBB = entry;
-
-        // 基值实际插在 PHI 序列之后，屏障检查使用同一个概念插入位置。
+        //基值实际插在 PHI 序列之后，屏障检查使用同一个概念插入位置。
         Instruction *InsertAfter = nullptr;
         for (Instruction *I : *insertBB) {
             if (!dynamic_cast<PhiInst *>(I)) break;
@@ -298,13 +266,11 @@ PreservationStatus ConstantHoistPass::run(Function &F,
             }
         }
         if (CrossesTiming) continue;
-
-        // 4. IR 改写：生成公共基值、块内偏移值，并替换整组常量使用。
+        //4.IR 改写：生成公共基值、块内偏移值，并替换整组常量使用。
         changed |= materializeGroup(G, insertBB);
     }
-
     if (!changed) return PreservationStatus::all();
-    // 5. 分析失效：仅改变 SSA 表达式，CFG、支配树和循环结构保持有效。
+    //5.分析失效：仅改变 SSA 表达式，CFG、支配树和循环结构保持有效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

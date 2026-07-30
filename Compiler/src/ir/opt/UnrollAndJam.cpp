@@ -1,5 +1,4 @@
 #include "ir/opt/UnrollAndJam.hpp"
-
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopAccessAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -8,15 +7,13 @@
 #include "ir/opt/LCSSA.hpp"
 #include "ir/opt/LoopUnroll.hpp"
 #include "lib/CFG.hpp"
-
 #include <algorithm>
 #include <limits>
 #include <utility>
-
+//使用给定资源与收益参数构造展开并合并Pass。
 UnrollAndJamPass::UnrollAndJamPass(UnrollAndJamConfig C)
     : Config(std::move(C)) {}
-
-// 2.1 外循环不允许任何值活出，因为 jam 会在同一内循环树中并列多个外轴 lane，目前没有为外部消费者建版本合流。
+//2.1 外循环不允许任何值活出，因为 jam 会在同一内循环树中并列多个外轴 lane，目前没有为外部消费者建版本合流。
 bool UnrollAndJamPass::hasLoopLiveOut(Loop *L) {
     if (!L) return true;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
@@ -35,13 +32,13 @@ bool UnrollAndJamPass::hasLoopLiveOut(Loop *L) {
     }
     return false;
 }
-
+//检查循环头是否只包含指定的规范归纳PHI。
 bool UnrollAndJamPass::hasOnlyCanonicalHeaderPhi(Loop *L, PhiInst *IV) {
     if (!L || !L->getHeader() || !IV) return false;
     const auto Phis = L->getHeader()->collectPhiNodes();
     return Phis.size() == 1 && Phis.front() == IV;
 }
-
+//检查循环头除规范归纳量和允许的归约外是否只承担循环控制。
 bool UnrollAndJamPass::hasControlOnlyHeader(
     Loop *L, PhiInst *IV, const LoopTripCountInfo &Trip,
     bool AllowReductionPhis) {
@@ -64,8 +61,7 @@ bool UnrollAndJamPass::hasControlOnlyHeader(
     }
     return true;
 }
-
-// 2.2 递归收集将被所有 lane 共享的内循环树控制。每一轴必须有有限、正步长的规范 IV，且域不能引用外轴。
+//2.2 递归收集将被所有 lane 共享的内循环树控制。每一轴必须有有限、正步长的规范 IV，且域不能引用外轴。
 bool UnrollAndJamPass::collectSharedLoopControl(
     UnrollAndJamShape &Shape, Loop *Current, SCEVResult &SE,
     const UnrollAndJamConfig &C, unsigned Depth) {
@@ -89,7 +85,6 @@ bool UnrollAndJamPass::collectSharedLoopControl(
     }
     auto *Update = dynamic_cast<Instruction *>(Induction->UpdateValue);
     if (!Update) return false;
-
     Shape.SharedLoops.push_back(Current);
     Shape.SharedExitingBlocks.insert(Trip->ExitingBlock);
     Shape.Control.insert(Induction->Phi);
@@ -101,7 +96,7 @@ bool UnrollAndJamPass::collectSharedLoopControl(
     }
     return true;
 }
-
+//收集外循环和完整共享内循环树中不得为各lane克隆的控制指令。
 bool UnrollAndJamPass::collectControl(
     UnrollAndJamShape &Shape, SCEVResult &SE,
     const UnrollAndJamConfig &C) {
@@ -135,8 +130,7 @@ bool UnrollAndJamPass::collectControl(
     }
     return true;
 }
-
-// 2.3 固定外 IV 回边入口和退出比较的被比较操作数，只接受语义等价于 IV < Bound 的正向循环。
+//2.3 固定外 IV 回边入口和退出比较的被比较操作数，只接受语义等价于 IV < Bound 的正向循环。
 bool UnrollAndJamPass::analyzeOuterControl(UnrollAndJamShape &Shape) {
     PhiInst *IV = Shape.OuterInduction.Phi;
     if (!IV || !Shape.Outer || !Shape.OuterLatch ||
@@ -157,7 +151,6 @@ bool UnrollAndJamPass::analyzeOuterControl(UnrollAndJamShape &Shape) {
         Shape.OuterBackedgeIncomingIndex = Index;
     }
     if (!FoundBackedge) return false;
-
     BinaryInst *Cmp = Shape.OuterTrip.ExitCmp;
     BinaryInst::Operation Predicate = Shape.OuterTrip.ContinueOnTrue
         ? Cmp->getOp()
@@ -181,7 +174,6 @@ bool UnrollAndJamPass::analyzeOuterControl(UnrollAndJamShape &Shape) {
     }
     if (LHS != Compared || Predicate != BinaryInst::L) return false;
     Shape.OuterExitUsesUpdate = Compared == Shape.OuterInduction.UpdateValue;
-
     auto *Update = dynamic_cast<Instruction *>(
         Shape.OuterInduction.UpdateValue);
     for (Use *U : Update->getUses()) {
@@ -194,7 +186,7 @@ bool UnrollAndJamPass::analyzeOuterControl(UnrollAndJamShape &Shape) {
     }
     return true;
 }
-
+//确认循环恰好通过迭代次数分析记录的一条退出边离开。
 bool UnrollAndJamPass::hasSingleExitEdge(
     Loop *L, const LoopTripCountInfo &Trip) {
     if (!L || !Trip.ExitingBlock || !Trip.ExitBlock ||
@@ -204,7 +196,6 @@ bool UnrollAndJamPass::hasSingleExitEdge(
     const auto ExitBlocks = L->getExitBlocks();
     if (ExitBlocks.size() != 1 || ExitBlocks.front() != Trip.ExitBlock)
         return false;
-
     unsigned ExitEdgeCount = 0;
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
@@ -218,8 +209,7 @@ bool UnrollAndJamPass::hasSingleExitEdge(
     return ExitEdgeCount == 1 &&
            Trip.ExitingBlock->countEdgesToSucc(Trip.ExitBlock) == 1;
 }
-
-// 2.4 要求每个进入循环的迭代都到达 latch，从而保证把外步长放大 Factor 倍不会跳过部分路径的状态更新。
+//2.4 要求每个进入循环的迭代都到达 latch，从而保证把外步长放大 Factor 倍不会跳过部分路径的状态更新。
 bool UnrollAndJamPass::hasCompleteIterationPath(
     Loop *L, const LoopTripCountInfo &Trip, BasicBlock *Latch,
     const PostDominatorTree &PDT) {
@@ -235,7 +225,6 @@ bool UnrollAndJamPass::hasCompleteIterationPath(
         ? ExitBranch->getTrueSuccessor()
         : ExitBranch->getFalseSuccessor();
     if (!Continue || !L->contains(Continue)) return false;
-
     for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
         if (!BB) return false;
         if (BB == L->getHeader() && Trip.ExitingBlock == BB &&
@@ -246,7 +235,7 @@ bool UnrollAndJamPass::hasCompleteIterationPath(
     }
     return PDT.postDominates(Latch, Continue);
 }
-
+//综合验证候选嵌套的规范形态、必经路径、LCSSA和副作用约束。
 bool UnrollAndJamPass::validateShape(
     const UnrollAndJamShape &Shape, const LoopInfo &LI,
     SCEVResult &SE,
@@ -293,8 +282,7 @@ bool UnrollAndJamPass::validateShape(
         !PDT.isReachableToExit(Shape.Inner->getHeader())) {
         return false;
     }
-
-    // 2.4.1 除已识别的循环退出外不允许条件 CFG；调用、分配、返回和可故障非访存指令也全部拒绝。
+    //2.4.1 除已识别的循环退出外不允许条件 CFG；调用、分配、返回和可故障非访存指令也全部拒绝。
     for (BasicBlock *BB : Shape.Blocks) {
         if (!BB || !BB->getTerminator()) return false;
         auto *Branch = BB->getBranchTerminator();
@@ -322,7 +310,7 @@ bool UnrollAndJamPass::validateShape(
     (void)LI;
     return true;
 }
-
+//判断循环内PHI能否为每个lane独立克隆并保持局部递推。
 bool UnrollAndJamPass::isSupportedLanePhi(
     const UnrollAndJamShape &Shape, const LoopInfo &LI, PhiInst *Phi) {
     if (!Phi || !Phi->getParent() || !Shape.Outer ||
@@ -343,7 +331,7 @@ bool UnrollAndJamPass::isSupportedLanePhi(
     }
     return true;
 }
-
+//判断指令是否直接依赖当前已发现的lane值集合。
 bool UnrollAndJamPass::instructionDependsOnLane(
     Instruction *I,
     const std::unordered_map<Value *, Value *> &ValueMap) {
@@ -352,8 +340,7 @@ bool UnrollAndJamPass::instructionDependsOnLane(
         if (ValueMap.count(I->getOperand(Index))) return true;
     return false;
 }
-
-// 3.1 查找可被多个 lane 共享的读取：它对外轴不变，却被内循环遍历，且结果流向 lane 依赖计算。
+//3.1 查找可被多个 lane 共享的读取：它对外轴不变，却被内循环遍历，且结果流向 lane 依赖计算。
 bool UnrollAndJamPass::hasShareableLaneRead(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
     const std::unordered_set<Instruction *> &LaneValues) {
@@ -365,7 +352,6 @@ bool UnrollAndJamPass::hasShareableLaneRead(
             auto OuterStride = LA.getByteStride(
                 Load, Shape.Outer, Shape.Outer);
             if (!OuterStride || *OuterStride != 0) continue;
-
             bool TraversedBySharedLoop = false;
             for (Loop *Axis : Shape.SharedLoops) {
                 auto Stride = LA.getByteStride(Load, Shape.Outer, Axis);
@@ -384,8 +370,7 @@ bool UnrollAndJamPass::hasShareableLaneRead(
     }
     return false;
 }
-
-// 3.1.1 长距离合并收益要求 lane 轴按元素大小相邻，而某共享内轴跨越足够长的内存区间。
+//3.1.1 长距离合并收益要求 lane 轴按元素大小相邻，而某共享内轴跨越足够长的内存区间。
 bool UnrollAndJamPass::hasLaneCoalescingBenefit(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
     const std::unordered_set<Instruction *> &LaneValues,
@@ -393,7 +378,6 @@ bool UnrollAndJamPass::hasLaneCoalescingBenefit(
     if (C.CacheLineBytes <= 0 || C.MinCoalescedAxisTripCount <= 0 ||
         C.MinLaneTraversalBytes <= 0)
         return false;
-
     for (BasicBlock *BB : Shape.Blocks) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -402,7 +386,6 @@ bool UnrollAndJamPass::hasLaneCoalescingBenefit(
                 !Load->getIRType()->isScalar()) {
                 continue;
             }
-
             const std::size_t ElementBytes = Load->getIRType()->getSize();
             if (ElementBytes == 0 ||
                 ElementBytes >
@@ -419,7 +402,6 @@ bool UnrollAndJamPass::hasLaneCoalescingBenefit(
                  *OuterStride != -ElementStride)) {
                 continue;
             }
-
             for (Loop *Axis : Shape.SharedLoops) {
                 auto Trip = SE.analyzeLoopTripCount(Axis);
                 auto AxisStride = LA.getByteStride(
@@ -444,15 +426,13 @@ bool UnrollAndJamPass::hasLaneCoalescingBenefit(
     }
     return false;
 }
-
-// 3.1.2 滑动窗口收益要求外轴和某共享内轴具有相同元素步长，且所有 lane 能落入同一缓存行。
+//3.1.2 滑动窗口收益要求外轴和某共享内轴具有相同元素步长，且所有 lane 能落入同一缓存行。
 bool UnrollAndJamPass::hasSlidingWindowBenefit(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
     const std::unordered_set<Instruction *> &LaneValues, int Factor,
     const UnrollAndJamConfig &C) {
     if (!isSupportedFactor(Factor) || C.CacheLineBytes <= 0)
         return false;
-
     for (BasicBlock *BB : Shape.Blocks) {
         if (!BB) return false;
         for (Instruction *I : *BB) {
@@ -476,7 +456,6 @@ bool UnrollAndJamPass::hasSlidingWindowBenefit(
                 *OuterStride != -ElementStride) {
                 continue;
             }
-
             const __int128 Magnitude = *OuterStride < 0
                 ? -static_cast<__int128>(*OuterStride)
                 : static_cast<__int128>(*OuterStride);
@@ -484,7 +463,6 @@ bool UnrollAndJamPass::hasSlidingWindowBenefit(
                 static_cast<__int128>(Factor - 1) * Magnitude +
                 ElementBytes;
             if (LaneSpan > C.CacheLineBytes) continue;
-
             for (Loop *Axis : Shape.SharedLoops) {
                 auto Trip = SE.analyzeLoopTripCount(Axis);
                 auto AxisStride = LA.getByteStride(
@@ -500,15 +478,13 @@ bool UnrollAndJamPass::hasSlidingWindowBenefit(
     }
     return false;
 }
-
-// 3.2 沿 PHI→FADD/FSUB→PHI 链识别严格浮点归约；每个 lane 保留独立递推，不跨 lane 重新结合。
+//3.2 沿 PHI→FADD/FSUB→PHI 链识别严格浮点归约；每个 lane 保留独立递推，不跨 lane 重新结合。
 bool UnrollAndJamPass::isStrictFPRecurrencePath(
     Value *Current, PhiInst *Phi, std::unordered_set<Value *> &Active,
     unsigned Depth) {
     if (!Current || !Phi || Depth > 16) return false;
     if (Current == Phi) return true;
     if (!Active.insert(Current).second) return false;
-
     bool ReachesPhi = false;
     if (auto *Binary = dynamic_cast<BinaryInst *>(Current)) {
         if (Binary->instType == Instruction::FADD ||
@@ -532,7 +508,7 @@ bool UnrollAndJamPass::isStrictFPRecurrencePath(
     Active.erase(Current);
     return ReachesPhi;
 }
-
+//统计lane克隆闭包中的严格浮点归约数量。
 unsigned UnrollAndJamPass::countStrictFPReductions(
     const UnrollAndJamShape &Shape) {
     unsigned Count = 0;
@@ -540,7 +516,6 @@ unsigned UnrollAndJamPass::countStrictFPReductions(
         auto *Phi = dynamic_cast<PhiInst *>(I);
         if (!Phi || !Phi->getIRType() || !Phi->getIRType()->isFloat())
             continue;
-
         bool IsStrictRecurrence = false;
         for (unsigned Index = 0; Index < Phi->getNumIncomingValues();
              ++Index) {
@@ -555,7 +530,7 @@ unsigned UnrollAndJamPass::countStrictFPReductions(
     }
     return Count;
 }
-
+//估算指定展开因子的代码增长和整数、浮点寄存器压力。
 bool UnrollAndJamPass::fitsRegisterBudget(
     const UnrollAndJamShape &Shape, int Factor,
     const UnrollAndJamConfig &C) {
@@ -567,7 +542,6 @@ bool UnrollAndJamPass::fitsRegisterBudget(
         static_cast<__int128>(Factor - 1) *
         Shape.LaneInstructions.size();
     if (Growth > C.MaxClonedInstructions) return false;
-
     unsigned RawLaneFPValues = 0;
     unsigned LaneAddressDepth = 0;
     unsigned LaneIntegerPhis = 0;
@@ -584,8 +558,7 @@ bool UnrollAndJamPass::fitsRegisterBudget(
             ++LaneIntegerPhis;
         }
     }
-
-    // 3.3 寄存器预算：地址链按最多两级同时活跃估算，浮点 load/计算/PHI 和严格归约都计入每 lane 压力。
+    //3.3 寄存器预算：地址链按最多两级同时活跃估算，浮点 load/计算/PHI 和严格归约都计入每 lane 压力。
     const unsigned StrictReductions = countStrictFPReductions(Shape);
     const unsigned LaneFPValues = StrictReductions == 0
         ? RawLaneFPValues
@@ -598,17 +571,16 @@ bool UnrollAndJamPass::fitsRegisterBudget(
         4 + static_cast<__int128>(Factor) * GPRPerLane;
     return ProjectedFPR <= C.FPRBudget && ProjectedGPR <= C.GPRBudget;
 }
-
+//检查展开因子是否属于实现支持的2、4或8。
 bool UnrollAndJamPass::isSupportedFactor(int Factor) {
     return Factor == 2 || Factor == 4 || Factor == 8;
 }
-
+//结合共享读取、访存局部性、归约延迟和寄存器预算选择展开因子。
 std::optional<int> UnrollAndJamPass::selectFactor(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
     const UnrollAndJamConfig &C) {
     if (!Shape.OuterTrip.ConstantTripCount || C.MaxFactor < 2)
         return std::nullopt;
-
     std::unordered_set<Instruction *> LaneValues(
         Shape.LaneInstructions.begin(), Shape.LaneInstructions.end());
     const bool Shareable = hasShareableLaneRead(Shape, LA, LaneValues);
@@ -616,7 +588,6 @@ std::optional<int> UnrollAndJamPass::selectFactor(
     const bool LongTraversal = hasLaneCoalescingBenefit(
         Shape, LA, SE, LaneValues, C);
     const unsigned StrictReductions = countStrictFPReductions(Shape);
-
     auto IsProfitable = [&](int Factor) {
         if (!isSupportedFactor(Factor) || Factor > C.MaxFactor ||
             *Shape.OuterTrip.ConstantTripCount < Factor ||
@@ -628,12 +599,10 @@ std::optional<int> UnrollAndJamPass::selectFactor(
                 Shape, LA, SE, LaneValues, Factor, C);
         return LongTraversal || Sliding;
     };
-
     if (C.Factor != 0)
         return IsProfitable(C.Factor)
             ? std::optional<int>(C.Factor)
             : std::nullopt;
-
     int LatencyFactor = 2;
     while (LatencyFactor < static_cast<int>(C.EstimatedFPAddLatency) &&
            LatencyFactor < 8) {
@@ -643,17 +612,16 @@ std::optional<int> UnrollAndJamPass::selectFactor(
         for (int Factor = LatencyFactor; Factor >= 2; Factor /= 2)
             if (IsProfitable(Factor)) return Factor;
     }
-    // 3.4 自动选择时，严格浮点归约从覆盖目标延迟的较大因子向下试探；无延迟链时仅保守尝试 2 路。
+    //3.4 自动选择时，严格浮点归约从覆盖目标延迟的较大因子向下试探；无延迟链时仅保守尝试 2 路。
     if (IsProfitable(2)) return 2;
     return std::nullopt;
 }
-
+//从外归纳变量出发构造需要为每个额外lane克隆的指令闭包。
 bool UnrollAndJamPass::collectLaneInstructions(
     UnrollAndJamShape &Shape, const UnrollAndJamConfig &C) {
     std::unordered_map<Value *, Value *> LaneValues;
     LaneValues[Shape.OuterInduction.Phi] = Shape.OuterInduction.Phi;
-
-    // 2.5 从外 IV 开始做依赖闭包：store 始终视为 lane 负载，其余指令在使用已标记值时加入。
+    //2.5 从外 IV 开始做依赖闭包：store 始终视为 lane 负载，其余指令在使用已标记值时加入。
     bool Changed = true;
     while (Changed) {
         Changed = false;
@@ -669,8 +637,7 @@ bool UnrollAndJamPass::collectLaneInstructions(
             }
         }
     }
-
-    // 2.5.1 共享循环控制不得反向依赖 lane 值，否则各 lane 不再共享同一内循环域。
+    //2.5.1 共享循环控制不得反向依赖 lane 值，否则各 lane 不再共享同一内循环域。
     for (Instruction *Control : Shape.Control) {
         if (!Control || Control == Shape.OuterInduction.UpdateValue ||
             Control == Shape.OuterTrip.ExitCmp ||
@@ -679,7 +646,6 @@ bool UnrollAndJamPass::collectLaneInstructions(
         }
         if (instructionDependsOnLane(Control, LaneValues)) return false;
     }
-
     for (BasicBlock *BB : Shape.Blocks) {
         for (Instruction *I : *BB) {
             if (!I || Shape.Control.count(I) || !LaneValues.count(I))
@@ -694,12 +660,12 @@ bool UnrollAndJamPass::collectLaneInstructions(
     }
     return !Shape.LaneInstructions.empty();
 }
-
+//从相邻循环建立通过结构、控制、依赖和闭包验证的候选形状。
 std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
     LoopAccessInfo &LA, DominatorTree &DT, PostDominatorTree &PDT,
     const UnrollAndJamConfig &C) {
-    // 2. 候选入口先由 LoopAccessAnalysis 证明直接嵌套矩形且不同外迭代无依赖。
+    //2.候选入口先由 LoopAccessAnalysis 证明直接嵌套矩形且不同外迭代无依赖。
     if (!Outer || !Inner ||
         !LA.isRectangularNest(Outer, Inner) ||
         !LA.areIterationsIndependent(Outer, Outer)) {
@@ -734,7 +700,7 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
                                     Shape.InnerLatch)) {
         return std::nullopt;
     }
-    // 2.6 将控制、外回边语义、CFG/LCSSA 形状和 lane 闭包串联校验，任一步不完整都放弃整个候选。
+    //2.6 将控制、外回边语义、CFG/LCSSA 形状和 lane 闭包串联校验，任一步不完整都放弃整个候选。
     Shape.Blocks = Outer->getBlocksInFunctionOrder();
     if (!collectControl(Shape, SE, C) || !analyzeOuterControl(Shape) ||
         !validateShape(Shape, LI, SE, DT, PDT, C) ||
@@ -743,9 +709,9 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     }
     return Shape;
 }
-
+//解除并销毁提交前计划持有的全部游离指令。
 void UnrollAndJamPass::destroyClonePlan(UnrollAndJamClonePlan &Plan) {
-    // 4.3 失败回滚只处理游离对象：先清空操作数解除 use 链，再销毁每 lane 克隆、lane IV 和新外更新。
+    //4.3 失败回滚只处理游离对象：先清空操作数解除 use 链，再销毁每 lane 克隆、lane IV 和新外更新。
     for (auto &Lane : Plan.Lanes) {
         for (auto &Pair : Lane.InstructionPairs)
             if (Pair.second) Pair.second->clearOperands();
@@ -768,7 +734,7 @@ void UnrollAndJamPass::destroyClonePlan(UnrollAndJamClonePlan &Plan) {
     }
     Plan.Factor = 1;
 }
-
+//按照当前lane的值映射重新绑定全部克隆操作数。
 bool UnrollAndJamPass::remapClonedOperands(
     UnrollAndJamLanePlan &Lane) {
     for (const auto &Pair : Lane.InstructionPairs) {
@@ -790,27 +756,23 @@ bool UnrollAndJamPass::remapClonedOperands(
     }
     return true;
 }
-
-// 4.2 对元素紧邻的 lane 内存访问，将克隆 GEP 规范化为原地址加减 LaneIndex，保持正/反向步长一致。
+//4.2 对元素紧邻的 lane 内存访问，将克隆 GEP 规范化为原地址加减 LaneIndex，保持正/反向步长一致。
 bool UnrollAndJamPass::canonicalizeLaneMemoryAddresses(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
     UnrollAndJamLanePlan &Lane, int LaneIndex) {
     if (!Shape.Outer || LaneIndex <= 0) return false;
     std::unordered_set<Instruction *> LaneValues(
         Shape.LaneInstructions.begin(), Shape.LaneInstructions.end());
-
     for (const auto &Pair : Lane.InstructionPairs) {
         auto *SourceGEP = dynamic_cast<GetElementPtrInst *>(Pair.first);
         auto *CloneGEP = dynamic_cast<GetElementPtrInst *>(Pair.second);
         if (!SourceGEP || !CloneGEP) continue;
-
         int Direction = 0;
         bool Conflict = false;
         for (Use *U : SourceGEP->getUses()) {
             auto *Memory = dynamic_cast<Instruction *>(
                 U ? U->getUser() : nullptr);
             if (!Memory || !LaneValues.count(Memory)) continue;
-
             std::shared_ptr<IRType> ElementType;
             if (auto *Load = dynamic_cast<LoadInst *>(Memory)) {
                 if (Load->getPointerOperand() != SourceGEP) continue;
@@ -848,7 +810,6 @@ bool UnrollAndJamPass::canonicalizeLaneMemoryAddresses(
             Direction = ThisDirection;
         }
         if (Conflict || Direction == 0) continue;
-
         const __int128 WideIndex =
             static_cast<__int128>(Direction) * LaneIndex;
         if (WideIndex < std::numeric_limits<std::int32_t>::min() ||
@@ -861,7 +822,7 @@ bool UnrollAndJamPass::canonicalizeLaneMemoryAddresses(
     }
     return true;
 }
-
+//离线构造额外lane的归纳量、指令克隆、地址映射和新外循环更新。
 std::optional<UnrollAndJamClonePlan>
 UnrollAndJamPass::buildClonePlan(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, int Factor,
@@ -881,8 +842,7 @@ UnrollAndJamPass::buildClonePlan(
     auto Ty = Shape.OuterInduction.Phi->getIRType();
     if (!Ty || !Ty->isInt() || Ty->isBool())
         return std::nullopt;
-
-    // 4. 计划阶段先在宽类型中验证 Factor*Step 和 lane 偏移不溢出，所有新指令在提交前不挂到基本块。
+    //4.计划阶段先在宽类型中验证 Factor*Step 和 lane 偏移不溢出，所有新指令在提交前不挂到基本块。
     UnrollAndJamClonePlan Plan;
     Plan.Factor = Factor;
     Plan.Lanes.reserve(static_cast<std::size_t>(Factor - 1));
@@ -896,7 +856,7 @@ UnrollAndJamPass::buildClonePlan(
         }
         Plan.Lanes.emplace_back();
         UnrollAndJamLanePlan &Lane = Plan.Lanes.back();
-        // 4.1 用外 IV + LaneIndex*Step 构造 lane IV，偏移常量严格沿用 PHI 的真实整数位宽。
+        //4.1 用外 IV + LaneIndex*Step 构造 lane IV，偏移常量严格沿用 PHI 的真实整数位宽。
         Value *LaneOffset = Value::makeIntegerForType(
             static_cast<std::int64_t>(WideOffset), Ty);
         if (!LaneOffset) {
@@ -906,9 +866,8 @@ UnrollAndJamPass::buildClonePlan(
         Lane.LaneIV = new BinaryInst(
             Shape.OuterInduction.Phi, BinaryInst::ADD, LaneOffset);
         Lane.ValueMap[Shape.OuterInduction.Phi] = Lane.LaneIV;
-
         for (Instruction *Source : Shape.LaneInstructions) {
-            // 4.1.1 按原函数顺序克隆 lane 闭包，随克隆扩展 ValueMap，再做一轮完整 operand 重映射。
+            //4.1.1 按原函数顺序克隆 lane 闭包，随克隆扩展 ValueMap，再做一轮完整 operand 重映射。
             Instruction *Clone = Source
                 ? Source->clone(Lane.ValueMap)
                 : nullptr;
@@ -940,11 +899,11 @@ UnrollAndJamPass::buildClonePlan(
         Shape.OuterInduction.Phi, BinaryInst::ADD, NewStepValue);
     return Plan;
 }
-
+//提交前重新验证源指令、挂接点、PHI入边和全部游离克隆。
 bool UnrollAndJamPass::validatePlanCommit(
     const UnrollAndJamShape &Shape,
     const UnrollAndJamClonePlan &Plan) {
-    // 5. 提交预检确认所有新指令仍游离、源指令和挂接点仍存活，且外 IV/退出比较仍引用原更新。
+    //5.提交预检确认所有新指令仍游离、源指令和挂接点仍存活，且外 IV/退出比较仍引用原更新。
     if (!isSupportedFactor(Plan.Factor) ||
         Plan.Lanes.size() != static_cast<std::size_t>(Plan.Factor - 1) ||
         !Plan.NewOuterUpdate ||
@@ -987,12 +946,11 @@ bool UnrollAndJamPass::validatePlanCommit(
     }
     return true;
 }
-
+//集中挂接全部lane克隆并把外循环更新步长放大为Factor倍。
 bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
                                    UnrollAndJamClonePlan &Plan) {
     if (!validatePlanCommit(Shape, Plan)) return false;
-
-    // 5.1 集中挂接：lane IV 放在外头 PHI 后，克隆 PHI 放在所属块 PHI 区，其余负载放在各自终结指令前。
+    //5.1 集中挂接：lane IV 放在外头 PHI 后，克隆 PHI 放在所属块 PHI 区，其余负载放在各自终结指令前。
     for (auto &Lane : Plan.Lanes) {
         auto *LaneIV = dynamic_cast<Instruction *>(Lane.LaneIV);
         Shape.Outer->getHeader()->insertAfterPhiNodes(LaneIV);
@@ -1007,8 +965,7 @@ bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
         Lane.InstructionPairs.clear();
         Lane.ValueMap.clear();
     }
-
-    // 5.2 将新的 Factor*Step 更新插到 latch，同时重定向外 IV 回边和使用 update 的退出比较。
+    //5.2 将新的 Factor*Step 更新插到 latch，同时重定向外 IV 回边和使用 update 的退出比较。
     if (Shape.OuterExitUsesUpdate &&
         Shape.OuterTrip.ExitCmp->getParent() == Shape.OuterLatch) {
         Instruction::insertBefore(Shape.OuterTrip.ExitCmp,
@@ -1027,23 +984,21 @@ bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
     Plan.Lanes.clear();
     return true;
 }
-
+//后序枚举相邻循环，处理余数后提交一次合法且有收益的展开并合并。
 PassResult UnrollAndJamPass::run(Function &F,
                                  FunctionAnalysisPassManager &FAM) {
-    // 1. 函数级成功次数达到上限后停止，避免固定点流水线持续扩大同一函数。
+    //1.函数级成功次数达到上限后停止，避免固定点流水线持续扩大同一函数。
     unsigned &Count = TransformCounts[&F];
     if (Count >= Config.MaxTransformsPerFunction)
         return PassResult::unchanged();
-
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &LA = FAM.getResult<LoopAccessAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &PDT = FAM.getResult<PostDominantAnalysis>(F);
     auto &Headers = TransformedHeaders[&F];
-
     for (Loop *Inner : LI.getLoopsInPostOrder()) {
-        // 1.1 从内向外枚举直接父子循环，跳过已记录的外头；每次调用最多成功提交一个候选。
+        //1.1 从内向外枚举直接父子循环，跳过已记录的外头；每次调用最多成功提交一个候选。
         Loop *Outer = Inner ? Inner->getParentLoop() : nullptr;
         if (!Outer || !Outer->getHeader() ||
             Headers.count(Outer->getHeader())) {
@@ -1051,14 +1006,13 @@ PassResult UnrollAndJamPass::run(Function &F,
         }
         auto Shape = buildShape(Outer, Inner, LI, SE, LA, DT, PDT, Config);
         if (!Shape) continue;
-        // 3. 形状合法后才评估共享读取、内存局部性、严格归约延迟与寄存器压力，得到唯一 Factor。
+        //3.形状合法后才评估共享读取、内存局部性、严格归约延迟与寄存器压力，得到唯一 Factor。
         auto Factor = selectFactor(*Shape, LA, SE, Config);
         if (!Factor || !Shape->OuterTrip.ConstantTripCount) continue;
-
         const std::int64_t Remainder =
             *Shape->OuterTrip.ConstantTripCount % *Factor;
         if (Remainder != 0) {
-            // 6. 非整除 trip count 不直接 jam：余数在预算内时复用 LoopUnroll peeling 剥掉尾数，CFG 变更后立即返回并重算全部分析。
+            //6.非整除 trip count 不直接 jam：余数在预算内时复用 LoopUnroll peeling 剥掉尾数，CFG 变更后立即返回并重算全部分析。
             if (Remainder < 0 ||
                 Remainder > static_cast<std::int64_t>(
                                 Config.MaxRemainderPeel)) {
@@ -1087,19 +1041,17 @@ PassResult UnrollAndJamPass::run(Function &F,
             }
             continue;
         }
-
         auto Plan = buildClonePlan(*Shape, LA, *Factor, Config);
         if (!Plan) continue;
         if (!executePlan(*Shape, *Plan)) {
-            // 4.3 执行前预检失败时计划仍未挂接，可完整销毁并继续尝试下一嵌套。
+            //4.3 执行前预检失败时计划仍未挂接，可完整销毁并继续尝试下一嵌套。
             destroyClonePlan(*Plan);
             continue;
         }
         Headers.insert(Outer->getHeader());
         ++Count;
-
         PreservationStatus PA;
-        // 6.1 jam 只在现有块内插入指令并替换 SSA 更新，不改 CFG，因此保留支配、后支配和循环结构。
+        //6.1 jam 只在现有块内插入指令并替换 SSA 更新，不改 CFG，因此保留支配、后支配和循环结构。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
