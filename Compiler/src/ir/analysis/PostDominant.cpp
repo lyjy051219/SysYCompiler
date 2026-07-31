@@ -1,14 +1,9 @@
 #include "ir/analysis/PostDominant.hpp"
-//构造空的后支配树分析结果
 PostDominatorTree::PostDominatorTree() = default;
-//移动构造后支配树分析结果
 PostDominatorTree::PostDominatorTree(PostDominatorTree &&other) noexcept = default;
-//移动赋值后支配树分析结果
 PostDominatorTree &PostDominatorTree::operator=(
     PostDominatorTree &&other) noexcept = default;
-//判断当前节点是否为分析层虚拟根
 bool PostDominatorNode::isVirtualRoot() const {return Block == nullptr;}
-//判断当前节点是否为后支配树叶节点
 bool PostDominatorNode::isLeaf() const {return FirstChild == nullptr;}
 //返回指定基本块的直接后支配块，直接后支配者为虚拟根时返回nullptr
 BasicBlock* PostDominatorTree::getIPostDom(BasicBlock* BB) const {
@@ -44,47 +39,19 @@ bool PostDominatorTree::postDominates(BasicBlock* A, BasicBlock* B) const {
 bool PostDominatorTree::isReachableToExit(BasicBlock* BB) const {
     return BB != nullptr && ExitReachable.count(BB) > 0;
 }
-//清空后支配树节点、映射和可达出口信息
 void PostDominatorTree::clear() {
     Nodes.clear();
     BlockToNode.clear();
     ExitReachable.clear();
     Root = nullptr;
 }
-//根据Pass保留状态判断当前分析结果是否失效
 bool PostDominatorTree::invalidate(Function &F, const PreservationStatus &PA) {
     if (PA.isKept(PostDominantAnalysis::ID())) {
         return false;
     }
     return true;
 }
-//返回入口可达区域中没有后继的所有真实出口块
-std::vector<BasicBlock*> PostSemiNCAInfo::findExitBlocks(
-    Function* func, const std::unordered_set<BasicBlock*>& reachable) {
-    std::vector<BasicBlock*> exits;
-    for (BasicBlock* BB : *func) {
-        if (!reachable.count(BB)) continue;
-        if (BB->size() == 0) continue;
-        auto succs = BB->getSuccessors();
-        if (succs.empty()) {
-            exits.push_back(BB);
-        }
-    }
-    return exits;
-}
-//预计算入口可达区域中每个基本块的反向CFG邻接关系
-void PostSemiNCAInfo::precomputeReverseCFG(
-    Function* func, const std::unordered_set<BasicBlock*>& reachable) {
-    for (BasicBlock* BB : *func) {
-        if (!reachable.count(BB)) continue;
-        for (BasicBlock* succ : BB->getSuccessors()) {
-            if (succ && reachable.count(succ)) {
-                reverseCFG[succ].push_back(BB);
-            }
-        }
-    }
-}
-//创建连接所有真实出口的虚拟根节点
+//构建算法1：创建虚拟根结点
 void PostSemiNCAInfo::addVirtualRoot() {
     ++lastNum;
     numToNode.push_back(nullptr);
@@ -117,7 +84,7 @@ unsigned PostSemiNCAInfo::eval(unsigned v) {
 void PostSemiNCAInfo::link(unsigned parent, unsigned child) {
     Infos[child].Father = parent;
 }
-//从指定出口沿反向CFG进行DFS编号并记录前驱关系
+//构建算法2：从所有真实出口反向DFS，编DFS序
 void PostSemiNCAInfo::runDFS(BasicBlock* startBlock, unsigned parentDFSNum) {
     //1.使用显式栈从当前真实出口开始遍历反向CFG
     std::stack<std::pair<BasicBlock*, unsigned>> st;
@@ -153,7 +120,7 @@ void PostSemiNCAInfo::runDFS(BasicBlock* startBlock, unsigned parentDFSNum) {
         }
     }
 }
-//在反向CFG的编号空间中求解半支配节点和直接后支配节点
+//构建算法5：Semi-NCA求直接后支配节点，这一步和支配树算法一样
 void PostSemiNCAInfo::runSemiNCA() {
     //1.逆DFS序通过eval和link汇合反向图前驱，得到半支配节点
     for (unsigned i = lastNum; i >= 2; --i) {
@@ -221,9 +188,9 @@ void PostSemiNCAInfo::buildPostDominatorTree(PostDominatorTree& PDT) {
         }
     }
 }
-//后支配分析主流程：建立反向CFG和虚拟根，求解可达出口区域，再保守挂接无限区域
+//后支配分析主流程
 PostDominatorTree PostSemiNCAInfo::calculate(Function* func) {
-    //1.清空一次性求解状态并建立0号编号哨兵，空函数直接返回
+    //1.初始化后支配树和PostSemiNCA类
     PostDominatorTree PDT;
     lastNum = 0;
     Infos.clear();
@@ -234,23 +201,25 @@ PostDominatorTree PostSemiNCAInfo::calculate(Function* func) {
     Infos.emplace_back();
     numToNode.push_back(nullptr);
     if (func->size() == 0) return PDT;
-    //2.限定入口可达块，识别真实出口并预计算反向CFG邻接表
+    //2.获取真实可达出口块，以及反向CFG(边反转存储)
     std::unordered_set<BasicBlock*> reachable;
     func->collectReachableBlocks(reachable);
     if (reachable.empty()) return PDT;
-    auto exits = findExitBlocks(func, reachable);
-    precomputeReverseCFG(func, reachable);
-    //3.创建虚拟根并从所有真实出口反向DFS，得到能够到达出口的区域
+    auto exits = func->findExitBlocks(reachable);
+    reverseCFG = func->buildReverseCFG(reachable);
+    //3.创建虚拟根
     addVirtualRoot();
+    //4.从所有真实出口反向DFS，编DFS序
     for (BasicBlock* exitBB : exits) {
         runDFS(exitBB, 1);
     }
+    //5.把反向 DFS 访问到的节点记为出口可达
     for (auto& kv : nodeToDFSNum) {
         if (kv.first != nullptr) {
             exitReachableSet.insert(kv.first);
         }
     }
-    //4.将无法到达真实出口的块直接挂到虚拟根，并排除在ExitReachable之外
+    //6.将无法到达真实出口的块直接挂到虚拟根，并排除在ExitReachable之外
     for (BasicBlock* BB : reachable) {
         if (nodeToDFSNum.find(BB) == nodeToDFSNum.end()) {
             unsigned currNum = ++lastNum;
@@ -264,20 +233,18 @@ PostDominatorTree PostSemiNCAInfo::calculate(Function* func) {
             Infos[currNum].Father  = 0;
         }
     }
-    //5.在完整编号图上求解直接后支配关系
+    //7.Semi-NCA求直接后支配节点
     runSemiNCA();
-    //6.封装树结构并发布可达出口集合
+    //8.构建后支配树
     buildPostDominatorTree(PDT);
     PDT.ExitReachable = std::move(exitReachableSet);
     return PDT;
 }
-//定义后支配分析Pass的唯一标识
 PassID PostDominantAnalysis::Key;
-//运行函数级后支配分析并返回后支配树
 PostDominantAnalysis::Result PostDominantAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
     //1.创建一次性反向Semi-NCA求解器
     PostSemiNCAInfo info;
-    //2.在虚拟出口视图上完成求解并返回后支配树和可达出口集合
+    //2.计算后支配树
     return info.calculate(&F);
 }

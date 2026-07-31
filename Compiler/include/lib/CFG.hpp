@@ -249,6 +249,13 @@ class Function : public Value, public ChainList<Function,BasicBlock>{
     std::string makeUniqueBlockIdent(const std::string &Base) const;
     // 从入口块出发计算可达块
     void collectReachableBlocks(std::unordered_set<BasicBlock *> &Reachable);
+    // 返回限定块集合中非空且没有后继的出口基本块
+    std::vector<BasicBlock *> findExitBlocks(
+        const std::unordered_set<BasicBlock *> &Blocks) const;
+    // 构造限定块集合内的反向CFG邻接表
+    std::unordered_map<BasicBlock *, std::vector<BasicBlock *>>
+    buildReverseCFG(
+        const std::unordered_set<BasicBlock *> &Blocks) const;
     // 清空函数内所有指令的操作数关系，供批量销毁或回滚前使用
     void dropAllReferences();
     void dumpIR();

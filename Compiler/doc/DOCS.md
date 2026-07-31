@@ -916,27 +916,32 @@ graph TD
 
 > 把CFG的边反转，把出口当入口，然后计算普通支配
 
-后支配：如果从B出发、最终到达某个真实出口的每条路径都经过A，则A后支配B
+后支配：如果从B出发，到函数出口每条路径都经过A，则A后支配B
 
-- 后支配树中的对象：
-
-  - VirtualExit：分析层创建的虚拟根，**无对应IR**；它把多个真实出口统一成单根问题
-  - Block节点：每个从函数Entry可达的真实基本块对应一个节点，包括不能到达真实出口的块
-  - IPostDom树边：`parent -> child`表示`parent = IPostDom(child)`
-  - ExitReachable事实：单独标记“从Entry可达并且还能到达至少一个真实出口”的块，不能与树节点集合混为一谈
-
-VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可以跳转到的真实后支配基本块。
+> 支配关注的是入口->当前块，后支配关注的是当前块->出口
 
 - 后支配树构建：
 
-  1. 先从函数Entry求入口可达区域，排除整段不可达CFG
-  2. 在该区域中寻找没有后继的有效真实出口，并建立CFG的反向邻接关系
-  3. 创建VirtualExit，把所有真实出口作为它在反向CFG中的后继
-  4. 从VirtualExit在反向CFG上遍历，并使用Semi-NCA求能到达出口区域的直接后支配关系
-  5. 对入口可达但不能到达任何真实出口的块，不猜测无限区域内部的后支配关系，而是把每个块保守地直接挂到VirtualExit
-  6. 如果函数没有真实出口，则所有入口可达块都直接挂到VirtualExit；这些块之间不会发布后支配关系
+  1. 获取真实可达出口块，以及反向CFG（边反转存储）
+  2. 创建VirtualExit
+  3. 对所有真实可达出口块反向DFS，编DFS序
+  4. 无法到达真实出口的基本块（但是入口可达）**直接挂载**到虚拟根，为其分配编号（在刚才分配的DFS序号后面）
+  5. 求每个基本块的半后支配者SDom和直接后支配者IDom -- **这一步和支配树算法（SemiNCA）和实现完全一样**
+  6. 构建后支配树
+
+  **和支配树的区别重点在于如何构建DFS序图**
 
 ![PostDominant构建的后支配树](assets/analysis-postdominant.svg)
+
+##### LoopInfo/LoopAnalysis循环分析
+
+建立循环森林
+
+![Generated image 1](assets/Generated image 1.png)
+
+##### 
+
+
 
 ##### BasicAliasAnalysis
 
@@ -1210,238 +1215,6 @@ VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可�
   4.
 
 
-
-
-
-##### RangeAnalysis--整数/浮点范围分析 + KnownBits
-
-基于 SCCP 的 worklist 不动点框架扩展的值范围分析，**同时产出两套独立但联动的 lattice**：
-
-- `IntRange` —— signed [min, max] 区间
-- `KnownBits` —— 32 位级别的 known-zero/known-one 双掩码
-
-以及一套独立的 `FloatRange`（float 的 `[min, max]`）。整套分析供 RangeAwareSimplify、ConstraintElimination 等化简 pass 消费。
-
-设计思路：
-
-复用 SCCP 的 worklist / ExecutableBlocks / FeasibleEdges 三元组基础设施。整数 lattice 从 SCCP 的 `{Top, Constant, Bottom}` 扩展到 `{Top, [min,max], Bottom}`，常量退化为 `[c, c]` 单值区间。KnownBits 独立一路，位级事实（典型：`and/or/shl/lshr/ashr` 操作后的对齐 / 符号位）比区间更精细，二者通过 `KnownBits::toIntRange()` 反推 + 写入前 intersect 的"联动桥"汇合。
-
-- IntRange / FloatRange 定义：
-
-  ```
-  struct IntRange {
-      int64_t min;   // I32_MIN 表 -∞
-      int64_t max;   // I32_MAX 表 +∞
-      int knownTrailingZeros;  // LSB 对齐 hint，add/sub/mul/shl 传播
-  };
-
-  struct FloatRange {
-      double min;    // -∞ 表无下界
-      double max;    // +∞ 表无上界
-      bool isNaN;    // 遇 NaN 污染 → Top
-  };
-  ```
-
-  `isTop()` 只看 `min/max` 是否是 i32 全范围（**不再**掺 knownTrailingZeros —— 此前混合判定让有 align 但 range 宽的值被当"非 Top"走无意义端点比较）。`isBottom()` 是 `min > max`（空区间），`isSingleValue()` 是 `min == max`。
-
-  整数用 int64 backing 避免 i32 中间溢出（例如 `(-2^31) / (-1) = 2^31` 在 i32 装不下），最后查询时再 cast 回 i32。
-
-- KnownBits lattice：
-
-  ```
-  struct KnownBits {
-      uint32_t zero;  // bit i = 1 → 原值第 i 位确定是 0
-      uint32_t one;   // bit i = 1 → 原值第 i 位确定是 1
-      // 不变量：zero & one == 0（否则是 bottom = 不可达）
-  };
-  ```
-
-  算子：`shl / lshr / ashr`（`k==0` 保 identity，`k ∈ [1, 31]` 按位迁移，越界退 Top）；`band / bor / bxor`；`add / sub / mul`（trailing-zero 传播，其余位退 unknown —— 进位会污染）。`unionWith` 用于 PHI 合流（bit 同时 known 且同值才保留），`intersectWith` 用于 narrowing（冲突 bit 同时丢掉避免污染）。
-
-  **toIntRange()**：把 KB 反推成一条 IntRange —— 冲突 → bottom；符号位已知 → 给 signed 的紧 [min, max]；符号位未知但有 trailing zeros → 全 i32 范围 + 保留 align 信息。solver 在写 `updateRange` 前调用 `tightenWithBits` 把这条 IntRange 和直接算出来的 IntRange intersect，让 KB 的位级事实自动反哺到区间层。
-
-- 三阶段整体流程：
-
-  ```mermaid
-  flowchart TD
-      A[Step 1: Forward widening<br/>worklist 不动点迭代<br/>EnqueueCount ≥ 32 widen 到 Top] --> B[Step 2: Narrowing<br/>backward constraint propagation<br/>intersect-only 语义<br/>ADD/SUB 反推操作数]
-      B --> C[Step 3: publishReturnRange<br/>把本函数所有 RetInst 操作数 union<br/>写入 InterprocCache.RetRanges]
-      C --> D[下次分析 H 调 F 时<br/>visitCall 从 cache 拿 F.RetRange<br/>替代 Top]
-  ```
-
-  单阶段 worklist 循环：
-
-  ```mermaid
-  flowchart TD
-      A[初始化: 常量 → 单值区间<br/>其他 → Top] --> B[worklist 取指令 I]
-      B --> C{I 的类型}
-      C -->|二元运算| D[visitBinary<br/>整数/浮点分派]
-      C -->|PHI| E[visitPhi<br/>取所有可达 incoming 并集]
-      C -->|条件分支| F[visitBranch<br/>单前驱时收窄]
-      C -->|CallInst 用户函数| F2[visitCall<br/>查 InterprocCache RetRange]
-      C -->|其他| G[result = Top]
-      D --> H{range 是否变化?}
-      E --> H
-      F --> H
-      F2 --> H
-      G --> H
-      H -->|否| B
-      H -->|是| I{Forward 模式<br/>& EnqueueCount &gt; MAX_ENQUEUE?}
-      I -->|是| J[widen → Top<br/>锁入 Widened 集合]
-      I -->|否 / Narrowing 模式| K[更新 range<br/>把所有 user 推入 worklist]
-      J --> B
-      K --> B
-  ```
-
-- 二元运算 transfer function：
-
-  整数（IntRange 和 KnownBits 两路并行）：
-  - ADD/SUB/MUL：四端点组合取 min/max，遇 i32 范围溢出饱和到 Top；KB 只保留 trailing-zero（add/sub 取两侧 tz 的 min，mul 取 tz 之和）
-  - SDIV：按被除数正负/除数跨 0 做 case 分析，避免除零
-  - SREM：结果符号取决于被除数，`|result| < |divisor|`
-  - **SHL 常量 k**：IntRange 按 `(uint64)min * 2^k` / `max * 2^k` 算，**任一端点越过 I32_MAX 退 Top**（不走饱和截断——i32 wrap 语义下 `1 << 31 = INT32_MIN`，截断会报成 `INT32_MAX` 污染下游）；负数左移直接退 Top 兼避 C++ UB；KB 低 k 位填 known-zero，高位向上迁移
-  - **ASHR / LSHR 常量 k**：IntRange 端点按 `>> k` 单调推；lshr 负数退 Top（signed 区间无法表 uint 高位填 0 后的大正数）；KB 高位按算术/逻辑填
-  - **AND**：双非负时 `[0, min(lMax, rMax)]` + 常量掩码时 `[0, c]`；KB 用 `lKB.zero | rKB.zero` 聚合已知零位、`lKB.one & rKB.one` 聚合同时已知一位
-  - **OR**：双非负时 `[max(lMin, rMin), I32_MAX]`；KB 对偶 AND
-  - **XOR**：IntRange 保守 Top；KB 对双侧都 known 的 bit 按异或算
-
-  浮点：
-  - ADD/SUB/MUL/FDIV：四端点组合取 min/max
-  - `inf * 0 = NaN` 退 Top，`0 / 0 = NaN` 退 Top
-  - ±0 归一化避免端点比较抖动
-
-  Select / Cast：
-  - **Select**：整数浮点分别 union true/false 支的 range；不尝试靠 cond 收窄（分支推理已在 visitBranch 做）
-  - **ZExt i1 → i32**：IntRange `[0, 1]`；KB 高 31 位 known-zero
-  - **SExt i1 → i32**：IntRange `[-1, 0]`；KB 因 "值只能是 0x00000000 或 0xFFFFFFFF" 无法用单一 KB 刻画，留 Top
-  - **Trunc i32 → i1**：IntRange `[0, 1]`；KB 高 31 位 known-zero + bit0 继承源的 bit0
-  - **SITOFP i32 → f32**：整数端点直接转 double
-  - **FPTOSI f32 → i32**：端点向零截断；**任一端点超出 i32 可表示范围或是 ±inf/NaN 直接退 Top**（不再夹到 INT_MIN/INT_MAX——上游会把单值区间错折成常量）
-
-- 条件分支收窄（IntRange + KnownBits 双路）：
-
-  仅在目标块**单前驱**时才对分支条件施加约束（多前驱块条件不是所有路径都满足，over-constrain 会错）：
-
-  IntRange 收窄：
-  ```
-  if terminator(fromBB) is "br (cmp op x rhs) trueBB falseBB":
-      if trueBB.preds.size() == 1:
-          记录 contextualRanges[trueBB][x]  = x 落在 [x op rhs] 的区间
-      if falseBB.preds.size() == 1:
-          记录 contextualRanges[falseBB][x] = x 落在 [x !op rhs] 的区间
-  ```
-
-  rhs 是 ConstInt 直接取值做边界，非常量 rhs 查其当前 range 取端点。整数和浮点分派：操作数类型 IR_INT 走 IntRange 边界 ±1（紧邻前/后一个整数），IR_FLOAT 走 FloatRange 端点（浮点没有"紧邻前一个"概念）。浮点非 Top 时假定不含 NaN（NaN 已被吸收到 Top），按 olt/ole/ogt/oge/oeq 端点比较。
-
-  **KnownBits 边敏感 contextual**（新）：
-  - `x == c` 的 true 边 / `x != c` 的 false 边：把 KB(c) 写入目标块的 `ContextualBits[x]`
-  - `x < 0` / `x >= 0` 的 true/false 边：写符号位 KB（sign=1 or sign=0），对应"sign-bit-narrowing"的常见路径
-  - 所有写入同样受"目标块单前驱" guard
-
-- GEP 索引约束：
-
-  SysY 程序（假设无 UB）若执行到 `gep arr, 0, i` 且 arr 是 `[N × T]` 类型，索引 i 必在 `[0, N-1]`。`visitGEP` 按 updateType 的逻辑走类型链，每个 ARRAYType 维度给对应索引加 contextual 约束 `[0, count-1]` 在 GEP 块。
-
-  ```
-  function visitGEP(GEP):
-      currentType = GEP.base.type
-      for i in [1, GEP.operands.size):
-          if currentType is ARRAYType:
-              narrowed = [0, count - 1] ∩ (旧 contextual or Top)
-              updateContextual(idx[i], GEP_block, narrowed)
-              currentType = array.elementType
-          elif currentType is POINTERType:
-              currentType = ptr.pointerType    // 指针算术，无边界
-  ```
-
-  SSA 保证：同一 Value 在不同点值相同。约束通过支配关系传播到被 GEP 块支配的所有使用。
-
-- widening（收敛保障）：
-
-  Forward 阶段不动点迭代中某个值的 range 变化达到 `MAX_ENQUEUE = 32` 次，直接 widen 到 Top 并写入 `Widened` 集合，后续此值的 forward transfer 不再更新。这是为了保证分析一定收敛——循环累加 `sum += i` 这种没有 SCEV 支持时的递增模式，靠 widening 保守收敛。
-
-  整数浮点共享同一个 `EnqueueCount` 和 `Widened` 集合。**浮点路径必须同样 widen**，否则 `a += 0.1` 这种循环累加在 COUNT=500000 的浮点 bench 上永远不收敛直接跑死。
-
-- Narrowing（backward constraint propagation）：
-
-  Forward widen 到 Top 的值本身是保守 over-approx，Narrowing 阶段在 forward 收敛后用 **intersect-only 语义**重跑一轮把它们收回来：
-
-  1. `NarrowingMode = true`，`updateRange` 改为 `cur = cur.intersectWith(new)`，不再 widen（`Widened` 锁失效，但不主动清除）
-  2. 所有可达指令重新入 worklist；对 ADD/SUB 做 **backward 推导**：`z = x + y ⟹ x = z - y, y = z - x`；`z = x - y ⟹ x = z + y, y = x - z`
-  3. 硬预算 `O(instCount × 4 + 64)` 防止病态函数跑飞；预算耗尽清空 worklist 保守结束
-
-  ```
-  function narrowBinaryBackward(BI, lhs, rhs, lRange, rRange):
-      // 整数 + 浮点同构成立
-      zR = getRange(BI)
-      switch BI.op:
-          case ADD:   // z = x + y
-              x -= rRange; y -= lRange
-          case SUB:   // z = x - y
-              x += rRange; y = lRange - zR
-          // 弱 backward（仅符号）：MUL/DIV/MOD 的端点反推非单调，只推符号
-          case MUL:   // z = x * y 且 z 非负
-              if zR 非负:
-                  if rRange.min > 0: x ∩= [0, INT_MAX]
-                  if lRange.min > 0: y ∩= [0, INT_MAX]
-          case DIV:   // z = x / y, z 非负, y > 0 ⟹ x 非负
-              if zR 非负 and rRange.min > 0: x ∩= [0, INT_MAX]
-          case MOD:   // srem: z 的符号 = 被除数的符号
-              if zR 非负 and rRange 非 Top: x ∩= [0, INT_MAX]
-  ```
-
-  浮点（FADD/FSUB）和整数 ADD/SUB 同构成立（假定非 NaN；NaN 已被吸收到 Top 不进 narrowing）。narrowing 是单调收缩的，ranges 只会变窄，bounded 就一定终止。
-
-- 跨函数 Return Range 传播：
-
-  RangeAnalysis 是 Function-level pass，但用一个文件内 `static InterprocCache` 做跨函数 return range 传播：
-
-  ```
-  struct InterprocCache {
-      unordered_map<Function*, IntRange> RetRanges;
-      unordered_map<Function*, FloatRange> FloatRetRanges;
-      // 参数 range 传播未启用（见下方设计权衡）
-  };
-  ```
-
-  机制：
-  1. 分析 F 时参数**保持 Top**（不从 cache seed），走 forward + narrowing
-  2. `publishReturnRange(F)` 扫所有 RetInst 操作数，union 作为 F 的返回值 range 写 cache
-  3. 后续分析 H 时若 `call F`，`visitCall` 从 cache 查 F 的 RetRange（没 cache 就 Top）
-
-  设计权衡：**不 seed 参数**是有意为之。如果把"所有 call site 实参的 union"作为参数初值，会让 F 被偏紧的参数分析，导致 return range 被低估 → 其他 caller 拿到低估的返回值 → RangeAwareSimplify 基于错误 range 做常量折叠 → WA（实际已验证）。安全的参数传播需要 pipeline 级多轮不动点迭代，当前版本先保守不做。
-
-- contextual range 查询：
-
-  `RI.query(Value *v, BasicBlock *BB, DominatorTree &DT)` 沿支配树往上找离 BB 最近的 block-level 约束，没找到就返回全局 range：
-
-  ```
-  function query(v, BB, DT):
-      range = globalRanges[v]
-      cur = BB
-      for depth in [0, 8) while cur:
-          if contextualRanges[cur].count(v):
-              range = range.intersectWith(contextualRanges[cur][v])
-          cur = DT.idom(cur)
-      return range
-  ```
-
-- 接口：
-
-  1. `IntRange query(Value *v, BasicBlock *BB, DominatorTree &DT)`：整数 range contextual 查询
-  2. `FloatRange queryFloat(Value *v, BasicBlock *BB, DominatorTree &DT)`：浮点 range contextual 查询
-  3. `LoopInductionInfo`：预留 SCEV 接口（`getInductionStart/Step/Count`），当前未实现，供后续 SCEV pass 填
-
-- 特殊输入推断：
-
-  前端 `getch()` 直接推断为 `[0, 127]`（ASCII），避免调用边界 Top 污染后续分析。
-
-- 留待后续：
-
-  - 循环归纳变量的 AddRec 推断：需要 SCEV 分析 pass，接口已留
-  - 跨函数**参数** range 传播：需要 pipeline 级多轮不动点迭代才能安全实现
-  - per-edge contextual range：目前只有 per-block，edge 级对多前驱块的 PHI 精度更高，结构改动较大
-  - PHI sign-preserving widening：曾尝试实现（widen 时若 newRange 非负则退到 `[0, INT_MAX]` 而非 Top），但会与 narrowing + GEP backward 组合产生 over-narrowing，将 `while (i > 0)` 这类出口条件被 foldComparisons 折叠为恒 true 的 bug（73_int_io 复现）。已回滚到直接 widen Top
 
 
 
@@ -3058,15 +2831,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 #### AnalysisPass
 
-##### Dominant支配树
 
-##### PostDominant后支配树
-
-##### LoopInfo/LoopAnalysis循环分析
-
-建立循环森林
-
-![Generated image 1](assets/Generated image 1.png)
 
 ##### MemorySSA
 

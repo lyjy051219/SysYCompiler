@@ -868,6 +868,31 @@ void Function::collectReachableBlocks(
   }
 }
 
+// 返回限定块集合中非空且没有CFG后继的真实出口块。
+std::vector<BasicBlock *> Function::findExitBlocks(
+    const std::unordered_set<BasicBlock *> &Blocks) const {
+  std::vector<BasicBlock *> Exits;
+  for (BasicBlock *BB : *this) {
+    if (!BB || !Blocks.count(BB) || BB->size() == 0) continue;
+    if (BB->getSuccessors().empty()) Exits.push_back(BB);
+  }
+  return Exits;
+}
+
+// 将限定块集合内的每条正向边 From->To 记录为反向邻接 To->From。
+std::unordered_map<BasicBlock *, std::vector<BasicBlock *>>
+Function::buildReverseCFG(
+    const std::unordered_set<BasicBlock *> &Blocks) const {
+  std::unordered_map<BasicBlock *, std::vector<BasicBlock *>> ReverseCFG;
+  for (BasicBlock *BB : *this) {
+    if (!BB || !Blocks.count(BB)) continue;
+    for (BasicBlock *Succ : BB->getSuccessors()) {
+      if (Succ && Blocks.count(Succ)) ReverseCFG[Succ].push_back(BB);
+    }
+  }
+  return ReverseCFG;
+}
+
 void Function::dropAllReferences() {
   // 先解除指令间的操作数关系，避免后续批量销毁时递归影响其他指令
   for (BasicBlock *BB : *this) {

@@ -1,57 +1,166 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" role="img" aria-labelledby="title desc">
-  <title id="title">PostDominant分析构建的后支配树</title>
-  <desc id="desc">多出口CFG通过虚拟出口根转换成一棵后支配树。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 690" role="img" aria-labelledby="title desc">
+  <title id="title">PostDominant分析：从原始CFG经反向DFS编号构造直接后支配树</title>
+  <desc id="desc">先从虚拟根连接所有真实出口并反向DFS编号，再把入口可达但不能到达真实出口的无限循环块追加编号并保守挂到虚拟根，最后依据直接后支配关系建树。</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
       <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
     </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#dc2626"/>
+    </marker>
     <style>
-      .title{font:700 24px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
+      .title{font:700 25px Inter,"Noto Sans SC",sans-serif;fill:#0f172a}
       .panel{fill:#f8fafc;stroke:#cbd5e1;stroke-width:2}
-      .label{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .panel-title{font:700 18px Inter,"Noto Sans SC",sans-serif;fill:#334155;text-anchor:middle}
       .node{fill:#fee2e2;stroke:#dc2626;stroke-width:2}
+      .loop{fill:#ede9fe;stroke:#7c3aed;stroke-width:2}
       .virtual{fill:#fef3c7;stroke:#d97706;stroke-width:2;stroke-dasharray:7 4}
-      .text{font:600 15px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
-      .small{font:14px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .phase1{fill:#eff6ff;stroke:#93c5fd;stroke-width:1.5;stroke-dasharray:6 4}
+      .phase2{fill:#fff7ed;stroke:#fb923c;stroke-width:1.5;stroke-dasharray:6 4}
+      .text{font:600 14px Inter,"Noto Sans SC",sans-serif;fill:#0f172a;text-anchor:middle}
+      .number{font:700 13px Inter,"Noto Sans SC",sans-serif;fill:#1d4ed8;text-anchor:middle}
+      .small{font:13px Inter,"Noto Sans SC",sans-serif;fill:#475569;text-anchor:middle}
+      .note{font:13px Inter,"Noto Sans SC",sans-serif;fill:#334155}
+      .phase-label{font:700 14px Inter,"Noto Sans SC",sans-serif;fill:#1e40af}
+      .phase-label-warm{font:700 14px Inter,"Noto Sans SC",sans-serif;fill:#9a3412}
       .edge{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}
-      .post{fill:none;stroke:#dc2626;stroke-width:2.5;marker-end:url(#arrow)}
+      .reverse{fill:none;stroke:#2563eb;stroke-width:2.2;marker-end:url(#arrow-blue)}
+      .post{fill:none;stroke:#dc2626;stroke-width:2.4;marker-end:url(#arrow-red)}
+      .artificial{fill:none;stroke:#d97706;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#arrow)}
+      .separator{stroke:#cbd5e1;stroke-width:1.5;stroke-dasharray:5 5}
     </style>
   </defs>
-  <rect width="1000" height="540" fill="#ffffff"/>
-  <text x="500" y="34" class="title" text-anchor="middle">PostDominant：多出口CFG → PostDominatorTree</text>
-  <rect x="28" y="58" width="444" height="420" rx="14" class="panel"/>
-  <rect x="492" y="58" width="480" height="420" rx="14" class="panel"/>
-  <text x="250" y="88" class="label" text-anchor="middle">原始CFG</text>
-  <text x="732" y="88" class="label" text-anchor="middle">直接后支配树</text>
-  <path d="M250 144 L155 202" class="edge"/>
-  <path d="M250 144 L345 202" class="edge"/>
-  <path d="M155 246 L155 330" class="edge"/>
-  <path d="M345 246 L345 330" class="edge"/>
-  <rect x="195" y="100" width="110" height="44" rx="9" class="node"/>
-  <rect x="100" y="202" width="110" height="44" rx="9" class="node"/>
-  <rect x="290" y="202" width="110" height="44" rx="9" class="node"/>
-  <rect x="100" y="330" width="110" height="44" rx="9" class="node"/>
-  <rect x="290" y="330" width="110" height="44" rx="9" class="node"/>
-  <text x="250" y="127" class="text">Entry</text>
-  <text x="155" y="229" class="text">Then</text>
-  <text x="345" y="229" class="text">Else</text>
-  <text x="155" y="357" class="text">ExitA</text>
-  <text x="345" y="357" class="text">ExitB</text>
-  <path d="M732 150 L570 212" class="post"/>
-  <path d="M732 150 L732 212" class="post"/>
-  <path d="M732 150 L894 212" class="post"/>
-  <path d="M570 256 L570 336" class="post"/>
-  <path d="M894 256 L894 336" class="post"/>
-  <rect x="657" y="100" width="150" height="50" rx="10" class="virtual"/>
-  <rect x="515" y="212" width="110" height="44" rx="9" class="node"/>
-  <rect x="677" y="212" width="110" height="44" rx="9" class="node"/>
-  <rect x="839" y="212" width="110" height="44" rx="9" class="node"/>
-  <rect x="515" y="336" width="110" height="44" rx="9" class="node"/>
-  <rect x="839" y="336" width="110" height="44" rx="9" class="node"/>
-  <text x="732" y="130" class="text">VirtualExit</text>
-  <text x="570" y="239" class="text">ExitA</text>
-  <text x="732" y="239" class="text">Entry</text>
-  <text x="894" y="239" class="text">ExitB</text>
-  <text x="570" y="363" class="text">Then</text>
-  <text x="894" y="363" class="text">Else</text>
+
+  <rect width="1500" height="690" fill="#ffffff"/>
+  <text x="750" y="35" class="title" text-anchor="middle">PostDominant：原始 CFG → 反向 DFS 编号 → Direct PostDominatorTree</text>
+
+  <!-- 三个阶段面板 -->
+  <rect x="20" y="58" width="410" height="570" rx="14" class="panel"/>
+  <rect x="450" y="58" width="600" height="570" rx="14" class="panel"/>
+  <rect x="1070" y="58" width="410" height="570" rx="14" class="panel"/>
+  <text x="225" y="88" class="panel-title">① 原始 CFG</text>
+  <text x="750" y="88" class="panel-title">② 反向 CFG 的 DFS 编号（示例次序）</text>
+  <text x="1275" y="88" class="panel-title">③ 直接后支配树</text>
+
+  <!-- 左：原始CFG -->
+  <path d="M225 151 L225 186" class="edge"/>
+  <path d="M225 230 L92 287" class="edge"/>
+  <path d="M225 230 L225 282" class="edge"/>
+  <path d="M225 230 L358 287" class="edge"/>
+  <path d="M92 331 L92 397" class="edge"/>
+  <path d="M225 326 L225 397" class="edge"/>
+  <path d="M358 331 L358 397" class="edge"/>
+  <path d="M401 419 C421 419 421 485 358 485 C311 485 311 438 326 427" class="edge"/>
+
+  <rect x="170" y="107" width="110" height="44" rx="9" class="node"/>
+  <rect x="165" y="186" width="120" height="44" rx="9" class="node"/>
+  <rect x="42" y="287" width="100" height="44" rx="9" class="node"/>
+  <rect x="175" y="282" width="100" height="44" rx="9" class="node"/>
+  <rect x="308" y="287" width="100" height="44" rx="9" class="loop"/>
+  <rect x="42" y="397" width="100" height="44" rx="9" class="node"/>
+  <rect x="175" y="397" width="100" height="44" rx="9" class="node"/>
+  <rect x="308" y="397" width="100" height="44" rx="9" class="loop"/>
+
+  <text x="225" y="134" class="text">Entry</text>
+  <text x="225" y="213" class="text">Dispatch</text>
+  <text x="92" y="314" class="text">Then</text>
+  <text x="225" y="309" class="text">Else</text>
+  <text x="358" y="314" class="text">LoopHead</text>
+  <text x="92" y="424" class="text">ExitA</text>
+  <text x="225" y="424" class="text">ExitB</text>
+  <text x="358" y="424" class="text">LoopBody</text>
+
+  <rect x="47" y="489" width="356" height="100" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="225" y="514" class="small">真实出口：ExitA、ExitB</text>
+  <text x="225" y="539" class="small">LoopHead / LoopBody 从 Entry 可达</text>
+  <text x="225" y="564" class="small">但无法到达任何真实出口</text>
+
+  <!-- 中：编号阶段分区 -->
+  <rect x="470" y="103" width="420" height="474" rx="12" class="phase1"/>
+  <rect x="906" y="103" width="124" height="474" rx="12" class="phase2"/>
+  <text x="918" y="128" class="phase-label-warm">阶段二</text>
+
+  <!-- 中：反向CFG边，先画边再画节点 -->
+  <path d="M680 172 L560 218" class="reverse"/>
+  <path d="M680 172 L800 218" class="reverse"/>
+  <path d="M560 262 L560 300" class="reverse"/>
+  <path d="M800 262 L800 300" class="reverse"/>
+  <path d="M560 344 L647 382" class="reverse"/>
+  <path d="M800 344 L713 382" class="reverse"/>
+  <path d="M680 426 L680 472" class="reverse"/>
+
+  <!-- 不能到出口区域到虚拟根的人工挂接 -->
+  <path d="M738 146 C850 142 920 202 965 294" class="artificial"/>
+  <path d="M738 157 C892 190 1027 272 1006 392 C1000 425 988 445 974 457" class="artificial"/>
+
+  <!-- 中：阶段一节点 -->
+  <rect x="622" y="128" width="116" height="44" rx="9" class="virtual"/>
+  <rect x="510" y="218" width="100" height="44" rx="9" class="node"/>
+  <rect x="750" y="218" width="100" height="44" rx="9" class="node"/>
+  <rect x="510" y="300" width="100" height="44" rx="9" class="node"/>
+  <rect x="750" y="300" width="100" height="44" rx="9" class="node"/>
+  <rect x="625" y="382" width="110" height="44" rx="9" class="node"/>
+  <rect x="625" y="472" width="110" height="44" rx="9" class="node"/>
+
+  <text x="680" y="149" class="text">VirtualExit</text>
+  <text x="680" y="165" class="number">#1</text>
+  <text x="560" y="239" class="text">ExitA</text>
+  <text x="560" y="255" class="number">#2</text>
+  <text x="800" y="239" class="text">ExitB</text>
+  <text x="800" y="255" class="number">#6</text>
+  <text x="560" y="321" class="text">Then</text>
+  <text x="560" y="337" class="number">#3</text>
+  <text x="800" y="321" class="text">Else</text>
+  <text x="800" y="337" class="number">#7</text>
+  <text x="680" y="403" class="text">Dispatch</text>
+  <text x="680" y="419" class="number">#4</text>
+  <text x="680" y="493" class="text">Entry</text>
+  <text x="680" y="509" class="number">#5</text>
+
+  <!-- 中：阶段二节点 -->
+  <rect x="923" y="302" width="84" height="44" rx="9" class="loop"/>
+  <rect x="923" y="457" width="84" height="44" rx="9" class="loop"/>
+  <text x="965" y="323" class="text">LoopHead</text>
+  <text x="965" y="339" class="number">#8</text>
+  <text x="965" y="478" class="text">LoopBody</text>
+  <text x="965" y="494" class="number">#9</text>
+
+  <line x1="470" y1="535" x2="1030" y2="535" class="separator"/>
+  <text x="680" y="558" class="small">蓝色实线：反向 CFG DFS 边；编号 #2–#7 先产生</text>
+  <text x="968" y="558" class="small">追加 #8、#9</text>
+  <text x="750" y="598" class="small">橙色虚线：非退出区不参与出口反向 DFS，随后分配编号并令 Parent = Sdom = #1</text>
+
+  <!-- 右：直接后支配树 -->
+  <path d="M1275 164 L1110 229" class="post"/>
+  <path d="M1275 164 L1190 229" class="post"/>
+  <path d="M1275 164 L1275 229" class="post"/>
+  <path d="M1275 164 L1360 229" class="post"/>
+  <path d="M1275 164 L1440 229" class="post"/>
+  <path d="M1110 273 L1110 345" class="post"/>
+  <path d="M1190 273 L1190 345" class="post"/>
+  <path d="M1275 273 L1275 345" class="post"/>
+
+  <rect x="1210" y="114" width="130" height="50" rx="10" class="virtual"/>
+  <rect x="1074" y="229" width="72" height="44" rx="9" class="node"/>
+  <rect x="1154" y="229" width="72" height="44" rx="9" class="node"/>
+  <rect x="1232" y="229" width="86" height="44" rx="9" class="node"/>
+  <rect x="1322" y="229" width="76" height="44" rx="9" class="loop"/>
+  <rect x="1402" y="229" width="76" height="44" rx="9" class="loop"/>
+  <rect x="1074" y="345" width="72" height="44" rx="9" class="node"/>
+  <rect x="1154" y="345" width="72" height="44" rx="9" class="node"/>
+  <rect x="1232" y="345" width="86" height="44" rx="9" class="node"/>
+
+  <text x="1275" y="144" class="text">VirtualExit</text>
+  <text x="1110" y="256" class="text">ExitA</text>
+  <text x="1190" y="256" class="text">ExitB</text>
+  <text x="1275" y="256" class="text">Dispatch</text>
+  <text x="1360" y="256" class="text">LoopHead</text>
+  <text x="1440" y="256" class="text">LoopBody</text>
+  <text x="1110" y="372" class="text">Then</text>
+  <text x="1190" y="372" class="text">Else</text>
+  <text x="1275" y="372" class="text">Entry</text>
+
 </svg>
