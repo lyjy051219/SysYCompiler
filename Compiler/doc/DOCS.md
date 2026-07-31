@@ -2173,149 +2173,6 @@ graph TD
 
 
 
-
-##### LoopSimplify
-
-依赖Dominant和LoopInfo两个AnalysisPass
-
-- 目的：确保Loop满足规范形式
-  - 唯一的 PreHeader（入口块）
-  - 唯一的 Back Edge
-  - Dedicated Exits （ 所有的 Exit Block 只能被**循环内部**的基本块指向）
-
-- 算法流程：
-
-  PreHeader是用来汇聚外部块的进入的
-
-  Latch块是用来汇聚回边的
-
-  Dedicated Exits 是用来汇聚所有从Loop中Exit并和外部跳转进行分割的
-
-  1. 插入PreHeader唯一入口块
-
-     得到原Header，遍历Header的所有前驱，筛选出那些来自循环外部的块，然后将这些块先去指向PreHeader
-
-     创建PreHeader的后，改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-     ```
-     // ================= 转换前 =================
-     Header:
-         phi [ 1, pre, 2, pre, 3, x, 4, y ]
-
-
-     // ================= 转换后 =================
-     preHeader:
-         Mergephi [ 1, pre, 2, pre ]
-    
-     Header:
-         phi [ Mergephi, preHeader, 3, x, 4, y ]
-     ```
-
-  2. 构造Dedicated Exits 专用出口块
-
-     当一个出口块（Exit BB）同时接收**循环内**和**循环外**的跳转时
-
-     把所有来自**循环内部**的边拦截住，让它们先跳到一个新创建的中间块，然后再由这个新块跳向原来的 Exit BB。
-
-     同样要创建好之后：改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-  3. 构造唯一回边--添加Latch块
-
-     将多条跳转回Header的边汇聚到唯一的Latch块中
-
-     同样要创建好之后：改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-  4. 简化Header中的PHI节点
-
-     为什么要简化：在LoopSimplify这个pass进行之后，Header中PHI最多只有两个入口（PreHeader，Latch）
-
-     如果只有一个来源直接进行替换，替换死循环PHI--**替换这两类PHI**
-
-- 图解：
-
-  转换前
-
-  ```mermaid
-  graph TD
-      %% 外部区域
-      O1[Outside 1]
-      O2[Outside 2]
-      O3[Outside 3]
-  
-      %% 循环内部
-      subgraph LoopArea [Loop]
-          direction TB
-          H[Header]
-          B1[Body 1]
-          B2[Body 2]
-  
-          H --> B1
-          H --> B2
-          B1 -->|回边 1| H
-          B2 -->|回边 2| H
-      end
-  
-      %% 出口区域
-      E[ExitingBlock]
-  
-      %% 跨区域连线
-      O1 --> H
-      O2 --> H
-      B1 --> E
-      O3 --> E
-  
-      %% 样式调整匹配你的手绘布局
-      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
-      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
-      class LoopArea loopBox;
-  ```
-
-  转换后
-
-  ```mermaid
-  graph TD
-      %% 外部区域
-      O1[Outside 1]
-      O2[Outside 2]
-      O3[Outside 3]
-  
-      %% 循环内部
-      subgraph LoopArea [Loop]
-          direction TB
-          PH["新块: PreHeader"]
-          H["Header<br>(PHI 被极大简化)"]
-          B1[Body 1]
-          B2[Body 2]
-          L["新块: Latch"]
-  
-          PH -->|① 唯一入口| H
-          H --> B1
-          H --> B2
-          B1 --> L
-          B2 --> L
-          L -->|③ 唯一回边| H
-      end
-  
-      %% 出口区域
-      DE["新块: Dedicated Exit"]
-      E[ExitingBlock]
-  
-      %% 跨区域连线
-      O1 --> PH
-      O2 --> PH
-  
-      B1 -->|② 拦截内部跳出| DE
-      DE --> E
-      O3 -->|外部连线保持原样| E
-  
-      %% 样式标注
-      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
-      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
-      classDef newBlock fill:#d1e7dd,stroke:#198754,stroke-width:2px,color:#0f5132;
-      class LoopArea loopBox;
-      class PH,L,DE newBlock;
-  ```
-
 ##### LCSSA--闭环SSA形式
 
 依赖Dominant和LoopInfo两个AnalysisPass
@@ -2852,7 +2709,7 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 #### TransformPass
 
-#### CFG规范化Pass
+#### CFG/Loop规范化Pass
 
 ##### CFGSimplify
 
@@ -2954,8 +2811,6 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 
 ![image-20260726183628890](assets/image-20260726183628890.png)
 
-
-
 ##### UnifyFuncExits统一函数出口
 
 用在中端转入后端前PassPipeline收尾阶段
@@ -2963,6 +2818,111 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 - 算法流程：将该函数中所有含Ret的基本块中的Ret换成无条件跳转Br，无条件跳转到新插入的UnifiedExit基本块，根据返回值类型创建PHI以及新的Ret指令
 
 ![image-20260726142830241](assets/image-20260726142830241.png)
+
+##### LoopSimplify
+
+依赖AnalysisPass：Dominant和LoopInfo
+
+- 目的：确保Loop满足规范形式
+
+  - 唯一的 PreHeader（入口块）
+  - 唯一的 Back Edge
+  - Dedicated Exits （ 所有的 Exit Block 只能被**循环内部**的基本块指向）
+
+- Loop规范形式
+
+  PreHeader是用来汇聚外部块的进入的
+
+  Latch块是用来汇聚回边的
+
+  Dedicated Exits 是用来汇聚所有从Loop中Exit并和外部跳转进行分割的
+
+- 图解：
+
+  转换前
+
+  ```mermaid
+  graph TD
+      %% 外部区域
+      O1[Outside 1]
+      O2[Outside 2]
+      O3[Outside 3]
+  
+      %% 循环内部
+      subgraph LoopArea [Loop]
+          direction TB
+          H[Header]
+          B1[Body 1]
+          B2[Body 2]
+  
+          H --> B1
+          H --> B2
+          B1 -->|回边 1| H
+          B2 -->|回边 2| H
+      end
+  
+      %% 出口区域
+      E[ExitBlock]
+  
+      %% 跨区域连线
+      O1 --> H
+      O2 --> H
+      B1 --> E
+      O3 --> E
+  
+      %% 样式调整匹配你的手绘布局
+      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
+      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
+      class LoopArea loopBox;
+  ```
+
+  转换后
+
+  ```mermaid
+  graph TD
+      %% 外部区域
+      O1[Outside 1]
+      O2[Outside 2]
+      O3[Outside 3]
+      PH["新块: PreHeader"]
+  
+      %% 循环内部
+      subgraph LoopArea [Loop]
+          direction TB
+          H["Header<br>(PHI 被极大简化)"]
+          B1[Body 1]
+          B2[Body 2]
+          L["新块: Latch"]
+  
+          H --> B1
+          H --> B2
+          B1 --> L
+          B2 --> L
+          L -->|③ 唯一回边| H
+      end
+  
+      %% 出口区域
+      DE["新块: Dedicated Exit"]
+      E[ExitBlock]
+  
+      %% 跨区域连线
+      O1 --> PH
+      O2 --> PH
+      PH -->|① 唯一入口| H
+  
+      B1 -->|② 拦截内部跳出| DE
+      DE --> E
+      O3 -->|外部连线保持原样| E
+  
+      %% 样式标注
+      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
+      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
+      classDef newBlock fill:#d1e7dd,stroke:#198754,stroke-width:2px,color:#0f5132;
+      class LoopArea loopBox;
+      class PH,L,DE newBlock;
+  ```
+
+##### 
 
 #### 清理类Pass
 

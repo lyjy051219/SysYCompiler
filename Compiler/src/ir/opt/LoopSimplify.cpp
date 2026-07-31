@@ -63,8 +63,7 @@ bool LoopSimplifyPass::rewritePhisForMergedPreds(
     }
     return changed;
 }
-//步骤 1：收集全部循环外前驱；若尚无唯一直连预头，则插入合并块、重定向
-//入口边并通过公共 PHI 修复保持每条入边的原值。
+//步骤 1：收集全部循环外前驱；若尚无唯一直连预头，则插入合并块、重定向入口边并通过公共 PHI 修复保持每条入边的原值。
 bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
     BasicBlock *header = L.getHeader();
     if (!header) return false;
@@ -94,8 +93,7 @@ bool LoopSimplifyPass::insertPreHeader(Function &F, Loop &L) {
     preheader->genUnCondInst(header);
     return true;
 }
-//步骤 2：为同时含循环内外前驱的出口插入专用出口。每次只拆一个出口，
-//防止继续使用已因本次 CFG 变更而过期的 LoopInfo。
+//步骤 2：为同时含循环内外前驱的出口插入专用出口。
 bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
     std::map<BasicBlock *, std::set<BasicBlock *>> exitInsidePreds;
     //2.1 按退出目标归并所有来自循环内部的边。
@@ -134,8 +132,7 @@ bool LoopSimplifyPass::insertDedicatedExits(Function &F, Loop &L) {
     }
     return false;
 }
-//步骤 3：多个循环内前驱都回到头部时，插入唯一 latch，并用桥接 PHI 合并
-//每条回边携带的递推值。
+//步骤 3：多个循环内前驱都回到头部时，插入唯一 latch，并用桥接 PHI 合并每条回边携带的递推值。
 bool LoopSimplifyPass::insertLatch(Function &F, Loop &L) {
     BasicBlock *header = L.getHeader();
     if (!header) return false;
@@ -194,8 +191,6 @@ bool LoopSimplifyPass::simplifyHeaderPhis(Loop &L) {
 }
 //按预头、专用出口、唯一锁存块和PHI清理顺序规范化单个循环。
 bool LoopSimplifyPass::runOnLoop(Function &F, Loop &L, bool &cfgChanged) {
-    //对单个循环严格按“预头 → 专用出口 → 唯一 latch → PHI 清理”推进；
-    //任一结构步骤成功后立即交还控制权，避免读取过期分析。
     if (insertPreHeader(F, L)) {
         cfgChanged = true;
         return true;
@@ -210,13 +205,11 @@ bool LoopSimplifyPass::runOnLoop(Function &F, Loop &L, bool &cfgChanged) {
     }
     return simplifyHeaderPhis(L);
 }
-//按循环后序提交一次规范化改写并精确报告分析保留状态。
 PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     bool changed = false;
     bool cfgChanged = false;
-    //1.以循环森林后序处理内层循环；发生首个 CFG 变化便停止，外层不动点
-    //会在重建支配树和 LoopInfo 后再次调用本 pass。
+    //1.以循环森林后序处理内层循环；发生首个CFG变化便停止，外层不动点会在重建支配树和LoopInfo后再次调用本pass
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L || !L->getHeader()) continue;
         bool loopCFGChanged = false;
@@ -231,8 +224,6 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
     }
     PreservationStatus PA;
     if (!cfgChanged) {
-        //2.仅退化 PHI 被消除时保留 CFG 分析；指针 PHI 的替换仍会改变别名
-        //与 ModRef 结论，因此使相关分析失效。
         PA.keep<DominantAnalysis>();
         PA.keep<PostDominantAnalysis>();
         PA.keep<LoopAnalysis>();
@@ -240,7 +231,6 @@ PreservationStatus LoopSimplifyPass::run(Function &F, FunctionAnalysisPassManage
         PA.discard<SideEffectAnalysis>();
         return PA;
     }
-    //3.插入或重定向基本块后，所有 CFG、循环、别名与副作用分析均需重建。
     PA.discard<DominantAnalysis>();
     PA.discard<PostDominantAnalysis>();
     PA.discard<LoopAnalysis>();
