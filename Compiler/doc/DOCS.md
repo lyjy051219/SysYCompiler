@@ -908,8 +908,6 @@ graph TD
   5. https://zhuanlan.zhihu.com/p/365912693
   6. https://zhuanlan.zhihu.com/p/1955319335347290919
 
-
-
 ##### PostDominant后支配树
 
 将入口可达CFG反向观察，并增加一个**无对应IR的VirtualExit**，构建单根的直接后支配树
@@ -938,6 +936,33 @@ graph TD
 建立循环森林
 
 ![Generated image 1](assets/Generated image 1.png)
+
+##### MemorySSA
+
+将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
+
+- 内存状态结点：
+
+  - LiveOnEntry：函数入口时未知的初始内存状态，**无对应IR**，无任何对应，每个函数只创建一个
+
+  - Phi：多个CFG前驱的内存状态汇合，**对应IR出现在迭代支配边界（没支持LiveInBlock，所以不是PrunedPHI）基本块入口**
+
+    incoming:(PredBB1, PredBB1Status)记录每个前驱CFG的内存节点状态
+
+  - Use：读取内存但不产生新内存版本,**对应IR：Load/只读Call**
+
+  - Def：可能修改内存，产生新内存版本，**对应IR：Store/可能写内存的Call**
+
+- 内存状态图：
+
+  1. 每个函数入口对应一个LiveOnEntry
+  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
+  3. 每个store/call产生一个新内存状态
+  4. 每个load使用当前内存状态，**但不产生新状态**
+
+![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
+
+参考资料：https://zhuanlan.zhihu.com/p/715818784
 
 ##### 
 
@@ -1850,14 +1875,6 @@ graph TD
 ##### Local&Global策略：
 
 将极小变量提升到局部，变成寄存器变量，将极大变量提升为全局变量防止栈溢出
-
-
-
-##### SCCP稀疏化常量传播
-
-函数内稀疏化常量传播
-
-> 没有支持向量化的相关支持
 
 
 
@@ -2829,50 +2846,6 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 
 
-#### AnalysisPass
-
-
-
-##### MemorySSA
-
-将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
-
-使用MemorySSA的TransformPass：
-
-1. LoadElimination：查询 Load 最近的相关 Store，执行跨块 Store-to-Load Forwarding
-2. GVNPRE：使用Store 转发；用相同 clobber 判断两次 Load 读取同一内存版本
-3. LICM：证明 Load 的最近相关写入位于循环外，从而提升 Load
-4. DSE：证明所有到达路径都已经写入同一个值，删除后续冗余 Store
-5. InstSimplify
-6. SCCPLocalAggregateSimplify
-
-- 内存状态结点：
-
-  - LiveOnEntry：函数入口时未知的初始内存状态，**无对应IR**，无任何对应，每个函数只创建一个
-
-  - Phi：多个CFG前驱的内存状态汇合，**对应IR在每个基本块入口**
-
-    incoming:(PredBB1, PredBB1Status)记录每个前驱CFG的内存节点状态
-
-  - Use：读取内存但不产生新内存版本,**对应IR：Load**
-
-  - Def：可能修改内存，产生新内存版本，**对应IR：Store/Call**
-
-- 内存状态图：
-
-  1. 每个函数入口对应一个LiveOnEntry
-  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
-  3. 每个store/call产生一个新内存状态
-  4. 每个load使用当前内存状态，但不产生新状态
-
-![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
-
-参考资料：https://zhuanlan.zhihu.com/p/715818784
-
-##### SCEV标量演化分析
-
-依赖AnalysisPass：
-
 
 
 
@@ -2880,8 +2853,6 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 #### TransformPass
 
 #### CFG规范化Pass
-
-
 
 ##### CFGSimplify
 
@@ -2994,6 +2965,31 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 ![image-20260726142830241](assets/image-20260726142830241.png)
 
 #### 清理类Pass
+
+##### DCE死代码消除
+
+##### ADCE激进死代码消除
+
+依赖AnalysisPass：PostDominant，SideEffect
+
+先假定所有指令是死的，只把返回、存储、副作用调用等标活，再反向标活这些指令依赖的指令和控制条件，最后删除剩余其他的一切
+
+- 算法流程：
+  1. 一开始就活跃的根指令：Store，Ret，无条件Br，无法到达真实出口的条件Br，Call（纯函数/只读函数调用不活跃，其他标活）
+  
+  1. 迭代闭包：
+  
+     指令的操作数对应的指令也活跃
+  
+     标活必经块上的分支指令：从目标块到PostIDom沿着后支配树遍历，遇到的每个基本块的条件分支指令标活
+  
+     PHI指令（特殊）：不仅标活incoming value对应的指令，还标活incoming block的条件分支指令
+  
+  1. 执行清扫：
+  
+     收集所有未标活的条件分支指令，删除不是PostIDom的那一侧的分支边
+  
+     收集所有未标活的非终结指令进行删除
 
 ##### DAE死参数消除
 
@@ -4261,11 +4257,9 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
      After：
 
      ```llvm
-       entry:
-         %r = tail call @g(%x)
-         ret %r
+       entry:ADCE    %r = tail call @g(%x)    ret %r
      ```
-
+     
      Before：
 
      ```llvm
@@ -4275,7 +4269,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %r = call @g(%p)
          ret %r
      ```
-
+     
      After：
 
      ```llvm
@@ -4286,7 +4280,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %r
        ; 实参定义闭包追到Alloca，Call保持非tail。
      ```
-
+     
   3. 只有函数确实直接自递归、且所有Entry Alloca的地址都不逃逸当前栈帧时，才尝试转循环。
 
      Before：
@@ -4299,7 +4293,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %self = call @f(%next, %slot)
          ret %self
      ```
-
+  
      After：
 
      ```llvm
@@ -4311,7 +4305,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %self
        ; Entry Alloca地址逃逸到Self Call，不能把不同递归帧合并为一个循环帧。
      ```
-
+  
   4. 找到每个返回路径上的最后一个Self Call，接受真尾递归`ret call`，或唯一整数`ADD/MUL`累加形式；Call与Ret之间的其他指令必须可安全前移且不依赖递归结果。
 
      Before（整数累加形态）：
@@ -4323,7 +4317,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %v = mul %n, %self
          ret %v
      ```
-
+  
      After（候选通过形状检查）：
 
      ```llvm
@@ -4334,7 +4328,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %v
        ; 进入后续累加器PHI改写，见第7步。
      ```
-
+  
      After：
 
      ```llvm
@@ -4344,7 +4338,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %v
        ; 浮点重新结合不安全，保持递归。
      ```
-
+  
   5. 首次提交时在旧Entry之前创建一次性新Entry，把旧Entry作为LoopHeader；入口Alloca移到新Entry，并为每个函数形参在LoopHeader创建PHI。
 
      Before：
@@ -4356,7 +4350,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ; 原函数体
        }
      ```
-
+  
      After：
 
      ```llvm
@@ -4369,7 +4363,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ; 原Entry中的非Alloca指令
        }
      ```
-
+  
   6. 把Self Call的每个实参接成形参PHI的回边输入，以跳回LoopHeader的Br替换Call和Ret。
 
      Before：
@@ -4380,7 +4374,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %self = call @f(%n.next)
          ret %self
      ```
-
+  
      After：
 
      ```llvm
@@ -4390,7 +4384,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
        LoopHeader:
          %n.loop = phi [%n, NewEntry], [%n.next, TailBB]
      ```
-
+  
   7. 对`return C + f(next)`或`return C * f(next)`创建累加器PHI，初值分别为0或1，每次回边更新累加值；正常返回路径再使用累计状态。首个成功累加站点确定ADD或MUL模式，之后操作不同的站点只被跳过，不会回滚已经完成的转换。
 
      Before：
@@ -4404,7 +4398,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
        Base:
          ret 1
      ```
-
+  
      After：
 
      ```llvm
@@ -4420,7 +4414,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %result = mul %acc, 1
          ret %result
      ```
-
+  
   8. 候选也可以无条件跳到共享返回块，但该块必须严格只含若干PHI和唯一Ret。Pass把Ret克隆回候选块，并按当前前驱解析目标块PHI；解析后的返回值仍必须精确等于Self Call或受支持的ADD/MUL累加器。任何BitCast返回包装最终都不能通过这一形状检查，共享返回块内出现BitCast还会更早破坏`PHI* + Ret`结构。
 
      Before：
@@ -4433,7 +4427,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %r = phi [%self, TailBB], [%base, BaseBB]
          ret %r
      ```
-
+  
      After（先克隆当前入边的Ret）：
 
      ```llvm
@@ -4445,7 +4439,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %r
        ; TailBB随后可按真尾递归改写成LoopHeader回边。
      ```
-
+  
      Before（BitCast返回包装）：
 
      ```llvm
@@ -4457,7 +4451,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %cast = bitcast %r
          ret %cast
      ```
-
+  
      After（返回包装不满足形状约束，保持原IR）：
 
      ```llvm
@@ -4469,7 +4463,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %cast = bitcast %r
          ret %cast
      ```
-
+  
 - 保守边界：
 
   - Call之后的Store、可能fault/poison的指令、不可证明必返的调用或被Self Call修改内存的只读调用都会阻止前移
@@ -8533,266 +8527,6 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 当前实现没有为普通无用户Load、除余、FPToSI、非法移位或undef依赖增加fault或poison门禁；这是源码事实，不应借用共享辅助函数的能力扩大DCE描述
   - 直接或间接递归调用不能通过“无环且必返”证明
   - 删除不改变CFG，因此支配、后支配和循环结构可保留；Value/Use和调用集合变化会使BasicAA与SideEffect失效
-
-##### ADCE
-
-以可观察操作为活跃根，同时沿数据依赖和后支配控制依赖求闭包；闭包之外的整片值图会删除。清扫阶段也实现了把未标活条件分支退化为某条原有后继的后备路径，但当前实现把无条件Br作为Live Root，因此普通结构化Triangle或Diamond的控制分支通常会经控制依赖被标活。
-
-依赖AnalysisPass：PostDominant。
-
-- 变换流程：
-
-  1. 扫描函数建立初始Live Root。Store、Ret、未知或必须保留的指令、有可观察副作用的Call、无条件Br始终是根；不能到达真实出口区域中的条件Br也保守作为根。
-
-     Store根 Before：
-
-     ```llvm
-     define void @store_live_root(i32 %a, i32 %b, i32* %p) {
-     entry:
-       %x = add i32 %a, %b
-       store i32 %x, i32* %p
-       ret void
-     }
-     ```
-
-     Store根 After（数据闭包全部保留）：
-
-     ```llvm
-     define void @store_live_root(i32 %a, i32 %b, i32* %p) {
-     entry:
-       %x = add i32 %a, %b
-       store i32 %x, i32* %p
-       ret void
-     }
-     ```
-
-     当前实现还把普通直接函数调用保守地视为Live Root，即使调用结果没有用户。
-
-     普通直接Call Before：
-
-     ```llvm
-     define i32 @ordinary_function(i32 %x) {
-     entry:
-       %r = add i32 %x, 1
-       ret i32 %r
-     }
-
-     define i32 @keep_ordinary_call(i32 %x) {
-     entry:
-       %unused = call i32 @ordinary_function(i32 %x)
-       ret i32 0
-     }
-     ```
-
-     普通直接Call After（保持原样）：
-
-     ```llvm
-     define i32 @ordinary_function(i32 %x) {
-     entry:
-       %r = add i32 %x, 1
-       ret i32 %r
-     }
-
-     define i32 @keep_ordinary_call(i32 %x) {
-     entry:
-       %unused = call i32 @ordinary_function(i32 %x)
-       ret i32 0
-     }
-     ```
-
-     ADCE不会像DCE那样递归证明普通直接callee为NoModRef且必返后删除；未知调用和计时调用同样为Live Root。只有明确NoModRef的普通builtin调用可能不作为根。
-
-  2. 从工作表弹出一条活跃指令，把它的所有指令型操作数定义标活，形成反向数据依赖闭包。
-
-     Before：
-
-     ```llvm
-     define void @data_live_closure(i32 %x, i32* %p) {
-     entry:
-       %a = add i32 %x, 1
-       %b = mul i32 %a, 2
-       %dead0 = sub i32 %x, 1
-       %dead1 = mul i32 %dead0, 8
-       store i32 %b, i32* %p
-       ret void
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define void @data_live_closure(i32 %x, i32* %p) {
-     entry:
-       %a = add i32 %x, 1
-       %b = mul i32 %a, 2
-       store i32 %b, i32* %p
-       ret void
-     }
-     ```
-
-     Store使`%b`活跃，`%b`再使`%a`活跃；与任何Live Root无数据关系的`%dead0/%dead1`被删除。
-
-  3. 对每个活跃指令所在块，借助立即后支配链寻找决定该块是否执行的条件分支，并把这些分支标活。每个活跃块只展开一次控制依赖。
-
-     Before：
-
-     ```llvm
-     define void @control_live_closure(i32 %x, i32* %p) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %write, label %skip
-     write:
-       store i32 1, i32* %p
-       br label %merge
-     skip:
-       br label %merge
-     merge:
-       ret void
-     }
-     ```
-
-     After（保持原样）：
-
-     ```llvm
-     define void @control_live_closure(i32 %x, i32* %p) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %write, label %skip
-     write:
-       store i32 1, i32* %p
-       br label %merge
-     skip:
-       br label %merge
-     merge:
-       ret void
-     }
-     ```
-
-     Store是根，`entry`的条件分支决定Store是否执行，因此条件分支和`%c`也必须保留。
-
-  4. 活跃PHI不仅依赖incoming值，还依赖每个incoming块对应边是否执行，因此为PHI的每条incoming边补充控制依赖。
-
-     Before：
-
-     ```llvm
-     define i32 @phi_edge_control(i32 %x) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %a = add i32 %x, 1
-       br label %merge
-     right:
-       %b = sub i32 %x, 1
-       br label %merge
-     merge:
-       %r = phi i32 [ %a, %left ], [ %b, %right ]
-       ret i32 %r
-     }
-     ```
-
-     After（保持原样）：
-
-     ```llvm
-     define i32 @phi_edge_control(i32 %x) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %a = add i32 %x, 1
-       br label %merge
-     right:
-       %b = sub i32 %x, 1
-       br label %merge
-     merge:
-       %r = phi i32 [ %a, %left ], [ %b, %right ]
-       ret i32 %r
-     }
-     ```
-
-     Ret使PHI活跃，PHI使`%a/%b`以及决定选择哪条incoming边的`%c`和条件Br活跃。
-
-  5. 标记收敛后，清扫器会先处理确实未标活的条件终结指令。幸存边必须来自原True或False后继：优先选择当前块的立即后支配者，其次选择后支配另一侧的后继，最后稳定选择True边；同时从弃边后继的PHI中删除当前块incoming。不过在下面这个普通Diamond中，两臂的无条件Br本身都是Live Root，它们的控制依赖会把`entry`条件Br和`%c`标活，所以本例只删除臂内死计算，不会折叠分支。
-
-     Before：
-
-     ```llvm
-     define i32 @collapse_dead_branch(i32 %x, i32 %a, i32 %b) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %dead1 = add i32 %a, 1
-       br label %merge
-     right:
-       %dead2 = add i32 %b, 1
-       br label %merge
-     merge:
-       ret i32 0
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define i32 @collapse_dead_branch(i32 %x, i32 %a, i32 %b) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       br label %merge
-     right:
-       br label %merge
-     merge:
-       ret i32 0
-     }
-     ```
-
-     `%dead1/%dead2`删除；`%c`及条件Br保留。只有某条条件Br在完整活跃闭包后仍未标活时，清扫器才会按上述优先级选择原有后继并修复弃边PHI。
-
-  6. 最后收集全部未标活非终结指令。死节点之间可能仍互相引用，因此先把残余Use替换成同型`undef`，再统一删除整个死值图。
-
-     Before：
-
-     ```llvm
-     define i32 @delete_dead_cycle(i1 %leave) {
-     entry:
-       br label %loop
-     loop:
-       %a = phi i32 [ 0, %entry ], [ %b, %back ]
-       br i1 %leave, label %exit, label %back
-     back:
-       %b = add i32 %a, 1
-       br label %loop
-     exit:
-       ret i32 0
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define i32 @delete_dead_cycle(i1 %leave) {
-     entry:
-       br label %loop
-     loop:
-       br i1 %leave, label %exit, label %back
-     back:
-       br label %loop
-     exit:
-       ret i32 0
-     }
-     ```
-
-     `%a/%b`构成互相引用的死环。提交时先用同型`undef`断开残余Use，再统一删除两条指令，最终IR中不保留临时`undef`。
-
-- 保守边界：
-
-  - 普通直接函数调用、未知调用和计时调用当前都作为Live Root保留
-  - 不能到达真实出口的区域缺少可靠后支配控制证明，其中的条件分支保守保留
-  - 死条件分支只能选择原有后继，不能绕过中间块凭空增加CFG边
-  - ADCE不会直接删除因分支改写而不可达的基本块，只删除死普通指令并修复弃边PHI；不可达块由后续CFG清理
-  - 只删除普通指令时可保留支配、后支配和循环结构；改写分支后这些结构分析均失效
 
 #### 控制流无分支化
 
