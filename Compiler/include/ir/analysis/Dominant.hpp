@@ -8,16 +8,13 @@
 #include <set>
 #include <stack>
 #include <algorithm>
-
-//DominatorTree表示函数的支配树分析结果
 class DominatorTree;
-//DominatorNode表示支配树中的一个节点
 class DominatorNode;
 
-//SemiNCAInfo保存一次函数级Semi-NCA求解所需的编号和并查集状态
+//SemiNCAInfo：支配树Build类，使用Semi-NCA算法构建
 class SemiNCAInfo {
 public:
-    //InterInfo保存一个DFS编号对应的Semi-NCA算法信息
+    //InterInfo：DFS编号对应的Semi-NCA算法信息
     struct InterInfo {
         //当前基本块在可达CFG中的DFS编号
         unsigned DFSNum = 0;
@@ -27,21 +24,21 @@ public:
         unsigned SdomNum = 0;
         //当前基本块的直接支配者编号
         unsigned IDomNum = 0;
-        //并查集求值时半支配编号最小的候选节点编号
+        //并查集：半支配最小的候选节点编号
         unsigned Label = 0;
-        //当前节点在并查集中的父节点编号
+        //并查集：当前节点所在的并查集父节点编号
         unsigned Father = 0;
         //当前基本块所有CFG前驱的DFS编号
         std::vector<unsigned> Predecessors;
     };
 private:
-    //按照DFS编号保存每个算法节点的信息，0号元素作为哨兵
+    //DFS编号 --> 每个算法节点的信息，0号元素作为哨兵
     std::vector<InterInfo> Infos;
-    //将可达基本块映射到对应的DFS编号
+    //可达BasicBlock* --> DFS编号
     std::unordered_map<BasicBlock*, unsigned> nodeToDFSNum;
-    //将DFS编号映射回对应的基本块，0号元素作为哨兵
+    //DFS编号 --> BasicBlock*
     std::vector<BasicBlock*> numToNode;
-    //记录当前已经分配的最大DFS编号
+    //当前已经分配的最大DFS编号
     unsigned lastNum = 0;
     //压缩并查集路径并维护路径上半支配编号最小的Label
     void compress(unsigned v);
@@ -49,18 +46,18 @@ private:
     unsigned eval(unsigned v);
     //将子节点连接到父节点所在的并查集中
     void link(unsigned parent, unsigned child);
-    //从函数入口遍历可达CFG并记录DFS编号、父节点和前驱
+    //构建第1步：从函数入口遍历可达CFG并记录DFS编号、父节点和前驱
     void runDFS(BasicBlock* entryBlock);
-    //根据编号化CFG计算每个节点的半支配者和直接支配者
+    //构建第2步：根据编号化CFG计算每个节点的半支配者和直接支配者
     void runSemiNCA();
-    //将Semi-NCA编号结果封装为支配树并建立查询信息
+    //构建第3步：使用IDom建树
     void buildDominatorTree(DominatorTree& DT);
 public:
-    //计算给定函数的完整支配树
+    //外层接口：供给run函数调用
     DominatorTree calculate(Function* func);
 };
 
-//DominatorNode表示支配树节点及其父子关系和查询时间戳
+//DominatorNode：支配树结点
 class DominatorNode {
 public:
     //当前支配树节点对应的基本块
@@ -73,6 +70,7 @@ public:
     DominatorNode* NextSibling = nullptr;
     //当前节点在支配树中的层级，根节点层级为0
     unsigned Level = 0;
+    /*欧拉区间*/
     //当前节点进入支配树DFS时的时间戳
     unsigned DFSNumIn = 0;
     //当前节点离开支配树DFS时覆盖到的时间戳
@@ -81,34 +79,30 @@ public:
     bool isLeaf() const;
 };
 
-//DominatorTree表示函数级支配树并提供块级和值级支配关系查询
+//DominatorTree：支配树
 class DominatorTree {
-    //允许SemiNCAInfo直接构建支配树的内部存储
     friend class SemiNCAInfo;
 public:
     //支配树根节点，对应函数入口基本块
     DominatorNode* Root = nullptr;
     //保存所有支配树节点，0号元素作为哨兵
     std::vector<DominatorNode> Nodes;
-    //将基本块映射到Nodes中的节点编号
+    //基本块->支配树节点编号的索引
     std::unordered_map<BasicBlock*, unsigned> BlockToNode;
-    //清空当前支配树的所有节点和索引
+
     void clear();
-    //构造一棵空支配树
     DominatorTree();
-    //禁止拷贝构造支配树以避免内部节点指针失效
     DominatorTree(const DominatorTree&) = delete;
-    //禁止拷贝赋值支配树以避免内部节点指针失效
     DominatorTree& operator=(const DominatorTree&) = delete;
-    //移动构造支配树并接管其节点存储
     DominatorTree(DominatorTree&& other) noexcept;
-    //移动赋值支配树并接管其节点存储
     DominatorTree& operator=(DominatorTree&& other) noexcept;
+
     //返回给定基本块的直接支配者基本块
     BasicBlock* getIDom(BasicBlock* BB) const;
     //返回给定基本块对应的支配树节点
     DominatorNode* getNode(BasicBlock* BB) const;
-    //判断基本块A是否支配基本块B
+    //判断基本块A是否支配基本块B -- 使用欧拉区间直接常数时间判断
+    //A支配B：A的欧拉区间包含B的欧拉区间
     bool dominates(BasicBlock* A, BasicBlock* B) const;
     //按照后序遍历返回所有支配树节点
     std::vector<DominatorNode *> getNodesInPostOrder() const;
@@ -122,22 +116,17 @@ public:
     std::set<BasicBlock *> getIteratedDominanceFrontier(
         const std::set<BasicBlock *> &DefBlocks,
         const std::set<BasicBlock *> *LiveInBlocks = nullptr) const;
-    //判断定义值是否在控制流和同块指令顺序上支配使用值
+    //DefVal定义的位置是否支配UseVal使用的位置--指令级支配
     bool dominatesValue(Value* DefVal, Value* UseVal) const;
-    //根据PreservationStatus判断当前分析结果是否失效
     bool invalidate(Function &F, const PreservationStatus &PA);
 };
 
-//DominantAnalysis是构建函数级支配树的分析Pass
+//DominantAnalysis：最外层包装类
 class DominantAnalysis : public AnalysisDescriptor<DominantAnalysis> {
 public:
-    //分析Pass返回的结果类型
     using Result = DominatorTree;
-    //运行支配分析并返回函数的支配树
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 private:
-    //允许AnalysisDescriptor访问本分析Pass的唯一标识
     friend AnalysisDescriptor<DominantAnalysis>;
-    //当前分析Pass的唯一标识
     static PassID Key;
 };

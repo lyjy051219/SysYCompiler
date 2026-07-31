@@ -1,28 +1,22 @@
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 
-//OptimizationLevel表示PassBuilder支持的模块优化等级
+//OptimizationLevel：表示编译器中端优化流水线的等级
 enum class OptimizationLevel{
-    //O0关闭中端优化流水线
     O0 = 0,
-    //O1启用标准中端优化流水线
     O1 = 1,
-    //O2启用当前最高等级的中端优化流水线
     O2 = 2
 };
 
-//PassBuilder负责注册分析并按优化等级组装模块与函数Pass流水线
+//PassBuilder：用来组织中端PassPipeline
 class PassBuilder{
 public:
     //构造不持有额外状态的PassBuilder
     explicit PassBuilder();
-
-    //向函数分析管理器注册标准优化流水线所需的全部分析
+    //注册函数级AnalysisPass
     void registerFunctionAnalyses(FunctionAnalysisPassManager &FAM);
-
-    //根据优化等级构造顶层模块Pass流水线
+    //构造中端PassPipeline
     ModulePassManager buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM);
-
 private:
     //构造建立SSA、简化标量表达式和CFG的轻量清理流水线
     static FunctionPassManager buildLightCleanupPipeline();

@@ -52,6 +52,4 @@
   <text x="732" y="225" class="text">Else</text>
   <text x="874" y="225" class="text">Merge</text>
   <text x="874" y="345" class="text">Exit</text>
-  <text x="732" y="395" class="small">每条树边满足 parent = IDom(child)</text>
-  <text x="500" y="515" class="small">每个入口可达BasicBlock对应一个树节点；不可达块不进入结果</text>
 </svg>

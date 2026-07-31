@@ -18,11 +18,11 @@
     </style>
   </defs>
   <rect width="1000" height="540" fill="#ffffff"/>
-  <text x="500" y="34" class="title" text-anchor="middle">PostDominant：多出口CFG → 虚拟根后支配树</text>
+  <text x="500" y="34" class="title" text-anchor="middle">PostDominant：多出口CFG → PostDominatorTree</text>
   <rect x="28" y="58" width="444" height="420" rx="14" class="panel"/>
   <rect x="492" y="58" width="480" height="420" rx="14" class="panel"/>
   <text x="250" y="88" class="label" text-anchor="middle">原始CFG</text>
-  <text x="732" y="88" class="label" text-anchor="middle">PostDominatorTree</text>
+  <text x="732" y="88" class="label" text-anchor="middle">直接后支配树</text>
   <path d="M250 144 L155 202" class="edge"/>
   <path d="M250 144 L345 202" class="edge"/>
   <path d="M155 246 L155 330" class="edge"/>
@@ -54,6 +54,4 @@
   <text x="894" y="239" class="text">ExitB</text>
   <text x="570" y="363" class="text">Then</text>
   <text x="894" y="363" class="text">Else</text>
-  <text x="732" y="420" class="small">每条树边满足 parent = IPostDom(child)</text>
-  <text x="500" y="515" class="small">VirtualExit无对应IR；它把多个真实出口统一成单根问题</text>
 </svg>

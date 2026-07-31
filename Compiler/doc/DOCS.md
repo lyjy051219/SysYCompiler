@@ -638,13 +638,7 @@ graph TD
   1. 注册AlalysisPass
   2. 组织不同优化层级的优化Pipeline
 
-- Pipeline：
-
-  我们的Pipeline组织如下
-
-  ```
-
-  ```
+- Pass Pipeline：PassPipeline组织形式详情请看PassBuilder源码
 
 - 注册AnalysisPass：以Function粒度为例
 
@@ -679,9 +673,30 @@ graph TD
   }
   ```
 
-  好处：
+  注册后，FAM内部大致形成
 
-  用来统一管理整个AnalysisPass，增加项目的可扩展性
+  ```c
+  AnalysisPasses
+  ├── DominantAnalysis::ID()     -> AnalysisPassWrapper<DominantAnalysis>
+  └── PostDominantAnalysis::ID() -> AnalysisPassWrapper<PostDominantAnalysis>
+  ```
+  
+  在TransformPass之中调用getResult时
+  
+  ```c
+  getResult<DominantAnalysis>(F)
+            │
+            ├─ ResultCache 中已有结果
+            │      └─ 直接返回 DominatorTree&
+            │
+            └─ 没有结果
+                   ├─ 找到已注册的 DominantAnalysis
+                   ├─ 调用 DominantAnalysis::run(F, FAM)
+                   ├─ 得到 DominatorTree
+                   ├─ 包装成 AnalysisResultWrapper
+                   ├─ 放入 ResultCache
+                   └─ 返回其中的 DominatorTree&
+  ```
 
 #### NewPassManager
 
@@ -833,124 +848,95 @@ graph TD
 
 #### AnalysisPass
 
-##### Dominant Analysis
+##### Dominant支配树
 
-- 支配树：
+将从函数入口可达的CFG抽象成一棵直接支配树,使用**Semi-NCA算法**进行构建
 
-  参考文献：
+支配：从函数入口到基本块B的每一条路径必须经过A，则A支配B
 
-  [支配树构建算法及伪代码](https://zhuanlan.zhihu.com/p/365912693)
+直接支配：除了B自身之外，离B最近的那个支配B的节点
 
-  [Semi-NCA论文](https://renatowerneck.wordpress.com/wp-content/uploads/2016/06/gtw06-dominators.pdf)
+半支配：从候选节点 `v` 到 `w` 存在一条路径；在到达 `w` 之前，这条路径不能先经过一个 DFS 编号比 `w` 更小的中间节点，那么**v就是w的一个半支配者**
 
-  应用：
+- 支配树构建：
 
-  1. 计算支配边界，构造SSA
-  2. 循环不变量提升
+  1. 从入口基本块遍历CFG，只为可达块编号，从小到大分配DFS序号
 
-  基本概念：
+  2. 求每个基本块的半支配者SDom和直接支配者IDom
 
-  1. DFS树：
+     - 逆DFS序遍历当前节点所有CFG前驱：
 
-     对CFG控制流图按照**先序遍历（深度优先遍历）**得到的一棵树
+       pre < i:前驱比当前节点更早被DFS访问,A(2) -> B(5),满足A是B的半支配者
 
-     实线：树的边
+       pre > i：前驱比当前节点更晚被DFS访问,A(2) -> ... -> X(7) -> B(3)
 
-     虚线：CFG中其他边
+       由于逆DFS序，所以X先于B被处理，但是这里不能简单将X作为最佳SDom
 
-     红色数字：DFS序
+       所以调用eval(pre)沿着并查集路径向上找到SDom最小的节点
 
-     红色字母：该节点的**半支配结点(Semi-Dominator)**
+     - 正DFS序：Semi-NCA
 
-     ![img](assets/v2-1c29ad05f0c1886e21da3b97588edb7d_1440w.jpg)
+       > 正DFS序保证父结点的IDom先于子结点被计算，从而可以使后续子结点可以沿着IDom链向上跳
 
-  2. DFS树中的概念：
+       从 `i` 的 DFS 父节点（IDom到i一定经过父结点）开始，沿着已经计算好的**真正IDom链**向上走，找到第一个 DFS 编号不大于 `sdom(i)` 的节点，这个节点是 `IDom(i)`
 
-     - 树边与非树边
+       > 之所以使用sdom作为上界，要理解sdom的含义，sdom代表我们找到的**最早一条**可以绕过DFS到达目标节点的路径，所以只要是当前节点还小于sdom就说明目前不能完全支配，**必须找到第一个在sdom上面的节点**
 
-     - 祖先与完全祖先（完全祖先不包括自身）--针对DFS树来说
+  3. 建树：使用FirstChild/NextSibling的形式组织多叉树
 
-     - 横跨边：右子树的节点指向左子树的边
+  4. 迭代支配边界构建(用于Mem2Reg，MemorySSA)：
 
-       横跨边的**起点永远大于终点编号**，因为DFS树中右子树的编号永远大于左子树的编号
+     支配边界：X支配Y的某个前驱(可以是自己)，且X不严格支配Y，则说Y是X的支配边界
 
-     - 返祖边：子节点到其完全祖先的边
+     > 下图中Merge是Then的支配边界，支配边界的含义就是Then块支配结束的位置，对应到下图就是支配结束在Then的最后一条指令
+     >
+     > 通俗理解支配边界就是**控制流汇聚的位置（直接看CFG图理解）**
 
-  3. 半支配路径与半支配节点
+     迭代支配边界：原始赋值会产生定义块，新插入的PHI指令也会产生定义块，所以需要不断处理新加入PHI的定义块，直到不再产生新PHI指令
 
-     - 半支配路径：这条路径中（不包括起点和终点）的**每一个点的编号都大于终点的编号**，则该路径为一条半支配路径
+     如果再加入LiveinBlocks就可以计算PrunedPHI版本的迭代支配边界（即去掉那些可以产生PHI指令但是PHI指令后续**不会被使用或在使用前会被重新定义**的基本块，这样的基本块不会创建PHI指令）
 
-       树边半支配路径：只能包含两个点（起点和终点），因为树边一定编号都小于终点的编号
+  5. 查询：不仅支持块级支配查询，还支持Value级/指令级支配查询
 
-       非树边半支配路径：路径上**指向终点的边（只要求指向终点的边）**为非树边，还需要保证中间节点的序号也要大于终点
+![analysis-dominant](assets/analysis-dominant.svg)
 
-       非树边半支配路径只能是**横跨边或返祖边**
+- 参考文献：
+  1. [支配树构建算法及伪代码](https://zhuanlan.zhihu.com/p/365912693)
+  2. [Semi-NCA论文](https://renatowerneck.wordpress.com/wp-content/uploads/2016/06/gtw06-dominators.pdf)
+  3. https://oi-wiki.org/graph/dominator-tree/
+  4. https://zhuanlan.zhihu.com/p/655369292
+  5. https://zhuanlan.zhihu.com/p/365912693
+  6. https://zhuanlan.zhihu.com/p/1955319335347290919
 
-       例子：黄色为树边半支配路径，绿色和紫色为非树边半支配路径
 
-       ![img](assets/v2-02eafd0eb292b151b1a288a42ba6ce2a_1440w.jpg)
 
-     - **半支配节点（sdom）**：在所有以V为终点的半支配路径中，**起点值最小**的那一个
+##### PostDominant后支配树
 
-       ![img](assets/v2-94bacb53ba85b434f48af64016d0faac_1440w.jpg)
+将入口可达CFG反向观察，并增加一个**无对应IR的VirtualExit**，构建单根的直接后支配树
 
-  4. 支配节点与支配树
+> 把CFG的边反转，把出口当入口，然后计算普通支配
 
-     - 支配结点：在求半支配结点的基础上求**支配节点（idom）**
+后支配：如果从B出发、最终到达某个真实出口的每条路径都经过A，则A后支配B
 
-       1. SLT算法：
+- 后支配树中的对象：
 
-          ![image-20260123153011084](assets/image-20260123153011084.png)
+  - VirtualExit：分析层创建的虚拟根，**无对应IR**；它把多个真实出口统一成单根问题
+  - Block节点：每个从函数Entry可达的真实基本块对应一个节点，包括不能到达真实出口的块
+  - IPostDom树边：`parent -> child`表示`parent = IPostDom(child)`
+  - ExitReachable事实：单独标记“从Entry可达并且还能到达至少一个真实出口”的块，不能与树节点集合混为一谈
 
-          情况1：idom(w) = sdom(w)
+VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可以跳转到的真实后支配基本块。
 
-          ![](assets/v2-103d832b6dc2773d40a325e85727b8a8_1440w.jpg)
+- 后支配树构建：
 
-          情况2：idom(w) = idom(u)
+  1. 先从函数Entry求入口可达区域，排除整段不可达CFG
+  2. 在该区域中寻找没有后继的有效真实出口，并建立CFG的反向邻接关系
+  3. 创建VirtualExit，把所有真实出口作为它在反向CFG中的后继
+  4. 从VirtualExit在反向CFG上遍历，并使用Semi-NCA求能到达出口区域的直接后支配关系
+  5. 对入口可达但不能到达任何真实出口的块，不猜测无限区域内部的后支配关系，而是把每个块保守地直接挂到VirtualExit
+  6. 如果函数没有真实出口，则所有入口可达块都直接挂到VirtualExit；这些块之间不会发布后支配关系
 
-          ![img](assets/v2-1bbfbd8c204f4a33fc6826ec4a41b006_1440w.jpg)
-
-       2. **Semi-NCA算法：**
-
-          **虽然算法时间复杂度比上面的大，但是实际使用比SLT快很多**
-
-          解读1：从根节点到W的**父结点**这条路径上找到第一个**小于**sdom(W)的结点，这个节点就是W的**idom**
-
-          解读2：
-
-          ![image-20260123161215423](assets/image-20260123161215423.png)
-
-          ![image-20260123160201786](assets/image-20260123160201786.png)
-
-     - 支配树：由支配节点（**idom**）组成的树
-
-  通过上面的分析，我们可以总结出如下求支配树的步骤
-
-  ![img](assets/v2-f58b712a4fe43bc3748372043a88c2eb_1440w.png)
-
-- 支配树相关伪代码实现：
-
-  [支配树伪代码](https://blog.csdn.net/dashuniuniu/article/details/103462147)
-
-  1. 计算半支配结点伪代码
-
-     ![img](assets/716291b347ee06cea2efb59afcbdcb53.png)
-
-     要点：逆DFS序进行分析，遍历所有前驱节点，
-
-  2. eval并查集伪代码
-
-     ![在这里插入图片描述](assets/b99a0302f528b6190427f656fa361dbd.png)
-
-  3. 计算idom--SemiNCA
-
-     ![算法](assets/6617504901610f31858fd46caf69e351.png)
-
-参考资料：
-https://oi-wiki.org/graph/dominator-tree/
-https://zhuanlan.zhihu.com/p/655369292
-https://zhuanlan.zhihu.com/p/365912693
-https://zhuanlan.zhihu.com/p/1955319335347290919
+![PostDominant构建的后支配树](assets/analysis-postdominant.svg)
 
 ##### BasicAliasAnalysis
 
@@ -1224,71 +1210,6 @@ https://zhuanlan.zhihu.com/p/1955319335347290919
   4.
 
 
-
-##### PostDominant--后支配树分析
-
-后支配树用于控制依赖、ADCE的terminator保活判定、DSE的exit可达性判断。
-
-设计思路：
-
-不真实修改 CFG 插入 VIRTUAL_EXIT_NODE，而是在预计算的**反向 CFG 视图**上直接跑 Semi-NCA。虚拟根节点的 `Block` 字段设为 `nullptr`，多出口通过"每个出口以虚拟根为父节点做反向 DFS"合并。反向 CFG 用一次 O(V+E) 扫描建邻接表，避免反复调用 O(|F|) 的 `getPredecessors()`。
-
-- 名词约定：
-
-  - 后支配：B postdom A ⟺ 从 A 到任一 exit 的所有路径都经过 B
-  - ipostdom(B)：后支配树上 B 的直接父节点
-  - exit-reachable：entry 可达且能到达某个 exit 的块（能到达 RetInst）
-  - reverse-unreachable：entry 可达但到不了任何 exit 的块（纯无限循环里的块）
-
-- 整体流程：
-
-  ```mermaid
-  flowchart TD
-      A["1.收集 entry 可达块<br/>collectForwardReachable"] --> B["2.找 exit 块<br/>findExitBlocks"]
-      B --> C["3.预计算反向 CFG<br/>precomputeReverseCFG"]
-      C --> D["4.分配虚拟根 DFS#1<br/>Block = nullptr"]
-      D --> E["5.从每个 exit 块反向 DFS<br/>parent = 虚拟根"]
-      E --> F["6.reverse-unreachable 块<br/>直接挂虚拟根下"]
-      F --> G["7.runSemiNCA"]
-      G --> H["8.构建 PostDominatorTree<br/>+ DFS in/out 时间戳"]
-  ```
-
-- 核心伪代码（Semi-NCA 部分从前向 Dominant 复用，只操作 DFS 编号数组 `Infos`）：
-
-  ```
-  function runSemiNCA():
-      // Phase A: 逆 DFS 序计算半支配节点
-      for i in [lastNum, 2]:
-          for pre in Infos[i].Predecessors:
-              u = eval(pre)
-              if Infos[u].SdomNum < Infos[i].SdomNum:
-                  Infos[i].SdomNum = Infos[u].SdomNum
-          link(Infos[i].Parent, i)
-
-      // Phase B: 正 DFS 序计算直接支配节点
-      for i in [2, lastNum]:
-          runner = Infos[i].Parent
-          while runner > Infos[i].SdomNum:
-              runner = Infos[runner].IDomNum
-          Infos[i].IDomNum = runner
-  ```
-
-- 关键设计点：
-
-  1. **虚拟根 Block = nullptr**，上层查询接口 `getIPostDom(BB)` 若返回的 idom 节点是虚拟根，向外返回 `nullptr`。消费者（ADCE/DSE）用 `isReachableToExit(BB)` 过滤真正不可信任的块（reverse-unreachable）
-
-  2. **反向 CFG 一次性建**：`reverseCFG[succ].push_back(BB)` 对每条原 CFG 边建一次反向条目，后续反向 DFS 只从 map 里取邻居
-
-  3. **reverse-unreachable 块挂虚拟根**：不继续沿反向图 DFS（因为它们到不了 exit，半支配路径定义不成立），直接分配 DFS 序号、父节点设为虚拟根。`Predecessors` 留空 → `runSemiNCA` 中 sdom 不会进一步更新
-
-  4. **DFS in/out 时间戳**用于 O(1) 的 `postDominates(A, B)` 查询：A postdom B ⟺ `A.DFSNumIn <= B.DFSNumIn && A.DFSNumOut >= B.DFSNumOut`
-
-- 接口：
-
-  1. `getIPostDom(BB)`：返回 BB 的直接后支配块（虚拟根对应 nullptr）
-  2. `postDominates(A, B)`：A 是否后支配 B（O(1)）
-  3. `isReachableToExit(BB)`：BB 是否能到达某个 exit（区分 reverse-unreachable）
-  4. `getNode(BB)`：返回树节点（nullptr 表示虚拟根）
 
 
 
@@ -3400,79 +3321,11 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 
 ### 参考博客
 
-### AnalysisPass构建结果补充
 
-本节以 `FunctionAnalysisPass.def` 中实际注册的函数级AnalysisPass为准，仿照前文MemorySSA的说明方式，重点描述每个Pass把IR抽象成了什么分析模型，以及TransformPass实际消费的是模型中的哪一种关系。`LoopAnalysis`和`MemorySSAAnalysis`已经在前文说明，因此不再重复；`SCEVExpander`是把SCEV表达式重新展开成IR的工具，不是独立注册的AnalysisPass。
 
-下列示意图画的是分析结果的语义结构。Dominant和PostDominant在Pass运行时直接建树；SCEV、LoopDependence和LoopAccess返回的是惰性查询器，相关模型在首次查询时形成。BasicAA图展示一次按需查询所展开的来源模型和查询结论，其中只有来源摘要及部分普通指针对结论会缓存；这些图都不表示Pass入口已经急切枚举了全函数的全部关系。
 
-##### Dominant/DominantAnalysis支配树分析
 
-将从函数入口可达的CFG抽象成一棵直接支配树：如果从Entry到基本块B的每一条路径都经过A，则A支配B；树中B的父节点是离B最近的严格支配者。
 
-依赖AnalysisPass：无。
-
-使用Dominant的主要TransformPass：
-
-1. Mem2Reg：根据迭代支配边界确定PHI插入位置，再沿支配树完成SSA重命名
-2. LCSSA、LICM、ConstantHoist：证明定义或被移动指令在循环出口和目标位置仍然可用
-3. GVNPRE、LoadElimination、InstSimplify：选择能够支配使用点的等价值或内存值
-4. LoopFusion、LoopInterchange、LoopRotate、LoopUnroll、LoopUnswitch、UnrollAndJam：验证循环CFG形状及变换后的值可用性
-5. ConstraintElimination、RangeAwareSimplify、GepCombine：只在被某个条件支配的区域内使用路径事实
-
-- 支配树中的对象：
-
-  - Root：对应函数Entry基本块，每个函数至多一个
-  - Block节点：每个从Entry可达的BasicBlock对应一个节点；入口不可达块不进入分析结果
-  - IDom树边：`parent -> child`表示`parent = IDom(child)`；它把“支配”这个偏序关系压缩成一棵树
-  - Euler区间：对支配树做一次DFS得到进入/离开编号；A的区间包含B的区间当且仅当A支配B。它只是树的查询索引，不是另一张图
-
-- 支配树构建：
-
-  1. 从Entry遍历CFG，只为可达块编号，并记录每个块的全部CFG前驱
-  2. 使用Semi-NCA在编号后的CFG上求每个块的半支配者
-  3. 沿候选支配链把半支配关系修正为直接支配关系
-  4. 按`IDom -> Block`连接树边，以Entry节点作为根
-  5. 对树编号，使块间`dominates`能够使用Euler区间查询；`dominatesValue`在此基础上对同块定义和使用另行检查指令顺序
-  6. 迭代支配边界由这棵树和CFG边按查询即时导出，不额外持久化另一张边界图
-
-下图中，Then、Else和Merge的直接支配者都是Entry，因为到达Merge存在两条互不经过对方的路径；Exit只有经过Merge才能到达，所以Merge是Exit的直接支配者。
-
-![Dominant构建的支配树](assets/analysis-dominant.svg)
-
-##### PostDominant/PostDominantAnalysis后支配树分析
-
-将入口可达CFG反向观察，并增加一个无对应IR的VirtualExit，构建单根的直接后支配树：如果从B出发、最终到达某个真实出口的每条路径都经过A，则A后支配B。
-
-依赖AnalysisPass：无。
-
-使用PostDominant的TransformPass：
-
-1. ADCE：沿直接后支配链恢复活跃指令所依赖的控制分支，并为被删除分支选择安全的汇合目标
-2. LoopFusion：证明循环体、Latch和退出路径形成能够安全融合的控制流形状
-3. LoopInterchange、UnrollAndJam：证明循环Latch后支配迭代路径，避免变换跳过必要控制流
-
-- 后支配树中的对象：
-
-  - VirtualExit：分析层创建的虚拟根，**无对应IR**；它把多个真实出口统一成单根问题
-  - Block节点：每个从函数Entry可达的真实基本块对应一个节点，包括不能到达真实出口的块
-  - IPostDom树边：`parent -> child`表示`parent = IPostDom(child)`
-  - ExitReachable事实：单独标记“从Entry可达并且还能到达至少一个真实出口”的块，不能与树节点集合混为一谈
-
-VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可以跳转到的真实后支配基本块。
-
-- 后支配树构建：
-
-  1. 先从函数Entry求入口可达区域，排除整段不可达CFG
-  2. 在该区域中寻找没有后继的有效真实出口，并建立CFG的反向邻接关系
-  3. 创建VirtualExit，把所有真实出口作为它在反向CFG中的后继
-  4. 从VirtualExit在反向CFG上遍历，并使用Semi-NCA求能到达出口区域的直接后支配关系
-  5. 对入口可达但不能到达任何真实出口的块，不猜测无限区域内部的后支配关系，而是把每个块保守地直接挂到VirtualExit
-  6. 如果函数没有真实出口，则所有入口可达块都直接挂到VirtualExit；这些块之间不会发布后支配关系
-
-下图中，ExitA和ExitB被VirtualExit统一；Then只能经过ExitA结束，所以ExitA直接后支配Then。Entry可以从两个不同出口结束，除VirtualExit外没有共同的严格后支配块。
-
-![PostDominant构建的后支配树](assets/analysis-postdominant.svg)
 
 ##### BasicAA/BasicAliasAnalysis基础别名分析
 

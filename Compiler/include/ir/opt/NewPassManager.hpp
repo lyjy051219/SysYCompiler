@@ -9,10 +9,7 @@
 #include <functional>
 #include <unordered_set>
 #include "lib/CFG.hpp"
-
-//Module表示模块级Pass和分析所处理的IR单元。
 class Module;
-//Function表示函数级Pass和分析所处理的IR单元。
 class Function;
 
 //PassID通过唯一对象地址标识一种分析或Pass类型

@@ -53,9 +53,8 @@
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/LoopDependence.hpp"
 #include "ir/analysis/LoopAccessAnalysis.hpp"
-//构造不持有额外状态的PassBuilder
 PassBuilder::PassBuilder() = default;
-//向函数分析管理器注册标准优化流水线所需的全部分析
+//注册函数级AnalysisPass
 void PassBuilder::registerFunctionAnalyses(FunctionAnalysisPassManager &FAM){
     //通过定义表逐项实例化并注册全部函数分析，registerPass负责去重和跨IR属性登记
     #define FUNCTION_ANALYSIS(NAME,CREATE_PASS)\
@@ -297,7 +296,7 @@ FunctionPassManager PassBuilder::buildLatePipeline() {
     LateFPM.addPass(LatePhiCleanupPass());
     return LateFPM;
 }
-//根据优化等级构造顶层模块Pass流水线
+
 ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, FunctionAnalysisPassManager &FAM) {
     //1. 模块 pipeline 把任意模块 IR 变化回调到 FAM.clear，防止跨函数摘要陈旧；
     //O0 保持空 pipeline，当前 O1/O2 共用下方完整顺序。
