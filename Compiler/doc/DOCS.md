@@ -964,7 +964,7 @@ graph TD
 
 参考资料：https://zhuanlan.zhihu.com/p/715818784
 
-##### 
+
 
 
 
@@ -1839,16 +1839,6 @@ graph TD
   3. 遍历后继块中所有Phi，创建Select指令，根据条件真假选择Phi之前对应的两个值，将生成的Select插入到前驱块的末尾，RAUW替换所有使用PHI的地方变成使用Select，删除后继块中的PHI指令
 
   4. 修改前驱块的条件分支，变成无条件分支，指向后继块，删除当前块，如果有else块一并删除
-
-
-
-##### Local2Global
-
-将局部Alloca分配的大数组提升为全局变量
-
-- 算法流程：
-  1. 遍历Module之下所有函数所有指令，找到Alloca，计算其分配的变量占用的字节数，如果大于阈值（1024 size_t），那么加入工作队列之中
-  2. 创建全局变量，提取原Alloca的底层类型，并复用原变量名字，RAUW替换alloca为该全局变量，清理Alloca
 
 
 
@@ -2922,9 +2912,50 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       class PH,L,DE newBlock;
   ```
 
-##### 
-
 #### 清理类Pass
+
+##### Local2Global
+
+将非递归main函数中局部Alloca分配的大数组提升为全局变量
+
+阈值选取1024：大于1024字节的数组会被提升
+
+##### GlobalInitializerFold
+
+主要在Local2Global后使用，当Local2Global将大尺寸对象的alloca提升为global之后，GlobalInitializerFold将memcpy消除，从而将初始化时间从运行期改到静态装载期
+
+目标对象：全局变量对应的**初始化memcpy（初始化长度覆盖整个对象）**
+
+完整变换流程：
+
+```
+前端：前端会引入memcpy
+@template = constant [300 x i32] [...]
+define i32 @main() {
+entry:
+  %a = alloca [300 x i32]       ; 1200 字节
+  call @memcpy(%a, @template, 1200, false)
+}
+
+Local2Global：
+@template = constant [300 x i32] [...]
+@.G.a = global [300 x i32] zeroinitializer
+define i32 @main() {
+entry:
+  call @memcpy(@.G.a, @template, 1200, false)
+}
+
+GlobalInitializerFold：
+@template = constant [300 x i32] [...]
+@.G.a = global [300 x i32] [...]
+
+define i32 @main() {
+entry:
+  ; memcpy 已删除
+}
+```
+
+
 
 ##### DCE死代码消除
 
@@ -3458,94 +3489,6 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 目标必须是可变全局，源可以是全局变量或全局常量
   - 类型形状、对象大小和复制长度必须完全一致
   - 只处理Entry安全前缀，不尝试跨普通内存操作证明等价
-
-##### Local2Global
-
-把非递归`main`入口中的大型Alloca改成同型全局对象，避免大对象占用主函数栈帧。
-
-依赖AnalysisPass：无。
-
-- 变换流程：
-
-  1. 建立直接调用图；如果`main`可能递归回到自身，则放弃整个Pass，因为每次递归本应获得独立栈对象。
-
-     Before：
-
-     ```llvm
-       define i32 @main() {
-       entry:
-         %buf = alloca [4096 x i32]
-         %again = call @main()
-         ret %again
-       }
-     ```
-
-     After：
-
-     ```llvm
-       define i32 @main() {
-       entry:
-         %buf = alloca [4096 x i32]
-         %again = call @main()
-         ret %again
-       }
-       ; 调用图能回到main，%buf保持每个栈帧独立。
-     ```
-
-  2. 只扫描`main` Entry中的Alloca，并以目标后端阈值筛选大型对象。
-
-     Before：
-
-     ```llvm
-       entry:
-         %large = alloca [4096 x i32]
-         %small = alloca i32
-         br Work
-       Work:
-         %late = alloca [4096 x i32]
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       @large = global [4096 x i32] zeroinitializer
-       entry:
-         %small = alloca i32
-         br Work
-       Work:
-         %late = alloca [4096 x i32]
-         ret 0
-       ; 只提升Entry中超过阈值的%large。
-     ```
-
-  3. 为候选创建同型全局变量，替换原Alloca的全部使用，再删除Alloca。
-
-     Before：
-
-     ```llvm
-       entry:
-         %buf = alloca [4096 x i32]
-         %p = gep %buf, 0, %i
-         store %v, %p
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       @buf = global [4096 x i32] zeroinitializer
-       entry:
-         %p = gep @buf, 0, %i
-         store %v, %p
-         ret 0
-     ```
-
-- 保守边界：
-
-  - 仅处理`main`，利用“程序入口对象生命周期等同整次程序执行”的语义
-  - 只提升超过阈值的入口对象，不改变小对象和动态控制区域中的分配
-  - 计时调用不观察栈/全局存储位置，因此不是该表示变换的屏障
 
 ##### Global2Local
 

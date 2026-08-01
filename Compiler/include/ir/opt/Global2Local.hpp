@@ -33,10 +33,6 @@ private:
 	static constexpr size_t RISCVThreshold = 32;
 	//记录是否放宽标量全局的直接load/store使用限制。
 	bool RelaxScalarUses = false;
-
-	//沿直接调用图判断根函数是否可能递归回到自身。
-	static bool isRecursiveFrom(
-		Function *Root, const FunctionCallGraph &CallGraph);
 	//检查标量全局在main中的使用是否为安全直接访存。
 	static bool isSafeScalarUseInMain(Use *U, Variable *GV);
 };

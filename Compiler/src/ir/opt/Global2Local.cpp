@@ -10,21 +10,6 @@
 //构造Pass并记录是否允许受限标量直接访存。
 Global2LocalPass::Global2LocalPass(bool RelaxScalarUses)
 	: RelaxScalarUses(RelaxScalarUses) {}
-//沿直接调用图判断根函数是否可能递归回到自身。
-bool Global2LocalPass::isRecursiveFrom(
-	Function *Root, const FunctionCallGraph &CallGraph) {
-	//1.1 若 main 的调用闭包能回到 main，把全局状态改成单次栈对象会改变重入语义。
-	if (!Root) return false;
-	auto RootIt = CallGraph.find(Root);
-	if (RootIt == CallGraph.end()) return false;
-	return isReachableFromRootsCustomSucc<Function>(
-		RootIt->second, Root,
-		[&CallGraph](Function *Current) -> std::vector<Function *> {
-			auto It = CallGraph.find(Current);
-			return It == CallGraph.end() ? std::vector<Function *>{}
-			                            : It->second;
-		});
-}
 //检查标量全局在main中的use是否为安全的直接load或store地址。
 bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	//2.1 标量全局只允许作为直接 load/store 地址，不能把地址本身存出或参与其他运算。
@@ -47,7 +32,7 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 	Function *Main = M->getMainFunction();
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 	auto CallGraph = M->buildDirectCallGraph();
-	if (isRecursiveFrom(Main, CallGraph))
+	if (Module::isFunctionRecursive(Main, CallGraph))
 		return PreservationStatus::all();
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
 	auto ReachableFromMain =

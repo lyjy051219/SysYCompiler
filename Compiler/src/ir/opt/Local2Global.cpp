@@ -5,47 +5,30 @@
 #include <memory>
 #include <utility>
 #include <vector>
-//沿直接调用图判断函数是否可能递归回到自身。
-bool Local2GlobalPass::isRecursiveFrom(
-	Function *F, const FunctionCallGraph &CallGraph) {
-	//1.1 从 main 的直接调用边出发检查能否回到自身；递归会让静态对象破坏每次调用
-	//独立分配的语义，因此整个提升流程必须停止。
-	if (!F) return false;
-	auto RootIt = CallGraph.find(F);
-	if (RootIt == CallGraph.end()) return false;
-	return isReachableFromRootsCustomSucc<Function>(
-		RootIt->second, F,
-		[&CallGraph](Function *Current) -> std::vector<Function *> {
-			auto It = CallGraph.find(Current);
-			return It == CallGraph.end() ? std::vector<Function *>{}
-			                            : It->second;
-		});
-}
-//在非递归main中把大型入口alloca转换为同型全局对象。
+//在非递归main中把大型入口alloca转换为同型全局对象
 PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;
-	//1.建立调用图并排除递归 main，确保入口 alloca 的生命周期等同于整次程序执行。
+	//1.排除递归main
 	std::vector<std::pair<AllocaInst *, std::shared_ptr<IRType>>> WorkList;
 	Function *Main = M.getMainFunction();
 	if (!Main) return PreservationStatus::all();
 	FunctionCallGraph CallGraph = M.buildDirectCallGraph();
-	if (isRecursiveFrom(Main, CallGraph)) {
+	if (Module::isFunctionRecursive(Main, CallGraph)) {
 		return PreservationStatus::all();
 	}
-	//2.只考察 main 入口块中的大对象。timer 不观察栈或全局存储位置，
-	//因此对象表示转换不受计时边界限制。
+	//2.从main从入口alloca中筛选大对象
 	BasicBlock *EntryBB = Main->front();
 	if (!EntryBB) return PreservationStatus::all();
 	for (AllocaInst *AI : collectInstructions<AllocaInst>(*EntryBB)) {
 		std::shared_ptr<IRType> ElemTy =
 			IRType::getPointeeType(AI->getIRType());
 		if (!ElemTy) continue;
-		if (ElemTy->getSize() > RISCVThreshold) {
+		if (ElemTy->getSize() > Threshold) {
 			WorkList.emplace_back(AI, ElemTy);
 		}
 	}
 	if (WorkList.empty()) return PreservationStatus::all();
-	//3.为每个候选创建同型全局量，先替换全部 use，再删除原 alloca。
+	//3.alloca->全局变量
 	for (auto &Entry : WorkList) {
 		AllocaInst *AI = Entry.first;
 		std::shared_ptr<IRType> ElemTy = Entry.second;

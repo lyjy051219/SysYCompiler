@@ -153,6 +153,10 @@ class Module final{
     // 从入口函数出发，在给定调用图上收集可达函数。
     static std::unordered_set<Function *> collectReachableFunctions(
         Function *Entry, const FunctionCallGraph &CallGraph);
+    // 从函数的直接被调函数出发，判断是否能沿给定直接调用图回到该函数。
+    // 查询至少经过一条调用边；调用边改变后，调用方必须传入重建后的图快照。
+    static bool isFunctionRecursive(
+        Function *Root, const FunctionCallGraph &CallGraph);
     std::vector<std::unique_ptr<Variable>>& getGlobalVar();
     // 按全局变量、函数的顺序输出整个模块的 LLVM IR。
     void dumpIR();

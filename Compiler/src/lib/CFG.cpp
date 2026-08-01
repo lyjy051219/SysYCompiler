@@ -653,6 +653,23 @@ std::unordered_set<Function *> Module::collectReachableFunctions(
   return Reachable;
 }
 
+bool Module::isFunctionRecursive(
+    Function *Root, const FunctionCallGraph &CallGraph) {
+  if (!Root) return false;
+  auto RootIt = CallGraph.find(Root);
+  if (RootIt == CallGraph.end()) return false;
+
+  // 以 Root 的直接后继而不是 Root 本身为搜索根，要求返回 Root 的路径
+  // 至少包含一条调用边；同时覆盖直接自递归和跨函数间接递归。
+  return isReachableFromRootsCustomSucc<Function>(
+      RootIt->second, Root,
+      [&CallGraph](Function *Current) -> std::vector<Function *> {
+        auto It = CallGraph.find(Current);
+        return It == CallGraph.end() ? std::vector<Function *>{}
+                                    : It->second;
+      });
+}
+
 std::vector<std::unique_ptr<Variable>>& Module::getGlobalVar(){return globalvars;}
 
 void Module::dumpIR() {
