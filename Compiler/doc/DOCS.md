@@ -908,35 +908,65 @@ graph TD
   5. https://zhuanlan.zhihu.com/p/365912693
   6. https://zhuanlan.zhihu.com/p/1955319335347290919
 
-
-
 ##### PostDominant后支配树
 
 将入口可达CFG反向观察，并增加一个**无对应IR的VirtualExit**，构建单根的直接后支配树
 
 > 把CFG的边反转，把出口当入口，然后计算普通支配
 
-后支配：如果从B出发、最终到达某个真实出口的每条路径都经过A，则A后支配B
+后支配：如果从B出发，到函数出口每条路径都经过A，则A后支配B
 
-- 后支配树中的对象：
-
-  - VirtualExit：分析层创建的虚拟根，**无对应IR**；它把多个真实出口统一成单根问题
-  - Block节点：每个从函数Entry可达的真实基本块对应一个节点，包括不能到达真实出口的块
-  - IPostDom树边：`parent -> child`表示`parent = IPostDom(child)`
-  - ExitReachable事实：单独标记“从Entry可达并且还能到达至少一个真实出口”的块，不能与树节点集合混为一谈
-
-VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可以跳转到的真实后支配基本块。
+> 支配关注的是入口->当前块，后支配关注的是当前块->出口
 
 - 后支配树构建：
 
-  1. 先从函数Entry求入口可达区域，排除整段不可达CFG
-  2. 在该区域中寻找没有后继的有效真实出口，并建立CFG的反向邻接关系
-  3. 创建VirtualExit，把所有真实出口作为它在反向CFG中的后继
-  4. 从VirtualExit在反向CFG上遍历，并使用Semi-NCA求能到达出口区域的直接后支配关系
-  5. 对入口可达但不能到达任何真实出口的块，不猜测无限区域内部的后支配关系，而是把每个块保守地直接挂到VirtualExit
-  6. 如果函数没有真实出口，则所有入口可达块都直接挂到VirtualExit；这些块之间不会发布后支配关系
+  1. 获取真实可达出口块，以及反向CFG（边反转存储）
+  2. 创建VirtualExit
+  3. 对所有真实可达出口块反向DFS，编DFS序
+  4. 无法到达真实出口的基本块（但是入口可达）**直接挂载**到虚拟根，为其分配编号（在刚才分配的DFS序号后面）
+  5. 求每个基本块的半后支配者SDom和直接后支配者IDom -- **这一步和支配树算法（SemiNCA）和实现完全一样**
+  6. 构建后支配树
+
+  **和支配树的区别重点在于如何构建DFS序图**
 
 ![PostDominant构建的后支配树](assets/analysis-postdominant.svg)
+
+##### LoopInfo/LoopAnalysis循环分析
+
+建立循环森林
+
+![Generated image 1](assets/Generated image 1.png)
+
+##### MemorySSA
+
+将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
+
+- 内存状态结点：
+
+  - LiveOnEntry：函数入口时未知的初始内存状态，**无对应IR**，无任何对应，每个函数只创建一个
+
+  - Phi：多个CFG前驱的内存状态汇合，**对应IR出现在迭代支配边界（没支持LiveInBlock，所以不是PrunedPHI）基本块入口**
+
+    incoming:(PredBB1, PredBB1Status)记录每个前驱CFG的内存节点状态
+
+  - Use：读取内存但不产生新内存版本,**对应IR：Load/只读Call**
+
+  - Def：可能修改内存，产生新内存版本，**对应IR：Store/可能写内存的Call**
+
+- 内存状态图：
+
+  1. 每个函数入口对应一个LiveOnEntry
+  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
+  3. 每个store/call产生一个新内存状态
+  4. 每个load使用当前内存状态，**但不产生新状态**
+
+![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
+
+参考资料：https://zhuanlan.zhihu.com/p/715818784
+
+
+
+
 
 ##### BasicAliasAnalysis
 
@@ -1210,238 +1240,6 @@ VirtualExit对应的空Block指针只是分析哨兵，不代表存在一个可�
   4.
 
 
-
-
-
-##### RangeAnalysis--整数/浮点范围分析 + KnownBits
-
-基于 SCCP 的 worklist 不动点框架扩展的值范围分析，**同时产出两套独立但联动的 lattice**：
-
-- `IntRange` —— signed [min, max] 区间
-- `KnownBits` —— 32 位级别的 known-zero/known-one 双掩码
-
-以及一套独立的 `FloatRange`（float 的 `[min, max]`）。整套分析供 RangeAwareSimplify、ConstraintElimination 等化简 pass 消费。
-
-设计思路：
-
-复用 SCCP 的 worklist / ExecutableBlocks / FeasibleEdges 三元组基础设施。整数 lattice 从 SCCP 的 `{Top, Constant, Bottom}` 扩展到 `{Top, [min,max], Bottom}`，常量退化为 `[c, c]` 单值区间。KnownBits 独立一路，位级事实（典型：`and/or/shl/lshr/ashr` 操作后的对齐 / 符号位）比区间更精细，二者通过 `KnownBits::toIntRange()` 反推 + 写入前 intersect 的"联动桥"汇合。
-
-- IntRange / FloatRange 定义：
-
-  ```
-  struct IntRange {
-      int64_t min;   // I32_MIN 表 -∞
-      int64_t max;   // I32_MAX 表 +∞
-      int knownTrailingZeros;  // LSB 对齐 hint，add/sub/mul/shl 传播
-  };
-
-  struct FloatRange {
-      double min;    // -∞ 表无下界
-      double max;    // +∞ 表无上界
-      bool isNaN;    // 遇 NaN 污染 → Top
-  };
-  ```
-
-  `isTop()` 只看 `min/max` 是否是 i32 全范围（**不再**掺 knownTrailingZeros —— 此前混合判定让有 align 但 range 宽的值被当"非 Top"走无意义端点比较）。`isBottom()` 是 `min > max`（空区间），`isSingleValue()` 是 `min == max`。
-
-  整数用 int64 backing 避免 i32 中间溢出（例如 `(-2^31) / (-1) = 2^31` 在 i32 装不下），最后查询时再 cast 回 i32。
-
-- KnownBits lattice：
-
-  ```
-  struct KnownBits {
-      uint32_t zero;  // bit i = 1 → 原值第 i 位确定是 0
-      uint32_t one;   // bit i = 1 → 原值第 i 位确定是 1
-      // 不变量：zero & one == 0（否则是 bottom = 不可达）
-  };
-  ```
-
-  算子：`shl / lshr / ashr`（`k==0` 保 identity，`k ∈ [1, 31]` 按位迁移，越界退 Top）；`band / bor / bxor`；`add / sub / mul`（trailing-zero 传播，其余位退 unknown —— 进位会污染）。`unionWith` 用于 PHI 合流（bit 同时 known 且同值才保留），`intersectWith` 用于 narrowing（冲突 bit 同时丢掉避免污染）。
-
-  **toIntRange()**：把 KB 反推成一条 IntRange —— 冲突 → bottom；符号位已知 → 给 signed 的紧 [min, max]；符号位未知但有 trailing zeros → 全 i32 范围 + 保留 align 信息。solver 在写 `updateRange` 前调用 `tightenWithBits` 把这条 IntRange 和直接算出来的 IntRange intersect，让 KB 的位级事实自动反哺到区间层。
-
-- 三阶段整体流程：
-
-  ```mermaid
-  flowchart TD
-      A[Step 1: Forward widening<br/>worklist 不动点迭代<br/>EnqueueCount ≥ 32 widen 到 Top] --> B[Step 2: Narrowing<br/>backward constraint propagation<br/>intersect-only 语义<br/>ADD/SUB 反推操作数]
-      B --> C[Step 3: publishReturnRange<br/>把本函数所有 RetInst 操作数 union<br/>写入 InterprocCache.RetRanges]
-      C --> D[下次分析 H 调 F 时<br/>visitCall 从 cache 拿 F.RetRange<br/>替代 Top]
-  ```
-
-  单阶段 worklist 循环：
-
-  ```mermaid
-  flowchart TD
-      A[初始化: 常量 → 单值区间<br/>其他 → Top] --> B[worklist 取指令 I]
-      B --> C{I 的类型}
-      C -->|二元运算| D[visitBinary<br/>整数/浮点分派]
-      C -->|PHI| E[visitPhi<br/>取所有可达 incoming 并集]
-      C -->|条件分支| F[visitBranch<br/>单前驱时收窄]
-      C -->|CallInst 用户函数| F2[visitCall<br/>查 InterprocCache RetRange]
-      C -->|其他| G[result = Top]
-      D --> H{range 是否变化?}
-      E --> H
-      F --> H
-      F2 --> H
-      G --> H
-      H -->|否| B
-      H -->|是| I{Forward 模式<br/>& EnqueueCount &gt; MAX_ENQUEUE?}
-      I -->|是| J[widen → Top<br/>锁入 Widened 集合]
-      I -->|否 / Narrowing 模式| K[更新 range<br/>把所有 user 推入 worklist]
-      J --> B
-      K --> B
-  ```
-
-- 二元运算 transfer function：
-
-  整数（IntRange 和 KnownBits 两路并行）：
-  - ADD/SUB/MUL：四端点组合取 min/max，遇 i32 范围溢出饱和到 Top；KB 只保留 trailing-zero（add/sub 取两侧 tz 的 min，mul 取 tz 之和）
-  - SDIV：按被除数正负/除数跨 0 做 case 分析，避免除零
-  - SREM：结果符号取决于被除数，`|result| < |divisor|`
-  - **SHL 常量 k**：IntRange 按 `(uint64)min * 2^k` / `max * 2^k` 算，**任一端点越过 I32_MAX 退 Top**（不走饱和截断——i32 wrap 语义下 `1 << 31 = INT32_MIN`，截断会报成 `INT32_MAX` 污染下游）；负数左移直接退 Top 兼避 C++ UB；KB 低 k 位填 known-zero，高位向上迁移
-  - **ASHR / LSHR 常量 k**：IntRange 端点按 `>> k` 单调推；lshr 负数退 Top（signed 区间无法表 uint 高位填 0 后的大正数）；KB 高位按算术/逻辑填
-  - **AND**：双非负时 `[0, min(lMax, rMax)]` + 常量掩码时 `[0, c]`；KB 用 `lKB.zero | rKB.zero` 聚合已知零位、`lKB.one & rKB.one` 聚合同时已知一位
-  - **OR**：双非负时 `[max(lMin, rMin), I32_MAX]`；KB 对偶 AND
-  - **XOR**：IntRange 保守 Top；KB 对双侧都 known 的 bit 按异或算
-
-  浮点：
-  - ADD/SUB/MUL/FDIV：四端点组合取 min/max
-  - `inf * 0 = NaN` 退 Top，`0 / 0 = NaN` 退 Top
-  - ±0 归一化避免端点比较抖动
-
-  Select / Cast：
-  - **Select**：整数浮点分别 union true/false 支的 range；不尝试靠 cond 收窄（分支推理已在 visitBranch 做）
-  - **ZExt i1 → i32**：IntRange `[0, 1]`；KB 高 31 位 known-zero
-  - **SExt i1 → i32**：IntRange `[-1, 0]`；KB 因 "值只能是 0x00000000 或 0xFFFFFFFF" 无法用单一 KB 刻画，留 Top
-  - **Trunc i32 → i1**：IntRange `[0, 1]`；KB 高 31 位 known-zero + bit0 继承源的 bit0
-  - **SITOFP i32 → f32**：整数端点直接转 double
-  - **FPTOSI f32 → i32**：端点向零截断；**任一端点超出 i32 可表示范围或是 ±inf/NaN 直接退 Top**（不再夹到 INT_MIN/INT_MAX——上游会把单值区间错折成常量）
-
-- 条件分支收窄（IntRange + KnownBits 双路）：
-
-  仅在目标块**单前驱**时才对分支条件施加约束（多前驱块条件不是所有路径都满足，over-constrain 会错）：
-
-  IntRange 收窄：
-  ```
-  if terminator(fromBB) is "br (cmp op x rhs) trueBB falseBB":
-      if trueBB.preds.size() == 1:
-          记录 contextualRanges[trueBB][x]  = x 落在 [x op rhs] 的区间
-      if falseBB.preds.size() == 1:
-          记录 contextualRanges[falseBB][x] = x 落在 [x !op rhs] 的区间
-  ```
-
-  rhs 是 ConstInt 直接取值做边界，非常量 rhs 查其当前 range 取端点。整数和浮点分派：操作数类型 IR_INT 走 IntRange 边界 ±1（紧邻前/后一个整数），IR_FLOAT 走 FloatRange 端点（浮点没有"紧邻前一个"概念）。浮点非 Top 时假定不含 NaN（NaN 已被吸收到 Top），按 olt/ole/ogt/oge/oeq 端点比较。
-
-  **KnownBits 边敏感 contextual**（新）：
-  - `x == c` 的 true 边 / `x != c` 的 false 边：把 KB(c) 写入目标块的 `ContextualBits[x]`
-  - `x < 0` / `x >= 0` 的 true/false 边：写符号位 KB（sign=1 or sign=0），对应"sign-bit-narrowing"的常见路径
-  - 所有写入同样受"目标块单前驱" guard
-
-- GEP 索引约束：
-
-  SysY 程序（假设无 UB）若执行到 `gep arr, 0, i` 且 arr 是 `[N × T]` 类型，索引 i 必在 `[0, N-1]`。`visitGEP` 按 updateType 的逻辑走类型链，每个 ARRAYType 维度给对应索引加 contextual 约束 `[0, count-1]` 在 GEP 块。
-
-  ```
-  function visitGEP(GEP):
-      currentType = GEP.base.type
-      for i in [1, GEP.operands.size):
-          if currentType is ARRAYType:
-              narrowed = [0, count - 1] ∩ (旧 contextual or Top)
-              updateContextual(idx[i], GEP_block, narrowed)
-              currentType = array.elementType
-          elif currentType is POINTERType:
-              currentType = ptr.pointerType    // 指针算术，无边界
-  ```
-
-  SSA 保证：同一 Value 在不同点值相同。约束通过支配关系传播到被 GEP 块支配的所有使用。
-
-- widening（收敛保障）：
-
-  Forward 阶段不动点迭代中某个值的 range 变化达到 `MAX_ENQUEUE = 32` 次，直接 widen 到 Top 并写入 `Widened` 集合，后续此值的 forward transfer 不再更新。这是为了保证分析一定收敛——循环累加 `sum += i` 这种没有 SCEV 支持时的递增模式，靠 widening 保守收敛。
-
-  整数浮点共享同一个 `EnqueueCount` 和 `Widened` 集合。**浮点路径必须同样 widen**，否则 `a += 0.1` 这种循环累加在 COUNT=500000 的浮点 bench 上永远不收敛直接跑死。
-
-- Narrowing（backward constraint propagation）：
-
-  Forward widen 到 Top 的值本身是保守 over-approx，Narrowing 阶段在 forward 收敛后用 **intersect-only 语义**重跑一轮把它们收回来：
-
-  1. `NarrowingMode = true`，`updateRange` 改为 `cur = cur.intersectWith(new)`，不再 widen（`Widened` 锁失效，但不主动清除）
-  2. 所有可达指令重新入 worklist；对 ADD/SUB 做 **backward 推导**：`z = x + y ⟹ x = z - y, y = z - x`；`z = x - y ⟹ x = z + y, y = x - z`
-  3. 硬预算 `O(instCount × 4 + 64)` 防止病态函数跑飞；预算耗尽清空 worklist 保守结束
-
-  ```
-  function narrowBinaryBackward(BI, lhs, rhs, lRange, rRange):
-      // 整数 + 浮点同构成立
-      zR = getRange(BI)
-      switch BI.op:
-          case ADD:   // z = x + y
-              x -= rRange; y -= lRange
-          case SUB:   // z = x - y
-              x += rRange; y = lRange - zR
-          // 弱 backward（仅符号）：MUL/DIV/MOD 的端点反推非单调，只推符号
-          case MUL:   // z = x * y 且 z 非负
-              if zR 非负:
-                  if rRange.min > 0: x ∩= [0, INT_MAX]
-                  if lRange.min > 0: y ∩= [0, INT_MAX]
-          case DIV:   // z = x / y, z 非负, y > 0 ⟹ x 非负
-              if zR 非负 and rRange.min > 0: x ∩= [0, INT_MAX]
-          case MOD:   // srem: z 的符号 = 被除数的符号
-              if zR 非负 and rRange 非 Top: x ∩= [0, INT_MAX]
-  ```
-
-  浮点（FADD/FSUB）和整数 ADD/SUB 同构成立（假定非 NaN；NaN 已被吸收到 Top 不进 narrowing）。narrowing 是单调收缩的，ranges 只会变窄，bounded 就一定终止。
-
-- 跨函数 Return Range 传播：
-
-  RangeAnalysis 是 Function-level pass，但用一个文件内 `static InterprocCache` 做跨函数 return range 传播：
-
-  ```
-  struct InterprocCache {
-      unordered_map<Function*, IntRange> RetRanges;
-      unordered_map<Function*, FloatRange> FloatRetRanges;
-      // 参数 range 传播未启用（见下方设计权衡）
-  };
-  ```
-
-  机制：
-  1. 分析 F 时参数**保持 Top**（不从 cache seed），走 forward + narrowing
-  2. `publishReturnRange(F)` 扫所有 RetInst 操作数，union 作为 F 的返回值 range 写 cache
-  3. 后续分析 H 时若 `call F`，`visitCall` 从 cache 查 F 的 RetRange（没 cache 就 Top）
-
-  设计权衡：**不 seed 参数**是有意为之。如果把"所有 call site 实参的 union"作为参数初值，会让 F 被偏紧的参数分析，导致 return range 被低估 → 其他 caller 拿到低估的返回值 → RangeAwareSimplify 基于错误 range 做常量折叠 → WA（实际已验证）。安全的参数传播需要 pipeline 级多轮不动点迭代，当前版本先保守不做。
-
-- contextual range 查询：
-
-  `RI.query(Value *v, BasicBlock *BB, DominatorTree &DT)` 沿支配树往上找离 BB 最近的 block-level 约束，没找到就返回全局 range：
-
-  ```
-  function query(v, BB, DT):
-      range = globalRanges[v]
-      cur = BB
-      for depth in [0, 8) while cur:
-          if contextualRanges[cur].count(v):
-              range = range.intersectWith(contextualRanges[cur][v])
-          cur = DT.idom(cur)
-      return range
-  ```
-
-- 接口：
-
-  1. `IntRange query(Value *v, BasicBlock *BB, DominatorTree &DT)`：整数 range contextual 查询
-  2. `FloatRange queryFloat(Value *v, BasicBlock *BB, DominatorTree &DT)`：浮点 range contextual 查询
-  3. `LoopInductionInfo`：预留 SCEV 接口（`getInductionStart/Step/Count`），当前未实现，供后续 SCEV pass 填
-
-- 特殊输入推断：
-
-  前端 `getch()` 直接推断为 `[0, 127]`（ASCII），避免调用边界 Top 污染后续分析。
-
-- 留待后续：
-
-  - 循环归纳变量的 AddRec 推断：需要 SCEV 分析 pass，接口已留
-  - 跨函数**参数** range 传播：需要 pipeline 级多轮不动点迭代才能安全实现
-  - per-edge contextual range：目前只有 per-block，edge 级对多前驱块的 PHI 精度更高，结构改动较大
-  - PHI sign-preserving widening：曾尝试实现（widen 时若 newRange 非负则退到 `[0, INT_MAX]` 而非 Top），但会与 narrowing + GEP backward 组合产生 over-narrowing，将 `while (i > 0)` 这类出口条件被 foldComparisons 折叠为恒 true 的 bug（73_int_io 复现）。已回滚到直接 widen Top
 
 
 
@@ -2044,16 +1842,6 @@ graph TD
 
 
 
-##### Local2Global
-
-将局部Alloca分配的大数组提升为全局变量
-
-- 算法流程：
-  1. 遍历Module之下所有函数所有指令，找到Alloca，计算其分配的变量占用的字节数，如果大于阈值（1024 size_t），那么加入工作队列之中
-  2. 创建全局变量，提取原Alloca的底层类型，并复用原变量名字，RAUW替换alloca为该全局变量，清理Alloca
-
-
-
 ##### Global2Local
 
 将全局变量Local到Main函数，从而在Mem2Reg可以将其提升为寄存器变量
@@ -2076,15 +1864,7 @@ graph TD
 
 ##### Local&Global策略：
 
-将极小变量提升到局部，变成寄存器变量，将极大变量提升为全局变量防止栈溢出
-
-
-
-##### SCCP稀疏化常量传播
-
-函数内稀疏化常量传播
-
-> 没有支持向量化的相关支持
+将极小变量提升到局部，变成寄存器变量，
 
 
 
@@ -2382,149 +2162,6 @@ graph TD
               - 将旧的 Root 指令压入 `TodoList`
 
 
-
-
-##### LoopSimplify
-
-依赖Dominant和LoopInfo两个AnalysisPass
-
-- 目的：确保Loop满足规范形式
-  - 唯一的 PreHeader（入口块）
-  - 唯一的 Back Edge
-  - Dedicated Exits （ 所有的 Exit Block 只能被**循环内部**的基本块指向）
-
-- 算法流程：
-
-  PreHeader是用来汇聚外部块的进入的
-
-  Latch块是用来汇聚回边的
-
-  Dedicated Exits 是用来汇聚所有从Loop中Exit并和外部跳转进行分割的
-
-  1. 插入PreHeader唯一入口块
-
-     得到原Header，遍历Header的所有前驱，筛选出那些来自循环外部的块，然后将这些块先去指向PreHeader
-
-     创建PreHeader的后，改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-     ```
-     // ================= 转换前 =================
-     Header:
-         phi [ 1, pre, 2, pre, 3, x, 4, y ]
-
-
-     // ================= 转换后 =================
-     preHeader:
-         Mergephi [ 1, pre, 2, pre ]
-    
-     Header:
-         phi [ Mergephi, preHeader, 3, x, 4, y ]
-     ```
-
-  2. 构造Dedicated Exits 专用出口块
-
-     当一个出口块（Exit BB）同时接收**循环内**和**循环外**的跳转时
-
-     把所有来自**循环内部**的边拦截住，让它们先跳到一个新创建的中间块，然后再由这个新块跳向原来的 Exit BB。
-
-     同样要创建好之后：改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-  3. 构造唯一回边--添加Latch块
-
-     将多条跳转回Header的边汇聚到唯一的Latch块中
-
-     同样要创建好之后：改动Value/User/Use（其实也是改动Br），改动Br跳转指令，改动Phi指令
-
-  4. 简化Header中的PHI节点
-
-     为什么要简化：在LoopSimplify这个pass进行之后，Header中PHI最多只有两个入口（PreHeader，Latch）
-
-     如果只有一个来源直接进行替换，替换死循环PHI--**替换这两类PHI**
-
-- 图解：
-
-  转换前
-
-  ```mermaid
-  graph TD
-      %% 外部区域
-      O1[Outside 1]
-      O2[Outside 2]
-      O3[Outside 3]
-  
-      %% 循环内部
-      subgraph LoopArea [Loop]
-          direction TB
-          H[Header]
-          B1[Body 1]
-          B2[Body 2]
-  
-          H --> B1
-          H --> B2
-          B1 -->|回边 1| H
-          B2 -->|回边 2| H
-      end
-  
-      %% 出口区域
-      E[ExitingBlock]
-  
-      %% 跨区域连线
-      O1 --> H
-      O2 --> H
-      B1 --> E
-      O3 --> E
-  
-      %% 样式调整匹配你的手绘布局
-      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
-      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
-      class LoopArea loopBox;
-  ```
-
-  转换后
-
-  ```mermaid
-  graph TD
-      %% 外部区域
-      O1[Outside 1]
-      O2[Outside 2]
-      O3[Outside 3]
-  
-      %% 循环内部
-      subgraph LoopArea [Loop]
-          direction TB
-          PH["新块: PreHeader"]
-          H["Header<br>(PHI 被极大简化)"]
-          B1[Body 1]
-          B2[Body 2]
-          L["新块: Latch"]
-  
-          PH -->|① 唯一入口| H
-          H --> B1
-          H --> B2
-          B1 --> L
-          B2 --> L
-          L -->|③ 唯一回边| H
-      end
-  
-      %% 出口区域
-      DE["新块: Dedicated Exit"]
-      E[ExitingBlock]
-  
-      %% 跨区域连线
-      O1 --> PH
-      O2 --> PH
-  
-      B1 -->|② 拦截内部跳出| DE
-      DE --> E
-      O3 -->|外部连线保持原样| E
-  
-      %% 样式标注
-      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
-      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
-      classDef newBlock fill:#d1e7dd,stroke:#198754,stroke-width:2px,color:#0f5132;
-      class LoopArea loopBox;
-      class PH,L,DE newBlock;
-  ```
 
 ##### LCSSA--闭环SSA形式
 
@@ -3056,67 +2693,13 @@ LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它�
 
 
 
-#### AnalysisPass
-
-##### Dominant支配树
-
-##### PostDominant后支配树
-
-##### LoopInfo/LoopAnalysis循环分析
-
-建立循环森林
-
-![Generated image 1](assets/Generated image 1.png)
-
-##### MemorySSA
-
-将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
-
-使用MemorySSA的TransformPass：
-
-1. LoadElimination：查询 Load 最近的相关 Store，执行跨块 Store-to-Load Forwarding
-2. GVNPRE：使用Store 转发；用相同 clobber 判断两次 Load 读取同一内存版本
-3. LICM：证明 Load 的最近相关写入位于循环外，从而提升 Load
-4. DSE：证明所有到达路径都已经写入同一个值，删除后续冗余 Store
-5. InstSimplify
-6. SCCPLocalAggregateSimplify
-
-- 内存状态结点：
-
-  - LiveOnEntry：函数入口时未知的初始内存状态，**无对应IR**，无任何对应，每个函数只创建一个
-
-  - Phi：多个CFG前驱的内存状态汇合，**对应IR在每个基本块入口**
-
-    incoming:(PredBB1, PredBB1Status)记录每个前驱CFG的内存节点状态
-
-  - Use：读取内存但不产生新内存版本,**对应IR：Load**
-
-  - Def：可能修改内存，产生新内存版本，**对应IR：Store/Call**
-
-- 内存状态图：
-
-  1. 每个函数入口对应一个LiveOnEntry
-  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
-  3. 每个store/call产生一个新内存状态
-  4. 每个load使用当前内存状态，但不产生新状态
-
-![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
-
-参考资料：https://zhuanlan.zhihu.com/p/715818784
-
-##### SCEV标量演化分析
-
-依赖AnalysisPass：
-
 
 
 
 
 #### TransformPass
 
-#### CFG规范化Pass
-
-
+#### CFG/Loop规范化Pass
 
 ##### CFGSimplify
 
@@ -3218,8 +2801,6 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 
 ![image-20260726183628890](assets/image-20260726183628890.png)
 
-
-
 ##### UnifyFuncExits统一函数出口
 
 用在中端转入后端前PassPipeline收尾阶段
@@ -3228,7 +2809,184 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
 
 ![image-20260726142830241](assets/image-20260726142830241.png)
 
-#### 清理类Pass
+##### LoopSimplify
+
+依赖AnalysisPass：Dominant和LoopInfo
+
+- 目的：确保Loop满足规范形式
+
+  - 唯一的 PreHeader（入口块）
+  - 唯一的 Back Edge
+  - Dedicated Exits （ 所有的 Exit Block 只能被**循环内部**的基本块指向）
+
+- Loop规范形式
+
+  PreHeader是用来汇聚外部块的进入的
+
+  Latch块是用来汇聚回边的
+
+  Dedicated Exits 是用来汇聚所有从Loop中Exit并和外部跳转进行分割的
+
+- 图解：
+
+  转换前
+
+  ```mermaid
+  graph TD
+      %% 外部区域
+      O1[Outside 1]
+      O2[Outside 2]
+      O3[Outside 3]
+  
+      %% 循环内部
+      subgraph LoopArea [Loop]
+          direction TB
+          H[Header]
+          B1[Body 1]
+          B2[Body 2]
+  
+          H --> B1
+          H --> B2
+          B1 -->|回边 1| H
+          B2 -->|回边 2| H
+      end
+  
+      %% 出口区域
+      E[ExitBlock]
+  
+      %% 跨区域连线
+      O1 --> H
+      O2 --> H
+      B1 --> E
+      O3 --> E
+  
+      %% 样式调整匹配你的手绘布局
+      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
+      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
+      class LoopArea loopBox;
+  ```
+
+  转换后
+
+  ```mermaid
+  graph TD
+      %% 外部区域
+      O1[Outside 1]
+      O2[Outside 2]
+      O3[Outside 3]
+      PH["新块: PreHeader"]
+  
+      %% 循环内部
+      subgraph LoopArea [Loop]
+          direction TB
+          H["Header<br>(PHI 被极大简化)"]
+          B1[Body 1]
+          B2[Body 2]
+          L["新块: Latch"]
+  
+          H --> B1
+          H --> B2
+          B1 --> L
+          B2 --> L
+          L -->|③ 唯一回边| H
+      end
+  
+      %% 出口区域
+      DE["新块: Dedicated Exit"]
+      E[ExitBlock]
+  
+      %% 跨区域连线
+      O1 --> PH
+      O2 --> PH
+      PH -->|① 唯一入口| H
+  
+      B1 -->|② 拦截内部跳出| DE
+      DE --> E
+      O3 -->|外部连线保持原样| E
+  
+      %% 样式标注
+      classDef default fill:#f8f9fa,stroke:#333,stroke-width:2px;
+      classDef loopBox fill:#ffffff,stroke:#000,stroke-width:2px;
+      classDef newBlock fill:#d1e7dd,stroke:#198754,stroke-width:2px,color:#0f5132;
+      class LoopArea loopBox;
+      class PH,L,DE newBlock;
+  ```
+
+
+
+##### Local2Global
+
+将非递归main函数中局部Alloca分配的大数组提升为全局变量，防止栈溢出
+
+阈值选取1024：大于1024字节的数组会被提升
+
+##### GlobalInitializerFold
+
+主要在Local2Global后使用，当Local2Global将大尺寸对象的alloca提升为global之后，GlobalInitializerFold将memcpy消除，从而将初始化时间从运行期改到静态装载期
+
+目标对象：全局变量对应的**初始化memcpy（初始化长度覆盖整个对象）**
+
+完整变换流程：
+
+```
+前端：前端会引入memcpy
+@template = constant [300 x i32] [...]
+define i32 @main() {
+entry:
+  %a = alloca [300 x i32]       ; 1200 字节
+  call @memcpy(%a, @template, 1200, false)
+}
+
+Local2Global：
+@template = constant [300 x i32] [...]
+@.G.a = global [300 x i32] zeroinitializer
+define i32 @main() {
+entry:
+  call @memcpy(@.G.a, @template, 1200, false)
+}
+
+GlobalInitializerFold：
+@template = constant [300 x i32] [...]
+@.G.a = global [300 x i32] [...]
+
+define i32 @main() {
+entry:
+  ; memcpy 已删除
+}
+```
+
+##### DeadGlobalCleanup死全局消除
+
+只用在中端快结束的位置，用于轻量级优化，比StoreOnlyGlobalElimination更加轻量，功能更弱
+
+功能：删除只存在store无其他Use的global和store，删除无Use的global，只处理标量，不处理数组
+
+
+
+##### DCE死代码消除
+
+##### ADCE激进死代码消除
+
+依赖AnalysisPass：PostDominant，SideEffect
+
+先假定所有指令是死的，只把返回、存储、副作用调用等标活，再反向标活这些指令依赖的指令和控制条件，最后删除剩余其他的一切
+
+- 算法流程：
+  1. 一开始就活跃的根指令：Store，Ret，无条件Br，无法到达真实出口的条件Br，Call（纯函数/只读函数调用不活跃，其他标活）
+  
+  1. 迭代闭包：
+  
+     指令的操作数对应的指令也活跃
+  
+     标活必经块上的分支指令：从目标块到PostIDom沿着后支配树遍历，遇到的每个基本块的条件分支指令标活
+  
+     PHI指令（特殊）：不仅标活incoming value对应的指令，还标活incoming block的条件分支指令
+  
+  1. 执行清扫：
+  
+     收集所有未标活的条件分支指令，删除不是PostIDom的那一侧的分支边
+  
+     收集所有未标活的非终结指令进行删除
 
 ##### DAE死参数消除
 
@@ -3737,94 +3495,6 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 目标必须是可变全局，源可以是全局变量或全局常量
   - 类型形状、对象大小和复制长度必须完全一致
   - 只处理Entry安全前缀，不尝试跨普通内存操作证明等价
-
-##### Local2Global
-
-把非递归`main`入口中的大型Alloca改成同型全局对象，避免大对象占用主函数栈帧。
-
-依赖AnalysisPass：无。
-
-- 变换流程：
-
-  1. 建立直接调用图；如果`main`可能递归回到自身，则放弃整个Pass，因为每次递归本应获得独立栈对象。
-
-     Before：
-
-     ```llvm
-       define i32 @main() {
-       entry:
-         %buf = alloca [4096 x i32]
-         %again = call @main()
-         ret %again
-       }
-     ```
-
-     After：
-
-     ```llvm
-       define i32 @main() {
-       entry:
-         %buf = alloca [4096 x i32]
-         %again = call @main()
-         ret %again
-       }
-       ; 调用图能回到main，%buf保持每个栈帧独立。
-     ```
-
-  2. 只扫描`main` Entry中的Alloca，并以目标后端阈值筛选大型对象。
-
-     Before：
-
-     ```llvm
-       entry:
-         %large = alloca [4096 x i32]
-         %small = alloca i32
-         br Work
-       Work:
-         %late = alloca [4096 x i32]
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       @large = global [4096 x i32] zeroinitializer
-       entry:
-         %small = alloca i32
-         br Work
-       Work:
-         %late = alloca [4096 x i32]
-         ret 0
-       ; 只提升Entry中超过阈值的%large。
-     ```
-
-  3. 为候选创建同型全局变量，替换原Alloca的全部使用，再删除Alloca。
-
-     Before：
-
-     ```llvm
-       entry:
-         %buf = alloca [4096 x i32]
-         %p = gep %buf, 0, %i
-         store %v, %p
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       @buf = global [4096 x i32] zeroinitializer
-       entry:
-         %p = gep @buf, 0, %i
-         store %v, %p
-         ret 0
-     ```
-
-- 保守边界：
-
-  - 仅处理`main`，利用“程序入口对象生命周期等同整次程序执行”的语义
-  - 只提升超过阈值的入口对象，不改变小对象和动态控制区域中的分配
-  - 计时调用不观察栈/全局存储位置，因此不是该表示变换的屏障
 
 ##### Global2Local
 
@@ -4496,11 +4166,9 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
      After：
 
      ```llvm
-       entry:
-         %r = tail call @g(%x)
-         ret %r
+       entry:ADCE    %r = tail call @g(%x)    ret %r
      ```
-
+     
      Before：
 
      ```llvm
@@ -4510,7 +4178,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %r = call @g(%p)
          ret %r
      ```
-
+     
      After：
 
      ```llvm
@@ -4521,7 +4189,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %r
        ; 实参定义闭包追到Alloca，Call保持非tail。
      ```
-
+     
   3. 只有函数确实直接自递归、且所有Entry Alloca的地址都不逃逸当前栈帧时，才尝试转循环。
 
      Before：
@@ -4534,7 +4202,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %self = call @f(%next, %slot)
          ret %self
      ```
-
+  
      After：
 
      ```llvm
@@ -4546,7 +4214,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %self
        ; Entry Alloca地址逃逸到Self Call，不能把不同递归帧合并为一个循环帧。
      ```
-
+  
   4. 找到每个返回路径上的最后一个Self Call，接受真尾递归`ret call`，或唯一整数`ADD/MUL`累加形式；Call与Ret之间的其他指令必须可安全前移且不依赖递归结果。
 
      Before（整数累加形态）：
@@ -4558,7 +4226,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %v = mul %n, %self
          ret %v
      ```
-
+  
      After（候选通过形状检查）：
 
      ```llvm
@@ -4569,7 +4237,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %v
        ; 进入后续累加器PHI改写，见第7步。
      ```
-
+  
      After：
 
      ```llvm
@@ -4579,7 +4247,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %v
        ; 浮点重新结合不安全，保持递归。
      ```
-
+  
   5. 首次提交时在旧Entry之前创建一次性新Entry，把旧Entry作为LoopHeader；入口Alloca移到新Entry，并为每个函数形参在LoopHeader创建PHI。
 
      Before：
@@ -4591,7 +4259,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ; 原函数体
        }
      ```
-
+  
      After：
 
      ```llvm
@@ -4604,7 +4272,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ; 原Entry中的非Alloca指令
        }
      ```
-
+  
   6. 把Self Call的每个实参接成形参PHI的回边输入，以跳回LoopHeader的Br替换Call和Ret。
 
      Before：
@@ -4615,7 +4283,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %self = call @f(%n.next)
          ret %self
      ```
-
+  
      After：
 
      ```llvm
@@ -4625,7 +4293,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
        LoopHeader:
          %n.loop = phi [%n, NewEntry], [%n.next, TailBB]
      ```
-
+  
   7. 对`return C + f(next)`或`return C * f(next)`创建累加器PHI，初值分别为0或1，每次回边更新累加值；正常返回路径再使用累计状态。首个成功累加站点确定ADD或MUL模式，之后操作不同的站点只被跳过，不会回滚已经完成的转换。
 
      Before：
@@ -4639,7 +4307,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
        Base:
          ret 1
      ```
-
+  
      After：
 
      ```llvm
@@ -4655,7 +4323,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %result = mul %acc, 1
          ret %result
      ```
-
+  
   8. 候选也可以无条件跳到共享返回块，但该块必须严格只含若干PHI和唯一Ret。Pass把Ret克隆回候选块，并按当前前驱解析目标块PHI；解析后的返回值仍必须精确等于Self Call或受支持的ADD/MUL累加器。任何BitCast返回包装最终都不能通过这一形状检查，共享返回块内出现BitCast还会更早破坏`PHI* + Ret`结构。
 
      Before：
@@ -4668,7 +4336,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %r = phi [%self, TailBB], [%base, BaseBB]
          ret %r
      ```
-
+  
      After（先克隆当前入边的Ret）：
 
      ```llvm
@@ -4680,7 +4348,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          ret %r
        ; TailBB随后可按真尾递归改写成LoopHeader回边。
      ```
-
+  
      Before（BitCast返回包装）：
 
      ```llvm
@@ -4692,7 +4360,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %cast = bitcast %r
          ret %cast
      ```
-
+  
      After（返回包装不满足形状约束，保持原IR）：
 
      ```llvm
@@ -4704,7 +4372,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
          %cast = bitcast %r
          ret %cast
      ```
-
+  
 - 保守边界：
 
   - Call之后的Store、可能fault/poison的指令、不可证明必返的调用或被Self Call修改内存的只读调用都会阻止前移
@@ -4935,100 +4603,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 函数必须确定、纯、标量且无计时边界；任何内存、指针或未定义语义都会拒绝
   - 新增全局状态和CFG后，模块及函数分析均需失效
 
-##### LateDeadGlobalCleanup
 
-在流水线末尾用廉价的Use形状检查删除“只被直接写入”的标量全局，并清扫所有已经没有Use的全局对象。
-
-依赖AnalysisPass：无。
-
-- 变换流程：
-
-  1. 对仍有Use的标量全局，要求每个Use都是以该全局本身作为地址的直接Store；只要存在Load、GEP、Call或地址逃逸就不是候选。
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         store 2, @g
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       entry:
-         ret 0
-       ; 两条Use都是以@g为地址的直接Store，因此Store和@g均被删除。
-     ```
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         %x = load @g
-         ret %x
-     ```
-
-     After（候选被拒绝，保持原IR）：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         %x = load @g
-         ret %x
-     ```
-
-     Load使`@g`不是纯写候选。
-
-  2. 先删除所有已证明不可观察的Store，使它们对全局量的Use消失。
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store %a, @g
-         store %b, @g
-         ret 0
-     ```
-
-     After（第2步）：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         ret 0
-       ; 删除直接Store后，@g已经没有IR Use。
-     ```
-
-  3. 再遍历全局表，删除原本就无Use、或刚被上一步清空Use的全局对象。
-
-     Before：
-
-     ```llvm
-       @unused.scalar = global i32 0
-       @unused.array = global [4 x i32] zeroinitializer
-       entry:
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       entry:
-         ret 0
-       ; 两个无Use全局均从模块全局表移除。
-     ```
-
-- 保守边界：
-
-  - 纯写判定只处理标量和直接Store地址，是StoreOnlyGlobalElimination之后的低成本收尾
-  - 数组、派生地址或任何非Store Use不会做深入证明
 
 #### SSA、标量表达式与地址规范化
 
@@ -8768,266 +8343,6 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 当前实现没有为普通无用户Load、除余、FPToSI、非法移位或undef依赖增加fault或poison门禁；这是源码事实，不应借用共享辅助函数的能力扩大DCE描述
   - 直接或间接递归调用不能通过“无环且必返”证明
   - 删除不改变CFG，因此支配、后支配和循环结构可保留；Value/Use和调用集合变化会使BasicAA与SideEffect失效
-
-##### ADCE
-
-以可观察操作为活跃根，同时沿数据依赖和后支配控制依赖求闭包；闭包之外的整片值图会删除。清扫阶段也实现了把未标活条件分支退化为某条原有后继的后备路径，但当前实现把无条件Br作为Live Root，因此普通结构化Triangle或Diamond的控制分支通常会经控制依赖被标活。
-
-依赖AnalysisPass：PostDominant。
-
-- 变换流程：
-
-  1. 扫描函数建立初始Live Root。Store、Ret、未知或必须保留的指令、有可观察副作用的Call、无条件Br始终是根；不能到达真实出口区域中的条件Br也保守作为根。
-
-     Store根 Before：
-
-     ```llvm
-     define void @store_live_root(i32 %a, i32 %b, i32* %p) {
-     entry:
-       %x = add i32 %a, %b
-       store i32 %x, i32* %p
-       ret void
-     }
-     ```
-
-     Store根 After（数据闭包全部保留）：
-
-     ```llvm
-     define void @store_live_root(i32 %a, i32 %b, i32* %p) {
-     entry:
-       %x = add i32 %a, %b
-       store i32 %x, i32* %p
-       ret void
-     }
-     ```
-
-     当前实现还把普通直接函数调用保守地视为Live Root，即使调用结果没有用户。
-
-     普通直接Call Before：
-
-     ```llvm
-     define i32 @ordinary_function(i32 %x) {
-     entry:
-       %r = add i32 %x, 1
-       ret i32 %r
-     }
-
-     define i32 @keep_ordinary_call(i32 %x) {
-     entry:
-       %unused = call i32 @ordinary_function(i32 %x)
-       ret i32 0
-     }
-     ```
-
-     普通直接Call After（保持原样）：
-
-     ```llvm
-     define i32 @ordinary_function(i32 %x) {
-     entry:
-       %r = add i32 %x, 1
-       ret i32 %r
-     }
-
-     define i32 @keep_ordinary_call(i32 %x) {
-     entry:
-       %unused = call i32 @ordinary_function(i32 %x)
-       ret i32 0
-     }
-     ```
-
-     ADCE不会像DCE那样递归证明普通直接callee为NoModRef且必返后删除；未知调用和计时调用同样为Live Root。只有明确NoModRef的普通builtin调用可能不作为根。
-
-  2. 从工作表弹出一条活跃指令，把它的所有指令型操作数定义标活，形成反向数据依赖闭包。
-
-     Before：
-
-     ```llvm
-     define void @data_live_closure(i32 %x, i32* %p) {
-     entry:
-       %a = add i32 %x, 1
-       %b = mul i32 %a, 2
-       %dead0 = sub i32 %x, 1
-       %dead1 = mul i32 %dead0, 8
-       store i32 %b, i32* %p
-       ret void
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define void @data_live_closure(i32 %x, i32* %p) {
-     entry:
-       %a = add i32 %x, 1
-       %b = mul i32 %a, 2
-       store i32 %b, i32* %p
-       ret void
-     }
-     ```
-
-     Store使`%b`活跃，`%b`再使`%a`活跃；与任何Live Root无数据关系的`%dead0/%dead1`被删除。
-
-  3. 对每个活跃指令所在块，借助立即后支配链寻找决定该块是否执行的条件分支，并把这些分支标活。每个活跃块只展开一次控制依赖。
-
-     Before：
-
-     ```llvm
-     define void @control_live_closure(i32 %x, i32* %p) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %write, label %skip
-     write:
-       store i32 1, i32* %p
-       br label %merge
-     skip:
-       br label %merge
-     merge:
-       ret void
-     }
-     ```
-
-     After（保持原样）：
-
-     ```llvm
-     define void @control_live_closure(i32 %x, i32* %p) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %write, label %skip
-     write:
-       store i32 1, i32* %p
-       br label %merge
-     skip:
-       br label %merge
-     merge:
-       ret void
-     }
-     ```
-
-     Store是根，`entry`的条件分支决定Store是否执行，因此条件分支和`%c`也必须保留。
-
-  4. 活跃PHI不仅依赖incoming值，还依赖每个incoming块对应边是否执行，因此为PHI的每条incoming边补充控制依赖。
-
-     Before：
-
-     ```llvm
-     define i32 @phi_edge_control(i32 %x) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %a = add i32 %x, 1
-       br label %merge
-     right:
-       %b = sub i32 %x, 1
-       br label %merge
-     merge:
-       %r = phi i32 [ %a, %left ], [ %b, %right ]
-       ret i32 %r
-     }
-     ```
-
-     After（保持原样）：
-
-     ```llvm
-     define i32 @phi_edge_control(i32 %x) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %a = add i32 %x, 1
-       br label %merge
-     right:
-       %b = sub i32 %x, 1
-       br label %merge
-     merge:
-       %r = phi i32 [ %a, %left ], [ %b, %right ]
-       ret i32 %r
-     }
-     ```
-
-     Ret使PHI活跃，PHI使`%a/%b`以及决定选择哪条incoming边的`%c`和条件Br活跃。
-
-  5. 标记收敛后，清扫器会先处理确实未标活的条件终结指令。幸存边必须来自原True或False后继：优先选择当前块的立即后支配者，其次选择后支配另一侧的后继，最后稳定选择True边；同时从弃边后继的PHI中删除当前块incoming。不过在下面这个普通Diamond中，两臂的无条件Br本身都是Live Root，它们的控制依赖会把`entry`条件Br和`%c`标活，所以本例只删除臂内死计算，不会折叠分支。
-
-     Before：
-
-     ```llvm
-     define i32 @collapse_dead_branch(i32 %x, i32 %a, i32 %b) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       %dead1 = add i32 %a, 1
-       br label %merge
-     right:
-       %dead2 = add i32 %b, 1
-       br label %merge
-     merge:
-       ret i32 0
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define i32 @collapse_dead_branch(i32 %x, i32 %a, i32 %b) {
-     entry:
-       %c = icmp slt i32 %x, 0
-       br i1 %c, label %left, label %right
-     left:
-       br label %merge
-     right:
-       br label %merge
-     merge:
-       ret i32 0
-     }
-     ```
-
-     `%dead1/%dead2`删除；`%c`及条件Br保留。只有某条条件Br在完整活跃闭包后仍未标活时，清扫器才会按上述优先级选择原有后继并修复弃边PHI。
-
-  6. 最后收集全部未标活非终结指令。死节点之间可能仍互相引用，因此先把残余Use替换成同型`undef`，再统一删除整个死值图。
-
-     Before：
-
-     ```llvm
-     define i32 @delete_dead_cycle(i1 %leave) {
-     entry:
-       br label %loop
-     loop:
-       %a = phi i32 [ 0, %entry ], [ %b, %back ]
-       br i1 %leave, label %exit, label %back
-     back:
-       %b = add i32 %a, 1
-       br label %loop
-     exit:
-       ret i32 0
-     }
-     ```
-
-     After：
-
-     ```llvm
-     define i32 @delete_dead_cycle(i1 %leave) {
-     entry:
-       br label %loop
-     loop:
-       br i1 %leave, label %exit, label %back
-     back:
-       br label %loop
-     exit:
-       ret i32 0
-     }
-     ```
-
-     `%a/%b`构成互相引用的死环。提交时先用同型`undef`断开残余Use，再统一删除两条指令，最终IR中不保留临时`undef`。
-
-- 保守边界：
-
-  - 普通直接函数调用、未知调用和计时调用当前都作为Live Root保留
-  - 不能到达真实出口的区域缺少可靠后支配控制证明，其中的条件分支保守保留
-  - 死条件分支只能选择原有后继，不能绕过中间块凭空增加CFG边
-  - ADCE不会直接删除因分支改写而不可达的基本块，只删除死普通指令并修复弃边PHI；不可达块由后续CFG清理
-  - 只删除普通指令时可保留支配、后支配和循环结构；改写分支后这些结构分析均失效
 
 #### 控制流无分支化
 

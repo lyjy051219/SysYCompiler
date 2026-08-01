@@ -36,7 +36,7 @@
 #include "ir/opt/GepOpt.hpp"
 #include "ir/opt/StoreOnlyGlobalElimination.hpp"
 #include "ir/opt/ConstantHoist.hpp"
-#include "ir/opt/LateDeadGlobalCleanup.hpp"
+#include "ir/opt/DeadGlobalCleanup.hpp"
 #include "ir/opt/LatePhiCleanup.hpp"
 #include "ir/opt/LateStrengthReduce.hpp"
 #include "ir/opt/LoopStrengthReduction.hpp"
@@ -380,7 +380,7 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));
     //14. 模块收尾删除只写/无 use 全局与死函数，确保新增特化、缓存和内联残骸不输出。
-    MPM.addPass(LateDeadGlobalCleanupPass());
+    MPM.addPass(DeadGlobalCleanupPass());
     MPM.addPass(DeadFunctionEliminationPass(FAM));
     return MPM;
 }

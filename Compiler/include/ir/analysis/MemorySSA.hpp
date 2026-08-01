@@ -11,7 +11,7 @@ struct MemoryLocation;
 class LoopInfo;
 class Loop;
 
-//MemorySSA：将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图。
+//MemorySSA：将内存状态抽象成SSA风格定义链，标记每一处内存写入点和内存读取点，构建内存图
 
 //MemoryAccess：内存访问节点
 class MemoryAccess {
