@@ -2961,6 +2961,25 @@ entry:
 
 功能：删除只存在store无其他Use的global和store，删除无Use的global，只处理标量，不处理数组
 
+##### GepEvaluate折叠GEP
+
+功能：折叠掉空索引的GEP替换为基址，拆分GEP
+
+```
+%ptr = getelementptr [16 x [16 x i32]], ptr @A,
+            		 i32 0, i32 %i, i32 %j
+->
+%row = getelementptr [16 x [16 x i32]], ptr @A,
+                     i32 0, i32 %i
+
+%ptr = getelementptr [16 x i32], ptr %row,
+                     i32 0, i32 %j
+```
+
+##### GepCombine
+
+
+
 
 
 ##### DCE死代码消除

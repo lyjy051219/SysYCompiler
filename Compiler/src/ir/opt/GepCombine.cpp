@@ -1,4 +1,4 @@
-#include "ir/opt/GepOpt.hpp"
+#include "ir/opt/GepCombine.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"

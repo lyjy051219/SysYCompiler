@@ -1,8 +1,6 @@
 #pragma once
-
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-
 #include <cstddef>
 #include <memory>
 #include <vector>
