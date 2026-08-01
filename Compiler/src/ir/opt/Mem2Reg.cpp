@@ -33,7 +33,7 @@ unsigned BlockInfo::getInstIndex(const Instruction* I){
 }
 //从块内访问顺序缓存中移除即将删除的指令。
 void BlockInfo::deleteIndex(const Instruction* I){InstNum.erase(I);}
-//检查alloca是否只被类型匹配的直接标量load和store访问。
+//检查alloca是否只被类型匹配的直接标量load和store访问
 bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
     //1.1 仅提升非数组标量，且 alloca 的每个 use 必须是类型精确匹配的直接 load/store；
     //地址被存储或交给其他指令都意味着逃逸。
@@ -65,7 +65,7 @@ bool PromotePass::isAllocaPromotable(const AllocaInst* AI) {
     }
     return true;
 }
-//检查alloca的全部用户是否位于入口支配树覆盖的可达区域。
+//检查alloca的全部用户是否位于入口支配树覆盖的可达区域
 bool PromotePass::areAllocaUsersReachable(const AllocaInst* AI,
                                           DominatorTree& DT) {
     //1.2 所有访问块都必须存在于入口支配树；不可达 use 无法参与统一重命名。
@@ -210,10 +210,9 @@ bool PromotePass::rewriteSingleBlockAlloca(AllocaInfo &info,AllocaInst* AI,Domin
     delete AI;
     return true;
 }
-//循环执行快速路径、裁剪PHI放置和支配树重命名直到不再发生提升。
+//核心流程函数
 bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
-    //1.每轮重新收集入口 alloca，过滤不可提升和不可达对象；timer 不访问程序内存，
-    //不阻止 SSA 表示提升。循环执行让本轮删除和 PHI 化简暴露的新快速路径继续处理。
+    //1.每轮重新收集入口 alloca
     bool changed = false;
     BasicBlock* EntryBB = F.front();
     if (!EntryBB) return false;
@@ -229,7 +228,7 @@ bool PromotePass::promoteMemoryToRegister(Function& F, DominatorTree& DT){
     if(Allocas.empty()) {
         return changed;
     }
-    //2.先删除无 use alloca，并尝试唯一 store、单块两条无需 PHI 的快速路径。
+    //2.先删除无 use alloca，并尝试唯一 store、单块两条无需 PHI 的快速路径
     for(unsigned i = 0; i != Allocas.size(); ++i){
         auto AI = Allocas[i];
         if (!AI->hasUses()) {
@@ -497,14 +496,12 @@ bool PromotePass::simplifyPhiNode(PhiInst* Phi) {
     delete Phi;
     return true;
 }
-//获取支配树并把函数入口中所有可提升的标量alloca转换为SSA值。
 PassResult PromotePass::run(Function &F, FunctionAnalysisPassManager &FAM){
-    //1.获取支配树并执行快速路径、pruned PHI放置和SSA重命名完整流程。
+    //1.获取支配树
     auto &dominant = FAM.getResult<DominantAnalysis>(F);
     if(!promoteMemoryToRegister(F, dominant)) {
         return PassResult::unchanged();
     }
-    //7.CFG未改，结构分析保持；内存对象转为SSA值后AA与副作用摘要失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<PostDominantAnalysis>();

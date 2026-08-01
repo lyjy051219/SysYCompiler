@@ -1246,132 +1246,6 @@ graph TD
 
 #### TransformPass
 
-##### Mem2Reg
-
-运行前后都需要运行一遍CFGSimplify
-
-- 算法流程：
-
-  外层：不动点循环（直到找不到可以提升的变量才能退出）
-
-  1. 筛选可以提升的变量
-
-     获取函数入口块，遍历除了Ret之外的每一条指令，如果是Alloca，判断是否isAllocaPromotable，如果可以那么收集到Allocas数组之中
-
-     `isAllocaPromotable`：
-
-     遍历Alloca的所有User
-
-     1. 如果是Load指令，直接跳过
-
-     2. 如果是Store指令：
-
-        如果Store存入的值是Alloca（值的地址）（指针逃逸），如果存入值的类型和Alloca分配时声明的类型不一致（类型不匹配），那么不是Promotable的
-
-     3. 如果是其他User直接拒绝，不是Promotable
-
-  2. 遍历Allocas之中所有的Alloca
-
-     1. 简单优化1：删除无用Alloca
-
-        如果没有被使用过，那么直接删除（从内存中，从Allocas中）
-
-     2. AnalyzeAlloca：扫描Alloca，收集Store与Load信息
-
-        遍历Alloca所有User
-
-        如果是Store指令，收集其所在的BasicBlock到StoreBlock之中，并记录OnlyStore为当前Store
-
-        如果是Load指令，收集其所在的BasicBlock到LoadBlock之中
-
-        单基本块快速优化：如果所有遇到的 Load 和 Store 都在同一个基本块里，`OnlyUsedInOneBlock` 保持为 true；一旦遇到一个 User 属于不同的基本块，就把这个标志位置为 false
-
-     3. 简单优化2：如果仅存在一个BasicBlock被Store（Size（StoreBlock）==1）
-
-     4. 简单优化3：如果只在一个基本块内被使用`OnlyUsedInOneBlock`==True
-
-     5. 标准流程构建Pruned SSA：
-
-        1. 建立map反向映射Alloca->Allocas数组当中的索引
-
-        2. 建立DefSet：将刚才的StoreBlock去重之后存入DefSet
-
-        3. 变量活性分析，记录LiveInBlock：
-
-           WorkList：初始加入LoadBlock之中所有块
-
-           遍历WorkList之中所有块：
-
-           1. 如果块内没有Store，那么在入口处一定存活，直接跳过
-           2. 否则那么就是块内既有Store又有Load，遍历该块内所有Inst，如果发现Store在Load之前发生，从WorkList之中移除，如果Load在Store之前，保留
-
-           While循环直到WorkList之中为空：
-
-           1. 如果已经在最终LiveInBlock之中那么说明已经处理过了直接跳过
-           2. 遍历该块之中的所有前驱，如果前驱之中含Store，那么活跃性传播截止，直接跳过，否则将前驱块加入到WorkList之中
-
-        4. 计算迭代支配边界IDF
-
-           传入刚才计算的DefSet，LiveInBlock，传入PHIBlockVector数组（结果数组）
-
-           计算过程：
-
-           1. 定义优先级队列，排序依据是支配树的层级从大到小（Level），层级越深（数值越大）的节点优先级越高
-
-           2. 定义WorkList，VisitedWorkList（记录哪些块已经进入过扫描逻辑了），VisitedPHI（记录哪些块决定要插入PHI），并预先分配大小
-
-           3. 遍历DefSet，获取支配树结点加入优先级队列，VisitWorkList
-
-           4. While遍历优先级队列，直到优先级队列为空
-
-              每轮之中从优先级队列top上面取出一个结点，使用WorkList While循环遍历所有子孙结点
-
-              获取该轮节点所在块
-
-              检查支配边界：如果后继结点Level>该结点Level,说明后继结点依然被该结点严格支配，反之说明后继结点是该结点的支配边界必须插入PHI结点，并检查VisitedWorkList没有访问过，并检查该后继块在LiveInBlock之中，如果满足上述条件加入结果数组之中，如果这个结果块不在DefSet之中，那么加入到优先级队列之中
-
-              对于这个结果块，遍历它在CFG上的后继，递归调用上面这个检查支配边界的函数
-
-              把结果块在支配树上的子结点加入到WorkList之中
-
-        5. 插入PHI结点：
-
-           遍历结果数组，创建并插入PHI结点，维护一个PhiToAlloca
-
-  3. 变量重命名：
-
-     创建IncomingVals数组，遍历Allocas，初始化每个值为Alloca对应类型的UndefValue
-
-     利用Vistied和WorkList（初始化传入函数入口块）进行While遍历
-
-     递归调用Rename：
-
-     1. 遍历该块内所有新插入的PHI结点，检查PhiToAlloca确保是我们刚插入的PHI，遍历该PHI的所有操作数，利用IncomingVal填入输入值和输入块，IncomingVal更新PHI为对应Alloca的最新定义
-
-     2. 如果Visited有这个那么就直接退出
-
-     3. 替换Load&Store：
-
-        遍历函数所有指令
-
-        如果是Load指令，如果他的操作数是Alloca，如果在Allocas之中，通过IncomingVals获取Value，RAUW替换所有用到Load结果的地方替换成Value，删掉这个Load
-
-        如果是Store指令，如果他的操作数是Alloca，如果在Allocas之中，更新IncomingVals[Alloca]下的这个值，删掉Store
-
-     4. 将当前块在支配树之中所有后继加入到WorkList，并更新Visited数组
-
-  4. 遍历Allocas指令进行删除
-
-
-参考资料：
-https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
-
-https://www.zhihu.com/question/41999500/answer/93243408
-
-
-
-
-
 ##### DCE
 
 依赖Side Effect
@@ -2457,6 +2331,23 @@ graph TD
 
 
 #### TransformPass
+
+##### Mem2Reg
+
+将入口块中标量alloca转换为Phi，删除相应的load/store/alloca
+
+依赖AnalysisPass：Dominant
+
+在运行之前先运行CFGSimplify清除不可达块，运行之后也需要
+
+算法：使用LiveInBlock+IDF创建**PrunedPHI**，在Live裁剪之后的IDF处插入PHI
+
+![Mem2Reg使用LiveInBlocks与IDF创建Pruned PHI](assets/mem2reg-pruned-phi.png)
+
+参考资料：
+https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
+
+https://www.zhihu.com/question/41999500/answer/93243408
 
 ##### CFGSimplify
 
