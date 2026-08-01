@@ -3063,7 +3063,13 @@ entry:
 
 ##### LatePhiCleanup晚期PHI函数清理
 
-> 只是一个在优化后期轻量级的PHI函数清理
+一个在中端后期轻量级的PHI函数清理
+
+功能：清除无Use的PHI，把所有incoming value相同的PHI退化成value
+
+退化：PHI的value必须都是同一个相同的value，并且PHI所在基本块只有一个前驱/value的定义支配该PHI
+
+
 
 
 
