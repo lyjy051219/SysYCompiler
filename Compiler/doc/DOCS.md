@@ -2096,158 +2096,7 @@ graph TD
 
 
 
-##### LCSSA--闭环SSA形式
 
-依赖Dominant和LoopInfo两个AnalysisPass
-
-标准SSA：每个变量只被赋值一次，且使用该变量的地方必须被其定义所支配
-
-LCSSA附加规则：如果一个变量是在**循环内部**定义的，但它在**循环外部**被使用了，那么这个跨越循环边界的数据流，**必须**通过在循环退出块（Exit Block）中的 PHI 节点来传递。
-
-- 算法流程：
-
-  外层：**基于自然循环后序遍历的同时，然后基于支配树找出直接支配ExitingBlock的,并且在循环内的这些Block，然后搜集这些块中的指令**
-
-  1. 处理每一条**在循环内定义的**指令，如果是死循环（ExitingBlock没有）就不处理
-
-     如果存在ExitingBlock，进行下面的内容
-
-  2. 寻找**这条指令在循环外部的Uses**：
-
-     遍历这条指令被Use的所有地方
-
-     如果发生在永远执行不到的死代码块中，直接将Use替换为UndefValue
-
-     如果User**是一个Phi**，那么其实在控制流的角度看所对应的Use其实是发生**在Phi对应的前驱基本块之中**
-
-     如果User普通情况，那我们的Use其实就是这条User所在的基本块
-
-     如果这两个情况的基本块在循环之外，这个也就是**一个循环边界，记录下来**
-
-  3. 插入LCSSA PHI：
-
-     确定指令在支配树上的起点：本BasicBlock
-
-     **遍历所有ExitingBlock：**
-
-     1. 如果指令所在块不支配ExitingBlock，跳过
-     2. 如果已经为ExitingBlock插入过值了，跳过
-
-     下面这几条默认指令所在块支配ExitingBlock：
-
-     1. 如果指令所在块支配ExitingBlock，插入LCSSA，添加指令I为输入值
-
-     2. 如果ExitingBlock的某个前驱不在循环之内，但是指令所在块又支配ExitingBlock：
-
-        说明执行流先从其他出口跳转出去，然后回到了ExitingBlock
-
-     3. 如果该ExitingBlock是其他不相交的循环的循环头：
-
-        这时我们插入LCSSA可能会破坏另一个循环的LCSSA形式，但是还是插入这个LCSSA
-
-        后两条直接把刚生成的LCSSA加入队列等待下一轮算法运行即可
-
-  4. 重写外部Use:利用支配树实现**（Minimal SSA）**
-
-     **遍历第二条说的循环边界，并在同时倒序爬支配树，寻找UserBlock的IDOM**
-
-     1. 循环只有一个ExitingBlock：IDOM一定会落在这个ExitingBlock上面（即IDOM落在循环外面）
-
-        这时其实还是线性的，那么我们递归找IDOM（ExitingBlock）要值即可
-
-     2. 循环有多个ExitingBlock，但UserBlock仅仅出现在某个ExitingBlock下游：
-
-        同样沿着IDOM就会落在该ExitingBlock下面，同1（IDOM落在循环外面）
-
-     3. 循环有多个ExitingBlock，且UserBlock落在ExitingBlock的汇合处：
-
-        **（IDOM落在循环里面）（理解：同时支配ExitingBlock的地方只能是在循环内部）**
-
-        同样我们递归，朝这多个ExitingBlock要值
-
-- 图解：
-
-  优化前：存在一个在循环内部定义，但是在循环外部被使用的变量
-
-  那我们就说这样的变量是跨越循环边界的数据流
-
-  ```mermaid
-  graph TD
-      %% 定义节点样式类，保持清晰度
-      classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
-      classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-  
-      %% 外部节点
-      PreHeader[PreHeader]
-  
-      %% 循环内部结构
-      subgraph Loop
-          direction TB
-          Header[Header]
-          %% 在 Body 节点中明确标注文本内容
-          Body["Body<br/>define: val"]
-          Latch[Latch]
-      end
-  
-      %% 控制流
-      PreHeader --> Header
-      Header --> Body
-      Body --> Latch
-      Latch --> Header
-  
-      %% 外部节点
-      %% 在 Exiting Block 节点中明确标注文本内容
-      ExitingBlock["Exiting Block<br/>Use: val"]
-  
-      %% 指向退出块的连线
-      %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
-      Body --> ExitingBlock
-  
-      %% 应用样式类
-      class Header,Body,Latch loopBlock;
-      class ExitingBlock exitBlock;
-  ```
-
-  优化后：
-
-  那我们引入这种只有一个输入值的Phi，外面的Use都只能使用这个Phi，不能使用里面的原变量
-
-  ```mermaid
-  graph TD
-      %% 定义节点样式类，保持清晰度
-      classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
-      classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
-  
-      %% 外部节点
-      PreHeader[PreHeader]
-  
-      %% 循环内部结构
-      subgraph Loop
-          direction TB
-          Header[Header]
-          %% 在 Body 节点中明确标注文本内容
-          Body["Body<br/>define: val"]
-          Latch[Latch]
-      end
-  
-      %% 控制流
-      PreHeader --> Header
-      Header --> Body
-      Body --> Latch
-      Latch --> Header
-  
-      %% 外部节点
-      %% 在 Exiting Block 节点中明确标注文本内容
-      ExitingBlock["Exiting Block<br/>%val.lcssa = phi i32 [ %val, %Body ]<br/>Use：val.lcssa"]
-  
-      %% 指向退出块的连线
-      %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
-      Body --> ExitingBlock
-  
-      %% 应用样式类
-      class Header,Body,Latch loopBlock;
-      class ExitingBlock exitBlock;
-  ```
 
 ##### LoopRotate循环旋转
 
@@ -2843,7 +2692,87 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       class PH,L,DE newBlock;
   ```
 
+##### LCSSA循环封闭的SSA形式
 
+循环定义的值只能在循环内部使用，外部只能使用其LCSSA形式的PHI函数
+
+执行前：
+
+```mermaid
+graph TD
+    %% 定义节点样式类，保持清晰度
+    classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
+
+    %% 外部节点
+    PreHeader[PreHeader]
+
+    %% 循环内部结构
+    subgraph Loop
+        direction TB
+        Header[Header]
+        %% 在 Body 节点中明确标注文本内容
+        Body["Body<br/>define: val"]
+        Latch[Latch]
+    end
+
+    %% 控制流
+    PreHeader --> Header
+    Header --> Body
+    Body --> Latch
+    Latch --> Header
+
+    %% 外部节点
+    %% 在 Exiting Block 节点中明确标注文本内容
+    ExitingBlock["Exit Block<br/>Use: val"]
+
+    %% 指向退出块的连线
+    %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
+    Body --> ExitingBlock
+
+    %% 应用样式类
+    class Header,Body,Latch loopBlock;
+    class ExitingBlock exitBlock;
+```
+
+执行后
+
+```mermaid
+graph TD
+    %% 定义节点样式类，保持清晰度
+    classDef loopBlock fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef exitBlock fill:#fce4ec,stroke:#880e4f,stroke-width:2px;
+
+    %% 外部节点
+    PreHeader[PreHeader]
+
+    %% 循环内部结构
+    subgraph Loop
+        direction TB
+        Header[Header]
+        %% 在 Body 节点中明确标注文本内容
+        Body["Body<br/>define: val"]
+        Latch[Latch]
+    end
+
+    %% 控制流
+    PreHeader --> Header
+    Header --> Body
+    Body --> Latch
+    Latch --> Header
+
+    %% 外部节点
+    %% 在 Exiting Block 节点中明确标注文本内容
+    ExitingBlock["Exit Block<br/>%val.lcssa = phi i32 [ %val, %Body ]<br/>Use：val.lcssa"]
+
+    %% 指向退出块的连线
+    %% 捕捉草图中从 Body 到 Exiting Block 的直接连接
+    Body --> ExitingBlock
+
+    %% 应用样式类
+    class Header,Body,Latch loopBlock;
+    class ExitingBlock exitBlock;
+```
 
 
 
