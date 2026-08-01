@@ -3,9 +3,7 @@
 #include "lib/CFG.hpp"
 #include <vector>
 
-//DominatorTree提供范围查询所需的支配上下文
 class DominatorTree;
-//RangeInfo提供整数索引在指定基本块处的值域
 class RangeInfo;
 
 //沿GEP与同形bitcast链证明指针始终位于已知对象边界内
