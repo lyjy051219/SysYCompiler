@@ -1864,7 +1864,7 @@ graph TD
 
 ##### Local&Global策略：
 
-将极小变量提升到局部，变成寄存器变量，将极大变量提升为全局变量防止栈溢出
+将极小变量提升到局部，变成寄存器变量，
 
 
 
@@ -2912,11 +2912,11 @@ GVN-PRE前置Pass，放置在LoopSimplify之前
       class PH,L,DE newBlock;
   ```
 
-#### 清理类Pass
+
 
 ##### Local2Global
 
-将非递归main函数中局部Alloca分配的大数组提升为全局变量
+将非递归main函数中局部Alloca分配的大数组提升为全局变量，防止栈溢出
 
 阈值选取1024：大于1024字节的数组会被提升
 
@@ -2954,6 +2954,12 @@ entry:
   ; memcpy 已删除
 }
 ```
+
+##### DeadGlobalCleanup死全局消除
+
+只用在中端快结束的位置，用于轻量级优化，比StoreOnlyGlobalElimination更加轻量，功能更弱
+
+功能：删除只存在store无其他Use的global和store，删除无Use的global，只处理标量，不处理数组
 
 
 
@@ -4597,100 +4603,7 @@ LoopAccess在LoopDependence的单次访存节点之上，把循环的完整迭�
   - 函数必须确定、纯、标量且无计时边界；任何内存、指针或未定义语义都会拒绝
   - 新增全局状态和CFG后，模块及函数分析均需失效
 
-##### LateDeadGlobalCleanup
 
-在流水线末尾用廉价的Use形状检查删除“只被直接写入”的标量全局，并清扫所有已经没有Use的全局对象。
-
-依赖AnalysisPass：无。
-
-- 变换流程：
-
-  1. 对仍有Use的标量全局，要求每个Use都是以该全局本身作为地址的直接Store；只要存在Load、GEP、Call或地址逃逸就不是候选。
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         store 2, @g
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       entry:
-         ret 0
-       ; 两条Use都是以@g为地址的直接Store，因此Store和@g均被删除。
-     ```
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         %x = load @g
-         ret %x
-     ```
-
-     After（候选被拒绝，保持原IR）：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store 1, @g
-         %x = load @g
-         ret %x
-     ```
-
-     Load使`@g`不是纯写候选。
-
-  2. 先删除所有已证明不可观察的Store，使它们对全局量的Use消失。
-
-     Before：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         store %a, @g
-         store %b, @g
-         ret 0
-     ```
-
-     After（第2步）：
-
-     ```llvm
-       @g = global i32 0
-       entry:
-         ret 0
-       ; 删除直接Store后，@g已经没有IR Use。
-     ```
-
-  3. 再遍历全局表，删除原本就无Use、或刚被上一步清空Use的全局对象。
-
-     Before：
-
-     ```llvm
-       @unused.scalar = global i32 0
-       @unused.array = global [4 x i32] zeroinitializer
-       entry:
-         ret 0
-     ```
-
-     After：
-
-     ```llvm
-       entry:
-         ret 0
-       ; 两个无Use全局均从模块全局表移除。
-     ```
-
-- 保守边界：
-
-  - 纯写判定只处理标量和直接Store地址，是StoreOnlyGlobalElimination之后的低成本收尾
-  - 数组、派生地址或任何非Store Use不会做深入证明
 
 #### SSA、标量表达式与地址规范化
 
