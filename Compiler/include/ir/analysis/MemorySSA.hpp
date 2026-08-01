@@ -55,12 +55,12 @@ private:
     BasicBlock *Block = nullptr;
     //对应的IR指令
     Instruction *Inst = nullptr;
-    //该节点之前的内存状态
+    //该节点之前的内存状态，反向边
     MemoryAccess *DefiningAccess = nullptr;
     //Phi节点主要使用：(PredBB1, PredBB1ExitMemory)记录每个可达前驱的出口内存状态；
     //入口块有回边时用(nullptr, LiveOnEntry)表示函数调用前的虚拟入口边
     std::vector<std::pair<BasicBlock *, MemoryAccess *>> IncomingAccesses;
-    //反向使用边供正向MemorySSA walker使用
+    //正向使用边：某个内存状态 → 后续使用该状态的节点
     std::vector<MemoryAccess *> Users;
 };
 
@@ -128,16 +128,16 @@ public:
         FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
 
-    //查询接口3：从ToState反向遍历到From执行后的内存边界；ToState若为Def也要
-    //检查该定义。任一路径无法到达边界、遇到环或预算耗尽时保守返回true
+    //查询接口3：从ToState反向遍历到From执行后的内存边界，查询是否有可能修改的位置
+    //本质：遍历MemorySSA内存状态图,主要是LocalAggressiveSimplify使用
     bool hasClobberBetween(
         Instruction *From, MemoryAccess *ToState,
         const MemoryLocation &Location, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM,
         std::size_t MaxVisitedAccesses = 256) const;
 
-    //查询接口4：检查循环中除Ignore外是否存在对Location的写，CheckReads为true
-    //时也检查读；预算耗尽保守视作存在干扰
+    //查询接口4：检查循环中其他指令是否会修改Ignore指定的内存位置
+    //主要是LICM使用，如果是NoModRef/Ref就可以外提load
     bool hasInterferingAccessInLoop(
         const MemoryLocation &Location, const Loop &L,
         Instruction *Ignore, bool CheckReads, BasicAAResult &AA,
@@ -151,6 +151,13 @@ public:
         std::size_t MaxVisitedAccesses = 256) const;
 
     //查询接口6：沿CFG证明候选Store的每条后继路径都在首次读取前被完整覆盖
+    //主要用于DSE
+    /*
+    store 1, p       // Candidate，可以删除
+    store 2, p       // Killer，完整覆盖
+    load p           // 只能读到2
+    */
+    //本质：按照CFG完整遍历，MemorySSA图只是检查是否该路径存在Store节点
     bool isStoreOverwrittenOnAllPaths(
         StoreInst *Store, BasicAAResult &AA, const LoopInfo &LI,
         FunctionAnalysisPassManager &FAM,

@@ -956,11 +956,12 @@ graph TD
 - 内存状态图：
 
   1. 每个函数入口对应一个LiveOnEntry
-  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（PrunedPHI，和mem2reg算法差不多一样）
-  3. 每个store/call产生一个新内存状态
-  4. 每个load使用当前内存状态，**但不产生新状态**
+  2. 只在可达MemoryDef所在块的迭代支配边界MemoryPhi（和mem2reg算法差不多一样）
+  3. 每个store/可能写内存的call产生一个新内存状态
+  4. 每个load/只读call使用当前内存状态，**但不产生新状态,下一个节点还是挂载到当前内存状态（上一个节点产生的状态）**
+  5. 纯调用（NoModRef）不创建MemoryAccess节点
 
-![ChatGPT Image 2026年7月29日 23_06_36](assets/ChatGPT Image 2026年7月29日 23_06_36.png)
+![MemorySSA（含Call分类）](assets/analysis-memoryssa-calls.png)
 
 参考资料：https://zhuanlan.zhihu.com/p/715818784
 
@@ -1774,30 +1775,6 @@ graph TD
   4. 修改前驱块的条件分支，变成无条件分支，指向后继块，删除当前块，如果有else块一并删除
 
 
-
-##### Global2Local
-
-将全局变量Local到Main函数，从而在Mem2Reg可以将其提升为寄存器变量
-
-- 算法流程：
-
-  1. Local地点：Main，RISCV阈值32 size_t
-
-  2. 遍历模块中所有全局变量：
-
-     如果没人使用它，跳过
-
-     如果这个全局变量大于阈值，跳过
-
-     遍历使用该全局变量的所有指令，获取该指令所在函数，如果User不是当前函数，并且当前函数可以调用到所在函数，不进行优化，如果User是当前函数并且没有被当作参数传递给了Memcpy，才可以进行优化
-
-     创建Alloca指令，将当前函数内所有用到该全局变量的地方全部替换成Alloca，插入到当前函数入口块PHI后面
-
-     初始化：分为数组类型和标量类型进行初始化
-
-##### Local&Global策略：
-
-将极小变量提升到局部，变成寄存器变量，
 
 
 
@@ -2774,6 +2751,15 @@ graph TD
     class ExitingBlock exitBlock;
 ```
 
+##### Global2Local
+
+将全局变量Local到非递归Main函数的Alloca，从而在Mem2Reg可以将其提升为寄存器变量
+
+阈值选取32字节：<=32字节的全局变量会被处理
+
+- 算法流程：
+
+  1. 
 
 
 ##### Local2Global

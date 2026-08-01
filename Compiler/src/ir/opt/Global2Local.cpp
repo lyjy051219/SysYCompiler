@@ -7,9 +7,7 @@
 #include "lib/TypeSystem.hpp"
 #include <algorithm>
 #include <utility>
-//构造Pass并记录是否允许受限标量直接访存。
-Global2LocalPass::Global2LocalPass(bool RelaxScalarUses)
-	: RelaxScalarUses(RelaxScalarUses) {}
+Global2LocalPass::Global2LocalPass(bool RelaxScalarUses): RelaxScalarUses(RelaxScalarUses) {}
 //检查标量全局在main中的use是否为安全的直接load或store地址。
 bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	//2.1 标量全局只允许作为直接 load/store 地址，不能把地址本身存出或参与其他运算。
@@ -24,30 +22,29 @@ bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	}
 	return false;
 }
-//在非递归main入口把安全小型全局转换为局部alloca并恢复初始化。
 PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-	//1.该函数 pass 仅在活动模块的 main 上执行，并先用直接调用图排除递归重入。
 	Module *M = Module::getActiveModule();
 	if (!M) return PreservationStatus::all();
 	Function *Main = M->getMainFunction();
 	if (!Main || Main != &F || !Main->front()) return PreservationStatus::all();
 	auto CallGraph = M->buildDirectCallGraph();
+    //递归main不处理
 	if (Module::isFunctionRecursive(Main, CallGraph))
 		return PreservationStatus::all();
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
-	auto ReachableFromMain =
-		Module::collectReachableFunctions(Main, CallGraph);
+    //收集main函数可达的所有函数
+	auto ReachableFromMain = Module::collectReachableFunctions(Main, CallGraph);
 	std::vector<Global2LocalCandidateInfo> WorkList;
-	//2.扫描小型可变全局：main 可达的其他函数不得引用候选；数组地址不得进入
-	//memcpy；标量 use 必须通过直接访问检查并遵守保守/宽松模式的循环限制。
+	//1.遍历所有全局变量
 	for (auto &GVPtr : M->getGlobalVar()) {
 		auto *GV = GVPtr.get();
 		if (!GV) continue;
+        //只处理全局变量，不处理全局常量
 		if (GV->vartag != Variable::GlobalVariable) continue;
 		if (!GV->hasUses()) continue;
 		auto ElemTy = IRType::getPointeeType(GV->getIRType());
 		if (!ElemTy) continue;
-		if (ElemTy->getSize() > RISCVThreshold) continue;
+		if (ElemTy->getSize() > Threshold) continue;
 		const bool IsArray = ElemTy->isArray();
 		bool CanPromote = true;
 		std::vector<Use *> MainUses;
@@ -55,12 +52,14 @@ PreservationStatus Global2LocalPass::run(Function &F, FunctionAnalysisPassManage
 		bool ScalarHasLoopMemUse = false;
 		bool ScalarAllUsesInEntry = true;
 		BasicBlock *MainEntry = Main->front();
+        //逐个分析全局变量的Use
 		for (Use *U : GV->getUses()) {
 			Function *UF = Instruction::getUserFunction(U);
 			if (!UF) {
 				CanPromote = false;
 				break;
 			}
+            //只要 main 可达的其他函数直接引用该全局变量，就拒绝转换
 			if (UF != Main) {
 				if (ReachableFromMain.count(UF)) {
 					CanPromote = false;
