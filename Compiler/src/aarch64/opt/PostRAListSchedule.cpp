@@ -12,8 +12,24 @@
 #include <vector>
 
 namespace aarch64 {
+// Post-RA List Scheduling pass 的公共实现。
+//
+// 作用：在寄存器分配之后，对每个基本块内部按依赖与指令延迟重排指令，尽量让长
+// 延迟指令（乘除、访存、浮点、调用）的结果在被使用前有时间就绪，从而隐藏流水线
+// 延迟、缩短块的完成周期。调度以一个简单的按周期推进的表调度启发式进行：把块按
+// barrier（终结指令、调用、内联 memcpy/memset、有副作用的非 store）切成若干段，
+// 段内构建依赖图（寄存器数据依赖、写后写/读后写的顺序依赖、访存顺序依赖），按
+// “关键路径优先级”择就绪指令发射。只有当重排后模拟出的完成周期严格更短时才采用。
+//
+// 流水线位置：寄存器分配之后（Post-RA），因此按物理寄存器建立依赖，调用会污染
+// caller-saved 寄存器。只重排块内指令顺序，不改变指令本身，语义保持等价。
+//
+// RISC-V 与 ARM64 两后端使用相同实现
+// 两后端各保留一份相同实现。
+
 namespace {
 
+// 依赖跟踪用的寄存器键：物理寄存器按 phys 区分，虚拟寄存器按 id 区分。
 struct RegKey {
   bool physical = false;
   uint32_t id = 0;
@@ -35,6 +51,7 @@ bool operator==(const RegKey &lhs, const RegKey &rhs) {
          lhs.phys == rhs.phys;
 }
 
+// 由机器寄存器构造 RegKey。
 RegKey makeRegKey(const MachineReg &reg) {
   if (reg.physical) {
     return RegKey{true, 0, reg.phys};
@@ -44,10 +61,12 @@ RegKey makeRegKey(const MachineReg &reg) {
 
 RegKey makeRegKey(PhysReg reg) { return RegKey{true, 0, reg}; }
 
+// 是否是零寄存器 x0。x0 恒为零、写入无效，因此在依赖跟踪中忽略，避免制造伪依赖。
 bool isZeroRegister(const RegKey &reg) {
   return reg.physical && reg.phys == PhysReg::X0;
 }
 
+// 以下三个谓词区分 load / store / 终结指令的操作码。
 bool isLoadOpcode(Opcode opcode) {
   return opcode == Opcode::LBU || opcode == Opcode::LW ||
          opcode == Opcode::LD || opcode == Opcode::FLW;
@@ -74,6 +93,8 @@ bool isTerminatorOpcode(Opcode opcode) {
   }
 }
 
+// 是否是调度屏障：终结指令、调用、内联 memcpy/memset，或有副作用的非 store 指令。
+// 屏障把块切分为独立调度段，其两侧指令不可互相跨越重排。
 bool isBarrierInstruction(const MachineInstr &instr) {
   if (instr.terminator || isTerminatorOpcode(instr.opcode)) {
     return true;
@@ -85,6 +106,8 @@ bool isBarrierInstruction(const MachineInstr &instr) {
   return instr.sideEffects && !isStoreOpcode(instr.opcode);
 }
 
+// 是否参与内存顺序：load/store、调用、内联 memcpy/memset、有副作用的非 store。
+// 这类指令之间保持原相对顺序（通过内存顺序依赖边），以免破坏访存语义。
 bool isMemoryOrderInstruction(const MachineInstr &instr) {
   return isLoadOpcode(instr.opcode) || isStoreOpcode(instr.opcode) ||
          instr.opcode == Opcode::CALL || instr.opcode == Opcode::MEMCPY_INLINE ||
@@ -92,6 +115,7 @@ bool isMemoryOrderInstruction(const MachineInstr &instr) {
          (instr.sideEffects && !isStoreOpcode(instr.opcode));
 }
 
+// 各操作码的近似执行延迟（周期数），是调度关键路径与就绪时间估算的基础。
 uint32_t opcodeLatency(Opcode opcode) {
   switch (opcode) {
   case Opcode::NOP:
@@ -184,6 +208,8 @@ uint32_t opcodeLatency(Opcode opcode) {
   return 1;
 }
 
+// 从操作数容器收集去重后的寄存器键（忽略无效寄存器与 x0）。模板同时支持
+// MachineOperand 列表与 PhysReg 列表（隐式操作数）两种形态。
 template <typename ContainerT>
 std::vector<RegKey> collectRegKeys(const ContainerT &operands) {
   std::vector<RegKey> result;
@@ -209,6 +235,8 @@ std::vector<RegKey> collectRegKeys(const ContainerT &operands) {
   return result;
 }
 
+// 一条指令预先算好的调度属性：延迟、是否访存、是否屏障，以及去重合并了显式与
+// 隐式操作数后的 use/def 寄存器集合。
 struct InstructionInfo {
   uint32_t latency = 0;
   bool memoryOp = false;
@@ -217,6 +245,7 @@ struct InstructionInfo {
   std::vector<RegKey> defs;
 };
 
+// 为块内每条指令构建 InstructionInfo（合并显式与隐式操作数并去重）。
 std::vector<InstructionInfo>
 buildInstructionInfo(const std::vector<MachineInstr> &instrs) {
   std::vector<InstructionInfo> info;
@@ -243,6 +272,8 @@ buildInstructionInfo(const std::vector<MachineInstr> &instrs) {
   return info;
 }
 
+// 调度模拟的状态：每个寄存器的就绪周期、内存就绪周期、当前发射周期、以及整段
+// 的最终完成周期（用于比较不同顺序的优劣）。
 struct ScheduleState {
   std::map<RegKey, uint64_t> regReady;
   uint64_t memoryReady = 0;
@@ -250,6 +281,7 @@ struct ScheduleState {
   uint64_t finish = 0;
 };
 
+// 取寄存器 reg 的就绪周期（未记录则为 0）。
 uint64_t readyTimeForReg(const ScheduleState &state, const RegKey &reg) {
   auto it = state.regReady.find(reg);
   if (it == state.regReady.end()) {
@@ -258,12 +290,15 @@ uint64_t readyTimeForReg(const ScheduleState &state, const RegKey &reg) {
   return it->second;
 }
 
+// 设置寄存器就绪周期（x0 忽略）。
 void setRegReady(ScheduleState &state, const RegKey &reg, uint64_t readyTime) {
   if (!isZeroRegister(reg)) {
     state.regReady[reg] = readyTime;
   }
 }
 
+// 调用会破坏所有 caller-saved 寄存器：把它们的就绪周期推到调用完成周期，模拟其
+// 值在调用后才可用（防止把依赖这些寄存器的指令错误地提前到调用之前之后重排）。
 void clobberCallerSavedRegs(ScheduleState &state, uint64_t readyTime) {
   for (PhysReg reg : callerSavedRegs(RegClass::GPR64)) {
     setRegReady(state, makeRegKey(reg), readyTime);
@@ -273,6 +308,9 @@ void clobberCallerSavedRegs(ScheduleState &state, uint64_t readyTime) {
   }
 }
 
+// 模拟发射一条指令：发射周期取当前周期与所有 use 就绪周期（访存还要等内存就绪）
+// 的最大值；完成周期为发射周期加延迟。更新当前周期、整段完成周期、各 def 与内存
+// 的就绪周期；若是调用则污染 caller-saved 寄存器。返回该指令的完成周期。
 uint64_t issueInstruction(const MachineInstr &instr, const InstructionInfo &info,
                           ScheduleState &state) {
   uint64_t issue = state.cycle;
@@ -299,6 +337,9 @@ uint64_t issueInstruction(const MachineInstr &instr, const InstructionInfo &info
   return completion;
 }
 
+// 段内依赖图的一个结点。completionSuccs 是数据依赖后继（需等前驱完成周期），
+// orderSuccs 是顺序依赖后继（写后写、读后写、访存顺序，只需前驱已发射）；
+// indegree 供拓扑就绪判定；releaseTime 是外部（跨段状态）施加的最早可发射周期。
 struct SegmentNode {
   size_t originalIndex = 0;
   uint64_t releaseTime = 0;
@@ -311,6 +352,7 @@ struct SegmentNode {
   bool memoryOp = false;
 };
 
+// 添加一条数据依赖边（真依赖，后继需等前驱完成周期），去重并递增后继入度。
 void addCompletionEdge(std::vector<SegmentNode> &nodes, size_t from, size_t to) {
   auto &succs = nodes[from].completionSuccs;
   if (std::find(succs.begin(), succs.end(), to) == succs.end()) {
@@ -319,6 +361,8 @@ void addCompletionEdge(std::vector<SegmentNode> &nodes, size_t from, size_t to) 
   }
 }
 
+// 添加一条顺序依赖边（反依赖/输出依赖/访存顺序，后继只需前驱已发射即可），去重
+// 并递增后继入度。
 void addOrderEdge(std::vector<SegmentNode> &nodes, size_t from, size_t to) {
   auto &succs = nodes[from].orderSuccs;
   if (std::find(succs.begin(), succs.end(), to) == succs.end()) {
@@ -327,6 +371,8 @@ void addOrderEdge(std::vector<SegmentNode> &nodes, size_t from, size_t to) {
   }
 }
 
+// 就绪结点间的择优比较：优先级（关键路径长度）高者优先，相等时按原始下标靠前者
+// 优先，保证调度确定性且尽量不打乱原顺序。
 bool moreImportantNode(size_t lhs, size_t rhs,
                        const std::vector<SegmentNode> &nodes,
                        const std::vector<uint64_t> &priorities) {
@@ -336,6 +382,8 @@ bool moreImportantNode(size_t lhs, size_t rhs,
   return nodes[lhs].originalIndex < nodes[rhs].originalIndex;
 }
 
+// 结点的调度优先级 = 自身延迟 + 所有后继优先级的最大值，即从该结点到段尾的关键
+// 路径长度。逆拓扑（按下标从后往前）一次算出，供列表调度择优。
 uint64_t maxPrioritySuccessor(const std::vector<SegmentNode> &nodes,
                              const std::vector<uint64_t> &priorities,
                              size_t index) {
@@ -349,6 +397,13 @@ uint64_t maxPrioritySuccessor(const std::vector<SegmentNode> &nodes,
   return nodes[index].latency + best;
 }
 
+// 对一个非屏障指令段做表调度并返回新的指令下标顺序。
+// 第一步建立依赖图：真依赖（use 依赖段内最近一次 def）连数据边；写后写、读后写
+// 连顺序边；访存指令串成一条内存顺序链；段外已有的 def 通过 releaseTime 施加最早
+// 发射约束。第二步逆拓扑算每个结点的关键路径优先级。第三步按周期推进做列表调度：
+// 在入度为 0 且已到 releaseTime 的就绪结点里，用 moreImportantNode 择优发射，无就绪
+// 结点则把当前周期快进到下一个 releaseTime；发射后更新后继的入度与 releaseTime
+// （数据后继等完成周期、顺序后继等发射周期）。检测到环则抛异常。
 std::vector<size_t>
 scheduleSegment(const std::vector<MachineInstr> &instrs,
                 const std::vector<InstructionInfo> &infos,
@@ -397,12 +452,12 @@ scheduleSegment(const std::vector<MachineInstr> &instrs,
     for (const RegKey &def : node.defs) {
       auto defFound = lastDef.find(def);
       if (defFound != lastDef.end()) {
-        addOrderEdge(nodes, defFound->second, localIndex);
+        addOrderEdge(nodes, defFound->second, localIndex);  // 写后写：保持顺序
       }
       auto useFound = openUses.find(def);
       if (useFound != openUses.end()) {
         for (size_t useIndex : useFound->second) {
-          addOrderEdge(nodes, useIndex, localIndex);
+          addOrderEdge(nodes, useIndex, localIndex);  // 读后写：读必须先于覆写
         }
         useFound->second.clear();
       }
@@ -477,6 +532,7 @@ scheduleSegment(const std::vector<MachineInstr> &instrs,
   return order;
 }
 
+// 按给定顺序整段模拟一遍，返回完成周期。用于评估原始顺序与候选顺序的优劣。
 uint64_t simulateOrder(const std::vector<MachineInstr> &instrs,
                        const std::vector<InstructionInfo> &infos,
                        const std::vector<size_t> &order) {
@@ -487,6 +543,7 @@ uint64_t simulateOrder(const std::vector<MachineInstr> &instrs,
   return state.finish;
 }
 
+// 生成恒等顺序 0,1,2,...（原始指令顺序）。
 std::vector<size_t> identityOrder(const std::vector<MachineInstr> &instrs) {
   std::vector<size_t> order(instrs.size());
   for (size_t i = 0; i < instrs.size(); ++i) {
@@ -495,10 +552,14 @@ std::vector<size_t> identityOrder(const std::vector<MachineInstr> &instrs) {
   return order;
 }
 
+// 两个顺序是否相同。
 bool sameOrder(const std::vector<size_t> &lhs, const std::vector<size_t> &rhs) {
   return lhs == rhs;
 }
 
+// 构造整块的候选调度顺序：顺序扫描，遇非屏障指令累积成段，遇屏障时先调度已累积
+// 的段再放入屏障本身；一旦发射了终结指令，其后的指令原样附加不再调度。返回全块
+// 的候选下标顺序，并在 state 中留下候选顺序的完成周期。
 std::vector<size_t> buildCandidateOrder(const std::vector<MachineInstr> &instrs,
                                         const std::vector<InstructionInfo> &infos,
                                         ScheduleState &state) {
@@ -542,6 +603,8 @@ std::vector<size_t> buildCandidateOrder(const std::vector<MachineInstr> &instrs,
   return order;
 }
 
+// 快速预判该块是否值得调度：只要存在某个长度不小于 2 的非屏障段，且段内含访存或
+// 延迟大于 1 的指令，就有隐藏延迟的空间。全是单周期短指令则调度无收益，跳过。
 bool blockHasUsefulSchedulingOpportunity(
     const std::vector<InstructionInfo> &infos) {
   std::vector<size_t> segment;
@@ -573,6 +636,9 @@ bool blockHasUsefulSchedulingOpportunity(
 
 } // namespace
 
+// pass 入口：对每个非零频率、指令数不少于 2 的块，若有调度价值则生成候选顺序，
+// 与原始顺序模拟比较完成周期，仅当候选严格更短时才真正按候选顺序重排块内指令。
+// 返回是否修改了函数。频率数据与块数不匹配视为错误。
 bool runPostRAListSchedule(MachineFunction &mf,
                            const MachineBlockFrequencyAnalysis::Result &frequencies) {
   if (frequencies.blockFrequency.size() != mf.blocks.size()) {

@@ -1,3 +1,18 @@
+// peepholeOpt.cpp - RISC-V MIR 层的窥孔优化与本地(块内)清理 pass 集合。
+//
+// 本文件实现若干在寄存器分配前后运行的机器级优化,均以基本块为作用域:
+//   - 比较+分支折叠:把 SLT/XOR/XORI 产生布尔再 BNEZ/BEQZ 的两三条指令折叠成
+//     一条带条件的分支(BLT/BGE/BEQ/BNE 等),需满足布尔值只此一处使用;
+//   - 全局地址复用:把同一全局的多次 LA 提到入口块共享一个寄存器;
+//   - 地址合并:把 ADDI/ADD 形成的“基址+常量”重定位到共同 pivot,缩短访存偏移;
+//   - 拷贝传播:顺着 COPY/F_COPY 把使用改写到源寄存器;
+//   - 本地 CSE:块内消除重复的纯运算与 load,带完善的 invalidation 逻辑;
+//   - RA 后窥孔:删冗余拷贝/加零/NOP,做零元恒等式折叠。
+//
+// 正确性关键点:改写只在“单次定义/单次使用、且不跨块”等前提下进行;CSE 对
+// store/call/副作用指令按内存与寄存器依赖精确失效;地址合并用版本号跟踪基址
+// 是否被重定义。相关判定见各辅助函数注释。SSA 特性在 RA 前成立,RA 后不成立,
+// 故拷贝传播/CSE 只在 RA 前运行,纯清理类在 RA 后运行。
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include <algorithm>
@@ -10,37 +25,45 @@
 namespace riscv {
 namespace {
 
+// 两个机器寄存器是否完全相同(物理标志、虚拟 id、寄存器类、物理编号全一致)。
 bool sameRegister(const MachineReg &lhs, const MachineReg &rhs) {
   return lhs.physical == rhs.physical && lhs.id == rhs.id && lhs.rc == rhs.rc &&
          lhs.phys == rhs.phys;
 }
 
+// 指令恰有一个寄存器定义和一个寄存器使用(典型的拷贝形态)。
 bool hasSingleRegDefUse(const MachineInstr &instr) {
   return instr.defs.size() == 1 && instr.uses.size() == 1 &&
          instr.defs.front().kind == OperandKind::Reg &&
          instr.uses.front().kind == OperandKind::Reg;
 }
 
+// 指令恰有一个寄存器定义。
 bool hasSingleRegDef(const MachineInstr &instr) {
   return instr.defs.size() == 1 && instr.defs.front().kind == OperandKind::Reg;
 }
 
+// 第 index 个使用是否为寄存器操作数。
 bool isRegUse(const MachineInstr &instr, std::size_t index) {
   return index < instr.uses.size() &&
          instr.uses[index].kind == OperandKind::Reg;
 }
 
+// 操作数是否为零寄存器 x0(物理寄存器且编号为 X0)。
 bool isZeroReg(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && operand.regValue.physical &&
          operand.regValue.phys == PhysReg::X0;
 }
 
+// 指令是否可安全改写:无副作用、非终结、无隐式定义/使用,且只有单个寄存器定义。
+// 这些前提保证把它替换成拷贝不会丢失额外的效果或改变控制流。
 bool isSafeToRewrite(const MachineInstr &instr) {
   return !instr.sideEffects && !instr.terminator &&
          instr.implicitDefs.empty() && instr.implicitUses.empty() &&
          hasSingleRegDef(instr);
 }
 
+// 用给定源操作数构造一条 COPY 指令,沿用原指令的定义与注释(用于零元恒等折叠)。
 MachineInstr makeCopyFrom(const MachineInstr &instr,
                           MachineOperand sourceOperand) {
   MachineInstr copy;
@@ -51,11 +74,13 @@ MachineInstr makeCopyFrom(const MachineInstr &instr,
   return copy;
 }
 
+// 构造与定义寄存器同类的零寄存器操作数(用于结果恒为 0 的折叠,如 x AND 0)。
 MachineOperand zeroForDef(const MachineInstr &instr) {
   return MachineOperand::reg(
       MachineReg::preg(PhysReg::X0, instr.defs.front().regValue.rc));
 }
 
+// 是否是自拷贝(COPY/F_COPY/PARALLEL_COPY 且源与目标同寄存器),可整条删除。
 bool isRedundantCopy(const MachineInstr &instr) {
   if (instr.sideEffects || instr.terminator) {
     return false;
@@ -68,6 +93,8 @@ bool isRedundantCopy(const MachineInstr &instr) {
          sameRegister(instr.defs.front().regValue, instr.uses.front().regValue);
 }
 
+// 折叠“加/移位立即数 0”为拷贝:形如 ADDI/ADDIW/ORI/XORI/各移位立即数 rd, rs, 0
+// 等价于 rd = rs,改写成 COPY。仅在可安全改写、且第二操作数是立即 0 时成立。
 bool foldAddImmediateZero(const MachineInstr &instr, MachineInstr &folded) {
   if (!isSafeToRewrite(instr) ||
       (instr.opcode != Opcode::ADDI && instr.opcode != Opcode::ADDIW &&
@@ -83,6 +110,11 @@ bool foldAddImmediateZero(const MachineInstr &instr, MachineInstr &folded) {
   return true;
 }
 
+// 折叠含零寄存器的二元恒等式:
+//   ADD/OR/XOR 有一操作数为 x0,结果等于另一操作数,折成拷贝;
+//   SUB/移位 的第二操作数为 x0(减零/移零位)也折成拷贝其第一操作数;
+//   AND 任一操作数为 x0,结果恒 0;MUL 任一操作数为 x0,结果恒 0;
+//   移位 的第一操作数(被移位值)为 x0,结果恒 0。
 bool foldBinaryZeroIdentity(const MachineInstr &instr, MachineInstr &folded) {
   if (!isSafeToRewrite(instr) || instr.uses.size() != 2 ||
       !isRegUse(instr, 0) || !isRegUse(instr, 1)) {
@@ -137,6 +169,8 @@ bool foldBinaryZeroIdentity(const MachineInstr &instr, MachineInstr &folded) {
   return false;
 }
 
+// 折叠两操作数为同一寄存器的运算:AND/OR x,x = x(折成拷贝);
+// SUB/XOR/SLT/SLTU x,x = 0(折成拷贝零寄存器)。
 bool foldSameOperand(const MachineInstr &instr, MachineInstr &folded) {
   if (!isSafeToRewrite(instr) || instr.uses.size() != 2 ||
       !isRegUse(instr, 0) || !isRegUse(instr, 1) ||
@@ -161,12 +195,14 @@ bool foldSameOperand(const MachineInstr &instr, MachineInstr &folded) {
   }
 }
 
+// 零元/恒等折叠总入口:依次尝试立即数加零、含零寄存器恒等式、同操作数折叠。
 bool foldZeroIdentity(const MachineInstr &instr, MachineInstr &folded) {
   return foldAddImmediateZero(instr, folded) ||
          foldBinaryZeroIdentity(instr, folded) ||
          foldSameOperand(instr, folded);
 }
 
+// 是否是自加零(ADDI rd, rd, 0),即定义与源为同一寄存器且立即数为 0,可删除。
 bool isRedundantAddZero(const MachineInstr &instr) {
   if (instr.sideEffects || instr.terminator || instr.opcode != Opcode::ADDI) {
     return false;
@@ -180,6 +216,7 @@ bool isRedundantAddZero(const MachineInstr &instr) {
   return sameRegister(instr.defs.front().regValue, instr.uses.front().regValue);
 }
 
+// RA 后可直接删除的指令:无副作用的 NOP、自拷贝、自加零。
 bool isRemovablePostRAInstr(const MachineInstr &instr) {
   if (!instr.sideEffects && !instr.terminator && instr.opcode == Opcode::NOP) {
     return true;
@@ -187,10 +224,13 @@ bool isRemovablePostRAInstr(const MachineInstr &instr) {
   return isRedundantCopy(instr) || isRedundantAddZero(instr);
 }
 
+// 操作数是否为虚拟寄存器(未分配物理寄存器)。
 bool isVirtualRegOperand(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical;
 }
 
+// 沿拷贝传播的替换表把一个虚拟寄存器解析到其最终等价寄存器。逐级跟随直到无
+// 后继或形成自映射,防止环。只对虚拟寄存器解析(物理寄存器视为终点)。
 MachineReg
 resolveReplacement(MachineReg reg,
                    const std::map<uint32_t, MachineReg> &replacements) {
@@ -208,6 +248,7 @@ resolveReplacement(MachineReg reg,
   return reg;
 }
 
+// 按替换表把指令的各虚拟寄存器使用改写为解析后的寄存器,返回是否有改动。
 bool rewriteUseReplacements(
     MachineInstr &instr, const std::map<uint32_t, MachineReg> &replacements) {
   bool changed = false;
@@ -223,6 +264,8 @@ bool rewriteUseReplacements(
   return changed;
 }
 
+// 判断操作数能否作为 CSE 表达式的组成:虚拟寄存器或 x0、立即数、帧对象、全局
+// 符号可参与;块标签、值引用会随上下文变化,不可参与。
 bool operandAllowedForCSE(const MachineOperand &operand) {
   switch (operand.kind) {
   case OperandKind::Reg:
@@ -238,6 +281,7 @@ bool operandAllowedForCSE(const MachineOperand &operand) {
   return false;
 }
 
+// 把寄存器编码成 CSE 键的一部分(物理/虚拟前缀 + 编号 + 寄存器类)。
 std::string regKey(const MachineReg &reg) {
   if (reg.physical) {
     return "p:" + std::to_string(static_cast<int>(reg.phys)) + ":" +
@@ -247,6 +291,7 @@ std::string regKey(const MachineReg &reg) {
          std::to_string(static_cast<int>(reg.rc));
 }
 
+// 把任意操作数编码成 CSE 键片段(按种类加前缀区分)。
 std::string operandKey(const MachineOperand &operand) {
   switch (operand.kind) {
   case OperandKind::Reg:
@@ -265,6 +310,7 @@ std::string operandKey(const MachineOperand &operand) {
   return "?";
 }
 
+// 操作码是否可交换(用于 CSE 键归一:两操作数排序后再入键,识别 a+b 与 b+a)。
 bool isCommutativeOpcode(Opcode opcode) {
   switch (opcode) {
   case Opcode::ADD:
@@ -282,11 +328,14 @@ bool isCommutativeOpcode(Opcode opcode) {
   }
 }
 
+// 是否是 load 操作码(其 CSE 结果存独立表,遇 store/调用需按内存失效)。
 bool isLoadOpcode(Opcode opcode) {
   return opcode == Opcode::LBU || opcode == Opcode::LW ||
          opcode == Opcode::LD || opcode == Opcode::FLW;
 }
 
+// 该操作码是否为可参与 CSE 的纯运算(无副作用、结果仅由操作数决定)。含常量
+// 物化、算术/逻辑/移位、比较、以及 load 地址计算等;load 本身也纳入(另表管理)。
 bool isPureCSEOpcode(Opcode opcode) {
   switch (opcode) {
   case Opcode::LI:
@@ -327,6 +376,8 @@ bool isPureCSEOpcode(Opcode opcode) {
   }
 }
 
+// 指令是否是本地 CSE 候选:无副作用/终结/隐式操作数,恰一个虚拟寄存器定义,
+// 操作码是纯运算,且所有使用都允许参与 CSE。
 bool isLocalCSECandidate(const MachineInstr &instr) {
   if (instr.sideEffects || instr.terminator || instr.implicitDefs.size() != 0 ||
       instr.implicitUses.size() != 0 || instr.defs.size() != 1 ||
@@ -340,6 +391,8 @@ bool isLocalCSECandidate(const MachineInstr &instr) {
                      operandAllowedForCSE);
 }
 
+// 生成指令的 CSE 键:操作码 + 结果寄存器类 + 各使用键;可交换运算把两操作数
+// 排序后入键,使 a op b 与 b op a 得到相同键。
 std::string cseKey(const MachineInstr &instr) {
   std::vector<std::string> uses;
   uses.reserve(instr.uses.size());
@@ -359,11 +412,14 @@ std::string cseKey(const MachineInstr &instr) {
   return key;
 }
 
+// CSE 数据结构:表达式/load 结果表(键到结果寄存器)、以及双向依赖索引,
+// 用于在某寄存器被重定义时快速失效所有依赖它的表项;上限限制表规模。
 using CSETable = std::map<std::string, MachineReg>;
 using CSEKeyDependencies = std::map<std::string, std::set<std::string>>;
 using CSERegisterDependencies = std::map<std::string, std::set<std::string>>;
 constexpr std::size_t kMaxLocalCSEEntries = 64;
 
+// 依赖索引里表示一个寄存器的键(仅按物理/虚拟编号,不含寄存器类)。
 std::string cseDependencyKey(const MachineReg &reg) {
   if (reg.physical) {
     return "p:" + std::to_string(static_cast<int>(reg.phys));
@@ -371,6 +427,7 @@ std::string cseDependencyKey(const MachineReg &reg) {
   return "v:" + std::to_string(reg.id);
 }
 
+// 从所有 CSE 表结构中移除一个键:同时清掉它在寄存器依赖索引里的反向引用。
 void removeCSEKey(const std::string &key, CSETable &exprs, CSETable &loads,
                   CSEKeyDependencies &keyDependencies,
                   CSERegisterDependencies &registerDependencies) {
@@ -394,6 +451,7 @@ void removeCSEKey(const std::string &key, CSETable &exprs, CSETable &loads,
   keyDependencies.erase(keyFound);
 }
 
+// 清空全部 CSE 表(遇到调用或非 store 副作用指令时整体失效)。
 void clearCSETables(CSETable &exprs, CSETable &loads,
                     CSEKeyDependencies &keyDependencies,
                     CSERegisterDependencies &registerDependencies) {
@@ -403,11 +461,13 @@ void clearCSETables(CSETable &exprs, CSETable &loads,
   registerDependencies.clear();
 }
 
+// 是否是内存 store 操作码。store 只会改变内存,故只需失效 load 表而非表达式表。
 bool isMemoryStoreOpcode(Opcode opcode) {
   return opcode == Opcode::SB || opcode == Opcode::SW || opcode == Opcode::SD ||
          opcode == Opcode::FSW;
 }
 
+// 仅失效 load 表(store 之后 load 结果可能过期,但纯 ALU 表达式不受内存影响)。
 void clearCSELoads(CSETable &loads, CSETable &exprs,
                    CSEKeyDependencies &keyDependencies,
                    CSERegisterDependencies &registerDependencies) {
@@ -425,6 +485,7 @@ void clearCSELoads(CSETable &loads, CSETable &exprs,
   }
 }
 
+// 登记一个 CSE 键对其各寄存器使用的依赖(双向索引),供后续按寄存器失效。
 void recordCSEKey(const std::string &key, const MachineInstr &instr,
                   CSEKeyDependencies &keyDependencies,
                   CSERegisterDependencies &registerDependencies) {
@@ -439,6 +500,8 @@ void recordCSEKey(const std::string &key, const MachineInstr &instr,
   }
 }
 
+// 某寄存器被重定义时,失效所有依赖它的 CSE 表项,并从拷贝替换表里剔除以它为
+// 键或为值的映射(避免把使用改写到已失效的等价寄存器)。
 void invalidateCSERegister(const MachineReg &reg, CSETable &exprs,
                            CSETable &loads, CSEKeyDependencies &keyDependencies,
                            CSERegisterDependencies &registerDependencies,
@@ -464,6 +527,7 @@ void invalidateCSERegister(const MachineReg &reg, CSETable &exprs,
   }
 }
 
+// 对一条指令的所有定义(含隐式定义,按两种寄存器类各失效一次)执行 CSE 失效。
 void invalidateCSEDefinitions(const MachineInstr &instr, CSETable &exprs,
                               CSETable &loads,
                               CSEKeyDependencies &keyDependencies,
@@ -483,6 +547,8 @@ void invalidateCSEDefinitions(const MachineInstr &instr, CSETable &exprs,
   }
 }
 
+// 统计每个虚拟寄存器被使用到的块集合(用于判断某定义的使用是否全在同一块内,
+// 从而可安全地在块内做拷贝传播/CSE 后删除定义)。
 std::map<uint32_t, std::set<std::size_t>>
 collectUseBlocks(const MachineFunction &mf) {
   std::map<uint32_t, std::set<std::size_t>> useBlocks;
@@ -499,6 +565,7 @@ collectUseBlocks(const MachineFunction &mf) {
   return useBlocks;
 }
 
+// 某虚拟寄存器的使用是否全部落在给定块内(无使用也算满足)。
 bool allUsesInBlock(
     uint32_t regId, std::size_t blockIndex,
     const std::map<uint32_t, std::set<std::size_t>> &useBlocks) {
@@ -509,6 +576,7 @@ bool allUsesInBlock(
   return found->second.size() == 1 && found->second.count(blockIndex) != 0;
 }
 
+// 统计每个虚拟寄存器的使用次数(用于比较+分支折叠要求布尔值只此一处使用)。
 std::map<uint32_t, std::size_t>
 collectVirtualUseCounts(const MachineFunction &mf) {
   std::map<uint32_t, std::size_t> counts;
@@ -524,6 +592,7 @@ collectVirtualUseCounts(const MachineFunction &mf) {
   return counts;
 }
 
+// 统计每个虚拟寄存器的定义次数(拷贝传播要求源/目标均只有单一定义)。
 std::map<uint32_t, std::size_t>
 collectVirtualDefCounts(const MachineFunction &mf) {
   std::map<uint32_t, std::size_t> counts;
@@ -539,6 +608,7 @@ collectVirtualDefCounts(const MachineFunction &mf) {
   return counts;
 }
 
+// 该虚拟寄存器是否恰被使用一次。
 bool hasSingleVirtualUse(const MachineOperand &def,
                          const std::map<uint32_t, std::size_t> &useCounts) {
   if (!isVirtualRegOperand(def)) {
@@ -548,6 +618,7 @@ bool hasSingleVirtualUse(const MachineOperand &def,
   return found != useCounts.end() && found->second == 1;
 }
 
+// 该虚拟寄存器是否恰被定义一次(SSA 前提下拷贝传播的正确性依据)。
 bool hasSingleVirtualDef(const MachineOperand &def,
                          const std::map<uint32_t, std::size_t> &defCounts) {
   if (!isVirtualRegOperand(def)) {
@@ -557,12 +628,14 @@ bool hasSingleVirtualDef(const MachineOperand &def,
   return found != defCounts.end() && found->second == 1;
 }
 
+// 是否是对某寄存器的 BEQZ/BNEZ 条件分支(操作数为寄存器 + 目标块)。
 bool isBranchOnZeroReg(const MachineInstr &instr) {
   return (instr.opcode == Opcode::BEQZ || instr.opcode == Opcode::BNEZ) &&
          instr.uses.size() == 2 && instr.uses[0].kind == OperandKind::Reg &&
          instr.uses[1].kind == OperandKind::Block;
 }
 
+// 是否是对结果测零的 SEQZ/SNEZ(可与后续分支进一步合并)。
 bool isZeroCompare(const MachineInstr &instr) {
   return (instr.opcode == Opcode::SEQZ || instr.opcode == Opcode::SNEZ) &&
          instr.defs.size() == 1 && instr.uses.size() == 1 &&
@@ -572,6 +645,7 @@ bool isZeroCompare(const MachineInstr &instr) {
          instr.implicitUses.empty();
 }
 
+// 是否是可折进分支的比较产生者:SLT/XOR/XORI 且干净(无副作用/隐式操作数)。
 bool isFoldableCompareProducer(const MachineInstr &instr) {
   return (instr.opcode == Opcode::SLT || instr.opcode == Opcode::XOR ||
           instr.opcode == Opcode::XORI) &&
@@ -580,6 +654,7 @@ bool isFoldableCompareProducer(const MachineInstr &instr) {
          instr.implicitDefs.empty() && instr.implicitUses.empty();
 }
 
+// 是否是两个寄存器输入的 SLT/XOR 比较(可折成 BLT/BGE 或 BEQ/BNE)。
 bool isBinaryRegCompareProducer(const MachineInstr &instr) {
   return (instr.opcode == Opcode::SLT || instr.opcode == Opcode::XOR) &&
          instr.uses.size() == 2 && instr.uses[0].kind == OperandKind::Reg &&
@@ -587,6 +662,7 @@ bool isBinaryRegCompareProducer(const MachineInstr &instr) {
          isFoldableCompareProducer(instr);
 }
 
+// 是否是 XORI rd, rs, 0(即 rd = rs 的比较别名,可让分支直接对 rs 测零)。
 bool isXoriZeroProducer(const MachineInstr &instr) {
   return instr.opcode == Opcode::XORI && instr.uses.size() == 2 &&
          instr.uses[0].kind == OperandKind::Reg &&
@@ -594,25 +670,31 @@ bool isXoriZeroProducer(const MachineInstr &instr) {
          instr.uses[1].immValue == 0 && isFoldableCompareProducer(instr);
 }
 
+// 分支的条件寄存器是否恰是 defInstr 定义的寄存器(判定二者是否可折叠)。
 bool branchUsesDef(const MachineInstr &branch, const MachineInstr &defInstr) {
   return isBranchOnZeroReg(branch) &&
          sameRegister(branch.uses[0].regValue, defInstr.defs[0].regValue);
 }
 
+// 零比较的条件寄存器是否恰是 defInstr 定义的寄存器。
 bool zeroCompareUsesDef(const MachineInstr &zeroCompare,
                         const MachineInstr &defInstr) {
   return isZeroCompare(zeroCompare) &&
          sameRegister(zeroCompare.uses[0].regValue, defInstr.defs[0].regValue);
 }
 
+// SLT+分支的目标分支操作码:BNEZ(结果非零即取真,即 a<b)对应 BLT,反之 BGE。
 Opcode branchOpcodeForSlt(Opcode branchOpcode) {
   return branchOpcode == Opcode::BNEZ ? Opcode::BLT : Opcode::BGE;
 }
 
+// XOR+分支的目标分支操作码:BNEZ(异或非零即不等)对应 BNE,反之 BEQ。
 Opcode branchOpcodeForXor(Opcode branchOpcode) {
   return branchOpcode == Opcode::BNEZ ? Opcode::BNE : Opcode::BEQ;
 }
 
+// 在中间还夹着一层 SEQZ/SNEZ 时,综合“分支取真/取假”与“比较测非零/测零”两重
+// 极性选出最终分支操作码:两重极性同向取 nonZeroBranch,异向取 zeroBranch。
 Opcode branchOpcodeForZeroCompare(Opcode zeroOpcode, Opcode branchOpcode,
                                   Opcode nonZeroBranch, Opcode zeroBranch) {
   const bool branchOnConditionTrue = branchOpcode == Opcode::BNEZ;
@@ -621,6 +703,7 @@ Opcode branchOpcodeForZeroCompare(Opcode zeroOpcode, Opcode branchOpcode,
                                                      : zeroBranch;
 }
 
+// 构造一条“寄存器-寄存器-目标”形式的比较分支(如 BLT/BGE/BEQ/BNE)。
 MachineInstr makeRegRegBranch(Opcode opcode, const MachineOperand &lhs,
                               const MachineOperand &rhs,
                               const MachineOperand &target) {
@@ -633,6 +716,7 @@ MachineInstr makeRegRegBranch(Opcode opcode, const MachineOperand &lhs,
   return branch;
 }
 
+// 构造一条“寄存器对零-目标”形式的分支(如 BEQZ/BNEZ)。
 MachineInstr makeRegZeroBranch(Opcode opcode, const MachineOperand &reg,
                                const MachineOperand &target) {
   MachineInstr branch;
@@ -643,6 +727,9 @@ MachineInstr makeRegZeroBranch(Opcode opcode, const MachineOperand &reg,
   return branch;
 }
 
+// 折叠“比较 + 分支”两条指令:要求比较可折叠、分支用其结果、且该结果只此一处
+// 使用(否则删掉比较会破坏其它使用)。SLT/XOR 折成寄存器比较分支,XORI 0 折成
+// 对源寄存器的测零分支。产物写入 folded。
 bool foldCompareAndBranch(const MachineInstr &cmp, const MachineInstr &branch,
                           const std::map<uint32_t, std::size_t> &useCounts,
                           MachineInstr &folded) {
@@ -671,6 +758,8 @@ bool foldCompareAndBranch(const MachineInstr &cmp, const MachineInstr &branch,
   return false;
 }
 
+// 折叠“SEQZ/SNEZ + 分支”:综合两重极性得到直接对源寄存器测零的分支。要求零比较
+// 结果只此一处使用。
 bool foldZeroCompareAndBranch(const MachineInstr &zeroCompare,
                               const MachineInstr &branch,
                               const std::map<uint32_t, std::size_t> &useCounts,
@@ -686,6 +775,8 @@ bool foldZeroCompareAndBranch(const MachineInstr &zeroCompare,
   return true;
 }
 
+// 折叠三段式“比较 + SEQZ/SNEZ + 分支”为一条比较分支。要求三者链式依赖、比较与
+// 零比较结果各自只此一处使用;最终分支操作码由比较类型与两重极性共同决定。
 bool foldCompareZeroCompareAndBranch(
     const MachineInstr &cmp, const MachineInstr &zeroCompare,
     const MachineInstr &branch,
@@ -722,8 +813,10 @@ bool foldCompareZeroCompareAndBranch(
   return false;
 }
 
+// 比较与分支之间允许间隔的最大指令数(用于折叠相隔若干条的比较与分支)。
 constexpr std::size_t kMaxCompareBranchGap = 4;
 
+// 指令是否定义了给定寄存器。
 bool definesRegister(const MachineInstr &instr, const MachineReg &reg) {
   return std::any_of(
       instr.defs.begin(), instr.defs.end(), [&](const MachineOperand &def) {
@@ -731,6 +824,8 @@ bool definesRegister(const MachineInstr &instr, const MachineReg &reg) {
       });
 }
 
+// 比较到分支之间的间隔指令是否都没有重定义比较的输入寄存器。若被重定义,把比较
+// 下沉到分支处会读到不同的值,折叠不安全。
 bool gapPreservesCompareInputs(const std::vector<MachineInstr> &instrs,
                                std::size_t producerIndex,
                                std::size_t branchIndex) {
@@ -746,6 +841,9 @@ bool gapPreservesCompareInputs(const std::vector<MachineInstr> &instrs,
   return true;
 }
 
+// 折叠与分支相隔若干条(不超过 kMaxCompareBranchGap)的比较。从分支往前扫,跳过
+// 都是本地 CSE 候选(纯运算、可移动)的间隔指令,找到定义条件寄存器的比较后,
+// 校验间隔未破坏比较输入,再折叠并删掉原比较指令。命中返回 true。
 bool foldSeparatedCompareAndBranch(
     std::vector<MachineInstr> &instrs, std::size_t branchIndex,
     const std::map<uint32_t, std::size_t> &useCounts) {
@@ -785,10 +883,13 @@ bool foldSeparatedCompareAndBranch(
   return false;
 }
 
+// 是否是可参与拷贝传播的拷贝操作码。
 bool isCopyPropagationOpcode(Opcode opcode) {
   return opcode == Opcode::COPY || opcode == Opcode::F_COPY;
 }
 
+// 拷贝的源是否允许被传播到使用处:虚拟源要求与目标同寄存器类;物理源仅允许 x0
+// 且目标非浮点(把 x0 传播进浮点使用不合法)。
 bool copySourceAllowed(const MachineReg &dst, const MachineReg &src) {
   if (!src.physical) {
     return src.rc == dst.rc;
@@ -796,6 +897,8 @@ bool copySourceAllowed(const MachineReg &dst, const MachineReg &src) {
   return src.phys == PhysReg::X0 && dst.rc != RegClass::FPR32;
 }
 
+// 指令是否是拷贝传播候选:单寄存器定义/使用的干净拷贝,目标唯一定义;若源是
+// 虚拟寄存器也要求唯一定义(保证传播过去的值在使用点稳定);源类别合法。
 bool isCopyPropagationCandidate(
     const MachineInstr &instr,
     const std::map<uint32_t, std::size_t> &defCounts) {
@@ -814,6 +917,8 @@ bool isCopyPropagationCandidate(
   return copySourceAllowed(instr.defs[0].regValue, instr.uses[0].regValue);
 }
 
+// 某寄存器被重定义时清理拷贝替换表:删掉以它为键或以它为值的映射,避免继续把
+// 使用改写到已过期的源。
 void killCopyReplacementsForDef(const MachineReg &def,
                                 std::map<uint32_t, MachineReg> &replacements) {
   if (!def.physical) {
@@ -828,6 +933,7 @@ void killCopyReplacementsForDef(const MachineReg &def,
   }
 }
 
+// 识别一条干净的 LA rd, global(取全局符号地址),取出符号名。用于全局地址复用。
 bool isLoadAddressOfGlobal(const MachineInstr &instr, std::string &symbol) {
   if (instr.opcode != Opcode::LA || instr.defs.size() != 1 ||
       instr.defs[0].kind != OperandKind::Reg || instr.uses.size() != 1 ||
@@ -840,6 +946,7 @@ bool isLoadAddressOfGlobal(const MachineInstr &instr, std::string &symbol) {
   return true;
 }
 
+// 构造一条 LA rd, symbol。
 MachineInstr makeLoadAddress(MachineReg dst, const std::string &symbol) {
   MachineInstr instr;
   instr.opcode = Opcode::LA;
@@ -848,6 +955,7 @@ MachineInstr makeLoadAddress(MachineReg dst, const std::string &symbol) {
   return instr;
 }
 
+// 构造一条拷贝,操作码按目标寄存器类选 F_COPY/COPY。
 MachineInstr makeCopy(MachineReg dst, MachineReg src,
                       const std::string &comment = "") {
   MachineInstr instr;
@@ -858,15 +966,21 @@ MachineInstr makeCopy(MachineReg dst, MachineReg src,
   return instr;
 }
 
+// 取绝对值(用于地址合并里比较偏移大小选 pivot)。
 int64_t abs64(int64_t value) { return value < 0 ? -value : value; }
 
+// 立即数是否落在有符号 12 位范围(能否直接作为访存偏移或 ADDI 立即数)。
 bool fitsSigned12(int64_t value) { return value >= -2048 && value <= 2047; }
 
+// 地址合并的分组键:相同基址寄存器 + 相同基址版本号归为一组,只有同组的候选
+// 才能相互重定位(版本号保证基址在其间未被重定义)。
 std::string addressCombineGroupKey(const MachineReg &base,
                                    uint64_t baseVersion) {
   return regKey(base) + "#" + std::to_string(baseVersion);
 }
 
+// 判断一个寄存器操作数是否是已知的地址常量:x0(GPR64)恒为 0;否则查由 LI/COPY
+// 追踪来的常量表。用于把 ADD reg, const 识别为“基址 + 常量偏移”。
 bool knownAddressConstant(const MachineOperand &operand,
                           const std::map<std::string, int64_t> &constants,
                           int64_t &value) {
@@ -892,6 +1006,8 @@ bool knownAddressConstant(const MachineOperand &operand,
   return true;
 }
 
+// 描述一个“基址 + 常量偏移”的地址计算候选:结果寄存器 reg、基址 base、偏移、
+// 基址版本号、分组键、以及定义在块内的序号(用于挑选最早的 pivot)。
 struct AddressCombineInfo {
   MachineReg reg;
   MachineReg base;
@@ -901,6 +1017,9 @@ struct AddressCombineInfo {
   std::size_t defIndex = 0;
 };
 
+// 识别一条把地址算成“基址 + 常量偏移”的 GPR64 定义,填充 AddressCombineInfo。
+// 覆盖两种形态:ADDI base, imm;以及 ADD 中一操作数是已知常量、另一是基址寄存器。
+// 排除目标与基址相同的自增(否则重定位会形成对自身的依赖)。
 bool isAddressCombineDef(const MachineInstr &instr,
                          const std::map<std::string, int64_t> &constants,
                          const std::map<std::string, uint64_t> &versions,
@@ -965,6 +1084,12 @@ bool isAddressCombineDef(const MachineInstr &instr,
   return false;
 }
 
+// 尝试重写一条访存指令的地址(基址 + 立即偏移),让它直接引用某个地址计算候选
+// 的更早基址,从而省掉中间的地址加法。策略:
+//   - 先在同组候选里找一个“pivot”(共同基址),使 (总偏移 - pivot 偏移) 仍能放进
+//     12 位;偏移绝对值最小者优先,同分再按定义序号/寄存器键决胜,得到最短编码;
+//   - 若无合适 pivot,则在基址版本未变且总偏移可放进 12 位时,直接折到原基址上。
+// 命中改写并返回 true。
 bool rewriteAddressUse(
     MachineInstr &instr, std::size_t baseIndex, std::size_t offsetIndex,
     const std::map<std::string, AddressCombineInfo> &activeCandidates,
@@ -1032,6 +1157,8 @@ bool rewriteAddressUse(
   return false;
 }
 
+// 提升一组物理寄存器的版本号(两种寄存器类各一次)。调用会破坏调用者保存寄存器,
+// 故调用点后需据此让相关地址候选失效。
 void bumpPhysicalVersions(const std::vector<PhysReg> &regs,
                           std::map<std::string, uint64_t> &versions) {
   for (PhysReg reg : regs) {
@@ -1040,6 +1167,8 @@ void bumpPhysicalVersions(const std::vector<PhysReg> &regs,
   }
 }
 
+// 一条指令定义的寄存器被重写后:移除以它为键的地址候选与常量记录,并提升其版本
+// 号(隐式定义的物理寄存器同样提升版本),使后续引用不会误用旧的地址关系。
 void invalidateDefinedRegisters(
     const MachineInstr &instr,
     std::map<std::string, AddressCombineInfo> &activeCandidates,
@@ -1063,6 +1192,8 @@ void invalidateDefinedRegisters(
 
 } // namespace
 
+// Pass:比较与分支折叠。每个块先做“相隔若干条”的折叠,再线性扫描做三段式、
+// 两段式(比较+分支、零比较+分支)的相邻折叠。返回是否有改动。
 bool runBranchCompareFolding(MachineFunction &mf) {
   bool changed = false;
   const auto useCounts = collectVirtualUseCounts(mf);
@@ -1120,6 +1251,9 @@ bool runBranchCompareFolding(MachineFunction &mf) {
   return changed;
 }
 
+// Pass(RA 前):全局地址复用。统计各全局被 LA 的次数,挑出复用最多的少数几个
+// (上限 kMaxCachedGlobals),在入口块预取到共享寄存器,把其余同符号的 LA 改成
+// 拷贝该共享寄存器。当全局种类多且单个复用极高时判定不划算而放弃(启发式)。
 bool runPreRAGlobalAddressReuse(MachineFunction &mf) {
   if (mf.blocks.empty()) {
     return false;
@@ -1204,6 +1338,9 @@ bool runPreRAGlobalAddressReuse(MachineFunction &mf) {
   return true;
 }
 
+// Pass(RA 前):地址合并。逐块跟踪常量(LI/COPY)、基址版本号与“基址+常量偏移”
+// 候选,把 load/store 的地址重定位到共同基址以缩短偏移或复用地址寄存器。指令定义、
+// 调用(破坏调用者保存寄存器)都会相应失效候选与提升版本号。返回是否有改动。
 bool runPreRAAddressCombine(MachineFunction &mf) {
   if (mf.blocks.empty()) {
     return false;
@@ -1282,6 +1419,9 @@ bool runPreRAAddressCombine(MachineFunction &mf) {
   return changed;
 }
 
+// Pass(RA 前):块内拷贝传播。逐块维护虚拟寄存器的替换表,把使用改写到拷贝的源;
+// 被重定义即清理相关映射。当拷贝的目标与源已相同、或目标的使用全在本块内时,可把
+// 该拷贝删除(块内使用已被改写,块外无使用)。返回是否有改动。
 bool runPreRACopyPropagation(MachineFunction &mf) {
   bool changed = false;
   const auto useBlocks = collectUseBlocks(mf);
@@ -1324,6 +1464,12 @@ bool runPreRACopyPropagation(MachineFunction &mf) {
   return changed;
 }
 
+// Pass(RA 前):块内公共子表达式消除。逐块维护表达式表与 load 表及其依赖索引:
+//   - 调用或非 store 副作用指令整体清表;store 只清 load 表(内存变了但 ALU 表达式
+//     的虚拟/x0 操作数不受影响);
+//   - 每条指令先按替换表改写使用,再让其定义失效相关表项;
+//   - 命中相同键且该定义使用全在本块内时,记录替换并删除本条(用已有结果代替);
+//   - 表满(kMaxLocalCSEEntries)时不再新增。返回是否有改动。
 bool runPreRALocalCSE(MachineFunction &mf) {
   bool changed = false;
   const auto useBlocks = collectUseBlocks(mf);
@@ -1383,6 +1529,8 @@ bool runPreRALocalCSE(MachineFunction &mf) {
   return changed;
 }
 
+// Pass(RA 后):最终窥孔清理。删除可移除指令(NOP/自拷贝/自加零),并对零元恒等式
+// 做折叠;折叠结果若又成了可删除指令则一并丢弃。返回是否有改动。
 bool runPostRAPeephole(MachineFunction &mf) {
   bool changed = false;
   for (MachineBasicBlock &block : mf.blocks) {

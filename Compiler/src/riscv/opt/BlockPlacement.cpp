@@ -14,29 +14,46 @@
 #include <vector>
 
 namespace riscv {
+// Block Placement pass 的公共实现。
+//
+// 作用：在保持逻辑 CFG 完全不变的前提下，按分支频率与 fallthrough 收益重排
+// 机器基本块的线性顺序，让高频边尽量成为相邻块之间的 fallthrough，从而减少
+// 显式跳转（尤其是动态执行次数多的跳转），并在需要时反转条件分支方向。
+//
+// 流水线位置：属于机器无关后端流水线的后期布局阶段，依赖机器循环分析
+// （MachineLoopAnalysis）与机器块频率分析（MachineBlockFrequencyAnalysis）。
+//
+// RISC-V 与 ARM64 两后端使用相同实现
+// 两后端各保留一份相同实现。文件内不含 namespace 包裹，直接是命名空间内的正文。
+
 namespace {
 
+// 一个块结尾的控制流形态：返回、无条件跳转、条件分支。
 enum class ControlKind { Return, Unconditional, Conditional };
 
+// 布局前固化下来的一个块的控制流信息。因为重排会改变块相邻关系，条件分支的
+// fallthrough（false 目标）在移动前必须先记录，否则事后无法还原语义。
 struct SavedControl {
   ControlKind kind = ControlKind::Return;
-  std::size_t originalIndex = 0;
-  MachineInstr terminator;
-  std::string trueTarget;
-  std::string falseTarget;
+  std::size_t originalIndex = 0;   // 该块在原始顺序中的下标
+  MachineInstr terminator;         // 原始终结指令（RET 或条件分支）
+  std::string trueTarget;          // 条件为真 / 无条件跳转的目标块标签
+  std::string falseTarget;         // 条件为假（原 fallthrough）的目标块标签
 };
 
+// 带权重的 CFG 边，权重来自块频率分析，用于 Pettis-Hansen 链式布局。
 struct WeightedEdge {
   int from = -1;
   int to = -1;
   uint64_t weight = 0;
 };
 
+// 一种候选布局的代价，按字典序比较；靠前的维度权重更高。
 struct LayoutCost {
-  uint64_t dynamicJumpExecutions = 0;
-  uint64_t staticJumpCount = 0;
-  uint64_t brokenFallthroughWeight = 0;
-  uint64_t blockDisplacement = 0;
+  uint64_t dynamicJumpExecutions = 0;   // 显式跳转的动态执行次数（最重要）
+  uint64_t staticJumpCount = 0;         // 静态跳转指令条数（代码体积）
+  uint64_t brokenFallthroughWeight = 0; // 未能成为 fallthrough 的边权之和
+  uint64_t blockDisplacement = 0;       // 块相对原位置的总位移（稳定性 tie-break）
 
   bool operator<(const LayoutCost &other) const {
     if (dynamicJumpExecutions != other.dynamicJumpExecutions) {
@@ -55,6 +72,7 @@ struct LayoutCost {
 using LabelEdge = std::pair<std::string, std::string>;
 using LabelEdgeSet = std::set<LabelEdge>;
 
+// 判断操作码是否为条件分支（用于识别与反转终结指令）。
 bool isConditionalBranch(Opcode opcode) {
   switch (opcode) {
   case Opcode::BEQZ:
@@ -69,11 +87,14 @@ bool isConditionalBranch(Opcode opcode) {
   }
 }
 
+// 判断操作码是否为本 pass 能识别并可安全重建的终结指令。
 bool isKnownTerminator(Opcode opcode) {
   return opcode == Opcode::RET || opcode == Opcode::J ||
          isConditionalBranch(opcode);
 }
 
+// 求条件分支的反转操作码（如 BEQ 反转为 BNE）。当块被移动、原 fallthrough
+// 目标不再相邻时，需要反转分支方向来重新指向新的相邻块。返回是否成功。
 bool invertedBranch(Opcode opcode, Opcode &inverted) {
   switch (opcode) {
   case Opcode::BEQZ:
@@ -99,6 +120,7 @@ bool invertedBranch(Opcode opcode, Opcode &inverted) {
   }
 }
 
+// 是否启用变换后的 MIR 校验。debug 构建默认开启，release 下由环境变量控制。
 bool verificationEnabled() {
 #ifndef NDEBUG
   return true;
@@ -107,10 +129,13 @@ bool verificationEnabled() {
 #endif
 }
 
+// 是否输出布局统计信息（由环境变量控制），用于调参与诊断。
 bool statisticsEnabled() {
   return std::getenv("BACKEND_BLOCK_PLACEMENT_STATS") != nullptr;
 }
 
+// 以下 same* 系列用于逐字段比较指令/操作数/整个程序，供“变换前后是否真正改变
+// 了程序”与校验逻辑使用。
 bool sameReg(const MachineReg &lhs, const MachineReg &rhs) {
   return lhs.physical == rhs.physical && lhs.id == rhs.id && lhs.rc == rhs.rc &&
          lhs.phys == rhs.phys;
@@ -137,6 +162,8 @@ bool sameOperand(const MachineOperand &lhs, const MachineOperand &rhs) {
   return false;
 }
 
+// 比较两条指令的操作数列表。ignoreBlockTargets 为真时跳过块目标操作数的比较，
+// 用于“除跳转目标外其余是否相同”的判断（反转分支时目标会变但其余不变）。
 bool sameOperandList(const std::vector<MachineOperand> &lhs,
                      const std::vector<MachineOperand> &rhs,
                      bool ignoreBlockTargets) {
@@ -155,6 +182,8 @@ bool sameOperandList(const std::vector<MachineOperand> &lhs,
   return true;
 }
 
+// 比较两条指令是否完全一致。ignoreOpcodeAndBlockTargets 用于校验反转分支：
+// 此时操作码与块目标允许不同，只要求其余字段一致。
 bool sameInstruction(const MachineInstr &lhs, const MachineInstr &rhs,
                      bool ignoreOpcodeAndBlockTargets = false) {
   return (ignoreOpcodeAndBlockTargets || lhs.opcode == rhs.opcode) &&
@@ -166,6 +195,7 @@ bool sameInstruction(const MachineInstr &lhs, const MachineInstr &rhs,
          lhs.terminator == rhs.terminator && lhs.comment == rhs.comment;
 }
 
+// 逐块逐指令比较两个块序列是否完全相同，用于判断布局是否实际产生了变化。
 bool sameProgram(const std::vector<MachineBasicBlock> &lhs,
                  const std::vector<MachineBasicBlock> &rhs) {
   if (lhs.size() != rhs.size()) {
@@ -186,11 +216,13 @@ bool sameProgram(const std::vector<MachineBasicBlock> &lhs,
   return true;
 }
 
+// 饱和加法，避免频率权重累加时溢出（溢出则钳到最大值）。
 uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs) {
   const uint64_t limit = std::numeric_limits<uint64_t>::max();
   return rhs > limit - lhs ? limit : lhs + rhs;
 }
 
+// 取分支指令唯一的块目标标签；有多个或没有块目标都视为非法。
 std::string branchTarget(const MachineInstr &instr) {
   std::string target;
   for (const MachineOperand &use : instr.uses) {
@@ -208,6 +240,7 @@ std::string branchTarget(const MachineInstr &instr) {
   return target;
 }
 
+// 从频率分析结果中查出 from 到 to 这条边的权重；表不一致或边缺失均报错。
 uint64_t edgeWeightForTarget(
     const MachineBlockFrequencyAnalysis::Result &frequencies, std::size_t from,
     std::size_t to) {
@@ -228,6 +261,7 @@ uint64_t edgeWeightForTarget(
   throw BackendError("missing machine frequency edge");
 }
 
+// 把分支指令的唯一块目标就地改写为 target。
 void setBranchTarget(MachineInstr &instr, const std::string &target) {
   bool replaced = false;
   for (MachineOperand &use : instr.uses) {
@@ -245,6 +279,7 @@ void setBranchTarget(MachineInstr &instr, const std::string &target) {
   }
 }
 
+// 在块末尾追加一条到 label 的无条件跳转（当目标不再是相邻块时用于补回控制流）。
 void appendJump(MachineBasicBlock &block, const std::string &label) {
   MachineInstr jump;
   jump.opcode = Opcode::J;
@@ -253,6 +288,10 @@ void appendJump(MachineBasicBlock &block, const std::string &label) {
   block.instrs.push_back(std::move(jump));
 }
 
+// 遍历函数所有块，把每个块结尾的控制流固化到 controls 中，并收集逻辑边集合
+// edges（供事后校验 CFG 未变）。返回 false 表示遇到无法可靠重建的控制流形态
+// （未知终结指令、不可反转的条件码等），此时调用方应放弃对该函数做布局。
+// 关键点：条件分支的 false 目标此刻等于旧布局里的相邻块，必须在移动前记下。
 bool saveControlFlow(const MachineFunction &mf,
                      std::map<std::string, SavedControl> &controls,
                      LabelEdgeSet &edges) {
@@ -356,6 +395,12 @@ bool saveControlFlow(const MachineFunction &mf,
   return true;
 }
 
+// 用 Pettis-Hansen 贪心算法构造块的初始链式布局。
+// 思路：把 CFG 的非回边按权重从大到小排序，依次尝试把权重大的边的两端块拼成
+// 一条链（边的起点块必须是某链的尾、终点块必须是另一链的头），使高频边尽量
+// 落在相邻块之间成为 fallthrough。回边被排除（回边天然指向已在前面的头块，
+// 不适合作为顺序 fallthrough）。入口块所在链始终保持在最前，不被接到别的链后。
+// 最后从入口链出发，按“与已放置块的连接权重、块热度、原始下标”择优拼接剩余链。
 std::vector<int> buildPettisHansenOrder(
     std::size_t blockCount,
     const MachineLoopAnalysis::Result &loops,
@@ -404,6 +449,8 @@ std::vector<int> buildPettisHansenOrder(
     owner[i] = static_cast<int>(i);
   }
 
+  // 按权重从大到小合并链：只有 from 是某链尾、to 是另一链头时才能拼接，保证
+  // 每条链是一段线性可 fallthrough 的块序列。
   for (const WeightedEdge &edge : edges) {
     const int fromChain = owner[static_cast<std::size_t>(edge.from)];
     const int toChain = owner[static_cast<std::size_t>(edge.to)];
@@ -441,6 +488,8 @@ std::vector<int> buildPettisHansenOrder(
 
   appendChain(owner[0]);
   while (order.size() < blockCount) {
+    // 在尚未放置的链里择优：优先与已放置块连接权重大的链，其次热度高的，
+    // 最后用最小原始下标做稳定 tie-break，保证确定性输出。
     int best = -1;
     uint64_t bestConnection = 0;
     uint64_t bestHeat = 0;
@@ -488,6 +537,8 @@ std::vector<int> buildPettisHansenOrder(
   return order;
 }
 
+// 两个前向声明，定义在文件后方：weightedFallthrough 统计给定顺序下成为
+// fallthrough 的边权之和；totalEdgeWeight 统计所有边权之和。
 uint64_t
 weightedFallthrough(const std::vector<int> &order,
                     const MachineBlockFrequencyAnalysis::Result &frequencies);
@@ -495,6 +546,10 @@ weightedFallthrough(const std::vector<int> &order,
 uint64_t
 totalEdgeWeight(const MachineBlockFrequencyAnalysis::Result &frequencies);
 
+// 计算某个候选布局 order 的代价 LayoutCost。逐块按其原始控制流形态推算：
+// 无条件跳转若目标不再相邻则计一次显式跳转（含动态执行次数）；条件分支若真假
+// 目标都不相邻则必然要补一条跳转，动态代价取“落到显式跳转那一侧”的边权。
+// useWeightedOrientation 为真时假定会按权重择优反转分支，取两侧较小权重。
 LayoutCost computeLayoutCost(
     const MachineFunction &originalMf, const std::vector<int> &order,
     const std::map<std::string, SavedControl> &controls,
@@ -575,6 +630,10 @@ LayoutCost computeLayoutCost(
   return cost;
 }
 
+// 在种子布局基础上，尝试“循环旋转”：把 latch 块移到 header 块之前，使回边
+// 变成 fallthrough、循环体的条件分支落在末尾。这类旋转会改变分支方向与代码相邻
+// 关系，只有当它能把一条更高频的显式跳转换成更便宜的形态（动态跳转次数严格
+// 下降）时才接受，静态体积或位移的 tie-break 不足以作为旋转依据。
 void considerBackedgeFallthroughOrders(
     const MachineFunction &mf, const std::vector<int> &seed,
     const LayoutCost &seedCost, const MachineLoopAnalysis::Result &loops,
@@ -635,6 +694,7 @@ void considerBackedgeFallthroughOrders(
   }
 }
 
+// 统计给定顺序下，有多少边权落在“相邻块”之间（即成为 fallthrough）。
 uint64_t
 weightedFallthrough(const std::vector<int> &order,
                     const MachineBlockFrequencyAnalysis::Result &frequencies) {
@@ -655,6 +715,7 @@ weightedFallthrough(const std::vector<int> &order,
   return weight;
 }
 
+// 统计所有 CFG 边的权重总和（fallthrough 收益的分母/上界）。
 uint64_t
 totalEdgeWeight(const MachineBlockFrequencyAnalysis::Result &frequencies) {
   uint64_t result = 0;
@@ -666,6 +727,7 @@ totalEdgeWeight(const MachineBlockFrequencyAnalysis::Result &frequencies) {
   return result;
 }
 
+// 删除块内所有终结指令，为按新相邻关系重建终结指令做准备。
 void eraseTerminators(MachineBasicBlock &block) {
   block.instrs.erase(std::remove_if(block.instrs.begin(), block.instrs.end(),
                                     [](const MachineInstr &instr) {
@@ -675,6 +737,11 @@ void eraseTerminators(MachineBasicBlock &block) {
                      block.instrs.end());
 }
 
+// 按最终的块顺序重建每个块的终结指令，使控制流与新相邻关系一致：
+// - RET 原样放回；
+// - 无条件跳转：目标恰为相邻块则省略跳转（fallthrough），否则补一条 J；
+// - 条件分支：若 false 目标相邻则保持原方向；若 true 目标相邻则反转分支指向
+//   false 目标；两者都不相邻时，按权重决定是否反转，再补一条到另一目标的 J。
 void rebuildTerminators(
     MachineFunction &mf, const std::map<std::string, SavedControl> &controls,
     const MachineBlockFrequencyAnalysis::Result &frequencies,
@@ -747,6 +814,7 @@ void rebuildTerminators(
   }
 }
 
+// 由块的 succs 收集“标签到标签”的逻辑边集合，用于比较布局前后 CFG 是否一致。
 LabelEdgeSet cfgLabelEdges(const MachineFunction &mf) {
   LabelEdgeSet result;
   for (const MachineBasicBlock &block : mf.blocks) {
@@ -761,6 +829,9 @@ LabelEdgeSet cfgLabelEdges(const MachineFunction &mf) {
   return result;
 }
 
+// 布局后的安全校验：块集合不增不减不重复、RET 不能凭空多出 successor、逻辑
+// CFG 边与布局前完全一致，并重新固化控制流对比每个终结指令的语义（方向要么
+// 保持、要么恰好是合法反转）。任何不一致都抛异常，防止布局引入错误。
 void verifyPlacedFunction(const MachineFunction &mf,
                           const std::map<std::string, SavedControl> &controls,
                           const LabelEdgeSet &oldEdges) {
@@ -835,6 +906,10 @@ void verifyPlacedFunction(const MachineFunction &mf,
 
 } // namespace
 
+// 布局 pass 的入口：对单个机器函数执行块重排。
+// 步骤：固化控制流 -> 若频率可靠则用 Pettis-Hansen 构造候选顺序并尝试循环旋转
+// -> 与原始顺序比较代价，择优选定顺序 -> 物理重排块并重建终结指令与 CFG ->
+// 校验 -> 若实际未变则返回 false。返回是否修改了函数。
 bool runBlockPlacement(
     MachineFunction &mf, const MachineLoopAnalysis::Result &loops,
     const MachineBlockFrequencyAnalysis::Result &frequencies) {

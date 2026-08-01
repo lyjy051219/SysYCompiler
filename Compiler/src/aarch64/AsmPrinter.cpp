@@ -1,3 +1,16 @@
+// AsmPrinter.cpp —— 把已完成寄存器分配与frame lowering的 MIR 发射为 ARM64(ARMv8-A) 汇编文本。
+// 这是 aarch64 后端里唯一真正做 ISA 翻译的地方:MIR 各操作码沿用 rv 命名(ADD/LW/BLT...),
+// 但在这里被翻译成 AArch64 助记符,例如:
+//   - 寄存器按操作数 RegClass 选宽度前缀:GPR32 用 w、GPR64 用 x、FPR32 用 s;
+//     31 号编码在多数指令里是零寄存器(wzr/xzr),在 sp 相关形式里则是栈指针,需区分。
+//   - LI 用 movz/movk 序列物化 64 位立即数;LA 用 adrp + add :lo12: 取全局地址。
+//   - REM 无对应指令,展开成 sdiv/udiv 再 msub;SLT/浮点比较用 cmp/fcmp + cset;
+//     两寄存器条件分支用 cmp + b.cond;逻辑立即数按位掩码可编码性决定直接编码或先物化。
+//   - 融合指令 madd/msub/smaddl/smsubl、条件选择 csel、访存的 [base, index, lsl/sxtw] 索引寻址。
+//   - prologue 与 epilogue 用 str/ldr 把 x30（lr）与用到的 callee-saved 存到 sp 相对槽。
+// 另外还负责:发射模块头与全局数据段(.bss/.rodata/.data)、内联 memcpy/memset 展开,
+// 以及为寄存器分配未覆盖时残留的虚拟寄存器做一个兜底的临时寄存器指派(基于使用计数回收)。
+// 命名约定:局部标签统一用 .L 前缀并配自增 id 保证唯一,访存写作 [base, #offset]。
 #include "aarch64/AsmPrinter.hpp"
 
 #include "lib/CFG.hpp"
@@ -14,15 +27,19 @@
 namespace aarch64 {
 namespace {
 
+// 判断 IR 类型是否为布尔(1 字节整型)。
 bool isBoolType(const std::shared_ptr<IRType> &type) {
   auto intType = std::dynamic_pointer_cast<INTType>(type);
   return intType && intType->getIsBool();
 }
 
+// 判断 IR 类型是否为指针类型。
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getTypeSystem() == IR_POINTER;
 }
 
+// 计算 IR 类型在内存中占用的字节数:布尔 1、int/float 4、指针 8,
+// 数组按元素数乘元素大小递归,其余回退到类型自身报告的 size。
 int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return 0;
@@ -45,6 +62,7 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
   }
 }
 
+// 求以 2 为底的对齐幂:给定字节对齐值返回其 log2(向上取整),供 .p2align 使用。
 int p2Align(int64_t align) {
   align = std::max<int64_t>(1, align);
   int power = 0;
@@ -74,7 +92,7 @@ constexpr PhysReg kReservedGprScratch = PhysReg::T6;
 // 取寄存器的 64 位 x 名（GPR）或 s 名（FPR）。
 const char *rawRegName(PhysReg reg) { return regName(reg); }
 
-// 按 RegClass 选择寄存器宽度前缀：GPR32->w，GPR64->x，FPR32->s。
+// 按 RegClass 选择寄存器宽度前缀：GPR32 用 w，GPR64 用 x，FPR32 用 s。
 std::string widthRegName(PhysReg reg, RegClass rc) {
   std::string base = rawRegName(reg);
   if (rc == RegClass::FPR32) {
@@ -171,7 +189,7 @@ bool isLogicalImmediate(uint64_t imm, unsigned width) {
   return false;
 }
 
-// 保存/恢复 sp 相对的寄存器（prologue/epilogue）。isFloat 时用 64 位 d 形式。
+// 保存/恢复 sp 相对偏移的寄存器。isFloat 时用 64 位 d 形式。
 void emitSpRelative(std::ostream &out, bool isLoad, PhysReg reg,
                     int64_t offset, bool isFloat) {
   const char *mnem = isLoad ? "ldr" : "str";
@@ -188,6 +206,8 @@ void emitSpRelative(std::ostream &out, bool isLoad, PhysReg reg,
       << "]\n";
 }
 
+// 兜底临时寄存器池。当 MIR 中仍残留虚拟寄存器时,AsmPrinter 自己按类别指派物理寄存器。
+// 叶子函数(不含 call)可用的整型/浮点scratch 寄存器:caller-saved 的 t/a、ft 系列。
 constexpr std::array<PhysReg, 11> kGprScratchRegs{
     PhysReg::T0, PhysReg::T1, PhysReg::T2, PhysReg::A0,
     PhysReg::A1, PhysReg::A2, PhysReg::A3, PhysReg::A4,
@@ -197,6 +217,8 @@ constexpr std::array<PhysReg, 8> kFprScratchRegs{
     PhysReg::FT0, PhysReg::FT1, PhysReg::FT2, PhysReg::FT3,
     PhysReg::FT4, PhysReg::FT5, PhysReg::FT6, PhysReg::FT7};
 
+// 含 call 的非叶子函数改用 callee-saved 的 s/fs 系列,避免临时值跨调用被破坏
+// (代价是需在 prologue 保存这些寄存器)。
 constexpr std::array<PhysReg, 11> kNonLeafGprScratchRegs{
     PhysReg::S1, PhysReg::S2,  PhysReg::S3, PhysReg::S4,
     PhysReg::S5, PhysReg::S6,  PhysReg::S7, PhysReg::S8,
@@ -207,6 +229,7 @@ constexpr std::array<PhysReg, 12> kNonLeafFprScratchRegs{
     PhysReg::FS4, PhysReg::FS5, PhysReg::FS6,  PhysReg::FS7,
     PhysReg::FS8, PhysReg::FS9, PhysReg::FS10, PhysReg::FS11};
 
+// 判断函数是否含 CALL 指令(即非叶子函数),决定 prologue 是否保存 x30(lr) 及临时池选择。
 bool functionContainsCall(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -218,17 +241,20 @@ bool functionContainsCall(const MachineFunction &function) {
   return false;
 }
 
+// 判断操作数是否为浮点类虚拟寄存器。
 bool isFprVirtualReg(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical &&
          operand.regValue.rc == RegClass::FPR32;
 }
 
+// 判断操作数是否为整型类(GPR32/64)虚拟寄存器。
 bool isGprVirtualReg(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical &&
          (operand.regValue.rc == RegClass::GPR32 ||
           operand.regValue.rc == RegClass::GPR64);
 }
 
+// 扫描函数是否用到整型虚拟寄存器(用于判断非叶子函数是否需保存整型临时池)。
 bool functionUsesGprVirtualRegs(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -247,6 +273,7 @@ bool functionUsesGprVirtualRegs(const MachineFunction &function) {
   return false;
 }
 
+// 扫描函数是否用到浮点虚拟寄存器。
 bool functionUsesFprVirtualRegs(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -265,16 +292,19 @@ bool functionUsesFprVirtualRegs(const MachineFunction &function) {
   return false;
 }
 
+// 判断某物理寄存器是否属于非叶子浮点scratch 池(fs0-fs11)。
 bool isNonLeafFprScratchReg(PhysReg reg) {
   return std::find(kNonLeafFprScratchRegs.begin(), kNonLeafFprScratchRegs.end(),
                    reg) != kNonLeafFprScratchRegs.end();
 }
 
+// 判断操作数是否为非叶子浮点scratch 池中的物理寄存器。
 bool isNonLeafFprScratchOperand(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && operand.regValue.physical &&
          isNonLeafFprScratchReg(operand.regValue.phys);
 }
 
+// 扫描函数是否已经使用了非叶子浮点scratch 寄存器(这些属 callee-saved,需在 prologue 保存)。
 bool functionUsesNonLeafFprScratchRegs(const MachineFunction &function) {
   for (const MachineBasicBlock &block : function.blocks) {
     for (const MachineInstr &instr : block.instrs) {
@@ -293,11 +323,13 @@ bool functionUsesNonLeafFprScratchRegs(const MachineFunction &function) {
   return false;
 }
 
+// 函数是否需要保存浮点临时:用到浮点虚拟寄存器,或已占用非叶子浮点scratch 寄存器。
 bool functionNeedsFprTempSaves(const MachineFunction &function) {
   return functionUsesFprVirtualRegs(function) ||
          functionUsesNonLeafFprScratchRegs(function);
 }
 
+// 收集函数实际用到的 callee-saved 寄存器,按整型/浮点(wantFloat)过滤。
 std::vector<PhysReg> usedCalleeSavedRegs(const MachineFunction &function,
                                          bool wantFloat) {
   std::vector<PhysReg> regs;
@@ -310,6 +342,9 @@ std::vector<PhysReg> usedCalleeSavedRegs(const MachineFunction &function,
   return regs;
 }
 
+// 确定 prologue 中需保存的整型 callee-saved 寄存器集合。
+// 常规情况用寄存器分配记录的 usedCalleeSaved;若该集合为空但函数含 call 且
+// 用到整型虚拟寄存器,说明兜底临时池会占用非叶子scratch 寄存器,则整批保存它们。
 std::vector<PhysReg> gprCalleeSavedRegsToSave(const MachineFunction &function) {
   std::vector<PhysReg> regs = usedCalleeSavedRegs(function, false);
   if (!regs.empty() || !functionContainsCall(function)) {
@@ -322,6 +357,7 @@ std::vector<PhysReg> gprCalleeSavedRegsToSave(const MachineFunction &function) {
   return regs;
 }
 
+// 与上面对称,确定需保存的浮点 callee-saved 寄存器集合。
 std::vector<PhysReg> fprCalleeSavedRegsToSave(const MachineFunction &function) {
   std::vector<PhysReg> regs = usedCalleeSavedRegs(function, true);
   if (!regs.empty() || !functionContainsCall(function)) {
@@ -334,6 +370,7 @@ std::vector<PhysReg> fprCalleeSavedRegsToSave(const MachineFunction &function) {
   return regs;
 }
 
+// 取全局对象的被指对象类型:全局在 IR 里以指针建模,这里剥掉指针层拿到真正的数据类型。
 std::shared_ptr<IRType> pointeeType(const GlobalObject &global) {
   if (!global.ir) {
     return nullptr;
@@ -347,6 +384,8 @@ std::shared_ptr<IRType> pointeeType(const GlobalObject &global) {
   return pointerType->getPointerType();
 }
 
+// 判断全局初值是否全零(含空初值、零常量、以及数组/嵌套初值逐元素全零),
+// 用于决定该全局放入 .bss(全零,只记大小)还是需要逐字节发射实际数据。
 bool isZeroInitializer(Value *value, const std::shared_ptr<IRType> &type) {
   if (!value) {
     return true;
@@ -401,16 +440,22 @@ bool isZeroInitializer(Value *value, const std::shared_ptr<IRType> &type) {
   return true;
 }
 
+// 发射 size 字节的零填充(.zero 指令),size 非正时不输出。
 void emitZeroBytes(std::ostream &out, int64_t size) {
   if (size > 0) {
     out << "    .zero " << size << '\n';
   }
 }
 
+// 按类型大小发射相应字节数的零填充。
 void emitZeroForType(std::ostream &out, const std::shared_ptr<IRType> &type) {
   emitZeroBytes(out, sizeOfType(type));
 }
 
+// 递归发射一个全局初值到数据段。
+// 数组:逐元素发射,不足元素数的尾部补零;指针:仅支持空指针(补零);
+// 布尔:发射 .byte 0/1;整型/布尔常量发射 .word;
+// 浮点常量按 IEEE-754 位模式重解释为无符号整数发射 .word;其余情况补零。
 void emitDataValue(std::ostream &out, Value *value,
                    const std::shared_ptr<IRType> &type) {
   if (auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type)) {
@@ -484,8 +529,11 @@ void emitDataValue(std::ostream &out, Value *value,
 
 } // namespace
 
+// 构造:绑定输出流。
 AsmPrinter::AsmPrinter(std::ostream &out) : out_(out) {}
 
+// 发射整个模块:先输出后端标识头,再逐个发射全局对象(数据段),
+// 然后进入 .text 段逐个发射函数。
 void AsmPrinter::emitModule(const MachineModule &module) {
   out_ << "// myCompiler AArch64 (ARMv8-A) backend\n";
   for (const GlobalObject &global : module.globals) {
@@ -497,6 +545,9 @@ void AsmPrinter::emitModule(const MachineModule &module) {
   }
 }
 
+// 发射一个全局对象。按初值特性选择段:全零入 .bss,常量入 .rodata,其余入 .data。
+// 依次输出 .globl 声明、.p2align 对齐、符号标签,再发射初值(全零走 .zero,
+// 否则逐元素发射),最后用 .size 记录符号大小。
 void AsmPrinter::emitGlobal(const GlobalObject &global) {
   auto type = pointeeType(global);
   Value *init = global.ir ? global.ir->getUsee() : nullptr;
@@ -521,6 +572,12 @@ void AsmPrinter::emitGlobal(const GlobalObject &global) {
   out_ << "    .size " << global.name << ", " << global.size << '\n';
 }
 
+// 发射单个函数,含 prologue、函数体、以及退出状态清理。
+// prologue:先按 frameSize 下调 sp;若函数含 call 或有 callee-saved 需保存,
+// 则从帧顶向下依次把 x30(lr)、整型/浮点被保存寄存器 str 到栈上(每个占 8 字节,
+// 浮点用 64 位 d 形式)。函数体:逐块发射(首块不再打标签,直接接在符号后),
+// 逐指令翻译;每条指令后更新虚拟寄存器的使用计数,及时回收不再活跃的兜底临时寄存器。
+// 空函数体直接发射 ret。末尾用 .size 记录函数大小并清空本函数的临时状态。
 void AsmPrinter::emitFunction(const MachineFunction &function) {
   prepareVirtualRegTemps(function);
   currentFunction_ = &function;
@@ -578,6 +635,12 @@ void AsmPrinter::emitFunction(const MachineFunction &function) {
   freeFprTemps_.clear();
 }
 
+// 把单条 MIR 指令翻译成 ARM64 汇编，这是 ISA 翻译的核心。按操作码分派：
+// mov/fmov 做寄存器与位模式搬移，movz+movk 物化立即数，add/sub 处理立即数，
+// 逻辑立即数按位掩码编码，移位，smull 做 64 位乘法，madd/msub/smaddl/smsubl 乘加融合，
+// sdiv+msub 求余，cmp+cset 比较置位，csel 条件选择，fcvtzs/scvtf 浮点与整数互转，
+// 访存，内联 memcpy/memset，bl/ret/cbz/b.cond/b 控制流，sxtw 符号扩展。
+// 每类先做操作数形态校验（不合法即抛 BackendError），再按对应助记符输出。
 void AsmPrinter::emitInstr(const MachineInstr &instr) {
   switch (instr.opcode) {
   case Opcode::COPY:
@@ -620,7 +683,7 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     }
     return;
   case Opcode::FMV_W_X:
-    // 把整数寄存器的位模式搬进浮点寄存器（bitcast i32->f32）。
+    // 把整数寄存器的位模式搬进浮点寄存器（i32 到 f32 的 bitcast）。
     // GPR 侧恒为 32 位 w 形式（含 wzr），fmov s, w。
     if (instr.defs.empty() || instr.uses.empty()) {
       throw BackendError("malformed FMV_W_X instruction");
@@ -629,7 +692,7 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
          << operandRegAt(instr.uses.front(), RegClass::GPR32) << '\n';
     return;
   case Opcode::FMV_X_W:
-    // 把浮点寄存器的位模式搬进整数寄存器（bitcast f32->i32）。
+    // 把浮点寄存器的位模式搬进整数寄存器（f32 到 i32 的 bitcast）。
     // GPR 侧恒为 32 位 w 形式，fmov w, s。
     if (instr.defs.empty() || instr.uses.empty()) {
       throw BackendError("malformed FMV_X_W instruction");
@@ -1216,6 +1279,10 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
   }
 }
 
+// 为兜底虚拟寄存器指派做准备(在寄存器分配未覆盖时才用到)。
+// 清空映射与计数,按是否叶子函数选择整型/浮点临时寄存器池(逆序压栈,便于从尾部弹出),
+// 再统计每个虚拟寄存器的 use/def 次数,供后续按活跃度回收临时寄存器。
+// 注:PARALLEL_COPY 的 def 计数额外加一,以避免其目的寄存器被过早回收。
 void AsmPrinter::prepareVirtualRegTemps(const MachineFunction &function) {
   gprVRegMap_.clear();
   fprVRegMap_.clear();
@@ -1255,12 +1322,14 @@ void AsmPrinter::prepareVirtualRegTemps(const MachineFunction &function) {
   }
 }
 
+// 指令发射后:对其每个 use 递减使用计数,计数归零则回收对应临时寄存器。
 void AsmPrinter::releaseInstrUses(const MachineInstr &instr) {
   for (const MachineOperand &use : instr.uses) {
     releaseOperandUse(use);
   }
 }
 
+// 指令发射后:若某 def 的虚拟寄存器只被定义一次且已无剩余使用,则回收它(死定义)。
 void AsmPrinter::releaseDeadDefs(const MachineInstr &instr) {
   for (const MachineOperand &def : instr.defs) {
     if (def.kind != OperandKind::Reg || def.regValue.physical) {
@@ -1277,6 +1346,7 @@ void AsmPrinter::releaseDeadDefs(const MachineInstr &instr) {
   }
 }
 
+// 递减单个 use 操作数的剩余使用计数;归零时若无多重定义待处理则回收其临时寄存器。
 void AsmPrinter::releaseOperandUse(const MachineOperand &operand) {
   if (operand.kind != OperandKind::Reg || operand.regValue.physical) {
     return;
@@ -1298,6 +1368,7 @@ void AsmPrinter::releaseOperandUse(const MachineOperand &operand) {
   }
 }
 
+// 把某虚拟寄存器占用的物理临时寄存器归还对应空闲池,并从映射表中移除。
 void AsmPrinter::releaseVirtualReg(MachineReg reg) {
   if (reg.rc == RegClass::FPR32) {
     auto mapped = fprVRegMap_.find(reg.id);
@@ -1317,6 +1388,7 @@ void AsmPrinter::releaseVirtualReg(MachineReg reg) {
   gprVRegMap_.erase(mapped);
 }
 
+// 从整型临时池借一个物理寄存器(池空则报错),用于发射期临时值。
 PhysReg AsmPrinter::acquireScratchGpr() {
   if (freeGprTemps_.empty()) {
     throw BackendError("RISC-V GPR scratch register pool exhausted");
@@ -1326,6 +1398,7 @@ PhysReg AsmPrinter::acquireScratchGpr() {
   return reg;
 }
 
+// 归还借出的整型临时寄存器(NoReg 表示未借,忽略)。
 void AsmPrinter::releaseScratchGpr(PhysReg reg) {
   if (reg == PhysReg::NoReg) {
     return;
@@ -1494,6 +1567,8 @@ AsmPrinter::memoryBaseReg(const MachineOperand &base, int64_t &offset) {
   return {resolveMemoryBase(base, offset), PhysReg::NoReg};
 }
 
+// 把寄存器操作数解析成物理寄存器:物理寄存器直接取,虚拟寄存器走兜底指派。
+// 这是需要拿到 PhysReg 本身(而非名字)的统一入口,如挑宽度/判浮点时。
 PhysReg AsmPrinter::regForOperand(const MachineOperand &operand) {
   if (operand.kind != OperandKind::Reg) {
     throw BackendError("expected register operand");
@@ -1505,6 +1580,8 @@ PhysReg AsmPrinter::regForOperand(const MachineOperand &operand) {
   return reg.physical ? reg.phys : assignVirtualReg(reg);
 }
 
+// 为一个虚拟寄存器指派物理临时寄存器(兜底路径)。已指派过则复用映射;
+// 否则从对应类别(浮点/整型)的空闲池取一个记入映射,池空则报错。
 PhysReg AsmPrinter::assignVirtualReg(MachineReg reg) {
   if (reg.rc == RegClass::FPR32) {
     auto existing = fprVRegMap_.find(reg.id);
@@ -1538,7 +1615,7 @@ PhysReg AsmPrinter::assignVirtualReg(MachineReg reg) {
 }
 
 std::string AsmPrinter::operandReg(const MachineOperand &operand) {
-  // 按操作数的 RegClass 选择寄存器宽度：GPR32->w，GPR64->x，FPR32->s。
+  // 按操作数的 RegClass 选择寄存器宽度：GPR32 用 w，GPR64 用 x，FPR32 用 s。
   if (operand.kind != OperandKind::Reg) {
     throw BackendError("expected register operand");
   }

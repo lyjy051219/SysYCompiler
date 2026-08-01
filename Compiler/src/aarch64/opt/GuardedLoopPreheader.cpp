@@ -12,10 +12,28 @@
 #include <vector>
 
 namespace aarch64 {
+// Guarded Loop Preheader pass 的公共实现。
+//
+// 作用：针对可能零次执行（zero-trip）的循环，避免在“循环体一次都不进”时白白
+// 执行预头里那些较昂贵但可推测的计算。做法是把预头拆成两部分：计算循环 guard
+// 条件所需的指令切片留在原预头，其余昂贵计算移入一个新插入的 compute 块；然后
+// 在原预头放置一个 guard 分支，当 guard 判定循环不会进入时直接跳到 exit，跳过 compute
+// 块。这样零次迭代的路径不再付出昂贵计算的代价，正常进入循环则照常执行。
+//
+// 流水线位置：寄存器分配前（Pre-RA）的机器函数级 pass，依赖机器 CFG、活跃性、
+// 循环分析。要求预头里被搬移的指令都是无副作用、可推测执行的纯虚拟寄存器运算。
+//
+// RISC-V 与 ARM64 两后端使用相同实现
+// 两后端各保留一份相同实现。
+
 namespace {
 
+// 只有当可搬移计算的总开销达到此阈值时才值得插入 guard，避免为省一点点计算反而
+// 增加一个分支与一个块的额外成本。
 constexpr unsigned kMinGuardedCost = 8;
 
+// 一个可施加 guard 变换的候选：预头/header 块下标、可省下的计算开销、预头指令中
+// 哪些属于 guard 切片（保留在预头）的位图，以及构造好的 guard 分支指令。
 struct Candidate {
   std::size_t preheader = 0;
   std::size_t header = 0;
@@ -24,6 +42,7 @@ struct Candidate {
   MachineInstr guard;
 };
 
+// 是否是条件分支操作码。
 bool isConditionalBranch(Opcode opcode) {
   switch (opcode) {
   case Opcode::BEQZ:
@@ -38,6 +57,7 @@ bool isConditionalBranch(Opcode opcode) {
   }
 }
 
+// 求条件分支的反转操作码（guard 需要把 header 的“进入循环”条件反转为“跳过循环”）。
 std::optional<Opcode> invertedBranch(Opcode opcode) {
   switch (opcode) {
   case Opcode::BEQZ:
@@ -57,10 +77,12 @@ std::optional<Opcode> invertedBranch(Opcode opcode) {
   }
 }
 
+// 操作数是否是虚拟寄存器（非物理寄存器）。
 bool isVirtualRegister(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical;
 }
 
+// 取指令唯一的块目标标签到 target；有多个或没有块目标返回 false。
 bool hasSingleBlockTarget(const MachineInstr &instr, std::string &target) {
   target.clear();
   for (const MachineOperand &use : instr.uses) {
@@ -75,6 +97,7 @@ bool hasSingleBlockTarget(const MachineInstr &instr, std::string &target) {
   return !target.empty();
 }
 
+// 把指令唯一的块目标就地改写为 target；有多个或没有块目标返回 false。
 bool replaceSingleBlockTarget(MachineInstr &instr, const std::string &target) {
   MachineOperand *blockUse = nullptr;
   for (MachineOperand &use : instr.uses) {
@@ -93,6 +116,9 @@ bool replaceSingleBlockTarget(MachineInstr &instr, const std::string &target) {
   return true;
 }
 
+// 判断一条条件分支是否形态规范：是条件分支且为终结指令、无副作用、无 def、无
+// 隐式操作数，且寄存器操作数个数（BEQZ/BNEZ 为 1，其余为 2）与恰一个块目标匹配。
+// 只有规范分支才能安全地被复制、反转并改目标以充当 guard。
 bool wellFormedConditionalBranch(const MachineInstr &instr) {
   if (!isConditionalBranch(instr.opcode) || !instr.terminator ||
       instr.sideEffects || !instr.defs.empty() || !instr.implicitDefs.empty() ||
@@ -116,6 +142,7 @@ bool wellFormedConditionalBranch(const MachineInstr &instr) {
   return registers == expectedRegisters && blocks == 1;
 }
 
+// 判断一条指令是否是形态规范的无条件跳转（J，唯一块目标写入 target）。
 bool wellFormedJump(const MachineInstr &instr, std::string &target) {
   return instr.opcode == Opcode::J && instr.terminator && !instr.sideEffects &&
          instr.defs.empty() && instr.implicitDefs.empty() &&
@@ -123,6 +150,10 @@ bool wellFormedJump(const MachineInstr &instr, std::string &target) {
          hasSingleBlockTarget(instr, target);
 }
 
+// 判断预头里一条指令是否可被安全地推测执行并搬到 guard 之后（compute 块）。要求
+// 无副作用、非终结、所有 def 都是虚拟寄存器、use 只含寄存器或立即数，且操作码
+// 属于白名单里的纯算术/逻辑/移位/比较/浮点等无陷阱指令。只有这样，把它挪到
+// guard 分支之后（可能不执行）才不会改变程序语义。
 bool isSpeculatablePreheaderInstruction(const MachineInstr &instr) {
   if (instr.sideEffects || instr.terminator || instr.defs.empty() ||
       !instr.implicitDefs.empty() || !instr.implicitUses.empty()) {
@@ -187,6 +218,7 @@ bool isSpeculatablePreheaderInstruction(const MachineInstr &instr) {
   }
 }
 
+// 各操作码的近似执行开销权重，用于估算可搬移计算能省下多少，决定是否值得 guard。
 unsigned instructionCost(const MachineInstr &instr) {
   switch (instr.opcode) {
   case Opcode::FDIV_S:
@@ -202,6 +234,7 @@ unsigned instructionCost(const MachineInstr &instr) {
   }
 }
 
+// 建立“块标签 -> 块下标”的映射，便于按分支目标标签定位块。
 std::map<std::string, std::size_t> blockIndices(const MachineFunction &mf) {
   std::map<std::string, std::size_t> result;
   for (std::size_t index = 0; index < mf.blocks.size(); ++index) {
@@ -210,6 +243,8 @@ std::map<std::string, std::size_t> blockIndices(const MachineFunction &mf) {
   return result;
 }
 
+// 统计每个虚拟寄存器在整个函数中被定义的次数（phi 消除后可能非 SSA、有多次
+// 定义），用于识别哪些寄存器是唯一定义、可安全搬移。
 std::map<uint32_t, std::size_t>
 virtualDefinitionCounts(const MachineFunction &mf) {
   std::map<uint32_t, std::size_t> result;
@@ -225,6 +260,10 @@ virtualDefinitionCounts(const MachineFunction &mf) {
   return result;
 }
 
+// 计算预头 [0, computeEnd) 中必须保留在 guard 之前（guard 切片）的指令位图。 guard 切片
+// 是计算 guard 条件所必需的那部分。做法：先把任何“多次定义”的寄存器所在指令强制
+// 保留（phi 消除留下的非 SSA 拷贝与 use-before-def 无法可靠搬移），再从 guard 条件
+// 的 use 出发，不依赖指令顺序地做定义-使用闭包，凡定义了被需要值的指令都并入切片。
 std::vector<bool> retainedDependencySlice(
     const MachineBasicBlock &preheader, std::size_t computeEnd,
     const MachineInstr &condition,
@@ -285,6 +324,10 @@ std::vector<bool> retainedDependencySlice(
   return slice;
 }
 
+// 校验 guard 切片与 compute 切片可以按“guard 切片整体前移、compute 切片整体后移”
+// 的方式重排而不破坏依赖：若某条 compute 指令使用了某个 guard 切片寄存器，而该寄存器
+// 在 guard 切片中的最后一次定义位置排在这条 compute 指令之后，则重排会产生
+// use-before-def，返回 false 拒绝。
 bool partitionCanReorder(const MachineBasicBlock &preheader,
                          const std::vector<bool> &guardSlice) {
   std::map<uint32_t, std::size_t> lastGuardDefinition;
@@ -317,6 +360,7 @@ bool partitionCanReorder(const MachineBasicBlock &preheader,
   return true;
 }
 
+// 由 header 与 latch 反向沿前驱收集自然循环的成员块（不越过 header）。
 std::set<int> naturalLoopMembers(int header, int latch,
                                  const MachineCFGAnalysis::Result &cfg) {
   std::set<int> members{header, latch};
@@ -336,6 +380,7 @@ std::set<int> naturalLoopMembers(int header, int latch,
   return members;
 }
 
+// 块是否以一条到 target 的无条件跳转结尾，且此前没有其他终结指令。
 bool blockEndsWithJumpTo(const MachineBasicBlock &block,
                          const std::string &target) {
   if (block.instrs.empty()) {
@@ -350,12 +395,23 @@ bool blockEndsWithJumpTo(const MachineBasicBlock &block,
       [](const MachineInstr &instr) { return instr.terminator; });
 }
 
+// exit 块是否含有 PHI。含 PHI 说明它有多个前驱、边特定的取值，插入 guard 会新增
+// 一条从预头直达 exit 的边，破坏其 PHI 语义，因此这类候选要排除。
 bool exitHasPhi(const MachineBasicBlock &block) {
   return std::any_of(
       block.instrs.begin(), block.instrs.end(),
       [](const MachineInstr &instr) { return instr.opcode == Opcode::PHI; });
 }
 
+// 针对一个 header 与其唯一 latch，检验并构造 guard 候选。要求严格的规范形态：
+// 循环恰好由 header 与 latch 两块组成；header 只有“条件分支 + 无条件跳转”两条
+// 指令，一个目标进入循环体、另一个是循环外的 exit；body(=latch) 单出口回到
+// header；header 只有唯一的循环外前驱且它正是紧邻其前的预头，预头单出口进 header，
+// exit 无 PHI。随后要求预头（去掉末尾跳转后）每条指令都可推测执行，切分出 guard
+// 切片与 compute 切片并验证可重排；估算 compute 开销需达到阈值；compute 定义的
+// 值必须唯一定义、且不在 exit 活跃、不被 guard 条件或循环外任何块使用（否则搬到可能
+// 不执行的 compute 块会出错）。最后由 header 分支复制出 guard：若原条件是“进入循环
+// 才走条件目标”，则反转，使 guard 在“循环不进入”时跳到 exit。
 std::optional<Candidate>
 buildCandidate(MachineFunction &mf, std::size_t headerIndex, int latchIndex,
                const MachineCFGAnalysis::Result &cfg,
@@ -392,6 +448,8 @@ buildCandidate(MachineFunction &mf, std::size_t headerIndex, int latchIndex,
   bool conditionalEnters = false;
   std::size_t bodyIndex = 0;
   std::size_t exitIndex = 0;
+  // 判定 header 两个出边哪个进循环体（=latch）、哪个是循环外 exit。conditionalEnters
+  // 记录“进入循环”的是条件分支目标还是 fallthrough 跳转目标，决定 guard 是否需反转。
   if (conditionalTarget == static_cast<std::size_t>(latchIndex) &&
       members.count(static_cast<int>(jumpTarget)) == 0) {
     conditionalEnters = true;
@@ -524,6 +582,7 @@ buildCandidate(MachineFunction &mf, std::size_t headerIndex, int latchIndex,
   return candidate;
 }
 
+// 为新插入的 compute 块生成一个在函数内唯一的标签（预头标签加后缀，冲突则递增）。
 std::string uniqueComputeLabel(const MachineFunction &mf,
                                const std::string &preheaderLabel) {
   const std::string base = preheaderLabel + ".guarded_compute";
@@ -540,6 +599,9 @@ std::string uniqueComputeLabel(const MachineFunction &mf,
   return candidate;
 }
 
+// 落地一个候选：把预头指令按切片位图拆分——guard 切片留在预头、其余移入新建的
+// compute 块——预头末尾放置 guard 分支，compute 块插到 header 之前（guard 不跳过时
+// 顺序 fallthrough 进入），最后重建 CFG。
 void applyCandidate(MachineFunction &mf, Candidate candidate) {
   MachineBasicBlock &preheader = mf.blocks[candidate.preheader];
   MachineBasicBlock compute;
@@ -564,6 +626,9 @@ void applyCandidate(MachineFunction &mf, Candidate candidate) {
 
 } // namespace
 
+// pass 入口：扫描所有 header（只处理恰有唯一 latch 的回边），构造 guard 候选，取
+// 开销最大的一个应用。每次调用只变换一个候选，因为 CFG 改动会使上面取用的缓存
+// 分析失效；若要求不动点，交由调用方带着新分析重跑。返回是否修改了函数。
 bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
                                   MachineFunctionAnalysisManager &am) {
   if (mf.blocks.size() < 5) {

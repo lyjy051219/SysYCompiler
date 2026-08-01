@@ -6,13 +6,12 @@
 
 // ARM64 专用乘加融合：把「乘法结果只被一条加/减消费」的模式融合成单条
 // madd/msub（32 位）或 smaddl/smsubl（32x32+64，用于地址累加与 magic
-// multiply 取高位后的加法）。收益覆盖矩阵乘、fft、稀疏矩阵向量乘等所有
-// 乘累加与数组地址计算热点。
+// multiply 取高位后的加法）。适用于任意乘累加与数组地址计算的通用模式。
 //
 // 融合规则（均要求乘法结果为单次使用，且乘法在加/减之前、同一基本块内，
 // 两者之间乘数寄存器未被重定义）：
-//   ADD  d, x, mul(n,m)  或  ADD  d, mul(n,m), x  ->  MADD/SMADDL d, n, m, x
-//   SUB  d, x, mul(n,m)                            ->  MSUB/SMSUBL d, n, m, x
+//   形如 d = x + mul(n,m) 或 d = mul(n,m) + x 的加法，合并为 MADD/SMADDL d, n, m, x；
+//   形如 d = x - mul(n,m) 的减法，合并为 MSUB/SMSUBL d, n, m, x。
 // SUB 只在减数一侧是乘法时才可融合（d = x - n*m）。
 
 namespace aarch64 {
