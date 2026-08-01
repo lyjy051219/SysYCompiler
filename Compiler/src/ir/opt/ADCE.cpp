@@ -11,7 +11,8 @@
 bool ADCEPass::isRootLive(
     Instruction *I, PostDominatorTree &PDT,
     FunctionAnalysisPassManager &FAM) {
-    //Store、Ret、Call（纯函数/只读函数不活跃）、未知语义指令、无条件Br，以及无法到达真实出口的条件Br
+    //Store、Ret、Call（仅无写效果且已证明必然返回时可不活跃）、未知语义指令、
+    //无条件Br，以及无法到达真实出口的条件Br。
     if (dynamic_cast<StoreInst *>(I)) return true;
     if (dynamic_cast<RetInst *>(I)) return true;
     if (dceInstructionMustBePreserved(I)) return true; //未知的二元指令
@@ -20,7 +21,11 @@ bool ADCEPass::isRootLive(
             const SideEffectInfo &SEI =
                 FAM.getResult<SideEffectAnalysis>(*Callee);
             ModRefInfo MRI = getFunctionModRefInfo(SEI);
-            return MRI != ModRefInfo::NoModRef && MRI != ModRefInfo::Ref;
+            if (MRI != ModRefInfo::NoModRef && MRI != ModRefInfo::Ref)
+                return true;
+            //ModRef只描述内存与可观察效果；即使调用为纯/只读，也必须
+            //递归证明被调函数及其调用闭包全部有限返回后才能删除。
+            return !dceCallIsGuaranteedToReturn(CI);
         }
         return true;
     }

@@ -2759,12 +2759,12 @@ std::string SCEVResult::format(const SCEVExpr *E) const {
     }
     return "<bad-scev>";
 }
-//运行SCEV分析并返回绑定循环信息与支配树的按需结果
+
 SCEVAnalysis::Result
 SCEVAnalysis::run(Function &F, FunctionAnalysisPassManager &FAM) const {
-    //1.循环递推识别依赖 LoopInfo，退出形状验证依赖 DominatorTree。
+    //1.依赖LoopAnalysis和DominantAnalysis
     auto &Loops = FAM.getResult<LoopAnalysis>(F);
     auto &Dom = FAM.getResult<DominantAnalysis>(F);
-    //2.返回惰性上下文；值表达式和次数信息在查询时驻留并缓存。
+    //2.返回空SCEVResult，需要TransformPass显式调用
     return SCEVResult(&F, &Loops, &Dom);
 }

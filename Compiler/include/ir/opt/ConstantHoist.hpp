@@ -1,11 +1,9 @@
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
-
 class DominatorTree;
 class LoopInfo;
 
@@ -52,7 +50,6 @@ struct ConstantHoistCollectResult {
 //4. 在公共点生成基值，在各使用块生成偏移值并替换原常量。
 class ConstantHoistPass : public PassDescriptor<ConstantHoistPass> {
 public:
-    //把函数中可共享的大整数常量改写为公共基值加块内小偏移。
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:

@@ -1,5 +1,4 @@
 #pragma once
-
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
@@ -534,17 +533,13 @@ private:
     PhiInst *findPhiForAffineRec(const Loop *L, const SCEVAffineInfo &Affine);
 };
 
-//SCEVAnalysis是构建函数级标量演化结果的分析Pass
+//SCEV包装类
 class SCEVAnalysis : public AnalysisDescriptor<SCEVAnalysis> {
 public:
-    //分析Pass返回的结果类型
     using Result = SCEVResult;
-    //运行SCEV分析并返回绑定循环信息与支配树的按需结果
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 
 private:
-    //允许AnalysisDescriptor访问本分析Pass的唯一标识
     friend AnalysisDescriptor<SCEVAnalysis>;
-    //当前分析Pass的唯一标识
     inline static PassID Key;
 };
