@@ -406,6 +406,9 @@ struct CloneBlockRegionOptions {
     std::function<std::string(const BasicBlock *, std::size_t)>
         MakeBlockIdent;
     bool ClearTailCallFlags = false;
+    // 允许区域克隆复制计时调用及其可达包装调用；这只复制 Call 指令，
+    // 不会把计时运行库函数本身内联。默认关闭以保持其他 CFG 变换的屏障。
+    bool AllowTimingCallCloning = false;
 };
 
 // 保存源块到克隆块、源指令到克隆指令的完整对应关系。

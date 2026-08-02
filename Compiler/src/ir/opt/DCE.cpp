@@ -9,6 +9,38 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+//递归证明函数自身CFG和全部直接用户函数调用均必然有限返回。
+bool DCEPass::isGuaranteedReturningFunction(
+	Function &F,
+	std::unordered_map<Function *, ReturnProofState> &Memo) {
+	auto It = Memo.find(&F);
+	if (It != Memo.end())
+		return It->second == ReturnProofState::Proven;
+	Memo[&F] = ReturnProofState::Visiting;
+	if (!hasAcyclicReturningCFG(F)) {
+		Memo[&F] = ReturnProofState::Failed;
+		return false;
+	}
+	for (BasicBlock *BB : F) {
+		for (Instruction *I : *BB) {
+			auto *CI = dynamic_cast<CallInst *>(I);
+			if (!CI) continue;
+			//所有BuildInFunction均来自受支持的运行时声明；其可观察性由
+			//调用者在返回性证明之外单独通过ModRef/SideEffect门禁处理。
+			if (CI->getBuiltinCallee()) continue;
+			Function *Callee = CI->getDirectCallee();
+			if (!Callee ||
+				!isGuaranteedReturningFunction(*Callee, Memo)) {
+				Memo[&F] = ReturnProofState::Failed;
+				return false;
+			}
+		}
+	}
+	Memo[&F] = ReturnProofState::Proven;
+	return true;
+}
+
 //证明函数入口可达CFG无环且每条路径均以ret结束。
 bool hasAcyclicReturningCFG(Function &F) {
 	//1.1 三色 DFS 要求入口可达的每条路径都以 ret 结束且不存在回边；这同时
@@ -228,6 +260,17 @@ bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
 	}
 	return true;
 }
+
+//递归证明一次调用及其直接调用闭包必然有限返回。
+bool dceCallIsGuaranteedToReturn(CallInst *CI) {
+	if (!CI) return false;
+	if (CI->getBuiltinCallee()) return true;
+	Function *Callee = CI->getDirectCallee();
+	if (!Callee) return false;
+	std::unordered_map<Function *, DCEPass::ReturnProofState> Memo;
+	return DCEPass::isGuaranteedReturningFunction(*Callee, Memo);
+}
+
 //判断指令是否没有用户且不包含任何必须保留的语义。
 bool DCEPass::isDeletableInstruction(
 	Instruction* I, FunctionAnalysisPassManager& FAM) {

@@ -9,7 +9,6 @@
 #include <set>
 #include <stack>
 #include <unordered_map>
-
 class BlockInfo;
 struct AllocaInfo;
 
@@ -28,10 +27,8 @@ struct Mem2RegRenameFrame {
 //流程：1. 筛选只被直接标量 load/store 使用的入口 alloca；
 //2. 先走无 PHI 快速路径；3. 以活跃性裁剪 IDF 并放置 PHI；
 //4. 沿支配树重命名 load/store；5. 删除内存指令并迭代折叠退化 PHI。
-//timer 不访问 SysY 程序对象，因此不会阻止纯 SSA 表示提升。
 class PromotePass : public PassDescriptor<PromotePass> {
 public:
-    //把函数入口中所有可提升的标量alloca转换为SSA值。
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
     //循环执行快速路径、裁剪PHI放置和支配树重命名直到不再发生提升。
@@ -69,7 +66,6 @@ struct AllocaInfo{
     //标记alloca的全部访问是否位于同一个基本块。
     bool OnlyUsedOneBlock;
 
-    //清空访问摘要并恢复默认状态。
     void clean();
 
     //扫描alloca的使用并建立访问块、唯一store和单块属性摘要。

@@ -5,7 +5,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
-#include "ir/opt/GepOpt.hpp"
+#include "ir/opt/GepCombine.hpp"
 #include "lib/IRUtils.hpp"
 #include <cstring>
 #include <limits>

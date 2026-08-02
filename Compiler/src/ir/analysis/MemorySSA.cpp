@@ -60,12 +60,10 @@ MemoryAccess *MemorySSAResult::createAccess(MemoryAccess::Kind K,
     return OwnedAccesses.back().get();
 }
 
-//建立正向使用边；同一个Phi可能从多个前驱接入同一状态，Users只保留一个节点
+//建立正向使用边：某个内存状态 → 后续使用该状态的节点
 void MemorySSAResult::addUser(MemoryAccess *Definition,
                               MemoryAccess *User) {
     if (!Definition || !User) return;
-    //普通Use/Def只会建立一次DefiningAccess，直接追加避免LiveOnEntry拥有大量
-    //读取者时退化成平方复杂度；只有Phi可能从多条CFG边重复接入同一状态。
     if (!User->isPhi() ||
         std::find(Definition->Users.begin(), Definition->Users.end(), User) ==
             Definition->Users.end())
@@ -223,7 +221,16 @@ MemoryAccess *MemorySSAResult::getClobberingAccess(
     //稀疏构图下Phi可能位于多个透明Def之后，不能只检查一层前驱
     return Result.NearestPhi;
 }
-
+//查询接口3：从ToState反向遍历到From执行后的内存边界，查询是否有可能修改的位置
+/*
+从 ToState 沿 DefiningAccess / MemoryPhi::IncomingAccesses 反向遍历，检查每一条内存状态路径能否无冲突地到达 From 执行后的状态
+不同节点的处理方式是：
+MemoryUse：不修改内存，直接向前遍历。
+MemoryDef：先用 AA/ModRef 判断是否可能修改 Location；不冲突才能继续。
+MemoryPhi：分叉遍历所有 incoming 路径。
+Boundary：成功到达 From 执行后的内存状态。
+LiveOnEntry：未到 Boundary 就到入口，说明存在绕过 From 的路径，失败。
+*/
 bool MemorySSAResult::hasClobberBetween(
     Instruction *From, MemoryAccess *ToState,
     const MemoryLocation &Location, BasicAAResult &AA,
@@ -589,6 +596,7 @@ MemorySSAResult MemorySSAAnalysis::run(
     }
 
     //5.沿着支配树进行rename
+    //连接节点之间的DefiningAccess，Users边，以及每个块的入口和出口内存状态
     for (BasicBlock *BB : DT.getBlocksInPreOrder()) {
         if (!BB) continue;
         MemoryAccess *Inherited = Result.LiveOnEntry;
@@ -610,7 +618,7 @@ MemorySSAResult MemorySSAAnalysis::run(
         Result.BlockExits[BB] = Current;
     }
 
-    //6.处理不可达块
+    //6.处理不可达块：所有不可达块挂到LiveOnEntry上
     for (BasicBlock *BB : F) {
         if (!BB || DT.getNode(BB)) continue;
         MemoryAccess *Current = Result.LiveOnEntry;

@@ -1,7 +1,6 @@
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
-
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>

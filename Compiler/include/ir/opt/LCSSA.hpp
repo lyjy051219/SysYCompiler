@@ -1,5 +1,4 @@
 #pragma once
-
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/opt/NewPassManager.hpp"
@@ -15,7 +14,6 @@
 //4. 改写所有跨边界 use，并把新 PHI 加入工作队列直至局部收敛。
 class LCSSAPass : public PassDescriptor<LCSSAPass> {
 public:
-	//为函数中的循环内定义建立出口PHI并改写全部跨循环边界使用。
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 	//检查循环外使用是否都通过位于退出块的合法LCSSA PHI。
 	static bool isLCSSAForm(Loop *L);
