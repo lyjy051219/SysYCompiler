@@ -1104,147 +1104,49 @@ graph TD
 
 ##### SideEffect--副作用分析
 
-实现**跨函数副作用分析**
+实现**跨函数副作用分析**，支持指令级，函数级副作用分析
 
-> 拓展：实现Select的支持
+- 算法规则：
 
-- Sylib:sysy运行时库函数：
+  1. 基址与基址传播
 
-  ```c
-  getint
-  getch
-  getfloat
-  getarray
-  getfarray
-  putint
-  putch
-  putarray
-  putfloat
-  putfarray
-  putf
-  starttime
-  stoptime
-  before_main
-  after_main
-  _sysy_starttime
-  _sysy_stoptime
-  ```
+     基址规则：
 
-  LLVM内置函数：
+      * 指针形参、全局变量和alloca的基址都是自身
+      * 一个指针可以具有多个已知基址
 
-  ```
-  memcpy
-  ```
+     指令传播规则：
 
-- 算法流程：
+      * GEP：继承base pointer的基址
+      * BitCast：继承操作数的基址
+      * PHI：合并所有incoming指针的基址
+      * Select：合并true和false指针的基址
+      * 局部指针槽Load：合并所有曾Store进该槽的指针值的基址
 
-  1. 构建基地址集合
+  2. 指令副作用收集规则：处理Load、Store和Call三类指令
 
-     1. 遍历函数所有形参中的指针，收集它们的基地址--就是他们自己
+     Load/Store：
 
-     2. 遍历函数中所有Alloca，收集他们的基地址--就是他们自己
+      * Load：将指针的所有外部基址（全局变量或形参）加入RefSet
+      * Store：将指针的所有外部基址（全局变量或形参）加入ModSet
+      * 局部alloca基址不加入RefSet或ModSet
 
-     3. 不动点迭代，遍历函数中所有指令
+     Call：
 
-        GEP，BitCast：获取他们的源指针，加入到该指令的基地址集合
+     函数最初的ModSet和RefSet由里面的load/store决定，或者由BulitinFunc决定
 
-        Phi：获取所有输入值的源指针，加入到该指令的基地址集合
+      * 普通直接调用：不动点迭代，Caller合并Callee的ModSet和RefSet
+      * 内置函数调用：
+         1. timer：不加入ModSet或RefSet，只标记可观察效果和顺序屏障
+         2. memcpy/memmove：目标指针加入ModSet，源指针加入RefSet
+         3.  memset：目标指针加入ModSet
+         4.  数组输入：指针实参加入ModSet
+         5. 数组输出：指针实参加入RefSet
+         6. 标量输入输出：不加入ModSet或RefSet，只标记可观察效果
 
-  2. 遍历函数中每一条指令，收集函数级ModSet和RefSet
+     
 
-     LOAD：先拿到他的基地址，遍历基地址，如果基地址是全局变量或者是形参，那么加入RefSet
-
-     STORE：先拿到他的基地址，遍历基地址，如果基地址是全局变量或者形参，那么标记为ModSet
-
-     CALL：先拿到它调用的目标函数Callee
-
-     - 如果Callee是Function（用户定义的）
-
-       - 遍历Callee的Mod集合
-
-         如果这个函数写了一个全局变量，将这个写到Call指令的Mod集合之中
-
-         如果这个函数写了一个形式参数，拿到Call中的实际的参数，然后遍历这个实际参数的Mod集合，将其加入到Call指令的Mod集合之中
-
-       - 遍历Callee的Ref集合
-
-         如果这个函数读了一个全局变量，将这个写到Call指令的Ref集合之中
-
-         如果这个函数写了一个形式参数，拿到Call中的实际参数，然后遍历这个实际参数的Ref集合，将其加入到Call指令的Ref集合之中
-
-       - 如果Callee之中有内置函数标志和Untracked标志，该Call指令的标记也立起来
-
-     - 如果Callee是BuildinFunction（syslib内置库函数）
-
-       ```
-       NoMemWrite：_sysy_starttime , _sysy_stoptime, getint, getch, getfloat, putint, putch, putfloat
-       MemWriteOnly (只写内存)：getarray, getfarray
-       MemReadOnly (只读内存)：putarray, putfarray, putf
-       MemReadWrite (既读又写)：memcpy
-       ```
-
-       - 如果Callee是Sysy的标准运行时库，将内置函数标志立起来
-
-       - 如果是Memcpy：获取它的第0个参数目标地址和第1个参数源地址
-
-         查出目标地址的基地址，如果是全局变量/形参那么就写入Mod集合里面
-
-         查出源地址的基地址，如果是全局变量/形参那么就写入Mod集合里面
-
-       - 如果函数被标记为Ref：将其实参传入的全局变量/形参加入到当前函数的Ref之中
-
-       - 如果函数被标记为Mod：将其实参传入的全局变量/形参加入到当前函数的Mod之中
-
-       - 没有进入上面任何一个分支，标注为Untracked
-
-- 接口：
-
-  1. 指令级副作用查询接口`getInstModRefInfo`
-
-     传入一个Value，一个Inst
-
-     如果LOAD指令，调用别名分析分析二者别名，如果无别名就是`NoModRef`,如果有别名就是`Ref`
-
-     如果STORE指令，调用别名分析分析二者别名，如果无别名就是`NoModRef`,如果有别名就是`Mod`
-
-     如果CALL指令，取出Callee和实参
-
-     1. 如果调用的是内置函数
-
-        如果是memcpy，计算第0个实参和Value的别名分析，重叠就是`Mod`，计算第1个实参和Value的别名分析，重叠就是`Ref`
-
-        如果是常规内置函数，如果函数属性是sylib那么NoModRef，如果有特定读写的内置函数，遍历它所有实参，调用别名分析计算实参与Value，如果重叠，贴上相应标签
-
-     2. 如果是普通函数
-
-        获取被调用函数的SideEffectInfo
-
-        如果有系统调用（**hasBuiltin == true**），直接`ModRef`
-
-        分别遍历Mod和Ref集合
-
-        1. 如果是全局变量，计算全局变量和Value别名分析
-        2. 如果是形参，找到对应的实参，计算实参与Value别名分析
-
-     3. 如果Untracked，返回`ModRef`
-
-     在上述过程中使用短路优化，即只要累计的副作用已经达到ModRef状态那么没必要继续遍历了，直接return即可
-
-  2. 函数级副作用查询接口`getFunctionModRefInfo`
-
-     如果存在系统调用(hasBuiltin == true)，直接返回`ModRef`
-
-     检查`RefSet`和`ModSet`，遍历里面的内容，如果含有一个不是常量的Value，那么就标记对应的`Mod`/`Ref`
-
-     最后合并`Mod Ref`标签即可
-
-  3. 循环级副作用分析&基本块级副作用分析：
-
-     循环级：遍历循环中所有基本块，每个进行副作用分析
-
-     基本块级：遍历基本块中所有指令，如果RET/ALLOCA直接副作用，如果CALL指令，拿到Callee，如果是内置函数/Untracked直接副作用，检查这个函数的ModSet/RefSet，如果Mod` 或 `ModRef直接副作用，如果STORE指令，如果被写入的指针是写的全局变量/形参的话直接副作用（换句话说只能写局部变量），然后检查ModRefInfo，沿着当前的CFG向下寻找指令，`getInstModRefInfo`检查，如果有任何指令Ref/ModRef这个指针，那么副作用
-
-  4.
+- 
 
 
 
