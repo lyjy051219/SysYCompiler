@@ -275,24 +275,11 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
     //同一个物理 GEP 可能从父地址族和自身根两次遇到，用集合保证只建一项。
     std::unordered_set<GetElementPtrInst *> SeenOldGEPs;
     for (Loop *L : Loops) {
-        //2.循环级合法性：要求规范预头/锁存块，不得含计时调用，且 SCEV 已
-        //证明完整迭代域无回绕，才能把整数递推等价替换成地址递推。
+        //2.循环级合法性：要求规范预头/锁存块，且 SCEV 已证明完整迭代域
+        //无回绕，才能把整数递推等价替换成地址递推。
         BasicBlock *PreHeader = nullptr;
         BasicBlock *Latch = nullptr;
         if (!L || !L->getLoopSimplifyForm(PreHeader, Latch)) continue;
-        bool HasTimingCall = false;
-        for (BasicBlock *LoopBB : L->getBlocksIncludingSubLoops()) {
-            if (!LoopBB) continue;
-            for (Instruction *LoopI : *LoopBB) {
-                auto *CI = dynamic_cast<CallInst *>(LoopI);
-                if (CI && CI->mayReachTimingCall()) {
-                    HasTimingCall = true;
-                    break;
-                }
-            }
-            if (HasTimingCall) break;
-        }
-        if (HasTimingCall) continue;
         auto Trip = SE.analyzeLoopTripCount(L);
         if (!Trip || !Trip->Valid || !Trip->ProvenNoWrap) continue;
         BasicBlock *Header = L->getHeader();
@@ -313,15 +300,7 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
             for (Instruction *I : *BB) {
                 auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
                 if (!GEP) continue;
-                //2.1 从预头插入位置到旧地址的路径不能跨计时屏障，否则会改变
-                //地址计算相对计时操作的动态次序。
-                Instruction *PreHeaderTerminator =
-                    PreHeader->getTerminator();
-                if (!PreHeaderTerminator ||
-                    F.hasTimingBarrierOnPath(
-                        PreHeader, PreHeaderTerminator->getPrev(), GEP)) {
-                    continue;
-                }
+                if (!PreHeader->getTerminator()) continue;
                 Value *Base = nullptr;
                 Value *Index = nullptr;
                 std::vector<IndexComponent> Prefix;
@@ -977,7 +956,7 @@ int LoopStrengthReductionPass::pointerIVLimit(const Loop *L) {
 //偏移组可让多个起点优先共享一个 IV，Used 标志防止候选被二次改写。
 bool LoopStrengthReductionPass::runAddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
                        DominatorTree &DT) {
-    //1—2.发现候选并完成结构、SCEV、支配、计时和无回绕验证。
+    //1—2.发现候选并完成结构、SCEV、支配和无回绕验证。
     std::vector<LSRCandidate> Candidates =
         collectCandidates(F, LI, SE, DT);
     if (Candidates.empty()) return false;

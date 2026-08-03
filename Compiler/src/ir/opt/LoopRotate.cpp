@@ -23,15 +23,7 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     (void)LI;
     BasicBlock *Header = L.getHeader();
     if (!Header) return false;
-    //2.语义筛选：旋转会复制 Header 并改变求值位置，所以循环子树中任何可达计时调用都使候选失效。
-    for (BasicBlock *BB : L.getBlocksIncludingSubLoops()) {
-        if (!BB) return false;
-        for (Instruction *I : *BB) {
-            auto *CI = dynamic_cast<CallInst *>(I);
-            if (CI && CI->mayReachTimingCall()) return false;
-        }
-    }
-    //2.1 结构入口：取唯一 PreHeader 和 Latch，并拒绝 Latch 本身退出的尾测循环，避免对已旋转形态重复处理。
+    //2.结构入口：取唯一 PreHeader 和 Latch，并拒绝 Latch 本身退出的尾测循环，避免对已旋转形态重复处理。
     BasicBlock *PreHeader = nullptr;
     BasicBlock *Latch = nullptr;
     if (!L.getLoopSimplifyForm(PreHeader, Latch)) return false;

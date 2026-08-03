@@ -1154,40 +1154,6 @@ graph TD
 
 #### TransformPass
 
-##### DCE
-
-依赖Side Effect
-
-函数内级联（递归删除）死代码消除
-
-- 算法流程：
-
-  1. 遍历目标函数中的所有指令
-
-     判断是否在工作队列之中（防止重复劳动），如果不在，调用下列的删除逻辑，然后开始处理工作队列里面的指令（直到处理完），调用下列的删除逻辑
-
-  2. 具体消除逻辑：
-
-     1. 检查：
-
-        如果这条指令还被其他指令使用，不行
-
-        如果是Terminator终结指令，不行
-
-        副作用：store不行，call(访问callee，调用副作用分析这个函数是不是只读，如果不是就是含副作用)
-
-        其他指令都可以
-
-     2. 执行消除：
-
-        遍历该指令所有操作数
-
-        获取每个操作数将指令I的这个操作数置空，如果操作数还有指令在使用它/该操作数就是该指令（自我引用），就跳过该操作数
-
-        检查该操作数是不是一条指令，如果是的话调用2.1的逻辑判断，如果满足判断条件就加入工作队列
-
-        处理完操作数就删除该指令
-
 ##### TailRecursionElimination尾递归消除
 
 依赖SideEffect
@@ -1494,68 +1460,6 @@ graph TD
 
 
 
-##### IfConversion
-
-引入Select指令
-
-优化前：
-
-```mermaid
-graph TD
-    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
-    classDef branch fill:#e2f0d9,stroke:#b2cba5,stroke-width:2px;
-    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
-
-    Pred["<b>Pred (前驱块)</b><br/>...<br/>%cond = icmp eq i32 %a, 0<br/>br i1 %cond, label %BB1, label %BB2"]:::pred
-
-    BB1["<b>BB1 (Then 块)</b><br/>%v1 = add i32 %x, 1<br/>br label %Succ"]:::branch
-    BB2["<b>BB2 (Else 块)</b><br/>%v2 = sub i32 %x, 1<br/>br label %Succ"]:::branch
-
-    Succ["<b>Succ (后继块)</b><br/>%res = phi i32 [ %v1, %BB1 ], [ %v2, %BB2 ]<br/>ret i32 %res"]:::succ
-
-    Pred -- "True" --> BB1
-    Pred -- "False" --> BB2
-    BB1 --> Succ
-    BB2 --> Succ
-```
-
-优化后
-
-```mermaid
-graph TD
-    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
-    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
-    classDef highlight fill:#fff2cc,stroke:#fbc58e,stroke-width:2px,stroke-dasharray: 5 5;
-
-    Pred["<b>Pred (前驱块)</b><br/><br/>%cond = icmp eq i32 %a, 0<br/><hr/><i> --- 从 BB1 和 BB2 提升上来的指令 ---</i><br/><b>%v1 = add i32 %x, 1</b><br/><b>%v2 = sub i32 %x, 1</b><br/><i> --- 新生成的 Select 指令 ---</i><br/><b>%res = select i1 %cond, i32 %v1, i32 %v2</b><br/><hr/>br label %Succ"]:::pred
-
-    Succ["<b>Succ (后继块)</b><br/><i></i><br/>ret i32 %res"]:::succ
-
-    Pred -- "无条件跳转" --> Succ
-
-```
-
-- 算法流程：
-
-  1. 获取当前基本块True块
-
-     只能有1个前驱和1个后继，前驱末尾是条件跳转（并且条件不是常量），获取该条件跳转指令
-
-     获取两个跳转路径目标：Dest0,Dest1
-
-     1. 如果Dest0和Dest1,其中有一个是当前块，一个是后继，那么标记没有else块
-     2. 如果Dest0和Dest1，其中有一个是当前块，一个不是后继（记做else），并且这个else块只有一个前驱和后继，标记有else块
-
-     如果该基本块和else块之中有Store，Load，Call，SDIV , UDIV , SREM, FDIV, FREM,不能IfConversion
-
-     待转换的基本块和else块中指令总数<=4（如果只有True块，那么它之中的指令数<=4）
-
-  2. 将该基本块和else块之中的指令除了终止指令全部移动到前驱块终止指令之前
-
-  3. 遍历后继块中所有Phi，创建Select指令，根据条件真假选择Phi之前对应的两个值，将生成的Select插入到前驱块的末尾，RAUW替换所有使用PHI的地方变成使用Select，删除后继块中的PHI指令
-
-  4. 修改前驱块的条件分支，变成无条件分支，指向后继块，删除当前块，如果有else块一并删除
-
 
 
 
@@ -1855,157 +1759,6 @@ graph TD
 
 
 
-
-
-##### LoopRotate循环旋转
-
-依赖Dominant和LoopInfo两个AnalysisPass
-
-目的：把一个传统的while结构转换成do-while结构
-
-循环内部少了一次无条件跳转，对CPU流水线指令和分支预测提升巨大
-
-- 算法流程：
-
-  顶层遍历：遍历Top-Level Loops，然后利用逆后序遍历去遍历每个loop
-
-  1. 循环可以Rotate条件1：
-
-     1. 满足LoopSimplify形式：
-
-        PreHeader：从Header的前驱中只能有一个来自循环外部的块（即PreHeader），并且这个PreHeader只能有一个后继就是Header（即无条件跳转）
-
-        Latch：Latch必须唯一
-
-        DedicatedExits：必须有，遍历所有从循环内部跳到循环外部的这些块，这些块的前驱只能来自循环内部
-
-  2. 循环可以Rotate条件2：
-
-     1. 循环只有1个/2个基本块，不进行Rotate
-     2. **循环只能有一个Exit Block**
-     3. Header必须以条件跳转结尾，并且Header是ExitingBlcok（一个分支跳到Exit Block）
-
-  3. 将Header的两个后继，Body作为NewHeader，Exit Block依旧作为Exit Block
-
-  4. 循环可以Rotate条件3：
-
-     1. **Exit Block的前驱只能是Header，并且唯一**
-     2. **Latch不能是ExitingBlock**，Latch后继必须是Header，并且只有一个后继
-     3. Body（NewHeader）的前驱只能是Header，并且唯一
-
-  5. Body（NewHeader）PHI折叠
-
-     无User：直接删除
-
-     **有LCSSA标记的不能删--这里需要更新LCSSA算法，看看怎样打上.lcssa标记**
-
-     PHI的输入值全部一样（但不是自我引用）：删除
-
-     RAUW删除
-
-  6. 核心Rotate1:将Header中的指令**clone到**PreHeader，并更新Body的PHI节点
-
-     1. 删除PreHeader中的无条件跳转指令
-
-     2. 准备Map：
-
-        Header->PreHeader->Body
-
-        [Header中旧 Phi 节点] -> [来自 PreHeader 的初始值]->[Body新建立的PHI]
-
-        [Header中普通指令] -> [存入PreHeader的指令]->[Body新建立的PHI]
-
-        Body新建立的PHI：输入值来自Header和PreHeader
-
-     3. 处理Header中的PHI节点
-
-        处理Body:在Body中建立一个新PHI节点，在原PHI节点中提取来自PreHeader的初始值作为新PHI的输入边（来源为PreHeader），提取原PHI节点中来自Latch的迭代值作为新PHI的输入边（来源为Header），更新Map
-
-     4. 处理Header的普通指令
-
-        处理PreHeader：遍历Header的普通指令，然后进行clone，然后根据上面的Map去更新这条克隆指令的usee，Use关系（即操作数），然后插入到PreHeader
-
-        处理Body：如果Body中用到了这个值，那么我们在Body中建立一个新PHI节点（后续步骤同3），更新Map，如果没用到就不用建立PHI了
-
-  7. 核心Rotate2：更新所有普通指令的Use关系
-
-     获取Map中所有来自Header的指令的Use，更新这些Use
-
-     1. 如果UserBlock在Header
-
-        普通指令不用管，PHI指令将Header的输入边替换为来自Body的输入边
-
-     2. 如果UserBlock在Body
-
-        如果这个User不是刚才Body建立的PHI，就将所有对Header的引用换成新建的这个PHI
-
-     3. 如果UserBlock在循环外部
-
-        更新ExitBlock：更新Exit中LCSSA PHI，添加来自PreHeader的输入边，如果不存在这么一个LCSSA，就重新建立一个PHI（输入来自PreHeader，和Header），重新建立需要去找这个Use替换成这个新PHI
-
-     4. 更新ExitBlock中不来自Header定义的但是传递到这里的LCSSA PHI，给他们添加一个来自PreHeader的输入
-
-  8. 核心Rotate3：CFG重连
-
-     去除PreHeader和Header连接，添加PreHeader与Body，PreHeader与Exit Block连接
-
-     更新Header的PHI：去除PreHeader的输入边
-
-     因为Header前驱只有Latch了，所以折叠PHI（逻辑同第6步）
-
-     **更新loopinfo的Header信息**
-
-  9. 常量折叠与修复LoopSimplify形式：
-
-     **修复PreHeader：**
-
-     1. 常量折叠：尝试折叠PreHeader中的Br条件分支，如果100%就能进入Body，那么就换成无条件分支，切断与ExitBlock的分支，这时PreHeader还可以做PreHeader
-     2. 如果不能进行折叠，直接在PreHeader和Body直接创建一个NewPreHeader，然后在这个NewPreHeader之中加入一个Br无条件跳转，修改PreHeader的Br分支--**这里好好读一读LoopSimplify相关逻辑**
-
-     **修复Dedicated Exits（独占出口块）：**
-
-     ExitBlock从只来自Header，变成来自PreHeader和Header，打破了Dedicated Exits的要求
-
-     所以我们在ExitBlock和PreHeader，Header中加入一个Exit，然后再无条件转接Exit--**这里好好读一读LoopSimplify相关逻辑**
-
-  10. 合并Header到Latch
-
-      删除Latch中无条件跳转，将Header中所有指令搬到Latch末尾，将Header的后继作为Latch的后继（更新CFG），修复和Header相关的PHI
-
-      删除Header
-
-  11. 更新支配树和LoopInfo
-
-- 图解
-
-  ```mermaid
-  graph TD
-      PreHeader --> Header
-      Header --> Body
-      Header --> Exit
-      Body --> Latch
-      Latch --> Header
-  ```
-
-  ```mermaid
-  graph TD
-      PreHeader --> Body
-      PreHeader --> Exit
-      Body --> Latch
-      Latch --> Header
-      Header --> Body
-      Header --> Exit
-  ```
-
-  ```mermaid
-  graph TD
-      PreHeader --> Body
-      PreHeader --> Exit
-      Body -->  Latch+Header
-      Latch+Header --> Body
-      Latch+Header --> Exit
-  ```
-
 ##### LICM循环不变量代码外提
 
 依赖AnalysisPass:Dominant,LoopInfo,BasicAliasAnalysis,SideEffect
@@ -2240,23 +1993,6 @@ graph TD
 
 #### TransformPass
 
-##### Mem2Reg
-
-将入口块中标量alloca转换为Phi，删除相应的load/store/alloca
-
-依赖AnalysisPass：Dominant
-
-在运行之前先运行CFGSimplify清除不可达块，运行之后也需要
-
-算法：使用LiveInBlock+IDF创建**PrunedPHI**，在Live裁剪之后的IDF处插入PHI
-
-![Mem2Reg使用LiveInBlocks与IDF创建Pruned PHI](assets/mem2reg-pruned-phi.png)
-
-参考资料：
-https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
-
-https://www.zhihu.com/question/41999500/answer/93243408
-
 ##### CFGSimplify
 
 - 算法流程：**该pass内部使用不动点循环，因为子优化之间会互相创造优化机会**
@@ -2335,6 +2071,76 @@ https://www.zhihu.com/question/41999500/answer/93243408
            修改基本块前驱末尾的跳转指令
 
            删除该基本块中的指令，删除该基本块
+
+
+
+##### IfConversion
+
+引入Select指令，避免小分支分支预测失败，暴露SCCP，GVNPRE等标量优化机会
+
+不能上提到Pred的指令：load/store，call，alloca，ret，div，rem，非常量shl/lshr/ashr
+
+收益模型：
+
+- TrueBB 指令数 + ElseBB 指令数 <= 4
+
+- Succ 中 PHI 数量不超过 3
+
+- 总加权成本<=6
+
+  其他指令成本1,MUL, FMUL, FADD, FSUB, FCMP成本2，SITOFP成本3
+
+可以处理两种CFG形状
+
+```
+Triangle：
+          ┌── TrueBB ──┐
+Pred ─────┤             ├── Succ
+          └─────────────┘
+Diamond：
+          ┌── TrueBB ──┐
+Pred ─────┤             ├── Succ
+          └── ElseBB ──┘
+```
+
+优化前：
+
+```mermaid
+graph TD
+    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
+    classDef branch fill:#e2f0d9,stroke:#b2cba5,stroke-width:2px;
+    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
+
+    Pred["<b>Pred (前驱块)</b><br/>...<br/>%cond = icmp eq i32 %a, 0<br/>br i1 %cond, label %BB1, label %BB2"]:::pred
+
+    BB1["<b>BB1 (Then 块)</b><br/>%v1 = add i32 %x, 1<br/>br label %Succ"]:::branch
+    BB2["<b>BB2 (Else 块)</b><br/>%v2 = sub i32 %x, 1<br/>br label %Succ"]:::branch
+
+    Succ["<b>Succ (后继块)</b><br/>%res = phi i32 [ %v1, %BB1 ], [ %v2, %BB2 ]<br/>ret i32 %res"]:::succ
+
+    Pred -- "True" --> BB1
+    Pred -- "False" --> BB2
+    BB1 --> Succ
+    BB2 --> Succ
+```
+
+优化后
+
+```mermaid
+graph TD
+    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
+    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
+    classDef highlight fill:#fff2cc,stroke:#fbc58e,stroke-width:2px,stroke-dasharray: 5 5;
+
+    Pred["<b>Pred (前驱块)</b><br/><br/>%cond = icmp eq i32 %a, 0<br/><hr/><i> --- 从 BB1 和 BB2 提升上来的指令 ---</i><br/><b>%v1 = add i32 %x, 1</b><br/><b>%v2 = sub i32 %x, 1</b><br/><i> --- 新生成的 Select 指令 ---</i><br/><b>%res = select i1 %cond, i32 %v1, i32 %v2</b><br/><hr/>br label %Succ"]:::pred
+
+    Succ["<b>Succ (后继块)</b><br/><i></i><br/>ret i32 %res"]:::succ
+
+    Pred -- "无条件跳转" --> Succ
+
+```
+
+
 
 
 
@@ -2550,6 +2356,23 @@ graph TD
     class ExitingBlock exitBlock;
 ```
 
+##### Mem2Reg
+
+将入口块中标量alloca转换为Phi，删除相应的load/store/alloca
+
+依赖AnalysisPass：Dominant
+
+在运行之前先运行CFGSimplify清除不可达块，运行之后也需要
+
+算法：使用LiveInBlock+IDF创建**PrunedPHI**，在Live裁剪之后的IDF处插入PHI
+
+![Mem2Reg使用LiveInBlocks与IDF创建Pruned PHI](assets/mem2reg-pruned-phi.png)
+
+参考资料：
+https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
+
+https://www.zhihu.com/question/41999500/answer/93243408
+
 ##### Global2Local
 
 将全局变量Local到非递归Main函数的Alloca，从而在Mem2Reg可以将其提升为寄存器变量
@@ -2558,7 +2381,11 @@ graph TD
 
 - 算法流程：
 
-  1. 
+  1. main可达的其他函数引用的全局变量拒绝转换
+
+  2. main无法到达的其他函数可以保留全局变量，并在main中创建alloca（全局变量只能放在store/load操作数，地址不能逃逸到其他指令，值还是正常使用）
+
+     在DFE删除死函数之后，需要使用DeadGlobalCleanup删除全局
 
 
 ##### Local2Global
@@ -2608,6 +2435,71 @@ entry:
 
 功能：删除只存在store无其他Use的global和store，删除无Use的global，只处理标量，不处理数组
 
+##### StoreOnlyGlobalElimination只写全局变量消除
+
+依赖AnalysisPass：SideEffect
+
+<p align="center">
+  <img src="assets/store-only-global-elimination.png" alt="StoreOnlyGlobalElimination 优化前后示意图" />
+</p>
+
+- 算法流程：
+
+  1. 对于每一个全局变量，分析读取他的load和call指令，建立RefInfo
+
+     call指令读取规则：只读Builtin，普通Func的RefSet
+
+     数组读取精度：只分析到第一维
+
+     > 只要 `A[2]` 下任意元素被读取，所有写向 `A[2][...]` 的 store 都会保留
+
+  2. store删除：
+
+     该全局变量没被读取：删除所有store
+
+     该全局变量读取：删除与RefInfo无关的store
+
+     其他情况保留
+
+  3. 对于没有任何写入的全局变量，将完整对象的 `load` 替换为全局初始化常量，删除load
+
+  4. 删除没有任何Use的全局变量
+
+
+##### ConstHoist大常量重写
+
+依赖AnalysisPass：Dominant
+
+减少i32大常量物化次数
+
+```
+entry:
+    br label %preheader
+preheader:
+    br label %loop
+loop:
+    %a = add i32 %x, 100000
+    %b = add i32 %y, 100008
+    %c = sub i32 %z, 100008
+    br i1 %cond, label %loop, label %exit
+->
+preheader:
+    %base = add i32 0, 100008 -- 基准值被提升到preheader
+    br label %loop
+loop:
+    %v100000 = add i32 %base, -8
+    %a = add i32 %x, %v100000
+    %b = add i32 %y, %base
+    %c = sub i32 %z, %base
+    br i1 %cond, label %loop, label %exit
+```
+
+目标常量：i32,>=2048
+
+改写只能：User为ADD/SUB/STORE/DIV/REM/移位**这些位置**
+
+算法规则：按照[组内最大值 - 组内最小值 < 2048]分组，每组选取使用次数最多的常量作为基准值，只有[每组大于3次使用或者在循环内>=2次使用]才可优化，在改写时，找支配这些基本块最近的公共支配块，在该块进行物化（如果在循环中就在preheader物化），每块中共用偏移加法
+
 ##### GepEvaluate折叠GEP
 
 功能：折叠掉空索引的GEP替换为基址，拆分GEP
@@ -2623,13 +2515,21 @@ entry:
                      i32 0, i32 %j
 ```
 
-##### GepCombine
-
-
-
-
-
 ##### DCE死代码消除
+
+依赖AnalysisPass：SideEffect
+
+按照Use-Def链级联删除死指令
+
+- 算法规则:
+
+  1. ret,br,store不可删
+
+  2. call条件删除：BuiltinFunc、直接/间接递归不可删，普通Callee函数NoModRef并且无store无Builtin内部调用
+
+     无User
+
+  3. 其他指令只需要判断无User，就直接可以删除
 
 ##### ADCE激进死代码消除
 
@@ -2717,8 +2617,6 @@ entry:
 
 
 
-
-
 ##### DeadFunctionElimination死函数消除
 
 目前在SysY2022之中，**函数只能通过Call指令进行调用**，没有其他调用方式，所以我们不需要考虑函数地址逃逸或者调用函数指针的情况
@@ -2726,6 +2624,10 @@ entry:
 - 算法逻辑：main函数一定Live ，从main函数开始，收集函数中可达基本块中的Call指令，将被Call指令调用的函数标记为Live，然后删除剩下的死函数即可 -- **可达调用图遍历**
 
 效果显著，把基本上全部死函数都消除掉了
+
+##### DSE死存储消除
+
+
 
 ##### LatePhiCleanup晚期PHI函数清理
 
@@ -2761,7 +2663,39 @@ entry:
 
 
 
+#### 循环优化
 
+##### LoopRotate 循环旋转
+
+目的：把一个传统的while结构转换成do-while结构
+
+依赖 AnalysisPass：DominantAnalysis、LoopAnalysis
+
+**前置形态**：要求 LoopSimplify + LCSSA；源码硬检查唯一 preheader/latch 和 exit，header 条件分支恰好一臂入环、一臂退出
+
+```mermaid
+flowchart LR
+    subgraph 转换前
+        P[PreHeader] --> H[Header]
+        H -->|true| B[Body]
+        H -->|false| E[Exit]
+        B --> L[Latch]
+        L --> H
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph 转换后
+        PT[原PreHeader] -->|false| E2[Exit]
+        PT -->|true| NP[New PreHeader]
+        NP --> B2[Body]
+        B2 --> L2[Latch+Header]
+        L2 -->|true| B2
+        L2 -->|false| DE[Dedicated Exit]
+        DE --> E2
+    end
+```
 
 
 
@@ -2773,3 +2707,1033 @@ entry:
 
 ### 参考资料
 
+##### LateStrengthReduce 晚期强度削减
+
+在后端前把残留的 i32 常量二次幂除法/余数降成移位、掩码或保持向零舍入的带符号偏置序列。
+
+- **依赖 AnalysisPass**：无；`run()` 不查询 `FAM`。
+- **支持 5 种转换形式**：
+  1. `udiv x, 2^k -> lshr x, k`；
+  2. `urem x, 2^k -> and x, 2^k - 1`；
+  3. 已证明 `x >= 0` 时，`sdiv x, 2^k -> ashr x, k`；
+  4. 已证明 `x >= 0` 时，`srem x, 2^k -> and x, 2^k - 1`；
+  5. 无法证明非负时，仅对 `sdiv x, 2` 生成符号偏置序列。
+
+```llvm
+%uq = udiv i32 %x, 8   ; -> lshr i32 %x, 3
+%ur = urem i32 %x, 8   ; -> and  i32 %x, 7
+
+; 可能为负的 sdiv x, 2，保持向零舍入
+%sign   = ashr i32 %x, 31
+%bias   = and  i32 %sign, 1
+%biased = add  i32 %x, %bias
+%q      = ashr i32 %biased, 1
+```
+
+非负证明采用深度 4 的有界递归，可识别非负常量、`zext`、两臂均非负的 `select`、清除符号位的 `and`、常量逻辑右移，以及满足条件的除余。其余可能为负的 signed 二次幂除法和余数保持不变。改写不改变 CFG，可保留支配、后支配与循环结构。
+
+
+
+##### DAE（Dead Argument Elimination）死参数消除
+
+跨直接调用图传播形参活性，并利用所有调用点的实参事实做参数特化、等价参数合并与函数签名收缩。
+
+- **依赖 AnalysisPass**：无；这是模块 Pass，`run()` 不查询 `MAM/FAM`。
+- **支持 4 个转换族**：
+  1. **全调用点共同值特化**：某形参在全部有效直接调用点均为同一常量，或同一 global 根加相同常量 GEP/bitcast 配方时，在函数体内用该值替换形参；本函数自递归且原样转发该 formal 的边不参与共同值冲突判定；
+  2. **全调用点冗余参数合并**：同类型参数在每个调用点都接收同一个非 `undef` SSA 值时，用前一个形参替换后一个；
+  3. **传递闭包死参删除**：参数只被继续转发到另一个死参数时也判死，统一从函数签名和全部直接调用中倒序删除；
+  4. **分组特化克隆**：按调用点局部常量、global 指针配方及实参等价类分组，建立 `f.spec.N`，从副本签名删除该组可特化/冗余的参数，只重定向该组外部调用。
+
+```llvm
+define i32 @f(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  ret i32 %x
+}
+
+define i32 @caller(i32 %v1, i32 %v2) {
+entry:
+  %r1 = call i32 @f(i32 %v1, i32 %v1)
+  %r2 = call i32 @f(i32 %v2, i32 %v2)
+  %sum = add i32 %r1, %r2
+  ret i32 %sum
+}
+
+; -> 函数体内 %b 的 use 改为 %a，随后签名收缩为 @f(i32 %a)
+```
+
+候选要求非保留签名且只有直接调用用途。global 指针配方仅允许常量索引 GEP/bitcast，最大深度 8。对分组特化：每函数最多生成 4 个特化副本，原函数最多 192 条指令，副本累计成本最多 384；单调用组只删除 1 个参数时，普通特化/含等价类特化的函数大小上限分别为 48/96。流程顺序为“共同值与等参特化 → DAE → 分组克隆 → 再 DAE”。
+
+##### CFGSimplify 控制流图简化
+
+把 CFG 与 PHI 的局部规则迭代到不动点，持续删除死边、传播已知条件、折叠 PHI 并合并或旁路基本块。
+
+- **依赖 AnalysisPass**：无。
+- **实际支持 8 个核心转换族**：
+  1. 删除非入口且无前驱或只有自前驱的块；
+  2. 折叠 `br cond, X, X` 和常量条件分支；
+  3. 若所有直接前驱的条件都能推出当前块条件为同一真值，折叠当前分支；
+  4. 合并 incoming 前驱与值映射完全一致的重复 PHI；
+  5. 穿透“常量布尔 PHI + 可选 xor true + branch”跳板，把每个前驱直接重定向到确定后继；
+  6. 规范布尔 PHI：全同值、两臂 0/1、多路 AND/OR/`select` 决策树，以及 i32 0/1 到 i1 再 `zext`；
+  7. 合并“当前块唯一前驱且前驱唯一后继”的线性块；
+  8. 旁路只含 PHI 和无条件分支的非入口跳板块，并把后继 PHI incoming 展开到跳板的全部前驱。
+
+```llvm
+; 两个互相独立的匹配片段
+const_branch:
+  br i1 true, label %T, label %F     ; -> br label %T
+same_target:
+  br i1 %c, label %T, label %T       ; -> br label %T
+
+; 布尔 PHI 穿透
+join:
+  %c = phi i1 [ true, %A ], [ false, %B ]
+  br i1 %c, label %T, label %F
+; -> A 直接跳 T，B 直接跳 F，join 删除
+```
+
+每次改边都会同步修复 successor PHI。布尔决策树最大深度为 6、最多新增 10 条指令；向上/向下控制链搜索约 4 层。可投机克隆的条件表达式只包含 ADD/SUB/MUL/AND/OR/XOR 和六种整数比较。这里的死块规则不是完整可达性 DFS，因此多块不可达 SCC 仍需其他清理暴露。
+
+##### FunctionMemoization 函数记忆化
+
+为纯、直接多重自递归的 i32/f32 标量函数插入固定容量直接映射缓存，命中时立即返回，未命中时执行原函数体并在返回前发布结果。
+
+> 源码正式名称是 `FunctionMemoization`；任务表中的 `FunctionMemorization` 是拼写错误，并不是仓库注册的别名。
+
+- **依赖 AnalysisPass**：`SideEffectAnalysis`；候选必须没有 builtin，且整体为 `NoModRef`。
+- **支持 1 种 CFG 变换**：
+
+```mermaid
+flowchart LR
+    Lookup[MemoLookup<br/>新函数入口：计算 hash / 检查 valid 与 keys<br/>概念流程]
+    Lookup -->|hit| Hit[MemoHit<br/>load result + ret]
+    Lookup -->|miss| Old[OriginalEntry<br/>原递归函数体]
+    Old --> R1[原 Ret 站点 1<br/>publish stores -> ret]
+    Old --> RN[原 Ret 站点 N<br/>publish stores -> ret]
+```
+
+每个函数建立 `valid[entries]`、每个参数一张 `key[entries]` 和 `result[entries]`。i32 直接作为键，f32 先按位 bitcast 为 i32；哈希从 `2166136261u` 开始，对每个参数执行 `(hash XOR key) * 16777619`，槽号为 `hash & (entries - 1)`。命中必须同时满足 `valid == 1` 和全部键逐项相等，因此碰撞只导致 miss/覆盖，不会返回错误结果。发布顺序严格为 `valid=0 -> keys -> result -> valid=1`。
+
+默认缓存 4096 槽，配置小于 16 或不是二次幂时回退到 4096；最多 4 个 i32/f32 参数，返回值也必须为 i32/f32，模块总缓存预算 256 KiB。函数至少有两个直接自递归点和一个外部调用点，且不能包含 alloca、load/store、GEP、指针值、非自调用、计时调用或不可达块；危险除余、非法移位、`fptosi`、`undef` 及未知操作也会拒绝候选。
+
+##### Reassociate 表达式重结合
+
+对整数 ADD/MUL/AND/OR/XOR/SUB 表达式进行确定性展平、排序、代数收缩和重建，迭代到不动点。
+
+- **依赖 AnalysisPass**：主算法无直接依赖；扫描无 use 的 call 时会按需查询 `SideEffectAnalysis`。
+- **支持 7 个核心转换族**：
+  1. 将 `sub a, b` 拆成 `%neg = mul b, -1` 与 `%r = add a, %neg`；
+  2. 展平单用户同 opcode 子树，按稳定 rank 排序并重建；
+  3. 常量归并及 `x+0 / x*1 / x*0`；
+  4. `x+x+... -> K*x`；
+  5. `x + (-1*x) -> 0`；
+  6. 提取覆盖项最多的公因式；
+  7. 乘积至少 4 项且有重复因子时复用平方。
+
+```llvm
+%p0 = mul i32 %a, %b
+%p1 = mul i32 %a, %c
+%r  = add i32 %p0, %p1
+; ->
+%s = add i32 %b, %c
+%r = mul i32 %a, %s
+
+; x*x*x*x
+%sq = mul i32 %x, %x
+%r  = mul i32 %sq, %sq
+```
+
+只处理整数；共享子表达式不会复制，而是作为叶保留。rank 由常量、参数、RPO 块序和指令序稳定确定，DIV/REM 叶使用最高 rank 使高延迟结果靠近根。候选定义链的计时屏障搜索预算为 256 个值。`PreserveAddressArithmetic=true` 时，沿整数转换 use 链最终进入 GEP 的表达式整体跳过，交给 GEPCombine/LSR；旧表达式树由后续 DCE 删除。
+
+##### SCEV 标量演化分析
+
+把整数 SSA 值惰性归一成驻留共享的符号 DAG，并从循环 header PHI 与退出比较派生递推、归纳变量、迭代次数、余数分解和无回绕事实。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`DominantAnalysis`。
+- **核心数据结构关系**：
+
+```mermaid
+flowchart TD
+    V[IR Value] --> VC[ValueCache]
+    VC --> DAG[Interned SCEVExpr DAG]
+    Phi[Header PHI] --> AddRec[AddRec @ Loop]
+    Phi --> OtherRec[MulRec / DivRec @ Loop]
+    AddRec -->|仅二项、degree 1| Aff[SCEVAffineInfo]
+    Aff --> TC[LoopTripCountInfo]
+    Cmp[ExitCmp] --> TC
+    Shape[LoopSimplify 形态] --> TC
+    TC --> IV[InductionDescriptor<br/>结合 TC.IndVar、Affine 与 PHI 入边]
+    TC --> BE[BackedgeCount]
+    TC --> Rem[LoopRemainderInfo]
+    Range[可选 RangeInfo] --> Step[SCEVStepRangeInfo / runtime no-wrap]
+```
+
+`SCEVExpr` 保存 `Kind、CastKind、Predicate、RawValue、RecLoop、ConstValue、Ty、Operands、Key`。22 种节点包括 Constant/Unknown，算术、移位、位运算、Binomial、Min/Max、Select、Cast、Compare，以及 AddRec/MulRec/DivRec；`Key` 用于 hash-cons，`ExprStorage` 保证节点指针稳定。
+
+`SCEVResult` 持有函数、LoopInfo、DominatorTree，以及 `Interned、ValueCache、ActiveValues、TripCountCache、BackedgeCountCache、LoopInductions`。结果是惰性的：`run()` 只绑定基础分析，`getSCEV` 首次查询时递归建图，并用 `ActiveValues` 把 SSA 环降为 Unknown。
+
+Header PHI 必须具有统一的循环外 Start 与循环内 Update。AddRec 递归抽取 ADD/SUB 中恰好一次出现的 self，其循环不变增量子表达式可包含 MUL/DIV 或合法 SHL；此外只把直接的 `phi * invariant`、`phi / invariant` 识别为 MulRec/DivRec，AddRec 阶数最高为 8。规范退出要求唯一 preheader/header/latch/exit，exiting 支配 latch，条件为当前循环 affine IV 与循环不变量 bound 的比较；仿射步长必须是非零常量且不能为 `INT64_MIN`。`<, <=, >, >=` 使用距离的向上取整计算次数，`!=` 只接受常量距离可被步长整除的情况。
+
+```llvm
+%i = phi i32 [ 0, %pre ], [ %next, %latch ]
+%next = add i32 %i, 2
+; -> SCEV: {0,+,2}<L>
+; 若条件为 %i < %N，则 trip count 为 max(0, ceil(N / 2))
+```
+
+该符号次数表达式本身不等于“循环已证明有限或无回绕”；变换 Pass 仍须单独检查 `Valid`、finite 与 `ProvenNoWrap` 等标志。
+
+递推、方向与安全查询递归深度上限为 64，穿 PHI/`select` 求精确常量的深度为 32。常量 i32 归纳的 `ProvenNoWrap` 要求宽整数计算出的末值仍在 i32；Range 增强的有限性证明可接受符号严格确定的循环不变步长，而专用运行时 preheader no-wrap 证明更保守，只接受直接 `+1/-1` 与严格 `</>`。
+
+##### IndVarSimplify 归纳变量简化
+
+用 SCEV 结构键发现重复整数递推，并以精确 SSA 形状再次把关，同时把退出比较统一成归纳变量位于左侧。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`。
+- **支持 2 种转换形式**：
+  1. **重复递推合并**：同一 header 中 PHI 的 SCEV `Key/RecLoop`、类型、incoming 前驱集合、循环外初值和回边更新 SSA 形状全部一致时，保留一个归纳 PHI；
+  2. **退出比较定向**：先要求 `analyzeLoopTripCount(L)` 返回有效的 `LoopTripCountInfo/ExitCmp`；若该退出比较右侧是本循环 affine IV、左侧不是，再交换操作数并反转谓词。
+
+```llvm
+header:
+  %i = phi i32 [ 0, %pre ], [ %i.next, %latch ]
+  %j = phi i32 [ 0, %pre ], [ %j.next, %latch ]
+  ; -> %j 的使用替换为 %i，删除 %j PHI
+  %c = icmp sgt i32 %bound, %i
+  ; -> %c = icmp slt i32 %i, %bound
+  br i1 %c, label %exit, label %latch
+latch:
+  %i.next = add i32 %i, 1
+  %j.next = add i32 %j, 1
+  br label %header
+```
+
+数学上 SCEV 相同并不足够：回边 Binary 的指令类型、opcode、类型及对应操作数必须完全同形，仅交换律 opcode 允许交换两侧。该 Pass 不展开 trip count、不改变 CFG；每次 `run()` 只处理第一个发生变化的循环，然后返回让固定点重新构建 SCEV。
+
+##### LoopDeletion 循环删除
+
+删除已证明有限、没有可观察行为，且循环外 SSA 使用能够完整修复的规范循环。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`。
+- **前置形态**：仅处理满足 `LoopSimplify + LCSSA` 的叶子循环；唯一 preheader/latch，所有离环边来自同一 exiting block 并到达同一 exit。
+- **支持 2 种删除形式**：
+  1. **零次迭代循环**：header 内指令必须可跳过；exit PHI 的循环内值能沿 header PHI 递归解析到 preheader incoming；
+  2. **有限无效循环**：常量次数具有 `ProvenNoWrap`，或运行时次数满足受限的 header 退出、i32 规范归纳和严格关系；循环内只有无可观察效果的纯计算/控制，exit PHI 为空或所有 incoming 均为同一循环外值。
+
+```llvm
+preheader:
+  br label %header
+header:
+  %i = phi i32 [ 0, %preheader ], [ %next, %latch ]
+  %cmp = icmp slt i32 %i, 0
+  br i1 %cmp, label %body, label %exit
+body:
+  br label %latch
+latch:
+  %next = add i32 %i, 1
+  br label %header
+exit:
+  %r = phi i32 [ %i, %header ]
+
+; ->
+preheader:
+  br label %exit
+; %r 的使用替换为 0，整个循环 CFG 删除
+```
+
+提交前会验证所有循环内定义的外部 use 都是计划中的 exit PHI。删除时先把 preheader 改接 exit，集中替换 PHI，再用 `undef` 断开残余 use，分两轮清空并删除循环块。该 Pass 不直接依赖 Dominant、BasicAA 或 SideEffect；CFG 改变后所有函数分析失效。
+
+运行时有限性后备证明只接受两种直接规范形态：步长 `+1` 配严格 `<`，或步长 `-1` 配严格 `>`；其余运行时循环即使直觉上会终止，也保持不变。
+
+##### LoopStrengthReduction（LSR）循环强度削减
+
+把循环内单一仿射变化维度的 GEP 地址计算，改写成 preheader 起始地址、header 指针 PHI 与 latch 递推 GEP。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`、`DominantAnalysis`。
+- **前置形态**：满足 `LoopSimplify`，SCEV 证明完整迭代域无回绕，循环中不存在可到达的计时调用。
+- **支持 2 种地址族改写**：
+  1. **完全同形共享**：循环、基址、步长、前后缀、类型和 SCEV 起点相同的 GEP 共用一个指针 IV；
+  2. **常量起点偏移共享**：形状相同但常量起点不同的地址，以最小起点为 anchor，其余地址由常量偏移 GEP 得到。
+
+```llvm
+; 转换前
+pre:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %pre ], [ %next, %latch ]
+  %idx = mul i32 %i, 4
+  %p = getelementptr i32, ptr %a, i32 %idx
+  %v = load i32, ptr %p
+  br label %latch
+latch:
+  %next = add i32 %i, 1
+  br label %loop
+
+; 转换后
+pre:
+  %p.start = getelementptr i32, ptr %a, i32 0
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %pre ], [ %next, %latch ]
+  %p.iv = phi ptr [ %p.start, %pre ], [ %p.next, %latch ]
+  %v = load i32, ptr %p.iv
+  br label %latch
+latch:
+  %next = add i32 %i, 1
+  %p.next = getelementptr i32, ptr %p.iv, i32 4
+  br label %loop
+```
+
+候选 GEP 链展平后必须恰有一个随当前循环变化的维度，活跃下标是非零常量步长的 affine SCEV；基址必须直接在 preheader 可用，起点与循环不变量维度既可直接可用，也可由 `SCEVExpander` 物化，每个待物化 SCEV 表达式各有 32 条新指令预算。地址族只能被 load/store 地址或单常量下标的派生 GEP 使用。最内层/外层循环最多创建 8/4 个指针 IV。
+
+常量次数下要求 `Iterations > SetupCost / PerIterationSaving`；未知次数必须证明至少执行一次，且每轮收益覆盖设置成本。CFG 不变，支配树、后支配树和循环树可保留。
+
+##### LoopUnswitch 循环分支外提
+
+在循环入口确定循环不变布尔条件，使循环内反复执行的 branch 或 `select` 变成常量控制。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`LoopAnalysis`、`SCEVAnalysis`；尝试 trivial 路径时额外查询 `MemorySSAAnalysis`。
+- **前置形态**：`LoopSimplify + LCSSA`，循环及子循环都不能到达计时调用。
+- **支持 3 种转换形式**：
+  1. **Trivial Unswitch**：候选分支一侧直接退出循环、一侧继续；将分支移到旧 preheader，创建新的继续 preheader，并在需要时拆共享 exit 修复 LCSSA；
+  2. **Entry-known Unswitch**：入口 guard 已证明条件恒真/恒假时，不克隆 CFG，直接替换循环内该条件的全部 use；
+  3. **Non-trivial Unswitch**：两侧都留在循环内时，保留较大的专门化闭包、克隆较小闭包，由 preheader 条件分派到两个常量化循环版本。
+
+```text
+Trivial：
+Before: pre -> header ... parent --cond--> exit / continue
+After : pre --cond--> exit / new.pre -> header
+                    loop 内 parent -> continue
+
+Non-trivial：
+Before: pre -> loop(parent 按 cond 选择 T/F)
+After : pre --cond--> true.pre  -> true.version
+                \---> false.pre -> false.version
+        （较大闭包保留，较小闭包克隆；原版并不固定对应 true 或 false）
+```
+
+Entry-known 证明支持布尔取反链及“变量与 i32 常量比较”的区间蕴含；入口链/支配 guard 深度上限 32，布尔取反剥离深度 8。Non-trivial 路径中被克隆的闭包最多 32 个块、192 条指令且不能含 call，加权规模不得超过原函数的 30%；克隆权重为 `指令数 + 3 * 块数 + 4 * exit PHI 数`。收益估算中的未知 trip count 取 1，已知值封顶为 64；`trip * 必经条件使用数 - 1` 必须严格大于克隆权重。每个函数最多执行一次完整版本克隆。
+
+##### BasicAliasAnalysis 基础别名分析
+
+按需构建指针来源摘要，并结合对象身份、PHI/`select` 路径、GEP 字节线性式和 SCEV 距离返回 `NoAlias / MayAlias / MustAlias`。
+
+- **依赖 AnalysisPass**：`SCEVAnalysis`；别名查询显式接收调用者的 `LoopInfo`。
+- **核心数据结构关系**：
+
+```mermaid
+flowchart TD
+    Run[BasicAliasAnalysis::run] --> Result[BasicAAResult]
+    Result --> Query[alias MemoryLocation A, B]
+    Result --> AC[AliasCache<br/>Value 对 -> AliasInfo]
+    Result --> OA[ObjectNoAlias<br/>互斥对象对]
+    Result --> PC[ProvenanceCache]
+    PC --> PI[PointerProvenanceInfo]
+    PI --> Bases[Bases / HasUnknownBase]
+    PI --> Offset[MinByteOffset / MaxByteOffset]
+    PI --> Obj[ObjectSize / Alignment]
+    Location[MemoryLocation<br/>Pointer + 可选 Size] --> Query
+    Query -->|从 Location.Pointer 查询| PC
+    Query --> LG[LinearGEP<br/>临时规范化结构：Base + Constant + Σ Index*Stride]
+```
+
+主流程先规范零偏移 GEP 和单输入 PHI；`undef` 来源返回 `MayAlias`，同一 SSA 指针直接返回 `MustAlias`。来源分析可穿过 GEP、bitcast、PHI 和 `select`；多来源指针只有在两个 base 集合笛卡尔积中的每一对都互斥时才给出 `NoAlias`。
+
+不同 `alloca`、不同 global、parameter 与 `alloca`、`alloca` 与 global 天然互斥。相同条件的两个 `select` 逐臂比较，同块 PHI 按 predecessor 一一配对；结论不一致退化为 `MayAlias`。同一底层对象的 GEP 被线性化：变量项抵消且偏移为 0 时为 `MustAlias`，访问字节区间分离时为 `NoAlias`；还可借正步长、有限、无回绕 SCEV 递推证明跨迭代距离。若查询只证明两个指针指向不同对象，但传入的是显式内存访问范围，则只有两侧访问都能证明落在各自对象边界内才保留 `NoAlias`，否则降级为 `MayAlias`。
+
+`PointerProvenanceInfo` 同时记录 bases、字节偏移区间、对象大小、已知对齐以及栈/全局/参数来源。来源和整数倍数查询各有 4096 个 SSA 节点预算，递归深度 64、单指针最多 64 个 base，PHI/`select` 的 MemoryLocation 展开深度为 32。函数只有直接调用用途时，还会从全部调用点为“形参对”及“形参—全局”播种对象互斥事实。
+
+##### DSE 死存储消除
+
+删除被后续完整覆盖、写入值本身冗余，或只影响未逃逸栈对象最终状态的 store。
+
+- **依赖 AnalysisPass**：`BasicAliasAnalysis`、`LoopAnalysis`、`MemorySSAAnalysis`；ModRef 查询会间接消费 `SideEffectAnalysis`。
+- **实现分为 4 层删除类别**：
+  1. **MemorySSA 全路径覆盖**：候选之后的每条内存路径都在首次读取/修改前遇到 `MustAlias` 且覆盖宽度不小于候选的 store；
+  2. **MemorySSA 同值冗余写**：所有反向路径都到达写入同一 SSA 值的完整覆盖 store；若在循环内，地址和值还须对每层循环不变；
+  3. **块内逆向覆盖**：从块尾维护尚未被观察的后继 store，load/call 按 Alias/ModRef 清除不再安全的候选；
+  4. **有界 CFG 后备**：把后继块分类为 `Kill / Clobber / Transparent`，每条可观察路径都必须先被覆盖；未逃逸 `alloca` 的最终写在返回路径上不可观察。
+
+```llvm
+; 以下是四个互相独立的节选
+; 1. 全路径覆盖
+entry.cover:
+  store i32 1, ptr %p
+  br i1 %c, label %L, label %R
+L:
+  store i32 2, ptr %p
+  br label %join.cover
+R:
+  store i32 3, ptr %p
+  br label %join.cover
+join.cover:
+  ret void
+; -> 第一条 store 删除
+
+; 2. 同值冗余写：第一次写在中间 load 处可观察，不能按覆盖删除
+same.value:
+  store i32 %v, ptr %p
+  %x = load i32, ptr %p
+  store i32 %v, ptr %p
+  ret i32 %x
+; -> 第二条由“已到达的同值写”证明为冗余并删除
+
+; 3. 块内后写覆盖
+local.overwrite:
+  store i32 1, ptr %p
+  store i32 2, ptr %p
+  ret void
+; -> 第一条 store 删除
+
+; 4. 未逃逸栈对象最终写
+dead.stack:
+  %a = alloca i32
+  store i32 7, ptr %a
+  ret void
+; -> store 删除
+```
+
+全路径覆盖/同值查询各最多处理 256 条 store，单次节点预算分别为 512/256；CFG 后备 BFS 最多访问 100 个块。第一层覆盖删除批次后会失效并重新获取 AA 与 MemorySSA；第二层同值删除后仍失效 MemorySSA，但后续阶段不再查询内存图，因而只重新获取 AA。CFG 不变，支配、后支配和循环结构可保留。
+
+##### LoadElimination 加载消除
+
+利用 MemorySSA、别名、支配和前驱数据流，把可证明未被修改的 load 转发成已有 SSA 值。
+
+- **依赖 AnalysisPass**：`BasicAliasAnalysis`、`LoopAnalysis`、`DominantAnalysis`、`MemorySSAAnalysis`；ModRef 查询间接依赖 `SideEffectAnalysis`。
+- **支持 5 类值转发**：
+  1. MemorySSA 多路径 store-to-load：所有最近 clobber 都是完整覆盖、`MustAlias` 且写入同一支配值；
+  2. MemorySSA load-to-load：两条 load 的 clobber 签名相同、地址 `MustAlias`，且候选支配目标并再次证明中间无写；
+  3. 块内最近 store/load 转发；
+  4. 循环内 load 复用循环外的支配 load，地址必须在目标循环外定义；
+  5. 汇合前驱值：所有前驱值相同则直接替换，不同则在目标块建立 PHI。
+
+转换前：
+
+```llvm
+entry:
+  br i1 %c, label %L, label %R
+L:
+  store i32 %a, ptr %p
+  br label %join
+R:
+  store i32 %b, ptr %p
+  br label %join
+join:
+  %x = load i32, ptr %p
+  ret i32 %x
+```
+
+转换后：
+
+```llvm
+entry:
+  br i1 %c, label %L, label %R
+L:
+  store i32 %a, ptr %p
+  br label %join
+R:
+  store i32 %b, ptr %p
+  br label %join
+join:
+  %x.forward = phi i32 [ %a, %L ], [ %b, %R ]
+  ret i32 %x.forward
+```
+
+查询结果使用 `KNOWN / PHI_NEEDED / CLOBBERED / UNKNOWN / NEED_PREDECESSORS` 五态，任一嵌套 PHI 需求、递归环或路径 clobber 都会停止转发。MemorySSA 快速层每次运行最多查询 512 条 load，之后的函数级后备流程仍会扫描其余 load；单次 MemorySSA walker 节点访问预算为 256，相同 clobber 候选最多 128 个，前驱递归深度 8、支配链 16，全路径扫描最多 64 个块/2048 条指令，每函数最多 64 次跨回边查询。
+
+##### LICM 循环不变量代码移动
+
+把安全的循环不变量提升到 preheader，把最终写下沉到全部 exit，或把非必执行的只读调用转换为首轮计算后缓存复用。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`LoopAnalysis`、`BasicAliasAnalysis`、`MemorySSAAnalysis`；只读调用检查按需查询 `SideEffectAnalysis`。
+- **支持 3 类转换**：
+  1. **Hoist**：提升 Binary、`select`、GEP、`trunc/zext/sext/fptosi/sitofp/bitcast`，以及经无故障、无 clobber 证明的 load/只读 call；
+  2. **Sink store**：地址和值循环不变、写点支配 latch 和全部 exiting block，且循环内无其他相关 Mod/Ref 时，在每个 exit 克隆 store 并删除循环内原写；
+  3. **非必执行不变调用缓存**：不能直接提升但支配 latch 的只读调用，在首轮执行一次，并通过 header 缓存 PHI 供后续迭代复用。
+
+```llvm
+; Hoist
+loop:
+  %k = add i32 %a, %b
+  %x = mul i32 %k, %i
+; ->
+preheader:
+  %k = add i32 %a, %b
+loop:
+  %x = mul i32 %k, %i
+
+; Sink
+loop:
+  store i32 %v, ptr @g
+; ->
+exit:
+  store i32 %v, ptr @g
+```
+
+除余提升要求常量非零除数，有符号除余还排除 `-1`；可能 poison 的移位和 `fptosi` 只在 header 安全前缀且支配全部退出/latch 时放行。Load 必须位于每轮必经安全前缀，或由 preheader 同址访问证明可解引用，并证明全循环无相关写。Sink 和调用缓存要求完整 `LoopSimplify + LCSSA`；调用缓存会修改 CFG 并使全部分析失效，普通 hoist/sink 不改 CFG。
+
+Sink 的地址和值所依赖的指令定义必须都在循环外；根对象仅接受 global 或 `alloca`，GEP 必须全为常量索引、首个指针索引为 0 且访问不越界，写入宽度不能超过最终对象。若循环不具备完整 LoopSimplify 形态，LICM 只走保守后备路径，最多提升 Binary/`select`，不会提升 GEP、cast、load 或 call。
+
+##### TailRecursionElimination（TRE）尾递归消除
+
+为安全的普通尾调用添加 tail 标记，并把直接自尾递归或整数加/乘伪尾递归改写为共享循环头与参数 PHI。
+
+- **依赖 AnalysisPass**：按需使用 `SideEffectAnalysis`；把只读调用跨 self-call 前移时还查询当前函数的 `BasicAliasAnalysis`、`LoopAnalysis`。函数可能到达计时调用时整体跳过。
+- **支持 3 类转换**：
+  1. **普通尾调用标记**：非自调用的 `call` 必须紧邻 `ret`，返回值/void 类型完全匹配，实参来源闭包不含 `alloca`；
+  2. **直接自尾递归转循环**：支持直接 `ret`，也支持经唯一无条件边进入“仅 PHI + ret”的共享返回块；
+  3. **ADD/MUL 累加器伪尾递归**：call 到 ret 之间只有一个整数 add 或 mul，恰有一个操作数是 self-call，分别以 0/1 初始化累加 PHI。
+
+```llvm
+; 转换前：直接自尾递归
+define i32 @f(i32 %x) {
+entry:
+  %done = icmp eq i32 %x, 0
+  br i1 %done, label %base, label %recurse
+base:
+  ret i32 0
+recurse:
+  %next = sub i32 %x, 1
+  %r = call i32 @f(i32 %next)
+  ret i32 %r
+}
+
+; 转换后（独立片段；函数名保持不变）
+define i32 @f(i32 %x) {
+entry.once:
+  br label %loop.header
+loop.header:
+  %x.phi = phi i32 [ %x, %entry.once ], [ %next, %backedge ]
+  %done = icmp eq i32 %x.phi, 0
+  br i1 %done, label %base, label %backedge
+base:
+  ret i32 0
+backedge:
+  %next = sub i32 %x.phi, 1
+  br label %loop.header
+}
+```
+
+首次成功站点会创建新函数入口，将旧入口变成循环头，为每个形参创建 PHI，并把原入口块中的 `alloca` 搬到循环外。真正转换前，这些入口 `alloca` 地址必须不逃逸；void 自递归要求 call 与 ret 相邻，其他 call 与 ret 间的指令不能有必须保留的副作用、fault/poison、store 或对 self-call 结果的依赖。一次重写中成功转换的伪尾递归站点共享同一累加 opcode，不匹配的站点保留原状；累加器必须唯一，self-call 恰为一个操作数且结果唯一用户是 Ret。每轮只提交一个站点并立即失效分析，重新扫描后再处理下一站点。
+
+##### SCCP 稀疏条件常量传播
+
+在可执行 CFG 边与 SSA 值格上同步求解常量，并用 MemorySSA 的共同到达写进一步传播内存读取，最后一次性折叠值、分支和不可执行块。
+
+- **依赖 AnalysisPass**：`MemorySSAAnalysis`、`BasicAliasAnalysis`、`LoopAnalysis`；MemorySSA 查询会通过 `FAM` 获取调用的内存效果。
+- **核心数据结构**：
+
+```mermaid
+flowchart LR
+    Top[Top<br/>尚未观察到信息] --> Constant[Constant<br/>唯一常量]
+    Constant --> Bottom[Bottom<br/>非常量或冲突]
+    Solver[SCCPSolver] --> VS[ValueState]
+    Solver --> EB[ExecutableBlocks]
+    Solver --> FE[FeasibleEdges]
+    Solver --> BW[BBWorkList]
+    Solver --> IW[InstWorkList]
+    Solver --> ML[LoadStoredValues<br/>StoreLoadDependents]
+```
+
+`LatticeValue` 的单调顺序为 `Top -> Constant -> Bottom`。PHI 只合并已标记可行的入边；条件分支会反向推动 CFG 边可行性。新的可执行块和格值分别进入两个工作队列：基本块由 `ExecutableBlocks` 保证只做首次激活，而相关指令可因操作数状态变化而重复入队重访，直到两个队列都为空。
+
+- **支持 3 类提交转换**：
+  1. 把格值为常量的可替换有结果指令（包括通过内存证明的 load）执行 RAUW 并删除原指令；
+  2. 删除不可执行基本块，修复后继 PHI；PHI 的 0 个/1 个 incoming 分别退化为 `undef`/唯一值；
+  3. 把常量条件分支改成无条件分支，并删除未选择边对应的 PHI incoming。
+
+```llvm
+%x = add i32 2, 3
+%c = icmp eq i32 %x, 5
+br i1 %c, label %T, label %F
+; ->
+br label %T
+```
+
+内存增强每次运行最多处理 512 个 load、每次 clobber 查询深度为 256；只有完整且非空的 clobber 集全部来自与 load `MustAlias`、完整覆盖、类型同形并写入同一个非 `undef` SSA 值的 store 时，该 load 才有资格传播这个共享 SSA 值；还必须等该值自身的格状态成为 `Constant`，load 才会折叠成常量。GEP、bitcast 和未知返回调用在值格上保守落到 `Bottom`。
+
+##### LoopDependence（LoopDependenceAnalysis）循环依赖分析
+
+惰性地把循环内的 load、store 和可映射调用表示成按循环轴分解的仿射地址，并生成保守依赖方向供循环交换、分布和调度查询。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`、`BasicAliasAnalysis`、`SideEffectAnalysis`。
+- **核心数据结构关系**：
+
+```mermaid
+flowchart TD
+    Cache[LoopDependenceInfo<br/>Loop* -> LoopSummary] --> Summary[LoopSummary]
+    Summary --> MA[LoopMemoryAccess]
+    MA --> Pair[Subscripts i：LoopAffineExpr<br/>与 ByteStrides i 成对描述一个坐标轴]
+    Summary --> DR[LoopDependenceRecord]
+    DR --> Src[Source / Sink]
+    DR --> Kind[Flow / Anti / Output / Unknown]
+    DR --> Axes[Loops 外到内]
+    DR --> Dir[DirectionMasks<br/>Same 或 Any]
+```
+
+- `LoopAffineExpr` 保存 `Constant`、`LoopCoefficients` 与循环外 `InvariantTerms`，`Exact` 表示整个表达式可精确仿射化；
+- `LoopMemoryAccess` 保存指令、指针、`MemoryLocation`、根对象、读写属性、按坐标分解的下标/字节步长及程序序；
+- `LoopDependenceRecord` 把一对访问、依赖种类、循环轴和每轴方向掩码绑定在一起；
+- `LoopSummary` 保存某循环作用域内的访问与依赖，并单独标记未知内存、可观察效果和顺序屏障。
+
+仿射化支持常量、循环外 Unknown、加减、常量乘、非截断 cast 和常量步长 AddRec；非线性乘法、除余、移位、位运算、MinMax、Select、Compare、MulRec/DivRec 或循环内未知值都会使地址不精确。方向证明刻意保守：只有同根、同访问宽度/步长布局、有限无回绕规范归纳，且独立轴系数为相同的 `+1` 或 `-1` 时才可能给出 `Same`。此外，相应坐标的常量项必须一致，目标轴不能混入其他坐标 band，访问宽度不得大于最内层字节步长，多层 stride 还须严格递减并逐层整除；任一条件缺失都返回 `Any`。
+
+每个摘要最多收集 512 个访存并检查 8192 对潜在写冲突候选，指针链深度最多 64、GEP 下标项最多 128。`isInterchangeLegal`、`isDistributionLegal`、`isConflictLocalToIteration`、`isInvariantAccessDisjointFromLoopWrite` 和 `getByteStride` 是结构 Pass 的主要消费接口。
+
+##### LoopDistribution 循环分布
+
+按 store 根的闭合反向切片寻找连续切点，把一个循环拆成两个串行、迭代域相同的循环，以分离局部性画像差异明显的访存组。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`、`LoopDependenceAnalysis`。
+- **前置形态**：候选循环自身满足有限的 `LoopSimplify + LCSSA`，具有唯一 preheader/latch、唯一无 PHI exit 和唯一退出边；候选及其全部子循环都必须已证明有限，循环内值不能 live-out。
+- **支持 1 种核心 CFG 变换**：
+
+```text
+转换前：
+PreHeader -> Loop { SliceA; SliceB; } -> Exit
+
+转换后：
+PreHeader -> Loop.A { SliceA; }
+          -> DistPreHeader
+          -> Loop.B { SliceB; }
+          -> Exit
+```
+
+算法为每条 store 建立循环内 SSA 反向切片，按原 store 程序序枚举所有连续切点；共享纯计算可保留在两侧，但共享切片不得含 store、call、br、ret 或 alloca，单次副作用必须恰好归属于一个分区。`LoopDependenceInfo::isDistributionLegal` 必须证明拆分不会把第二分区到第一分区的依赖次序反转。
+
+收益模型把绝对字节步长分到 `0、<=8、<=64、<=512、>512` 五档，store 权重为 2、load 为 1；只统计分区专属访存，两个分区画像距离至少达到 100（完整一档）才提交，并选择距离最大的切点。
+
+候选限制为最多 24 个块、160 条指令和 24 个 store 根，store 总数必须在 2～24 之间；拒绝调用、`alloca`、`ret`、未知二元操作以及依赖循环内 load/call 的控制条件。每函数累计最多分布 2 次，每次 `run()` 只提交一个候选，并为生成块添加 `.dist` 来源标记以避免与融合 Pass 振荡。
+
+##### InstSimplify 指令简化
+
+使用去重工作表反复应用局部代数、`select` 与 PHI 等价规则，并在内存分析证明安全时把分支两侧读取合成一个读取。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`BasicAliasAnalysis`、`LoopAnalysis`、`MemorySSAAnalysis`；内存回退扫描会按需查询调用副作用。
+- **支持 6 大类转换**：
+  1. 二元运算和比较，包括 Add/Sub/Mul/Div/Rem/And/Or/Xor/Cmp 九组规则；结构性代数规则主要针对整数，浮点只做语义安全的常量求值与单位元规则；
+  2. `select` 常量、同臂和布尔吸收化简；
+  3. 忽略 self/`undef` 后的退化 PHI；
+  4. `PHI-of-Binary -> Binary-of-PHI`；
+  5. `PHI-of-GEP -> GEP-of-PHI`；
+  6. `PHI-of-Load -> Load-of-PHI`。
+
+```llvm
+add i32 %x, 0                         ; -> %x
+mul i32 %x, 8                         ; -> shl i32 %x, 3
+select i1 %c, i1 true, i1 %y          ; -> or i1 %c, %y
+phi i32 [ %x, %A ], [ %x, %B ]       ; -> %x
+
+; PHI-of-Binary：转换前
+A:
+  %a1 = add i32 %a, %k
+B:
+  %a2 = add i32 %b, %k
+join:
+  %r = phi i32 [ %a1, %A ], [ %a2, %B ]
+
+; 转换后
+join:
+  %u = phi i32 [ %a, %A ], [ %b, %B ]
+  %r = add i32 %u, %k
+```
+
+浮点规则严格保留 IEEE 语义：加法只把 `-0.0` 当单位元、减法只把 `+0.0` 当单位元，不做浮点 `x-x` 或零乘。名字带 `.lcssa` 的 PHI 不参与这些简化；跨臂 Binary/GEP/Load 合并要求无计时屏障。GEP 的唯一变化位置可以是 base，也可以是一个非常量索引；每个 incoming GEP 都必须确实包含动态索引，并拒绝 `alloca` 基址。Load 合并要求每个 incoming 是对应前驱中的单用户 load，并由 MemorySSA（深度 256）或逐指令 ModRef 扫描证明到块出口无 clobber。
+
+##### LoopInterchange 循环交换
+
+在依赖方向合法且局部性收益足够时，通过物理 CFG 换轴或只交换归纳变量角色来改变两层循环的执行顺序。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`PostDominantAnalysis`、`LoopAnalysis`、`SCEVAnalysis`、`LoopDependenceAnalysis`。
+- **支持 2 种转换形式**：
+  1. **物理 CFG 交换**：针对旋转后的受限非完美循环巢，新增首轮检查、两个 preheader 和 latch，真正交换外/内控制骨架；
+  2. **归纳变量角色交换**：两轴迭代域完全相同时保持 CFG 不变，只交换非控制 use；必要时将不故障的外轴纯计算前缀克隆到内层 header。
+
+```text
+; 归纳变量角色交换路径：两轴具有相同的 start/step/trip/zero-trip 属性
+for (i = 0; i < N; ++i)              for (j = 0; j < N; ++j)
+  for (j = 0; j < N; ++j)    ->        for (i = 0; i < N; ++i)
+    use A[j][i];                          use A[j][i];
+```
+
+公共合法性要求直接父子循环、有限且 LCSSA、规范归纳变量、无不支持的副作用，并由依赖分析证明每条依赖至少在待交换的一个轴上为 `Same`。局部性收益为内层每个访存的 `权重 * (旧内轴步长惩罚 - 新内轴步长惩罚)`，store/load 权重为 2/1，最低收益为 6。
+
+物理路径使用固定的 outer 三块 + inner 两块骨架，Prefix 必须有 load、不能有 store，且 Prefix load 与内层写确定不相交；角色路径要求两轴 SCEV 起点、步长、trip count 和零次属性一致，外层直属块无访存。每函数最多交换 4 次，可下沉纯计算前缀最多 8 条。
+
+##### GVNPRE 全局值编号与部分冗余消除
+
+用支配值号消除全局冗余纯表达式和内存读取，再通过 PHI translation 在恰缺一条前驱的路径补算表达式，消除部分冗余。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`LoopAnalysis`、`BasicAliasAnalysis`、`MemorySSAAnalysis`；调用优化按需查询 `SideEffectAnalysis`。构造参数 `EnablePRE=false` 时只运行 GVN。
+- **核心结构**：`ExprKey` 由 opcode/谓词、结果类型和操作数值号组成；交换律操作数会排序，交换比较操作数时同步反转谓词。`LeaderTable` 按 value number 保存全部候选，`findLeader` 再按支配关系、块内顺序和计时屏障筛选当前使用点可用的代表；PRE 另维护 `AvailOut` 和 `PhiTranslateTable`。
+- **支持 6 类转换**：
+  1. 纯表达式全局 CSE；
+  2. store-to-load 转发；
+  3. load-to-load CSE；
+  4. `NoModRef` 或可证明无干扰的只读调用 CSE；
+  5. 互递归等价 PHI 图合并；
+  6. PRE 在缺失前驱插入表达式，并在汇合块建立结果 PHI。
+
+```text
+PredA: %x = add %a, %b ----\
+                              Join: %r = add %a, %b
+PredB: ---------------------/
+
+                         |
+                         v
+
+PredA: %x = add %a, %b ----\
+PredB: %y = add %a, %b -----+--> Join: %r = phi [ %x, PredA ], [ %y, PredB ]
+```
+
+PRE 只接受有结果、纯且可安全推测的标量表达式，排除内存、call、比较、控制、PHI 和可能 fault/poison 的操作；所有前驱必须存活且不是回边，并且必须“恰有一条缺失、至少一条已有”。函数超过 1500 条指令或单块超过 400 条时跳过；GVN/PRE 各最多 12 轮，单轮 MemorySSA 查询最多 512 次，唯一前驱回扫最多 64 条指令。
+
+##### RangeAnalysis 数值范围分析
+
+在可行 CFG 上联合求解 i1/i32 有符号区间、无符号区间、已知位和 f32 状态区间；整数结果再叠加边、支配路径与 SCEV 归纳事实形成程序点敏感查询，浮点最终查询则只可靠地使用全局结果。
+
+- **依赖 AnalysisPass**：`SCEVAnalysis`、`DominantAnalysis`。
+- **核心抽象域**：
+  - `IntRange {min, max, knownTrailingZeros}`：有符号区间，`min > max` 表示 Bottom；
+  - `UIntRange {min, max}`：无符号位模式区间；
+  - `KnownBits {zero, one}`：确定为 0/1 的位集合，同一位冲突表示不可达事实；
+  - `FloatRange {min, max, mayNaN, mayPositiveZero, mayNegativeZero}`：显式区分 NaN 和正负零；
+  - `LoopInductionInfo`：归纳循环、初值、步长、上界和无回绕属性。
+
+```mermaid
+flowchart LR
+    CFG[可行 CFG 边] --> Product[整数乘积域<br/>Signed x Unsigned x KnownBits]
+    CFG --> Float[FloatRange]
+    Product --> IntNarrow[整数 Narrowing]
+    IntNarrow --> IntGlobal[整数 GlobalRanges]
+    IntNarrow --> Edge[整数 EdgeRanges]
+    Edge -->|仅单前驱边可形成上下文事实| Context[沿 IDom 链的 ContextualRanges]
+    SCEV[SCEV 归纳事实] --> Local[BlockLocalRanges]
+    IntGlobal --> IntQuery[整数程序点 query]
+    Context --> IntQuery
+    Local --> IntQuery
+    Float --> FloatNarrow[浮点 Narrowing]
+    FloatNarrow --> FloatGlobal[FloatGlobalRanges]
+    FloatGlobal --> FloatQuery[浮点 query：仅全局结果]
+```
+
+`RangeInfo` 的整数域中，全局、上下文和边结果各保存 `Signed/Unsigned/KnownBits` 三类映射；块局部结果只保存 `Signed/Unsigned`，不存在 `BlockLocalBits`。浮点结构虽有全局与上下文字段，但求解收尾会清空浮点上下文且不会建立浮点边映射，因此最终浮点查询只使用全局结果。整数查询则取全局基线、完整 IDom 链路径事实和当前块 SCEV local 事实的交，边查询再叠加指定边约束。
+
+求解分五步：前向工作表只合并可行 PHI incoming；有符号区间、无符号区间或浮点区间的单值更新达到 32 次时 widen 到 Top 并锁定，KnownBits 不使用该计数式 widen；随后在 `可达指令数 * 4 + 64` 预算内 narrowing，并仅对已证无回绕的 add/sub 反推操作数；narrowing 未完成则清空强事实整体退化为 Top；成功后重建整数边/支配上下文事实并叠加有限、无回绕的 SCEV 归纳范围。整数乘积域最多交叉约化 3 轮。
+
+整数只精确建模 i1/i32，支持加减乘、带/不带符号除余、合法常量移位、and/or 与 KnownBits xor；溢出、可能除零或非凸位模式退化为 Top。浮点前向建模四则并保留 NaN/±0/无穷信息；整数 `select` 支持真假臂敏感查询，浮点 `select` 仅在前向求解时按常量条件选臂或合并全局范围。
+
+##### GepCombine GEP 组合
+
+规范化链式 GEP，将指针 PHI 外提成索引 PHI + 公共 GEP，并把同块相邻地址重基址为前一地址的常量步进。
+
+- **依赖 AnalysisPass**：`RangeAnalysis`、`DominantAnalysis`。
+- **支持 3 大类、共 7 个实现分支**：
+  1. **链式 GEP 合并（3 个分支）**：当前 GEP 首索引为 0、基 GEP 末索引为 0，或两端常量索引可安全相加且合并结果忽略首个零后最多只有一个非零索引；
+  2. **GEP-of-PHI（2 个分支）**：incoming 完全相同，或只有一个索引位置不同；
+  3. **同块相邻 GEP 重基址（2 个分支）**：末索引为 `previous + C`，或两个末索引为同基值加不同常量。
+
+```llvm
+; 链合并
+%p = getelementptr [100 x [20 x i32]], ptr %A, i32 0, i32 %i, i32 0
+%q = getelementptr i32, ptr %p, i32 %j
+; ->
+%q = getelementptr [100 x [20 x i32]], ptr %A, i32 0, i32 %i, i32 %j
+
+; GEP-of-PHI：转换前
+A:
+  %gep.A.i = getelementptr [100 x i32], ptr %base, i32 0, i32 %i
+  br label %join
+B:
+  %gep.A.j = getelementptr [100 x i32], ptr %base, i32 0, i32 %j
+  br label %join
+join:
+  %p = phi ptr [ %gep.A.i, %A ], [ %gep.A.j, %B ]
+
+; ->
+A.after:
+  br label %join.after
+B.after:
+  br label %join.after
+join.after:
+  %k = phi i32 [ %i, %A.after ], [ %j, %B.after ]
+  %p.after = getelementptr [100 x i32], ptr %base, i32 0, i32 %k
+
+; 相邻重基址（至少两个索引）
+%p = getelementptr [100 x i32], ptr %A, i32 0, i32 %i
+%i.plus.1 = add i32 %i, 1 ; RangeAnalysis 已证明该 ADD 不回绕
+%q = getelementptr [100 x i32], ptr %A, i32 0, i32 %i.plus.1
+; -> %q = getelementptr i32, ptr %p, i32 1
+```
+
+链合并要求基 GEP 单用户且无计时屏障，最多迭代 4 轮；PHI 形态要求单用户、至少两个 incoming、无 self/timer、同基址同形且最多一个变化索引；相邻重基址要求除最后索引外操作数完全一致，`RangeAnalysis` 负责证明源 ADD 不回绕，而常量索引合并与常量差另由 `IRMath::addI32` 做独立溢出检查。
+
+##### ConstraintElimination 约束消除
+
+沿支配树传播分支路径上的整数约束，并结合范围事实把能够证明恒真或恒假的后续分支条件替换成布尔常量。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`RangeAnalysis`。
+- **核心状态**：
+  - `ConstraintElimConstraint`：以 `val op (bound + boundOffset)` 统一表示路径约束，并单独缓存常量边界；
+  - `ConstraintElimStackFrame`：记录支配树 DFS 节点及进入节点前的约束栈深度，使兄弟子树不会错误共享路径事实；
+  - `ConstraintElimFoldCandidate`：延迟保存待折叠的分支、原比较和证明结果，遍历完成后统一提交。
+- **支持 4 类证明形式**：
+  1. 同一左值上的直接蕴含或矛盾，例如 `x < 10` 蕴含 `x < 20`；
+  2. 交换比较两侧并反转谓词，例如 `a < b` 与 `b > a`；
+  3. 经过一个中间值的传递关系，例如 `x < y`、`y <= 8` 蕴含 `x < 8`；
+  4. 在 `RangeAnalysis` 证明无回绕后，将 `x + C`、`x - C`、`C - x` 规范为 `Base + Offset` 再比较。
+
+转换前：
+
+```llvm
+entry:
+  %c0 = icmp slt i32 %x, 10
+  br i1 %c0, label %inside, label %exit
+inside:
+  %c1 = icmp slt i32 %x, 20
+  br i1 %c1, label %always, label %unreachable
+```
+
+转换后：
+
+```llvm
+inside:
+  br i1 true, label %always, label %unreachable
+```
+
+本 Pass 只替换条件值，不直接删除 CFG 边；紧随其后的 `CFGSimplify` 负责删除不可达分支。路径约束只从“当前块恰有一个前驱”的条件分支边提取；常量偏移分解默认最多递归 2 层，且每次搬移都要求 i32 区间能够证明加减不回绕，不能证明时保持原比较。
+
+##### RangeAwareSimplify 范围感知化简
+
+消费整数区间、浮点区间和已知位信息，在普通常量传播无法处理的情况下继续折叠表达式、比较与 `select`。
+
+- **依赖 AnalysisPass**：`RangeAnalysis`、`DominantAnalysis`。
+- **实际执行 7 类转换**：
+  1. 将整数/浮点单值区间以及完全已知的整数位模式折叠为常量；
+  2. 用不相交区间、单值区间或已知位冲突折叠整数比较，用排除 NaN 的浮点区间折叠浮点比较；
+  3. 分别证明 `icmp(select cond, T, F), R` 的两臂结果，将其折叠为常量或原 `cond`；
+  4. 条件区间恒真或恒假时直接选择 `select` 的一条臂；
+  5. 识别 `select` 构成的绝对值，在已知符号下选择 `x` 或 `-x`；
+  6. 识别 `min/max` 形式，在两侧区间顺序确定时直接选值；
+  7. 被除数已证非负、除数为二次幂时，把有符号除法/余数改成右移/掩码。
+
+```llvm
+; 已知 %x 的范围为 [0, 31]
+%q = sdiv i32 %x, 8      ; -> %q = ashr i32 %x, 3
+%r = srem i32 %x, 8      ; -> %r = and  i32 %x, 7
+
+; 已知 %a 为 [0, 3]，%b 为 [10, 20]
+%c = icmp slt i32 %a, %b ; -> true
+
+; 已知 %x >= 0
+%isneg = icmp slt i32 %x, 0
+%n = sub i32 0, %x
+%v = select i1 %isneg, i32 %n, i32 %x ; -> %x
+```
+
+实现会在同一基本块内以深度 3 有界展开纯整数表达式，并把局部推导区间与全局程序点区间取交。`convertSignedToUnsigned` 阶段目前只扫描证据；由于 IR 没有可区别表达语义的独立替换形式，该阶段尚不产生转换。
+
+##### LoopIdiomRecognize 循环惯用模式识别
+
+把单位步长、连续访问且副作用封闭的内存循环替换成 `memset`、`memcpy` 或 `memmove`。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`LoopAnalysis`、`RangeAnalysis`、`SCEVAnalysis`。
+- **前置形态**：最内层循环满足 `LoopSimplify`，存在常量起点、步长为 1 的规范归纳变量；元素仅支持 i32 或 float，单次访问大小为 4 字节。
+- **支持 3 种惯用形式**：
+  1. **连续填充**：循环中唯一 `store` 写入四个字节完全相同的整数/浮点常量，替换为 `memset`；
+  2. **连续复制**：唯一 `load` 直接供给唯一 `store`，源和目标可证明属于不同对象，替换为 `memcpy`；
+  3. **临时数组双复制**：相邻的 `source -> temporary` 与 `temporary -> destination` 两个循环合并为一次 `memmove`；常量次数版本删除无用临时 `alloca`，运行时版本保留原循环和临时数组作为慢路径。
+
+```llvm
+; 填充循环核心：转换前
+%p = getelementptr i32, ptr %dst, i32 %i
+store i32 0, ptr %p
+
+; 转换后（位于 preheader）
+call void @llvm.memset.p0.i32(
+    ptr %dst.start, i8 0, i32 %bytes, i1 false)
+
+; 复制循环核心：转换前
+%s = getelementptr i32, ptr %src, i32 %i
+%d = getelementptr i32, ptr %dst, i32 %i
+%v = load i32, ptr %s
+store i32 %v, ptr %d
+
+; 转换后（位于 preheader）
+call void @llvm.memcpy.p0.p0.i32(
+    ptr %dst.start, ptr %src.start, i32 %bytes, i1 false)
+```
+
+常量迭代次数版本直接插入 intrinsic 并删除被替代的访存；运行时次数版本要求 `iv < bound`，并建立 `count >= 8` 且 `count <= INT32_MAX / 4` 的快速路径：
+
+```mermaid
+flowchart LR
+    P[PreHeader] -->|guard 成立| Fast[memset / memcpy / memmove]
+    P -->|guard 不成立| H[原循环慢路径]
+    Fast --> E[Exit]
+    H --> E
+```
+
+所有地址都必须是“唯一动态归纳维 + 其余常量维”的连续 GEP；把起始 IV 替成常量后，intrinsic 的源/目标首地址 GEP 必须通过已知 `alloca/global` 对象边界检查，但实现不会据此宣称整个 `tripCount * 4` 区间均已证明在界内。运行时版本还要求起点非负、bound 在 preheader 可用且目标 exit 不含 PHI；出现额外调用、额外访存、循环外用户或不安全重叠时保守放弃。
+
+##### LoopAccessAnalysis 循环访存分析
+
+把 `LoopDependence` 的仿射访问记录提升为完整迭代域上的地址足迹，并为循环独立性、融合和局部性优化提供统一查询接口。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`、`RangeAnalysis`、`DominantAnalysis`、`BasicAliasAnalysis`、`LoopDependenceAnalysis`。
+- **核心数据结构关系**：
+
+```mermaid
+flowchart TD
+    Info[LoopAccessInfo<br/>Loop* -> Summary 惰性缓存] --> Summary[LoopAccessSummary]
+    Summary --> Access[LoopMemoryAccess 列表]
+    Summary --> Footprint[LoopAccessFootprint 列表]
+    Footprint --> Dim[LoopAccessDimension]
+    Footprint --> Base[Base / StartOffset / ObjectSize]
+    Footprint --> Extent[MinOffset / MaxOffsetExclusive]
+    Dim --> Axis[Axis / TripCount / ByteStride]
+    Info -->|classifyPair 返回| Pair[LoopAccessPairKind]
+    Pair --> NC[NoConflict]
+    Pair --> SI[SameIterationOnly]
+    Pair --> UK[Unknown]
+```
+
+- `LoopAccessDimension` 描述一个循环轴的 SCEV 次数、常量次数、字节步长、有限性和单位步长；
+- `LoopAccessFootprint` 描述底层对象、起始/最小/最大字节偏移、对象大小、元素大小、对齐以及 `Exact/IsConsecutive/IsFullAccess/IsEmpty`；
+- `LoopAccessSummary` 将一个循环作用域的稳定访问记录与足迹一一对应，并标记未知内存和是否存在写入；
+- `LoopFusionAccessResult` 记录融合是否合法、是否因证据不足而未知，以及同迭代真依赖/冲突对数量。
+
+构建足迹时归一化稳定 base（必要时可退回 `Access.Root`），并证明各轴步长与次数、访问必执行和地址算术不回绕；只有对象大小已知时，才额外强制常量半开足迹位于对象边界内，未知对象大小本身不会阻止发布 `Exact`。访问对只产生三值结论：纯读对直接为 `NoConflict`；不同对象且 `NoAlias` 也为 `NoConflict`；地址相等强制循环坐标相同为 `SameIterationOnly`；其余均为 `Unknown`。单次变换最多检查 8192 对访问，地址无回绕查询最多访问 4096 个 SSA 节点且递归深度不超过 64。
+
+核心查询包括 `isConsecutiveAccess`、`areIterationsIndependent`、`analyzeFusion`、`isRectangularNest`、`hasCrossAxisReuse` 和 `getByteStride`。
+
+##### LoopFusion 循环融合
+
+将两个严格相邻、迭代域完全相同且内存顺序安全的同级循环合成一个循环，使同次迭代的生产值能立即被消费。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`PostDominantAnalysis`、`LoopAnalysis`、`SCEVAnalysis`、`LoopAccessAnalysis`。
+- **前置形态**：两个循环均为 `LoopSimplify + LCSSA`，由唯一桥接块串联；SCEV 的起点、步长、次数及零次执行属性完全一致，循环树有限，且循环内值没有 live-out。两循环的退出测试都必须位于 header，第二 body entry 与最终 exit 不能含 PHI。
+- **支持 1 种核心 CFG 变换**：
+
+```mermaid
+flowchart LR
+    subgraph 转换前
+        H1[Header1] --> B1[Body1]
+        B1 --> L1[Latch1]
+        L1 --> H1
+        H1 --> Bridge
+        Bridge --> H2[Header2]
+        H2 --> B2[Body2]
+        B2 --> L2[Latch2]
+        L2 --> H2
+        H2 --> E2[Exit2]
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph 转换后
+        FH[Fused Header] --> FB1[Body1]
+        FB1 --> FL1[Latch1]
+        FL1 --> FB2[Body2]
+        FB2 --> FL2[Latch2]
+        FL2 --> FH
+        FH --> FE[Exit2]
+    end
+```
+
+提交时把桥中的安全纯计算外提到第一循环 preheader，将第二循环的非归纳 PHI 移入第一 header，用第一归纳变量替换第二归纳变量，重接三条 CFG 边，最后删除桥和第二 header。
+
+`LoopAccessAnalysis` 必须证明所有跨循环写冲突均为无冲突或只发生在同一逻辑迭代，而且至少存在一个同迭代写后读真依赖才认为有收益；第一循环若本身是单 store 的 `memset/memcpy` 惯用候选也拒绝融合。实现还拒绝调用、`alloca`、`ret` 和带 `.dist` 来源标记的循环；load/store 的次序安全交给 LoopAccess 判断，其他可能 fault/poison 的指令拒绝重排，仅额外放行已证明常量除数安全的整数除余。同迭代真依赖候选最多 128 条指令，通用硬上限为 128 个块/512 条指令，桥最多 24 条指令、移动 PHI 最多 32 个；每次 `run()` 只融合一对，每函数累计最多融合 4 对。
+
+##### UnrollAndJam 展开并合并
+
+展开外层循环的多个迭代 lane，同时只保留一份共享内层循环控制，从而增加严格浮点归约的并行度并改善跨 lane 的访存局部性。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`SCEVAnalysis`、`LoopAccessAnalysis`、`DominantAnalysis`、`PostDominantAnalysis`；常量余数需要先 peeling 时额外查询 `BasicAliasAnalysis`。
+- **前置形态**：直接父子循环构成有限矩形循环巢，满足 `LoopSimplify + LCSSA`；外层为正步长、无回绕、常量次数且至少执行 2 次，不同外层迭代由 `LoopAccessAnalysis` 证明独立，外循环完全不允许 live-out。外层必须恰有一个直接子循环且 header 只含规范 IV PHI；各层均为单退出、每次迭代必经 latch，除已识别的循环退出外不允许额外条件 CFG。
+- **支持 1 种结构变换，因子可为 2/4/8**：
+
+```text
+转换前：                              转换后（Factor = 2）：
+for (i = 0; i < N; ++i)              for (i = 0; i < N; i += 2)
+  for (j = 0; j < M; ++j)              for (j = 0; j < M; ++j) {
+    body(i, j);                           body(i,     j);   // lane 0
+                                          body(i + 1, j);   // lane 1
+                                        }
+```
+
+算法从外层归纳变量出发建立 lane 依赖闭包，克隆受外轴影响的非控制指令，并无条件把所有 store 纳入 lane 闭包；每条额外 lane 生成 `IV + lane * step`，重映射克隆操作数与相邻 GEP，最后把外层回边更新改成 `IV + Factor * step`。共享内循环树深度最多 3，候选最多 24 个块，所有额外 lane 合计最多克隆 96 条指令。
+
+收益模型要求存在可跨 lane 共享的读取，并且满足“长距离相邻 lane 访存”或“严格浮点归约的缓存行滑动窗口”之一；默认 FPR/GPR 预算分别为 24/18，缓存行为 64 B，共享轴次数至少 64，长遍历跨度至少 256 KiB，浮点加法估算延迟为 3。常量次数不能整除因子时，可先剥离至多 7 次余数迭代；peeling 改 CFG 并使全部分析失效，普通 jam 只改 SSA 和块内指令，保留支配树、后支配树和循环树。每个函数默认最多成功 jam 2 次。
+
+##### LocalAggregateSimplify 局部聚合化简
+
+分阶段折叠只读常量表，并把小型、地址不逃逸的局部数组转换成标量值或直接删除。
+
+- **依赖 AnalysisPass**：`DominantAnalysis`、`RangeAnalysis`；跨块只读数组阶段按需查询 `BasicAliasAnalysis`、`LoopAnalysis`、`MemorySSAAnalysis`。
+- **关键数据结构**：
+  - `LocalAggregatePointerPath`：根 `alloca`、常量聚合下标序列及路径是否全常量；
+  - `LocalAggregateReadOnlyConstantArrayPlan`：常量源、初始化 `memcpy`、元素 GEP 与待替换 load；
+  - `LocalAggregateSynthExpression`：由 Index、Constant、Binary 构成的低成本表达式树；
+  - `LocalAggregateDeadUses`：可整体删除的写入与派生指针集合。
+- **支持 5 类转换**：
+  1. **只读全局 load 折叠**：常量下标直接读取初始化值；有界动态 i32 查表尝试综合为不超过 3 条二元指令的等价表达式；
+  2. **同块常量转发**：顺序解释“完整常量 `memcpy` + 常量下标覆盖”，把后续 load 替换为初始化元素或最近 store；
+  3. **跨块只读局部数组展开**：用支配关系与 MemorySSA 证明初始化到 load 之间无 clobber，再用常量、综合表达式或极小 `select` 链替换全部读取；
+  4. **常量路径标量化**：把只经常量 GEP 访问的聚合拆成最多 32 个独立标量 `alloca`，并把实际登记为标量槽位的初始化拆成标量 store；
+  5. **死聚合删除**：地址不逃逸且内容从未被读取时，删除所有 store/目标 `memcpy`、派生指针和根 `alloca`。
+
+```llvm
+; 常量表综合
+@T = constant [4 x i32] [i32 1, i32 3, i32 5, i32 7]
+; RangeAnalysis 已证明 0 <= %i < 4
+%p = getelementptr [4 x i32], ptr @T, i32 0, i32 %i
+%v = load i32, ptr %p
+; ->
+%twice = mul i32 %i, 2
+%v = add i32 %twice, 1
+
+; 常量路径标量化
+%a = alloca [2 x i32]
+%p0 = getelementptr [2 x i32], ptr %a, i32 0, i32 0
+%p1 = getelementptr [2 x i32], ptr %a, i32 0, i32 1
+; ->
+%a.0 = alloca i32
+%a.1 = alloca i32
+```
+
+综合搜索最多处理 32 个 i32 表元素和 12 个候选常量；每个成本层最多枚举 4096 个 pending 状态，再截断保留 128 个状态，且表达式成本必须严格低于普通 load 的估算成本 4。没有可用综合式时，“至多 2 个元素的 `select`”回退只用于跨块局部数组阶段，全局动态常量表没有该回退。跨块阶段最多查询 64 个数组，每个计划最多收集 256 个 load，每条 load 的 MemorySSA clobber walk 另有 256 个节点预算。
+
+##### LoopUnroll 循环展开
+
+依据 SCEV 次数证明和代码成本，在完全展开、部分展开、运行时展开与 peeling 中选择一种方式复制循环体并修复 CFG/PHI。
+
+- **依赖 AnalysisPass**：`LoopAnalysis`、`DominantAnalysis`、`SCEVAnalysis`、`BasicAliasAnalysis`、`RangeAnalysis`。
+- **前置形态**：循环满足规范 `LoopSimplify` CFG 与 LCSSA，具有可分析的唯一退出形态，全部指令可由克隆器支持；任何可能到达计时调用的循环都拒绝展开。
+- **支持 5 种转换形式**：
+  1. **Full**：已证无回绕的小常量次数、且退出测试位于 latch 的循环完全展开成直线 CFG，只保留最后一次退出值；
+  2. **Partial**：常量次数能被 2/4 路因子整除时，在一个主循环迭代中串接多个 body 副本；
+  3. **PartialWithRemainder**：常量次数不能整除时生成展开主循环和常量尾部副本；
+  4. **Runtime**：在当前 preheader 或可证明安全的祖先循环入口物化运行时 trip count，生成分组主循环和动态尾部；二次幂因子用 `and/lshr` 求余数与组数；
+  5. **Peeling**：在残余循环前克隆前 1～2 次迭代，使首轮条件常量化，或让循环不变的重复 store 能从残余循环删除。
+
+```text
+Partial（Factor = 4）：
+
+Header -> Body(i) -> Body(i+1) -> Body(i+2) -> Body(i+3)
+       -> Latch(i += 4) -> Header
+
+Runtime：
+
+安全的 PreHeader/祖先入口 -> 计算 TripCount / NumGroups / Remainder
+                         -> 4 路展开主循环
+                         -> 动态 Tail
+                         -> Exit
+```
+
+默认收益阈值为：完全展开成本 192，部分展开 160，运行时展开 96；普通/极小循环完全展开次数上限分别为 16/32，部分展开最大因子 4，运行时默认及最大因子均为 4。Partial/Runtime 仅处理无普通 call 的最内层循环，默认原 body 成本上限分别为 72/48；普通 call 或嵌套循环仍可能 Full，但成本阈值减半且 trip count 不得超过 4。Runtime 的 SCEV 展开节点数与新增指令成本各不超过 8。
+
+默认 peeling 最多 2 次；运行时或尚未证明 no-wrap、因而需要保留退出检查的 guarded peeling 最多 1 次，成本上限 64 且最多克隆 24 个块。决策优先级固定为 Full → Peeling → Partial（含余数）→ Runtime；一次 Pass 最多成功处理 4 个循环，每次 CFG/SSA 克隆后立即使函数分析失效并重建。

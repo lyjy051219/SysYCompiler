@@ -53,8 +53,6 @@ bool FuncInlinePass::isInlineSite(
 	CalleeInlineProfile& OutProfile)
 {
 	if (!CI || !Callee) return false;
-	//计时函数内联直接拒绝！！！
-	if (CI->isTimingCall()) return false;
     //普通内联函数调用点及指令支持
 	constexpr int kCallSitesThreshold = 3;
 	constexpr int kInstThreshold = 200;
@@ -130,7 +128,6 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		if (InitialMap.size() != Callee->getParamCount()) continue;
 		CloneBlockRegionOptions CloneOptions;
 		CloneOptions.ClearTailCallFlags = true;
-		CloneOptions.AllowTimingCallCloning = true;
 		auto ClonedRegion = cloneBasicBlockRegion(
 			F, CalleeOrigBlocks, InitialMap, CloneOptions);
 		if (!ClonedRegion) continue;

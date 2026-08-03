@@ -99,30 +99,7 @@ std::optional<ClonedBlockRegion> cloneBasicBlockRegion(
             BasicBlock *NewBB = Region.ClonedBlocks[BlockIndex];
             for (Instruction *OldI : *OldBB) {
                 if (!OldI) return Fail();
-                Instruction *NewI = nullptr;
-                auto *OldCall = dynamic_cast<CallInst *>(OldI);
-                if (Options.AllowTimingCallCloning && OldCall) {
-                    Value *OldCallee = OldCall->getCallee();
-                    auto CalleeIt = Region.VMap.find(OldCallee);
-                    Value *NewCallee = CalleeIt == Region.VMap.end()
-                        ? OldCallee
-                        : CalleeIt->second;
-                    std::vector<Value *> NewArgs;
-                    NewArgs.reserve(OldCall->getArgCount());
-                    for (Value *OldArg : OldCall->getArgs()) {
-                        auto ArgIt = Region.VMap.find(OldArg);
-                        NewArgs.push_back(ArgIt == Region.VMap.end()
-                            ? OldArg
-                            : ArgIt->second);
-                    }
-                    if (NewCallee) {
-                        auto *NewCall = new CallInst(NewCallee, NewArgs);
-                        NewCall->setTailCall(OldCall->isTailCall());
-                        NewI = NewCall;
-                    }
-                } else {
-                    NewI = OldI->clone(Region.VMap);
-                }
+                Instruction *NewI = OldI->clone(Region.VMap);
                 if (!NewI) return Fail();
 
                 NewBB->pushBack(NewI);

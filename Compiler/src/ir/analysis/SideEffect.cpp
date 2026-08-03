@@ -2,6 +2,7 @@
 #include "lib/IRUtils.hpp"
 #include <cstdint>
 #include <limits>
+#include <queue>
 bool isModSet(ModRefInfo MRI) {return (unsigned(MRI) & unsigned(ModRefInfo::Mod)) != 0;}
 bool isRefSet(ModRefInfo MRI) {return (unsigned(MRI) & unsigned(ModRefInfo::Ref)) != 0;}
 bool isNoModRef(ModRefInfo MRI) {return MRI == ModRefInfo::NoModRef;}
@@ -266,6 +267,72 @@ CallEffectSummary getCallEffectSummary(
             CI, FAM.getResult<SideEffectAnalysis>(*Callee));
     }
     return SideEffectAnalysis::getOpaqueCallSummary();
+}
+
+//判断两个位置之间是否存在一条经过有序调用并到达终点的CFG路径
+bool hasOrderingBarrierOnPath(
+    Function &F, BasicBlock *StartBlock, const Instruction *StartAfter,
+    const Instruction *EndBefore, FunctionAnalysisPassManager &FAM) {
+    //参数或父子关系损坏时保守报告存在屏障，避免错误IR绕过顺序保护。
+    if (!StartBlock || !EndBefore || StartBlock->getParent() != &F ||
+        !EndBefore->getParent() ||
+        EndBefore->getParent()->getParent() != &F ||
+        (StartAfter && StartAfter->getParent() != StartBlock)) {
+        return true;
+    }
+
+    struct OrderingPathState {
+        BasicBlock *Block;
+        Instruction *Next;
+        bool SawBarrier;
+    };
+
+    std::queue<OrderingPathState> WorkList;
+    std::unordered_set<BasicBlock *> VisitedWithoutBarrier;
+    std::unordered_set<BasicBlock *> VisitedWithBarrier;
+    Instruction *First = StartAfter ? StartAfter->getNext()
+                                    : StartBlock->front();
+    WorkList.push({StartBlock, First, false});
+    if (!StartAfter) VisitedWithoutBarrier.insert(StartBlock);
+
+    while (!WorkList.empty()) {
+        OrderingPathState State = WorkList.front();
+        WorkList.pop();
+        if (!State.Block) continue;
+
+        bool SawBarrier = State.SawBarrier;
+        bool ReachedEnd = false;
+        for (Instruction *I = State.Next; I; I = I->getNext()) {
+            if (I == EndBefore) {
+                if (SawBarrier) return true;
+                ReachedEnd = true;
+                break;
+            }
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (CI && getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                SawBarrier = true;
+            }
+        }
+        if (ReachedEnd) continue;
+
+        for (BasicBlock *Succ : State.Block->getSuccessors()) {
+            if (!Succ || Succ->getParent() != &F) continue;
+            auto &Visited = SawBarrier ? VisitedWithBarrier
+                                       : VisitedWithoutBarrier;
+            if (!Visited.insert(Succ).second) continue;
+            WorkList.push({Succ, Succ->front(), SawBarrier});
+        }
+    }
+    return false;
+}
+
+//从一条指令之后开始查询通用顺序屏障
+bool hasOrderingBarrierOnPath(
+    Function &F, const Instruction *StartAfter,
+    const Instruction *EndBefore, FunctionAnalysisPassManager &FAM) {
+    if (!StartAfter || !StartAfter->getParent()) return true;
+    return hasOrderingBarrierOnPath(
+        F, StartAfter->getParent(), StartAfter, EndBefore, FAM);
 }
 //指令级 ModRef 流程：先构造区间重叠判定，再按 Load、Store、Call 分类求效果。
 ModRefInfo getInstModRefInfo(const MemoryLocation &Location, Instruction* I,

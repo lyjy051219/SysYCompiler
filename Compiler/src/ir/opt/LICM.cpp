@@ -130,9 +130,9 @@ bool LICMPass::isReusableLoopInvariantCall(
 	BasicAAResult &AA,
 	const LoopInfo &LI,
 	FunctionAnalysisPassManager &FAM) {
-	//2.4 可复用调用本身必须无计时行为、callee 副作用至多为已跟踪 Ref 且没有
-	//Mod；是否跨越 timer 由最终插入位置的 CFG 路径检查判断，不封锁整个循环。
-	if (!CI || CI->mayReachTimingCall()) return false;
+	//2.4 可复用调用的 callee 副作用至多为已跟踪 Ref 且没有 Mod；
+	//运行库及其包装调用由统一副作用摘要排除。
+	if (!CI) return false;
 	auto *CalleeFunc = CI->getDirectCallee();
 	if (!CalleeFunc || !CalleeFunc->front()) return false;
 	const SideEffectInfo &SEI =
@@ -523,20 +523,20 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				}
 				if (!isInvariant(I, *L, DT, SinkInvariant)) continue;
 				BasicBlock *DefBB = I->getParent();
-				bool CrossesTiming = false;
+				bool CrossesOrderingBarrier = false;
 				for (BasicBlock *ExitBB : ExitBlocks) {
 					Instruction *InsertBefore = ExitBB ? ExitBB->front() : nullptr;
 					while (InsertBefore &&
 						   dynamic_cast<PhiInst *>(InsertBefore)) {
 						InsertBefore = InsertBefore->getNext();
 					}
-					if (!InsertBefore ||
-						F.hasTimingBarrierOnPath(I, InsertBefore)) {
-						CrossesTiming = true;
+					if (!InsertBefore || hasOrderingBarrierOnPath(
+							F, I, InsertBefore, FAM)) {
+						CrossesOrderingBarrier = true;
 						break;
 					}
 				}
-				if (CrossesTiming) continue;
+				if (CrossesOrderingBarrier) continue;
 				//3.3 在每个出口 PHI 区后克隆 store；若操作数仍来自循环，为该出口创建并
 				//缓存 LCSSA bridge PHI。必须覆盖所有出口才能提交原指令删除。
 				std::unordered_map<BasicBlock *, Instruction *> ExitClone;
@@ -630,11 +630,11 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 					continue;
 				}
 				auto LoopInsts = collectLiveLoopInsts();
-				Instruction *PreHeaderTerminator =
-					PreHeader->getTerminator();
-				if (!PreHeaderTerminator ||
-					F.hasTimingBarrierOnPath(
-						PreHeader, PreHeaderTerminator->getPrev(), I)) {
+				Instruction *PreHeaderTerminator = PreHeader->getTerminator();
+				if (!PreHeaderTerminator) continue;
+				if (dynamic_cast<LoadInst *>(I) &&
+					hasOrderingBarrierOnPath(
+						F, PreHeader, PreHeaderTerminator->getPrev(), I, FAM)) {
 					continue;
 				}
 				bool Aggressive = true;

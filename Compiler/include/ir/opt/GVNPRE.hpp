@@ -264,7 +264,7 @@ private:
 	void forgetInstruction(Instruction *I);
 	//判断同一基本块中的指令A是否位于指令B之前
 	bool isBeforeInSameBlock(Instruction *A, Instruction *B) const;
-	//查找在使用位置可支配且未跨越计时屏障的值号代表
+	//查找在使用位置可支配的值号代表
 	Instruction *findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const;
 
 	//查找在指定前驱块出口可用的值号代表

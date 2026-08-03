@@ -65,7 +65,7 @@ InstSimplifier::InstSimplifier(
 bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
     //5.1验证分支 load 能否下沉到汇合块：优先比较该load点与所在前驱BlockExit
     //的目标位置clobber，只有每条反向路径都透明才接受；旧MemorySSA失效或不能
-    //完成证明时退回逐指令ModRef，同时始终保留timer顺序屏障检查。
+    //完成证明时退回逐指令ModRef，并由通用调用摘要保留有序副作用边界。
     if (!L || !FAM || !AA || !LI) return false;
     Value *Ptr = L->getPointerOperand();
     if (!Ptr) return false;
@@ -86,9 +86,9 @@ bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
             SeenLoad = (I == L);
             continue;
         }
-        if (auto *CI = dynamic_cast<CallInst *>(I);
-            CI && CI->mayReachTimingCall()) {
-            return false;
+        if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            CallEffectSummary Effects = getCallEffectSummary(CI, *FAM);
+            if (Effects.HasOrderingBarrier) return false;
         }
         if (!MemorySSAProvesTransparent) {
             ModRefInfo MRI = getInstModRefInfo(
@@ -120,11 +120,10 @@ bool InstSimplifier::isLoadSuitableForSinking(LoadInst *L) const {
 }
 //尝试把二元指令跨PHI各输入臂分解并折叠
 Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
-    //1.验证PHI形状和计时屏障，任何输入不一致时保守回退
+    //1.验证PHI形状，任何输入不一致时保守回退
     //2.寻找所有输入二元式的公共操作数，并要求公共定义支配汇合点
     //3.变化项先合成为新PHI，再在PHI区后重建一次等价运算以维护SSA顺序
     if (!Phi) return nullptr;
-    if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
     const unsigned N = Phi->getNumIncomingValues();
     if (N < 2) return nullptr;
     auto *First = dynamic_cast<BinaryInst *>(Phi->getIncomingValue(0));
@@ -138,7 +137,6 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
     for (unsigned i = 0; i < N; ++i) {
         auto *Bin = dynamic_cast<BinaryInst *>(Phi->getIncomingValue(i));
         if (!Bin || Bin->getOp() != Op) return nullptr;
-        if (!F || F->hasTimingBarrierOnPath(Bin, Phi)) return nullptr;
         Value *L = nullptr;
         Value *R = nullptr;
         if (!BinaryInst::getOperands(Bin, L, R)) return nullptr;
@@ -198,11 +196,10 @@ Value *InstSimplifier::foldPhiOfBinary(PhiInst *Phi) {
 }
 //尝试把GEP跨PHI各输入臂分解并折叠
 Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
-    //1.验证全部输入都是无计时屏障的动态GEP并拒绝栈地址基址
+    //1.验证全部输入都是动态GEP并拒绝栈地址基址
     //2.比较基址与各索引，只允许一个非公共且非常量的位置
     //3.为差异位置创建PHI并在汇合块重建GEP，保持地址计算类型与SSA布局
     if (!Phi) return nullptr;
-    if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
     const unsigned N = Phi->getNumIncomingValues();
     if (N < 2) return nullptr;
     auto *First = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0));
@@ -217,7 +214,6 @@ Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
     for (unsigned i = 0; i < N; ++i) {
         auto *GEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(i));
         if (!GEP || GEP->hasOnlyConstantIndices()) return nullptr;
-        if (!F || F->hasTimingBarrierOnPath(GEP, Phi)) return nullptr;
         Value *Ptr = nullptr;
         std::vector<Value *> Idxs;
         if (!GetElementPtrInst::getBaseAndIndices(GEP, Ptr, Idxs)) return nullptr;
@@ -293,11 +289,12 @@ Value *InstSimplifier::foldPhiOfGEP(PhiInst *Phi) {
 }
 //尝试把Load跨PHI各输入臂安全下沉
 Value *InstSimplifier::foldPhiOfLoad(PhiInst *Phi) {
-    //1.每条输入必须是对应前驱中的单用户Load且无计时屏障
+    //1.每条输入必须是对应前驱中的单用户Load，且移动路径不跨通用顺序屏障
     //2.别名与MemorySSA必须证明Load到前驱出口之间没有写入破坏
     //3.先合并地址再于汇合块创建单一Load，随后禁用陈旧MemorySSA的增量证明
     if (!Phi) return nullptr;
-    if (!F || F->hasTimingBarrierOnPath(Phi, Phi)) return nullptr;
+    if (!F || !FAM || hasOrderingBarrierOnPath(*F, Phi, Phi, *FAM))
+        return nullptr;
     const unsigned N = Phi->getNumIncomingValues();
     if (N < 2) return nullptr;
     auto *First = dynamic_cast<LoadInst *>(Phi->getIncomingValue(0));
@@ -307,7 +304,7 @@ Value *InstSimplifier::foldPhiOfLoad(PhiInst *Phi) {
     for (unsigned i = 0; i < N; ++i) {
         auto *L = dynamic_cast<LoadInst *>(Phi->getIncomingValue(i));
         if (!L) return nullptr;
-        if (!F || F->hasTimingBarrierOnPath(L, Phi)) return nullptr;
+        if (hasOrderingBarrierOnPath(*F, L, Phi, *FAM)) return nullptr;
         if (!L->hasExactlyOneUse()) return nullptr;
         if (L->getParent() != Phi->getIncomingBlock(i)) return nullptr;
         if (!isLoadSuitableForSinking(L)) return nullptr;

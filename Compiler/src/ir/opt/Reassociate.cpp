@@ -16,7 +16,7 @@
 ReassociatePass::ReassociatePass(bool PreserveAddressArithmetic)
 	: PreserveAddressArithmetic(PreserveAddressArithmetic) {}
 //清理判定服务主流程扫描：无使用的纯计算无需再规范化；终结、PHI、store、
-//计时可达调用及有副作用调用必须保留，交由相应清理 pass 处理。
+//有副作用调用必须保留，交由相应清理 pass 处理。
 bool ReassociatePass::isDeadInstruction(
 	Instruction *I, FunctionAnalysisPassManager &FAM) {
 	if (!I) return false;
@@ -26,7 +26,6 @@ bool ReassociatePass::isDeadInstruction(
 		return false;
 	}
 	if (auto *CI = dynamic_cast<CallInst *>(I)) {
-		if (CI->mayReachTimingCall()) return false;
 		if (dceCallHasSideEffect(CI, FAM)) return false;
 	}
 	return true;
@@ -573,8 +572,8 @@ Value *ReassociateEngine::optExp(
 	if (Ops.size() == 1) return Ops[0];
 	return nullptr;
 }
-//单根优化流程：筛选合法整数根，验证计时边界，规范 SUB，展开并排序同操作
-//树，执行代数化简，最后仅在形状确有变化时重建。
+//单根优化流程：筛选合法整数根，规范 SUB，展开并排序同操作树，执行代数
+//化简，最后仅在形状确有变化时重建。
 bool ReassociateEngine::optimizeInst(Instruction *I) {
 	if (!I || !I->getParent()) return false;
 	auto *BI = dynamic_cast<BinaryInst *>(I);
@@ -592,26 +591,7 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 		!IRType::isInt(RHS ? RHS->getIRType() : nullptr)) {
 		return false;
 	}
-	//2.合法性验证沿候选表达式的定义链检查计时屏障；固定预算耗尽即放弃，
-	//避免把重建节点跨越计时分段，同时限制异常深图的编译时间。
-	std::vector<Value *> TimingWorkList{LHS, RHS};
-	std::unordered_set<Value *> TimingVisited;
-	std::size_t TimingBudget = 0;
-	while (!TimingWorkList.empty()) {
-		Value *Current = TimingWorkList.back();
-		TimingWorkList.pop_back();
-		if (!Current || !TimingVisited.insert(Current).second) continue;
-		if (++TimingBudget > 256) return false;
-		auto *Def = dynamic_cast<Instruction *>(Current);
-		if (!Def || !Def->getParent()) continue;
-		if (F.hasTimingBarrierOnPath(Def, I)) return false;
-		if (!dynamic_cast<BinaryInst *>(Def)) continue;
-		forEachOperand(
-			Def, [&](size_t, Use *, Value *Operand) {
-				if (Operand) TimingWorkList.push_back(Operand);
-			});
-	}
-	//3.SUB 先规范为 LHS + RHS * (-1)，新节点经 Todo 在后续继续重结合。
+	//2.SUB 先规范为 LHS + RHS * (-1)，新节点经 Todo 在后续继续重结合。
 	if (Op == BinaryInst::SUB) {
 		Instruction *Neg = createBinaryBefore(
 			I, BinaryInst::MUL, RHS,

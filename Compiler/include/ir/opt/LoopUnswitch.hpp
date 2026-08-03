@@ -225,8 +225,6 @@ private:
                               const Loop &L, const DominatorTree &DT);
     //检查循环是否满足规范形状并填充头、预头和回边块
     static bool getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape);
-    //判断循环及其子循环是否可能执行计时调用
-    static bool loopMayReachTimingCall(const Loop *L);
     //判断基本块是否直接属于给定循环而非其子循环
     static bool isDirectLoopBlock(const LoopInfo &LI, Loop *L,
                                   BasicBlock *BB);
