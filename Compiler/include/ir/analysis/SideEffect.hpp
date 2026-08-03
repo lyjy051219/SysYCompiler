@@ -232,3 +232,11 @@ ModRefInfo getCallProgramModRefInfo(
 //返回一次调用的程序内存、可观察效果和顺序屏障摘要
 CallEffectSummary getCallEffectSummary(
     CallInst *CI, FunctionAnalysisPassManager &FAM);
+
+//判断两个指令位置之间是否存在一条经过通用顺序屏障且能够到达终点的CFG路径
+bool hasOrderingBarrierOnPath(
+    Function &F, BasicBlock *StartBlock, const Instruction *StartAfter,
+    const Instruction *EndBefore, FunctionAnalysisPassManager &FAM);
+bool hasOrderingBarrierOnPath(
+    Function &F, const Instruction *StartAfter,
+    const Instruction *EndBefore, FunctionAnalysisPassManager &FAM);

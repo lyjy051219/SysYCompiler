@@ -376,7 +376,7 @@ bool GVNPRESolver::isBeforeInSameBlock(Instruction *A, Instruction *B) const {
 }
 //查找在使用位置合法可用的值号代表
 Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const {
-    //2.4 leader 必须支配 use；同块还必须位于 use 之前，且两者之间不能跨计时屏障。
+    //2.4 leader 必须支配 use；同块还必须位于 use 之前。
     if (!UseBB) return nullptr;
     auto It = LeaderTable.find(Num);
     if (It == LeaderTable.end()) return nullptr;
@@ -388,7 +388,6 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
         if (UseI && R.BB == UseBB && !isBeforeInSameBlock(R.Inst, UseI)) {
             continue;
         }
-        if (UseI && F.hasTimingBarrierOnPath(R.Inst, UseI)) continue;
         Best = R.Inst;
         if (R.Inst->isConst()) return Best;
     }
@@ -534,7 +533,7 @@ ModRefInfo GVNPRESolver::getCallModRef(CallInst *CI) {
 bool GVNPRESolver::isCallCSEEligible(CallInst *CI) {
     //2.8 调用 CSE 仅支持已定义、非 builtin、非 void/指针返回且摘要至多 Ref 的函数，
     //并排除传递调用 builtin 的不稳定摘要。
-    if (!CI || CI->mayReachTimingCall() || CI->getBuiltinCallee() ||
+    if (!CI || CI->getBuiltinCallee() ||
         !CI->getIRType() ||
         CI->getIRType()->isVoid() || CI->getIRType()->isPointer())
         return false;
@@ -884,8 +883,7 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 !identicalCall(CI, Previous) ||
                 !DT.dominates(It->Block, BB) ||
                 (It->Block == BB &&
-                 !Instruction::comesBefore(Previous, CI)) ||
-                F.hasTimingBarrierOnPath(Previous, CI)) {
+                 !Instruction::comesBefore(Previous, CI))) {
                 continue;
             }
             MemoryAccess *CallAccess = MSSA.getMemoryAccess(CI);
@@ -942,7 +940,6 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 continue;
             }
             if (auto *PrevCall = dynamic_cast<CallInst *>(Cur)) {
-                if (PrevCall->mayReachTimingCall()) return false;
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
@@ -1034,8 +1031,7 @@ bool GVNPRESolver::runGVN() {
 }
 //合并支配等价的循环PHI并维护SSA使用关系
 bool GVNPRESolver::eliminateCongruentPhis() {
-    //2.16 在每个可达块中成对比较同型 PHI；不因循环含 timer 整体放弃，
-    //而是对候选操作数图做有界跨屏障检查后再合并。
+    //2.16 在每个可达块中成对比较同型 PHI，并合并支配关系明确的等价节点。
     bool Changed = false;
     for (BasicBlock *BB : RPO) {
         if (!BB || isDeadBlock(BB)) continue;
@@ -1055,30 +1051,6 @@ bool GVNPRESolver::eliminateCongruentPhis() {
                 }
                 PhiCongruenceMatcher Matcher;
                 if (!Matcher.equivalent(Leader, Candidate)) continue;
-                auto CrossesTiming = [&](Value *Root) {
-                    std::vector<Value *> WorkList{Root};
-                    std::unordered_set<Value *> Seen;
-                    std::size_t Budget = 0;
-                    while (!WorkList.empty()) {
-                        Value *Current = WorkList.back();
-                        WorkList.pop_back();
-                        if (!Current || !Seen.insert(Current).second) continue;
-                        if (++Budget > 512) return true;
-                        auto *Def = dynamic_cast<Instruction *>(Current);
-                        if (!Def || !Def->getParent()) continue;
-                        if (Def != Leader && Def != Candidate &&
-                            F.hasTimingBarrierOnPath(Def, Candidate)) {
-                            return true;
-                        }
-                        forEachOperand(
-                            Def, [&](size_t, Use *, Value *Operand) {
-                                if (Operand) WorkList.push_back(Operand);
-                            });
-                    }
-                    return false;
-                };
-                if (CrossesTiming(Leader) || CrossesTiming(Candidate))
-                    continue;
                 Candidate->replaceAllUsesWith(Leader);
                 Removed.insert(Candidate);
                 Changed = true;
@@ -1258,10 +1230,6 @@ bool GVNPRESolver::runPRE() {
                     PREPred = Pred;
                     continue;
                 }
-                if (F.hasTimingBarrierOnPath(Leader, I)) {
-                    Abort = true;
-                    break;
-                }
                 if (Leader == I) {
                     NumWithout = 2;
                     Abort      = true;
@@ -1275,11 +1243,7 @@ bool GVNPRESolver::runPRE() {
                 continue;
             }
             Instruction *PredTerminator = PREPred->getTerminator();
-            if (!PredTerminator ||
-                F.hasTimingBarrierOnPath(
-                    PREPred, PredTerminator->getPrev(), I)) {
-                continue;
-            }
+            if (!PredTerminator) continue;
             //3.7 在缺失前驱终结前克隆表达式，并逐操作数解析该边可用值；任一操作数
             //无合法 leader 时丢弃离线克隆。
             Instruction *Cloned = I->clone({});
@@ -1438,8 +1402,7 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
 //对给定函数逐块运行局部值编号并返回分析保留状态
 PreservationStatus LocalGVNPass::run(Function &F,
                                      FunctionAnalysisPassManager &) {
-    //1. 每个基本块独立维护表达式 leader 表，按程序顺序将重复纯表达式替换为首个；
-    //计时调用清空表，禁止跨越计时边界合并地址或计算。
+    //1. 每个基本块独立维护表达式 leader 表，按程序顺序将重复纯表达式替换为首个。
     bool Changed = false;
     for (BasicBlock *BB : F) {
         if (!BB) continue;
@@ -1447,11 +1410,6 @@ PreservationStatus LocalGVNPass::run(Function &F,
         auto Insts = collectInstructions(*BB);
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
-            if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && CI->mayReachTimingCall()) {
-                Leaders.clear();
-                continue;
-            }
             LocalExprKey Key;
             if (!buildLocalExprKey(I, Key)) continue;
             auto It = Leaders.find(Key);

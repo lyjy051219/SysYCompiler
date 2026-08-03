@@ -53,18 +53,6 @@ bool LoopUnswitchPass::getCanonicalLoopShape(Loop *L, CanonicalLoopShape &Shape)
     Shape = {L->getHeader(), PreHeader, Latch};
     return true;
 }
-//判断循环及其子循环是否可能执行计时调用
-bool LoopUnswitchPass::loopMayReachTimingCall(const Loop *L) {
-    if (!L) return true;
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        if (!BB) return true;
-        for (Instruction *I : *BB) {
-            auto *CI = dynamic_cast<CallInst *>(I);
-            if (CI && CI->mayReachTimingCall()) return true;
-        }
-    }
-    return false;
-}
 //判断基本块是否直接属于给定循环而非其子循环
 bool LoopUnswitchPass::isDirectLoopBlock(const LoopInfo &LI, Loop *L, BasicBlock *BB) {
     return L && BB && LI.getLoopFor(BB) == L;
@@ -516,6 +504,9 @@ bool LoopUnswitchPass::isSafeTrivialPrefix(
         for (Instruction *I : *BB) {
             if (!I) return false;
             if (I == C.Branch) break;
+            // 平凡外提会让退出路径跳过这段前缀；调用是否可观察需要依赖
+            // 跨函数分析，因此此处对所有调用采用统一的结构门禁。
+            if (dynamic_cast<CallInst *>(I)) return false;
             MemoryAccess *MA = MSSA.getMemoryAccess(I);
             if ((MA && MA->isDef()) ||
                 instructionMayFaultOrProducePoison(I) ||
@@ -576,9 +567,8 @@ LoopUnswitchPass::findTrivialCandidate(
     if (DomOrder.empty()) {
         for (BasicBlock *BB : F) DomOrder.push_back(BB);
     }
-    //2.从内向外选择规范、无计时调用且条件在预头可用的循环
+    //2.从内向外选择规范且条件在预头可用的循环
     for (Loop *L : LI.getLoopsInPostOrder()) {
-        if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
         //3.候选分支必须一侧继续、一侧退出，并通过前缀和出口PHI合法性证明
@@ -751,8 +741,7 @@ LoopUnswitchPass::findEntryKnownCandidates(
     LoopInfo &LI, const DominatorTree &DT) {
     std::vector<EntryKnownCandidate> Result;
     for (Loop *L : LI.getLoopsInPostOrder()) {
-        //4.从内向外收集 entry-known 候选，计时循环仍不可折叠；同一循环内相同条件只记录一次。
-        if (loopMayReachTimingCall(L)) continue;
+        //4.从内向外收集 entry-known 候选；同一循环内相同条件只记录一次。
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape) ||
             !Shape.PreHeader->getTerminator()) {
@@ -852,7 +841,6 @@ LoopUnswitchPass::findBestNonTrivialCandidate(
     if (FunctionWeight == 0) return std::nullopt;
     for (Loop *L : LI.getLoopsInPostOrder()) {
         //5.枚举 non-trivial 候选：分支两侧都必须留在循环内，条件在 preheader 可用，Parent 在每迭代进展前必经。
-        if (loopMayReachTimingCall(L)) continue;
         CanonicalLoopShape Shape;
         if (!getCanonicalLoopShape(L, Shape)) continue;
         std::vector<BasicBlock *> AllBlocks = L->getBlocksInFunctionOrder();
@@ -1256,8 +1244,7 @@ bool LoopUnswitchPass::transformTrivial(
         !C.Branch || !C.Exit || !C.Continue) {
         return false;
     }
-    //1.提交前重新验证计时门禁、预头边和原分支身份，候选过期时保守回退
-    if (loopMayReachTimingCall(C.L)) return false;
+    //1.提交前重新验证预头边和原分支身份，候选过期时保守回退
     BasicBlock *OldPreHeader = C.Shape.PreHeader;
     BasicBlock *Header = C.Shape.Header;
     auto *OldPreBr = OldPreHeader->getBranchTerminator();
@@ -1363,7 +1350,6 @@ bool LoopUnswitchPass::transformTrivial(
 bool LoopUnswitchPass::transformEntryKnown(const EntryKnownCandidate &C) {
     //4.3entry-known 提交仅把选中循环内的条件 use 替换为已证明布尔常量，后续简化 pass 负责折叠 CFG。
     if (!C.Condition || !C.L) return false;
-    if (loopMayReachTimingCall(C.L)) return false;
     BlockSet Blocks;
     for (BasicBlock *BB : C.AllBlocks)
         if (BB) Blocks.insert(BB);
@@ -1376,8 +1362,7 @@ bool LoopUnswitchPass::transformNonTrivial(Function &F, NonTrivialCandidate &C) 
         !C.CloneSucc) {
         return false;
     }
-    //6.提交前重新验证计时门禁、preheader 和候选分支全部仍与发现阶段一致。
-    if (loopMayReachTimingCall(C.L)) return false;
+    //6.提交前重新验证 preheader 和候选分支全部仍与发现阶段一致。
     BrInst *OldPreBr = C.Shape.PreHeader->getBranchTerminator();
     if (!BasicBlock::isUncondBr(OldPreBr) ||
         OldPreBr->getTrueSuccessor() != C.Shape.Header ||

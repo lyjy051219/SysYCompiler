@@ -376,10 +376,8 @@ std::string LoopUnrollPass::makePeelBlockIdent(Function *F,
 //判断指令种类是否由循环展开克隆器完整支持
 bool LoopUnrollPass::isSupportedCloneInstruction(Instruction *I) {
     if (!I) return false;
-    //2.2 所有展开/剥离路径共享该克隆门禁：计时调用及封装、ret、alloca 和未知二元指令不得被复制。
-    if (auto *CI = dynamic_cast<CallInst *>(I)) {
-        if (CI->mayReachTimingCall()) return false;
-    }
+    //2.2 所有展开/剥离路径共享该克隆门禁：ret、alloca 和未知二元指令
+    //不得被复制；普通调用由通用指令克隆接口保持原参数与顺序。
     switch (I->instType) {
     case Instruction::RET:
     case Instruction::ALLOCA:
@@ -1889,17 +1887,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
     if (!L) {
         return LoopUnrollResult::Unmodified;
     }
-    //2. 单候选先扫描整个循环子树，任何直接或经用户函数可达的计时调用都禁止复制或改变首迭代位置。
-    for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
-        if (!BB) return LoopUnrollResult::Unmodified;
-        for (Instruction *I : *BB) {
-            auto *CI = dynamic_cast<CallInst *>(I);
-            if (CI && CI->mayReachTimingCall()) {
-                return LoopUnrollResult::Unmodified;
-            }
-        }
-    }
-    //2.1 依次证明规范 CFG/LCSSA、可用 trip-count 和全循环指令可克隆，再估算直属循环体成本。
+    //2.依次证明规范 CFG/LCSSA、可用 trip-count 和全循环指令可克隆，再估算直属循环体成本。
     if (!isCanonicalLoop(L)) {
         return LoopUnrollResult::Unmodified;
     }

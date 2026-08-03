@@ -965,142 +965,23 @@ graph TD
 
 参考资料：https://zhuanlan.zhihu.com/p/715818784
 
-##### SCEV
-
-依赖AnalysisPass：Dominant，LoopAnalysis
-
-
-
-
-
-
-
 ##### BasicAliasAnalysis
 
-采用**即时计算别名分析**实现
+依赖AnalysisPass： SCEV、 LoopAnalysis、DominantAnalysis
 
-即时计算别名分析可以分析简单的含变量索引的数组指针
+1. 三值关系：NoAlias / MayAlias / MustAlias
 
-- 基址对象：
+2. 对 load/store 使用带字节宽度的 MemoryLocation
 
-  在sysy之中，指针仅来源于数组作为参数传递，所以我们的指针的基址只能来自**Alloca/Param/GlobalVariable中的数组类型**
+3. 同一底层对象的常量 GEP 区间不相交时返回 NoAlias
 
-  - Alloca：在函数体中定义的局部数组/局部变量
-  - Param：函数形参，传入的数组指针
-  - Variable::GlobalVariable:全局变量/数组
-  - Variable::GlobalConstant：全局常量
+   ```
+   %p0 = gep [4 x i32], ptr %a, 0, 0
+   %p1 = gep [4 x i32], ptr %a, 0, 1
+   NoAlias
+   ```
 
-- 即时计算别名分析：
-
-  > 如果想写的好一点可以实现一下aliasSelect，还有`a[2*i]` 和 `a[2*j+1]`这种的alias判定
-
-  传入两个Value指针V1,V2
-
-  1. 如果任一者访问的内存大小为0,直接判定为NoAlias
-
-  2. 剥离BitCast
-
-     整个循环可以采用visit数组进行循环条件判定，如果遇到了之前已经visited的循环那么就直接退出循环即可
-
-     如果Value类型不是指针类型直接返回
-
-     如果这一层是GEP，看一下是否所有索引全为零，如果不是那么就直接返回当前的GEP，如果是的话，那么就拿到GEP的基址指针
-
-     如果这一层是BitCast，那么就拿到它的操作数，继续下一轮剥离
-
-     如果这一层是只有一个输入源的PHI节点，拿到操作数继续向下剥离
-
-     如果是其他指令那么就直接返回即可
-
-  3. 如果V1/V2有是UndefValue的，那么直接判定为NoAlias
-
-  4. 判断相等性并拦截跨迭代相等性的情况
-
-     如果V1,V2不相等，那么直接返回false
-
-     如果不是inst类型，那么直接返回true
-
-     如果inst不在任何循环里，那么返回true
-
-     如果inst在任何循环里面，那么人false
-
-     true的可以直接判定为MustAlias
-
-  5. **核心寻找基地址：O1,O2**
-
-     继续可以用while循环+visited数组的方式来作为外层循环的条件
-
-     如果是GEP指令，直接拿到它的基址指针，将V更新为基址指针
-
-     如果是BitCast指令，直接拿到源操作数，更新V
-
-     如果是Phi节点，如果只有一个输入，那么拿到操作数，更新V
-
-     其余情况就直接返回V即可
-
-  6. 快速判定：
-
-     1. 如果底层对象不同O1!=O2
-
-        如果二者都是Alloca（局部数组），那么NoAlias
-
-        如果二者都是Variable::GlobalVariable，那么NoAlias
-
-        如果一个是Param（函数参数）一个是Alloca（局部数组），那么NoAlias
-
-        如果一个是Alloca一个是Variable::GlobalVariable，那么NoAlias
-
-     2. 如果底层对象相同
-
-        循环深度限制/加入一个visited数组
-
-        循环查找：构造一个map，key是V1,V21,value是AliasResult，如果尝试将O1,O2（排除顺序），加入到map之中，如果缓存命中那么就可以直接返回
-
-        如果是GEP（说明O1,O2指向同一个底层数组），那么aliasGEP
-
-        如果是PHI，那么aliasPHI
-
-        - aliasGEP
-
-          将GEP拍平成一个一元线性方程：
-          $$
-          Base+ConstantOffset+∑(Value_i​×Stride_i​)
-          $$
-          解析GEP的所有索引+内层操作数，知道碰上最底层的基址
-
-          1. 如果已经不是指令/操作符了。直接返回
-
-          2. 如果BitCast，那么获取操作数
-
-          3. 如果GEP，那么遍历获取GEP的所有索引
-
-             如果索引是常数，那么获取当前维度把`常数索引 * 步长`累加到总的`ConstantOffset`之中
-
-             如果索引是变量，直接`VarIndices[%i] += 1 * 当前维度步长`
-
-          将GEP1和GEP2上面计算的一元线性方程做减法
-
-          首先检查基址
-
-          1. 如果减法化简之后所有的变量被抵消了，常量没有抵消，没有抵消如果大于数组元素的字节大小，可以返回NoAlias，如过小于数组元素的字节大小，返回MayAlias，如果常量也完全抵消了，那么MustAlias
-          2. 如果变量无法抵消，直接返回MayAlias
-
-        - aliasPHI:判断一个PHI节点和另一个指针O2是否有重叠情况
-
-          > 总体思路就是比较这个PHI节点的所有输入值和另一个指针O2是否存在别名
-
-          如果这个PHI没有任何输入，直接返回NoAlias
-
-          如果O2也是一个PHI，并且两个PHI在同一个基本块之中，只需要做N-N的一对一比对输入值即可
-
-          如果是常规情况，遍历PHI的所有输入，分别与O2比较，对每个输入和O2调用外层的aliasCheck函数，对所有AliasResult结果求交集
-
-          > `NoAlias` + `NoAlias` = `NoAlias
-          > MustAlias` + `MustAlias` = `MustAlias`
-          >
-          > 任何结果 + `MayAlias` = `MayAlias`
-          >
-          > `NoAlias` + `MustAlias` = `MayAlias`
+4. PHI/Select 只有所有路径得到相同强结论时才保留，否则退化为 MayAlias
 
 ##### SideEffect--副作用分析
 
@@ -1144,1118 +1025,73 @@ graph TD
          5. 数组输出：指针实参加入RefSet
          6. 标量输入输出：不加入ModSet或RefSet，只标记可观察效果
 
-     
 
-- 
+##### SCEV
 
+依赖 AnalysisPass：LoopAnalysis、DominantAnalysis
 
+1. 为整数表达式构造共享的 SCEV DAG，包括常量、Unknown、算术、cast、select、比较和 GEP 字节偏移
 
+2. 识别循环 Header PHI 的递推表达式：
 
+   ```
+   {Start,+,Step}<Loop>
+   ```
 
-#### TransformPass
+   也支持最高 8 阶的多项式 AddRec，以及有限的 MulRec/DivRec
 
-##### DCE
+3. 分析规范循环的 trip count、backedge count、trip multiple、步长和 no-wrap。
 
-依赖Side Effect
+4. 支持 `< <= > >=`；常量距离时还支持 `!=`。
 
-函数内级联（递归删除）死代码消除
-
-- 算法流程：
-
-  1. 遍历目标函数中的所有指令
-
-     判断是否在工作队列之中（防止重复劳动），如果不在，调用下列的删除逻辑，然后开始处理工作队列里面的指令（直到处理完），调用下列的删除逻辑
-
-  2. 具体消除逻辑：
-
-     1. 检查：
-
-        如果这条指令还被其他指令使用，不行
-
-        如果是Terminator终结指令，不行
-
-        副作用：store不行，call(访问callee，调用副作用分析这个函数是不是只读，如果不是就是含副作用)
-
-        其他指令都可以
-
-     2. 执行消除：
-
-        遍历该指令所有操作数
-
-        获取每个操作数将指令I的这个操作数置空，如果操作数还有指令在使用它/该操作数就是该指令（自我引用），就跳过该操作数
-
-        检查该操作数是不是一条指令，如果是的话调用2.1的逻辑判断，如果满足判断条件就加入工作队列
-
-        处理完操作数就删除该指令
-
-##### TailRecursionElimination尾递归消除
-
-依赖SideEffect
-
-支持累加/累乘累加器，支持call与ret不紧挨的广义尾递归消除
-
-- 算法流程：
-
-  1. 处理普通尾调用(call调用的函数不是自身)：
-
-     > 这一步不是为了尾递归消除，而是为了给后端机器码生成器提供优化提示(允许复用栈帧)
-
-     简单逃逸分析：没有任何Alloca被call指令当作参数传走
-
-     检查call与ret的返回值必须匹配
-
-     ```
-     %r = call @other_function(...)  // 不能是当前函数本身
-     ret %r                          // ret 必须直接返回 call 的结果
-
-     call @other_function(...)       // 调用的函数也必须是 void
-     ret void
-     ```
-
-     call后紧跟ret，并且call调用的函数不是自身
-
-  2. 处理尾递归(call调用的函数是自身)：
-
-     遍历目标函数中所有基本块：
-
-     1. 处理终结指令是无条件跳转的情况，并且无条件跳转目标块的PHI指令之后第一条指令必须是Ret（该块除了Ret没有其他逻辑）：
-
-        找到该块中的Call Inst：从块末尾开始倒着向前找Call Inst，并检查Callee必须是函数自身--**不一定要求call与ret挨着**
-
-        图合并操作：将目标块之中的Ret clone到该块的末尾，遍历新clone的Ret的操作数，如果是BitCast，clone之后插入到新Ret前面，并获取BitCast的操作数，如果是PHI，访问PHI拿到从该块传递来的值，直接接入到Ret的操作数上
-
-        将目标块中的PHI中关于该块传递进来的值全部删掉
-
-        将该块中的Br无条件指令删除
-
-     2. 处理终结指令是Ret的情况：
-
-        找到该块中的Call Inst：从块末尾开始倒着向前找Call Inst，并检查Callee必须是函数自身--**不一定要求call与ret挨着**
-
-     3. 获得上面的Call Inst之后，开始进行真正的尾递归消除逻辑：
-
-         遍历call和ret之间的所有指令：1，2条在这个循环里
-
-        1. 查看这条指令是否可以移动到call指令之前：
-
-           副作用不行：store不行，call(访问callee，调用副作用分析这个函数是不是只读，如果不是就是含副作用)
-
-           如果指令是LOAD指令，拿到LOAD读取的地址，调用副作用getInstModRefInfo分析，如果Call Inst Mod这块地址，那么就不能移动
-
-           检查该指令的操作数是否包含Call Inst的返回值，如果有不能移动
-
-        2. 识别累加/累乘的伪尾递归，判定是否可以改成带有累加器的循环：
-
-           检查该指令是否同时满足交换律和结合律：只能放行ADD和MUL指令
-
-           如果有多条这种累加指令，不行
-
-           检查这条指令的两个操作数，必须有一个且只能有一个是Call Inst的返回值
-
-           检查这条指令只能被使用一次，且User是Ret指令
-
-        处理：
-
-        1. 创建循环头：
-
-           拿到目标函数的入口块，创建一个新的基本块插入到入口块前面，在新基本块末尾插入无条件跳转指令让其可以直接跳转到入口块
-
-           遍历原入口块，将所有Alloca指令搬到新基本块之中
-
-           遍历函数所有形参，在原入口块最前面为每个形参创建一个PHI，将原来使用形参的地方全部替换成新创建的PHI，将形参作为输入值加入PHI
-
-        2. 将这次尾递归传递的实参，添加到原入口块的PHI节点之中
-
-        3. 如果含累加器指令：
-
-           在原入口块节点插入一个PHI指令，如果是ADD初始值设置为0,如果是乘法初始值设置为1，将这个值加入到PHI之中，把原来使用call返回值的地方改成使用累加器指令
-
-        4. 收尾：
-
-           创建一条Br，代替原来的Ret，将旧的Ret和Call从内存中删掉
-
-           将剩下的Ret之前创建BinaryInst，计算累加器与Ret原本的返回值，然后修改Ret的返回值
-
-
-
-
-
-##### InstSimplify 指令简化
-
-运行前需要运行一下CFGSimplify清除不可达块，运行后需要运行DCE
-
-- 算法流程：
-
-  遍历目标函数之中每个基本块之中每条指令（被人使用的）
-
-  - 核心Simplify：拿到Simplify之后的Value
-
-    Switch分发：
-
-    1. Add/FAdd：
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 如果LHS是常量，RHS不是常量，交换左右操作数的位置
-       3. 其余情况返回nullptr
-
-       UndefValue情况：如果LHS/RHS其中有一个是UndefValue，那么就返回UndefValue
-
-       如果RHS是0,返回LHS
-
-       如果LHS与RHS互为相反数，返回对应类型的0值
-
-       如果一个操作数是X另一个操作数是一个减法表达式，这个减法表达式恰好是Y-X，那么返回Y
-
-    2. Sub/FSub：
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 其余情况直接返回
-
-       UndefValue情况：如果LHS/RHS其中有一个是UndefValue，那么就返回UndefValue
-
-       如果匹配X-0,那么直接返回X
-
-       如果匹配X-X，那么直接返回0
-
-    3. Mul/FMul：
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 如果LHS是常量，RHS不是常量，交换左右操作数的位置
-       3. 其余情况返回nullptr
-
-       UndefValue情况：如果LHS/RHS其中有一个是UndefValue，那么就返回0
-
-       如果RHS为0,那么返回0
-
-       如果RHS为1,那么返回LHS
-
-    4. SDiv/UDiv/FDiv：
-
-       这一条仅适用于SDiv：如果两个数互为相反数，直接返回-1
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 其余情况返回nullptr
-
-       X/Undef：返回Undef
-
-       Undef/X：返回0
-
-       Undef / 0：返回Undef
-
-       Undef/Undef：返回Undef
-
-       X/0：返回Undef
-
-       0/X：返回0
-
-       X/X：返回1
-
-       X/1：返回X
-
-    5. SRem/URem/FRem：
-
-       如果两个数互为相反数，直接返回0
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 其余情况直接返回
-
-       X % undef ：返回undef
-
-       undef % X ：返回 0
-
-       0 % X ：返回0
-
-       X % 0 ：返回undef
-
-       X % 1 ：返回0
-
-       X % X ：返回0
-
-    6. And：
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 如果LHS是常量，RHS不是常量，交换左右操作数的位置
-       3. 其余情况返回nullptr
-
-       X & undef -> 0
-
-       X & X = X
-
-       X & 0 = 0
-
-       X & -1 = X
-
-    7. Or:
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 如果LHS是常量，RHS不是常量，交换左右操作数的位置
-       3. 其余情况返回nullptr
-
-       X | undef -> -1
-
-       X | -1 = -1
-
-       X | X = X
-
-       X | 0 = X
-
-    8. Xor:
-
-       常量情况：
-
-       1. 如果LHS和RHS都是常量：常量折叠
-       2. 如果LHS是常量，RHS不是常量，交换左右操作数的位置
-       3. 其余情况返回nullptr
-
-       A ^ undef -> undef
-
-       A ^ 0 = A
-
-       A ^ A = 0
-
-    9. ICmp
-
-       常量情况：常量折叠
-
-       icmp X, X -> true/false--根据情况来定
-
-    10. FCmp
-
-        常量情况：常量折叠
-
-        fcmp X, X -> true/false--根据情况来定
-
-    11. Select
-
-        常量情况：
-
-        1. 如果Cond，TrueVal，FalseVal都是常量：常量折叠
-        2. 如果Cond为UndefValue：选取TrueVal，FalseVal为常量的一个返回，如果都不是常量那么随便选一个
-        3. 如果Cond为常量true，那么返回TrueVal
-        4. 如果Cond为常量false，那么返回FalseVal
-
-        模式匹配：
-
-        1. select ?, X, X -> X
-        2. select x, y, false = x & y
-        3. select x, y, true = !x | y
-        4. select x, false, y = !x & y
-        5. select x, true, y = x | y
-        6. select ?, undef,  X -> X
-        7. select ?, X, undef  -> X
-        8. select i1 x, i32 1, i32 0 = zext x
-        9. select i1 x, i64 1, i64 0 = zext x
-        10. select (x == y), x, y ->x
-        11. select (X != Y), X, Y -> X
-        12. select ((X | Y) == 0, X, 0) -> 0
-        13. select ((X & Y) == -1, X, -1) -> -1
-
-    12. PHI：平凡PHI消除
-
-        跳过LCSSA形式的PHI
-
-        遍历PHI之中所有输入值
-
-        ​	如果遇到输入值是本身，那么直接跳过
-
-        ​	如果遇到UndefValue，那么用HasUndef记录之后直接跳过
-
-        ​	遇到第一个非 undef、非 self 的值，记为 CommonValue
-
-        ​	如果找到CommonValue但是遇到了其余不一样的值，那么直接返回无法化简
-
-        如果最后CommonValue还是Nullptr（说明PHI的所有输入要么全是它自己要么全是UndefValue），用RAUW替换所有使用该PHI的地方为UndefValue，然后删除
-
-        当HasUndef True的时候，需要检查CommonValue是否支配该PHI节点（将），如果支配执行下面的逻辑，如果没有结束算法
-
-        最后用RAUW替换所有使用该PHI的地方为CommonValue
-
-    13. 其余没有提到的指令直接返回nullptr
-
-  遍历当前指令的User，加入到WorkList之中，RAUW替换所有使用为Value
-
-- 常量折叠：
-
-  ConstantFoldBinaryInstruction函数
-
-
-
-##### IfConversion
-
-引入Select指令
-
-优化前：
-
-```mermaid
-graph TD
-    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
-    classDef branch fill:#e2f0d9,stroke:#b2cba5,stroke-width:2px;
-    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
-
-    Pred["<b>Pred (前驱块)</b><br/>...<br/>%cond = icmp eq i32 %a, 0<br/>br i1 %cond, label %BB1, label %BB2"]:::pred
-
-    BB1["<b>BB1 (Then 块)</b><br/>%v1 = add i32 %x, 1<br/>br label %Succ"]:::branch
-    BB2["<b>BB2 (Else 块)</b><br/>%v2 = sub i32 %x, 1<br/>br label %Succ"]:::branch
-
-    Succ["<b>Succ (后继块)</b><br/>%res = phi i32 [ %v1, %BB1 ], [ %v2, %BB2 ]<br/>ret i32 %res"]:::succ
-
-    Pred -- "True" --> BB1
-    Pred -- "False" --> BB2
-    BB1 --> Succ
-    BB2 --> Succ
-```
-
-优化后
-
-```mermaid
-graph TD
-    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
-    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
-    classDef highlight fill:#fff2cc,stroke:#fbc58e,stroke-width:2px,stroke-dasharray: 5 5;
-
-    Pred["<b>Pred (前驱块)</b><br/><br/>%cond = icmp eq i32 %a, 0<br/><hr/><i> --- 从 BB1 和 BB2 提升上来的指令 ---</i><br/><b>%v1 = add i32 %x, 1</b><br/><b>%v2 = sub i32 %x, 1</b><br/><i> --- 新生成的 Select 指令 ---</i><br/><b>%res = select i1 %cond, i32 %v1, i32 %v2</b><br/><hr/>br label %Succ"]:::pred
-
-    Succ["<b>Succ (后继块)</b><br/><i></i><br/>ret i32 %res"]:::succ
-
-    Pred -- "无条件跳转" --> Succ
+5. 可以把 AddRec 在第 `n` 次迭代求值为二项式展开。
 
 ```
+%i = phi i32 [0, %pre], [%next, %latch]
+%next = add i32 %i, 2
+%cmp = icmp slt i32 %i, 10
+```
 
-- 算法流程：
+分析结果：
 
-  1. 获取当前基本块True块
+```
+SCEV(%i) = {0,+,2}
+TripCount = 5
+BackedgeTakenCount = 4
+```
 
-     只能有1个前驱和1个后继，前驱末尾是条件跳转（并且条件不是常量），获取该条件跳转指令
+##### LoopDependence
 
-     获取两个跳转路径目标：Dest0,Dest1
+类型：AnalysisPass。依赖 Loop、SCEV、BasicAA、SideEffect
 
-     1. 如果Dest0和Dest1,其中有一个是当前块，一个是后继，那么标记没有else块
-     2. 如果Dest0和Dest1，其中有一个是当前块，一个不是后继（记做else），并且这个else块只有一个前驱和后继，标记有else块
+1. 收集循环 load/store 和可映射调用的内存访问，记录根对象、读写类型、仿射下标、字节步长和程序顺序。
+2. 产生 Flow、Anti、Output、Unknown 依赖。
+3. 为每个循环轴产生方向掩码；当前实现主要只有：SameIteration / AnyDirection
 
-     如果该基本块和else块之中有Store，Load，Call，SDIV , UDIV , SREM, FDIV, FREM,不能IfConversion
+##### LoopAccess
 
-     待转换的基本块和else块中指令总数<=4（如果只有True块，那么它之中的指令数<=4）
+依赖 AnalysisPass：Loop、SCEV、Range、Dominant、BasicAA、LoopDependence
 
-  2. 将该基本块和else块之中的指令除了终止指令全部移动到前驱块终止指令之前
+1. 为循环访存建立 footprint：根对象、起始/最小/最大字节偏移、对象大小、对齐、元素宽度和每轴 stride
 
-  3. 遍历后继块中所有Phi，创建Select指令，根据条件真假选择Phi之前对应的两个值，将生成的Select插入到前驱块的末尾，RAUW替换所有使用PHI的地方变成使用Select，删除后继块中的PHI指令
+2. 记录访问是否有限、unit-stride、连续、完整覆盖和精确
 
-  4. 修改前驱块的条件分支，变成无条件分支，指向后继块，删除当前块，如果有else块一并删除
+3. 对访问对分类：
 
+   ```
+   NoConflict
+   SameIterationOnly
+   Unknown
+   ```
 
+4. 提供迭代独立性、fusion 合法性、矩形循环嵌套、跨轴复用及字节步长查询
 
-
-
-##### GVNPRE
-
-依赖AnalysisPass：Dominant，AliasAnalysis，SideEffect
-
-运行之前先运行BCE和CFGSimplify，InstSimplify，DCE，SCCP
-
-- 算法流程：
-
-  1. GVN：
-
-     外层：不动点循环
-
-     清理哈希表
-
-     > 核心数据结构：
-     >
-     > **`ValueNum` (值编号缓存表)**
-     >
-     > **`ExpressionTable` (表达式查重表)**
-     >
-     > **`LeaderTable` (领导者备忘录)**
-
-     RPO逆后序遍历目标函数中每个基本块（如果发现在死块里面就直接跳过），遍历基本块中每一条指令（跳过PHI指令）
-
-     1. 如果是LOAD指令：
-
-        找到该LOAD在基本块中的位置，从该位置向前扫描每一条指令，直到入口块第一条指令，调用别名分析，找到和它使用同一个地址的最近的一条指令
-
-        如果该指令是LOAD/STORE（MustAlias），那么RAUW将使用LOAD的全部换成上一次使用的值，然后删除LOAD
-
-        如果STORE（MayAlias），放弃优化
-
-        如果STORE（NoAlias）/LOAD（MayAlias/NoAlias），继续寻找
-
-        如果CALL，调用getInstModRefInfo，如果结果包含Mod，那么放弃优化，如果Ref/NoModRef，继续寻找
-
-        如果经过上面优化是True，那么就返回True处理下一条指令，如果经过上面优化是False（放弃优化），那么执行下面的逻辑
-
-        记录：在ValueNum哈希表中进行寻找，如果编号过直接返回，如果没有，直接分配NextValueNum++一个新的编号，然后将{Num，LOADINST，该指令所在基本块}记录在InstTable之中
-
-        返回false（只是记录，原本程序逻辑和代码结构没变）
-
-     2. 如果是CALL指令：调用副作用分析发现只是Ref
-
-        找到该CALL在基本块中的位置，从该位置向前扫描每一条指令，直到入口块第一条指令
-
-        如果遇到STORE，调用Alias，如果不是NoAlias，放弃优化
-
-        如果遇到CALL，调用getInstModRefInfo，如果遇到是一模一样的CALL，那么RAUW直接替换，删除该CALL，如果是其他CALL，如果计算出来是ModSet那么放弃优化
-
-        如果优化失败了，执行下面的逻辑
-
-        记录：和上面LOAD的一样
-
-     3. 如果是Br条件跳转指令：
-
-        如果发现Cond是常量，那么找到永远不会执行的那个分支，将这个分支里面的块收集到死块集合之中
-
-     4. 如果指令没有返回值直接跳过
-
-     5. 值编号：
-
-        获取下一个编号NextNum
-
-        获取Num编号
-
-        Num编号逻辑：
-
-        1. 如果ValueNum哈希表能查到，直接返回查到的
-
-        2. 如果传入的不是一条具体的指令，那么就分配新号码ValueNum++
-
-        3. 如果是普通运算指令
-
-           记录这条指令的返回值类型和Opcode，然后获取当前指令的所有操作数的ValueNum，存入该指令的VarArgs
-
-           如果是ADD/MUL/AND/OR/XOR这种满足交换律的，按照从小到大的ValueNum排序VarArgs
-
-           如果是比较指令，同样满足上面的小ValueNum的原则，但是比较符号也要一同取反，然后将Opcode和具体比较符号通过`(C->getOpcode() << 8) | Predicate`位运算结合在一起作为唯一的Opcode
-
-        4. 如果是LOAD/STORE：直接分配新号码
-
-        5. 如果是GEP：
-
-           依次对基地址和索引求哈希
-
-        6. 如果是CALL：
-
-           调用副作用分析
-
-           如果NoModRef，处理方法同普通运算指令（提取表达式），算哈希，存入哈希表
-
-           其他情况直接分配新号码
-
-        7. 如果是PHI/ALLOCA/RET/BR这种指令，直接分配新号码
-
-        如果Alloca/Ret/Br/PHI，将{Num，INST，该指令所在基本块}记录在InstTable之中，直接返回
-
-        如果Num>=NextNum，那么将{Num，INST，该指令所在基本块}记录在InstTable之中，直接返回
-
-        根据当前指令所在基本块和Num去找Leader，根据Num去找LeaderTable中到Leaders，遍历所有Leaders，查看Leader所在基本块是不是支配当前指令所在块，如果找到这么一条指令就存起来，如果这条指令是常量直接返回不用找了，循环结束之后返回指令
-
-        如果没找到就将自己{Num，INST，该指令所在基本块}记录在LeaderTable之中
-
-        如果查到自己直接false
-
-        RAUW将使用当前指令的地方全部换成Leader，然后删除当前指令，返回即可
-
-        > 这里的LeaderTable就是上面的InstTable
-
-  2. PRE：
-
-     处理死块：
-
-     遍历死块中所有指令，调用分配ValueNum的函数分配Num，然后插入到LeaderTable之中
-
-     外层：不动点循环
-
-     DFS遍历当前函数所有基本块（函数入口块跳过），遍历当前基本块之中的每一条指令
-
-     1. 如果是ALLOCA/RET/BR/PHI/无返回值的指令/比较指令/LOAD/STORE/CALL（经过SideEffect后不是NoModRef的纯函数的拒绝）
-
-        > GEP提升，纯函数提升
-
-     2. 前驱块分析：
-
-        获取当前指令的ValueNum
-
-        遍历当前指令所在块的前驱：
-
-        如果前驱不可达放弃，如果前驱是循环回边放弃
-
-        PHITranslate:
-
-        查PHITranslateTable如果缓存之中有直接返回翻译出来的结果，如果没有执行下面的逻辑，执行完之后存入缓存，返回翻译后的新ValueNum
-
-        1. 如果当前要翻译的编号本身是PHI节点：
-
-           看这个PHI是不是在当前块之中如果不是，说明不受跨块影响，不用翻译
-
-           遍历PHI输入值，找到属于目标前驱的那个输入值返回输入值编号
-
-        2. 如果Num不是PHI，说明是普通算数指令：
-
-           从表达式哈希之中拿到表达式
-
-           遍历表达式中每一个操作数，调用PHITranslate
-
-           如果是ADD/MUL/OR/XOR/AND这些满足交换律的，重新排序表达式的ValueNum值，从小到大
-
-           如果全局表达式表中能查到NewNum，那么就返回
-
-        3. 如果查不到就返回旧Num
-
-        拿着翻译后的Num去找Leader
-
-        如果没找到，那么记录这个前驱PREPred，NumWithout++，如果找到了自己说明是循环回边，NumWithout = 2，直接放弃，如果找到了真的，加入到PredMap之中，NumWith++
-
-        只有NumWithout == 1 且 NumWith > 0的时候才能进行后面的逻辑
-
-        如果要提升的是DIV/REM直接返回
-
-        clone当前指令，插入到PREPred前驱块末尾（在终止指令之前），在当前块PHI指令最后插入PHI，遍历PredMap，如果以前就有那么就直接加入输入值，如果是刚才缺失的路径那么就把刚插入的那条指令加入输入值
-
-        给新的PHI发和原指令一样的Num，然后RAUW进行替换，删除原指令，更新LeaderTable
-
-  3. 清空哈希表等数据结构
-
-
-
-
-
-##### Reassociate表达式重结合
-
-利用代数中结合律和交换律重新排列表达式中的计算顺序，从而暴露更多的优化机会
-
-排序的依据：排序的依据就是 Rank（秩），规则很简单：Rank 越小，在表达式树中越靠右（越容易被沉到底部折叠）；Rank 越大，越靠左
-
-为SCCP，GVN，LICM铺路
-
-运行之后运行DCE
-
-- 算法流程：
-
-  1. 创建RankMap
-
-     初始化rank=2
-
-     遍历函数的所有参数，为这些参数建立从3递增的rank（每个参数的rank都各不相同）
-
-     逆后序遍历函数中的基本块，每个基本块的rank间隔为`++Rank << 16`，遍历块内指令，为每个符合条件（不标ADD, SUB,MUL,AND, OR, XOR其余都标）的指令在本基本块的rank基础上分配rank并递增rank
-
-  2. 不动点循环：
-
-     逆后序遍历函数中基本块，遍历基本块之中的所有指令
-
-     如果是死指令，断开对子节点的Use，直接跳过（留给后续DCE），如果不是调用下面的逻辑optimizeInst（该函数运行期间会收集TodoList）
-
-     While循环遍历TodoList：如果是死代码，断开它对子节点的Use，然后跳过（留给后续DCE），如果不是死代码，继续运行optimizeInst
-
-  3. 保留CFG相关的分析结果
-
-  4. optimizeInst：
-
-     1. 规范化：
-
-        如果不是ADD，MUL，AND，OR，XOR，SUB直接返回执行下一条指令
-
-        如果本条指令是SUB A-B指令，直接优化成A + B×（-1），将新生成的指令加入TodoList，然后直接返回执行下一条指令
-
-     2. 内部节点过滤：
-
-        如果这条指令只有一个User，并且User的Opcode和这条指令的Opcode一样，并且User不是自己，并且User和这条指令在同一个基本块之内：
-
-        将User的指令加入到TodoList之中，这条指令直接退出，不进行下面的优化步骤
-
-     3. ReassociateExp：(走到这里传入的Inst一定是Root)
-
-        1. Linearize：
-
-           WorkList While循环：
-
-           1. 遍历当前指令的操作数
-
-              如果Opcode和Root Opcode一样，并且只有一个User，那么加入WorkList
-
-              否则，压入最终的Ops数组之中
-
-        2. 排序：Rank大的排在Ops前面，Rank小的排在Ops后面
-
-        3. OptExp：
-
-           1. 常量折叠：从Ops数组末尾开始循环，将常亮根据每步的Opcode直接做折叠，拿到最后的常量
-
-           2. 如果Ops全空了，那么直接返回最后的常量
-
-           3. 简化：
-
-              如果总常量是0并且当前是加法/总常量是1并且当前是乘法，直接扔掉总常量
-
-              如果当前是乘法并且总常量是0,直接返回0
-
-           4. 如果Ops之中只有一个变量了，那么直接返回这个变量
-
-           5. 高级优化：
-
-              1. ADD：
-
-                 遍历排好序的Ops数组
-
-                 优化1：合并同类项，比如有C（C为常量）个Y，找到这C个Y，然后创建乘法C×Y，将原来的删掉，将新乘法加入到Ops数组之中
-
-                 优化2：抵消相反数，一旦找到MUL（X，-1），就会找X是否同时存在，如果同时存在那么直接二者删掉
-
-                 优化3：提取公因式，匹配模式：A* B + A* C -> A*(B+C)，具体来说遍历所有是乘法的操作数，统计他们的出现次数，找到出现次数最多的因子，如果出现次数>1，那么就去乘法项之中把这个因子提取出来，将剩下部分加起来
-
-              2. MUL：分治思想
-
-                 传入的Ops大小必须>=4
-
-                 提取Ops之中重复的变量，从Ops之中删去，按照(X,指数)存储起来，如果找不到就放弃优化
-
-                 合并相同指数的底数：$A^N$×$B^N$=$(A×B)^N$,具体来说就是先生成一条底数乘法指令然后删除已经被合并的因子
-
-                 指数奇数：如果指数是奇数，把底数拿出来一份，放入外层乘积列表之中，所有因子的指数都必须统一右移 1 位（减半向下取整，`Power >>= 1`）
-
-                 递归：处理偶数次幂，如果减半后最大的指数仍然大于 0，说明还需要继续算。直接递归调用自己，递归返回的结果（我们称之为 `SquareRoot`），需要被平方。所以它把 `SquareRoot` 往外层乘积列表里塞了两次
-
-                 把当前层级 `OuterProduct` 里面收集到的所有东西（包括奇数剥离出来的底数，以及递归返回的平方项）统统乘起来
-
-           6. 如果在刚才的高级优化之中数组长度发生改变，递归调用OptExp自己，直到数组长度不变
-
-           如果OptExp算出一个结果Value，直接RAUW将使用当前指令的地方全部换成Value，将Root放入TodoList，完成优化
-
-        4. 如果Ops大小为1了，直接RAUW将使用当前指令的地方全部换成Value，将Root放入TodoList，完成优化
-
-        5. 重建表达式树：
-
-           1. 取出最底层的两个叶子：从 `Ops` 数组的末尾（`back`）弹出两个元素，分别作为 `RHS` 和 `LHS`。此时这两个元素是整棵树中 Rank 最小的（通常是常量或最外层的变量）
-           2. 生成底层指令：根据原 Root 指令的 Opcode（例如 `ADD` 或 `MUL`），生成一条新的二元指令 `ResultInst = Opcode(LHS, RHS)`
-           3. 插入新指令：将 `ResultInst` 插入到原 Root 指令的物理位置之前（`insertBefore`），以保证新生成的指令绝对满足支配关系（Dominance）
-           4. 新指令入队：将 `ResultInst` 加入 `TodoList`（因为它是一条全新生成的指令，下一轮也许还能触发别处的优化）
-           5. While 循环挂载剩余节点：
-              - 只要 `Ops` 数组还不为空，就继续从末尾弹出一个元素，记为 `NextVal`
-              - 生成新的指令：`NewInst = Opcode(NextVal, ResultInst)`（即：把刚才生成的结果当做一边，新取出的变量当做另一边）
-              - 将 `NewInst` 同样插入到原 Root 指令之前
-              - 将 `NewInst` 压入 `TodoList`
-              - 更新游标：`ResultInst = NewInst`
-           6. 收尾与替换 (RAUW)：
-              - 循环结束后，最后的 `ResultInst` 就是这棵新树的最顶层新根节点
-              - 调用 `replaceAllUsesWith(RAUW)`，将所有引用了旧 Root 指令的地方，全部替换为 `ResultInst`
-              - 将旧的 Root 指令压入 `TodoList`
-
-
-
-
-
-##### LoopRotate循环旋转
-
-依赖Dominant和LoopInfo两个AnalysisPass
-
-目的：把一个传统的while结构转换成do-while结构
-
-循环内部少了一次无条件跳转，对CPU流水线指令和分支预测提升巨大
-
-- 算法流程：
-
-  顶层遍历：遍历Top-Level Loops，然后利用逆后序遍历去遍历每个loop
-
-  1. 循环可以Rotate条件1：
-
-     1. 满足LoopSimplify形式：
-
-        PreHeader：从Header的前驱中只能有一个来自循环外部的块（即PreHeader），并且这个PreHeader只能有一个后继就是Header（即无条件跳转）
-
-        Latch：Latch必须唯一
-
-        DedicatedExits：必须有，遍历所有从循环内部跳到循环外部的这些块，这些块的前驱只能来自循环内部
-
-  2. 循环可以Rotate条件2：
-
-     1. 循环只有1个/2个基本块，不进行Rotate
-     2. **循环只能有一个Exit Block**
-     3. Header必须以条件跳转结尾，并且Header是ExitingBlcok（一个分支跳到Exit Block）
-
-  3. 将Header的两个后继，Body作为NewHeader，Exit Block依旧作为Exit Block
-
-  4. 循环可以Rotate条件3：
-
-     1. **Exit Block的前驱只能是Header，并且唯一**
-     2. **Latch不能是ExitingBlock**，Latch后继必须是Header，并且只有一个后继
-     3. Body（NewHeader）的前驱只能是Header，并且唯一
-
-  5. Body（NewHeader）PHI折叠
-
-     无User：直接删除
-
-     **有LCSSA标记的不能删--这里需要更新LCSSA算法，看看怎样打上.lcssa标记**
-
-     PHI的输入值全部一样（但不是自我引用）：删除
-
-     RAUW删除
-
-  6. 核心Rotate1:将Header中的指令**clone到**PreHeader，并更新Body的PHI节点
-
-     1. 删除PreHeader中的无条件跳转指令
-
-     2. 准备Map：
-
-        Header->PreHeader->Body
-
-        [Header中旧 Phi 节点] -> [来自 PreHeader 的初始值]->[Body新建立的PHI]
-
-        [Header中普通指令] -> [存入PreHeader的指令]->[Body新建立的PHI]
-
-        Body新建立的PHI：输入值来自Header和PreHeader
-
-     3. 处理Header中的PHI节点
-
-        处理Body:在Body中建立一个新PHI节点，在原PHI节点中提取来自PreHeader的初始值作为新PHI的输入边（来源为PreHeader），提取原PHI节点中来自Latch的迭代值作为新PHI的输入边（来源为Header），更新Map
-
-     4. 处理Header的普通指令
-
-        处理PreHeader：遍历Header的普通指令，然后进行clone，然后根据上面的Map去更新这条克隆指令的usee，Use关系（即操作数），然后插入到PreHeader
-
-        处理Body：如果Body中用到了这个值，那么我们在Body中建立一个新PHI节点（后续步骤同3），更新Map，如果没用到就不用建立PHI了
-
-  7. 核心Rotate2：更新所有普通指令的Use关系
-
-     获取Map中所有来自Header的指令的Use，更新这些Use
-
-     1. 如果UserBlock在Header
-
-        普通指令不用管，PHI指令将Header的输入边替换为来自Body的输入边
-
-     2. 如果UserBlock在Body
-
-        如果这个User不是刚才Body建立的PHI，就将所有对Header的引用换成新建的这个PHI
-
-     3. 如果UserBlock在循环外部
-
-        更新ExitBlock：更新Exit中LCSSA PHI，添加来自PreHeader的输入边，如果不存在这么一个LCSSA，就重新建立一个PHI（输入来自PreHeader，和Header），重新建立需要去找这个Use替换成这个新PHI
-
-     4. 更新ExitBlock中不来自Header定义的但是传递到这里的LCSSA PHI，给他们添加一个来自PreHeader的输入
-
-  8. 核心Rotate3：CFG重连
-
-     去除PreHeader和Header连接，添加PreHeader与Body，PreHeader与Exit Block连接
-
-     更新Header的PHI：去除PreHeader的输入边
-
-     因为Header前驱只有Latch了，所以折叠PHI（逻辑同第6步）
-
-     **更新loopinfo的Header信息**
-
-  9. 常量折叠与修复LoopSimplify形式：
-
-     **修复PreHeader：**
-
-     1. 常量折叠：尝试折叠PreHeader中的Br条件分支，如果100%就能进入Body，那么就换成无条件分支，切断与ExitBlock的分支，这时PreHeader还可以做PreHeader
-     2. 如果不能进行折叠，直接在PreHeader和Body直接创建一个NewPreHeader，然后在这个NewPreHeader之中加入一个Br无条件跳转，修改PreHeader的Br分支--**这里好好读一读LoopSimplify相关逻辑**
-
-     **修复Dedicated Exits（独占出口块）：**
-
-     ExitBlock从只来自Header，变成来自PreHeader和Header，打破了Dedicated Exits的要求
-
-     所以我们在ExitBlock和PreHeader，Header中加入一个Exit，然后再无条件转接Exit--**这里好好读一读LoopSimplify相关逻辑**
-
-  10. 合并Header到Latch
-
-      删除Latch中无条件跳转，将Header中所有指令搬到Latch末尾，将Header的后继作为Latch的后继（更新CFG），修复和Header相关的PHI
-
-      删除Header
-
-  11. 更新支配树和LoopInfo
-
-- 图解
-
-  ```mermaid
-  graph TD
-      PreHeader --> Header
-      Header --> Body
-      Header --> Exit
-      Body --> Latch
-      Latch --> Header
-  ```
-
-  ```mermaid
-  graph TD
-      PreHeader --> Body
-      PreHeader --> Exit
-      Body --> Latch
-      Latch --> Header
-      Header --> Body
-      Header --> Exit
-  ```
-
-  ```mermaid
-  graph TD
-      PreHeader --> Body
-      PreHeader --> Exit
-      Body -->  Latch+Header
-      Latch+Header --> Body
-      Latch+Header --> Exit
-  ```
-
-##### LICM循环不变量代码外提
-
-依赖AnalysisPass:Dominant,LoopInfo,BasicAliasAnalysis,SideEffect
-
-- 算法流程：下沉Sink，外提Hoist
-
-  最外层：依然是遍历顶层循环+后序遍历单棵循环树
-
-  1. 前置检查：
-
-     1. 是否符合LCSSA形式
-     2. 是否符合LoopSimplify形式（PreHeader，Latch，Dedicated Exits）
-
-  2. 下沉Sink：
-
-     一条指令在**每次迭代中都在计算**，但是**结果只有在退出循环才被使用**
-
-     Sink：将其沉到循环的ExitBlock，只在退出循环时执行一次
-
-     后序遍历--从循环尾开始向上遍历到循环头，倒序遍历本层循环中基本块中所有指令：
-
-     1. 检查：
-
-        1. 检查是否存在DedicatedExits
-
-        2. 检查指令--判断一条指令是否可以被安全的移出循环：--**需要使用别名分析**
-
-           绝对不能移动：
-
-           RET，BR，PHI，ALLOCA，Binary中的：SDIV，FDIV，SREM，FREM
-
-           可以移动：
-
-           排除上面之后的BinaryInst
-
-           严格检查可以移动：LOAD，STORE，CALL
-
-           CALL：
-
-           调用副作用分析，分析是否含内置函数和Untracked标记，有的话直接false
-
-           检查ModRefInfo，只有NoModRef/Ref可以
-
-           调用ModRefInfo
-
-           检查ModSet是否为空，untracked是否是未标记的
-
-           如果RefSet依旧为空，那么直接true
-
-           如果RefSet不为空，遍历Set中每一条指令，比对函数中中每一条指令，调用别名分析分析二者，只要一条会修改这块内存那么就直接false
-
-           LOAD：遍历循环之中每一条其他指令，调用副作用分析`getInstModRefInfo`检查是否会影响LOAD读取的地址
-
-           STORE：如果是激进外提直接否定，不提STORE
-
-           遍历循环之中每一条其他指令，调用副作用分析`getInstModRefInfo`检查是否会影响STORE读取的地址，并用支配树证明，如果当前的Store是最后一次写入（覆盖掉之前所有的）其实是可以下沉到循环之外的
-
-        3. 检查这条指令的所有User是否全在循环之外
-
-        4. 判断循环不变量：
-
-           循环不变量（一条指令的操作数都是循环不变量，即所有操作数的定义都在循环外/操作数是常量，递推：该变量的所有操作数的**可达定义只有一个（即定义是确定的，没有经过if条件），这个定义来自循环内，并且它本身也是循环不变量**）
-
-     2. 下沉：
-
-        遍历所有出口块，直接将指令I clone 到对应的 Exit Block（受指令I所在块支配） 中（PHI节点之后）
-
-        遍历clone出来的指令I的操作数，如果操作数来自循环内部但没有创建LCSSA PHI的话，那我们就去创建PHI并替换指令I的操作数，如果已经创建，直接替换指令I的操作数即可
-
-        遍历使用指令I的User，将这些User的Usee指令I换成我们新创建的指令，然后删除旧指令
-
-  3. 外提Hoist：
-
-     RPO遍历循环中所有基本块，正向遍历基本块中所有指令
-
-     1. 条件：
-
-        再次检查是否存在PreHeader
-
-        检查激进Hoist：
-
-        如果这条指令所在的基本块，支配该循环中所有的Exit出口块和所有的Latch回边块，标记为激进Hoist（该块后向支配PreHeader的逻辑，只不过用支配树的逻辑实现）
-
-        检查指令：和sink第一条相同
-
-        检查循环不变量：和sink第三条相同
-
-     2. 外提：统一move到PreHeader块末尾
-
-
-
-##### LoopDeletion循环删除
-
-依赖AnalysisPass：Dominant，LoopInfo，BasicAliasAnalysis，SideEffect，SCEV
-
-- 算法流程：
-
-  1. 符合LCSSA形式
-
-  2. 检查是否符合LoopSimplify形式，并获得PreHeader
-
-  3. 获取循环的所有ExitBlock，必须是唯一ExitBlock
-
-  4. 如果循环永远不会执行：
-
-     1. 判断循环会不会进入：
-
-        获取PreHeader，如果PreHeader是整个函数的EntryBlock，那么一定可以进入
-
-        遍历PreHeader所有前驱块，找到这些前驱块的终止指令，如果是Br并且条件是常量，那么提取出两个目标基本块，如果条件不是常量那么直接返回可以进入，其他终止指令的情况直接保守可以进入，如果两个目标基本块中那个True的正好是PreHeader，那么可以进入，反之不可以进入
-
-     2. 如果不可以进入
-
-        1. 删掉PreHeader的旧分支指令，构建一条分支指令`br ExitBlock`
-        2. 遍历ExitBlock中的PHI节点，强制将第0项的来源改为PreHeader，将后续所有项删除，值不变
-        3. 遍历循环里的所有指令，如果循环外还有指令使用这些值，将这些Use全改成UndefValue
-        4. 删除循环之中的所有指令（删除之前现在所有UseDef清除）所有基本块
-        5. 更新支配树，LoopInfo，SCEV
-
-  5. 如果是多出口的情况，直接返回
-
-  6. 常规循环删除：
-
-     1. 判断：
-
-        取出这个唯一ExitBlock的所有PHI节点，逐个检查这个PHI是否是一个平凡PHI（所有输入值都是一样的），只要有一个输入值不一样的那么就返回，如果这个输入值是一个指令，如果还在循环内，直接返回
-
-        遍历循环体内的所有指令，进行循环级副作用分析，如果有副作用直接返回
-
-        DFS遍历这个循环
-
-        经过上述检验的可以执行下述的删除
-
-     2. 如果符合条件，执行删除，逻辑和4.2相同
-
-
-
-##### LoopUnswitch
-
-将循环内部依赖于**循环不变量**的分支移动到循环外
-
-先运行LoopSimplify，LCSSA，LICM再运行LoopUnswitch
-
-依赖AnalysisPass：DominatorTree，LoopInfo，SCEV，MemorySSA
-
-实现了如下两种UnSwitch的形式
-
-- Trivial Unswitch：目标分支的至少一个后继可以退出循环
-- Non-trivial Unswitch：两个分支的后继都留在循环内
-
-并且只做了Full Unswitch，即分支条件全是循环不变量
-
-- 算法流程：
-
-  1. 确认是loopsimplify，LCSSA形式
-
-  2. 优先执行Trivial Unswitch，其次执行Non-trivial Unswitch（并且每个函数中二者只能执行其一）
-
-  3. Full Trivial Unswitch：
-
-     检查：从 LoopInfo::Header 开始向下检查每个必经的基本块，检查当前块的 MemoryDef 以及副作用。如果存在除 MemoryPhi 以外的 MemoryDef，或者存在具有副作用的指令，则停止扫描。
-
-     获取当前块ParentBB的分支指令，必须是非常量条件分支
-
-     核心：检查整个条件是不是全都是循环不变量，然后明确true和false哪个分支的successor是退出循环的，哪个是继续循环的（这里不接受两个successor都退出循环或两个successor都继续循环），该分支属于当前循环本身，而不是位于某个内层子循环中。
-
-     检查离开分支的ExitBB中的PHI中的incoming value，这个incoming value必须也是循环不变量（不能在循环内被计算），否则不能被执行
-
-     然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader
-
-     如果ExitBB只有当前分支块 ParentBB这一个前驱，那么出口直接复用，如果ExitBB还有其他前驱，那么进行切分，旧的ExitBB保留全部PHI，并新增跳到NewBB的Br无条件分支指令，NewBB保留原来旧ExitBB所有其他指令
-
-     然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor（退出方向   -> ExitBB 或切分得到的 NewBB，继续方向   -> NewPreHeader）
-
-     然后创建ParentBB的新分支指令Br无条件跳转到继续循环的那个块上
-
-     对出口 PHI 进行修复：
-
-     - 如果直接复用原来的 `ExitBB`，则将 PHI 中来自 `ParentBB` 的 incoming block 修改为来自 `OldPreHeader`，incoming value 保持不变。
-     - 如果对ExitBB进行了切分，则不能简单地把原 PHI 的 incoming block 修改为OldPreHeader。需要在切分得到的NewBB中创建新的合流 PHI，用来合并：
-       - 从 `OldPreHeader` 直接退出时使用的循环不变量值；
-       - 从原 `ExitBB` 正常退出时得到的原 PHI 结果。
-
-     最后替换循环内所有使用循环不变量的Use为确定的True/False常量
-
-     变换完成后重新获取当前ParentBB的 terminator：
-
-     - 如果当前terminator已经变成无条件 branch，则根据其唯一successor更新下一个必经基本块，并继续扫描。
-     - 如果successor已经离开当前循环，或者该基本块已经被访问过，则停止扫描。
-
-     ![image-20260714200129403](assets/image-20260714200129403.png)
-
-  4. Full Non-trivial Unswitch：
-
-     获取当前块ParentBB，以及对应的分支指令。要求整个分支条件都是循环不变量，并且该分支属于当前循环本身，而不是位于某个内层子循环中。
-
-     根据目前的分支指令确定两个分支的successor，根据支配树，确定我们每个分支具体需要clone的支配子树（如果某些基本块被其中一个 successor 支配，并且只能通过该 successor 到达，那么这些基本块只属于对应的专门化路径。在克隆某个循环版本时，由另一个 successor 独占支配的基本块不需要复制；这些块在当前专门化版本中不可达。）
-
-     然后新建一个NewPreHeader插入在OldPreHeader以及Header之间，并且更新Header的PHI之中 incoming block由OldPreHeader->NewPreHeader--**这一部分和刚才Trivial Unswitch一样**
-
-     克隆循环：克隆当前循环所需要的全部基本块，并且为克隆循环新建一个 ClonedPreHeader。在clone过程中建立原值到clone值的映射，clone每条指令的时候必须重新映射其操作数，然后克隆循环 Header 中的 PHI,并根据其映射修改相关的incoming，克隆循环内其他 PHI 时，也必须同时映射 incoming value 和 incoming block，如果根据支配子树裁剪了部分基本块，那么必须删除由未克隆基本块产生的 PHI incoming，并在 PHI 只剩一个 incoming value 时进一步简化 PHI，对于循环出口和 LCSSA PHI，需要为克隆循环建立对应的退出值。原循环退出产生的值和克隆循环退出产生的值，最终需要在循环外合流
-
-     然后删除OldPreHeader原来的无条件跳转，然后将ParentBB的分支指令从ParentBB移动到OldPreHeader，并根据true还是false更新这条分支指令successor
-
-     然后对原循环进行专门化，由于原循环负责 `Cond = false` 的版本，所以原循环中的 `ParentBB` 不再需要保留原条件分支，而是创建新的无条件 branch，删除原循环之中不需要保留的那条分支的CFG边，必须删除 `CloneSucc` 中所有来自 `ParentBB` 的 PHI incoming，
-
-     然后对clone循环进行专门化，根据映射将克隆循环中的原条件 branch 替换为无条件 branch，同时删除克隆循环中指向另一个 successor 的 CFG 边，并删除对应 successor PHI 中来自 `ClonedParentBB` 的 incoming
-
-     然后进行循环不变量的常量替换，并替换该循环内所有对该循环不变量的Use
-
-     对于每个原循环 ExitBB：
-
-     1. 保留原循环版本的退出 incoming。
-     2. 增加克隆循环版本对应的退出 incoming。
-     3. 如果原 ExitBB 不能直接同时承接两个循环版本，则切分或新建 ExitMergeBB。
-     4. 在 ExitMergeBB 中建立合流 PHI。
-     5. 所有循环外 Use 改为使用合流 PHI 的结果。
-
-     ![image-20260714205026714](assets/image-20260714205026714.png)
-
-
-
-
-
-
-
-
-
-
-
-
+```
+store ..., ptr A[i]
+load  ..., ptr A[i]
+```
 
 #### TransformPass
-
-##### Mem2Reg
-
-将入口块中标量alloca转换为Phi，删除相应的load/store/alloca
-
-依赖AnalysisPass：Dominant
-
-在运行之前先运行CFGSimplify清除不可达块，运行之后也需要
-
-算法：使用LiveInBlock+IDF创建**PrunedPHI**，在Live裁剪之后的IDF处插入PHI
-
-![Mem2Reg使用LiveInBlocks与IDF创建Pruned PHI](assets/mem2reg-pruned-phi.png)
-
-参考资料：
-https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
-
-https://www.zhihu.com/question/41999500/answer/93243408
 
 ##### CFGSimplify
 
@@ -2336,7 +1172,71 @@ https://www.zhihu.com/question/41999500/answer/93243408
 
            删除该基本块中的指令，删除该基本块
 
+##### IfConversion
 
+引入Select指令，避免小分支分支预测失败，暴露SCCP，GVNPRE等标量优化机会
+
+不能上提到Pred的指令：load/store，call，alloca，ret，div，rem，非常量shl/lshr/ashr
+
+收益模型：
+
+- TrueBB 指令数 + ElseBB 指令数 <= 4
+
+- Succ 中 PHI 数量不超过 3
+
+- 总加权成本<=6
+
+  其他指令成本1,MUL, FMUL, FADD, FSUB, FCMP成本2，SITOFP成本3
+
+可以处理两种CFG形状
+
+```
+Triangle：
+          ┌── TrueBB ──┐
+Pred ─────┤             ├── Succ
+          └─────────────┘
+Diamond：
+          ┌── TrueBB ──┐
+Pred ─────┤             ├── Succ
+          └── ElseBB ──┘
+```
+
+优化前：
+
+```mermaid
+graph TD
+    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
+    classDef branch fill:#e2f0d9,stroke:#b2cba5,stroke-width:2px;
+    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
+
+    Pred["<b>Pred (前驱块)</b><br/>...<br/>%cond = icmp eq i32 %a, 0<br/>br i1 %cond, label %BB1, label %BB2"]:::pred
+
+    BB1["<b>BB1 (Then 块)</b><br/>%v1 = add i32 %x, 1<br/>br label %Succ"]:::branch
+    BB2["<b>BB2 (Else 块)</b><br/>%v2 = sub i32 %x, 1<br/>br label %Succ"]:::branch
+
+    Succ["<b>Succ (后继块)</b><br/>%res = phi i32 [ %v1, %BB1 ], [ %v2, %BB2 ]<br/>ret i32 %res"]:::succ
+
+    Pred -- "True" --> BB1
+    Pred -- "False" --> BB2
+    BB1 --> Succ
+    BB2 --> Succ
+```
+
+优化后
+
+```mermaid
+graph TD
+    classDef pred fill:#f9f2f4,stroke:#dbb1c1,stroke-width:2px;
+    classDef succ fill:#ddebf7,stroke:#a9c4e2,stroke-width:2px;
+    classDef highlight fill:#fff2cc,stroke:#fbc58e,stroke-width:2px,stroke-dasharray: 5 5;
+
+    Pred["<b>Pred (前驱块)</b><br/><br/>%cond = icmp eq i32 %a, 0<br/><hr/><i> --- 从 BB1 和 BB2 提升上来的指令 ---</i><br/><b>%v1 = add i32 %x, 1</b><br/><b>%v2 = sub i32 %x, 1</b><br/><i> --- 新生成的 Select 指令 ---</i><br/><b>%res = select i1 %cond, i32 %v1, i32 %v2</b><br/><hr/>br label %Succ"]:::pred
+
+    Succ["<b>Succ (后继块)</b><br/><i></i><br/>ret i32 %res"]:::succ
+
+    Pred -- "无条件跳转" --> Succ
+
+```
 
 ##### BreakCriticalEdges打破关键边
 
@@ -2550,6 +1450,23 @@ graph TD
     class ExitingBlock exitBlock;
 ```
 
+##### Mem2Reg
+
+将入口块中标量alloca转换为Phi，删除相应的load/store/alloca
+
+依赖AnalysisPass：Dominant
+
+在运行之前先运行CFGSimplify清除不可达块，运行之后也需要
+
+算法：使用LiveInBlock+IDF创建**PrunedPHI**，在Live裁剪之后的IDF处插入PHI
+
+![Mem2Reg使用LiveInBlocks与IDF创建Pruned PHI](assets/mem2reg-pruned-phi.png)
+
+参考资料：
+https://ustc-compiler-principles.github.io/2023/lab4/Mem2Reg%E4%BB%8B%E7%BB%8D.pdf
+
+https://www.zhihu.com/question/41999500/answer/93243408
+
 ##### Global2Local
 
 将全局变量Local到非递归Main函数的Alloca，从而在Mem2Reg可以将其提升为寄存器变量
@@ -2558,7 +1475,11 @@ graph TD
 
 - 算法流程：
 
-  1. 
+  1. main可达的其他函数引用的全局变量拒绝转换
+
+  2. main无法到达的其他函数可以保留全局变量，并在main中创建alloca（全局变量只能放在store/load操作数，地址不能逃逸到其他指令，值还是正常使用）
+
+     在DFE删除死函数之后，需要使用DeadGlobalCleanup删除全局
 
 
 ##### Local2Global
@@ -2608,6 +1529,71 @@ entry:
 
 功能：删除只存在store无其他Use的global和store，删除无Use的global，只处理标量，不处理数组
 
+##### StoreOnlyGlobalElimination只写全局变量消除
+
+依赖AnalysisPass：SideEffect
+
+<p align="center">
+  <img src="assets/store-only-global-elimination.png" alt="StoreOnlyGlobalElimination 优化前后示意图" />
+</p>
+
+- 算法流程：
+
+  1. 对于每一个全局变量，分析读取他的load和call指令，建立RefInfo
+
+     call指令读取规则：只读Builtin，普通Func的RefSet
+
+     数组读取精度：只分析到第一维
+
+     > 只要 `A[2]` 下任意元素被读取，所有写向 `A[2][...]` 的 store 都会保留
+
+  2. store删除：
+
+     该全局变量没被读取：删除所有store
+
+     该全局变量读取：删除与RefInfo无关的store
+
+     其他情况保留
+
+  3. 对于没有任何写入的全局变量，将完整对象的 `load` 替换为全局初始化常量，删除load
+
+  4. 删除没有任何Use的全局变量
+
+
+##### ConstHoist大常量重写
+
+依赖AnalysisPass：Dominant
+
+减少i32大常量物化次数
+
+```
+entry:
+    br label %preheader
+preheader:
+    br label %loop
+loop:
+    %a = add i32 %x, 100000
+    %b = add i32 %y, 100008
+    %c = sub i32 %z, 100008
+    br i1 %cond, label %loop, label %exit
+->
+preheader:
+    %base = add i32 0, 100008 -- 基准值被提升到preheader
+    br label %loop
+loop:
+    %v100000 = add i32 %base, -8
+    %a = add i32 %x, %v100000
+    %b = add i32 %y, %base
+    %c = sub i32 %z, %base
+    br i1 %cond, label %loop, label %exit
+```
+
+目标常量：i32,>=2048
+
+改写只能：User为ADD/SUB/STORE/DIV/REM/移位**这些位置**
+
+算法规则：按照[组内最大值 - 组内最小值 < 2048]分组，每组选取使用次数最多的常量作为基准值，只有[每组大于3次使用或者在循环内>=2次使用]才可优化，在改写时，找支配这些基本块最近的公共支配块，在该块进行物化（如果在循环中就在preheader物化），每块中共用偏移加法
+
 ##### GepEvaluate折叠GEP
 
 功能：折叠掉空索引的GEP替换为基址，拆分GEP
@@ -2625,11 +1611,36 @@ entry:
 
 ##### GepCombine
 
+依赖 AnalysisPass：Range、DominantAnalysis
 
+1. 合并单用户链式 GEP：
 
+   ```
+   %row = gep ptr %a, 0, %i
+   %elt = gep ptr %row, 0, %j
+   ; =>
+   %elt = gep ptr %a, 0, %i, %j
+   ```
 
+2. 对单用户指针 PHI，若 incoming GEP 同基址、同形且只有一个索引位置不同，改写为索引 PHI + 公共 GEP。
+
+3. 在同一基本块内，将公共前缀相同的相邻 GEP 改为前一个 GEP + 常量差，Range 必须证明地址算术不回绕
 
 ##### DCE死代码消除
+
+依赖AnalysisPass：SideEffect
+
+按照Use-Def链级联删除死指令
+
+- 算法规则:
+
+  1. ret,br,store不可删
+
+  2. call条件删除：BuiltinFunc、直接/间接递归不可删，普通Callee函数NoModRef并且无store无Builtin内部调用
+
+     无User
+
+  3. 其他指令只需要判断无User，就直接可以删除
 
 ##### ADCE激进死代码消除
 
@@ -2660,11 +1671,7 @@ entry:
 
 - 算法流程：
 
-  1. 遍历所有函数
-
-     跳过Runtime库函数，llvm intrinsic，main函数
-
-     **形参常量特化**：遍历该函数每个形参，检查**调用该函数**的所有 `CallInst`。如果某个参数在所有调用点传入的都是**同一个常量/如果不是同一个常量，可以分组创建函数副本进行特化**，则在函数体内将该形参的所有 Use 替换为该常量（`RAUW`）
+  1. **形参特化**：如果某个形参在所有调用点收到的实参都相同，就直接用该值替换函数中的形参
 
      ```
      define i32 @foo(i32 %x) {
@@ -2682,9 +1689,9 @@ entry:
        ret i32 %v
      }
      ```
-
+  
      **冗余参数合并**：检查调用该函数的所有 `CallInst`。如果某几个参数在所有调用点传入的**实参完全相同**（例如 arg2 永远等于 arg1），则在函数体内将 arg2 的所有 Use 替换为 arg1
-
+  
      ```
      define i32 @foo(i32 %a, i32 %b) {
      entry:
@@ -2702,22 +1709,18 @@ entry:
        ret i32 %x
      }
      ```
+  
+  2. 死参数消除：支持调用链传播
+  
+  3. **分组特化：**如果不是像**形参特化**一样所有调用都相同，而是一部分调用相同的情况，如下，就创建相关函数副本
 
-  2. 遍历所有函数：找到死参数
+     ```
+     call @foo(1, %a)
+     call @foo(1, %b)
+     call @foo(2, %c)
+     ```
 
-     跳过sysylib，memcpy，main函数
-
-     遍历该函数的参数列表，如果该参数Use=0,标注为Dead，如果Use!=0,遍历每个User，如果是CallInst就递归判断，在中途中还要记录已经判断过的函数，如有一个地方用到那么就是Live，否则Dead，其他情况标注为Live
-
-  3. 遍历所有函数：清除死参数与函数重写
-
-     跳过sysylib，memcpy，main函数
-
-     删除掉函数中所有死参数，并进行更新基本块中的Use，找到调用旧函数的所有CallInst，创建新的CallInst，并根据新的形参列表决定传入的实参，删去旧的CallInst
-
-
-
-
+  4. 死参数消除
 
 ##### DeadFunctionElimination死函数消除
 
@@ -2726,6 +1729,202 @@ entry:
 - 算法逻辑：main函数一定Live ，从main函数开始，收集函数中可达基本块中的Call指令，将被Call指令调用的函数标记为Live，然后删除剩下的死函数即可 -- **可达调用图遍历**
 
 效果显著，把基本上全部死函数都消除掉了
+
+##### DSE 死存储消除
+
+依赖 AnalysisPass：BasicAliasAnalysis、LoopAnalysis、MemorySSA、SideEffectAnalysis
+
+1. 消除**所有路径**都被覆盖的store：
+
+   对store之后的每一条CFG路径，若遇到均MustAlias并且完整覆盖对象的新store，则这一条store可以删除
+
+   ```
+   store i32 1, ptr %p       ; 候选，可以删除
+   br i1 %cond, label %L, label %R
+   L:
+       store i32 2, ptr %p   
+       br label %exit
+   R:
+       store i32 3, ptr %p  
+       br label %exit
+   ```
+
+2. 相同值冗余写store：
+
+   从候选 store 对应的 **MemorySSA内存状态图**开始反向遍历。若所有反向路径都能到达一条向 MustAlias 地址完整写入同一个 Value 的旧 store，并且中间没有其他可能修改该地址的操作，则候选 store 不会改变内存状态，可以删除
+
+   ```
+   store i32 %v, ptr %p
+   %x = load i32, ptr %p      ; MemoryUse，不影响
+   store i32 %v, ptr %p       ; 候选，可以删除
+   ret i32 %x
+   ```
+
+3. 消除**基本块内**被覆盖的store：
+
+   在单个基本块内逆向扫描，删除被后续同地址、同覆盖范围的store
+
+4. 如果alloca的地址没有逃逸出当前函数，并且某次store后没有读取，那么这条store可以删掉
+
+   ```
+   %a = alloca i32
+   store i32 7, ptr %a  -- %a随着函数返回生命周期结束，所以可以删除store
+   ret void
+   ```
+
+##### LoadElimination
+
+依赖 AnalysisPass：BasicAliasAnalysis、LoopAnalysis、DominantAnalysis、MemorySSAAnalysis、SideEffectAnalysis
+
+1. 消除所有路径上都能从同一个 store 值转发的 load：
+
+   从候选 load 对应的 MemorySSA 内存状态开始反向遍历。若所有路径上的最近 MemoryDef 都是：向 MustAlias 地址写入,完整覆盖 load 读取的对象,写入同一个 SSA Value,该 Value 支配候选 load,则直接用该 Value 替换 load
+
+   ```
+   br i1 %cond, label %L, label %R
+   L:
+       store i32 %v, ptr %p
+       br label %join
+   R:
+       store i32 %v, ptr %p
+       br label %join
+   join:
+       %x = load i32, ptr %p   ; 可以替换为 %v
+       ret i32 %x
+   ```
+
+2. 消除可以复用旧 load 结果的 load：
+
+   若旧 load 支配候选 load，并且二者：地址 MustAlias,结果类型兼容,MemorySSA标识二者来自相同内存来源，从旧 load 到候选 load 的所有 CFG 路径上都没有可能修改该地址的操作，则候选 load 可以替换为旧 load 的结果
+
+   ```
+   %x = load i32, ptr %p
+   %y = add i32 %a, %b         ; 不修改 %p
+   %z = load i32, ptr %p       ; 可以替换为 %x
+   ret i32 %z
+   ```
+
+3. 消除基本块内的冗余 load：
+
+   在单个基本块内，从候选 load 向前逆向扫描：
+
+   - 遇到 MustAlias、类型兼容的 store，直接转发 store 写入的值；
+   - 遇到 MustAlias、类型兼容的旧 load，复用旧 load；
+   - 遇到 MayAlias/MustAlias 的其他写入，则停止优化；
+   - 纯读取操作可以安全穿越。
+
+   ```
+   store i32 %v, ptr %p
+   %a = add i32 %x, %y
+   %r = load i32, ptr %p       ; 可以替换为 %v
+   ret i32 %r
+   ```
+
+4. 合并不同 CFG 前驱上的可用值：
+
+   若候选 load 所在基本块内没有可用值，则递归查询所有前驱：
+
+   - 所有前驱得到同一个 Value：直接用该 Value 替换 load；
+   - 每个前驱都有确定值，但值不同：在汇合块创建 PHI，使用 PHI 替换 load；
+   - 任一前驱存在相关写入、未知内存效果或无法完成查询：保留 load。
+
+   ```
+   br i1 %cond, label %L, label %R
+   
+   L:
+       store i32 %a, ptr %p
+       br label %join
+   
+   R:
+       store i32 %b, ptr %p
+       br label %join
+   
+   join:
+       %x = load i32, ptr %p   ; 可以删除
+       ret i32 %x
+   ```
+
+   转换为：
+
+   ```
+   join:
+       %x.forward = phi i32 [ %a, %L ], [ %b, %R ]
+       ret i32 %x.forward
+   ```
+
+5. 消除循环内可复用循环外值的 load：
+
+   对循环内的候选 load，若：
+
+   - 指针地址在目标循环外定义；
+   - 循环外存在一个支配循环头的 MustAlias load；
+   - 旧 load 支配候选 load；
+   - 从旧 load 到候选 load 的所有 CFG 路径及循环回边上都没有相关写入；
+
+   则循环内 load 可以复用循环外 load 的值
+
+   ```
+   entry:
+       %init = load i32, ptr %p
+       br label %loop
+   
+   loop:
+       %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+       %x = load i32, ptr %p       ; 可以替换为 %init
+       %next = add i32 %i, 1
+       %cond = icmp slt i32 %next, %n
+       br i1 %cond, label %loop, label %exit
+   ```
+
+##### SCCP
+
+依赖 AnalysisPass：MemorySSA、BasicAA、LoopAnalysis
+
+1. 联合求解可执行块、可行 CFG 边和值格：Top -> Constant -> Bottom
+
+2. PHI 只合并来自可行边的 incoming
+
+3. 折叠 binary、cast、select、整数/浮点安全恒等式和常量条件分支
+
+4. 对 load，从 MemorySSA 内存状态反向遍历。只有所有路径的首个 clobber 都是：
+
+   - MustAlias store；
+   - 完整覆盖 load；
+   - 类型 shape 相同；
+   - 写入同一个 SSA Value；
+
+   才把 load 的值格绑定到 stored value
+
+5. 收敛后替换常量、删除不可达块、折叠 PHI 和分支
+
+##### ConstraintElimination
+
+依赖 AnalysisPass：DominantAnalysis、Range
+
+1. 在 Range 证明无回绕时，将有限深度的 `x+C/x-C` 规范成 `Base+Offset`
+2. 沿支配树 DFS 维护当前路径成立的条件约束
+3. 使用直接蕴含、反向等价、一跳传递关系及 Range 上下界证明比较恒真或恒假
+4. 只把 branch condition 替换成布尔常量，真正的 CFG 删除交给后续 CFGSimplify
+
+##### RangeAwareSimplify
+
+依赖 AnalysisPass：Range、DominantAnalysis
+
+1. 将 Range/KnownBits 证明为单值的纯计算替换为常量
+
+2. 利用整数区间、KnownBits 冲突或无 NaN 浮点包络折叠比较
+
+3. 化简 `icmp(select)`、恒定 select、abs select 和 min/max select
+
+4. 若被除数已证明非负、除数是正二次幂：
+
+   ```
+   %q = sdiv i32 %x, 8
+   ; =>
+   %q = ashr i32 %x, 3
+   ```
+
+   `srem` 则改为 `and 7`
 
 ##### LatePhiCleanup晚期PHI函数清理
 
@@ -2759,17 +1958,385 @@ entry:
 
 ![image-20260801225851953](assets/image-20260801225851953.png)
 
+##### FunctionMemoization
 
+依赖 AnalysisPass：SideEffect
 
+1. 选择纯递归函数：SideEffect 必须为 `NoModRef`，返回值及 1～4 个参数只能是 i32/f32
 
+2. 只接受直接自递归，要求至少两处自递归调用、至少一个外部调用点和至少一个返回点。
 
+3. 创建直接映射缓存：
 
+   ```
+   valid[slot]
+   key0[slot] ... keyN[slot]
+   result[slot]
+   ```
 
+4. 整数参数直接参与哈希；浮点参数按位转为 `i32`。命中时直接返回缓存结果
 
+5. 每个原返回点按照 `valid=0 → keys → result → valid=1` 的顺序发布新缓存项
 
+典型效果：
 
+```
+%r = call i32 @fib(i32 %n)
+```
 
+会先检查 `%n` 对应的缓存槽，命中时不再进入递归函数主体
 
+默认缓存为 4096 槽，模块总预算 256 KiB
+
+##### LateStrengthReduce
+
+1. 无符号二次幂除法：
+
+   ```
+   %q = udiv i32 %x, 8
+   ; =>
+   %q = lshr i32 %x, 3
+   ```
+
+2. 无符号二次幂取余：
+
+   ```
+   %r = urem i32 %x, 8
+   ; =>
+   %r = and i32 %x, 7
+   ```
+
+3. 若能证明被除数非负，有符号除余也可分别改为 `ashr` 和 `and`。
+
+4. 对无法证明符号的 `sdiv x, 2`，通过偏置保持“向零舍入”：
+
+   ```
+   %sign = ashr i32 %x, 31
+   %bias = and i32 %sign, 1
+   %adj  = add i32 %x, %bias
+   %q    = ashr i32 %adj, 1
+   ```
+
+##### Reassociate
+
+依赖 AnalysisPass：SideEffectAnalysis
+
+1. 只处理整数 ADD/SUB/MUL/AND/OR/XOR
+
+2. 将减法规范为加负数，展开单用途的同运算表达式树，再按稳定 rank 排序。
+
+3. 合并常量，消除 `x+0`、`x*1`、`x*0`。
+
+4. 合并重复项：
+
+   ```
+   %r = add i32 %x, %x
+   ; =>
+   %r = mul i32 2, %x
+   ```
+
+5. 消去 `x + (-x)`，并从多个乘积中提取公共因子。
+
+6. 对包含重复因子的长乘法链，使用平方复用减少乘法数量。
+
+不处理浮点；共享子表达式不会被展开
+
+##### TailRecursionElimination
+
+依赖 AnalysisPass： BasicAA、LoopAnalysis、SideEffectAnalysis
+
+1. 对普通 `call` 紧邻 `ret` 的情况标记 tail call
+
+2. 将直接自尾递归转换为入口循环，并为函数参数建立 Header PHI
+
+3. 支持整数 ADD/MUL 伪尾递归：
+
+   ```
+   %r = call i32 @f(...)
+   %v = add i32 %r, %x
+   ret i32 %v
+   ```
+
+   通过额外 accumulator PHI 转换；ADD 单位元为 0，MUL 为 1。
+
+4. 支持跳到共享返回块的尾递归站点
+
+##### GVNPRE
+
+依赖 AnalysisPass：Dominant、Loop、BasicAA、MemorySSA、SideEffect
+
+1. 为 binary、GEP、select、cast 和合格纯调用建立带类型的规范值号，消除支配冗余
+
+2. 递归比较循环 PHI 表达式图，合并同余 PHI
+
+3. 使用 MemorySSA 的完整 clobber 集合和 MustAlias 做 store-to-load forwarding 与 load CSE；失败时退回有限的唯一前驱扫描
+
+4. 对 Ref-only 调用，比较其读取位置的 MemorySSA 签名，消除未被写破坏的重复调用
+
+5. PRE 只处理恰好一个前驱缺少表达式的情况：
+
+   ```
+   L: %a = add i32 %x, %y
+   R: br label %M
+   M: %b = add i32 %x, %y
+   ```
+
+   在 `R` 克隆表达式，并在 `M` 建 PHI
+
+##### InstSimplify
+
+依赖 AnalysisPass：Dominant、BasicAA、Loop、MemorySSA；调用 ModRef 查询会间接使用 SideEffect
+
+1. 工作表固定点化简算术、位运算、比较、select、因式分解、平方差和二次幂乘法
+
+2. 折叠退化 PHI
+
+3. 将各 incoming 中同形的 binary/GEP 提到汇合块：
+
+   ```
+   %a = add i32 %x, 4
+   %b = add i32 %y, 4
+   %p = phi i32 [%a, %L], [%b, %R]
+   
+   ; =>
+   %v = phi i32 [%x, %L], [%y, %R]
+   %p = add i32 %v, 4
+   ```
+
+##### LocalAggregateSimplify
+
+依赖 AnalysisPass： Dominant、Range、 BasicAA、Loop、MemorySSA
+
+1. 折叠只读全局数组 load：常量索引直接读取 initializer；较小的动态 i32 表可尝试合成为低成本算术表达式
+
+2. 对“完整 memcpy 初始化的局部数组”，在同一基本块解释后续常量索引 store/load，并转发精确值
+
+3. 对跨块只读局部数组，要求初始化支配所有 load，MemorySSA 证明没有 clobber；随后替换为常量、统一值、算术表达式或小型 select 链
+
+4. 对仅使用常量路径、无逃逸且最多访问 32 个元素的 aggregate，拆分为多个标量 alloca
+
+5. 删除非逃逸的只写 aggregate：
+
+   ```
+   %a = alloca [4 x i32]
+   store ..., ptr %a[0]
+   ret void
+   ```
+
+   若不存在读取或逃逸，整个 aggregate 及其写入可删除
+
+#### 循环优化
+
+##### LoopRotate 循环旋转
+
+目的：把一个传统的while结构转换成do-while结构
+
+依赖 AnalysisPass：DominantAnalysis、LoopAnalysis
+
+**前置形态**：要求 LoopSimplify + LCSSA；源码硬检查唯一 preheader/latch 和 exit，header 条件分支恰好一臂入环、一臂退出
+
+```mermaid
+flowchart LR
+    subgraph 转换前
+        P[PreHeader] --> H[Header]
+        H -->|true| B[Body]
+        H -->|false| E[Exit]
+        B --> L[Latch]
+        L --> H
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph 转换后
+        PT[原PreHeader] -->|false| E2[Exit]
+        PT -->|true| NP[New PreHeader]
+        NP --> B2[Body]
+        B2 --> L2[Latch+Header]
+        L2 -->|true| B2
+        L2 -->|false| DE[Dedicated Exit]
+        DE --> E2
+    end
+```
+
+##### IndVarSimplify
+
+依赖 AnalysisPass：LoopAnalysis、SCEV
+
+1. 按 SCEV Key 对整数 Header PHI 分组
+
+2. 对同 Key 的 PHI 再检查各前驱起点、更新 opcode 和 SSA 操作数形态；完全一致时合并重复递推
+
+3. 将退出比较中的归纳变量规范到左侧：
+
+   ```
+   %c = icmp sgt i32 %n, %iv
+   ; =>
+   %c = icmp slt i32 %iv, %n
+   ```
+
+##### LoopDeletion
+
+依赖 AnalysisPass：LoopAnalysis、SCEV
+
+1. 只考虑最内层、LoopSimplify、LCSSA 循环。
+2. 常量 trip count 必须非负，并在非零时证明 no-wrap；运行期仅支持规范 `i32 +1/-1` 严格比较循环。
+3. 零次循环可直接沿 preheader incoming 解析 exit PHI。
+4. 非零循环必须没有 load/store/call/alloca 等可观察操作，且所有 live-out 都能由 exit PHI 安全替代。
+5. 成功后将 preheader 直接连到 exit，并删除整个循环块集合。
+
+```
+for (i = 0; i < 4; ++i)
+    dead = i * 7;
+; =>
+; 整个循环删除
+```
+
+##### LoopStrengthReduction
+
+依赖 AnalysisPass：LoopAnalysis、SCEV、DominantAnalysis
+
+当前实现不是通用整数 LSR，只优化循环 load/store 使用的 GEP 地址族
+
+1. 要求地址相对当前循环只有一个变化维度，且索引为常量步长 affine recurrence
+
+2. 在 preheader/header/latch 建立指针归纳变量：
+
+   ```
+   %p.start = gep ptr %a, 0
+   %p.iv    = phi ptr [%p.start, %pre], [%p.next, %latch]
+   %p.next  = gep ptr %p.iv, 4
+   ```
+
+3. 起点和布局相同的地址共用一个 pointer IV；末维不同常量起点可以通过常量偏移共享
+
+4. 只有每轮节省的指令足以偿还 preheader 设置成本时才变换
+
+##### LoopUnswitch
+
+依赖 AnalysisPass：Dominant、Loop、SCEV；trivial 模式额外使用 MemorySSA。Trivial unswitch：循环内不变量条件的一侧直接退出时，把条件移到 preheader。
+
+![image-20260803172425654](assets/image-20260803172425654.png)
+
+Non-trivial unswitch：两侧均在循环内时，保留较大的闭包，克隆较小闭包，生成两个特化循环版本
+
+![image-20260803172443751](assets/image-20260803172443751.png)
+
+##### LICM
+
+依赖 AnalysisPass：Dominant、Loop、BasicAA、MemorySSA、SideEffectAnalysis
+
+1. 把循环不变的 binary/select/GEP/cast 移到 preheader
+2. Load 提升要求地址循环不变，并由安全执行前缀或 preheader 的 MustAlias 访问证明可解引用；MemorySSA 必须证明循环内无写破坏
+3. 不变 store 可以下沉到所有循环出口，但地址仅限 global/alloca 上的常量、在界 GEP，并要求 store 支配所有 latch/exiting block
+4. 必执行的只读调用可以提升；非必执行但支配 latch 的只读调用
+
+##### LoopDistribution
+
+依赖 AnalysisPass：Loop、SCEV、LoopDependence
+
+1. 要求 LCSSA、唯一 preheader/latch/exit/exiting edge，并且 exit 没有 PHI
+
+2. 以 store 为 statement root，为每个 store 构建循环内 SSA 反向切片
+
+3. 只枚举保持原 store 顺序的连续切点：
+
+   ```
+   stores[0..cut) | stores[cut..end)
+   ```
+
+4. LoopDependence 必须证明顺序合法；局部性模型要求两个分区的字节 stride 有明显差异
+
+5. 克隆完整循环，原循环保留第一分区，克隆循环保留第二分区，两者串行执行。
+
+```
+for (i,j) {
+    A[i][j] = ...;
+    B[j][i] = ...;
+}
+```
+
+可拆成两个循环，随后分别由 LoopInterchange 选择合适顺序
+
+##### LoopInterchange
+
+依赖 AnalysisPass：Dominant、PostDominant、Loop、SCEV、LoopDependence
+
+1. 角色交换：当相邻两层循环起点、步长、trip count 和零次语义完全相同时，不改 CFG，只交换 payload 中两层 IV 的用途
+2. 物理交换：识别旋转后的固定循环骨架，建立辅助块并真正重接 CFG/PHI
+
+```
+; before
+%p = gep ptr %A, %j, %i
+
+; after
+%p = gep ptr %A, %i, %j
+```
+
+##### LoopIdiomRecognize
+
+依赖 AnalysisPass：Dominant、Loop、Range、SCEV
+
+1. 识别连续 i32/f32 写循环；若写入常量的四个字节相同，替换为 `memset`
+
+2. 识别连续 load→store 循环；源和目标必须是不同的、已知 alloca/global 根，替换为 `memcpy`
+
+3. 识别相邻的“源→临时数组”和“临时数组→目标”循环；临时 alloca 只能被这两个循环使用，替换为 `memmove`
+
+4. 常量 trip count 时直接插入 intrinsic；运行期循环会生成快速路径 guard：
+
+   ```
+   count >= 8 && count <= INT_MAX / 4
+   ```
+
+   快路径执行 intrinsic，慢路径保留原循环。
+
+```
+for (i = 0; i < n; ++i)
+    A[i] = 0;
+```
+
+可转为 `memset(A, 0, n * 4)`
+
+##### LoopFusion
+
+依赖 AnalysisPass：Dominant、PostDominant、Loop、SCEV、LoopAccess
+
+1. 只处理严格相邻的同层循环
+2. 两个循环必须具有完全相同的 SCEV 起点、非零常量步长、trip count 和零次执行语义
+3. LoopAccess 必须证明所有跨循环冲突为 NoConflict 或 SameIterationOnly
+
+##### UnrollAndJam
+
+依赖 AnalysisPass：Loop、SCEV、LoopAccess、Dominant、PostDominant、 BasicAA
+
+1. 处理直接父子矩形循环嵌套，将多个外层迭代的内层循环体合并到同一个内层循环中
+2. 外层必须是正的常量 trip count、常量步长、no-wrap 规范循环；LoopAccess 必须证明外层迭代独立
+3. 主要收益来自：多个 lane 共享一个沿外层不变、沿内层变化的 load，或者严格浮点递推的滑动窗口访问形态
+4. 支持因子 2/4/8；实际自动选择受寄存器、代码规模和 cache-line 成本约束
+5. 若 trip count 不能整除因子，先 peel 最多 7 次余数迭代，后续固定点再执行 jam
+
+##### LoopUnroll
+
+依赖 AnalysisPass：Loop、Dominant、SCEV、BasicAA、Range
+
+决策优先级为：
+
+1. Full unroll：常量 trip count 且 no-wrap。默认最多 16 次；极小循环可放宽到 32 次。
+2. Peeling：识别首轮特殊条件，或可在剩余循环中删除的 invariant store；通常 peel 1～2 次。
+3. Partial unroll：常量 trip count 可整除时优先选择因子 4，其次 2。
+4. Partial with remainder：建立分组主循环，并在后面生成固定数量的 tail 副本。
+5. Runtime unroll：运行期 trip count 需要廉价 SCEV 展开和 no-wrap 证明；生成主循环次数与动态 tail，二次幂因子用 `and/lshr` 计算
 
 ### 参考资料
 
+1. https://llvm.org/docs/Passes.html
+2. https://www.zhihu.com/people/bie-shuo-tai-duo-i
+3. https://gbc.xq.gl/
+4. https://evian-zhang.github.io/llvm-ir-tutorial/index.html
+5. https://enna1.github.io/
+6. https://llvm-study-notes.readthedocs.io/en/latest/index.html
+7. https://understanding-llvm-transformation-passes.readthedocs.io/
+8. 《Engineering A Compiler 2nd Edition / 编译器设计 第二版》
+9. 《Static Single Assignment Book》
+10. 《深入理解 LLVM：代码生成》

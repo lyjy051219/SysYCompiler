@@ -46,7 +46,7 @@ struct ConstantHoistCollectResult {
 //将可共享的大整数常量改写成“公共基值 + 块内小偏移”：
 //1. 过滤依赖字面量形态的操作数，并按常量值收集使用点；
 //2. 把差值可由目标立即数编码的常量聚成一组，执行次数不足的组直接放弃；
-//3. 用支配关系和循环层次选择公共物化点，并拒绝跨越计时屏障的提升；
+//3. 用支配关系和循环层次选择公共物化点；
 //4. 在公共点生成基值，在各使用块生成偏移值并替换原常量。
 class ConstantHoistPass : public PassDescriptor<ConstantHoistPass> {
 public:

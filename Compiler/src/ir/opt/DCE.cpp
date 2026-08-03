@@ -81,11 +81,6 @@ bool DCEPass::isGuaranteedRemovableFunction(
 		return false;
 	}
 	Memo[&F] = ReturnProofState::Visiting;
-	//计时函数及其封装即使没有程序内存效果也具有可观察行为，不能证明为可删除。
-	if (F.mayReachTimingCall()) {
-		Memo[&F] = ReturnProofState::Failed;
-		return false;
-	}
 	const SideEffectInfo &SEI = FAM.getResult<SideEffectAnalysis>(F);
 	if (!isNoModRef(getFunctionModRefInfo(SEI)) ||
 		!hasAcyclicReturningCFG(F)) {
@@ -104,8 +99,15 @@ bool DCEPass::isGuaranteedRemovableFunction(
 			}
 			auto *CI = dynamic_cast<CallInst *>(I);
 			if (!CI) continue;
-			if (auto *BIF = CI->getBuiltinCallee()) {
-				if (classifyBuiltin(BIF) != FuncAttr::NoModRef) {
+			if (CI->getBuiltinCallee()) {
+				// 内置调用统一按调用效果摘要判断；无程序内存访问并不等于
+				// 没有 I/O、计时或其他外部可观察行为。
+				CallEffectSummary Effects = getCallEffectSummary(CI, FAM);
+				if (Effects.HasUnknownMemory ||
+					Effects.HasObservableEffect ||
+					Effects.HasOrderingBarrier ||
+					Effects.MayCrossObjectBounds ||
+					!Effects.ProgramMemory.empty()) {
 					Memo[&F] = ReturnProofState::Failed;
 					return false;
 				}
@@ -241,18 +243,18 @@ bool instructionMayFaultOrProducePoison(const Instruction *I) {
 }
 //判断调用是否具有可观察副作用或无法证明必然返回。
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {
-	//1.3 调用删除按 builtin/普通函数分流：输出、计时与非 NoModRef builtin 保留；
+	//1.3 调用删除按 builtin/普通函数分流：内置调用统一查询完整效果摘要，
 	//普通函数必须通过完整的“无副作用且必返回”递归证明。
 	if (!CI) return true;
-	if (CI->mayReachTimingCall()) return true;
 	Value* Callee = CI->getCallee();
 	if (!Callee) return true;
-	if (auto* BIF = dynamic_cast<BuildInFunction*>(Callee)) {
-		const std::string& N = BIF->getIdent();
-		if (BuildInFunction::isOutputName(N)) {
-			return true;
-		}
-		return classifyBuiltin(BIF) != FuncAttr::NoModRef;
+	if (dynamic_cast<BuildInFunction*>(Callee)) {
+		CallEffectSummary Effects = getCallEffectSummary(CI, FAM);
+		return Effects.HasUnknownMemory ||
+			Effects.HasObservableEffect ||
+			Effects.HasOrderingBarrier ||
+			Effects.MayCrossObjectBounds ||
+			!Effects.ProgramMemory.empty();
 	}
 	if (auto* F = dynamic_cast<Function*>(Callee)) {
 		std::unordered_map<Function *, DCEPass::ReturnProofState> Memo;

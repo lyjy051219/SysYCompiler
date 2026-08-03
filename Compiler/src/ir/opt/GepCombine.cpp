@@ -183,8 +183,7 @@ bool gepIsProvablyWithinKnownObject(
 }
 //合并单用户GEP链并在提交所有使用改写后统一删除旧基址
 bool GepCombinePass::combineChainedGEPs(Function &F) {
-    //2.快照所有 GEP，寻找“当前 GEP 以单用户 GEP 为基址”的链式候选；
-    //计时屏障会阻止合并，以免改变其两侧地址计算的执行位置。
+    //2.快照所有 GEP，寻找“当前 GEP 以单用户 GEP 为基址”的链式候选。
     bool changed = false;
     auto geps = collectInstructions<GetElementPtrInst>(F);
     std::unordered_set<GetElementPtrInst *> deleted;
@@ -197,7 +196,6 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
         if (!BaseGEP) continue;
         if (deleted.count(BaseGEP)) continue;
         if (BaseGEP->countUses() > 1) continue;
-        if (F.hasTimingBarrierOnPath(BaseGEP, GEP)) continue;
         if (BaseGEP->getNumIndices() < 1) continue;
         Value *firstIdx = GEP->getIndex(0);
         Value *baseLastIdx = BaseGEP->getIndex(BaseGEP->getNumIndices() - 1);
@@ -267,14 +265,13 @@ bool GepCombinePass::combineChainedGEPs(Function &F) {
 //把同基址同形的incoming GEP外提为索引PHI加公共GEP
 bool GepCombinePass::foldGEPOfPhi(Function &F) {
     //3.寻找单用户指针 PHI，其所有 incoming 都是同基址、同索引数的 GEP，
-    //且最多只有同一个索引位置不同；自引用和跨计时屏障候选被排除。
+    //且最多只有同一个索引位置不同；自引用候选被排除。
     bool changed = false;
     for (BasicBlock *BB : F) {
         auto phis = BB->collectPhiNodes();
         for (PhiInst *Phi : phis) {
             if (Phi->getNumIncomingValues() < 2) continue;
             if (!Phi->getIRType() || !Phi->getIRType()->isPointer()) continue;
-            if (F.hasTimingBarrierOnPath(Phi, Phi)) continue;
             if (Phi->countUses() > 1) continue;
             auto *FirstGEP = dynamic_cast<GetElementPtrInst *>(Phi->getIncomingValue(0));
             if (!FirstGEP) continue;
@@ -290,7 +287,6 @@ bool GepCombinePass::foldGEPOfPhi(Function &F) {
                 Phi, [&](unsigned I, Value *Incoming, BasicBlock *) {
                 auto *OtherGEP = dynamic_cast<GetElementPtrInst *>(Incoming);
                 if (!OtherGEP) return false;
-                if (F.hasTimingBarrierOnPath(OtherGEP, Phi)) return false;
                 if (I == 0) return true;
                 if (OtherGEP->getNumIndices() != FirstGEP->getNumIndices()) {
                     return false;
@@ -428,7 +424,6 @@ bool GepCombinePass::combineLoopGEPs(
             for (size_t i = 1; i < grp.Geps.size(); i++) {
                 auto *prevGEP = grp.Geps[i - 1];
                 auto *curGEP = grp.Geps[i];
-                if (F.hasTimingBarrierOnPath(prevGEP, curGEP)) continue;
                 Value *prevLast = prevGEP->getIndex(prevGEP->getNumIndices() - 1);
                 Value *curLast = curGEP->getIndex(curGEP->getNumIndices() - 1);
                 //4.2若当前末索引等于前一末索引加常量且原加法无回绕，把当前GEP

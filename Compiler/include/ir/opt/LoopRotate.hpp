@@ -10,7 +10,7 @@
 
 //LoopRotate 的整体流程：
 //1. 在函数内从外向内尝试循环，每成功旋转一个候选就失效循环/支配分析并重新扫描。
-//2. 候选必须是 LoopSimplify + LCSSA 的头部测试循环，具有唯一出口、回边和严格前驱形态，且不得复制计时调用。
+//2. 候选必须是 LoopSimplify + LCSSA 的头部测试循环，具有唯一出口、回边和严格前驱形态。
 //3. 先折叠 Body 中可简化的普通 PHI，再把 Header 计算克隆到 PreHeader，并在 Body 为首次/回边值建 PHI。
 //4. 按 Header、循环体和循环外使用分别重写 SSA，在出口补齐 LCSSA 合流。
 //5. 将首次条件移到 PreHeader，修复专用 preheader/出口，再把旧 Header 合并到 Latch 形成尾部测试。

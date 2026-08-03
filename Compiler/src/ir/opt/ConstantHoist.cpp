@@ -243,29 +243,11 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         std::vector<ConstantHoistUseSite> allUses;
         for (auto &m : G.members)
             for (auto &u : m.uses) allUses.push_back(u);
-        //3.合法性验证：选择支配所有 use 的插入块，并确保提前物化不会跨越
-        //计时屏障或改变计时循环中的动态执行关系。
+        //3.合法性验证：选择支配所有 use 的插入块。常量物化是无副作用
+        //计算，其位置不受外部调用的程序顺序约束。
         BasicBlock *common = foldCommonDominator(DT, allUses);
         BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);
         if (!insertBB) insertBB = entry;
-        //基值实际插在 PHI 序列之后，屏障检查使用同一个概念插入位置。
-        Instruction *InsertAfter = nullptr;
-        for (Instruction *I : *insertBB) {
-            if (!dynamic_cast<PhiInst *>(I)) break;
-            InsertAfter = I;
-        }
-        bool CrossesTiming = false;
-        for (const ConstantHoistUseSite &UseSite : allUses) {
-            if (!UseSite.inst ||
-                F.hasTimingBarrierOnPath(
-                    insertBB, InsertAfter, UseSite.inst) ||
-                F.hasTimingBarrierOnPath(
-                    UseSite.inst, UseSite.inst)) {
-                CrossesTiming = true;
-                break;
-            }
-        }
-        if (CrossesTiming) continue;
         //4.IR 改写：生成公共基值、块内偏移值，并替换整组常量使用。
         changed |= materializeGroup(G, insertBB);
     }

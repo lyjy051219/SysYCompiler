@@ -316,8 +316,7 @@ bool TailRecursionEliminationPass::markTailCalls(Function &F) {
         if (!prevInst) continue;
         auto *CI = dynamic_cast<CallInst*>(prevInst);
         if (!CI) continue;
-        //1.2 计时调用及其封装必须保持普通后端调用序列，自调用则留给后续转循环路径。
-        if (CI->mayReachTimingCall()) continue;
+        //1.2 自调用留给后续转循环路径。
         if (isSelfCall(CI, F)) continue;
         //1.3 反向追溯每个实参的操作数闭包，任何来自 alloca 的地址都不得传给尾调用。
         bool hasEscapingLocalPtr = false;
@@ -563,9 +562,7 @@ bool TailRecursionEliminationPass::eliminateTailRecursion(
 //处理函数中的普通尾调用和全部可消除自尾递归站点
 PreservationStatus TailRecursionEliminationPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     bool changed = false;
-    //1. 函数内任何可达计时调用都禁止本 pass：无论 tail 标志还是转循环，都可能改变调用序列或栈帧边界。
-    if (F.mayReachTimingCall()) return PreservationStatus::all();
-    //1.1 先执行不改 CFG 的普通尾调用标记，使后端可复用调用者栈帧。
+    //1.先执行不改 CFG 的普通尾调用标记，使后端可复用调用者栈帧。
     changed |= markTailCalls(F);
     //2. 真正 TRE 只在存在自递归且入口 alloca 地址均不逃逸时进入，因为这些对象会被搬到循环外并只分配一次。
     if (!hasSelfRecursion(F) || hasEscapingEntryAlloca(F)) {

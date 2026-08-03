@@ -71,8 +71,8 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
 bool FunctionMemoizationPass::collectCandidate(
     Function &F, FunctionAnalysisPassManager &FAM,
     FunctionMemoizationCandidate &Candidate) {
-    //1.先检查签名、直接调用约束、参数个数与标量类型，并排除计时调用和带前驱/PHI
-    //的原入口；这些条件保证可以安全在函数最前面插入 lookup 块。
+    //1.先检查签名、直接调用约束、参数个数、标量类型和原入口形状；
+    //函数的外部可观察行为随后由统一副作用摘要排除。
     Candidate = FunctionMemoizationCandidate{};
     if (F.hasReservedSignature() || !F.front() ||
         !F.hasOnlyDirectCallUses() ||
@@ -81,7 +81,6 @@ bool FunctionMemoizationPass::collectCandidate(
         !isSupportedScalarType(F.getIRType())) {
         return false;
     }
-    if (F.mayReachTimingCall()) return false;
     BasicBlock *OriginalEntry = F.front();
     if (!OriginalEntry || !OriginalEntry->getPredecessors().empty() ||
         !OriginalEntry->collectPhiNodes().empty()) {
