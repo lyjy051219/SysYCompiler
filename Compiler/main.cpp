@@ -68,26 +68,55 @@ static void emitAssemblyImpl(std::ostream &out) {
 }
 
 int main(int argc, const char *argv[]) {
-    (void)argc;
     /*
      * 功能测试：
      *   compiler testcase.sysy -S -o testcase.s
      * 性能测试：
      *   compiler testcase.sysy -S -o testcase.s -O1
+     * 评测平台实际调用（两种顺序都兼容）：
+     *   compiler -S -o testcase.s testcase.sy [-O1]
      */
 
     // 在解析和生成 IR 前确定目标，使指针、索引及聚合类型布局全程一致。
     TargetInfo::get().setArch(defaultTargetArch());
 
-    // 参数位置固定，可以直接读取输入、输出文件路径。
-    std::string inputPath = argv[1];
-    std::string outputPath = argv[4];
+    // 解析命令行：支持 compiler <input> -S -o <out> 与
+    // compiler -S -o <out> <input> [-O1] 两种形态；-S/-o/-O1 位置无关。
+    std::string inputPath;
+    std::string outputPath;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i] ? argv[i] : "";
+        if (arg == "-S") {
+            continue;
+        }
+        if (arg == "-o" && i + 1 < argc) {
+            outputPath = argv[++i];
+            continue;
+        }
+        if (arg == "-O1" || arg == "-O0" || arg == "-O2") {
+            continue;
+        }
+        if (!arg.empty() && arg[0] == '-') {
+            continue; // 未知选项忽略
+        }
+        if (!arg.empty()) {
+            inputPath = arg; // 最后一个非选项参数视为输入文件
+        }
+    }
+    if (inputPath.empty() || outputPath.empty()) {
+        std::cerr << "usage: compiler <input.sy> -S -o <output.s> [-O1]" << std::endl;
+        return 2;
+    }
 
     //默认中端优化等级为O1
     OptimizationLevel OptLevel = OptimizationLevel::O1;
 
     //读取源文件->词法分析->语法分析->生成AST
     yyin = fopen(inputPath.c_str(), "r");
+    if (!yyin) {
+        std::cerr << "Error: cannot open input file " << inputPath << std::endl;
+        return 1;
+    }
     yy::parser parser;
     parser.parse();
     fclose(yyin);
