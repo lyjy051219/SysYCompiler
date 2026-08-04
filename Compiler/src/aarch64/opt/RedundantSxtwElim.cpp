@@ -26,8 +26,11 @@ bool sameReg(const MachineOperand &a, const MachineOperand &b) {
 }
 
 // 这些指令的乘数操作数（uses[0]/uses[1]）按 w 视图消费，可安全替换。
+// 注意：SMULL/SMADDL/SMSUBL 对乘数取 w 视图并自行符号扩展；MULW/MADD/MSUB
+// 本身就是 32 位指令。真 64 位乘法 MUL 按 x 视图消费，不得出现在此列表中，
+// 否则会把 SXTW 结果替换成源寄存器而改变 64 位乘积（P0 语义收窄的配套修复）。
 bool isMulLikeWConsumer(Opcode op) {
-  return op == Opcode::MUL || op == Opcode::MULW || op == Opcode::MADD ||
+  return op == Opcode::SMULL || op == Opcode::MULW || op == Opcode::MADD ||
          op == Opcode::MSUB || op == Opcode::SMADDL || op == Opcode::SMSUBL;
 }
 

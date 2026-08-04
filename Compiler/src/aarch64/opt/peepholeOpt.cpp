@@ -152,7 +152,8 @@ bool foldBinaryZeroIdentity(const MachineInstr &instr, MachineInstr &folded) {
     }
   }
 
-  if (instr.opcode == Opcode::MUL || instr.opcode == Opcode::MULW) {
+  if (instr.opcode == Opcode::MUL || instr.opcode == Opcode::MULW ||
+      instr.opcode == Opcode::SMULL) {
     if (isZeroReg(instr.uses[0]) || isZeroReg(instr.uses[1])) {
       folded = makeCopyFrom(instr, zeroForDef(instr));
       return true;
@@ -317,6 +318,7 @@ bool isCommutativeOpcode(Opcode opcode) {
   case Opcode::ADDW:
   case Opcode::MUL:
   case Opcode::MULW:
+  case Opcode::SMULL:
   case Opcode::AND:
   case Opcode::OR:
   case Opcode::XOR:
@@ -357,6 +359,7 @@ bool isPureCSEOpcode(Opcode opcode) {
   case Opcode::SNEZ:
   case Opcode::MUL:
   case Opcode::MULW:
+  case Opcode::SMULL:
   case Opcode::ADDI:
   case Opcode::ADDIW:
   case Opcode::ANDI:

@@ -696,6 +696,14 @@ struct SignedPow2DivisionGroup {
   MachineReg quotient;
 };
 
+// SIGNED_DIV_FOLD 默认开启（P0#4）。设置 BACKEND_DISABLE_SIGNED_DIV_FOLD 环境
+// 变量可完整复现旧的“默认关闭”行为，供 A/B 回归对比；历史显式开启名
+// BACKEND_ENABLE_SIGNED_DIV_FOLD 保留兼容（默认已开启，不再参与判定，DISABLE
+// 优先级最高）。
+bool signedDivFoldEnabled() {
+  return std::getenv("BACKEND_DISABLE_SIGNED_DIV_FOLD") == nullptr;
+}
+
 // 从 block 的 begin 处尝试匹配指令选择为“有符号除以 2^shift”生成的规范四指令序列：
 //   sign     = SRAIW dividend, 31        （全 0 或全 1 的符号掩码）
 //   bias     = SRLIW sign, 32-shift       （下移得到 0 或 2^shift-1 的偏置）
@@ -778,7 +786,7 @@ matchSignedPow2DivisionGroup(const MachineBasicBlock &block,
 // 中间商必须恰好被使用 2 次（一次给偏置、一次给下一段除法），否则不能安全合并。
 // 每合并一处即从头重算 def/use 表并重试，直到不再有可合并的链。
 bool foldChainedSignedPow2Divisions(MachineFunction &mf) {
-  if (std::getenv("BACKEND_ENABLE_SIGNED_DIV_FOLD") == nullptr) {
+  if (!signedDivFoldEnabled()) {
     return false;
   }
 
@@ -924,7 +932,7 @@ bool foldSignedDivisionByTwoBias(MachineFunction &mf) {
 // 即偏置可直接以 q 为输入，跳过中间的取符号右移。 guard（范围证明必要）：必须存在
 // 前置的算术右移把 q 窄化到至少 k 位，否则一个大正数可能高位非零使等式不成立。
 bool foldNarrowSignedDivisionBias(MachineFunction &mf) {
-  if (std::getenv("BACKEND_ENABLE_SIGNED_DIV_FOLD") == nullptr) {
+  if (!signedDivFoldEnabled()) {
     return false;
   }
   const DefinitionTable definitions = collectDefinitions(mf);
@@ -1009,9 +1017,9 @@ MachinePreservationStatus preserveBlockStructureAnalyses() {
 // 一次性把块内被替换指令换成新序列。返回是否修改了函数。
 bool runPreRAAffineCombine(MachineFunction &mf) {
   bool changed = false;
-  // 除法链折叠匹配的是指令选择自身生成的规范序列，默认关闭以保持保守；
-  // 需要时可设置环境变量 BACKEND_ENABLE_SIGNED_DIV_FOLD 打开。
-  if (std::getenv("BACKEND_ENABLE_SIGNED_DIV_FOLD") != nullptr) {
+  // 除法链折叠匹配的是指令选择自身生成的规范序列，默认开启；
+  // 设置 BACKEND_DISABLE_SIGNED_DIV_FOLD 可复现旧的默认关闭行为。
+  if (signedDivFoldEnabled()) {
     changed = foldChainedSignedPow2Divisions(mf);
     changed = foldSignedDivisionByTwoBias(mf) || changed;
     changed = foldNarrowSignedDivisionBias(mf) || changed;

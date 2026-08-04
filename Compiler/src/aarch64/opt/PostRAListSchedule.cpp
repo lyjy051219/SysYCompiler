@@ -160,6 +160,7 @@ uint32_t opcodeLatency(Opcode opcode) {
     return 1;
   case Opcode::MUL:
   case Opcode::MULW:
+  case Opcode::SMULL:
     return 3;
   case Opcode::FADD_S:
   case Opcode::FSUB_S:

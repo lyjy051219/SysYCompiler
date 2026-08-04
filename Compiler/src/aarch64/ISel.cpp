@@ -26,6 +26,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -632,7 +633,7 @@ bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
 }
 
 // 有符号 除以正常量(非 2 的幂)的 magic 序列:
-//   product = lhs * magic(64 位乘法),high = product >> 32(取高 32 位),
+//   product = lhs * magic(32×32→64 有符号长乘 SMULL),high = product >> 32(取高 32 位),
 //   若 magic 为负则 high += lhs(补偿),再算术右移 shift 位,最后减去被除数
 //   的符号位(SRAIW 31,负数得 -1)得到向零取整的商。
 void lowerSignedDivByPositiveConstant(MachineFunction &mf,
@@ -643,7 +644,7 @@ void lowerSignedDivByPositiveConstant(MachineFunction &mf,
                                        RegClass::GPR64);
 
   MachineReg product = mf.createVReg(RegClass::GPR64);
-  appendRegInstr(mbb, Opcode::MUL, product, {lhs, magicReg});
+  appendRegInstr(mbb, Opcode::SMULL, product, {lhs, magicReg});
 
   MachineReg high = mf.createVReg(RegClass::GPR64);
   appendImmInstr(mbb, Opcode::SRAI, high, MachineOperand::reg(product), 32);
@@ -1201,7 +1202,8 @@ std::shared_ptr<IRType> advanceGepType(const std::shared_ptr<IRType> &type,
 }
 
 // 把一个动态索引乘以步长后累加到当前偏移寄存器上。步长为 1 免乘;为 2 的幂用
-// 左移;否则物化步长再 MUL。currentOffset 无效表示这是第一个动态项,直接返回。
+// 左移;否则物化步长再 SMULL(32×32→64 有符号长乘,索引先 SXTW 为 64 位)。
+// currentOffset 无效表示这是第一个动态项,直接返回。
 MachineReg addScaledIndex(MachineFunction &mf, MachineBasicBlock &mbb,
                           MachineReg currentOffset, Value *index,
                           int64_t scale) {
@@ -1221,7 +1223,7 @@ MachineReg addScaledIndex(MachineFunction &mf, MachineBasicBlock &mbb,
                      log2PowerOfTwo(scale));
     } else {
       MachineReg scaleReg = materializeInt(mf, mbb, scale, RegClass::GPR64);
-      appendRegInstr(mbb, Opcode::MUL, scaled, {index64, scaleReg});
+      appendRegInstr(mbb, Opcode::SMULL, scaled, {index64, scaleReg});
     }
   }
 
@@ -2036,6 +2038,91 @@ void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
   }
 }
 
+// 计算两个对齐字节数的最大公约数(负数按绝对值处理,结果至少为 1)。
+int64_t gcdAlignment(int64_t a, int64_t b) {
+  auto magnitude = [](int64_t v) -> uint64_t {
+    return v < 0 ? static_cast<uint64_t>(-(v + 1)) + 1u
+                 : static_cast<uint64_t>(v);
+  };
+  return static_cast<int64_t>(std::gcd(magnitude(a), magnitude(b)));
+}
+
+// 静态证明一个指针值的最小对齐字节数。返回 1 表示只能证明字节对齐,展开
+// memcpy/memset 时不得使用 ldr/str 等自然宽度访存。证明来源(按强度递减):
+//   - alloca/全局对象:对象类型自然对齐(栈帧/数据段布局保证);
+//   - GEP:基址对齐与常量偏移、动态索引步长的最大公约数(动态索引取任意整数,
+//     index*scale 必为 scale 的倍数,故参与 gcd 是安全下界);
+//   - bitcast(指针→指针):物理地址不变,沿用源指针对齐;
+//   - 其余指针来源(形参、load/PHI/SELECT 结果等):按指针所指类型的 ABI 自然
+//     对齐。本 IR 没有 inttoptr/任意地址算术,类型契约即对齐契约;
+//   - 非常规来源(空指针、undef、深度超限)一律保守返回 1。
+int64_t provenPointerAlignment(Value *value, unsigned depth = 0) {
+  if (!value || !isPointerType(value->getIRType()) || depth >= 16) {
+    return 1;
+  }
+  if (auto *alloca = dynamic_cast<AllocaInst *>(value)) {
+    return alignOfType(pointeeType(alloca, "memcpy/memset alignment"));
+  }
+  if (auto *variable = dynamic_cast<Variable *>(value)) {
+    auto type = variable->getIRType();
+    if (isPointerType(type)) {
+      return alignOfType(pointeeType(variable, "memcpy/memset alignment"));
+    }
+    return alignOfType(type);
+  }
+  if (auto *gep = dynamic_cast<GetElementPtrInst *>(value)) {
+    Value *base = useValue(*gep, 0);
+    if (!base || !isPointerType(base->getIRType())) {
+      return 1;
+    }
+    int64_t alignment = provenPointerAlignment(base, depth + 1);
+    int64_t constOffset = 0;
+    auto currentType = pointeeType(base, "memcpy/memset alignment");
+    auto &uses = gep->getUserList();
+    for (std::size_t i = 1; i < uses.size(); ++i) {
+      int64_t scale = 0;
+      currentType = advanceGepType(currentType, i == 1, scale);
+      if (scale <= 0) {
+        return 1;
+      }
+      int64_t index = 0;
+      if (exactIntegerConstant(uses[i]->getValue(), index)) {
+        if (!addScaledOffset(index, scale, constOffset)) {
+          return 1;
+        }
+      } else {
+        alignment = gcdAlignment(alignment, scale);
+      }
+    }
+    return gcdAlignment(alignment, constOffset);
+  }
+  if (auto *bitcast = dynamic_cast<BitCastInst *>(value)) {
+    Value *source = useValue(*bitcast, 0);
+    if (source && isPointerType(source->getIRType())) {
+      return provenPointerAlignment(source, depth + 1);
+    }
+    return 1;
+  }
+  if (dynamic_cast<ConstPtr *>(value) || dynamic_cast<UndefValue *>(value)) {
+    return 1;
+  }
+  return alignOfType(pointeeType(value, "memcpy/memset alignment"));
+}
+
+// 地址整体可证明对齐 = 指针来源对齐 与 地址偏移/栈对象请求对齐 的公约数。
+// 同时覆盖 FrameIndex 基址与 GEP/bitcast 叠加出的常量偏移。
+int64_t provenAddressAlignment(MachineFunction &mf, const Address &address,
+                               Value *value) {
+  int64_t alignment = gcdAlignment(provenPointerAlignment(value),
+                                    address.offset);
+  if (address.kind == Address::Kind::FrameIndex && address.frameIndex >= 0 &&
+      address.frameIndex < static_cast<int>(mf.stackObjects.size())) {
+    alignment =
+        gcdAlignment(alignment, mf.stackObjects[address.frameIndex].align);
+  }
+  return alignment;
+}
+
 // 把内存内建 lower 为对 libc(memcpy/memset/memmove)的普通调用。先把三个实参全部
 // 物化到临时寄存器,再统一拷入 a0-a2,以维持并行拷贝语义(避免某源恰被分到 a0-a2
 // 时被提前覆盖)。第 3 个参数是字节数:常量直接物化,32 位动态值零扩展到 64 位。
@@ -2151,6 +2238,11 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   Address srcAddress = addressForValue(mf, mbb, state, src, name);
+  // 只有目标与源都静态证明至少 4 字节对齐时,才允许 ldr/str 字循环;任一无法
+  // 证明时整体退化为纯字节循环,与 RISC-V 侧保持一致的对齐防御策略。
+  const int64_t copyAlign =
+      std::min(provenAddressAlignment(mf, dstAddress, dst),
+               provenAddressAlignment(mf, srcAddress, src));
   if (size > kLoopMemcpyThreshold) {
     MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);
     MachineReg srcReg = materializeAddress(mf, mbb, srcAddress);
@@ -2159,6 +2251,8 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
     loop.uses.push_back(MachineOperand::reg(dstReg));
     loop.uses.push_back(MachineOperand::reg(srcReg));
     loop.uses.push_back(MachineOperand::imm(size));
+    // 第 4 个操作数为可证明对齐字节数,AsmPrinter 据此决定是否启用字循环。
+    loop.uses.push_back(MachineOperand::imm(copyAlign));
     loop.implicitDefs = {PhysReg::T3, PhysReg::T4, PhysReg::T5, PhysReg::T6};
     loop.sideEffects = true;
     mbb.instrs.push_back(std::move(loop));
@@ -2166,15 +2260,17 @@ void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   int64_t offset = 0;
-  for (; offset + 4 <= size; offset += 4) {
-    Address loadAddress = srcAddress;
-    Address storeAddress = dstAddress;
-    loadAddress.offset += offset;
-    storeAddress.offset += offset;
+  if (copyAlign >= 4) {
+    for (; offset + 4 <= size; offset += 4) {
+      Address loadAddress = srcAddress;
+      Address storeAddress = dstAddress;
+      loadAddress.offset += offset;
+      storeAddress.offset += offset;
 
-    MachineReg tmp = mf.createVReg(RegClass::GPR32);
-    appendLoad(mbb, Opcode::LW, tmp, loadAddress);
-    appendStore(mbb, Opcode::SW, tmp, storeAddress);
+      MachineReg tmp = mf.createVReg(RegClass::GPR32);
+      appendLoad(mbb, Opcode::LW, tmp, loadAddress);
+      appendStore(mbb, Opcode::SW, tmp, storeAddress);
+    }
   }
   for (; offset < size; ++offset) {
     Address loadAddress = srcAddress;
@@ -2216,6 +2312,8 @@ void lowerMemset(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   Address dstAddress = addressForValue(mf, mbb, state, dst, name);
+  const int64_t dstAlign = provenAddressAlignment(mf, dstAddress, dst);
+  const bool wordAligned = dstAlign >= 4;
   if (size > kLoopMemsetThreshold) {
     MachineReg dstReg = materializeAddress(mf, mbb, dstAddress);
     MachineInstr loop;
@@ -2223,6 +2321,8 @@ void lowerMemset(MachineFunction &mf, MachineBasicBlock &mbb,
     loop.uses.push_back(MachineOperand::reg(dstReg));
     loop.uses.push_back(MachineOperand::imm(byte));
     loop.uses.push_back(MachineOperand::imm(size));
+    // 第 4 个操作数为可证明对齐字节数,AsmPrinter 据此决定是否启用字循环。
+    loop.uses.push_back(MachineOperand::imm(dstAlign));
     loop.implicitDefs = {PhysReg::T3, PhysReg::T5, PhysReg::T6};
     loop.sideEffects = true;
     mbb.instrs.push_back(std::move(loop));
@@ -2233,10 +2333,12 @@ void lowerMemset(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg word = materializeInt(mf, mbb, static_cast<int64_t>(repeated),
                                    RegClass::GPR32);
   int64_t offset = 0;
-  for (; offset + 4 <= size; offset += 4) {
-    Address address = dstAddress;
-    address.offset += offset;
-    appendStore(mbb, Opcode::SW, word, address);
+  if (wordAligned) {
+    for (; offset + 4 <= size; offset += 4) {
+      Address address = dstAddress;
+      address.offset += offset;
+      appendStore(mbb, Opcode::SW, word, address);
+    }
   }
   for (; offset < size; ++offset) {
     Address address = dstAddress;

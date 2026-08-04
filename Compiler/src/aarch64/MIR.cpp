@@ -165,6 +165,8 @@ const char *opcodeName(Opcode opcode) {
     return "PARALLEL_COPY";
   case Opcode::SXTW:
     return "SXTW";
+  case Opcode::SMULL:
+    return "SMULL";
   }
   return "<unknown>";
 }

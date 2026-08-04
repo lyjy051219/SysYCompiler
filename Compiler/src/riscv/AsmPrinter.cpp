@@ -821,14 +821,17 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
   // MEMCPY_INLINE:把 [src, size) 复制到 [dst, size)。
   // 就地展开成两段循环:先按 4 字节字循环搬 size/4 个字,再按字节循环搬余下 size%4 个字节。
   // 使用保留寄存器(dst/src/tmp/计数器)与本指令唯一的一组 .L 局部标签,不占用分配寄存器。
+  // 第 4 个操作数是 ISel 静态证明的对齐字节数;align<4 时只允许字节访存,跳过字循环。
   case Opcode::MEMCPY_INLINE: {
-    if (instr.uses.size() < 3 || instr.uses[2].kind != OperandKind::Imm) {
+    if (instr.uses.size() < 4 || instr.uses[2].kind != OperandKind::Imm ||
+        instr.uses[3].kind != OperandKind::Imm) {
       throw BackendError("malformed MEMCPY_INLINE instruction");
     }
     const std::string dst = operandReg(instr.uses[0]);
     const std::string src = operandReg(instr.uses[1]);
     const int64_t size = instr.uses[2].immValue;
-    if (size < 0) {
+    const int64_t align = instr.uses[3].immValue;
+    if (size < 0 || align < 1 || (align & (align - 1)) != 0) {
       throw BackendError("negative MEMCPY_INLINE size");
     }
 
@@ -837,8 +840,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     const std::string byteLoop = ".Lmemcpy" + std::to_string(id) + ".loopb";
     const std::string byteStart = ".Lmemcpy" + std::to_string(id) + ".bytes";
     const std::string done = ".Lmemcpy" + std::to_string(id) + ".done";
-    const int64_t wordCount = size / 4;
-    const int64_t byteCount = size % 4;
+    const bool wordAligned = align >= 4;
+    const int64_t wordCount = wordAligned ? size / 4 : 0;
+    const int64_t byteCount = wordAligned ? size % 4 : size;
 
     out_ << "    mv " << regName(kReservedMemcpyDst) << ", " << dst << '\n';
     out_ << "    mv " << regName(kReservedMemcpySrc) << ", " << src << '\n';
@@ -882,15 +886,19 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
   // MEMSET_INLINE:把 [dst, size) 填充为字节值 byte。
   // 把单字节复制成 4 份得到一个字模式(byte*0x01010101),先按字循环填 size/4 个字,
   // 再按字节循环填余下字节。结构与 MEMCPY_INLINE 对称。
+  // 第 4 个操作数是 ISel 静态证明的对齐字节数;align<4 时只允许字节访存,跳过字循环。
   case Opcode::MEMSET_INLINE: {
-    if (instr.uses.size() < 3 || instr.uses[1].kind != OperandKind::Imm ||
-        instr.uses[2].kind != OperandKind::Imm) {
+    if (instr.uses.size() < 4 || instr.uses[1].kind != OperandKind::Imm ||
+        instr.uses[2].kind != OperandKind::Imm ||
+        instr.uses[3].kind != OperandKind::Imm) {
       throw BackendError("malformed MEMSET_INLINE instruction");
     }
     const std::string dst = operandReg(instr.uses[0]);
     const int64_t byte = instr.uses[1].immValue;
     const int64_t size = instr.uses[2].immValue;
-    if (byte < 0 || byte > 255 || size < 0) {
+    const int64_t align = instr.uses[3].immValue;
+    if (byte < 0 || byte > 255 || size < 0 || align < 1 ||
+        (align & (align - 1)) != 0) {
       throw BackendError("invalid MEMSET_INLINE operands");
     }
 
@@ -899,8 +907,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     const std::string byteLoop = ".Lmemset" + std::to_string(id) + ".loopb";
     const std::string byteStart = ".Lmemset" + std::to_string(id) + ".bytes";
     const std::string done = ".Lmemset" + std::to_string(id) + ".done";
-    const int64_t wordCount = size / 4;
-    const int64_t byteCount = size % 4;
+    const bool wordAligned = align >= 4;
+    const int64_t wordCount = wordAligned ? size / 4 : 0;
+    const int64_t byteCount = wordAligned ? size % 4 : size;
     const uint32_t repeated = static_cast<uint32_t>(byte) * 0x01010101u;
 
     out_ << "    mv " << regName(kReservedMemcpyDst) << ", " << dst << '\n';

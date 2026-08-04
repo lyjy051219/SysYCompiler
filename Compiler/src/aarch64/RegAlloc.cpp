@@ -170,6 +170,7 @@ struct ProgramInfo {
   std::set<std::size_t> loopLatchBlocks;         // 循环 latch 块下标集合
   bool aggressiveLARematerialization = false;    // 是否激进重物化 LA(环境变量开关)
   bool coalesceGPRVirtualCopies = true;          // 是否允许合并 GPR 虚拟寄存器间的拷贝
+  bool coalesceFPRVirtualCopies = true;          // 是否允许合并 FPR 虚拟寄存器间的拷贝
 };
 
 // 分析程序,填充 ProgramInfo。
@@ -186,6 +187,8 @@ ProgramInfo analyzeProgram(const MachineFunction &mf,
       std::getenv("BACKEND_AGGRESSIVE_LA_REMAT") != nullptr;
   info.coalesceGPRVirtualCopies =
       std::getenv("BACKEND_DISABLE_GPR_VREG_COALESCING") == nullptr;
+  info.coalesceFPRVirtualCopies =
+      std::getenv("BACKEND_DISABLE_FPR_VREG_COALESCING") == nullptr;
   for (const auto &[latch, header] : loopInfo.backedges) {
     (void)header;
     if (latch >= 0) {
@@ -312,6 +315,16 @@ bool nodeMatchesBank(Node node, bool floatBank,
   }
   auto found = classes.find(node);
   return found != classes.end() && isFloatClass(found->second) == floatBank;
+}
+
+// 判断节点是否为 fa0-fa7(浮点参数/返回值寄存器)的预着色节点。
+// RISC-V 与 AArch64 的 PhysReg 枚举中 FA0-FA7 连续排列。
+bool isFprArgReturnNode(Node node) {
+  if (!isPhysicalNode(node)) {
+    return false;
+  }
+  const PhysReg reg = nodePhysicalReg(node);
+  return reg >= PhysReg::FA0 && reg <= PhysReg::FA7;
 }
 
 // 从一组操作数中挑出属于本寄存器体的虚拟寄存器节点。
@@ -821,13 +834,32 @@ private:
       return;
     }
 
-    // 浮点参数和返回值 COPY 还承担栈上传参与 fa0-fa7 之间的顺序隔离。
-    // 在当前 MIR 中将其与预着色节点合并会丢失该顺序信息。
+    // 浮点体解冻(P0#3):允许 FPR 虚拟-虚拟及普通虚拟-物理拷贝走 George/Briggs
+    // 保守合并。唯一保留冻结的是「函数含调用时、合并代表为 fa0-fa7 预着色节点」
+    // 的传送:这类拷贝还承担调用点/返回点浮点参数与返回值落位的顺序隔离,
+    // 在含调用函数中与旧行为保持一致;叶函数及 ft/fs 预着色、虚拟-虚拟 FPR
+    // 拷贝一律参与合并。另有 BACKEND_DISABLE_FPR_VREG_COALESCING 应急 A/B 开关。
     if (graph_.floatBank) {
-      move.state = MoveState::Frozen;
-      addWorkList(keep);
-      addWorkList(removed);
-      return;
+      if (!info_.coalesceFPRVirtualCopies) {
+        // 应急开关:完整复现改造前的「FPR 体全部冻结」行为,用于严格 A/B 对比。
+        move.state = MoveState::Frozen;
+        addWorkList(keep);
+        addWorkList(removed);
+        return;
+      }
+      if (graph_.containsCall && isFprArgReturnNode(keep)) {
+        move.state = MoveState::Frozen;
+        addWorkList(keep);
+        addWorkList(removed);
+        return;
+      }
+      if (graph_.precolored.count(keep) == 0 &&
+          !move.virtualCoalescingEligible) {
+        move.state = MoveState::Frozen;
+        addWorkList(keep);
+        addWorkList(removed);
+        return;
+      }
     }
 
     // Cyclic PHI bundles carry an explicit barrier and never enter the move

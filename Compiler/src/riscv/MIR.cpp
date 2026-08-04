@@ -14,7 +14,7 @@
 namespace riscv {
 namespace {
 
-// 把 MIR 操作码枚举转成人类可读名字,仅供调试转储使用(非最终汇编助记符)。
+// 把 MIR 操作码枚举转成可读名字,仅供调试转储使用(非最终汇编助记符)。
 const char *opcodeName(Opcode opcode) {
   switch (opcode) {
   case Opcode::NOP:

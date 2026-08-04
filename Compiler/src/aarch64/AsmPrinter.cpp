@@ -912,21 +912,26 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
       default:
         break;
       }
-      // 64 位 MUL 在本后端只用于 32×32→64 的模式（常量除法的 magic
-      // multiply 取高位，以及 GEP 索引×步长）。RISC-V 依赖 LW/LI 的符号扩展，
-      // ARM64 的 ldr w/movz 是零扩展，故必须用 smull（对 w 视图自行符号扩展）
-      // 才能得到正确的 64 位有符号乘积。i32 的 MULW 仍用普通 mul。
+      // MUL 为真 64 位乘法（mul xd, xn, xm），MULW 为 32 位乘法（mul wd, wn, wm），
+      // 均按 def 的寄存器类选择宽度。32×32→64 的有符号长乘是独立的 SMULL
+      // opcode（下方单独分支发射 smull xd, wn, wm）：ISel 只在常量除法 magic
+      // multiply 与 GEP 索引×步长时生成 SMULL。宽度语义在 MIR 层显式区分后，
+      // 任何把真 64 位 MUL 当作 smull 消费的 Pass 都会被消除。
       const RegClass w = instr.defs.front().regValue.rc;
-      if (instr.opcode == Opcode::MUL) {
-        out_ << "    smull " << operandRegAt(instr.defs.front(), RegClass::GPR64)
-             << ", " << operandRegAt(instr.uses[0], RegClass::GPR32) << ", "
-             << operandRegAt(instr.uses[1], RegClass::GPR32) << '\n';
-        return;
-      }
       out_ << "    " << mnemonic << ' ' << operandRegAt(instr.defs.front(), w)
            << ", " << operandRegAt(instr.uses[0], w) << ", "
            << operandRegAt(instr.uses[1], w) << '\n';
     }
+    return;
+  case Opcode::SMULL:
+    // 32×32→64 有符号长乘：smull xd, wn, wm。乘数固定取 w 视图（符号扩展），
+    // 结果写入 64 位 x 寄存器。
+    if (instr.defs.empty() || instr.uses.size() < 2) {
+      throw BackendError("malformed smull instruction");
+    }
+    out_ << "    smull " << operandRegAt(instr.defs.front(), RegClass::GPR64)
+         << ", " << operandRegAt(instr.uses[0], RegClass::GPR32) << ", "
+         << operandRegAt(instr.uses[1], RegClass::GPR32) << '\n';
     return;
   case Opcode::MADD:
   case Opcode::MSUB:
@@ -1077,14 +1082,18 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
   case Opcode::FSW:
     emitMemoryInstr(instr);
     return;
+  // MEMCPY_INLINE:把 [src, size) 复制到 [dst, size)。
+  // 第 4 个操作数是 ISel 静态证明的对齐字节数;align<4 时只允许字节访存,跳过字循环。
   case Opcode::MEMCPY_INLINE: {
-    if (instr.uses.size() < 3 || instr.uses[2].kind != OperandKind::Imm) {
+    if (instr.uses.size() < 4 || instr.uses[2].kind != OperandKind::Imm ||
+        instr.uses[3].kind != OperandKind::Imm) {
       throw BackendError("malformed MEMCPY_INLINE instruction");
     }
     const std::string dst = operandReg(instr.uses[0]);
     const std::string src = operandReg(instr.uses[1]);
     const int64_t size = instr.uses[2].immValue;
-    if (size < 0) {
+    const int64_t align = instr.uses[3].immValue;
+    if (size < 0 || align < 1 || (align & (align - 1)) != 0) {
       throw BackendError("negative MEMCPY_INLINE size");
     }
 
@@ -1093,8 +1102,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     const std::string byteLoop = ".Lmemcpy" + std::to_string(id) + ".loopb";
     const std::string byteStart = ".Lmemcpy" + std::to_string(id) + ".bytes";
     const std::string done = ".Lmemcpy" + std::to_string(id) + ".done";
-    const int64_t wordCount = size / 4;
-    const int64_t byteCount = size % 4;
+    const bool wordAligned = align >= 4;
+    const int64_t wordCount = wordAligned ? size / 4 : 0;
+    const int64_t byteCount = wordAligned ? size % 4 : size;
 
     // 保留寄存器：T5/T4 作 dst/src(x 形式)，T3 临时值，T6 计数器。
     {
@@ -1127,15 +1137,20 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     }
     return;
   }
+  // MEMSET_INLINE:把 [dst, size) 填充为字节值 byte。
+  // 第 4 个操作数是 ISel 静态证明的对齐字节数;align<4 时只允许字节访存,跳过字循环。
   case Opcode::MEMSET_INLINE: {
-    if (instr.uses.size() < 3 || instr.uses[1].kind != OperandKind::Imm ||
-        instr.uses[2].kind != OperandKind::Imm) {
+    if (instr.uses.size() < 4 || instr.uses[1].kind != OperandKind::Imm ||
+        instr.uses[2].kind != OperandKind::Imm ||
+        instr.uses[3].kind != OperandKind::Imm) {
       throw BackendError("malformed MEMSET_INLINE instruction");
     }
     const std::string dst = operandReg(instr.uses[0]);
     const int64_t byte = instr.uses[1].immValue;
     const int64_t size = instr.uses[2].immValue;
-    if (byte < 0 || byte > 255 || size < 0) {
+    const int64_t align = instr.uses[3].immValue;
+    if (byte < 0 || byte > 255 || size < 0 || align < 1 ||
+        (align & (align - 1)) != 0) {
       throw BackendError("invalid MEMSET_INLINE operands");
     }
 
@@ -1144,8 +1159,9 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     const std::string byteLoop = ".Lmemset" + std::to_string(id) + ".loopb";
     const std::string byteStart = ".Lmemset" + std::to_string(id) + ".bytes";
     const std::string done = ".Lmemset" + std::to_string(id) + ".done";
-    const int64_t wordCount = size / 4;
-    const int64_t byteCount = size % 4;
+    const bool wordAligned = align >= 4;
+    const int64_t wordCount = wordAligned ? size / 4 : 0;
+    const int64_t byteCount = wordAligned ? size % 4 : size;
     const uint32_t repeated = static_cast<uint32_t>(byte) * 0x01010101u;
 
     {

@@ -184,6 +184,7 @@ bool isSpeculatablePreheaderInstruction(const MachineInstr &instr) {
   case Opcode::SUBW:
   case Opcode::MUL:
   case Opcode::MULW:
+  case Opcode::SMULL:
   case Opcode::AND:
   case Opcode::OR:
   case Opcode::XOR:
@@ -225,6 +226,7 @@ unsigned instructionCost(const MachineInstr &instr) {
     return 16;
   case Opcode::MUL:
   case Opcode::MULW:
+  case Opcode::SMULL:
   case Opcode::FMUL_S:
     return 3;
   case Opcode::LI:

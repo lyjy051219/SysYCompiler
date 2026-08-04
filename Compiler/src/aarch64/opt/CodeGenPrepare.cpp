@@ -1260,7 +1260,10 @@ std::vector<PrepareCandidate> collectCandidatesForLoop(
     return {};
 
   std::vector<PrepareCandidate> Candidates;
-  for (BasicBlock *BB : L->getBlocks()) {
+  // 使用 RPO 序（只含当前循环层、由 CFG 确定性遍历生成）而不是
+  // L->getBlocks()（其填充顺序来自 LoopInfo 内部 unordered_map 的哈希遍历，
+  // 随进程 ASLR 变化），保证候选收集顺序可复现：同输入多次编译 .s 一致。
+  for (BasicBlock *BB : L->getBlocksInRPO()) {
     if (!BB)
       continue;
     for (Instruction *Inst : *BB) {
@@ -1558,10 +1561,11 @@ bool runCodeGenPrepare(Module &module) {
     }
     std::stable_sort(Loops.begin(), Loops.end(),
                      [](const Loop *A, const Loop *B) {
-                       if (A->getDepth() != B->getDepth()) {
-                         return A->getDepth() > B->getDepth();
-                       }
-                       return A->getHeader() < B->getHeader();
+                       // 仅按深度从内到外排序；同深度循环保持 collectLoopOrder
+                       // 的确定输入序（stable_sort 不交换相等元素）。不要用
+                       // 指针地址做平局比较，否则同深度兄弟循环的相对顺序随
+                       // ASLR 变化，导致改写结果抖动。
+                       return A->getDepth() > B->getDepth();
                      });
     const auto LoopInductions = collectLoopInductions(SCEV, Loops);
     const auto InductionRanges = buildInductionRanges(SCEV, LoopInductions);

@@ -35,6 +35,12 @@ enum class Opcode {
   FDIV_S, FCVT_W_S, FCVT_S_W, LBU, SB, LW, SW, LD, SD, FLW, FSW, GEP,
   MEMCPY_INLINE, MEMSET_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J,
   PHI, SELECT, PARALLEL_COPY,
+  // ARM64 专用：32×32→64 有符号长乘（smull xd, wn, wm）。乘数按 w 视图读取，
+  // 结果写入 64 位 x 寄存器，与真 64 位乘法 MUL（mul xd, xn, xm）严格区分。
+  // 只有 SMULL 与 64 位 ADD/SUB 融合成 SMADDL/SMSUBL 在 ISA 语义上等价；
+  // 真 64 位 MUL 无对应的长乘加指令，任何把 MUL 当 SMULL 消费的 Pass 都是
+  // 潜在错误编译（P0 修复，见 MulAddFusion.cpp 的位宽语义契约）。
+  SMULL,
   // ARM64 专用：把 32 位有符号整数符号扩展成 64 位（用于 GEP 索引地址计算）。
   SXTW,
   // ARM64 专用乘加融合。均为 defs[0]=uses[0]*uses[1]+uses[2]（MSUB 为减）。
