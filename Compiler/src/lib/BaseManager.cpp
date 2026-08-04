@@ -1,6 +1,6 @@
-#include "BaseManager.hpp"
-#include "CFG.hpp"
-#include "IRUtils.hpp"
+#include "lib/BaseManager.hpp"
+#include "lib/CFG.hpp"
+#include "lib/IRUtils.hpp"
 
 #include <cstddef>
 #include <cstdint>

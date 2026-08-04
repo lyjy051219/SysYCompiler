@@ -2,21 +2,53 @@
 #include "./include/lib/IRGenerator.hpp"
 #include "./include/lib/Target.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
-#ifdef ENABLE_RISCV_BACKEND
 #include "./include/riscv/Target.hpp"
-#endif
-#ifdef ENABLE_AARCH64_BACKEND
 #include "./include/aarch64/Target.hpp"
-#endif
 #include <iostream>
 #include <string>
 #include <memory>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 
 std::unique_ptr<CompUnit> ASTRoot = nullptr;
 std::unique_ptr<Module> ModuleIR = std::make_unique<Module>();
 extern FILE *yyin;
+
+// 目标架构选择：
+// - 本地 CMake 构建仍以编译期宏为准（RISC-V / AArch64 各自只编一个后端）；
+// - 评测平台直接 clang++ 编译（不定义 ENABLE_*_BACKEND 宏），默认 AArch64
+//   （ARM 赛道），可用环境变量 BACKEND_ARCH=riscv 切到 RISC-V 以便对照。
+static TargetArch defaultTargetArch() {
+#if defined(ENABLE_AARCH64_BACKEND) && !defined(ENABLE_RISCV_BACKEND)
+  return TargetArch::AArch64;
+#elif defined(ENABLE_RISCV_BACKEND) && !defined(ENABLE_AARCH64_BACKEND)
+  return TargetArch::RISCV64;
+#else
+  const char *arch = std::getenv("BACKEND_ARCH");
+  if (arch && std::strcmp(arch, "riscv") == 0) {
+    return TargetArch::RISCV64;
+  }
+  return TargetArch::AArch64;
+#endif
+}
+
+// 汇编发射：与 defaultTargetArch 保持同一套选择逻辑。
+static void emitAssemblyImpl(std::ostream &out) {
+#if defined(ENABLE_RISCV_BACKEND) && !defined(ENABLE_AARCH64_BACKEND)
+  riscv::emitAssembly(*ModuleIR, out);
+#elif defined(ENABLE_AARCH64_BACKEND) && !defined(ENABLE_RISCV_BACKEND)
+  aarch64::emitAssembly(*ModuleIR, out);
+#else
+  const char *arch = std::getenv("BACKEND_ARCH");
+  if (arch && std::strcmp(arch, "riscv") == 0) {
+    riscv::emitAssembly(*ModuleIR, out);
+  } else {
+    aarch64::emitAssembly(*ModuleIR, out);
+  }
+#endif
+}
 
 int main(int argc, const char *argv[]) {
     (void)argc;
@@ -28,11 +60,7 @@ int main(int argc, const char *argv[]) {
      */
 
     // 在解析和生成 IR 前确定目标，使指针、索引及聚合类型布局全程一致。
-#ifdef ENABLE_AARCH64_BACKEND
-    TargetInfo::get().setArch(TargetArch::AArch64);
-#else
-    TargetInfo::get().setArch(TargetArch::RISCV64);
-#endif
+    TargetInfo::get().setArch(defaultTargetArch());
 
     // 参数位置固定，可以直接读取输入、输出文件路径。
     std::string inputPath = argv[1];
@@ -60,40 +88,19 @@ int main(int argc, const char *argv[]) {
     ModulePassManager MPM = PB.buildModulePipeline(OptLevel, FAM);
     MPM.run(*ModuleIR, MAM);
 
-#ifdef ENABLE_RISCV_BACKEND
     try {
         std::ofstream asmOut(outputPath);
         if (!asmOut.is_open()) {
             std::cerr << "Error: Cannot open output file " << outputPath << std::endl;
             return 1;
         }
-        riscv::emitAssembly(*ModuleIR, asmOut);
+        emitAssemblyImpl(asmOut);
     } catch (const riscv::BackendError &error) {
         std::cerr << "RISC-V backend error: " << error.message() << std::endl;
         return 1;
-    }
-#elif defined(ENABLE_AARCH64_BACKEND)
-    try {
-        std::ofstream asmOut(outputPath);
-        if (!asmOut.is_open()) {
-            std::cerr << "Error: Cannot open output file " << outputPath << std::endl;
-            return 1;
-        }
-        aarch64::emitAssembly(*ModuleIR, asmOut);
     } catch (const aarch64::BackendError &error) {
         std::cerr << "ARM64 backend error: " << error.message() << std::endl;
         return 1;
     }
-#else
-    freopen(outputPath.c_str(), "w", stdout);
-    const TargetInfo &Target = TargetInfo::get();
-    std::cout << "target datalayout = \""
-              << Target.getLLVMDataLayoutString() << "\"\n";
-    std::cout << "target triple = \""
-              << Target.getLLVMTargetTriple() << "\"\n\n";
-    BuildInFunction::dumpDefaultDeclarations();
-    ModuleIR->dumpIR();
-    fclose(stdout);
-#endif
     return 0;
 }
