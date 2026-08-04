@@ -2,6 +2,7 @@
 #include "./include/lib/IRGenerator.hpp"
 #include "./include/lib/Target.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
+#include "./include/Common.hpp"
 #include "./include/riscv/Target.hpp"
 #include "./include/aarch64/Target.hpp"
 #include <iostream>
@@ -18,8 +19,9 @@ extern FILE *yyin;
 
 // 目标架构选择：
 // - 本地 CMake 构建仍以编译期宏为准（RISC-V / AArch64 各自只编一个后端）；
-// - 评测平台直接 clang++ 编译（不定义 ENABLE_*_BACKEND 宏），默认 AArch64
-//   （ARM 赛道），可用环境变量 BACKEND_ARCH=riscv 切到 RISC-V 以便对照。
+// - 评测平台直接 clang++ 编译（不定义 ENABLE_*_BACKEND 宏），默认后端由
+//   Common.hpp 的 DEFAULT_BACKEND_ARCH_RISCV 决定（当前为 RISC-V 赛道），
+//   可用环境变量 BACKEND_ARCH=riscv/aarch64 覆盖以便对照。
 static TargetArch defaultTargetArch() {
 #if defined(ENABLE_AARCH64_BACKEND) && !defined(ENABLE_RISCV_BACKEND)
   return TargetArch::AArch64;
@@ -30,7 +32,14 @@ static TargetArch defaultTargetArch() {
   if (arch && std::strcmp(arch, "riscv") == 0) {
     return TargetArch::RISCV64;
   }
+  if (arch && std::strcmp(arch, "aarch64") == 0) {
+    return TargetArch::AArch64;
+  }
+#ifdef DEFAULT_BACKEND_ARCH_RISCV
+  return TargetArch::RISCV64;
+#else
   return TargetArch::AArch64;
+#endif
 #endif
 }
 
@@ -44,9 +53,17 @@ static void emitAssemblyImpl(std::ostream &out) {
   const char *arch = std::getenv("BACKEND_ARCH");
   if (arch && std::strcmp(arch, "riscv") == 0) {
     riscv::emitAssembly(*ModuleIR, out);
-  } else {
-    aarch64::emitAssembly(*ModuleIR, out);
+    return;
   }
+  if (arch && std::strcmp(arch, "aarch64") == 0) {
+    aarch64::emitAssembly(*ModuleIR, out);
+    return;
+  }
+#ifdef DEFAULT_BACKEND_ARCH_RISCV
+  riscv::emitAssembly(*ModuleIR, out);
+#else
+  aarch64::emitAssembly(*ModuleIR, out);
+#endif
 #endif
 }
 

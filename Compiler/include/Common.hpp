@@ -7,3 +7,8 @@
 // 没有任何头文件，导致平台遗漏 -I <repo>/include，所有带
 // "ir/..."/"lib/..."/"aarch64/..."/"riscv/..."/"yacc/..." 前缀的包含语句
 // 无法解析（提交 CE）。本文件的存在让平台把 include/ 根加入搜索路径。
+
+// 评测平台直接编译（不定义 ENABLE_*_BACKEND 宏）时的默认目标后端。
+// - RISC-V 赛道提交：保持下面这行定义（默认 RISC-V）；
+// - ARM 赛道提交：把下面这行注释掉/删除（默认 AArch64）。
+#define DEFAULT_BACKEND_ARCH_RISCV 1
