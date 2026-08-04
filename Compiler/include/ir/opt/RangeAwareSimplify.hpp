@@ -60,7 +60,7 @@ private:
     //根据两侧区间顺序折叠select构成的最小值或最大值模式
     static bool foldMinMaxViaSelect(
         Function &F, RangeInfo &RI, DominatorTree &DT);
-    //检查有符号余数是否具备无符号化范围证据
-    static bool convertSignedToUnsigned(
+    //把商区间受限的有符号余数改写为减法或单次条件校正
+    static bool foldBoundedSignedRemainders(
         Function &F, RangeInfo &RI, DominatorTree &DT);
 };

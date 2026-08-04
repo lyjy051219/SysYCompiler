@@ -503,8 +503,10 @@ int LoopUnrollPass::localSCEVNodeCost(const SCEVExpr *E) {
     case SCEVExprKind::MulRec:
     case SCEVExprKind::DivRec:
         return 4;
+    default:
+        //尚未纳入物化器的SCEV节点按不可接受的高成本处理。
+        return 1000000;
     }
-    return 1000000;
 }
 //提取展开要求的唯一preheader、header、latch、exiting和exit
 std::optional<LoopExecutionShape>
@@ -572,6 +574,449 @@ bool LoopUnrollPass::isValueCompatibleWithPhi(Value *V, PhiInst *Phi) {
 bool LoopUnrollPass::isValueCompatibleWithType(Value *V, std::shared_ptr<IRType> Ty) {
     if (!isDataValue(V) || !Ty) return false;
     return IRType::hasSameShape(Ty, V->getIRType());
+}
+//判断操作是否属于可按整数位模式安全重关联的结合律归约
+bool LoopUnrollPass::isAssociativeIntegerReductionOp(
+    BinaryInst::Operation Op) {
+    return Op == BinaryInst::ADD || Op == BinaryInst::MUL ||
+           Op == BinaryInst::AND || Op == BinaryInst::OR ||
+           Op == BinaryInst::XOR;
+}
+//返回整数归约操作的通用依赖延迟权重
+int LoopUnrollPass::getIntegerReductionLatency(BinaryInst::Operation Op) {
+    //4.2.3 乘法在现有中端成本表中按三拍依赖估算，其余整数结合律操作按一拍；
+    //该权重只描述操作种类，不读取函数名、输入值或相邻指令模式。
+    return Op == BinaryInst::MUL ? 3 : 1;
+}
+//构造给定整数结合律操作对应的单位元
+Value *LoopUnrollPass::makeIntegerReductionIdentity(
+    BinaryInst::Operation Op, std::shared_ptr<IRType> Ty) {
+    if (!Ty || !Ty->isInt() || Ty->isBool()) return nullptr;
+    switch (Op) {
+    case BinaryInst::ADD:
+    case BinaryInst::OR:
+    case BinaryInst::XOR:
+        return makeTypedIntConstant(0, Ty);
+    case BinaryInst::MUL:
+        return makeTypedIntConstant(1, Ty);
+    case BinaryInst::AND:
+        return makeTypedIntConstant(-1, Ty);
+    default:
+        return nullptr;
+    }
+}
+//判断归约输入是否依赖候选之外的不受支持Header循环状态
+bool LoopUnrollPass::dependsOnUnsupportedHeaderState(
+    Value *V, Loop *L, PhiInst *Candidate, PhiInst *ControlIV,
+    const std::unordered_set<PhiInst *> &HeaderPhis,
+    std::unordered_set<Value *> &Active, int Depth) {
+    //4.2.4 允许归约项通过规范控制IV计算本迭代地址或数值，但拒绝其他循环携带
+    //状态；这样数组sum一类通用归约仍可优化，耦合递推不会被错误拆成独立链。
+    if (!V || !L || Depth > 64) return true;
+    if (V == Candidate) return true;
+    auto *Phi = dynamic_cast<PhiInst *>(V);
+    if (Phi && HeaderPhis.count(Phi)) {
+        return Phi != ControlIV;
+    }
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I || !I->getParent() || !L->contains(I->getParent())) {
+        return false;
+    }
+    if (!Active.insert(V).second) return true;
+    bool Unsupported = false;
+    for (size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+        Value *Operand = I->getOperand(Index);
+        if (!Operand || dynamic_cast<BasicBlock *>(Operand)) continue;
+        if (dependsOnUnsupportedHeaderState(
+                Operand, L, Candidate, ControlIV, HeaderPhis,
+                Active, Depth + 1)) {
+            Unsupported = true;
+            break;
+        }
+    }
+    Active.erase(V);
+    return Unsupported;
+}
+//估算循环内同时占用整数寄存器的循环状态与不变输入数量
+int LoopUnrollPass::estimateIntegerReductionRegisterPressure(Loop *L) {
+    if (!L || !L->getHeader()) return std::numeric_limits<int>::max();
+    std::unordered_set<Value *> LiveIntegerInputs;
+    int Pressure = 2;
+    for (PhiInst *Phi : L->getHeader()->collectPhiNodes()) {
+        if (Phi && Phi->getIRType() &&
+            (Phi->getIRType()->isInt() ||
+             Phi->getIRType()->isPointer())) {
+            ++Pressure;
+        }
+    }
+    for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
+        if (!BB) return std::numeric_limits<int>::max();
+        for (Instruction *I : *BB) {
+            if (!I) return std::numeric_limits<int>::max();
+            for (size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+                Value *Operand = I->getOperand(Index);
+                if (!Operand || Operand->isConst() ||
+                    dynamic_cast<BasicBlock *>(Operand) ||
+                    !Operand->getIRType() ||
+                    (!Operand->getIRType()->isInt() &&
+                     !Operand->getIRType()->isPointer())) {
+                    continue;
+                }
+                auto *Def = dynamic_cast<Instruction *>(Operand);
+                if (!Def || !Def->getParent() ||
+                    !L->contains(Def->getParent())) {
+                    LiveIntegerInputs.insert(Operand);
+                }
+            }
+        }
+    }
+    if (LiveIntegerInputs.size() > static_cast<std::size_t>(
+            std::numeric_limits<int>::max() - Pressure)) {
+        return std::numeric_limits<int>::max();
+    }
+    return Pressure + static_cast<int>(LiveIntegerInputs.size());
+}
+//为已决定的整除部分展开选择整数多累加器计划
+std::vector<IntegerReductionPlan>
+LoopUnrollPass::collectIntegerReductionPlans(
+    Loop *L, const LoopTripCountInfo &TCI, int UnrollCount,
+    const UnrollConfig &Config, const DominatorTree &DT) {
+    std::vector<IntegerReductionPlan> Candidates;
+    if (!L || !L->getHeader() || !TCI.Valid || !TCI.PreHeader ||
+        !TCI.Latch || !TCI.ExitBlock ||
+        (TCI.ExitingBlock != TCI.Latch &&
+         TCI.ExitingBlock != TCI.Header) ||
+        UnrollCount < 2 || Config.ReductionAccumulatorMaxLanes < 2 ||
+        Config.ReductionRegisterBudget <= 0 ||
+        !TCI.ConstantTripCount || *TCI.ConstantTripCount <= 0) {
+        return Candidates;
+    }
+    //4.2.5 整除部分展开需要在唯一专用出口仅执行一次最终合并；存在循环外前驱时
+    //不猜测边频率，也不为其他路径制造undef累加状态。
+    for (BasicBlock *Pred : TCI.ExitBlock->getPredecessors()) {
+        if (!Pred || !L->contains(Pred)) return Candidates;
+    }
+    if (*TCI.ConstantTripCount % UnrollCount != 0) return Candidates;
+    std::unordered_set<PhiInst *> HeaderPhis;
+    for (PhiInst *Phi : L->getHeader()->collectPhiNodes())
+        if (Phi) HeaderPhis.insert(Phi);
+    for (PhiInst *Phi : L->getHeader()->collectPhiNodes()) {
+        if (!Phi || Phi == TCI.IndVar || !Phi->getIRType() ||
+            !Phi->getIRType()->isInt() || Phi->getIRType()->isBool()) {
+            continue;
+        }
+        Value *Initial = Phi->getIncomingFromPred(TCI.PreHeader);
+        auto *Update = dynamic_cast<BinaryInst *>(
+            Phi->getIncomingFromPred(TCI.Latch));
+        if (!Initial || !Update || !Update->getParent() ||
+            !L->contains(Update->getParent()) ||
+            !DT.dominates(Update->getParent(), TCI.Latch) ||
+            !isAssociativeIntegerReductionOp(Update->getOp()) ||
+            !IRType::hasSameShape(Phi->getIRType(), Update->getIRType()) ||
+            !IRType::hasSameShape(Phi->getIRType(), Initial->getIRType()) ||
+            Update->getNumOperands() != 2) {
+            continue;
+        }
+        const bool PhiOnLeft = Update->getOperand(0) == Phi;
+        const bool PhiOnRight = Update->getOperand(1) == Phi;
+        if (PhiOnLeft == PhiOnRight) continue;
+        const unsigned AccumulatorOperand = PhiOnLeft ? 0U : 1U;
+        Value *Contribution = Update->getOperand(1U - AccumulatorOperand);
+        if (!Contribution || !Contribution->getIRType() ||
+            !IRType::hasSameShape(Phi->getIRType(),
+                                  Contribution->getIRType())) {
+            continue;
+        }
+        bool ClosedRecurrence = true;
+        bool HasObservableExit = false;
+        for (Use *U : Phi->getUses()) {
+            auto *UserI = dynamic_cast<Instruction *>(
+                U ? U->getUser() : nullptr);
+            auto OperandIndex = U ? U->getOperandIndex() : std::nullopt;
+            if (UserI == Update && OperandIndex &&
+                *OperandIndex == AccumulatorOperand) {
+                continue;
+            }
+            auto *ExitPhi = dynamic_cast<PhiInst *>(UserI);
+            if (TCI.ExitingBlock == TCI.Header && ExitPhi &&
+                ExitPhi->getParent() == TCI.ExitBlock &&
+                ExitPhi->hasUses()) {
+                HasObservableExit = true;
+                continue;
+            }
+            ClosedRecurrence = false;
+            break;
+        }
+        if (!ClosedRecurrence) continue;
+        for (Use *U : Update->getUses()) {
+            auto *UserI = dynamic_cast<Instruction *>(
+                U ? U->getUser() : nullptr);
+            if (UserI == Phi) continue;
+            auto *ExitPhi = dynamic_cast<PhiInst *>(UserI);
+            if (TCI.ExitingBlock == TCI.Latch && ExitPhi &&
+                ExitPhi->getParent() == TCI.ExitBlock &&
+                ExitPhi->hasUses()) {
+                HasObservableExit = true;
+                continue;
+            }
+            ClosedRecurrence = false;
+            break;
+        }
+        if (!ClosedRecurrence || !HasObservableExit) continue;
+        std::unordered_set<Value *> Active;
+        if (dependsOnUnsupportedHeaderState(
+                Contribution, L, Phi, TCI.IndVar, HeaderPhis,
+                Active, 0)) {
+            continue;
+        }
+        const int SplitIndex = (UnrollCount + 1) / 2;
+        const int NewChainDepth =
+            std::max(SplitIndex, UnrollCount - SplitIndex);
+        const int ChainSaving = UnrollCount - NewChainDepth;
+        if (ChainSaving <= 0) continue;
+        const int Latency = getIntegerReductionLatency(Update->getOp());
+        const std::int64_t GroupCount =
+            *TCI.ConstantTripCount / UnrollCount;
+        const __int128 Benefit = static_cast<__int128>(GroupCount) *
+                                 ChainSaving * Latency - Latency;
+        const std::int64_t RequiredBenefit =
+            std::max<std::int64_t>(1, Config.ReductionMinChainBenefit);
+        if (Benefit < RequiredBenefit ||
+            Benefit > std::numeric_limits<std::int64_t>::max()) {
+            continue;
+        }
+        IntegerReductionPlan Plan;
+        Plan.Phi = Phi;
+        Plan.Update = Update;
+        Plan.Contribution = Contribution;
+        Plan.InitialValue = Initial;
+        Plan.Op = Update->getOp();
+        Plan.AccumulatorOperand = AccumulatorOperand;
+        Plan.LaneCount = 2;
+        Plan.SplitIndex = SplitIndex;
+        Plan.CriticalChainSaving = ChainSaving;
+        Plan.EstimatedNetBenefit = static_cast<std::int64_t>(Benefit);
+        Candidates.push_back(std::move(Plan));
+    }
+    std::sort(
+        Candidates.begin(), Candidates.end(),
+        [](const IntegerReductionPlan &A,
+           const IntegerReductionPlan &B) {
+            return A.EstimatedNetBenefit > B.EstimatedNetBenefit;
+        });
+    const int BasePressure = estimateIntegerReductionRegisterPressure(L);
+    int AddedPressure = 0;
+    std::vector<IntegerReductionPlan> Selected;
+    for (const IntegerReductionPlan &Plan : Candidates) {
+        const int Extra = std::max(0, Plan.LaneCount - 1);
+        if (BasePressure == std::numeric_limits<int>::max() ||
+            AddedPressure > Config.ReductionRegisterBudget - BasePressure ||
+            Extra > Config.ReductionRegisterBudget -
+                        BasePressure - AddedPressure) {
+            continue;
+        }
+        Selected.push_back(Plan);
+        AddedPressure += Extra;
+    }
+    return Selected;
+}
+//判断基本块是否属于原循环或任一展开副本
+bool LoopUnrollPass::isBlockInUnrolledCore(
+    BasicBlock *BB, const UnrolledBodyCore &Core) {
+    if (!BB) return false;
+    for (const auto &Iteration : Core.IterBlocks)
+        for (BasicBlock *Candidate : Iteration)
+            if (Candidate == BB) return true;
+    return false;
+}
+//把归约计划完整映射为各展开副本并快照循环外结果use
+bool LoopUnrollPass::buildIntegerReductionRewrite(
+    const IntegerReductionPlan &Plan, UnrolledBodyCore &Core,
+    PhiInst *PrimaryPhi, Value *ResultValue, bool NeedIdentity,
+    IntegerReductionRewrite &Rewrite) {
+    Rewrite = IntegerReductionRewrite{};
+    if (!Plan.Update || !Plan.Contribution || !Plan.InitialValue ||
+        Plan.LaneCount != 2 || Plan.SplitIndex <= 0 ||
+        Plan.SplitIndex >= Core.Count ||
+        Plan.AccumulatorOperand > 1) {
+        return false;
+    }
+    Rewrite.Plan = &Plan;
+    Rewrite.PrimaryPhi = PrimaryPhi;
+    Rewrite.Updates.reserve(Core.Count);
+    Rewrite.Contributions.reserve(Core.Count);
+    for (int Iter = 0; Iter < Core.Count; ++Iter) {
+        auto *Update = dynamic_cast<BinaryInst *>(
+            mapDataValueAtIteration(Plan.Update, Iter, Core));
+        Value *Contribution =
+            mapDataValueAtIteration(Plan.Contribution, Iter, Core);
+        if (!Update || !Contribution ||
+            Update->getOp() != Plan.Op ||
+            Update->getNumOperands() != 2 ||
+            Update->getOperand(1U - Plan.AccumulatorOperand) !=
+                Contribution ||
+            !isValueCompatibleWithType(
+                Contribution, Plan.Update->getIRType())) {
+            return false;
+        }
+        Rewrite.Updates.push_back(Update);
+        Rewrite.Contributions.push_back(Contribution);
+    }
+    Rewrite.OriginalResult = ResultValue ? ResultValue
+                                         : Rewrite.Updates.back();
+    if (!Rewrite.OriginalResult) return false;
+    for (Use *U : Rewrite.OriginalResult->getUses()) {
+        auto *UserI = dynamic_cast<Instruction *>(
+            U ? U->getUser() : nullptr);
+        if (!UserI || !UserI->getParent()) return false;
+        if (!isBlockInUnrolledCore(UserI->getParent(), Core)) {
+            auto *ExitPhi = dynamic_cast<PhiInst *>(UserI);
+            if (PrimaryPhi && Rewrite.OriginalResult == PrimaryPhi &&
+                ExitPhi && ExitPhi->getParent() == Core.Shape.Exit) {
+                if (ExitPhi->getNumIncomingValues() != 1 ||
+                    ExitPhi->getIncomingBlock(0) != Core.Shape.Header ||
+                    ExitPhi->getIncomingValue(0) != PrimaryPhi ||
+                    !ExitPhi->hasUses()) {
+                    return false;
+                }
+                Rewrite.ResultPhis.push_back(ExitPhi);
+                for (Use *ExitUse : ExitPhi->getUses())
+                    if (ExitUse) Rewrite.ResultUses.push_back(ExitUse);
+                continue;
+            }
+            Rewrite.ResultUses.push_back(U);
+        }
+    }
+    if (Rewrite.ResultUses.empty()) return false;
+    if (NeedIdentity) {
+        Rewrite.Identity = makeIntegerReductionIdentity(
+            Plan.Op, Plan.Update->getIRType());
+        if (!Rewrite.Identity) return false;
+    }
+    return true;
+}
+//对整除部分展开后的整数归约构造两条循环携带累加链
+unsigned LoopUnrollPass::applyPartialIntegerReductionAccumulators(
+    UnrolledBodyCore &Core,
+    const std::vector<IntegerReductionPlan> &Plans,
+    const std::unordered_map<PhiInst *, Value *> &HeaderReplacements) {
+    if (Plans.empty() || Core.Count < 2 ||
+        !Core.Shape.PreHeader || !Core.Shape.Header || !Core.Shape.Exit ||
+        Core.Latches.empty() || !Core.Latches.back() ||
+        Core.Exitings.empty() || !Core.Exitings.back()) {
+        return 0;
+    }
+    const bool LatchExiting = hasLatchExitShape(Core);
+    const bool HeaderExiting =
+        !LatchExiting && Core.Shape.Exiting == Core.Shape.Header;
+    if (!LatchExiting && !HeaderExiting) return 0;
+    BasicBlock *ExitPred = HeaderExiting ? Core.Shape.Header
+                                        : Core.Exitings.back();
+    for (BasicBlock *Pred : Core.Shape.Exit->getPredecessors())
+        if (Pred != ExitPred) return 0;
+    std::vector<IntegerReductionRewrite> Rewrites;
+    for (const IntegerReductionPlan &Plan : Plans) {
+        auto ReplacementIt = HeaderReplacements.find(Plan.Phi);
+        auto *PrimaryPhi = ReplacementIt == HeaderReplacements.end()
+                               ? nullptr
+                               : dynamic_cast<PhiInst *>(
+                                     ReplacementIt->second);
+        if (!PrimaryPhi || PrimaryPhi->getParent() != Core.Shape.Header)
+            continue;
+        IntegerReductionRewrite Rewrite;
+        if (!buildIntegerReductionRewrite(
+                Plan, Core, PrimaryPhi,
+                HeaderExiting ? static_cast<Value *>(PrimaryPhi)
+                              : static_cast<Value *>(nullptr),
+                true, Rewrite)) {
+            continue;
+        }
+        unsigned BackedgeIndex = PrimaryPhi->getNumIncomingValues();
+        for (unsigned Index = 0;
+             Index < PrimaryPhi->getNumIncomingValues(); ++Index) {
+            if (PrimaryPhi->getIncomingBlock(Index) ==
+                Core.Latches.back()) {
+                if (BackedgeIndex !=
+                    PrimaryPhi->getNumIncomingValues()) {
+                    BackedgeIndex = PrimaryPhi->getNumIncomingValues();
+                    break;
+                }
+                BackedgeIndex = Index;
+            }
+        }
+        if (BackedgeIndex == PrimaryPhi->getNumIncomingValues() ||
+            PrimaryPhi->getIncomingValue(BackedgeIndex) !=
+                Rewrite.Updates.back()) {
+            continue;
+        }
+        Rewrites.push_back(std::move(Rewrite));
+    }
+    unsigned Changed = 0;
+    for (IntegerReductionRewrite &Rewrite : Rewrites) {
+        const IntegerReductionPlan &Plan = *Rewrite.Plan;
+        const int Split = Plan.SplitIndex;
+        unsigned BackedgeIndex = Rewrite.PrimaryPhi->getNumIncomingValues();
+        for (unsigned Index = 0;
+             Index < Rewrite.PrimaryPhi->getNumIncomingValues(); ++Index) {
+            if (Rewrite.PrimaryPhi->getIncomingBlock(Index) ==
+                Core.Latches.back()) {
+                BackedgeIndex = Index;
+                break;
+            }
+        }
+        if (BackedgeIndex == Rewrite.PrimaryPhi->getNumIncomingValues())
+            continue;
+        auto *SecondaryPhi = new PhiInst(Plan.Update->getIRType());
+        SecondaryPhi->setIdent(
+            SecondaryPhi->getIdent() + ".unr.acc");
+        SecondaryPhi->addIncoming(Rewrite.Identity,
+                                  Core.Shape.PreHeader);
+        SecondaryPhi->addIncoming(Rewrite.Updates.back(),
+                                  Core.Latches.back());
+        Core.Shape.Header->pushFront(SecondaryPhi);
+        Value *Previous = Rewrite.PrimaryPhi;
+        for (int Iter = 0; Iter < Split; ++Iter) {
+            Rewrite.Updates[Iter]->replaceOperand(
+                Plan.AccumulatorOperand, Previous);
+            Previous = Rewrite.Updates[Iter];
+        }
+        Value *Lane0Final = Previous;
+        Previous = SecondaryPhi;
+        for (int Iter = Split; Iter < Core.Count; ++Iter) {
+            Rewrite.Updates[Iter]->replaceOperand(
+                Plan.AccumulatorOperand, Previous);
+            Previous = Rewrite.Updates[Iter];
+        }
+        Value *Lane1Final = Previous;
+        Rewrite.PrimaryPhi->setIncomingValue(
+            BackedgeIndex, Lane0Final);
+        auto *Lane0Exit = new PhiInst(Plan.Update->getIRType());
+        auto *Lane1Exit = new PhiInst(Plan.Update->getIRType());
+        Lane0Exit->setIdent(Lane0Exit->getIdent() + ".unr.acc.exit");
+        Lane1Exit->setIdent(Lane1Exit->getIdent() + ".unr.acc.exit");
+        Lane0Exit->addIncoming(
+            HeaderExiting ? static_cast<Value *>(Rewrite.PrimaryPhi)
+                          : Lane0Final,
+            ExitPred);
+        Lane1Exit->addIncoming(
+            HeaderExiting ? static_cast<Value *>(SecondaryPhi)
+                          : Lane1Final,
+            ExitPred);
+        Core.Shape.Exit->pushFront(Lane1Exit);
+        Core.Shape.Exit->pushFront(Lane0Exit);
+        auto *Combined = new BinaryInst(Lane0Exit, Plan.Op, Lane1Exit);
+        Combined->setIdent(Combined->getIdent() + ".unr.reduce");
+        Core.Shape.Exit->insertAfterPhiNodes(Combined);
+        for (Use *U : Rewrite.ResultUses)
+            if (U) U->replaceUseeWith(Combined);
+        for (PhiInst *ExitPhi : Rewrite.ResultPhis) {
+            if (!ExitPhi || ExitPhi->hasUses()) continue;
+            ExitPhi->eraseFromParent();
+            delete ExitPhi;
+        }
+        ++Changed;
+    }
+    return Changed;
 }
 //把数据值映射到指定展开迭代且拒绝基本块结果
 Value *LoopUnrollPass::mapDataValueAtIteration(Value *V,
@@ -1312,8 +1757,10 @@ bool LoopUnrollPass::canMaterializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *
     case SCEVExprKind::MulRec:
     case SCEVExprKind::DivRec:
         return false;
+    default:
+        //移位、位运算、选择和二项式等节点尚无对应物化路径，保守拒绝。
+        return false;
     }
-    return false;
 }
 //在preheader处递归物化SCEV并缓存公共子表达式
 Value *LoopUnrollPass::materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
@@ -1389,6 +1836,19 @@ Value *LoopUnrollPass::materializeSCEV(const SCEVExpr *E, Loop *L, BasicBlock *P
     }
     if (Result) Cache[E] = Result;
     return Result;
+}
+//判断通用整数SCEV表达式能否在循环预头无故障地物化
+bool LoopUnrollPass::canMaterializeRuntimeSCEV(
+    const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+    const DominatorTree &DT) {
+    return canMaterializeSCEV(E, L, PreHeader, DT);
+}
+//在循环预头物化通过同一合法性门禁的通用整数SCEV表达式
+Value *LoopUnrollPass::materializeRuntimeSCEV(
+    const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+    const DominatorTree &DT) {
+    std::unordered_map<const SCEVExpr *, Value *> Cache;
+    return materializeSCEV(E, L, PreHeader, DT, Cache);
 }
 //从指定迭代开始按照替换表改写全部展开副本
 bool LoopUnrollPass::replaceValuesInIterationBlocks(
@@ -2231,6 +2691,8 @@ LoopUnrollResult LoopUnrollPass::executeFullUnroll(
     if (!removeOriginalHeaderPhisForFull(*Core)) {
         return LoopUnrollResult::Unmodified;
     }
+    //5.1.2 完全展开后的结合律表达式会由后续Reassociate统一规范；此处不构造
+    //会被重新串行化的临时多链，避免制造没有最终关键链收益的无效复杂度。
     SE.clear();
     return LoopUnrollResult::FullyUnrolled;
 }
@@ -2242,7 +2704,6 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
     LoopInfo &LI,
     DominatorTree &DT) {
     (void)LI;
-    (void)DT;
     if (!L || Decision.Count < 2) {
         return LoopUnrollResult::Unmodified;
     }
@@ -2254,11 +2715,16 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
          TCI->ExitingBlock != TCI->Header)) {
         return LoopUnrollResult::Unmodified;
     }
+    //5.2.1 只为已证整除的部分展开准备计划；非Header/Latch退出、非专用出口
+    //以及任意浮点或非闭合循环携带状态都会在收集阶段保守拒绝。
+    std::vector<IntegerReductionPlan> ReductionPlans =
+        collectIntegerReductionPlans(
+            L, *TCI, Decision.Count, Config, DT);
     auto Core = cloneUnrolledBodyCore(L, Decision.Count, SE);
     if (!Core) {
         return LoopUnrollResult::Unmodified;
     }
-    //5.2.1 latch-tested 循环将前 Factor-1 个退出改为直连下一副本，末 Latch 回到首 Header，只保留末副本退出 PHI 值。
+    //5.2.2 latch-tested 循环将前 Factor-1 个退出改为直连下一副本，末 Latch 回到首 Header，只保留末副本退出 PHI 值。
     if (hasLatchExitShape(*Core)) {
         BasicBlock *LastExiting = Core->Exitings.back();
         BasicBlock *ClonedHeader = Core->Headers.back();
@@ -2279,7 +2745,7 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
             return LoopUnrollResult::Unmodified;
         }
     } else if (Core->Shape.Exiting == Core->Shape.Header) {
-        //5.2.2 header-tested 循环保留首 Header 的退出检查，删除后续副本头检查，并把各 Latch 依次连到下一 Header/首 Header。
+        //5.2.3 header-tested 循环保留首 Header 的退出检查，删除后续副本头检查，并把各 Latch 依次连到下一 Header/首 Header。
         for (int Iter = 1; Iter < Decision.Count; ++Iter) {
             BasicBlock *Body =
                 getNonExitSuccessor(Core->Exitings[Iter], Core->Shape.Exit);
@@ -2306,11 +2772,17 @@ LoopUnrollResult LoopUnrollPass::executePartialUnroll(
         discardUncommittedUnrollClones(*Core);
         return LoopUnrollResult::Unmodified;
     }
-    //5.2.3 两种形态最后都将原 Header PHI 回边改为组内末副本状态。
+    //5.2.4 两种形态最后都将原 Header PHI 回边改为组内末副本状态。
+    std::unordered_map<PhiInst *, Value *> HeaderPhiReplacements;
     if (!rewriteOriginalHeaderPhisForPartial(*Core,
-                                             Decision.Count - 1)) {
+                                             Decision.Count - 1,
+                                             &HeaderPhiReplacements)) {
         return LoopUnrollResult::Unmodified;
     }
+    //5.2.5 Header/Latch退出的闭合整数归约都拆成两条循环携带链，最终合并
+    //统一放在专用Exit中，避免每个展开组额外执行一次合并操作。
+    applyPartialIntegerReductionAccumulators(
+        *Core, ReductionPlans, HeaderPhiReplacements);
     SE.clear();
     return LoopUnrollResult::PartiallyUnrolled;
 }

@@ -11,11 +11,12 @@
 bool ADCEPass::isRootLive(
     Instruction *I, PostDominatorTree &PDT,
     FunctionAnalysisPassManager &FAM) {
-    //Store、Ret、Call（仅无写效果且已证明必然返回时可不活跃）、未知语义指令、
-    //无条件Br，以及无法到达真实出口的条件Br。
+    //Store、Ret、Call（仅无写效果且已证明必然返回时可不活跃）、未知/可能故障
+    //指令、无条件Br，以及无法到达真实出口的条件Br。
     if (dynamic_cast<StoreInst *>(I)) return true;
     if (dynamic_cast<RetInst *>(I)) return true;
     if (dceInstructionMustBePreserved(I)) return true; //未知的二元指令
+    if (instructionMayFaultOrProducePoison(I)) return true;
     if (auto *CI = dynamic_cast<CallInst *>(I)) {
         if (Function *Callee = CI->getDirectCallee()) {
             const SideEffectInfo &SEI =

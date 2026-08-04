@@ -11,12 +11,19 @@
 #include <utility>
 #include <vector>
 
+class BasicBlock;
+class BinaryInst;
+class BrInst;
 class DominatorTree;
+class Function;
+class Instruction;
 class Loop;
 class LoopAccessInfo;
 class LoopInfo;
 class PhiInst;
 class PostDominatorTree;
+class RangeInfo;
+class Value;
 
 //UnrollAndJamConfig集中描述展开并合并的次数、收益模型和代码增长限制。
 struct UnrollAndJamConfig {
@@ -46,6 +53,75 @@ struct UnrollAndJamConfig {
     std::size_t MaxNestBlocks = 24;
     //限制所有额外lane合计允许克隆的指令数量。
     std::size_t MaxClonedInstructions = 96;
+    //限制运行期jam的标量尾副本、额外lane和分派计算合计代码增长。
+    std::size_t MaxRuntimeClonedInstructions = 192;
+    //给出收益模型中一次可消除共享load的抽象动态成本。
+    unsigned EstimatedSharedLoadCost = 2;
+    //给出每个被共享内循环省去的规范控制抽象动态成本。
+    unsigned EstimatedInnerControlCost = 1;
+    //给出运行期主段、尾段分派和边界计算的固定抽象动态成本。
+    unsigned EstimatedRuntimeDispatchCost = 8;
+    //要求运行期jam在模型中至少取得指定抽象净收益。
+    unsigned MinRuntimeNetBenefit = 1;
+    //限制单个函数在固定点迭代期间最多执行的二维分块次数。
+    unsigned MaxTileTransformsPerFunction = 1;
+    //限制单个分块轴采用的最大常量tile大小。
+    std::int64_t MaxTileSize = 32;
+    //限制模型估算的单个二维tile工作集字节数。
+    std::int64_t TileWorkingSetBytes = 8 * 1024;
+    //要求每个tile至少减少指定数量的缓存行装入机会。
+    std::int64_t MinTileSavedCacheLines = 4;
+};
+
+//LoopTilingShape保存严格二维整除分块所需的原循环控制和边界信息。
+struct LoopTilingShape {
+    //Outer和Inner记录需要分块的直接父子循环轴。
+    Loop *Outer = nullptr;
+    Loop *Inner = nullptr;
+    //记录外轴预头、循环头、回边和最终出口。
+    BasicBlock *OuterPreHeader = nullptr;
+    BasicBlock *OuterHeader = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    BasicBlock *OuterExit = nullptr;
+    //记录内轴预头、循环头、回边和位于外轴内的专用出口。
+    BasicBlock *InnerPreHeader = nullptr;
+    BasicBlock *InnerHeader = nullptr;
+    BasicBlock *InnerLatch = nullptr;
+    BasicBlock *InnerExit = nullptr;
+    //记录两轴规范归纳PHI、退出比较和控制分支。
+    PhiInst *OuterIV = nullptr;
+    PhiInst *InnerIV = nullptr;
+    BinaryInst *OuterCmp = nullptr;
+    BinaryInst *InnerCmp = nullptr;
+    BrInst *OuterPreBranch = nullptr;
+    BrInst *OuterHeaderBranch = nullptr;
+    BrInst *InnerPreBranch = nullptr;
+    BrInst *InnerHeaderBranch = nullptr;
+    BrInst *InnerExitBranch = nullptr;
+    //记录两轴常量起点、常量上界对应的IR值。
+    Value *OuterStartValue = nullptr;
+    Value *InnerStartValue = nullptr;
+    Value *OuterBoundValue = nullptr;
+    Value *InnerBoundValue = nullptr;
+    //记录两轴PHI起始入边和比较上界的操作数位置。
+    unsigned OuterStartIncomingIndex = 0;
+    unsigned InnerStartIncomingIndex = 0;
+    unsigned OuterBoundOperandIndex = 0;
+    unsigned InnerBoundOperandIndex = 0;
+    //记录两轴已经证明为正且无回绕的常量迭代次数。
+    std::int64_t OuterTripCount = 0;
+    std::int64_t InnerTripCount = 0;
+};
+
+//LoopTileChoice保存统一缓存行与工作集模型选出的二维tile参数。
+struct LoopTileChoice {
+    //OuterTile和InnerTile分别记录两轴每个tile覆盖的迭代数量。
+    std::int64_t OuterTile = 0;
+    std::int64_t InnerTile = 0;
+    //WorkingSetBytes记录单个tile的保守缓存工作集估算。
+    std::int64_t WorkingSetBytes = 0;
+    //SavedCacheLines记录每个tile至少可复用的缓存行数量。
+    std::int64_t SavedCacheLines = 0;
 };
 
 //2. 候选形状保存直接父子循环、完整共享内循环树、规范控制切片与需按 lane 复制的指令闭包。
@@ -76,6 +152,12 @@ struct UnrollAndJamShape {
     bool OuterExitUsesUpdate = false;
     //记录退出比较中引用外归纳变量或其更新值的操作数索引。
     unsigned OuterExitComparedOperand = 0;
+    //记录运行期外轴已在预头结合范围事实证明有限且不回绕。
+    bool OuterRuntimeNoWrapProven = false;
+    //记录运行期直接内轴已在预头结合范围事实证明有限且不回绕。
+    bool InnerRuntimeNoWrapProven = false;
+    //记录直接内轴运行期次数能够在外轴预头安全物化。
+    bool InnerTripMaterializableAtOuterPreHeader = false;
     //按函数顺序记录候选嵌套涉及的全部基本块。
     std::vector<BasicBlock *> Blocks;
     //记录由所有lane共同复用的内循环树。
@@ -109,12 +191,13 @@ struct UnrollAndJamClonePlan {
 };
 
 //UnrollAndJam 的整体流程：
-//1. 从内向外枚举直接父子循环，用函数级次数预算和外循环头记录阻止重复增长。
-//2. 证明嵌套为矩形、外迭代互相独立，且共享内循环树满足 LoopSimplify/LCSSA、唯一出口和完整迭代路径。
-//3. 从外 IV 建立 lane 依赖闭包，要求存在可共享读取与合并/滑窗收益，再用代码增长和 GPR/FPR 预算选择 2/4/8 路。
-//4. 离线构造各 lane 的 IV、指令克隆和地址映射；任一步失败都销毁整个未提交计划。
-//5. 预检所有挂接点后集中插入 lane，将外 IV 更新改为 Factor*Step，必要时同步 latch 退出比较。
-//6. 常量 trip count 不整除时先调用 peeling 处理余数；jam 不改 CFG 时保留支配/循环分析，peeling 则全部失效。
+//1. 优先识别常量整除、双轴独立的完美二维循环，用统一缓存行/工作集模型选择tile并构造四层控制流。
+//2. 未分块候选从内向外枚举直接父子循环，用函数级次数预算和外循环头记录阻止重复增长。
+//3. 证明嵌套为矩形、外迭代互相独立，且共享内循环树满足 LoopSimplify/LCSSA、唯一出口和完整迭代路径。
+//4. 从外 IV 建立 lane 依赖闭包，要求存在可共享读取与合并/滑窗收益，再用代码增长和 GPR/FPR 预算选择 2/4/8 路。
+//5. 离线构造各 lane 的 IV、指令克隆和地址映射；任一步失败都销毁整个未提交计划。
+//6. 预检所有挂接点后集中插入 lane，将外 IV 更新改为 Factor*Step，必要时同步 latch 退出比较。
+//7. 常量 trip count 不整除时先调用 peeling 处理余数；jam 不改 CFG 时保留支配/循环分析，peeling 则全部失效。
 class UnrollAndJamPass : public PassDescriptor<UnrollAndJamPass> {
 public:
     //使用给定配置构造循环展开并合并Pass。
@@ -131,6 +214,44 @@ private:
     //记录各函数已经变换过的外循环头以阻止重复代码增长。
     std::unordered_map<Function *, std::unordered_set<BasicBlock *>>
         TransformedHeaders;
+    //记录各函数在固定点迭代期间已经完成的二维分块次数。
+    std::unordered_map<Function *, unsigned> TileTransformCounts;
+    //记录分块产生和复用的全部循环头，阻止固定点再次对同一层级分块。
+    std::unordered_map<Function *, std::unordered_set<BasicBlock *>>
+        TiledHeaders;
+
+    //1.5 严格二维分块只接受整除边界、完美矩形和完整可建模访存。
+    //从规范头测循环提取常量起点、上界、次数及其可改写位置。
+    static bool matchTilingAxis(
+        Loop *Axis, const LoopTripCountInfo &Trip,
+        const InductionDescriptor &Induction,
+        PhiInst *&IV, BinaryInst *&Cmp, Value *&StartValue,
+        Value *&BoundValue, unsigned &StartIncomingIndex,
+        unsigned &BoundOperandIndex, std::int64_t &TripCount);
+    //检查块中除允许指令和无条件分支外不含其他计算。
+    static bool hasOnlyTilingControl(
+        BasicBlock *BB,
+        const std::unordered_set<Instruction *> &Allowed,
+        BasicBlock *ExpectedSuccessor);
+    //构建通过CFG、SSA、迭代域、访存和顺序语义门禁的二维候选。
+    static bool buildTilingShape(
+        Loop *Outer, Loop *Inner, LoopAccessInfo &LA, SCEVResult &SE,
+        DominatorTree &DT, PostDominatorTree &PDT,
+        LoopTilingShape &Shape);
+    //按缓存行计算一次访问在给定二维tile中的保守工作集行数。
+    static std::optional<std::int64_t> estimateTileCacheLines(
+        std::int64_t OuterStride, std::int64_t InnerStride,
+        std::size_t ElementBytes, std::size_t Alignment,
+        std::int64_t OuterTile, std::int64_t InnerTile,
+        std::int64_t CacheLineBytes);
+    //统一考虑缓存行复用、tile工作集和新增控制开销并选择整除tile。
+    static std::optional<LoopTileChoice> selectTile(
+        const LoopTilingShape &Shape, LoopAccessInfo &LA,
+        const UnrollAndJamConfig &Config);
+    //提交已完成全部证明的四层tile-i/tile-j/point-i/point-j控制流。
+    static bool applyTiling(Function &F, LoopTilingShape &Shape,
+                            const LoopTileChoice &Choice,
+                            std::vector<BasicBlock *> &NewHeaders);
 
     //2.1 收集规范循环控制，并证明子循环域不依赖待展开的外轴。
     //检查循环内是否存在被循环外指令使用的活跃值。
@@ -144,9 +265,11 @@ private:
     //递归收集共享内循环树的规范控制切片并验证每一层迭代域。
     static bool collectSharedLoopControl(
         UnrollAndJamShape &Shape, Loop *Current, SCEVResult &SE,
+        RangeInfo &RI, DominatorTree &DT,
         const UnrollAndJamConfig &Config, unsigned Depth);
     //收集外循环和完整共享内循环树中不得按lane复制的控制指令。
     static bool collectControl(UnrollAndJamShape &Shape, SCEVResult &SE,
+                               RangeInfo &RI, DominatorTree &DT,
                                const UnrollAndJamConfig &Config);
     //定位外归纳量的回边入值和退出比较使用形式。
     static bool analyzeOuterControl(UnrollAndJamShape &Shape);
@@ -174,6 +297,10 @@ private:
         const std::unordered_map<Value *, Value *> &ValueMap);
     //检查是否存在跨lane复用的外轴不变读取。
     static bool hasShareableLaneRead(
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+        const std::unordered_set<Instruction *> &LaneValues);
+    //统计直接内轴每次有效迭代必定执行且可由全部lane共享的读取数量。
+    static unsigned countGuaranteedShareableLaneReads(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
         const std::unordered_set<Instruction *> &LaneValues);
     //检查lane轴相邻访存能否在长共享轴上形成合并收益。
@@ -204,7 +331,13 @@ private:
     //结合显式配置、收益模式和资源预算选择最终展开因子。
     static std::optional<int> selectFactor(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
-        SCEVResult &SE, const UnrollAndJamConfig &Config);
+        SCEVResult &SE, const UnrollAndJamConfig &Config,
+        std::int64_t *RuntimeMinInnerTrip = nullptr);
+    //用共享读取、内层控制、静态增长和SCEV分派成本评估运行期因子。
+    static bool evaluateRuntimeFactor(
+        const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
+        int Factor, const UnrollAndJamConfig &Config,
+        std::int64_t &MinInnerTrip);
     //2.5 建立候选形状并把所有受外 IV 影响的非控制指令收入 lane 克隆集。
     //构造受外归纳变量影响且对使用封闭的lane指令克隆集合。
     static bool collectLaneInstructions(UnrollAndJamShape &Shape,
@@ -212,7 +345,8 @@ private:
     //从相邻循环建立通过全部结构、控制和访存门禁的候选形状。
     static std::optional<UnrollAndJamShape> buildShape(
         Loop *Outer, Loop *Inner, LoopInfo &LI, SCEVResult &SE,
-        LoopAccessInfo &LA, DominatorTree &DT, PostDominatorTree &PDT,
+        LoopAccessInfo &LA, RangeInfo &RI, DominatorTree &DT,
+        PostDominatorTree &PDT,
         const UnrollAndJamConfig &Config);
     //4.3 计划失败清理保证先断开 operand/use 关系，再销毁所有游离指令。
     static void destroyClonePlan(UnrollAndJamClonePlan &Plan);
@@ -246,4 +380,10 @@ private:
     //5. 只在提交预检成功后挂接克隆并替换外循环步长，提交阶段不再保留可回滚对象。
     static bool executePlan(UnrollAndJamShape &Shape,
                             UnrollAndJamClonePlan &Plan);
+    //为运行期次数构造分组jam主循环、原形标量尾循环及两级零次分派。
+    static bool executeRuntimePlan(
+        Function &F, UnrollAndJamShape &Shape,
+        UnrollAndJamClonePlan &Plan, SCEVResult &SE,
+        const DominatorTree &DT, std::int64_t MinInnerTrip,
+        const UnrollAndJamConfig &Config);
 };

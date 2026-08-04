@@ -67,6 +67,28 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     }
     return false;
 }
+//判断指针是否由副作用分析完整追踪到候选允许读取的全局对象。
+bool FunctionMemoizationPass::isTrackedReadGlobalPointer(
+    Value *Pointer, const SideEffectInfo &Effects,
+    const std::unordered_set<Value *> &AllowedReadGlobals) {
+    //1.3 只接受“一个或多个已知全局基址”的来源；未知来源、局部对象、形参地址
+    //以及未出现在函数只读摘要中的对象都不能成为记忆化函数的读取状态。
+    if (!Pointer || !Pointer->isPointerValue()) return false;
+    if (Pointer->isGlobal())
+        return AllowedReadGlobals.count(Pointer) != 0;
+    auto It = Effects.ptrMap.find(Pointer);
+    if (It == Effects.ptrMap.end() || It->second.untracked ||
+        It->second.bases.empty()) {
+        return false;
+    }
+    for (Value *Base : It->second.bases) {
+        if (!Base || !Base->isGlobal() ||
+            !AllowedReadGlobals.count(Base)) {
+            return false;
+        }
+    }
+    return true;
+}
 //验证函数纯度、递归结构与标量语义并建立稳定的候选快照。
 bool FunctionMemoizationPass::collectCandidate(
     Function &F, FunctionAnalysisPassManager &FAM,
@@ -92,13 +114,25 @@ bool FunctionMemoizationPass::collectCandidate(
             return false;
         }
     }
-    //1.2 目标函数必须完全 NoModRef，且所有基本块均可达；逐条指令排除内存、指针、
-    //不确定运算及非自递归调用，同时收集递归调用点和返回点。
+    //1.2 目标函数至多读取可追踪的全局对象，不能写程序内存、执行I/O、形成顺序
+    //屏障或访问未知/跨对象内存。读取全局的函数只在一次顶层递归树内复用缓存。
     const SideEffectInfo &Effects =
         FAM.getResult<SideEffectAnalysis>(F);
-    if (Effects.hasBuiltin ||
-        getFunctionModRefInfo(Effects) != ModRefInfo::NoModRef) {
+    ModRefInfo FunctionEffect = getFunctionModRefInfo(Effects);
+    if (Effects.hasBuiltin || Effects.hasUnknownMemory ||
+        Effects.hasObservableEffect || Effects.hasOrderingBarrier ||
+        Effects.mayCrossObjectBounds || !Effects.ModSet.empty() ||
+        (FunctionEffect != ModRefInfo::NoModRef &&
+         FunctionEffect != ModRefInfo::Ref)) {
         return false;
+    }
+    std::unordered_set<Value *> AllowedReadGlobals;
+    for (Value *ReadObject : Effects.RefSet) {
+        auto *Global = dynamic_cast<Variable *>(ReadObject);
+        if (!Global || !Global->isGlobal()) return false;
+        AllowedReadGlobals.insert(Global);
+        if (Global->vartag == Variable::GlobalVariable)
+            Candidate.MutableReadGlobals.push_back(Global);
     }
     std::unordered_set<BasicBlock *> Reachable;
     F.collectReachableBlocks(Reachable);
@@ -108,10 +142,26 @@ bool FunctionMemoizationPass::collectCandidate(
         for (Instruction *Inst : *Block) {
             if (hasUnsafeOrUndefinedOperation(Inst)) return false;
             if (dynamic_cast<AllocaInst *>(Inst) ||
-                dynamic_cast<LoadInst *>(Inst) ||
-                dynamic_cast<StoreInst *>(Inst) ||
-                dynamic_cast<GetElementPtrInst *>(Inst)) {
+                dynamic_cast<StoreInst *>(Inst)) {
                 return false;
+            }
+            if (auto *Load = dynamic_cast<LoadInst *>(Inst)) {
+                //1.3 每次load都必须能追踪到摘要声明的只读全局；禁止通过指针load
+                //把地址带入函数，避免后续访问逃出已证明的对象集合。
+                if (Load->isPointerValue() ||
+                    !isTrackedReadGlobalPointer(
+                        Load->getPointerOperand(), Effects,
+                        AllowedReadGlobals)) {
+                    return false;
+                }
+                continue;
+            }
+            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Inst)) {
+                if (!isTrackedReadGlobalPointer(
+                        GEP, Effects, AllowedReadGlobals)) {
+                    return false;
+                }
+                continue;
             }
             if (Inst->getIRType() && Inst->getIRType()->isPointer()) {
                 return false;
@@ -143,23 +193,39 @@ bool FunctionMemoizationPass::collectCandidate(
             }
         }
     }
-    //1.3 至少有两个递归调用才值得缓存，并要求存在函数外调用作为递归计算入口；
+    //1.4 至少有两个递归调用才值得缓存，并要求存在函数外调用作为递归计算入口；
     //所有调用实参都必须已定义，避免把 undef 的任意取值固化进缓存。
     if (Candidate.RecursiveCalls.size() < 2 ||
-        Candidate.Returns.empty()) {
+        Candidate.Returns.empty() ||
+        Candidate.Returns.size() > MaxReturnSites) {
         Candidate = FunctionMemoizationCandidate{};
         return false;
     }
     bool HasExternalCallSite = false;
     for (CallInst *Call : F.getDirectCallSites()) {
         if (!Call || !Call->getParentFunction()) return false;
-        if (Call->getParentFunction() != &F) HasExternalCallSite = true;
+        if (Call->getParentFunction() != &F) {
+            HasExternalCallSite = true;
+            Candidate.ExternalCalls.push_back(Call);
+        }
         for (unsigned Index = 0; Index < Call->getArgCount(); ++Index) {
             Value *Argument = Call->getArg(Index);
             if (!Argument || Argument->isUndef()) return false;
         }
     }
     if (!HasExternalCallSite) return false;
+    //1.5 用统一的静态代码增长上限约束查找、返回发布和外部失效逻辑；该模型
+    //只依赖IR结构，不读取函数名、输入值或测试用例特征。
+    if (Candidate.ExternalCalls.size() > MaxExternalCallSites)
+        return false;
+    const std::size_t ParameterCount = F.getParamCount();
+    const std::size_t EstimatedAddedInstructions =
+        7 + 7 * ParameterCount +
+        Candidate.Returns.size() * (ParameterCount + 3) +
+        (Candidate.MutableReadGlobals.empty()
+             ? 0 : 1 + 7 * Candidate.ExternalCalls.size());
+    if (EstimatedAddedInstructions > MaxAddedInstructions)
+        return false;
     Candidate.Target = &F;
     return true;
 }
@@ -217,6 +283,68 @@ Value *FunctionMemoizationPass::appendHashMix(
     Block.pushBack(Mixed);
     return Mixed;
 }
+//在读取可变全局的候选的每个函数外入口推进缓存代际。
+bool FunctionMemoizationPass::insertExternalCacheInvalidation(
+    Module &M, const FunctionMemoizationCandidate &Candidate,
+    Variable *SlotEpochCache, Variable *CurrentEpoch,
+    unsigned CacheEntries) {
+    //2.4 纯计算或只读常量不需要跨调用失效；读取可变全局时，每个顶层调用
+    //推进一次非零代际。自递归调用不推进，因而同一棵递归树内仍可命中。
+    if (Candidate.MutableReadGlobals.empty()) return true;
+    if (!SlotEpochCache || !CurrentEpoch ||
+        Candidate.ExternalCalls.empty()) {
+        return false;
+    }
+    for (CallInst *Call : Candidate.ExternalCalls) {
+        if (!Call || !Call->getParent() ||
+            Call->getDirectCallee() != Candidate.Target ||
+            Call->getParentFunction() == Candidate.Target) {
+            return false;
+        }
+    }
+    const uint64_t ByteCount =
+        static_cast<uint64_t>(CacheEntries) * sizeof(uint32_t);
+    if (ByteCount == 0 || ByteCount > UINT32_MAX) return false;
+    const char *MemsetName = BuildInFunction::getDefaultMemsetName();
+    for (CallInst *Call : Candidate.ExternalCalls) {
+        //普通路径只把零长度交给memset；32位代际回绕到零时才清空整个槽位表，
+        //并把活动代际恢复为1，因此不能把调用次数不溢出当作正确性前提。
+        auto *OldEpoch = new LoadInst(CurrentEpoch);
+        auto *NextEpoch = new BinaryInst(
+            OldEpoch, BinaryInst::ADD, ConstInt::newConstInt(1));
+        auto *Wrapped = new BinaryInst(
+            NextEpoch, BinaryInst::E, ConstInt::newConstInt(0));
+        auto *ActiveEpoch = new SelectInst(
+            Wrapped, ConstInt::newConstInt(1), NextEpoch);
+        auto *ClearBytes = new SelectInst(
+            Wrapped,
+            ConstInt::newConstInt(static_cast<int64_t>(ByteCount)),
+            ConstInt::newConstInt(0));
+        std::vector<Value *> Arguments{
+            SlotEpochCache, ConstInt::newConstInt(0, 1), ClearBytes,
+            ConstBool::newConstBool(false)};
+        auto *Clear = new CallInst(
+            BuildInFunction::genBuildInFunction(MemsetName), Arguments);
+        auto *PublishEpoch = new StoreInst(ActiveEpoch, CurrentEpoch);
+        const std::vector<Instruction *> Sequence{
+            OldEpoch, NextEpoch, Wrapped, ActiveEpoch,
+            ClearBytes, Clear, PublishEpoch};
+        bool Inserted = true;
+        for (Instruction *Inst : Sequence) {
+            if (Call->insertBefore(Inst)) continue;
+            Inserted = false;
+            break;
+        }
+        if (!Inserted) {
+            for (Instruction *Inst : Sequence) {
+                if (Inst && !Inst->getParent()) delete Inst;
+            }
+            return false;
+        }
+    }
+    M.registerBuiltin(MemsetName);
+    return true;
+}
 //为候选创建缓存全局量、命中入口和返回点有序发布逻辑。
 bool FunctionMemoizationPass::transformCandidate(
     Module &M, const FunctionMemoizationCandidate &Candidate,
@@ -258,16 +386,16 @@ bool FunctionMemoizationPass::transformCandidate(
     LookupBlock->pushBack(SlotIndex);
     std::string Prefix =
         ".__sysy_memo." + std::to_string(CacheOrdinal);
-    auto ValidType = ARRAYType::NewArray(
+    auto SlotEpochType = ARRAYType::NewArray(
         INTType::getInt32Ty(), static_cast<int>(CacheEntries));
     auto KeyType = ARRAYType::NewArray(
         INTType::getInt32Ty(), static_cast<int>(CacheEntries));
     auto ResultType = ARRAYType::NewArray(
         F->getIRType(), static_cast<int>(CacheEntries));
-    //2.4 为有效位、每个参数键和结果分别创建同容量全局数组，并计算当前槽地址。
-    auto *ValidCache = new Variable(
-        Variable::GlobalVariable, ValidType,
-        makeUniqueGlobalName(M, Prefix + ".valid"));
+    //2.4 为槽位代际、每个参数键和结果分别创建同容量全局数组。
+    auto *SlotEpochCache = new Variable(
+        Variable::GlobalVariable, SlotEpochType,
+        makeUniqueGlobalName(M, Prefix + ".slot.epoch"));
     std::vector<Variable *> KeyCaches;
     KeyCaches.reserve(F->getParamCount());
     for (unsigned Index = 0; Index < F->getParamCount(); ++Index) {
@@ -279,8 +407,22 @@ bool FunctionMemoizationPass::transformCandidate(
     auto *ResultCache = new Variable(
         Variable::GlobalVariable, ResultType,
         makeUniqueGlobalName(M, Prefix + ".result"));
-    GetElementPtrInst *ValidPointer =
-        appendSlotPointer(*LookupBlock, ValidCache, SlotIndex);
+    //2.5 读取可变全局的函数为每个槽保存代际，并以独立标量记录当前代际；
+    //全局零初始化配合外部入口先推进到1，保证零始终表示无效槽。
+    Variable *CurrentEpoch = nullptr;
+    if (!Candidate.MutableReadGlobals.empty()) {
+        CurrentEpoch = new Variable(
+            Variable::GlobalVariable, INTType::getInt32Ty(),
+            makeUniqueGlobalName(M, Prefix + ".epoch"));
+    }
+    if (!insertExternalCacheInvalidation(
+            M, Candidate, SlotEpochCache, CurrentEpoch, CacheEntries)) {
+        delete LookupBlock;
+        delete HitBlock;
+        return false;
+    }
+    GetElementPtrInst *SlotEpochPointer =
+        appendSlotPointer(*LookupBlock, SlotEpochCache, SlotIndex);
     std::vector<GetElementPtrInst *> KeyPointers;
     KeyPointers.reserve(KeyCaches.size());
     for (Variable *KeyCache : KeyCaches) {
@@ -289,12 +431,18 @@ bool FunctionMemoizationPass::transformCandidate(
     }
     GetElementPtrInst *ResultPointer =
         appendSlotPointer(*LookupBlock, ResultCache, SlotIndex);
-    //2.5 命中条件要求 valid 且所有存储键逐一相等；命中块读取缓存结果并返回，
-    //未命中边进入原函数入口执行正常递归计算。
-    auto *ValidValue = new LoadInst(ValidPointer);
-    LookupBlock->pushBack(ValidValue);
+    //2.6 命中条件要求槽位代际等于当前活动代际，且所有存储键逐一相等；
+    //命中块读取缓存结果并返回，未命中边进入原函数入口执行正常递归计算。
+    auto *SlotEpoch = new LoadInst(SlotEpochPointer);
+    LookupBlock->pushBack(SlotEpoch);
+    Value *ActiveEpoch = ConstInt::newConstInt(1);
+    if (CurrentEpoch) {
+        auto *LoadedEpoch = new LoadInst(CurrentEpoch);
+        LookupBlock->pushBack(LoadedEpoch);
+        ActiveEpoch = LoadedEpoch;
+    }
     auto *InitialHit = new BinaryInst(
-        ValidValue, BinaryInst::E, ConstInt::newConstInt(1));
+        SlotEpoch, BinaryInst::E, ActiveEpoch);
     LookupBlock->pushBack(InitialHit);
     Value *IsHit = InitialHit;
     for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {
@@ -312,27 +460,27 @@ bool FunctionMemoizationPass::transformCandidate(
     auto *CachedResult = new LoadInst(ResultPointer);
     HitBlock->pushBack(CachedResult);
     HitBlock->pushBack(new RetInst(CachedResult));
-    //2.6 完整 lookup/hit CFG 构造完成后才接入函数，并撤销递归调用的 tail 标记。
+    //2.7 完整 lookup/hit CFG 构造完成后才接入函数，并撤销递归调用的 tail 标记。
     F->pushFront(LookupBlock);
     F->pushBlock(HitBlock);
     for (CallInst *RecursiveCall : Candidate.RecursiveCalls) {
         if (RecursiveCall) RecursiveCall->setTailCall(false);
     }
-    //2.7 每个原返回点按“valid 清零 → 写全部键 → 写结果 → valid 置一”的顺序发布，
-    //防止尚未完整更新的直接映射槽被后续递归命中。
+    //2.8 每个原返回点按“槽代际清零 → 写全部键 → 写结果 → 发布活动代际”
+    //的顺序更新，防止尚未完整写入的直接映射槽被后续递归命中。
     for (RetInst *Return : Candidate.Returns) {
         if (!Return || !Return->getParent()) continue;
         Value *Result = Return->getReturnValue();
         if (!Result) continue;
         Return->insertBefore(new StoreInst(
-            ConstInt::newConstInt(0), ValidPointer));
+            ConstInt::newConstInt(0), SlotEpochPointer));
         for (unsigned Index = 0; Index < KeyPointers.size(); ++Index) {
             Return->insertBefore(new StoreInst(
                 KeyBits[Index], KeyPointers[Index]));
         }
         Return->insertBefore(new StoreInst(Result, ResultPointer));
         Return->insertBefore(new StoreInst(
-            ConstInt::newConstInt(1), ValidPointer));
+            ActiveEpoch, SlotEpochPointer));
     }
     return true;
 }
@@ -354,7 +502,7 @@ PreservationStatus FunctionMemoizationPass::run(
         if (!collectCandidate(*F, FAM, Candidate)) continue;
         Candidates.push_back(std::move(Candidate));
     }
-    //2.按模块总缓存预算依次变换候选；单个缓存大小由参数键数组、valid 数组和
+    //2.按模块总缓存预算依次变换候选；单个缓存大小由参数键、槽位代际和
     //结果数组共同估算，超过剩余预算的函数跳过。
     std::size_t UsedCacheBytes = 0;
     unsigned CacheOrdinal = 0;
@@ -363,6 +511,8 @@ PreservationStatus FunctionMemoizationPass::run(
         std::size_t CacheBytes =
             static_cast<std::size_t>(CacheEntries) * sizeof(uint32_t) *
             (Candidate.Target->getParamCount() + 2);
+        if (!Candidate.MutableReadGlobals.empty())
+            CacheBytes += sizeof(uint32_t);
         if (CacheBytes > MaxModuleCacheBytes - UsedCacheBytes) continue;
         if (!transformCandidate(M, Candidate, CacheOrdinal)) continue;
         UsedCacheBytes += CacheBytes;

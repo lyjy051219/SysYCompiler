@@ -156,6 +156,488 @@ std::vector<BasicBlock *> CFGSimplifyPass::collectControllerCandidates(
 	return Result;
 }
 
+//入边特化只克隆不访问内存、不调用函数且不可观察的标量计算。
+bool CFGSimplifyPass::isEdgeSpecializableInstruction(
+	Instruction *I, BrInst *Branch) {
+	if (!I) return false;
+	if (auto *Br = dynamic_cast<BrInst *>(I)) return Br == Branch;
+	if (auto *Phi = dynamic_cast<PhiInst *>(I))
+		return IRType::isScalar(Phi->getIRType());
+
+	if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
+		Value *LHS = nullptr;
+		Value *RHS = nullptr;
+		return IRType::isScalar(BI->getIRType()) &&
+			BinaryInst::getOperands(BI, LHS, RHS) && LHS && RHS &&
+			IRType::isScalar(LHS->getIRType()) &&
+			IRType::isScalar(RHS->getIRType());
+	}
+
+	if (auto *Select = dynamic_cast<SelectInst *>(I)) {
+		Value *Condition = Select->getCondition();
+		Value *TrueValue = Select->getTrueValue();
+		Value *FalseValue = Select->getFalseValue();
+		return IRType::isScalar(Select->getIRType()) && Condition &&
+			IRType::isBool(Condition->getIRType()) && TrueValue && FalseValue &&
+			IRType::isScalar(TrueValue->getIRType()) &&
+			IRType::isScalar(FalseValue->getIRType());
+	}
+
+	switch (I->instType) {
+		case Instruction::TRUNC:
+		case Instruction::ZEXT:
+		case Instruction::SEXT:
+		case Instruction::FPTOSI:
+		case Instruction::SITOFP: {
+			Value *Operand = I->getUnaryOperand();
+			return Operand && IRType::isScalar(Operand->getIRType()) &&
+				IRType::isScalar(I->getIRType());
+		}
+		default:
+			return false;
+	}
+}
+
+//指定入边上的PHI输入相当于一组局部常量环境；此解释器只消费
+//IR已定义的常量语义，不根据指令排列或常量的具体数值做特判。
+Value *CFGSimplifyPass::evaluateValueOnIncomingEdge(
+	Value *V, BasicBlock *Block,
+	const std::unordered_map<PhiInst *, Value *> &PhiInputs,
+	unsigned Depth, std::unordered_map<Value *, Value *> &Memo,
+	std::unordered_set<Value *> &Visiting,
+	unsigned &FoldedInstructionCount, bool &UsedIncomingPhi) {
+	constexpr unsigned MaxEvaluationDepth = 6;
+	if (!V || Value::isUndef(V) || Depth > MaxEvaluationDepth) return nullptr;
+	if (V->isConst()) return V;
+	auto MemoIt = Memo.find(V);
+	if (MemoIt != Memo.end()) return MemoIt->second;
+	if (!Visiting.insert(V).second) return nullptr;
+
+	auto Finish = [&](Value *Result) -> Value * {
+		Visiting.erase(V);
+		Memo[V] = Result;
+		return Result;
+	};
+
+	auto *I = dynamic_cast<Instruction *>(V);
+	if (!I || I->getParent() != Block)
+		return Finish(nullptr);
+
+	if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
+		auto It = PhiInputs.find(Phi);
+		if (It == PhiInputs.end() || !It->second ||
+			Value::isUndef(It->second) || !It->second->isConst()) {
+			return Finish(nullptr);
+		}
+		UsedIncomingPhi = true;
+		return Finish(It->second);
+	}
+
+	if (auto *BI = dynamic_cast<BinaryInst *>(I)) {
+		Value *LHS = nullptr;
+		Value *RHS = nullptr;
+		if (!BinaryInst::getOperands(BI, LHS, RHS)) return Finish(nullptr);
+		Value *FoldedLHS = evaluateValueOnIncomingEdge(
+			LHS, Block, PhiInputs, Depth + 1, Memo, Visiting,
+			FoldedInstructionCount, UsedIncomingPhi);
+		Value *FoldedRHS = evaluateValueOnIncomingEdge(
+			RHS, Block, PhiInputs, Depth + 1, Memo, Visiting,
+			FoldedInstructionCount, UsedIncomingPhi);
+		if (!FoldedLHS || !FoldedRHS) return Finish(nullptr);
+		Value *Folded = BinaryInst::foldConstants(
+			BI->getOp(), FoldedLHS, FoldedRHS, true);
+		if (!Folded || Value::isUndef(Folded)) return Finish(nullptr);
+		++FoldedInstructionCount;
+		return Finish(Folded);
+	}
+
+	if (auto *Select = dynamic_cast<SelectInst *>(I)) {
+		Value *FoldedCondition = evaluateValueOnIncomingEdge(
+			Select->getCondition(), Block, PhiInputs, Depth + 1, Memo,
+			Visiting, FoldedInstructionCount, UsedIncomingPhi);
+		bool ConditionValue = false;
+		if (!FoldedCondition ||
+			!FoldedCondition->tryGetBoolConst(ConditionValue)) {
+			return Finish(nullptr);
+		}
+		Value *Selected = ConditionValue ? Select->getTrueValue()
+			: Select->getFalseValue();
+		Value *Folded = evaluateValueOnIncomingEdge(
+			Selected, Block, PhiInputs, Depth + 1, Memo, Visiting,
+			FoldedInstructionCount, UsedIncomingPhi);
+		if (!Folded || Value::isUndef(Folded) || !Folded->isConst())
+			return Finish(nullptr);
+		++FoldedInstructionCount;
+		return Finish(Folded);
+	}
+
+	switch (I->instType) {
+		case Instruction::TRUNC:
+		case Instruction::ZEXT:
+		case Instruction::SEXT:
+		case Instruction::FPTOSI:
+		case Instruction::SITOFP: {
+			Value *Operand = I->getUnaryOperand();
+			Value *FoldedOperand = evaluateValueOnIncomingEdge(
+				Operand, Block, PhiInputs, Depth + 1, Memo, Visiting,
+				FoldedInstructionCount, UsedIncomingPhi);
+			if (!FoldedOperand) return Finish(nullptr);
+			Value *Folded = Instruction::foldConstantCast(
+				I->instType, FoldedOperand, I->getIRType());
+			if (!Folded || Value::isUndef(Folded)) return Finish(nullptr);
+			++FoldedInstructionCount;
+			return Finish(Folded);
+		}
+		default:
+			return Finish(nullptr);
+	}
+}
+
+//只记录“当前值唯一用户就是期望用户”的依赖链，因此删掉克隆分支
+//后可以从链顶向操作数安全删除，不会破坏后继PHI或其他计算。
+void CFGSimplifyPass::collectDeadConditionChain(
+	Value *V, Instruction *ExpectedUser, BasicBlock *Block,
+	std::unordered_set<Instruction *> &Visited,
+	std::vector<Instruction *> &Result) {
+	auto *I = dynamic_cast<Instruction *>(V);
+	if (!I || I->getParent() != Block || dynamic_cast<PhiInst *>(I) ||
+		dynamic_cast<BrInst *>(I) ||
+		!isEdgeSpecializableInstruction(I, nullptr)) {
+		return;
+	}
+	Instruction *OnlyUser = nullptr;
+	if (I->countInstructionUses(&OnlyUser) != 1 || OnlyUser != ExpectedUser ||
+		!Visited.insert(I).second) {
+		return;
+	}
+	Result.push_back(I);
+	for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+		collectDeadConditionChain(
+			I->getOperand(Index), I, Block, Visited, Result);
+	}
+}
+
+//建计划阶段同时校验块形、SSA外部use、所有PHI输入和收益；任一项
+//不完整就放弃整个候选，不会产生部分CFG修改。
+bool CFGSimplifyPass::buildEdgeSpecializationPlan(
+	Function &F, BasicBlock *Block,
+	const std::unordered_set<BasicBlock *> &LoopBlocks,
+	EdgeSpecializationPlan &Plan) {
+	Plan = EdgeSpecializationPlan{};
+	if (!Block || Block == F.front() || LoopBlocks.count(Block)) return false;
+	auto *Branch = Block->getBranchTerminator();
+	if (!BasicBlock::isCondBr(Branch)) return false;
+	BasicBlock *TrueBlock = Branch->getTrueSuccessor();
+	BasicBlock *FalseBlock = Branch->getFalseSuccessor();
+	if (!TrueBlock || !FalseBlock || TrueBlock == FalseBlock ||
+		TrueBlock == Block || FalseBlock == Block) {
+		return false;
+	}
+	Value *Condition = Branch->getCondition();
+	bool ConstantCondition = false;
+	if (!Condition || Value::isUndef(Condition) ||
+		Condition->tryGetBoolConst(ConstantCondition)) {
+		return false;
+	}
+
+	auto Predecessors = Block->getPredecessors();
+	if (Predecessors.size() < 2 || Predecessors.size() > 4) return false;
+	std::unordered_set<BasicBlock *> UniquePredecessors;
+	for (BasicBlock *Pred : Predecessors) {
+		if (!Pred || Pred == Block || !UniquePredecessors.insert(Pred).second ||
+			Pred->countEdgesToSucc(Block) != 1) {
+			return false;
+		}
+	}
+
+	unsigned PhiCount = 0;
+	unsigned NonPhiInstructionCount = 0;
+	for (Instruction *I : *Block) {
+		if (!isEdgeSpecializableInstruction(I, Branch)) return false;
+		if (dynamic_cast<PhiInst *>(I))
+			++PhiCount;
+		else
+			++NonPhiInstructionCount;
+	}
+	if (PhiCount > 8 || NonPhiInstructionCount == 0 ||
+		NonPhiInstructionCount > 6) {
+		return false;
+	}
+
+	auto Phis = Block->collectPhiNodes();
+	if (Phis.size() != PhiCount) return false;
+	for (PhiInst *Phi : Phis) {
+		if (!Phi || Phi->getNumIncomingValues() != Predecessors.size())
+			return false;
+		for (BasicBlock *Pred : Predecessors) {
+			Value *Incoming = Phi->getIncomingFromPred(Pred);
+			if (Phi->countIncomingFromPred(Pred) != 1 || !Incoming ||
+				!Incoming->getIRType() || !Phi->getIRType() ||
+				!Incoming->getIRType()->hasSameShape(*Phi->getIRType())) {
+				return false;
+			}
+			if (auto *IncomingI = dynamic_cast<Instruction *>(Incoming)) {
+				if (IncomingI->getParent() == Block) return false;
+			}
+		}
+	}
+
+	//SSA定义离开本块时必须经过直接后继PHI，这样才能为克隆边构造对应输入。
+	for (Instruction *I : *Block) {
+		if (!I || I == Branch) continue;
+		for (Use *U : I->getUses()) {
+			if (!U || U->getValue() != I) continue;
+			auto *UserI = dynamic_cast<Instruction *>(U->getUser());
+			if (!UserI) return false;
+			if (UserI->getParent() == Block) continue;
+			auto *SuccessorPhi = dynamic_cast<PhiInst *>(UserI);
+			if (!SuccessorPhi ||
+				(SuccessorPhi->getParent() != TrueBlock &&
+				 SuccessorPhi->getParent() != FalseBlock) ||
+				SuccessorPhi->countIncomingFromPred(Block) != 1 ||
+				SuccessorPhi->getIncomingFromPred(Block) != I) {
+				return false;
+			}
+			unsigned SameUserUses = 0;
+			for (Use *OtherUse : I->getUses()) {
+				if (OtherUse && OtherUse->getValue() == I &&
+					OtherUse->getUser() == SuccessorPhi) {
+					++SameUserUses;
+				}
+			}
+			if (SameUserUses != 1) return false;
+		}
+	}
+
+	std::unordered_set<Instruction *> DeadVisited;
+	std::vector<Instruction *> DeadConditionChain;
+	collectDeadConditionChain(
+		Condition, Branch, Block, DeadVisited, DeadConditionChain);
+	if (DeadConditionChain.empty()) return false;
+
+	//只在两入边汇合块上做特化：移走一条边后原PHI会全部消失。
+	//克隆中保留下来的指令数不得超过被删除的PHI数，从而静态码量
+	//不增长；被删除的条件链则保证特化边上的动态指令严格减少。
+	unsigned SurvivingCloneInstructionCount =
+		NonPhiInstructionCount -
+		static_cast<unsigned>(DeadConditionChain.size());
+	if (Predecessors.size() != 2 ||
+		SurvivingCloneInstructionCount > PhiCount) {
+		return false;
+	}
+
+	unsigned BestBenefit = 0;
+	for (BasicBlock *Pred : Predecessors) {
+		if (!Pred || Pred == TrueBlock || Pred == FalseBlock) continue;
+		std::unordered_map<PhiInst *, Value *> PhiInputMap;
+		std::vector<EdgeSpecializationPhiInput> CandidatePhiInputs;
+		bool InputsValid = true;
+		for (PhiInst *Phi : Phis) {
+			Value *Incoming = Phi->getIncomingFromPred(Pred);
+			if (!Incoming || !PhiInputMap.emplace(Phi, Incoming).second) {
+				InputsValid = false;
+				break;
+			}
+			CandidatePhiInputs.push_back({Phi, Incoming});
+		}
+		if (!InputsValid) continue;
+
+		std::unordered_map<Value *, Value *> Memo;
+		std::unordered_set<Value *> Visiting;
+		unsigned FoldedInstructionCount = 0;
+		bool UsedIncomingPhi = false;
+		Value *FoldedCondition = evaluateValueOnIncomingEdge(
+			Condition, Block, PhiInputMap, 0, Memo, Visiting,
+			FoldedInstructionCount, UsedIncomingPhi);
+		bool ConditionValue = false;
+		if (!FoldedCondition ||
+			!FoldedCondition->tryGetBoolConst(ConditionValue) ||
+			FoldedInstructionCount == 0 || !UsedIncomingPhi) {
+			continue;
+		}
+
+		BasicBlock *Taken = ConditionValue ? TrueBlock : FalseBlock;
+		if (!Taken || Taken == Pred) continue;
+		//收益只按该边上实际消失的纯计算计数，不使用操作码排列、
+		//常量取值或测试名称等特征。
+		unsigned Benefit =
+			static_cast<unsigned>(DeadConditionChain.size());
+		if (Benefit <= BestBenefit) continue;
+
+		std::vector<EdgeSpecializationSuccessorInput> SuccessorInputs;
+		bool SuccessorInputsValid = true;
+		for (PhiInst *Phi : Taken->collectPhiNodes()) {
+			if (!Phi || Phi->countIncomingFromPred(Block) != 1) {
+				SuccessorInputsValid = false;
+				break;
+			}
+			Value *Incoming = Phi->getIncomingFromPred(Block);
+			if (!Incoming || !Incoming->getIRType() || !Phi->getIRType() ||
+				!Incoming->getIRType()->hasSameShape(*Phi->getIRType())) {
+				SuccessorInputsValid = false;
+				break;
+			}
+			SuccessorInputs.push_back({Phi, Incoming});
+		}
+		if (!SuccessorInputsValid) continue;
+
+		BestBenefit = Benefit;
+		Plan.Block = Block;
+		Plan.Predecessor = Pred;
+		Plan.Taken = Taken;
+		Plan.Branch = Branch;
+		Plan.CloneInstructionCount =
+			PhiCount + NonPhiInstructionCount;
+		Plan.PhiInputs = std::move(CandidatePhiInputs);
+		Plan.SuccessorInputs = std::move(SuccessorInputs);
+		Plan.DeadConditionChain = DeadConditionChain;
+	}
+	return Plan.Block != nullptr;
+}
+
+//提交前再校验所有指针和边；克隆完成后所需值一次性翻译，之后的
+//操作都是无失败的CFG/PHI基础操作，避免留下半提交状态。
+bool CFGSimplifyPass::commitEdgeSpecialization(
+	Function &F, const EdgeSpecializationPlan &Plan) {
+	if (!Plan.Block || !Plan.Predecessor || !Plan.Taken || !Plan.Branch ||
+		Plan.Branch->getParent() != Plan.Block ||
+		Plan.Block->getBranchTerminator() != Plan.Branch ||
+		Plan.Predecessor->countEdgesToSucc(Plan.Block) != 1) {
+		return false;
+	}
+	for (const EdgeSpecializationPhiInput &Input : Plan.PhiInputs) {
+		if (!Input.Phi || Input.Phi->getParent() != Plan.Block ||
+			Input.Phi->countIncomingFromPred(Plan.Predecessor) != 1 ||
+			Input.Phi->getIncomingFromPred(Plan.Predecessor) != Input.Incoming) {
+			return false;
+		}
+	}
+	for (const EdgeSpecializationSuccessorInput &Input : Plan.SuccessorInputs) {
+		if (!Input.Phi || Input.Phi->getParent() != Plan.Taken ||
+			Input.Phi->countIncomingFromPred(Plan.Block) != 1 ||
+			Input.Phi->getIncomingFromPred(Plan.Block) != Input.Incoming) {
+			return false;
+		}
+	}
+
+	std::string CloneName = F.makeUniqueBlockIdent(
+		Plan.Block->getIdent() + ".edge.spec");
+	CloneBlockRegionOptions Options;
+	Options.MakeBlockIdent = [CloneName](const BasicBlock *, std::size_t) {
+		return CloneName;
+	};
+	auto Region = cloneBasicBlockRegion(F, {Plan.Block}, {}, Options);
+	if (!Region) return false;
+	BasicBlock *CloneBlock = Region->getClonedBlock(Plan.Block);
+	auto *CloneBranch = dynamic_cast<BrInst *>(
+		Region->getClonedInstruction(Plan.Branch));
+	if (!CloneBlock || !CloneBranch ||
+		CloneBlock->getBranchTerminator() != CloneBranch) {
+		if (CloneBlock) CloneBlock->eraseBlockSafely();
+		return false;
+	}
+
+	std::vector<std::pair<PhiInst *, Value *>> ClonePhiInputs;
+	for (const EdgeSpecializationPhiInput &Input : Plan.PhiInputs) {
+		auto *ClonePhi = dynamic_cast<PhiInst *>(
+			Region->getClonedInstruction(Input.Phi));
+		if (!ClonePhi || !Input.Incoming || !ClonePhi->getIRType() ||
+			!Input.Incoming->getIRType() ||
+			!Input.Incoming->getIRType()->hasSameShape(
+				*ClonePhi->getIRType())) {
+			CloneBlock->eraseBlockSafely();
+			return false;
+		}
+		ClonePhiInputs.push_back({ClonePhi, Input.Incoming});
+	}
+
+	auto TranslateValue = [&](Value *Source) -> Value * {
+		if (!Source) return nullptr;
+		for (const EdgeSpecializationPhiInput &Input : Plan.PhiInputs) {
+			if (Source == Input.Phi) return Input.Incoming;
+		}
+		if (auto *I = dynamic_cast<Instruction *>(Source)) {
+			if (I->getParent() == Plan.Block)
+				return Region->getClonedInstruction(I);
+		}
+		return Source;
+	};
+
+	std::vector<std::pair<PhiInst *, Value *>> TranslatedSuccessorInputs;
+	for (const EdgeSpecializationSuccessorInput &Input :
+		 Plan.SuccessorInputs) {
+		Value *Translated = TranslateValue(Input.Incoming);
+		if (!Translated || !Translated->getIRType() ||
+			!Input.Phi->getIRType() ||
+			!Translated->getIRType()->hasSameShape(*Input.Phi->getIRType())) {
+			CloneBlock->eraseBlockSafely();
+			return false;
+		}
+		TranslatedSuccessorInputs.push_back({Input.Phi, Translated});
+	}
+
+	std::vector<Instruction *> ClonedDeadConditionChain;
+	for (Instruction *I : Plan.DeadConditionChain) {
+		Instruction *CloneI = Region->getClonedInstruction(I);
+		if (!CloneI) {
+			CloneBlock->eraseBlockSafely();
+			return false;
+		}
+		ClonedDeadConditionChain.push_back(CloneI);
+	}
+
+	//重定向是提交点；在此之前出现任何不一致都只需删除孤立克隆块。
+	if (!BasicBlock::redirectBranchTarget(
+			Plan.Predecessor, Plan.Block, CloneBlock)) {
+		CloneBlock->eraseBlockSafely();
+		return false;
+	}
+
+	for (const auto &Input : ClonePhiInputs) {
+		Input.first->replaceAllUsesWith(Input.second);
+		delete Input.first;
+	}
+	if (!BasicBlock::replaceCondBrWithUncond(CloneBlock, Plan.Taken))
+		return false;
+	for (const auto &Input : TranslatedSuccessorInputs)
+		Input.first->addIncoming(Input.second, CloneBlock);
+	for (const EdgeSpecializationPhiInput &Input : Plan.PhiInputs)
+		PhiInst::removeIncomingByPred(
+			Input.Phi, Plan.Predecessor, 1);
+
+	//先删条件链顶再删操作数；计划阶段已证明每一层都只有上一层一个use。
+	for (Instruction *I : ClonedDeadConditionChain) {
+		if (I && I->getParent() == CloneBlock && !I->hasUses()) delete I;
+	}
+	return true;
+}
+
+//入边特化每个源块最多选一条边，并以全函数块数/指令数预算限制码量。
+bool CFGSimplifyPass::specializeBranchesOnIncomingEdges(
+	Function &F, const std::unordered_set<BasicBlock *> &LoopBlocks) {
+	constexpr unsigned MaxSpecializedBlocks = 4;
+	constexpr unsigned MaxClonedInstructions = 24;
+	unsigned SpecializedBlocks = 0;
+	unsigned ClonedInstructions = 0;
+	bool Changed = false;
+	auto Blocks = snapshotPointers(F);
+	for (BasicBlock *Block : Blocks) {
+		if (!Block || SpecializedBlocks >= MaxSpecializedBlocks) break;
+		EdgeSpecializationPlan Plan;
+		if (!buildEdgeSpecializationPlan(F, Block, LoopBlocks, Plan)) continue;
+		if (Plan.CloneInstructionCount == 0 ||
+			ClonedInstructions + Plan.CloneInstructionCount >
+				MaxClonedInstructions) {
+			continue;
+		}
+		if (!commitEdgeSpecialization(F, Plan)) continue;
+		++SpecializedBlocks;
+		ClonedInstructions += Plan.CloneInstructionCount;
+		Changed = true;
+	}
+	return Changed;
+}
+
 //1.消除死块
 bool CFGSimplifyPass::removeDeadBlocks(Function &F) {
 	bool Changed = false;
@@ -1074,8 +1556,16 @@ bool CFGSimplifyPass::simplifyBranches(Function &F) {
 	return Changed;
 }
 
-PreservationStatus CFGSimplifyPass::run(Function &F, FunctionAnalysisPassManager &) {
-	bool ChangedAny = false;
+PreservationStatus CFGSimplifyPass::run(
+	Function &F, FunctionAnalysisPassManager &FAM) {
+	//入边特化只读取修改前的循环归属快照；第一次克隆后LoopInfo即失效，
+	//后续固定点阶段不再查询该分析。
+	auto &LI = FAM.getResult<LoopAnalysis>(F);
+	std::unordered_set<BasicBlock *> LoopBlocks;
+	for (const auto &Entry : LI.BBToLoop) {
+		if (Entry.first && Entry.second) LoopBlocks.insert(Entry.first);
+	}
+	bool ChangedAny = specializeBranchesOnIncomingEdges(F, LoopBlocks);
 
 	while (true) {
         //必须迭代到不动点，因为这些子优化会互相创造优化机会
@@ -1094,11 +1584,11 @@ PreservationStatus CFGSimplifyPass::run(Function &F, FunctionAnalysisPassManager
 				if (BB) Changed |= threadBranchOnPhi(F, BB);
 			}
 		}
-        //6.
+		//6.规范化布尔PHI。
 		Changed |= normalizeBooleanPhis(F);
-        //7.合并基本块
+		//7.合并入边特化产生的空跳板并继续合并普通基本块。
 		Changed |= mergeBlocks(F);
-        //8.简化条件分支
+		//8.简化条件分支
 		Changed |= simplifyBranches(F);
 
 		ChangedAny |= Changed;

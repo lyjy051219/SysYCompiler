@@ -898,6 +898,46 @@ FloatRange FloatRange::fdiv(const FloatRange &rhs) const {
         R = R.unionWith(FloatRange(0.0, 0.0));
     return R;
 }
+//把另一条调用路径的抽象事实并入当前摘要
+void RangeValueSummary::merge(const RangeValueSummary &Other) {
+    if (Other.HasInteger) {
+        if (!HasInteger) {
+            HasInteger = true;
+            SignedRange = Other.SignedRange;
+            UnsignedRange = Other.UnsignedRange;
+            Bits = Other.Bits;
+        } else {
+            SignedRange = SignedRange.unionWith(Other.SignedRange);
+            UnsignedRange = UnsignedRange.unionWith(Other.UnsignedRange);
+            Bits = Bits.unionWith(Other.Bits);
+        }
+    }
+    if (Other.HasFloat) {
+        if (!HasFloat) {
+            HasFloat = true;
+            FloatValueRange = Other.FloatValueRange;
+        } else {
+            FloatValueRange =
+                FloatValueRange.unionWith(Other.FloatValueRange);
+        }
+    }
+}
+//判断两个摘要是否携带完全相同的抽象事实
+bool RangeValueSummary::operator==(
+    const RangeValueSummary &Other) const {
+    return HasInteger == Other.HasInteger &&
+           HasFloat == Other.HasFloat &&
+           (!HasInteger ||
+            (SignedRange == Other.SignedRange &&
+             UnsignedRange == Other.UnsignedRange &&
+             Bits == Other.Bits)) &&
+           (!HasFloat || FloatValueRange == Other.FloatValueRange);
+}
+//判断两个摘要是否不同
+bool RangeValueSummary::operator!=(
+    const RangeValueSummary &Other) const {
+    return !(*this == Other);
+}
 //构造没有归纳事实的空摘要
 LoopInductionInfo::LoopInductionInfo()
     : RecLoop(nullptr), initial(0), step(0), hasUpperBound(false),
@@ -2398,7 +2438,25 @@ void RangeSolver::visitCall(CallInst *CI) {
         SetTopForResultType();
         return;
     }
-    if (dynamic_cast<Function *>(callee)) {
+    if (auto *DirectCallee = dynamic_cast<Function *>(callee)) {
+        if (DirectReturnSummaries) {
+            auto It = DirectReturnSummaries->find(DirectCallee);
+            if (It != DirectReturnSummaries->end()) {
+                const RangeValueSummary &Summary = It->second;
+                if (CI->getIRType() && CI->getIRType()->isInt() &&
+                    Summary.HasInteger) {
+                    updateIntegerFacts(
+                        CI, Summary.SignedRange, Summary.UnsignedRange,
+                        Summary.Bits);
+                    return;
+                }
+                if (CI->getIRType() && CI->getIRType()->isFloat() &&
+                    Summary.HasFloat) {
+                    updateFloatRange(CI, Summary.FloatValueRange);
+                    return;
+                }
+            }
+        }
         SetTopForResultType();
         return;
     }
@@ -2946,11 +3004,33 @@ void RangeSolver::rebuildIntegerContextualFacts(Function &F) {
     }
 }
 //RangeAnalysis 主求解流程严格分阶段运行；任何 narrowing 截断都会丢弃部分下近似。
-RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV,
-                             const DominatorTree *DT) {
+RangeInfo RangeSolver::solve(
+    Function &F, SCEVResult *SCEV, const DominatorTree *DT,
+    const std::unordered_map<Value *, RangeValueSummary> *Seeds,
+    const std::unordered_map<Function *, RangeValueSummary> *ReturnSummaries) {
     //1.从入口启动可达性与前向传播，更新次数预算保证循环最终扩宽收敛。
     CurFunc = &F;
     DomTree = DT;
+    ParameterSeeds = Seeds;
+    DirectReturnSummaries = ReturnSummaries;
+    //形参摘要来自全部可达直接调用点的并集；缺少摘要的形参仍由getRange按Top初始化。
+    if (ParameterSeeds) {
+        for (unsigned Index = 0; Index < F.getParamCount(); ++Index) {
+            Value *Param = F.getParam(Index);
+            auto It = ParameterSeeds->find(Param);
+            if (!Param || It == ParameterSeeds->end()) continue;
+            const RangeValueSummary &Summary = It->second;
+            if (Param->getIRType() && Param->getIRType()->isInt() &&
+                Summary.HasInteger) {
+                updateIntegerFacts(
+                    Param, Summary.SignedRange, Summary.UnsignedRange,
+                    Summary.Bits);
+            } else if (Param->getIRType() && Param->getIRType()->isFloat() &&
+                       Summary.HasFloat) {
+                updateFloatRange(Param, Summary.FloatValueRange);
+            }
+        }
+    }
     markBlockExecutable(F.front());
     runForward();
     //2.在最终前向格上执行反向收窄；预算耗尽时清空值事实，查询自然退化为 Top。
@@ -2999,13 +3079,186 @@ RangeInfo RangeSolver::solve(Function &F, SCEVResult *SCEV,
         info.LoopInductions = *ScevInductions;
     return info;
 }
-//Pass 入口取得 SCEV 后创建一次性求解器，并返回封装好的范围信息。
-RangeAnalysis::Result RangeAnalysis::run(Function &F,
-                                          FunctionAnalysisPassManager &FAM) const {
-    //1.获取循环次数提示和完整支配上下文；依赖关系由新 PassManager 自动记录。
-    auto &SCEV = FAM.getResult<SCEVAnalysis>(F);
-    auto &DT = FAM.getResult<DominantAnalysis>(F);
-    //2.创建一次性求解器，运行五阶段流程并返回只读范围结果。
-    RangeSolver solver;
-    return solver.solve(F, &SCEV, &DT);
+//从函数内范围结果提取一个调用边可携带的标量摘要
+static RangeValueSummary summarizeRangeValue(
+    Value *V, BasicBlock *Context, const RangeInfo &Info,
+    const DominatorTree &DT) {
+    RangeValueSummary Summary;
+    if (!V || !V->getIRType()) return Summary;
+    if (V->getIRType()->isInt() && isModeledIntegerRangeType(V)) {
+        IntRange Signed = Info.query(V, Context, DT);
+        UIntRange Unsigned = Info.queryUnsigned(V, Context, DT);
+        KnownBits Bits = Info.queryBits(V, Context, DT);
+        if (Signed.isBottom() || Unsigned.isBottom() || Bits.isConflict())
+            return Summary;
+        reduceIntegerRangeProduct(Signed, Unsigned, Bits);
+        Summary.HasInteger = true;
+        Summary.SignedRange = Signed;
+        Summary.UnsignedRange = Unsigned;
+        Summary.Bits = Bits;
+    } else if (V->getIRType()->isFloat()) {
+        FloatRange Range = Info.queryFloat(V, Context, DT);
+        if (Range.isBottom()) return Summary;
+        Summary.HasFloat = true;
+        Summary.FloatValueRange = Range;
+    }
+    return Summary;
+}
+//汇合函数全部可达return，构造普通直接调用可消费的返回摘要
+static bool summarizeFunctionReturn(
+    Function *F, const RangeInfo &Info, const DominatorTree &DT,
+    RangeValueSummary &Summary) {
+    Summary = RangeValueSummary{};
+    if (!F || !F->getIRType() || F->getIRType()->isVoid()) return false;
+    bool SawReachableReturn = false;
+    for (RetInst *Ret : collectInstructions<RetInst>(*F)) {
+        BasicBlock *BB = Ret ? Ret->getParent() : nullptr;
+        if (!BB || !DT.getNode(BB)) continue;
+        Value *Returned = Ret->getReturnValue();
+        RangeValueSummary Current =
+            summarizeRangeValue(Returned, BB, Info, DT);
+        if ((Returned && Returned->getIRType() &&
+             Returned->getIRType()->isInt() && !Current.HasInteger) ||
+            (Returned && Returned->getIRType() &&
+             Returned->getIRType()->isFloat() && !Current.HasFloat)) {
+            return false;
+        }
+        Summary.merge(Current);
+        SawReachableReturn = true;
+    }
+    return SawReachableReturn &&
+           (Summary.HasInteger || Summary.HasFloat);
+}
+//从全部可达直接调用点汇合下一轮形参摘要
+static std::unordered_map<Value *, RangeValueSummary>
+collectParameterRangeSeeds(
+    const std::vector<Function *> &Functions,
+    const std::unordered_map<Function *, RangeInfo> &Results,
+    const std::unordered_map<Function *, bool> &Recursive,
+    FunctionAnalysisPassManager &FAM) {
+    std::unordered_map<Value *, RangeValueSummary> Seeds;
+    for (Function *Callee : Functions) {
+        if (!Callee || Recursive.at(Callee) ||
+            !Callee->hasOnlyDirectCallUses()) {
+            continue;
+        }
+        std::vector<CallInst *> Calls = Callee->getDirectCallSites();
+        if (Calls.empty()) continue;
+        for (unsigned Index = 0; Index < Callee->getParamCount(); ++Index) {
+            Value *Param = Callee->getParam(Index);
+            if (!Param || !Param->getIRType() ||
+                (!isModeledIntegerRangeType(Param) &&
+                 !Param->getIRType()->isFloat())) {
+                continue;
+            }
+            RangeValueSummary Combined;
+            bool SawReachableCall = false;
+            bool Complete = true;
+            for (CallInst *Call : Calls) {
+                Function *Caller = Call ? Call->getParentFunction() : nullptr;
+                auto ResultIt = Results.find(Caller);
+                if (!Call || !Caller || ResultIt == Results.end() ||
+                    Index >= Call->getArgCount()) {
+                    Complete = false;
+                    break;
+                }
+                auto &CallerDT = FAM.getResult<DominantAnalysis>(*Caller);
+                BasicBlock *CallBB = Call->getParent();
+                if (!CallBB || !CallerDT.getNode(CallBB)) continue;
+                Value *Argument = Call->getArg(Index);
+                RangeValueSummary Current = summarizeRangeValue(
+                    Argument, CallBB, ResultIt->second, CallerDT);
+                if ((Param->getIRType()->isInt() && !Current.HasInteger) ||
+                    (Param->getIRType()->isFloat() && !Current.HasFloat)) {
+                    Complete = false;
+                    break;
+                }
+                Combined.merge(Current);
+                SawReachableCall = true;
+            }
+            if (Complete && SawReachableCall) Seeds.emplace(Param, Combined);
+        }
+    }
+    return Seeds;
+}
+//Pass入口在有界模块规模内求解直接调用范围固定点，超预算或未收敛时退回函数内分析
+RangeAnalysis::Result RangeAnalysis::run(
+    Function &F, FunctionAnalysisPassManager &FAM) const {
+    constexpr std::size_t kMaxSummaryFunctions = 32;
+    constexpr std::size_t kMaxSummaryInstructions = 8000;
+    constexpr int kMaxSummaryRounds = 6;
+    Module *M = Module::getActiveModule();
+    std::vector<Function *> Functions;
+    std::size_t InstructionCount = 0;
+    if (M) {
+        for (auto &FunctionPtr : M->getFunctions()) {
+            Function *Current = FunctionPtr.get();
+            if (!Current || !Current->front()) continue;
+            Functions.push_back(Current);
+            forEachInstruction(*Current, [&](Instruction *) {
+                ++InstructionCount;
+            });
+        }
+    }
+    auto RunLocal = [&]() {
+        auto &SCEV = FAM.getResult<SCEVAnalysis>(F);
+        auto &DT = FAM.getResult<DominantAnalysis>(F);
+        RangeSolver Solver;
+        return Solver.solve(F, &SCEV, &DT);
+    };
+    if (!M || Functions.empty() ||
+        Functions.size() > kMaxSummaryFunctions ||
+        InstructionCount > kMaxSummaryInstructions) {
+        return RunLocal();
+    }
+    FunctionCallGraph CallGraph = M->buildDirectCallGraph();
+    std::unordered_map<Function *, bool> Recursive;
+    for (Function *Current : Functions)
+        Recursive[Current] = Module::isFunctionRecursive(Current, CallGraph);
+    std::unordered_map<Value *, RangeValueSummary> ParameterSeeds;
+    std::unordered_map<Function *, RangeValueSummary> ReturnSummaries;
+    std::unordered_map<Function *, RangeInfo> Results;
+    bool Converged = false;
+    for (int Round = 0; Round < kMaxSummaryRounds; ++Round) {
+        std::unordered_map<Function *, RangeInfo> RoundResults;
+        for (Function *Current : Functions) {
+            auto &SCEV = FAM.getResult<SCEVAnalysis>(*Current);
+            auto &DT = FAM.getResult<DominantAnalysis>(*Current);
+            RangeSolver Solver;
+            RoundResults.emplace(
+                Current, Solver.solve(
+                    *Current, &SCEV, &DT,
+                    &ParameterSeeds, &ReturnSummaries));
+        }
+        std::unordered_map<Function *, RangeValueSummary> NewReturns;
+        for (Function *Current : Functions) {
+            if (!Current || Recursive[Current]) continue;
+            auto ResultIt = RoundResults.find(Current);
+            if (ResultIt == RoundResults.end()) continue;
+            auto &DT = FAM.getResult<DominantAnalysis>(*Current);
+            RangeValueSummary Summary;
+            if (summarizeFunctionReturn(
+                    Current, ResultIt->second, DT, Summary)) {
+                NewReturns.emplace(Current, Summary);
+            }
+        }
+        auto NewSeeds = collectParameterRangeSeeds(
+            Functions, RoundResults, Recursive, FAM);
+        Converged = NewReturns == ReturnSummaries &&
+                    NewSeeds == ParameterSeeds;
+        ReturnSummaries = std::move(NewReturns);
+        ParameterSeeds = std::move(NewSeeds);
+        Results = std::move(RoundResults);
+        if (Converged) break;
+    }
+    if (!Converged) return RunLocal();
+    auto RootIt = Results.find(&F);
+    if (RootIt == Results.end()) return RunLocal();
+    RangeInfo RootResult = std::move(RootIt->second);
+    for (auto &Entry : Results) {
+        if (!Entry.first || Entry.first == &F) continue;
+        FAM.setCachedResult<RangeAnalysis>(
+            *Entry.first, std::move(Entry.second));
+    }
+    return RootResult;
 }

@@ -14,6 +14,8 @@ bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     if (!I) return false;
     if (dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I)) return true;
     if (dceInstructionMustBePreserved(I)) return false;
+    //可能陷阱或产生poison的死计算也不得借未定义行为随循环一起删除。
+    if (instructionMayFaultOrProducePoison(I)) return false;
     if (dynamic_cast<BinaryInst *>(I)) return true;
     if (dynamic_cast<SelectInst *>(I) ||
         dynamic_cast<GetElementPtrInst *>(I)) {

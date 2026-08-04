@@ -6,6 +6,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
 #include <functional>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -226,11 +227,31 @@ bool instructionMayFaultOrProducePoison(const Instruction *I) {
 	if (dynamic_cast<const LoadInst *>(I)) return true;
 	switch (I->instType) {
 		case Instruction::SDIV:
-		case Instruction::UDIV:
-		case Instruction::FDIV:
 		case Instruction::SREM:
+		case Instruction::UDIV:
 		case Instruction::UREM:
+		{
+			//2.4.1 常量非零除数已排除除零；有符号-1还需排除INT_MIN溢出。
+			auto *BI = dynamic_cast<const BinaryInst *>(I);
+			Value *LHS = nullptr;
+			Value *RHS = nullptr;
+			int32_t Divisor = 0;
+			if (!BI || !BI->getOperands(LHS, RHS) ||
+				!RHS || !RHS->tryGetIntConst(Divisor) || Divisor == 0) {
+				return true;
+			}
+			if ((I->instType == Instruction::SDIV ||
+				 I->instType == Instruction::SREM) && Divisor == -1) {
+				int32_t Dividend = 0;
+				return !LHS || !LHS->tryGetIntConst(Dividend) ||
+					Dividend == std::numeric_limits<int32_t>::min();
+			}
+			return false;
+		}
+		case Instruction::FDIV:
 		case Instruction::FREM:
+			//IEEE浮点除余以Inf/NaN表达零除数，不产生整数式陷阱或poison。
+			return false;
 		case Instruction::FPTOSI:
 			return true;
 		case Instruction::SHL:
@@ -284,6 +305,8 @@ bool DCEPass::isDeletableInstruction(
 		return false;
 	}
 	if (dceInstructionMustBePreserved(I)) return false;
+	//竞赛模式不利用除零、非法转换或动态越界移位等未定义行为删除原计算。
+	if (instructionMayFaultOrProducePoison(I)) return false;
 	if (auto* CI = dynamic_cast<CallInst*>(I)) {
 		if (dceCallHasSideEffect(CI, FAM)) return false;
 	}

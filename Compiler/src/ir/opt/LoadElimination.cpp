@@ -2,11 +2,16 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/LoopAccessAnalysis.hpp"
+#include "ir/analysis/LoopDependence.hpp"
 #include "ir/analysis/MemorySSA.hpp"
+#include "ir/analysis/RangeAnalysis.hpp"
+#include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "lib/IRUtils.hpp"
 #include <functional>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -354,6 +359,348 @@ bool LoadEliminationPass::processFunction(
     }
     return changed;
 }
+//证明规范循环至少执行一次，避免把首轮load无条件放到零次循环的预头。
+bool LoadEliminationPass::isKnownNonZeroTrip(
+    const LoopTripCountInfo &Trip,
+    const InductionDescriptor &Induction,
+    RangeInfo &RI, DominatorTree &DT) {
+    //6.1 常量次数直接判定；规范尾部测试循环从预头进入Header后必执行首轮。
+    if (!Trip.Valid || !Trip.PreHeader || !Trip.Header || !Trip.Latch ||
+        !Trip.ExitCmp || !Induction.Valid || !Induction.Phi ||
+        !Induction.StartValue) {
+        return false;
+    }
+    if (Trip.ConstantTripCount)
+        return *Trip.ConstantTripCount > 0;
+    if (Trip.ExitingBlock == Trip.Latch &&
+        Trip.ComparePhase == LoopExitComparePhase::BackedgeUpdate) {
+        return true;
+    }
+    //6.2 头部测试的运行时次数必须由预头路径范围证明首次继续条件恒真；仅知道
+    //循环有限并不足以安全投机一次解引用。
+    if (Trip.ExitingBlock != Trip.Header ||
+        Trip.ComparePhase != LoopExitComparePhase::HeaderPhi) {
+        return false;
+    }
+    BinaryInst::Operation Predicate = Trip.ContinueOnTrue
+        ? Trip.ExitCmp->getOp()
+        : BinaryInst::negatePredicate(Trip.ExitCmp->getOp());
+    Value *Left = Trip.ExitCmp->getOperand(0);
+    Value *Right = Trip.ExitCmp->getOperand(1);
+    if (Right == Induction.Phi) {
+        std::swap(Left, Right);
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (Left != Induction.Phi || !Right) return false;
+    IntRange Start = RI.query(Induction.StartValue, Trip.PreHeader, DT);
+    IntRange Bound = RI.query(Right, Trip.PreHeader, DT);
+    if (Start.isBottom() || Bound.isBottom()) return false;
+    switch (Predicate) {
+    case BinaryInst::L:
+        return Start.max < Bound.min;
+    case BinaryInst::LE:
+        return Start.max <= Bound.min;
+    case BinaryInst::G:
+        return Start.min > Bound.max;
+    case BinaryInst::GE:
+        return Start.min >= Bound.max;
+    case BinaryInst::E:
+        return Start.min == Start.max && Bound.min == Bound.max &&
+               Start.min == Bound.min;
+    case BinaryInst::NE:
+        return Start.max < Bound.min || Bound.max < Start.min;
+    default:
+        return false;
+    }
+}
+//验证循环中不存在能够覆盖候选地址的其他写入或不可跨越调用。
+bool LoadEliminationPass::hasNoInterferingWrite(
+    const LoopCarriedForwardingCandidate &Candidate,
+    BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM) {
+    if (!Candidate.TargetLoop || !Candidate.Load || !Candidate.Store)
+        return false;
+    MemoryLocation LoadLocation = MemoryLocation::get(Candidate.Load);
+    MemoryLocation StoreLocation = MemoryLocation::get(Candidate.Store);
+    for (BasicBlock *BB :
+         Candidate.TargetLoop->getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (!I || I == Candidate.Store) continue;
+            //6.3 调用即使不写程序内存也可能具有I/O、计时或故障顺序，当前变换
+            //不把首轮解引用跨越任何调用。
+            if (dynamic_cast<CallInst *>(I)) return false;
+            if (mayModifyPointer(LoadLocation, I, AA, LI, FAM) ||
+                mayModifyPointer(StoreLocation, I, AA, LI, FAM)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+//递归把首轮地址表达式物化到预头，循环Header PHI替换成对应入口值。
+Value *LoadEliminationPass::materializeFirstIterationValue(
+    Value *Original, const LoopCarriedForwardingCandidate &Candidate,
+    DominatorTree &DT,
+    std::unordered_map<Value *, Value *> &ValueMap,
+    std::unordered_set<Value *> &Active,
+    std::vector<Instruction *> &Created, unsigned Depth) {
+    if (!Original || Value::isUndef(Original) ||
+        !Candidate.TargetLoop || !Candidate.PreHeader || Depth > 32) {
+        return nullptr;
+    }
+    auto Known = ValueMap.find(Original);
+    if (Known != ValueMap.end()) return Known->second;
+    if (Original->isConst() || Original->isParam() ||
+        Original->isGlobal()) {
+        ValueMap.emplace(Original, Original);
+        return Original;
+    }
+    auto *OriginalInst = dynamic_cast<Instruction *>(Original);
+    Instruction *PreHeaderTerminator = Candidate.PreHeader->back();
+    if (!OriginalInst || !OriginalInst->getParent() ||
+        !PreHeaderTerminator) {
+        return nullptr;
+    }
+    if (!Candidate.TargetLoop->contains(OriginalInst->getParent())) {
+        if (!DT.dominatesValue(OriginalInst, PreHeaderTerminator))
+            return nullptr;
+        ValueMap.emplace(Original, Original);
+        return Original;
+    }
+    //6.4 Header PHI在首轮的值严格取唯一预头incoming；其他循环PHI不猜测。
+    if (auto *Phi = dynamic_cast<PhiInst *>(OriginalInst)) {
+        if (Phi->getParent() != Candidate.TargetLoop->getHeader())
+            return nullptr;
+        Value *Incoming = nullptr;
+        unsigned IncomingCount = 0;
+        forEachPhiIncoming(
+            Phi, [&](unsigned, Value *ValueIncoming, BasicBlock *Pred) {
+                if (Pred == Candidate.PreHeader) {
+                    Incoming = ValueIncoming;
+                    ++IncomingCount;
+                }
+                return true;
+            });
+        if (IncomingCount != 1 || !Incoming) return nullptr;
+        Value *Mapped = materializeFirstIterationValue(
+            Incoming, Candidate, DT, ValueMap, Active, Created,
+            Depth + 1);
+        if (Mapped) ValueMap.emplace(Original, Mapped);
+        return Mapped;
+    }
+    bool Supported = dynamic_cast<GetElementPtrInst *>(OriginalInst) ||
+                     dynamic_cast<BitCastInst *>(OriginalInst) ||
+                     dynamic_cast<ZextInst *>(OriginalInst) ||
+                     dynamic_cast<SextInst *>(OriginalInst);
+    if (auto *Binary = dynamic_cast<BinaryInst *>(OriginalInst)) {
+        Supported = Binary->getOp() == BinaryInst::ADD ||
+                    Binary->getOp() == BinaryInst::SUB ||
+                    Binary->getOp() == BinaryInst::MUL;
+    }
+    if (!Supported ||
+        Created.size() >= MaxInitialAddressInstructions) {
+        return nullptr;
+    }
+    ScopedActiveMark ActiveMark(Active, Original);
+    if (!ActiveMark.inserted()) return nullptr;
+    for (const auto &OperandUse : OriginalInst->getUserList()) {
+        Value *Operand = OperandUse ? OperandUse->getValue() : nullptr;
+        Value *Mapped = materializeFirstIterationValue(
+            Operand, Candidate, DT, ValueMap, Active, Created,
+            Depth + 1);
+        if (!Mapped) return nullptr;
+        ValueMap[Operand] = Mapped;
+    }
+    if (auto *Binary = dynamic_cast<BinaryInst *>(OriginalInst)) {
+        Value *Left = nullptr;
+        Value *Right = nullptr;
+        if (!Binary->getOperands(Left, Right)) return nullptr;
+        auto MappedLeft = ValueMap.find(Left);
+        auto MappedRight = ValueMap.find(Right);
+        if (MappedLeft == ValueMap.end() ||
+            MappedRight == ValueMap.end()) {
+            return nullptr;
+        }
+        Value *Folded = BinaryInst::foldConstants(
+            Binary->getOp(), MappedLeft->second,
+            MappedRight->second, true);
+        if (Folded) {
+            ValueMap.emplace(Original, Folded);
+            return Folded;
+        }
+    }
+    //6.5 只有删除目标load后会随之变死的单用户地址链才允许复制；因此运行时
+    //仅一轮时，预头地址计算替代原地址计算而不会额外增加动态算术。
+    if (OriginalInst->getUses().size() != 1 ||
+        Created.size() >= MaxInitialAddressInstructions) {
+        return nullptr;
+    }
+    Instruction *Cloned = OriginalInst->clone(ValueMap);
+    if (!Cloned ||
+        !Candidate.PreHeader->insertBeforeTerminator(Cloned)) {
+        delete Cloned;
+        return nullptr;
+    }
+    Created.push_back(Cloned);
+    ValueMap.emplace(Original, Cloned);
+    return Cloned;
+}
+//为单个规范叶子循环收集一个精确距离一的跨迭代转发候选。
+bool LoadEliminationPass::collectLoopCarriedForwardingCandidate(
+    Loop *L, LoopAccessInfo &LA, SCEVResult &SE, RangeInfo &RI,
+    DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM,
+    LoopCarriedForwardingCandidate &Candidate) {
+    Candidate = LoopCarriedForwardingCandidate{};
+    if (!L || !L->isInnermost() ||
+        L->getBackedgeSrcs().size() != 1) {
+        return false;
+    }
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch || Latch != L->getBackedgeSrcs().front() ||
+        !PreHeader->hasTerminator() || !Latch->hasTerminator()) {
+        return false;
+    }
+    auto Trip = SE.analyzeLoopTripCount(L);
+    auto Induction = SE.getCanonicalInduction(L);
+    std::vector<BasicBlock *> ExitBlocks = L->getExitBlocks();
+    if (!Trip || !Induction || !Trip->Valid || !Induction->Valid ||
+        !Trip->ExitingBlock || !Trip->ExitBlock ||
+        ExitBlocks.size() != 1 || ExitBlocks.front() != Trip->ExitBlock ||
+        !DT.dominates(Trip->ExitingBlock, Latch) ||
+        !SE.isKnownFiniteLoop(L, RI, DT) ||
+        !isKnownNonZeroTrip(*Trip, *Induction, RI, DT) ||
+        (Trip->ConstantTripCount && *Trip->ConstantTripCount < 2)) {
+        return false;
+    }
+    const LoopAccessSummary &Summary = LA.getSummary(L);
+    if (Summary.HasUnknownMemory) return false;
+    std::vector<LoadInst *> Loads;
+    std::vector<StoreInst *> Stores;
+    for (const LoopMemoryAccess *Access : Summary.Accesses) {
+        if (!Access || !Access->Inst) continue;
+        if (auto *Load = dynamic_cast<LoadInst *>(Access->Inst))
+            Loads.push_back(Load);
+        if (auto *Store = dynamic_cast<StoreInst *>(Access->Inst))
+            Stores.push_back(Store);
+    }
+    std::size_t ExaminedPairs = 0;
+    for (LoadInst *Load : Loads) {
+        if (!Load || !Load->getParent() || !Load->hasUses()) continue;
+        StoreInst *UniqueStore = nullptr;
+        for (StoreInst *Store : Stores) {
+            if (++ExaminedPairs > MaxLoopCarriedPairs) return false;
+            if (!Store || !Store->getParent() ||
+                !Store->fullyCoversItsPointer() ||
+                !isTypeCompatible(Store->getValueOperand(), Load)) {
+                continue;
+            }
+            auto Distance = LA.getConstantDependenceDistance(
+                Store, Load, L, L);
+            auto StoreStride = LA.getByteStride(Store, L, L);
+            auto LoadStride = LA.getByteStride(Load, L, L);
+            if (!Distance || *Distance != 1 || !StoreStride ||
+                !LoadStride || *StoreStride == 0 ||
+                *StoreStride != *LoadStride) {
+                continue;
+            }
+            if (UniqueStore && UniqueStore != Store) {
+                UniqueStore = nullptr;
+                break;
+            }
+            UniqueStore = Store;
+        }
+        if (!UniqueStore) continue;
+        Value *StoredValue = UniqueStore->getValueOperand();
+        Instruction *LatchTerminator = Latch->back();
+        if (!StoredValue || !LatchTerminator ||
+            !DT.dominates(Load->getParent(), Latch) ||
+            !DT.dominates(UniqueStore->getParent(), Latch) ||
+            !DT.dominatesValue(StoredValue, LatchTerminator)) {
+            continue;
+        }
+        LoopCarriedForwardingCandidate Proposed;
+        Proposed.TargetLoop = L;
+        Proposed.PreHeader = PreHeader;
+        Proposed.Latch = Latch;
+        Proposed.Load = Load;
+        Proposed.Store = UniqueStore;
+        if (!hasNoInterferingWrite(Proposed, AA, LI, FAM))
+            continue;
+        Candidate = Proposed;
+        return true;
+    }
+    return false;
+}
+//插入首轮load和循环携带PHI，用上一轮store值替换当前轮相邻地址load。
+bool LoadEliminationPass::transformLoopCarriedForwarding(
+    const LoopCarriedForwardingCandidate &Candidate,
+    DominatorTree &DT) {
+    if (!Candidate.TargetLoop || !Candidate.PreHeader ||
+        !Candidate.Latch || !Candidate.Load || !Candidate.Store ||
+        !Candidate.Load->getParent() || !Candidate.Store->getParent()) {
+        return false;
+    }
+    std::unordered_map<Value *, Value *> ValueMap;
+    std::unordered_set<Value *> Active;
+    std::vector<Instruction *> Created;
+    Value *InitialPointer = materializeFirstIterationValue(
+        Candidate.Load->getPointerOperand(), Candidate, DT,
+        ValueMap, Active, Created, 0);
+    auto Rollback = [&]() {
+        for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+            if (*It && (*It)->getParent()) delete *It;
+    };
+    if (!InitialPointer) {
+        Rollback();
+        return false;
+    }
+    auto *InitialLoad = new LoadInst(InitialPointer);
+    if (!isTypeCompatible(InitialLoad, Candidate.Load) ||
+        !Candidate.PreHeader->insertBeforeTerminator(InitialLoad)) {
+        delete InitialLoad;
+        Rollback();
+        return false;
+    }
+    //6.6 PHI的预头incoming是原首轮load，回边incoming取store当前写入值；先替换
+    //load用户再读取store值，可正确处理store值本身就是该load的退化复制。
+    auto *Carried = new PhiInst(Candidate.Load->getIRType());
+    Carried->addIncoming(InitialLoad, Candidate.PreHeader);
+    Candidate.TargetLoop->getHeader()->pushFront(Carried);
+    Candidate.Load->replaceAllUsesWith(Carried);
+    Value *BackedgeValue = Candidate.Store->getValueOperand();
+    if (!BackedgeValue ||
+        !isTypeCompatible(BackedgeValue, Candidate.Load)) {
+        //预检已保证此分支不可达；若IR接口返回异常，保守保留原load并撤销新增值。
+        Carried->replaceAllUsesWith(Candidate.Load);
+        delete Carried;
+        delete InitialLoad;
+        Rollback();
+        return false;
+    }
+    Carried->addIncoming(BackedgeValue, Candidate.Latch);
+    delete Candidate.Load;
+    return true;
+}
+//按循环后序尝试一次距离一转发，成功后停止消费已失效的访问分析。
+bool LoadEliminationPass::processOneLoopCarriedForwarding(
+    const LoopInfo &LI, LoopAccessInfo &LA, SCEVResult &SE,
+    RangeInfo &RI, DominatorTree &DT, BasicAAResult &AA,
+    FunctionAnalysisPassManager &FAM) {
+    for (Loop *L : LI.getLoopsInPostOrder()) {
+        LoopCarriedForwardingCandidate Candidate;
+        if (!collectLoopCarriedForwardingCandidate(
+                L, LA, SE, RI, DT, AA, LI, FAM, Candidate)) {
+            continue;
+        }
+        if (transformLoopCarriedForwarding(Candidate, DT))
+            return true;
+    }
+    return false;
+}
 //运行MemorySSA快速层与CFG后备层并精确声明分析失效
 PreservationStatus LoadEliminationPass::run(Function &F,
                                             FunctionAnalysisPassManager &FAM) {
@@ -361,7 +708,27 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     BasicAAResult *AA = &FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
-    //2.快速层：在查询预算内让MemorySSA汇总每条路径的最近clobber。若这些定义
+    //2.在常规load消除前尝试一次严格的循环距离一转发。成功后地址、SCEV和内存
+    //分析都已过期，立即返回；流水线后续LoadElimination实例会继续常规清理。
+    auto &SE = FAM.getResult<SCEVAnalysis>(F);
+    auto &RI = FAM.getResult<RangeAnalysis>(F);
+    auto &LA = FAM.getResult<LoopAccessAnalysis>(F);
+    if (processOneLoopCarriedForwarding(
+            LI, LA, SE, RI, DT, *AA, FAM)) {
+        PreservationStatus PA;
+        PA.keep<DominantAnalysis>();
+        PA.keep<PostDominantAnalysis>();
+        PA.keep<LoopAnalysis>();
+        PA.discard<BasicAliasAnalysis>();
+        PA.discard<MemorySSAAnalysis>();
+        PA.discard<SideEffectAnalysis>();
+        PA.discard<SCEVAnalysis>();
+        PA.discard<RangeAnalysis>();
+        PA.discard<LoopDependenceAnalysis>();
+        PA.discard<LoopAccessAnalysis>();
+        return PA;
+    }
+    //3.快速层：在查询预算内让MemorySSA汇总每条路径的最近clobber。若这些定义
     //全是MustAlias完整覆盖Store且写入同一个支配值，则直接计划转发；否则保留
     //完整clobber签名来筛选支配load，再通过CFG区间证明确认可复用。查询阶段
     //不修改IR，MemorySSA walker会依据程序内存摘要透明越过timer。

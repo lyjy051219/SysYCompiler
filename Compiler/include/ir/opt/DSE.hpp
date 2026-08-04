@@ -33,6 +33,10 @@ private:
                                         const StoreInst *Store);
     //判断指针是否源自仅被安全地址操作及直接访存使用的局部栈对象。
     static bool isNonEscapingLocalStackPointer(Value *Pointer);
+    //判断store是否只是把同一基本块内先前读取的值无变化写回原地址。
+    static bool isReloadStoreBackRedundant(
+        StoreInst *Store, BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
     //结合别名与调用ModRef信息逆向删除块内被后续写完整覆盖的store。
     static bool eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                                        const LoopInfo &LI,

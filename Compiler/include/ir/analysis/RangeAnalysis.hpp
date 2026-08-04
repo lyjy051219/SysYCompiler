@@ -339,6 +339,29 @@ private:
     }
 };
 
+//RangeValueSummary保存跨直接调用边传播的标量参数或返回值抽象事实
+struct RangeValueSummary {
+    //HasInteger标记当前摘要包含i1/i32整数事实
+    bool HasInteger = false;
+    //SignedRange保存整数的有符号区间
+    IntRange SignedRange;
+    //UnsignedRange保存整数的无符号位模式区间
+    UIntRange UnsignedRange;
+    //Bits保存整数的确定位事实
+    KnownBits Bits;
+    //HasFloat标记当前摘要包含f32浮点事实
+    bool HasFloat = false;
+    //FloatValueRange保存浮点数值及NaN/有符号零状态
+    FloatRange FloatValueRange;
+
+    //把另一条调用路径的抽象事实并入当前摘要
+    void merge(const RangeValueSummary &Other);
+    //判断两个摘要是否携带完全相同的抽象事实
+    bool operator==(const RangeValueSummary &Other) const;
+    //判断两个摘要是否不同
+    bool operator!=(const RangeValueSummary &Other) const;
+};
+
 //LoopInductionInfo保存SCEV提供的有限无回绕循环归纳摘要
 struct LoopInductionInfo {
     //RecLoop指向归纳变量所属的自然循环
@@ -512,6 +535,11 @@ public:
         nullptr;
     //DomTree指向当前函数的支配树
     const DominatorTree *DomTree = nullptr;
+    //ParameterSeeds保存由全部直接调用点汇合得到的形参初始事实
+    const std::unordered_map<Value *, RangeValueSummary> *ParameterSeeds = nullptr;
+    //DirectReturnSummaries保存普通直接被调函数的返回值摘要
+    const std::unordered_map<Function *, RangeValueSummary> *
+        DirectReturnSummaries = nullptr;
     //返回值的有符号区间引用并按类型或常量初始化
     IntRange &getRange(Value *V);
     //返回值的无符号区间并按类型或常量初始化
@@ -583,8 +611,12 @@ public:
     //根据最终整数格重新构建块局部和CFG边上下文事实
     void rebuildIntegerContextualFacts(Function &F);
     //运行完整求解流程并封装RangeInfo结果
-    RangeInfo solve(Function &F, SCEVResult *SCEV = nullptr,
-                    const DominatorTree *DT = nullptr);
+    RangeInfo solve(
+        Function &F, SCEVResult *SCEV = nullptr,
+        const DominatorTree *DT = nullptr,
+        const std::unordered_map<Value *, RangeValueSummary> *Seeds = nullptr,
+        const std::unordered_map<Function *, RangeValueSummary> *
+            ReturnSummaries = nullptr);
 };
 
 //RangeAnalysis是构建函数级范围信息的分析Pass
@@ -592,6 +624,8 @@ class RangeAnalysis : public AnalysisDescriptor<RangeAnalysis> {
 public:
     //分析Pass返回的结果类型
     using Result = RangeInfo;
+    //跨函数调用边变化时必须同步失效全部已发布范围摘要
+    static constexpr bool InvalidateAcrossIRUnits = true;
     //运行范围分析并返回函数的完整范围信息
     Result run(Function &F, FunctionAnalysisPassManager &FAM) const;
 

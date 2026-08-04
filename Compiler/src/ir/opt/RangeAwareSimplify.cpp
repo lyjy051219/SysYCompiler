@@ -6,6 +6,7 @@
 #include "lib/IRUtils.hpp"
 #include <vector>
 #include <cmath>
+#include <limits>
 #include <unordered_set>
 //判断二元操作是否支持局部整数区间递归求值
 bool RangeAwareSimplifyPass::isPureIntExprOp(BinaryInst::Operation op) {
@@ -581,11 +582,11 @@ bool RangeAwareSimplifyPass::strengthReduce(
     }
     return changed;
 }
-//检查有符号余数是否具备无符号化范围证据
-bool RangeAwareSimplifyPass::convertSignedToUnsigned(
+//把商区间受限的有符号余数改写为减法或单次条件校正
+bool RangeAwareSimplifyPass::foldBoundedSignedRemainders(
     Function &F, RangeInfo &RI, DominatorTree &DT) {
-    //8. 预留的有符号余数扫描阶段目前只收集范围证据；IR 尚无独立 urem，
-    //因此不实施语义不可表达的替换，也不会报告 changed。
+    //8.只处理i32正的常量模数，商区间由程序点范围证明；不匹配特定模数、函数名
+    //或指令出现顺序。二次幂机会已由前一阶段优先改写为更便宜的按位与。
     bool changed = false;
     std::vector<BinaryInst *> srems;
     for (BinaryInst *BI : collectInstructions<BinaryInst>(F))
@@ -595,11 +596,98 @@ bool RangeAwareSimplifyPass::convertSignedToUnsigned(
         Value *rhs = nullptr;
         if (!srem->getOperands(lhs, rhs)) continue;
         BasicBlock *BB = srem->getParent();
-        if (!BB) continue;
-        IntRange lRange = RI.query(lhs, BB, DT);
-        IntRange rRange = RI.query(rhs, BB, DT);
-        (void)lRange;
-        (void)rRange;
+        auto *ModulusValue = dynamic_cast<ConstInt *>(rhs);
+        auto IntegerType = lhs && lhs->getIRType()
+            ? std::dynamic_pointer_cast<INTType>(lhs->getIRType())
+            : nullptr;
+        if (!BB || !ModulusValue || !IntegerType ||
+            IntegerType->getBitWidth() != 32) {
+            continue;
+        }
+        const int64_t Modulus = ModulusValue->getVal();
+        if (Modulus <= 1 || Modulus > IntRange::I32_MAX) continue;
+        IntRange LRange = queryIntExpr(lhs, BB, RI, DT);
+        if (LRange.isBottom() || LRange.isTop() ||
+            LRange.min < IntRange::I32_MIN ||
+            LRange.max > IntRange::I32_MAX) {
+            continue;
+        }
+        //8.1 C/SysY有符号除法向零截断；正常量下端点商保持单调，可直接界定商集合。
+        const int64_t MinQuotient = LRange.min / Modulus;
+        const int64_t MaxQuotient = LRange.max / Modulus;
+        Value *Replacement = nullptr;
+        std::vector<Instruction *> NewInstructions;
+        auto InsertAllBeforeRemainder = [&]() {
+            for (Instruction *I : NewInstructions)
+                Instruction::insertBefore(srem, I);
+        };
+        if (MinQuotient == MaxQuotient) {
+            //8.2 商恒定时x%M精确等于x-q*M；宽整数先证明整个结果区间不溢出i32。
+            const __int128 Offset = static_cast<__int128>(MinQuotient) *
+                                    static_cast<__int128>(Modulus);
+            const __int128 ResultMin = static_cast<__int128>(LRange.min) - Offset;
+            const __int128 ResultMax = static_cast<__int128>(LRange.max) - Offset;
+            if (ResultMin < IntRange::I32_MIN ||
+                ResultMax > IntRange::I32_MAX ||
+                Offset < std::numeric_limits<int64_t>::min() ||
+                Offset > std::numeric_limits<int64_t>::max()) {
+                continue;
+            }
+            if (Offset == 0) {
+                Replacement = lhs;
+            } else {
+                Value *OffsetValue = ConstInt::newConstIntForType(
+                    static_cast<int64_t>(Offset), IntegerType);
+                auto *Subtract = new BinaryInst(
+                    lhs, BinaryInst::SUB, OffsetValue);
+                NewInstructions.push_back(Subtract);
+                Replacement = Subtract;
+            }
+        } else if (MinQuotient == 0 && MaxQuotient == 1) {
+            //8.3 商只可能为0或1时执行一次正向校正；两臂都会求值，故额外证明减法安全。
+            const __int128 AdjustedMin =
+                static_cast<__int128>(LRange.min) - Modulus;
+            const __int128 AdjustedMax =
+                static_cast<__int128>(LRange.max) - Modulus;
+            if (AdjustedMin < IntRange::I32_MIN ||
+                AdjustedMax > IntRange::I32_MAX) {
+                continue;
+            }
+            Value *M = ConstInt::newConstIntForType(Modulus, IntegerType);
+            auto *NeedsAdjust = new BinaryInst(lhs, BinaryInst::GE, M);
+            auto *Adjusted = new BinaryInst(lhs, BinaryInst::SUB, M);
+            auto *Select = new SelectInst(NeedsAdjust, Adjusted, lhs);
+            NewInstructions.push_back(NeedsAdjust);
+            NewInstructions.push_back(Adjusted);
+            NewInstructions.push_back(Select);
+            Replacement = Select;
+        } else if (MinQuotient == -1 && MaxQuotient == 0) {
+            //8.4 商只可能为-1或0时执行一次负向校正，保留余数与被除数同号的语义。
+            const __int128 AdjustedMin =
+                static_cast<__int128>(LRange.min) + Modulus;
+            const __int128 AdjustedMax =
+                static_cast<__int128>(LRange.max) + Modulus;
+            if (AdjustedMin < IntRange::I32_MIN ||
+                AdjustedMax > IntRange::I32_MAX) {
+                continue;
+            }
+            Value *M = ConstInt::newConstIntForType(Modulus, IntegerType);
+            Value *NegativeM = ConstInt::newConstIntForType(
+                -Modulus, IntegerType);
+            auto *NeedsAdjust = new BinaryInst(
+                lhs, BinaryInst::LE, NegativeM);
+            auto *Adjusted = new BinaryInst(lhs, BinaryInst::ADD, M);
+            auto *Select = new SelectInst(NeedsAdjust, Adjusted, lhs);
+            NewInstructions.push_back(NeedsAdjust);
+            NewInstructions.push_back(Adjusted);
+            NewInstructions.push_back(Select);
+            Replacement = Select;
+        }
+        if (!Replacement) continue;
+        InsertAllBeforeRemainder();
+        srem->replaceAllUsesWith(Replacement);
+        delete srem;
+        changed = true;
     }
     return changed;
 }
@@ -619,7 +707,7 @@ PreservationStatus RangeAwareSimplifyPass::run(Function &F,
     changed |= foldAbsViaSelect(F, RI, DT);
     changed |= foldMinMaxViaSelect(F, RI, DT);
     changed |= strengthReduce(F, RI, DT);
-    changed |= convertSignedToUnsigned(F, RI, DT);
+    changed |= foldBoundedSignedRemainders(F, RI, DT);
     if (!changed) return PreservationStatus::all();
     //9. 只替换计算值、不直接改 CFG，支配与循环结构仍可保留。
     PreservationStatus PA;

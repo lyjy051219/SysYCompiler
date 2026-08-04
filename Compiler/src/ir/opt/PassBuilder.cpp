@@ -4,6 +4,7 @@
 #include "ir/opt/DeadFunctionElimination.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/DSE.hpp"
+#include "ir/opt/StoreMerge.hpp"
 #include "ir/opt/LoadElimination.hpp"
 #include "ir/opt/CFGSimpify.hpp"
 #include "ir/opt/SCCP.hpp"
@@ -16,6 +17,7 @@
 #include "ir/opt/LICM.hpp"
 #include "ir/opt/LoopUnswitch.hpp"
 #include "ir/opt/LoopDeletion.hpp"
+#include "ir/opt/LoopExitValueSimplify.hpp"
 #include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/TailRecursionElimination.hpp"
 #include "ir/opt/Reassociate.hpp"
@@ -97,7 +99,9 @@ FunctionPassManager PassBuilder::buildHeavyMemoryPipeline() {
     //3. 值编号暴露的常量由 SCCP 消费，随后立即清除死分支。
     FPM.addPass(SCCPPass());
     FPM.addPass(CFGSimplifyPass());
-    //4. 先转发冗余 load，再删除因此变得不可观察或被覆盖的 store。
+    //4. 先把各控制流路径末尾的store合流成统一内存定义，再转发冗余load并删除
+    //因此变得不可观察或被覆盖的store。
+    FPM.addPass(StoreMergePass());
     FPM.addPass(LoadEliminationPass());
     FPM.addPass(DSEPass());
     //5. ADCE 沿数据/控制依赖清理整个死图，最后再次规范 CFG。
@@ -154,12 +158,13 @@ FunctionPassManager PassBuilder::buildPostUnrollCleanupPipeline() {
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(DCEPass());
     FPM.addPass(CFGSimplifyPass());
-    //6. 在最后重建 LoopSimplify+LCSSA，规范归纳变量、删除死循环，并立即让 LICM
-    //消费最后一轮展开暴露的不变量。
+    //6. 在最后重建LoopSimplify+LCSSA，规范归纳变量并综合无副作用循环的live-out；
+    //随后删除死循环，并立即让LICM消费最后一轮展开暴露的不变量。
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 4));
     FPM.addPass(LCSSAPass());
     FPM.addPass(IndVarSimplifyPass());
+    FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(LoopDeletionPass());
     FPM.addPass(LICMPass());
     return FPM;
@@ -188,20 +193,28 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
     FPM.addPass(IndVarSimplifyPass());
+    FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(LICMPass());
-    //4. Unswitch 克隆 CFG 后再次清理并恢复 LoopSimplify+LCSSA。
+    //4. Unswitch克隆CFG后消费新产生的边约束，再次恢复LoopSimplify+LCSSA。
     FPM.addPass(LoopUnswitchPass());
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 4));
     FPM.addPass(LCSSAPass());
-    //5. 识别内存循环 idiom，再用标量闭合链与 ADCE/DCE 清理替换后的循环残骸；
-    //LoopDeletion 在副作用消失后删除整个无用循环，LSR 规范剩余地址归纳式。
+    FPM.addPass(RangeAwareSimplifyPass());
+    FPM.addPass(ConstraintEliminationPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 2));
+    FPM.addPass(LCSSAPass());
+    //5. 识别内存循环idiom，再用无代码增长的路径下沉缩短纯值活跃区间，并以
+    //标量闭合链综合循环live-out；随后清理残骸、删空循环并规范剩余地址归纳式。
     FPM.addPass(LoopIdiomRecognizePass());
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(ReassociatePass( true));
     FPM.addPass(LocalGVNPass());
-    FPM.addPass(GVNPREPass( false));
+    FPM.addPass(GVNPREPass( false, true));
+    FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(ADCEPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LoopDeletionPass());
@@ -225,11 +238,12 @@ FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FPM.addPass(LocalGVNPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LateStrengthReducePass());
-    //2. 强度削减产生的新地址与内存机会再走一轮化简、GEP、load/DSE；
+    //2. 强度削减产生的新地址与内存机会再走一轮化简、GEP、store合流和load/DSE；
     //最后清退化 PHI 和 CFG。
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
+    FPM.addPass(StoreMergePass());
     FPM.addPass(LoadEliminationPass());
     FPM.addPass(DSEPass());
     FPM.addPass(CFGSimplifyPass());
@@ -248,19 +262,27 @@ FunctionPassManager PassBuilder::buildLateLoopRediscoveryPipeline() {
     FPM.addPass(LCSSAPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         IndVarSimplifyPass(), 2));
-    //2. 重新运行 LICM/idiom，再以标量值编号和 ADCE/DCE 消费新结果。
+    //2. 先消费晚期标量化暴露的范围与路径事实，再重新运行LICM/idiom。
+    FPM.addPass(RangeAwareSimplifyPass());
+    FPM.addPass(ConstraintEliminationPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 2));
+    FPM.addPass(LCSSAPass());
     FPM.addPass(LICMPass());
     FPM.addPass(LoopIdiomRecognizePass());
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(ReassociatePass( true));
     FPM.addPass(LocalGVNPass());
     FPM.addPass(GVNPREPass( false));
+    FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(ADCEPass());
     FPM.addPass(DCEPass());
     FPM.addPass(CFGSimplifyPass());
-    //3. 删除新变空循环并做强度、内存与 CFG 最终闭合。
+    //3. 删除新变空循环并做强度、store合流、内存与CFG最终闭合。
     FPM.addPass(LoopDeletionPass());
     FPM.addPass(LoopStrengthReductionPass());
+    FPM.addPass(StoreMergePass());
     FPM.addPass(LoadEliminationPass());
     FPM.addPass(DSEPass());
     FPM.addPass(DCEPass());
@@ -354,8 +376,15 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
         createModuleFunctionBridge(buildLoopPipeline(), FAM), 3));
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildPostLoopCleanupPipeline(), FAM), 1));
-    //10. 循环变换改变调用参数与常量后再运行 DAE/标量清理和死函数删除。
+    //10. 循环变换改变调用参数与常量后再运行DAE/标量清理；随后用低增长模型
+    //内联新生成的专用小函数，并立即删除旧函数体与清理克隆表达式。
     MPM.addPass(DAEPass());
+    MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(FuncInlinePass( false, true), FAM), 3));
+    MPM.addPass(DeadFunctionEliminationPass(FAM));
+    MPM.addPass(createModuleFunctionBridge(buildLightCleanupPipeline(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
     MPM.addPass(DeadFunctionEliminationPass(FAM));
     //11. 在主要内联/循环优化完成后为合适递归函数插入 memoization，避免早期缓存 CFG
@@ -368,13 +397,17 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(RangeAwareSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(ConstraintEliminationPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
     MPM.addPass(createModuleFunctionBridge(
         buildLateLoopRediscoveryPipeline(), FAM));
-    //13. 最后一轮地址、load、store、死值和 CFG 清理后进入 late 控制流/出口规范化。
+    //13. 最后一轮地址、store合流、load、DSE、死值和CFG清理后进入late控制流。
     MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(StoreMergePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(LoadEliminationPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DSEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));

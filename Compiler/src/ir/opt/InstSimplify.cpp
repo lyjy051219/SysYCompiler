@@ -524,12 +524,11 @@ Value *InstSimplifier::simplifyMul(
 //应用有符号除法恒等式和安全相消规则
 Value *InstSimplifier::simplifyDiv(
     BinaryInst *BI, Value *LHS, Value *RHS) {
-    //3.4除法按整数/浮点分别处理 undef、零除数与简单单位元；整数除零产生 undef，
-    //浮点除零不在此折叠，x/x 也仅对整数成立。
+    //3.4除法按整数/浮点分别处理undef、零除数与安全单位元；整数除零产生undef，
+    //浮点除零不在此折叠。
     const auto Op = BI->getOp();
     const auto Ty = BI->getIRType();
     const bool IsFloat = IRType::isFloat(Ty);
-    const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
     if (LHS->isConst() && RHS->isConst()) {
         return BinaryInst::foldConstants(Op, LHS, RHS);
     }
@@ -546,19 +545,11 @@ Value *InstSimplifier::simplifyDiv(
     if (Value::isConstZero(RHS)) {
         return IsFloat ? nullptr : Value::makeUndefForType(Ty);
     }
-    if (IsIntArith && Value::isConstZero(LHS)) {
-        return Value::makeZeroForType(Ty);
-    }
-    if (IsIntArith && LHS == RHS) {
-        return Value::makeOneForType(Ty);
-    }
     if (Value::isConstOne(RHS)) {
         return LHS;
     }
-    if (IsIntArith && Op == BinaryInst::DIV &&
-        Value::isConstMinusOne(RHS)) {
-        return new BinaryInst(Value::makeZeroForType(Ty), BinaryInst::SUB, LHS);
-    }
+    //3.4.1 不在缺少非零与INT_MIN排除证明时折叠0/x、x/x或x/-1，
+    //避免依赖源程序未定义行为取得结果；范围驱动规则在证据充分时另行处理。
     return nullptr;
 }
 //应用有符号取余恒等式和安全相消规则
@@ -569,10 +560,6 @@ Value *InstSimplifier::simplifyRem(
     const auto Ty = BI->getIRType();
     const bool IsFloat = IRType::isFloat(Ty);
     const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
-    if (IsIntArith && BI->getOp() == BinaryInst::MOD &&
-        InstSimplifyPass::isNegationPair(LHS, RHS)) {
-        return Value::makeZeroForType(Ty);
-    }
     if (LHS->isConst() && RHS->isConst()) {
         return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
     }
@@ -581,17 +568,26 @@ Value *InstSimplifier::simplifyRem(
         return IsFloat ? Value::makeUndefForType(Ty)
                        : Value::makeZeroForType(Ty);
     }
-    if (IsIntArith && Value::isConstZero(LHS))
-        return Value::makeZeroForType(Ty);
     if (Value::isConstZero(RHS)) {
         return IsFloat ? nullptr : Value::makeUndefForType(Ty);
     }
     if (IsIntArith && Value::isConstOne(RHS)) return Value::makeZeroForType(Ty);
-    if (IsIntArith && BI->getOp() == BinaryInst::MOD &&
-        Value::isConstMinusOne(RHS))
-        return Value::makeZeroForType(Ty);
-    if (IsIntArith && LHS == RHS)
-        return Value::makeZeroForType(Ty);
+    //3.5.1 同一非零常量模数的重复余数是幂等的；显式排除srem的-1溢出点，
+    //该规则只依据运算语义，不依赖函数名、测试常量或相邻指令形态。
+    if (IsIntArith) {
+        auto *Inner = dynamic_cast<BinaryInst *>(LHS);
+        Value *InnerRHS = Inner ? Inner->getOperand(1) : nullptr;
+        int32_t Divisor = 0;
+        if (Inner && Inner->getOp() == BI->getOp() &&
+            InnerRHS &&
+            Value::tryGetIntConst(RHS, Divisor) && Divisor != 0 &&
+            (BI->getOp() != BinaryInst::MOD || Divisor != -1) &&
+            Value::areEqualConstants(InnerRHS, RHS)) {
+            return Inner;
+        }
+    }
+    //3.5.2 不在缺少非零证明时折叠0%x、x%x或x%-x，也不借INT_MIN%-1的
+    //未定义行为把结果硬化为零。
     return nullptr;
 }
 //应用按位与恒等式、吸收律和常量折叠规则

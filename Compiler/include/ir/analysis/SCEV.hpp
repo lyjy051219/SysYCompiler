@@ -342,6 +342,10 @@ public:
     std::optional<SCEVStepRangeInfo>
     analyzeAffineStepRange(Value *V, BasicBlock *Context,
                            RangeInfo &RI, DominatorTree &DT);
+    //在指定程序点按Range事实保守求值一个i1或i32的SCEV表达式范围
+    std::optional<IntRange> evaluateRangeAt(
+        const SCEVExpr *E, BasicBlock *Context, RangeInfo &RI,
+        DominatorTree &DT) const;
     //将给定循环递推表达式求值到指定迭代表达式
     const SCEVExpr *getSCEVAtIteration(const SCEVExpr *E,
                                        const SCEVExpr *Iter,

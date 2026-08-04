@@ -1,6 +1,7 @@
 #include "ir/opt/LoopIdiomRecognize.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
+#include "ir/analysis/LoopAccessAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -9,6 +10,7 @@
 #include "lib/IRUtils.hpp"
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <unordered_set>
 //剥离地址转换并返回可用于不相交证明的对象根
 Value *LoopIdiomRecognizePass::getDisjointObjectRoot(Value *V) {
@@ -39,6 +41,494 @@ bool LoopIdiomRecognizePass::areProvablyDisjoint(
     Value *ARoot = getDisjointObjectRoot(A.Base);
     Value *BRoot = getDisjointObjectRoot(B.Base);
     return ARoot && BRoot && ARoot != BRoot;
+}
+//展平最终标量typed GEP并记录完整对象布局
+bool LoopIdiomRecognizePass::matchAffineViewAccess(
+    Value *Pointer, AffineViewAccess &Access) {
+    //1.只接受没有bitcast的零索引typed GEP链；根对象必须是全局数组或栈数组。
+    Access = {};
+    auto *Address = dynamic_cast<GetElementPtrInst *>(Pointer);
+    if (!Address) return false;
+    Value *Root = nullptr;
+    std::vector<Value *> Indices;
+    if (!GetElementPtrInst::flattenZeroBasedChain(
+            Address, Root, Indices) || !Root || Indices.size() < 3) {
+        return false;
+    }
+    Value *ObjectRoot = getDisjointObjectRoot(Root);
+    if (!ObjectRoot || ObjectRoot != Root) return false;
+    auto ObjectType = IRType::getPointeeType(Root->getIRType());
+    auto ElementType = IRType::getPointeeType(Address->getIRType());
+    if (!ObjectType || !ObjectType->isArray() || !ElementType ||
+        (!ElementType->hasIntegerBitWidth(32) && !ElementType->isFloat())) {
+        return false;
+    }
+    //2.每个typed索引都必须具有精确的正字节步长，最终指针必须落到标量元素。
+    std::vector<int64_t> Strides;
+    int64_t FinalStride = 0;
+    if (!GetElementPtrInst::getIndexStrides(
+            Root, Indices, Strides, FinalStride) ||
+        Strides.size() != Indices.size() ||
+        FinalStride != static_cast<int64_t>(ElementType->getSize())) {
+        return false;
+    }
+    for (int64_t Stride : Strides)
+        if (Stride <= 0) return false;
+    Access.Address = Address;
+    Access.Root = Root;
+    Access.Indices = std::move(Indices);
+    Access.ByteStrides = std::move(Strides);
+    Access.AxisAtIndex.assign(Access.Indices.size(), -1);
+    return true;
+}
+//把二维生产者GEP的动态索引绑定到两条规范归纳轴
+bool LoopIdiomRecognizePass::bindAffineViewAxes(
+    AffineViewAccess &Access, PhiInst *OuterIV, PhiInst *InnerIV) {
+    //1.首版只承认直接归纳PHI形成的轴置换；其他索引必须是真正常量。
+    if (!Access.Address || !Access.Root || !OuterIV || !InnerIV ||
+        OuterIV == InnerIV ||
+        Access.AxisAtIndex.size() != Access.Indices.size()) {
+        return false;
+    }
+    unsigned AxisCounts[2] = {0, 0};
+    for (size_t Index = 0; Index < Access.Indices.size(); ++Index) {
+        Value *V = Access.Indices[Index];
+        if (V == OuterIV) {
+            Access.AxisAtIndex[Index] = 0;
+            ++AxisCounts[0];
+            continue;
+        }
+        if (V == InnerIV) {
+            Access.AxisAtIndex[Index] = 1;
+            ++AxisCounts[1];
+            continue;
+        }
+        int64_t Constant = 0;
+        if (!V || !V->tryGetInt64Const(Constant)) return false;
+        Access.AxisAtIndex[Index] = -1;
+    }
+    return AxisCounts[0] == 1 && AxisCounts[1] == 1;
+}
+//递归检查对象地址的全部使用并收集真实读写
+bool LoopIdiomRecognizePass::collectAffineViewObjectUses(
+    Value *Current, Function &F, bool AllowArrayInput,
+    std::unordered_set<Value *> &Visited,
+    std::vector<LoadInst *> &Loads,
+    std::vector<StoreInst *> &Stores,
+    std::vector<Instruction *> &Writers) {
+    if (!Current) return false;
+    if (!Visited.insert(Current).second) return true;
+    for (Use *U : Current->getUses()) {
+        if (!U || U->getValue() != Current) return false;
+        auto *I = dynamic_cast<Instruction *>(U->getUser());
+        if (!I || I->getParentFunction() != &F) return false;
+        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I)) {
+            //1.对象指针只能作为typed GEP的基址，不能偷偷参与索引或其他运算。
+            if (GEP->getBasePointer() != Current ||
+                !collectAffineViewObjectUses(
+                    GEP, F, AllowArrayInput, Visited,
+                    Loads, Stores, Writers)) {
+                return false;
+            }
+            continue;
+        }
+        if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+            if (Load->getPointerOperand() != Current) return false;
+            Loads.push_back(Load);
+            continue;
+        }
+        if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+            if (Store->getPointerOperand() != Current) return false;
+            Stores.push_back(Store);
+            Writers.push_back(Store);
+            continue;
+        }
+        if (auto *Call = dynamic_cast<CallInst *>(I)) {
+            //2.源数组只额外允许SysY数组输入接口；这是运行时ABI的内存语义，
+            //不是按测试函数名选择优化。该接口不会保存实参地址。
+            if (!AllowArrayInput || Call->getArgIndex(U) != 0 ||
+                !Call->getBuiltinCallee() ||
+                !BuildInFunction::isArrayInputName(
+                    Call->getCalleeName())) {
+                return false;
+            }
+            Writers.push_back(Call);
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+//收集最终标量地址向根对象回溯时经过的全部typed GEP
+bool LoopIdiomRecognizePass::collectAffineViewGEPChain(
+    Value *Pointer, Value *ExpectedRoot,
+    std::unordered_set<Instruction *> &Instructions) {
+    if (!Pointer || !ExpectedRoot) return false;
+    Value *Current = Pointer;
+    std::unordered_set<Value *> Seen;
+    while (Current && Current != ExpectedRoot && Seen.insert(Current).second) {
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(Current);
+        if (!GEP || !GEP->getBasePointer()) return false;
+        Instructions.insert(GEP);
+        Current = GEP->getBasePointer();
+    }
+    return Current == ExpectedRoot;
+}
+//证明生产循环只承担二维置换复制和必要控制
+bool LoopIdiomRecognizePass::hasOnlyAffineViewProducerInstructions(
+    const AffineViewCandidate &Candidate, SCEVResult &SE) {
+    if (!Candidate.Outer || !Candidate.Inner || !Candidate.OuterIV ||
+        !Candidate.InnerIV || !Candidate.Store || !Candidate.Load) {
+        return false;
+    }
+    auto OuterInduction = SE.getCanonicalInduction(Candidate.Outer);
+    auto InnerInduction = SE.getCanonicalInduction(Candidate.Inner);
+    auto OuterTrip = SE.analyzeLoopTripCount(Candidate.Outer);
+    auto InnerTrip = SE.analyzeLoopTripCount(Candidate.Inner);
+    if (!OuterInduction || !InnerInduction || !OuterTrip || !InnerTrip ||
+        !OuterInduction->UpdateValue || !InnerInduction->UpdateValue ||
+        !OuterTrip->ExitCmp || !InnerTrip->ExitCmp) {
+        return false;
+    }
+    //1.允许集合只包含两条规范归纳链、两端GEP、唯一load/store和分支。
+    std::unordered_set<Instruction *> Allowed{
+        Candidate.OuterIV,
+        Candidate.InnerIV,
+        dynamic_cast<Instruction *>(OuterInduction->UpdateValue),
+        dynamic_cast<Instruction *>(InnerInduction->UpdateValue),
+        OuterTrip->ExitCmp,
+        InnerTrip->ExitCmp,
+        Candidate.Load,
+        Candidate.Store};
+    if (Allowed.count(nullptr)) return false;
+    if (!collectAffineViewGEPChain(
+            Candidate.Destination.Address,
+            Candidate.Destination.Root, Allowed) ||
+        !collectAffineViewGEPChain(
+            Candidate.Source.Address,
+            Candidate.Source.Root, Allowed)) {
+        return false;
+    }
+    for (BasicBlock *BB : Candidate.Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (dynamic_cast<BrInst *>(I)) continue;
+            if (!Allowed.count(I)) return false;
+        }
+    }
+    //2.生产循环定义的值不得在循环外活跃，避免删除复制后仍保留隐藏计算语义。
+    for (Instruction *I : Allowed) {
+        if (!I || I == Candidate.Store) continue;
+        for (Use *U : I->getUses()) {
+            auto *UserI = U ? dynamic_cast<Instruction *>(U->getUser())
+                            : nullptr;
+            if (!UserI || !UserI->getParent() ||
+                !Candidate.Outer->contains(UserI->getParent())) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+//判断一次写入足迹是否精确覆盖整个目标对象
+bool LoopIdiomRecognizePass::affineViewCoversWholeObject(
+    LoopAccessInfo &LA, Loop *Scope, Instruction *Access,
+    Value *ExpectedRoot, int64_t ElementCount) {
+    if (!Scope || !Access || !ExpectedRoot || ElementCount <= 0)
+        return false;
+    std::vector<const LoopAccessFootprint *> Footprints =
+        LA.getFootprints(Scope, Access);
+    if (Footprints.size() != 1 || !Footprints.front()) return false;
+    const LoopAccessFootprint &Footprint = *Footprints.front();
+    if (!Footprint.Exact || !Footprint.IsFullAccess ||
+        Footprint.Base != ExpectedRoot || !Footprint.ObjectSize ||
+        !Footprint.MinByteOffset || !Footprint.MaxByteOffsetExclusive ||
+        *Footprint.MinByteOffset != 0 || Footprint.ElementSize == 0 ||
+        *Footprint.MaxByteOffsetExclusive !=
+            static_cast<int64_t>(*Footprint.ObjectSize)) {
+        return false;
+    }
+    const __int128 Bytes = static_cast<__int128>(ElementCount) *
+                           static_cast<__int128>(Footprint.ElementSize);
+    return Bytes == static_cast<__int128>(*Footprint.ObjectSize);
+}
+//判断生产循环完成后是否仍可能执行某个源对象写入块
+bool LoopIdiomRecognizePass::isReachableFromAffineViewExit(
+    BasicBlock *Exit, BasicBlock *Target) {
+    if (!Exit || !Target) return false;
+    std::vector<BasicBlock *> WorkList{Exit};
+    std::unordered_set<BasicBlock *> Visited;
+    while (!WorkList.empty()) {
+        BasicBlock *BB = WorkList.back();
+        WorkList.pop_back();
+        if (!BB || !Visited.insert(BB).second) continue;
+        if (BB == Target) return true;
+        for (BasicBlock *Successor : BB->getSuccessors())
+            if (Successor && !Visited.count(Successor))
+                WorkList.push_back(Successor);
+    }
+    return false;
+}
+//构建完整二维只读仿射视图消除候选
+bool LoopIdiomRecognizePass::buildAffineViewCandidate(
+    Function &F, Loop *Outer, LoopAccessInfo &LA, SCEVResult &SE,
+    DominatorTree &DT, AffineViewCandidate &Candidate) {
+    Candidate = {};
+    //1.首版只处理函数顶层、直接父子、正单位步长且常量次数的完整矩形循环。
+    if (!Outer || Outer->getParentLoop() ||
+        Outer->getSubLoops().size() != 1) {
+        return false;
+    }
+    Loop *Inner = Outer->getSubLoops().front();
+    if (!Inner || !Inner->isInnermost() ||
+        !LA.isRectangularNest(Outer, Inner)) {
+        return false;
+    }
+    BasicBlock *OuterPreHeader = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    BasicBlock *InnerPreHeader = nullptr;
+    BasicBlock *InnerLatch = nullptr;
+    if (!Outer->getLoopSimplifyForm(OuterPreHeader, OuterLatch) ||
+        !Inner->getLoopSimplifyForm(InnerPreHeader, InnerLatch) ||
+        !OuterPreHeader || !OuterLatch || !InnerPreHeader || !InnerLatch) {
+        return false;
+    }
+    std::vector<BasicBlock *> Exits = Outer->getExitBlocks();
+    if (Exits.size() != 1 || !Exits.front()) return false;
+    auto OuterInduction = SE.getCanonicalInduction(Outer);
+    auto InnerInduction = SE.getCanonicalInduction(Inner);
+    auto OuterTrip = SE.analyzeLoopTripCount(Outer);
+    auto InnerTrip = SE.analyzeLoopTripCount(Inner);
+    if (!OuterInduction || !InnerInduction || !OuterTrip || !InnerTrip ||
+        !OuterInduction->Valid || !InnerInduction->Valid ||
+        !OuterTrip->Valid || !InnerTrip->Valid ||
+        !OuterInduction->Phi || !InnerInduction->Phi ||
+        !OuterInduction->ConstantStart || !InnerInduction->ConstantStart ||
+        *OuterInduction->ConstantStart != 0 ||
+        *InnerInduction->ConstantStart != 0 ||
+        !OuterInduction->ConstantStep || !InnerInduction->ConstantStep ||
+        *OuterInduction->ConstantStep != 1 ||
+        *InnerInduction->ConstantStep != 1 ||
+        !OuterTrip->ConstantTripCount || !InnerTrip->ConstantTripCount ||
+        !OuterTrip->ProvenNoWrap || !InnerTrip->ProvenNoWrap ||
+        *OuterTrip->ConstantTripCount <= 0 ||
+        *InnerTrip->ConstantTripCount <= 0) {
+        return false;
+    }
+    const __int128 WideElementCount =
+        static_cast<__int128>(*OuterTrip->ConstantTripCount) *
+        static_cast<__int128>(*InnerTrip->ConstantTripCount);
+    if (WideElementCount < MinAffineViewElements ||
+        WideElementCount > std::numeric_limits<int64_t>::max()) {
+        return false;
+    }
+    Candidate.Outer = Outer;
+    Candidate.Inner = Inner;
+    Candidate.ExitBlock = Exits.front();
+    Candidate.OuterIV = OuterInduction->Phi;
+    Candidate.InnerIV = InnerInduction->Phi;
+    Candidate.ElementCount = static_cast<int64_t>(WideElementCount);
+    //2.生产循环内必须恰有一条load feeding唯一store，且不能含调用或其他访存。
+    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return false;
+        for (Instruction *I : *BB) {
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                if (Candidate.Load) return false;
+                Candidate.Load = Load;
+            } else if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+                if (Candidate.Store) return false;
+                Candidate.Store = Store;
+            } else if (dynamic_cast<CallInst *>(I)) {
+                return false;
+            }
+        }
+    }
+    if (!Candidate.Load || !Candidate.Store ||
+        Candidate.Store->getValueOperand() != Candidate.Load ||
+        !Candidate.Load->hasExactlyOneUse()) {
+        return false;
+    }
+    //3.两端必须是同型、不同唯一对象上的直接二维轴置换，任何动态算术索引都拒绝。
+    if (!matchAffineViewAccess(
+            Candidate.Store->getPointerOperand(), Candidate.Destination) ||
+        !matchAffineViewAccess(
+            Candidate.Load->getPointerOperand(), Candidate.Source) ||
+        Candidate.Destination.Root == Candidate.Source.Root ||
+        !Candidate.Destination.Root->getIRType()->hasSameShape(
+            *Candidate.Source.Root->getIRType()) ||
+        Candidate.Destination.Indices.size() !=
+            Candidate.Source.Indices.size() ||
+        Candidate.Destination.ByteStrides != Candidate.Source.ByteStrides ||
+        !bindAffineViewAxes(
+            Candidate.Destination, Candidate.OuterIV,
+            Candidate.InnerIV) ||
+        !bindAffineViewAxes(
+            Candidate.Source, Candidate.OuterIV,
+            Candidate.InnerIV)) {
+        return false;
+    }
+    for (size_t Index = 0;
+         Index < Candidate.Destination.Indices.size(); ++Index) {
+        const int DestinationAxis = Candidate.Destination.AxisAtIndex[Index];
+        const int SourceAxis = Candidate.Source.AxisAtIndex[Index];
+        if ((DestinationAxis < 0) != (SourceAxis < 0)) return false;
+        if (DestinationAxis < 0 &&
+            !Value::areEqualConstants(
+                Candidate.Destination.Indices[Index],
+                Candidate.Source.Indices[Index])) {
+            return false;
+        }
+    }
+    //4.目标写足迹必须无洞覆盖整个对象；源置换也必须精确落在同尺寸完整对象内。
+    if (!affineViewCoversWholeObject(
+            LA, Outer, Candidate.Store,
+            Candidate.Destination.Root, Candidate.ElementCount)) {
+        return false;
+    }
+    std::vector<const LoopAccessFootprint *> SourceFootprints =
+        LA.getFootprints(Outer, Candidate.Load);
+    if (SourceFootprints.size() != 1 || !SourceFootprints.front())
+        return false;
+    const LoopAccessFootprint &SourceFootprint = *SourceFootprints.front();
+    const __int128 SourceBytes =
+        static_cast<__int128>(Candidate.ElementCount) *
+        static_cast<__int128>(SourceFootprint.ElementSize);
+    if (!SourceFootprint.Exact ||
+        SourceFootprint.Base != Candidate.Source.Root ||
+        !SourceFootprint.ObjectSize || !SourceFootprint.MinByteOffset ||
+        !SourceFootprint.MaxByteOffsetExclusive ||
+        *SourceFootprint.MinByteOffset != 0 ||
+        *SourceFootprint.MaxByteOffsetExclusive !=
+            static_cast<int64_t>(*SourceFootprint.ObjectSize) ||
+        SourceBytes != static_cast<__int128>(*SourceFootprint.ObjectSize)) {
+        return false;
+    }
+    if (!hasOnlyAffineViewProducerInstructions(Candidate, SE)) return false;
+    //5.临时对象不得逃逸或有第二次写入；全部读取必须位于生产循环完成之后。
+    std::vector<LoadInst *> TemporaryLoads;
+    std::vector<StoreInst *> TemporaryStores;
+    std::vector<Instruction *> TemporaryWriters;
+    std::unordered_set<Value *> TemporaryVisited;
+    if (!collectAffineViewObjectUses(
+            Candidate.Destination.Root, F, false, TemporaryVisited,
+            TemporaryLoads, TemporaryStores, TemporaryWriters) ||
+        TemporaryStores.size() != 1 ||
+        TemporaryStores.front() != Candidate.Store ||
+        TemporaryWriters.size() != 1 || TemporaryLoads.empty()) {
+        return false;
+    }
+    for (LoadInst *Load : TemporaryLoads) {
+        if (!Load || !Load->getParent() || Outer->contains(Load->getParent()) ||
+            !DT.dominates(Candidate.ExitBlock, Load->getParent())) {
+            return false;
+        }
+    }
+    //6.源对象同样不得逃逸；所有源写必须位于从生产循环出口不可达的先行区域。
+    std::vector<LoadInst *> SourceLoads;
+    std::vector<StoreInst *> SourceStores;
+    std::vector<Instruction *> SourceWriters;
+    std::unordered_set<Value *> SourceVisited;
+    if (!collectAffineViewObjectUses(
+            Candidate.Source.Root, F, true, SourceVisited,
+            SourceLoads, SourceStores, SourceWriters)) {
+        return false;
+    }
+    for (Instruction *Writer : SourceWriters) {
+        if (!Writer || !Writer->getParent() ||
+            isReachableFromAffineViewExit(
+                Candidate.ExitBlock, Writer->getParent())) {
+            return false;
+        }
+    }
+    //7.逐个消费者反解目标轴并代入源置换；只复用原索引值，不生成任何新算术。
+    Candidate.Rewrites.clear();
+    Candidate.Rewrites.reserve(TemporaryLoads.size());
+    for (LoadInst *Load : TemporaryLoads) {
+        AffineViewAccess Consumer;
+        if (!matchAffineViewAccess(Load->getPointerOperand(), Consumer) ||
+            Consumer.Root != Candidate.Destination.Root ||
+            Consumer.Indices.size() != Candidate.Destination.Indices.size() ||
+            Consumer.ByteStrides != Candidate.Destination.ByteStrides ||
+            !Load->getIRType()->hasSameStorageType(
+                *Candidate.Load->getIRType())) {
+            return false;
+        }
+        Value *AxisValues[2] = {nullptr, nullptr};
+        for (size_t Index = 0; Index < Consumer.Indices.size(); ++Index) {
+            const int Axis = Candidate.Destination.AxisAtIndex[Index];
+            if (Axis < 0) {
+                if (!Value::areEqualConstants(
+                        Consumer.Indices[Index],
+                        Candidate.Destination.Indices[Index])) {
+                    return false;
+                }
+                continue;
+            }
+            Value *ConsumerIndex = Consumer.Indices[Index];
+            Value *ProducerIndex = Candidate.Destination.Indices[Index];
+            if (!ConsumerIndex || !ProducerIndex ||
+                !ConsumerIndex->getIRType()->hasSameShape(
+                    *ProducerIndex->getIRType())) {
+                return false;
+            }
+            AxisValues[Axis] = ConsumerIndex;
+        }
+        if (!AxisValues[0] || !AxisValues[1]) return false;
+        AffineViewRewrite Rewrite;
+        Rewrite.Load = Load;
+        Rewrite.SourceIndices.reserve(Candidate.Source.Indices.size());
+        for (size_t Index = 0;
+             Index < Candidate.Source.Indices.size(); ++Index) {
+            const int Axis = Candidate.Source.AxisAtIndex[Index];
+            Value *NewIndex = Axis < 0
+                ? Candidate.Source.Indices[Index]
+                : AxisValues[Axis];
+            if (!NewIndex ||
+                !NewIndex->getIRType()->hasSameShape(
+                    *Candidate.Source.Indices[Index]->getIRType())) {
+                return false;
+            }
+            Rewrite.SourceIndices.push_back(NewIndex);
+        }
+        Candidate.Rewrites.push_back(std::move(Rewrite));
+    }
+    return !Candidate.Rewrites.empty();
+}
+//提交完整证明后的二维只读仿射视图消除
+bool LoopIdiomRecognizePass::transformAffineView(
+    Function &F, Loop *Outer, LoopAccessInfo &LA, SCEVResult &SE,
+    DominatorTree &DT) {
+    AffineViewCandidate Candidate;
+    if (!buildAffineViewCandidate(F, Outer, LA, SE, DT, Candidate))
+        return false;
+    //1.先离线构造所有源地址，确保类型完全一致后才触碰现有消费者。
+    std::vector<std::unique_ptr<GetElementPtrInst>> Planned;
+    Planned.reserve(Candidate.Rewrites.size());
+    for (const AffineViewRewrite &Rewrite : Candidate.Rewrites) {
+        if (!Rewrite.Load || !Rewrite.Load->getParent()) return false;
+        std::vector<Value *> Indices = Rewrite.SourceIndices;
+        auto Address = std::make_unique<GetElementPtrInst>(
+            Candidate.Source.Root, Indices);
+        if (!Address->getIRType()->hasSameShape(
+                *Rewrite.Load->getPointerOperand()->getIRType())) {
+            return false;
+        }
+        Planned.push_back(std::move(Address));
+    }
+    //2.每个旧load保持原值身份，仅把地址换成等价源GEP；新GEP不增加索引算术。
+    for (size_t Index = 0; Index < Candidate.Rewrites.size(); ++Index) {
+        LoadInst *Load = Candidate.Rewrites[Index].Load;
+        GetElementPtrInst *Address = Planned[Index].release();
+        if (!Load->insertBefore(Address) ||
+            !Load->replaceOperand(0, Address)) {
+            delete Address;
+            return false;
+        }
+    }
+    //3.生产store已无任何可观察消费者，删除唯一复制访存；地址与空循环交给既有清理链。
+    delete Candidate.Store;
+    if (!Candidate.Load->hasUses()) delete Candidate.Load;
+    return true;
 }
 //提取可由memset表示的重复字节常量
 bool LoopIdiomRecognizePass::getRepeatedByte(Value *V, uint8_t &Byte) {
@@ -180,6 +670,53 @@ GetElementPtrInst *LoopIdiomRecognizePass::materializeStartPointer(
     }
     return StartGEP;
 }
+//计算线性访问起点到唯一已知底层对象末端的剩余容量
+bool LoopIdiomRecognizePass::getKnownRemainingObjectBytes(
+    const LinearAccess &Access, int64_t Start, BasicAAResult &AA,
+    size_t &RemainingBytes) {
+    //1.基址必须具有唯一对象、精确字节偏移和静态对象大小；参数、合流指针或
+    //动态子对象偏移均没有足够证据，不能据此生成整段内存 intrinsic。
+    RemainingBytes = 0;
+    if (!Access.Base || !Access.GEP || Access.Indices.empty() ||
+        Access.InductionIndex >= Access.Indices.size()) {
+        return false;
+    }
+    const PointerProvenanceInfo &Provenance =
+        AA.getPointerProvenance(Access.Base);
+    auto BaseOffset = Provenance.getExactByteOffset();
+    if (!Provenance.getUniqueBase() || !Provenance.ObjectSize ||
+        !BaseOffset) {
+        return false;
+    }
+    //2.按原 typed GEP 布局计算指定起始迭代的精确字节偏移，使用宽整数承接
+    //乘加，避免在证明过程中依赖宿主整数回绕。
+    std::vector<int64_t> Strides;
+    int64_t FinalStride = 0;
+    if (!GetElementPtrInst::getIndexStrides(
+            Access.Base, Access.Indices, Strides, FinalStride) ||
+        Strides.size() != Access.Indices.size() || FinalStride <= 0) {
+        return false;
+    }
+    __int128 Offset = static_cast<__int128>(*BaseOffset);
+    for (size_t Index = 0; Index < Access.Indices.size(); ++Index) {
+        int64_t IndexValue = 0;
+        if (Index == Access.InductionIndex) {
+            IndexValue = Start;
+        } else if (!Access.Indices[Index] ||
+                   !Access.Indices[Index]->tryGetInt64Const(IndexValue)) {
+            return false;
+        }
+        Offset += static_cast<__int128>(IndexValue) *
+                  static_cast<__int128>(Strides[Index]);
+    }
+    //3.只在起点位于完整分配对象的半开区间内时发布剩余容量；调用方再用
+    //count*元素字节约束整段访问，因而不会把首地址合法误当成完整足迹合法。
+    const __int128 ObjectBytes =
+        static_cast<__int128>(*Provenance.ObjectSize);
+    if (Offset < 0 || Offset > ObjectBytes) return false;
+    RemainingBytes = static_cast<size_t>(ObjectBytes - Offset);
+    return true;
+}
 //匹配可参与临时数组双复制消除的简单连续复制循环
 bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
     Loop *L, SCEVResult &SE, DominatorTree &DT,
@@ -268,7 +805,7 @@ bool LoopIdiomRecognizePass::matchSimpleCopyLoop(
 bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     Function &F, const CopyLoopMatch &First,
     const CopyLoopMatch &Second, DominatorTree &DT, RangeInfo &RI,
-    bool &CFGChanged) {
+    BasicAAResult &AA, bool &CFGChanged) {
     //4. 从已匹配复制循环中寻找 source→temporary 与 temporary→destination 的相邻
     //二段复制；起点、次数/运行期边界及桥接 CFG 必须完全一致。
     if (!First.L || !Second.L || First.L == Second.L ||
@@ -276,13 +813,23 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         First.Start != Second.Start ||
         First.IsRuntime != Second.IsRuntime)
         return false;
+    const size_t ElementBytes = First.Source.ElementTy
+                                    ? First.Source.ElementTy->getSize()
+                                    : 0;
+    if (ElementBytes == 0 ||
+        ElementBytes >
+            static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    const int64_t MaxRepresentableCount =
+        std::numeric_limits<int32_t>::max() /
+        static_cast<int64_t>(ElementBytes);
     if (First.IsRuntime) {
         if (!First.RuntimeBound ||
             First.RuntimeBound != Second.RuntimeBound)
             return false;
     } else if (First.TripCount != Second.TripCount ||
-               First.TripCount >
-                   std::numeric_limits<int32_t>::max() / 4) {
+               First.TripCount > MaxRepresentableCount) {
         return false;
     }
     BasicBlock *Bridge = First.ExitBlock;
@@ -357,7 +904,40 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     if (First.IsRuntime &&
         !AvailableAt(First.RuntimeBound, First.PreHeader))
         return false;
-    //4.5 先物化两端首地址，并用范围/对象边界证明整条 GEP 链在已知对象内。
+    //4.5 分别求出最终源、临时写入、临时读取和最终目标从首元素到完整对象末端的
+    //容量。四者都必须具有唯一对象与精确起点；这既约束新 memmove，也不借助原
+    //两段循环可能存在的越界行为。运行期 guard 使用四者容量的最小值。
+    size_t SourceRemaining = 0;
+    size_t TempWriteRemaining = 0;
+    size_t TempReadRemaining = 0;
+    size_t DestRemaining = 0;
+    if (!getKnownRemainingObjectBytes(
+            First.Source, First.Start, AA, SourceRemaining) ||
+        !getKnownRemainingObjectBytes(
+            First.Destination, First.Start, AA, TempWriteRemaining) ||
+        !getKnownRemainingObjectBytes(
+            Second.Source, Second.Start, AA, TempReadRemaining) ||
+        !getKnownRemainingObjectBytes(
+            Second.Destination, Second.Start, AA, DestRemaining)) {
+        return false;
+    }
+    size_t SafeBytes = SourceRemaining;
+    if (TempWriteRemaining < SafeBytes) SafeBytes = TempWriteRemaining;
+    if (TempReadRemaining < SafeBytes) SafeBytes = TempReadRemaining;
+    if (DestRemaining < SafeBytes) SafeBytes = DestRemaining;
+    size_t SafeCount = SafeBytes / ElementBytes;
+    if (SafeCount > static_cast<size_t>(MaxRepresentableCount))
+        SafeCount = static_cast<size_t>(MaxRepresentableCount);
+    if (!First.IsRuntime) {
+        const __int128 RequiredBytes =
+            static_cast<__int128>(First.TripCount) *
+            static_cast<__int128>(ElementBytes);
+        if (RequiredBytes > static_cast<__int128>(SafeBytes)) return false;
+    } else if (SafeCount < 8) {
+        //容量不足以达到统一收益阈值时 fast path 永远不可达，不为其引入版本化开销。
+        return false;
+    }
+    //4.6 容量证明完成后再物化两端首地址，并校验 typed GEP 每一级均在已知对象内。
     GetElementPtrInst *SourceStart = materializeStartPointer(
         First.Source, First.IndVar, First.Start, First.PreHeader);
     if (!SourceStart ||
@@ -378,11 +958,12 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     Value *RuntimeGuard = nullptr;
     BasicBlock *FastBlock = nullptr;
     std::vector<Instruction *> RuntimeValues;
-    //4.6 常量次数直接生成字节数；运行期次数构造有工作量、收益阈值及字节乘法
-    //不溢出的 guard，并离线创建 fast block，失败路径统一回滚临时指令。
+    //4.7 常量次数直接生成已完成足迹证明的字节数；运行期次数同时守卫收益、
+    //字节乘法不溢出和完整对象容量，并离线创建 fast block。
     if (!First.IsRuntime) {
         ByteCount = ConstInt::newConstInt(
-            static_cast<int32_t>(First.TripCount * 4));
+            static_cast<int32_t>(
+                First.TripCount * static_cast<int64_t>(ElementBytes)));
     } else {
         BrInst *OldBranch = First.PreHeader->getBranchTerminator();
         if (!OldBranch || OldBranch->isConditional() ||
@@ -404,11 +985,13 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         Value *Start = Value::makeIntegerLike(Bound,
                                                static_cast<int32_t>(First.Start));
         Value *Zero = Value::makeIntegerLike(Bound, 0);
-        Value *Four = Value::makeIntegerLike(Bound, 4);
+        Value *ElementByteValue = Value::makeIntegerLike(
+            Bound, static_cast<int32_t>(ElementBytes));
         Value *MinCount = Value::makeIntegerLike(Bound, 8);
         Value *MaxCount = Value::makeIntegerLike(
-            Bound, std::numeric_limits<int32_t>::max() / 4);
-        if (!Start || !Zero || !Four || !MinCount || !MaxCount) {
+            Bound, static_cast<int32_t>(SafeCount));
+        if (!Start || !Zero || !ElementByteValue || !MinCount ||
+            !MaxCount) {
             delete DestStart;
             delete SourceStart;
             return false;
@@ -431,7 +1014,8 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
                                                 MinCount);
             auto *Fits = new BinaryInst(Count, BinaryInst::LE, MaxCount);
             auto *Guard = new BinaryInst(LargeEnough, BinaryInst::AND, Fits);
-            auto *Bytes = new BinaryInst(Count, BinaryInst::MUL, Four);
+            auto *Bytes = new BinaryInst(
+                Count, BinaryInst::MUL, ElementByteValue);
             if (!Insert(LargeEnough) || !Insert(Fits) || !Insert(Guard) ||
                 !Insert(Bytes))
                 goto PairFailure;
@@ -458,7 +1042,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
         if (Module *M = Module::getActiveModule())
             M->registerBuiltin(BuildInFunction::getDefaultMemmoveName());
     }
-    //4.7 运行期版本保留原两循环为慢路径，fast block 直达第二段出口；常量版本
+    //4.8 运行期版本保留原两循环为慢路径，fast block 直达第二段出口；常量版本
     //直接删除两段 load/store/GEP 及失去 use 的临时 alloca。
     if (FastBlock) {
         delete First.PreHeader->getBranchTerminator();
@@ -481,7 +1065,7 @@ bool LoopIdiomRecognizePass::transformTemporaryCopyPair(
     }
     return true;
 PairFailure:
-    //4.8 接入 CFG 前失败时按创建逆序删除 fast block、guard 与首地址，保持原循环不变。
+    //4.9 接入 CFG 前失败时按创建逆序删除 fast block、guard 与首地址，保持原循环不变。
     if (FastBlock) {
         FastBlock->eraseFromParent();
         delete FastBlock;
@@ -495,8 +1079,7 @@ PairFailure:
 //把单个连续填充或复制循环替换为memset或memcpy
 bool LoopIdiomRecognizePass::transformLoop(
     Function &F, Loop *L, SCEVResult &SE, DominatorTree &DT,
-    RangeInfo &RI,
-    bool &CFGChanged) {
+    RangeInfo &RI, BasicAAResult &AA, bool &CFGChanged) {
     //2. 仅处理 LoopSimplify 形态的最内层单位正步长循环，要求常量 trip count
     //正且无回绕；运行期合法性稍后结合退出谓词验证。
     if (!L || !L->isInnermost()) return false;
@@ -537,6 +1120,17 @@ bool LoopIdiomRecognizePass::transformLoop(
     LinearAccess DestAccess;
     if (!matchLinearAccess(DestGEP, IV->Phi, L, DestAccess))
         return false;
+    const size_t ElementBytes = DestAccess.ElementTy
+                                    ? DestAccess.ElementTy->getSize()
+                                    : 0;
+    if (ElementBytes == 0 ||
+        ElementBytes >
+            static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    const int64_t MaxRepresentableCount =
+        std::numeric_limits<int32_t>::max() /
+        static_cast<int64_t>(ElementBytes);
     if (TCI->ExitingBlock == TCI->Header &&
         Store->getParent() == TCI->Header)
         return false;
@@ -544,9 +1138,10 @@ bool LoopIdiomRecognizePass::transformLoop(
     int32_t ConstantByteCount = 0;
     if (IsConstant) {
         TripCount = *TCI->ConstantTripCount;
-        if (TripCount > std::numeric_limits<int32_t>::max() / 4)
+        if (TripCount > MaxRepresentableCount)
             return false;
-        ConstantByteCount = static_cast<int32_t>(TripCount * 4);
+        ConstantByteCount = static_cast<int32_t>(
+            TripCount * static_cast<int64_t>(ElementBytes));
     }
     LoadInst *SourceLoad = nullptr;
     GetElementPtrInst *SourceGEP = nullptr;
@@ -574,7 +1169,36 @@ bool LoopIdiomRecognizePass::transformLoop(
     if (!hasOnlyAllowedLoopInstructions(
             L, *TCI, *IV, Store, DestGEP, SourceLoad, SourceGEP, DT))
         return false;
-    //3. 物化目标及可选源首地址，并证明它们位于已知 alloca/global 对象边界内。
+    //3.先从精确起点求目标及可选源对象的剩余容量。常量次数必须静态证明完整
+    //count*元素字节均在界内；运行期以两端容量最小值形成 fast-path 上界。
+    size_t DestRemaining = 0;
+    if (!getKnownRemainingObjectBytes(
+            DestAccess, *IV->ConstantStart, AA, DestRemaining)) {
+        return false;
+    }
+    size_t SafeBytes = DestRemaining;
+    if (!IsMemset) {
+        size_t SourceRemaining = 0;
+        if (!getKnownRemainingObjectBytes(
+                SourceAccess, *IV->ConstantStart, AA,
+                SourceRemaining)) {
+            return false;
+        }
+        if (SourceRemaining < SafeBytes) SafeBytes = SourceRemaining;
+    }
+    size_t SafeCount = SafeBytes / ElementBytes;
+    if (SafeCount > static_cast<size_t>(MaxRepresentableCount))
+        SafeCount = static_cast<size_t>(MaxRepresentableCount);
+    if (IsConstant) {
+        if (static_cast<__int128>(ConstantByteCount) >
+            static_cast<__int128>(SafeBytes)) {
+            return false;
+        }
+    } else if (SafeCount < 8) {
+        //fast path 不可能达到统一收益阈值时不增加分支和不可达 intrinsic 块。
+        return false;
+    }
+    //3.1 容量证明完成后物化目标及可选源首地址，并继续校验 typed GEP 每级边界。
     auto *DestStart = materializeStartPointer(
         DestAccess, IV->Phi, *IV->ConstantStart, PreHeader);
     if (!DestStart ||
@@ -598,8 +1222,8 @@ bool LoopIdiomRecognizePass::transformLoop(
     BasicBlock *FastBlock = nullptr;
     Value *RuntimeGuard = nullptr;
     std::vector<Instruction *> RuntimeValues;
-    //3.2 常量次数直接计算 4*tripCount；运行期仅接受 iv < bound，且 bound 在
-    //preheader 可用。构造 count、最小收益和最大安全字节数 guard 以及 fast block。
+    //3.2 常量次数使用已完成足迹证明的字节数；运行期仅接受 iv < bound，且 bound
+    //在preheader可用。构造 count、收益阈值和完整对象容量 guard 以及 fast block。
     if (IsConstant) {
         ByteCount = ConstInt::newConstInt(ConstantByteCount);
     } else {
@@ -658,12 +1282,13 @@ bool LoopIdiomRecognizePass::transformLoop(
         Value *StartValue = Value::makeIntegerLike(
             Bound, static_cast<int32_t>(*IV->ConstantStart));
         Value *ZeroValue = Value::makeIntegerLike(Bound, 0);
-        Value *FourValue = Value::makeIntegerLike(Bound, 4);
+        Value *ElementByteValue = Value::makeIntegerLike(
+            Bound, static_cast<int32_t>(ElementBytes));
         Value *MinFastCount = Value::makeIntegerLike(Bound, 8);
         Value *MaxFastCount = Value::makeIntegerLike(
-            Bound, std::numeric_limits<int32_t>::max() / 4);
-        if (!StartValue || !ZeroValue || !FourValue || !MinFastCount ||
-            !MaxFastCount) {
+            Bound, static_cast<int32_t>(SafeCount));
+        if (!StartValue || !ZeroValue || !ElementByteValue ||
+            !MinFastCount || !MaxFastCount) {
             delete SourceStart;
             delete DestStart;
             return false;
@@ -699,12 +1324,13 @@ bool LoopIdiomRecognizePass::transformLoop(
         }
         auto *EnoughWork = new BinaryInst(Count, BinaryInst::GE,
                                           MinFastCount);
-        auto *FitsByteCount = new BinaryInst(Count, BinaryInst::LE,
+        auto *FitsFootprint = new BinaryInst(Count, BinaryInst::LE,
                                              MaxFastCount);
         auto *UseFastPath = new BinaryInst(EnoughWork, BinaryInst::AND,
-                                           FitsByteCount);
-        auto *Bytes = new BinaryInst(Count, BinaryInst::MUL, FourValue);
-        if (!InsertRuntime(EnoughWork) || !InsertRuntime(FitsByteCount) ||
+                                           FitsFootprint);
+        auto *Bytes = new BinaryInst(
+            Count, BinaryInst::MUL, ElementByteValue);
+        if (!InsertRuntime(EnoughWork) || !InsertRuntime(FitsFootprint) ||
             !InsertRuntime(UseFastPath) || !InsertRuntime(Bytes)) {
             for (auto It = RuntimeValues.rbegin();
                  It != RuntimeValues.rend(); ++It)
@@ -776,9 +1402,17 @@ PreservationStatus LoopIdiomRecognizePass::run(
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
+    auto &LA = FAM.getResult<LoopAccessAnalysis>(F);
+    auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
     bool Changed = false;
     bool CFGChanged = false;
     std::vector<Loop *> Loops = LI.getLoopsInPostOrder(true);
+    //2.先尝试完整二维复制视图消除；成功后内存图已经变化，立即返回让外层固定点
+    //重建LoopAccess、别名和SCEV，再继续处理其他候选。
+    for (Loop *L : Loops) {
+        if (transformAffineView(F, L, LA, SE, DT))
+            return PreservationStatus::none();
+    }
     //4. 优先预匹配全部简单复制循环并尝试消除相邻临时数组复制对；该变换跨两个循环，
     //成功后直接使全部分析失效并返回。
     std::vector<CopyLoopMatch> Copies;
@@ -793,13 +1427,13 @@ PreservationStatus LoopIdiomRecognizePass::run(
     for (const CopyLoopMatch &First : Copies) {
         for (const CopyLoopMatch &Second : Copies) {
             if (transformTemporaryCopyPair(
-                    F, First, Second, DT, RI, CFGChanged)) {
+                    F, First, Second, DT, RI, AA, CFGChanged)) {
                 return PreservationStatus::none();
             }
         }
     }
     for (Loop *L : Loops) {
-        Changed |= transformLoop(F, L, SE, DT, RI, CFGChanged);
+        Changed |= transformLoop(F, L, SE, DT, RI, AA, CFGChanged);
         if (CFGChanged) break;
     }
     if (!Changed) return PreservationStatus::all();
