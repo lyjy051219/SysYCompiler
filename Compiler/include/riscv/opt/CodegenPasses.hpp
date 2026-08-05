@@ -99,6 +99,13 @@ struct PreRAMachineDCEPass {
                                 MachineFunctionAnalysisManager &am);
 };
 
+// 分配前机器层循环不变量外提：把循环内不变且可安全推测的纯计算/可证安全 load
+// 移到 preheader，每轮循环只执行一次。
+struct PreRAMachineLICMPass {
+  MachinePreservationStatus run(MachineFunction &mf,
+                                MachineFunctionAnalysisManager &am);
+};
+
 // 分配后窥孔优化
 struct PostRAPeepholePass {
   MachinePreservationStatus run(MachineFunction &mf,

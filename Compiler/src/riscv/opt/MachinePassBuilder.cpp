@@ -202,6 +202,11 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
     addOptionalPass(MPM, Options, "pre-ra-guarded-loop-preheader",
                     PreRAGuardedLoopPreheaderPass());
   }
+  // 机器层循环不变量外提放在 pre-RA 流水线最末位（guarded-loop-preheader 之后），
+  // 消费 copy-prop/affine-combine/address-combine/local-CSE 的全部化简产物。
+  // A/B 开关：BACKEND_DISABLE_PASSES=pre-ra-machine-licm。
+  addOptionalPass(MPM, Options, "pre-ra-machine-licm",
+                  PreRAMachineLICMPass());
   return MPM;
 }
 

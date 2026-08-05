@@ -380,6 +380,7 @@ MachineLoopAnalysis::run(MachineFunction &mf,
         }
       }
     }
+    result.membersByHeader[header] = members;
     for (int block : members) {
       // 循环成员块深度加一;嵌套循环的块会被多个自然循环各加一次,得到嵌套深度。
       ++result.depth[static_cast<std::size_t>(block)];

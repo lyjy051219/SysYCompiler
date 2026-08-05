@@ -3,6 +3,7 @@
 #include "Registers.hpp"
 #include <cstdint>
 #include <iosfwd>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -92,6 +93,14 @@ struct MachineBasicBlock {
   std::vector<int> succs;
 };
 
+struct GlobalObject {
+  std::string name;
+  Variable *ir = nullptr;
+  bool constant = false;
+  int64_t size = 0;
+  int64_t align = 4;
+};
+
 struct MachineFunction {
   std::string name;
   Function *irFunction = nullptr;
@@ -101,6 +110,10 @@ struct MachineFunction {
   std::vector<StackObject> stackObjects;
   std::unordered_map<Value *, MachineReg> valueRegs;
   std::unordered_map<Value *, int> valueStackObjects;
+  // 模块级全局对象快照（符号名 -> 尺寸/常量性），lowerModule 时按
+  // MachineModule::globals 填充，std::map 保证确定性遍历序。
+  // 供机器层 pass（如 machineLICM 的 load 在界/常量性查询）使用，避免依赖 IR 层。
+  std::map<std::string, GlobalObject> globals;
   std::vector<PhysReg> usedCalleeSaved;
   int64_t maxOutgoingArgs = 0;
   int64_t frameSize = 0;
@@ -108,14 +121,6 @@ struct MachineFunction {
 
   MachineReg createVReg(RegClass rc);
   int createStackObject(int64_t size, int64_t align, std::string name);
-};
-
-struct GlobalObject {
-  std::string name;
-  Variable *ir = nullptr;
-  bool constant = false;
-  int64_t size = 0;
-  int64_t align = 4;
 };
 
 struct MachineModule {
