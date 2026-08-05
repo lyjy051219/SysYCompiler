@@ -208,6 +208,11 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   addOptionalPass(MPM, Options, "mul-add-fusion", MulAddFusionPass());
   // 乘加融合生成 smaddl 后，其乘数若来自 SXTW 可消除冗余符号扩展。
   addOptionalPass(MPM, Options, "redundant-sxtw-elim", RedundantSxtwElimPass());
+  // 机器层循环不变量外提放在 pre-RA 流水线最末位（redundant-sxtw-elim 之后），
+  // 消费 copy-prop/affine-combine/address-combine/local-CSE/mul-add-fusion/
+  // sxtw-elim 的全部化简产物。A/B 开关：BACKEND_DISABLE_PASSES=pre-ra-machine-licm。
+  addOptionalPass(MPM, Options, "pre-ra-machine-licm",
+                  PreRAMachineLICMPass());
   // 注：address-index-fold默认关闭。其收益依赖「地址是否可
   // 共享/外提」的判断，而复用只有寄存器分配后才可见；分配前逐次折叠会破坏
   // 循环不变地址的共享，对含循环不变地址复用的热循环反而增加动态指令数。

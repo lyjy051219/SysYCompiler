@@ -196,6 +196,16 @@ MachinePreservationStatus PreRAGuardedLoopPreheaderPass::run(
                  : MachinePreservationStatus::all();
 }
 
+// 分配前机器层循环不变量外提:移动指令到 preheader,可能新建 preheader 块,
+// 改动 CFG 与活跃区间,全部分析失效。
+MachinePreservationStatus
+PreRAMachineLICMPass::run(MachineFunction &mf,
+                          MachineFunctionAnalysisManager &am) {
+  const bool changed = runPreRAMachineLICM(mf, am);
+  return changed ? MachinePreservationStatus::none()
+                 : MachinePreservationStatus::all();
+}
+
 // 分配前机器级死代码删除:删除结果无人使用且无副作用的指令。
 // 只删指令不改块结构,故有改动时仍保留 CFG/循环/块频率分析。
 MachinePreservationStatus

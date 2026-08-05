@@ -80,6 +80,10 @@ public:
   struct Result {
     std::vector<int> depth;
     std::set<std::pair<int, int>> backedges;
+    // 按 header 排序的自然循环成员块下标集合（含 header 自身）。
+    // 增量字段：既有消费方（RegAlloc/BlockPlacement/GuardedLoopPreheader）
+    // 只读 depth/backedges，不受影响。供 machineLICM 等按 header 枚举循环。
+    std::map<int, std::set<int>> membersByHeader;
   };
 
   Result run(MachineFunction &mf, MachineFunctionAnalysisManager &am) const;

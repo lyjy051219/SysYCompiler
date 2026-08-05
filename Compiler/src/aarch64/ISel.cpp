@@ -2661,6 +2661,14 @@ MachineModule IRLowering::lowerModule() {
     }
   }
 
+  // 给每个机器函数写入模块级全局对象快照（符号名 -> GlobalObject），
+  // 供机器层 pass（如 machineLICM）做全局符号的在界/常量性查询。
+  for (MachineFunction &function : mm.functions) {
+    for (const GlobalObject &object : mm.globals) {
+      function.globals.emplace(object.name, object);
+    }
+  }
+
   return mm;
 }
 
