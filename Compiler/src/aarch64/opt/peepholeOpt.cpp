@@ -5,7 +5,7 @@
 //     一条带条件的分支(BLT/BGE/BEQ/BNE 等),需满足布尔值只此一处使用;
 //   - 全局地址复用:把同一全局的多次 LA 提到入口块共享一个寄存器;
 //   - 地址合并:把 ADDI/ADD 形成的“基址+常量”重定位到共同 pivot,缩短访存偏移;
-//   - 拷贝传播:顺着 COPY/F_COPY 把使用改写到源寄存器;
+//   - 拷贝传播:顺着 COPY/F_COPY 把使用改写到源寄存器(函数级,跨块);
 //   - 本地 CSE:块内消除重复的纯运算与 load,带完善的 invalidation 逻辑;
 //   - RA 后窥孔:删冗余拷贝/加零/NOP,做零元恒等式折叠。
 //
@@ -1426,18 +1426,168 @@ bool runPreRAAddressCombine(MachineFunction &mf) {
   return changed;
 }
 
-// Pass(RA 前):块内拷贝传播。逐块维护虚拟寄存器的替换表,把使用改写到拷贝的源;
-// 被重定义即清理相关映射。当拷贝的目标与源已相同、或目标的使用全在本块内时,可把
-// 该拷贝删除(块内使用已被改写,块外无使用)。返回是否有改动。
-bool runPreRACopyPropagation(MachineFunction &mf) {
-  bool changed = false;
-  const auto useBlocks = collectUseBlocks(mf);
-  const auto defCounts = collectVirtualDefCounts(mf);
-
+// 收集每个虚拟寄存器的全部使用位置:(块下标, 指令下标) 对,按块内顺序排列。
+// 供函数级拷贝传播判定“同块内位于拷贝定义之前的使用”。
+std::map<uint32_t, std::vector<std::pair<std::size_t, std::size_t>>>
+collectUsePositions(const MachineFunction &mf) {
+  std::map<uint32_t, std::vector<std::pair<std::size_t, std::size_t>>>
+      positions;
   for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size();
        ++blockIndex) {
+    const std::vector<MachineInstr> &instrs = mf.blocks[blockIndex].instrs;
+    for (std::size_t instrIndex = 0; instrIndex < instrs.size();
+         ++instrIndex) {
+      for (const MachineOperand &use : instrs[instrIndex].uses) {
+        if (isVirtualRegOperand(use)) {
+          positions[use.regValue.id].emplace_back(blockIndex, instrIndex);
+        }
+      }
+    }
+  }
+  return positions;
+}
+
+// 用标准不动点迭代计算支配集:dominators[i] 为支配块 i 的全部块(含自身)。
+// 入口块为 0;不可达块只支配自己。结果仅由 CFG 前驱决定,确定性可复现。
+// 支配集用位图表示(每块一个 bit),交运算为按字 AND,比 std::set 快约两个
+// 数量级(大函数如 82_long_func 的 452 块场景下避免 O(B^3) 集合并集开销)。
+using DomBitSet = std::vector<uint64_t>;
+
+std::vector<DomBitSet>
+computeDominators(const MachineCFGAnalysis::Result &cfg) {
+  const std::size_t blockCount = cfg.preds.size();
+  const std::size_t words = (blockCount + 63) / 64;
+  std::vector<DomBitSet> dominators(
+      blockCount, DomBitSet(words, 0));
+  if (blockCount == 0) {
+    return dominators;
+  }
+  dominators[0][0] = 1;  // 入口块只支配自己
+  const uint64_t validMask =
+      (blockCount % 64 == 0)
+          ? ~uint64_t(0)
+          : ((uint64_t(1) << (blockCount % 64)) - 1);
+  for (std::size_t i = 1; i < blockCount; ++i) {
+    // 其余块先假设支配所有块,再按 dom(n) = {n} ∪ ⋂ dom(pred) 迭代收缩。
+    for (std::size_t w = 0; w < words; ++w) {
+      dominators[i][w] = ~uint64_t(0);
+    }
+    dominators[i][words - 1] &= validMask;
+  }
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (std::size_t i = 1; i < blockCount; ++i) {
+      DomBitSet next(words, ~uint64_t(0));
+      bool firstPred = true;
+      for (int pred : cfg.preds[i]) {
+        if (pred < 0 || pred >= static_cast<int>(blockCount)) {
+          continue;
+        }
+        const DomBitSet &predDoms =
+            dominators[static_cast<std::size_t>(pred)];
+        if (firstPred) {
+          next = predDoms;
+          firstPred = false;
+        } else {
+          for (std::size_t w = 0; w < words; ++w) {
+            next[w] &= predDoms[w];
+          }
+        }
+      }
+      if (firstPred) {
+        std::fill(next.begin(), next.end(), uint64_t(0));
+      }
+      next[i / 64] |= uint64_t(1) << (i % 64);
+      if (next != dominators[i]) {
+        dominators[i] = std::move(next);
+        changed = true;
+      }
+    }
+  }
+  return dominators;
+}
+
+// 查询块 dominator 是否支配块 dominated(位图 O(1) 判位)。
+bool dominatesBlock(const std::vector<DomBitSet> &dominators,
+                    std::size_t dominator, std::size_t dominated) {
+  const DomBitSet &set = dominators[dominated];
+  return (set[dominator / 64] >> (dominator % 64)) & 1;
+}
+
+// Pass(RA 前):函数级拷贝传播。
+// 第一遍沿整个函数收集“源/目标均单定义”的干净拷贝(含链式解析),并用可达性
+// 守卫把关:拷贝块必须支配目标的所有使用块(支配守卫),且同块内不存在位于拷贝
+// 定义之前的使用(块内顺序守卫)。满足守卫的候选进入函数级替换表,其全部使用可
+// 改写、拷贝本身可删除;不满足的维持旧块内行为(只传播块内使用、保留拷贝)。
+// 第二遍逐块用“函数级表 + 块内增量”改写使用,并删除已全量改写的拷贝与恒等拷贝。
+// 正确性依据:源/目标均单定义 ⇒ 源的值在整个函数内恒定不变,传播不跨越任何
+// 重定义(虚拟源唯一定义;物理源仅允许 x0,永不重定义),故跨块改写安全。
+bool runPreRACopyPropagation(MachineFunction &mf,
+                             MachineFunctionAnalysisManager &am) {
+  const std::size_t blockCount = mf.blocks.size();
+  const auto useBlocks = collectUseBlocks(mf);
+  const auto usePositions = collectUsePositions(mf);
+  const auto defCounts = collectVirtualDefCounts(mf);
+  const auto &cfg = am.getResult<MachineCFGAnalysis>(mf);
+  const auto dominators = computeDominators(cfg);
+
+  // 第一遍:构建函数级替换表 dst.id -> 解析后的源,并标记可删除的拷贝目标。
+  std::map<uint32_t, MachineReg> globalReplacements;
+  std::set<uint32_t> propagated;  // 已全量传播、拷贝可删除的目标寄存器
+  for (std::size_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
+    const std::vector<MachineInstr> &instrs = mf.blocks[blockIndex].instrs;
+    for (std::size_t instrIndex = 0; instrIndex < instrs.size();
+         ++instrIndex) {
+      const MachineInstr &instr = instrs[instrIndex];
+      if (!isCopyPropagationCandidate(instr, defCounts)) {
+        continue;
+      }
+      const MachineReg dst = instr.defs[0].regValue;
+      const MachineReg src =
+          resolveReplacement(instr.uses[0].regValue, globalReplacements);
+      if (sameRegister(dst, src)) {
+        // 恒等拷贝(dst == 解析后的源)直接可删,不进入替换表。
+        propagated.insert(dst.id);
+        continue;
+      }
+
+      // 支配守卫:拷贝块必须支配目标的所有使用块(可达性守卫)。
+      bool guarded = true;
+      auto uses = useBlocks.find(dst.id);
+      if (uses != useBlocks.end()) {
+        for (std::size_t useBlock : uses->second) {
+          if (!dominatesBlock(dominators, blockIndex, useBlock)) {
+            guarded = false;
+            break;
+          }
+        }
+      }
+      // 块内顺序守卫:同块内位于拷贝定义之前的使用不允许改写(与旧块内语义一致)。
+      if (guarded) {
+        auto positions = usePositions.find(dst.id);
+        if (positions != usePositions.end()) {
+          for (const auto &[useBlock, useIndex] : positions->second) {
+            if (useBlock == blockIndex && useIndex < instrIndex) {
+              guarded = false;
+              break;
+            }
+          }
+        }
+      }
+      if (!guarded) {
+        continue;
+      }
+      globalReplacements[dst.id] = src;
+      propagated.insert(dst.id);
+    }
+  }
+
+  // 第二遍:逐块改写使用并删除已全量改写的拷贝。
+  bool changed = false;
+  for (std::size_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
     MachineBasicBlock &block = mf.blocks[blockIndex];
-    std::map<uint32_t, MachineReg> replacements;
+    std::map<uint32_t, MachineReg> replacements = globalReplacements;
     std::vector<MachineInstr> rewritten;
     rewritten.reserve(block.instrs.size());
 
@@ -1455,8 +1605,7 @@ bool runPreRACopyPropagation(MachineFunction &mf) {
         const MachineReg src =
             resolveReplacement(instr.uses[0].regValue, replacements);
         replacements[dst.id] = src;
-        if (sameRegister(dst, src) ||
-            allUsesInBlock(dst.id, blockIndex, useBlocks)) {
+        if (sameRegister(dst, src) || propagated.count(dst.id) != 0) {
           changed = true;
           continue;
         }

@@ -120,8 +120,10 @@ MachineFunctionPassManager buildPreRALinearPipeline(
   return MPM;
 }
 
-// 分配前固定点迭代的核心体:只放需要反复喂回的 拷贝传播 + 机器 DCE,
-// 这两者互相触发新的优化机会,故放进固定点循环反复运行至收敛。
+// 分配前固定点迭代的核心体:拷贝传播 + 机器 DCE。
+// 拷贝传播已是函数级单遍全量改写(跨块),DCE 紧随其后清理变死的结果,
+// 一轮即可收敛;第 2~3 轮为纯编译开销(评测 §1.18:关固定点后运行
+// geomean 0.965、代码不变、编译 -5.4%),故固定点最多 1 轮。
 MachineFunctionPassManager buildPreRAFixedPointCorePipeline(
     const BackendOptions &Options) {
   MachineFunctionPassManager MPM;
@@ -168,7 +170,8 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
   addOptionalPass(MPM, Options, "pre-ra-global-address-reuse",
                   PreRAGlobalAddressReusePass());
 
-  // copy-prop / local CSE / DCE 里，只有 copy-prop 和 DCE 需要反复喂回；
+  // copy-prop / local CSE / DCE 里，copy-prop 为函数级单遍全量改写，DCE 一轮
+  // 即可清掉变死的结果，固定点最多 1 轮（P1#8：第 2~3 轮为纯编译开销）；
   // local CSE 只跑一轮，减少重复 local CSE 带来的活跃区间膨胀。
   if (passDisabled(Options, "pre-ra-fixed-point")) {
     MachineFunctionPassManager linear = buildPreRALinearPipeline(Options);
@@ -191,7 +194,7 @@ MachinePassBuilder::buildPreRAOptPipeline(const BackendOptions &Options) {
     MachineFunctionPassManager core = buildPreRAFixedPointCorePipeline(Options);
     if (!core.empty()) {
       MPM.addPass(createMachineFixedPointPass<MachineFunction>(
-          std::move(core), 3));
+          std::move(core), 1));
     }
   }
   // 带 guard 的循环预头默认关闭（BACKEND_ENABLE_GUARDED_LOOP_PREHEADER 打开）。

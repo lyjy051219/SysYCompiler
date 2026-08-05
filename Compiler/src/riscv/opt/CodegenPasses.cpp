@@ -119,11 +119,11 @@ PreRAAddressCombinePass::run(MachineFunction &mf,
 }
 
 // 分配前拷贝传播:把对拷贝源的引用直接替换成原始寄存器,消除中间拷贝。
+// 函数级(跨块)实现,内部经分析管理器取 CFG 计算支配守卫。
 MachinePreservationStatus
 PreRACopyPropagationPass::run(MachineFunction &mf,
                               MachineFunctionAnalysisManager &am) {
-  (void)am;
-  const bool changed = runPreRACopyPropagation(mf);
+  const bool changed = runPreRACopyPropagation(mf, am);
   return changed ? preserveBlockStructureAnalyses()
                  : MachinePreservationStatus::all();
 }
