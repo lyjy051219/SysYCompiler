@@ -80,6 +80,7 @@ bool isStoreOpcode(Opcode opcode) {
 bool isTerminatorOpcode(Opcode opcode) {
   switch (opcode) {
   case Opcode::RET:
+  case Opcode::TAILCALL:
   case Opcode::BEQZ:
   case Opcode::BNEZ:
   case Opcode::BEQ:

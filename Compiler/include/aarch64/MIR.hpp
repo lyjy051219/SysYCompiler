@@ -35,6 +35,12 @@ enum class Opcode {
   SEQZ, SNEZ, FEQ_S, FLT_S, FLE_S, FADD_S, FSUB_S, FMUL_S,
   FDIV_S, FCVT_W_S, FCVT_S_W, LBU, SB, LW, SW, LD, SD, FLW, FSW, GEP,
   MEMCPY_INLINE, MEMSET_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J,
+  // ARM64 专用尾调用：把"实参 COPY 就位 + 直接跳转"一体化的出口指令。
+  // 语义 = 尾声恢复（x30/callee-saved 按 functionContainsCall 与
+  // gprCalleeSavedRegsToSave 决策）+ 回收栈帧 + 不写 x30 的 b 跳转，被调
+  // 函数直接返回给本函数的调用者。实参物理寄存器以 implicitUses 保护（与
+  // CALL 一致），使寄存器分配器保留调用点前的实参 COPY。
+  TAILCALL,
   PHI, SELECT, PARALLEL_COPY,
   // ARM64 专用：32×32→64 有符号长乘（smull xd, wn, wm）。乘数按 w 视图读取，
   // 结果写入 64 位 x 寄存器，与真 64 位乘法 MUL（mul xd, xn, xm）严格区分。

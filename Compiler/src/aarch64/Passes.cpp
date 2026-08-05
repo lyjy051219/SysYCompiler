@@ -27,10 +27,11 @@ void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
                               const std::string &newLabel);
 int findBlockIndex(const MachineFunction &mf, const std::string &label);
 
-// 判断操作码是否为终结指令(返回、条件分支、无条件跳转)。
+// 判断操作码是否为终结指令(返回、条件分支、无条件跳转、尾调用)。
 bool isTerminator(Opcode opcode) {
   switch (opcode) {
   case Opcode::RET:
+  case Opcode::TAILCALL:
   case Opcode::BEQZ:
   case Opcode::BNEZ:
   case Opcode::BEQ:
@@ -44,9 +45,10 @@ bool isTerminator(Opcode opcode) {
   }
 }
 
-// J 与 RET 不会顺序落入下一块。
+// J、RET 与 TAILCALL 不会顺序落入下一块。
 bool isNoFallthroughTerminator(Opcode opcode) {
-  return opcode == Opcode::RET || opcode == Opcode::J;
+  return opcode == Opcode::RET || opcode == Opcode::J ||
+         opcode == Opcode::TAILCALL;
 }
 
 // 指令是否为终结指令:显式 terminator 标记或操作码属于终结类。

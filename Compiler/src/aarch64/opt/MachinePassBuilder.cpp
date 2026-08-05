@@ -84,6 +84,16 @@ bool passDisabled(const BackendOptions &options, const char *passName) {
   return nameListDisables(envDisabled, passName);
 }
 
+} // namespace
+
+// 对外的统一开关查询:指令选择阶段(lowerCall 的 tail-call 判定)与
+// MachinePassBuilder 内部共用同一份 BACKEND_DISABLE_PASSES 语义。
+bool machinePassDisabled(const BackendOptions &options, const char *passName) {
+  return passDisabled(options, passName);
+}
+
+namespace {
+
 // 按开关有条件地把一个 pass 加入流水线:若该 pass 被关闭则跳过,否则追加。
 template <typename PassT>
 void addOptionalPass(MachineFunctionPassManager &MPM,

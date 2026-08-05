@@ -27,7 +27,7 @@ void emitAssembly(Module &module, std::ostream &out,
   runCodeGenPrepare(module);
 
   // 指令选择：中端 IR lower 为带虚拟寄存器的 MIR
-  IRLowering lowering(module);
+  IRLowering lowering(module, codegenOptions);
   MachineModule machine = lowering.lowerModule();
 
   // 建立分析管理器并注册所有后端分析

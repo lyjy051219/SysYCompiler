@@ -417,7 +417,10 @@ void appendImplicitDefs(const MachineInstr &instr, bool floatBank,
       defs.push_back(physicalNode(reg));
     }
   }
-  if (instr.opcode == Opcode::CALL) {
+  // TAILCALL 与 CALL 一样是调用边界:进入被调函数后本函数所有 caller-saved
+  // 值即失效(实参除外——已由调用点前的 COPY 就位并被 TAILCALL 隐式使用),
+  // 与 CALL 同样并入定义集,保证跨调用活跃的值与它们干涉。
+  if (instr.opcode == Opcode::CALL || instr.opcode == Opcode::TAILCALL) {
     const RegClass rc = floatBank ? RegClass::FPR32 : RegClass::GPR64;
     for (PhysReg reg : callerSavedRegs(rc)) {
       const RegisterInfo &info = getRegisterInfo(reg);
@@ -1535,7 +1538,8 @@ rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
 
       // 调用边界清空块级缓存:跨调用的临时寄存器要占用 caller-saved 之外的颜色,
       // 活跃区间跨调用会显著抬高干涉度;调用后重新加载仍比逐 use 重载省。
-      if (instr.opcode == Opcode::CALL) {
+      // TAILCALL 同样视为调用边界(其后无活跃值,清缓存仅为保持一致)。
+      if (instr.opcode == Opcode::CALL || instr.opcode == Opcode::TAILCALL) {
         slotCache.clear();
       }
 

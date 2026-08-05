@@ -141,6 +141,8 @@ const char *opcodeName(Opcode opcode) {
     return "MEMSET_INLINE";
   case Opcode::CALL:
     return "CALL";
+  case Opcode::TAILCALL:
+    return "TAILCALL";
   case Opcode::RET:
     return "RET";
   case Opcode::BEQZ:

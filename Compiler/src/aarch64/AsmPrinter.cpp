@@ -1223,6 +1223,38 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
     }
     out_ << "    bl " << instr.uses.front().symbol << '\n';
     return;
+  case Opcode::TAILCALL:
+    // 尾调用：与尾声完全一致地恢复返回地址 x30（本函数含普通调用时）与
+    // callee-saved、回收栈帧，再用不写 x30 的 b 直接跳转到被调函数。被调
+    // 函数直接返回给本函数的调用者，本函数不再执行 epilogue。实参已由调用
+    // 点前的 COPY 序列就位于 a0-a7/fa0-fa7（caller-saved，不受本段恢复影响）。
+    if (currentFunction_) {
+      const bool containsCall = functionContainsCall(*currentFunction_);
+      const std::vector<PhysReg> savedGprs =
+          gprCalleeSavedRegsToSave(*currentFunction_);
+      const std::vector<PhysReg> savedFprs =
+          fprCalleeSavedRegsToSave(*currentFunction_);
+      int64_t offset = currentFunction_->frameSize;
+      if (containsCall) {
+        offset -= 8;
+        emitSpRelative(out_, /*isLoad=*/true, PhysReg::RA, offset,
+                       /*isFloat=*/false);
+      }
+      for (PhysReg reg : savedGprs) {
+        offset -= 8;
+        emitSpRelative(out_, true, reg, offset, false);
+      }
+      for (PhysReg reg : savedFprs) {
+        offset -= 8;
+        emitSpRelative(out_, true, reg, offset, /*isFloat=*/true);
+      }
+      emitStackAdjust(currentFunction_->frameSize);
+    }
+    if (instr.uses.empty() || instr.uses.front().kind != OperandKind::Global) {
+      throw BackendError("malformed TAILCALL instruction");
+    }
+    out_ << "    b " << instr.uses.front().symbol << '\n';
+    return;
   case Opcode::BNEZ:
     // 非零跳转：cbnz。
     if (instr.uses.size() < 2 || instr.uses[1].kind != OperandKind::Block) {

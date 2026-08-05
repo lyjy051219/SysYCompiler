@@ -10,6 +10,11 @@
 
 namespace aarch64 {
 
+// 判断某可选优化是否被关闭：先看 options 显式禁用列表，再看环境变量
+// BACKEND_DISABLE_PASSES（逗号/分号/空格分隔的 pass 名，或 all 关闭全部）。
+// 机器层 pass 与指令选择（如 tail-call）共用同一开关机制，保证 A/B 可比。
+bool machinePassDisabled(const BackendOptions &options, const char *passName);
+
 class MachinePassBuilder {
 public:
   MachinePassBuilder() = default;

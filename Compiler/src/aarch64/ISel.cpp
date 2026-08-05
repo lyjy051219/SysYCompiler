@@ -16,6 +16,7 @@
 
 #include "aarch64/Frame.hpp"
 #include "aarch64/Target.hpp"
+#include "aarch64/opt/MachinePassBuilder.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -197,6 +198,9 @@ struct DivRemKeyHash {
 // lowering 过程中跨指令共享的状态:各 Value 的地址、各 IR 块的标签、以及
 // 当前块内的除法商复用表。除法复用只在块内有效,因此进入新块要清表。
 struct LoweringState {
+  // 后端选项快照:lowerCall 据此查询 A/B 开关(BACKEND_DISABLE_PASSES=tail-call
+  // 时关闭尾调用降低)。
+  const BackendOptions *options = nullptr;
   std::unordered_map<Value *, Address> addresses;
   std::unordered_map<BasicBlock *, std::string> blockLabels;
   std::unordered_map<DivRemKey, MachineReg, DivRemKeyHash> divRemQuotients;
@@ -1609,6 +1613,12 @@ void lowerBinary(MachineFunction &mf, MachineBasicBlock &mbb,
 // lower return。有返回值时按类别拷入 a0 / fa0,并在 RET 指令上记录隐式使用该
 // 返回寄存器(供活跃性分析知道返回值在此被读取)。
 void lowerRet(MachineFunction &mf, MachineBasicBlock &mbb, RetInst &inst) {
+  // 尾调用已把本块出口换为 TAILCALL(终结指令,直接 b 到被调函数),紧邻的
+  // ret 不再生成任何代码:返回值 COPY 与 epilogue 均被跳过——被调函数将把
+  // 结果直接带给本函数的调用者。
+  if (!mbb.instrs.empty() && mbb.instrs.back().opcode == Opcode::TAILCALL) {
+    return;
+  }
   Value *retValue = useValue(inst, 0);
   if (retValue) {
     MachineReg src = valueReg(mf, mbb, retValue);
@@ -2353,7 +2363,67 @@ void lowerUnsupported(MachineFunction &mf, MachineBasicBlock &mbb,
 // lower call。先识别 memcpy/memset/memmove 内建走各自的特化路径;其余按 RV 调用
 // 约定传参:整数/指针用 a0-a7,浮点用 fa0-fa7,溢出的参数按 8 字节槽压栈(栈大小
 // 16 字节对齐)。先物化所有实参再落位以保并行拷贝语义;调用前后调整 sp;有返回值
-// 时从 a0/fa0 拷回结果寄存器。
+// 时从 a0/fa0 拷回结果寄存器。满足尾调用门槛时改为 TAILCALL 出口。
+//
+// 判断调用是否可安全按尾调用降低。中端 markTailCalls(TRE)是标记唯一生成点，
+// 但标记在后继 pass 中不保值(UnifyFuncExits 会把 call;ret 改写为
+// call;br@unified_exit，FunctionMemoization 会清标记)，这里在消费点重新验证：
+//   - IR 形状:call 紧邻 ret，且返回值形状精确匹配(void→void；非 void→ret 的
+//     操作数就是该 call，无 PHI/位宽转换包装)；
+//   - 实参闭包:任一实参的操作数闭包中不得出现 AllocaInst(与 TRE 同判据，
+//     防止尾跳回收本帧后实参里的栈地址失效；Global2Local 等后期 pass 可能
+//     在标记之后引入栈对象，故消费点必须重验)。
+bool isTailCallCandidate(CallInst &inst) {
+  if (!inst.isTailCall()) {
+    return false;
+  }
+  // 形状:call 必须是块内最后一条有效指令,紧随其后是 ret。
+  Instruction *next = inst.getNext();
+  auto *ret = dynamic_cast<RetInst *>(next);
+  if (!ret) {
+    return false;
+  }
+  Value *retValue = ret->getReturnValue();
+  if (retValue == nullptr) {
+    // void 返回:call 也必须返回 void。
+    if (!isVoidType(inst.getIRType())) {
+      return false;
+    }
+  } else if (retValue != &inst) {
+    // 非 void 返回:必须精确返回该 call 的结果。
+    return false;
+  }
+  // 实参闭包 alloca 检查:反向追溯每个实参的操作数闭包。
+  std::unordered_set<Value *> visited;
+  std::vector<Value *> worklist;
+  auto &uses = inst.getUserList();
+  for (std::size_t i = 1; i < uses.size(); ++i) {
+    Value *arg = uses[i]->getValue();
+    if (arg) {
+      worklist.push_back(arg);
+    }
+  }
+  while (!worklist.empty()) {
+    Value *curr = worklist.back();
+    worklist.pop_back();
+    if (!curr || visited.count(curr)) {
+      continue;
+    }
+    visited.insert(curr);
+    if (dynamic_cast<AllocaInst *>(curr)) {
+      return false;
+    }
+    if (auto *operandUser = dynamic_cast<User *>(curr)) {
+      for (const auto &use : operandUser->getUserList()) {
+        if (use && use->getValue()) {
+          worklist.push_back(use->getValue());
+        }
+      }
+    }
+  }
+  return true;
+}
+
 void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
                LoweringState &state, CallInst &inst) {
   Value *callee = requiredUseValue(inst, 0, "call instruction");
@@ -2429,10 +2499,19 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
   }
 
   stackBytes = ((stackBytes + 15) / 16) * 16;
+  // 尾调用判定:中端标记 + 消费点形状重验 + 首版门槛(实参全部走寄存器,
+  // 无栈参,规避出参区与帧回收的交互)+ A/B 开关(disable:tail-call)。
+  // 有栈参时降级为普通调用,正确性不受影响。
+  const bool tailCall =
+      isTailCallCandidate(inst) &&
+      (state.options == nullptr ||
+       !machinePassDisabled(*state.options, "tail-call")) &&
+      stackBytes == 0;
   // 外传栈参数改用帧底部预留的固定区(FrameLowering 按 maxOutgoingArgs 预留),
   // 不在调用点动态下调 sp。动态下调会让活跃跨调用点、相对 sp 寻址的溢出值在 sp
   // 变动后取到错误偏移,大量栈参数时导致崩溃。此处记录本函数最大外传字节数。
-  if (stackBytes > mf.maxOutgoingArgs) {
+  // 尾调用无栈参且不再返回,不占用出参区。
+  if (!tailCall && stackBytes > mf.maxOutgoingArgs) {
     mf.maxOutgoingArgs = stackBytes;
   }
   std::vector<MachineReg> argRegs;
@@ -2472,6 +2551,23 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
       storeOpcode = Opcode::SD;
     }
     appendStore(mbb, storeOpcode, argRegs[i], stackSlot);
+  }
+
+  if (tailCall) {
+    // 尾调用:实参 COPY 已就位,出口换为不写返回地址寄存器 x30 的 TAILCALL
+    // (AsmPrinter 展开为:恢复 x30/callee-saved + 回收栈帧 + b 直接跳转)。
+    // 返回值由被调函数直接带给本函数的调用者,不生成结果 COPY,也不走本函数
+    // 的 epilogue。implicitUses 与 CALL 一致,防止分配器把实参 COPY 当死码删除。
+    MachineInstr tail;
+    tail.opcode = Opcode::TAILCALL;
+    tail.uses.push_back(MachineOperand::global(name));
+    for (PhysReg reg : argPhysRegs) {
+      tail.implicitUses.push_back(reg);
+    }
+    tail.sideEffects = true;
+    tail.terminator = true;
+    mbb.instrs.push_back(std::move(tail));
+    return;
   }
 
   MachineInstr call;
@@ -2648,7 +2744,8 @@ void lowerInstruction(MachineFunction &mf, MachineBasicBlock &mbb,
 
 } // namespace
 
-IRLowering::IRLowering(Module &module) : module_(module) {}
+IRLowering::IRLowering(Module &module, const BackendOptions &options)
+    : module_(module), options_(options) {}
 
 // lower 整个模块:先处理全局对象,再逐个函数 lower 为机器函数。
 MachineModule IRLowering::lowerModule() {
@@ -2723,6 +2820,7 @@ MachineFunction IRLowering::lowerFunction(Function &function) {
   }
 
   LoweringState state;
+  state.options = &options_;
   for (const MachineBasicBlock &mbb : mf.blocks) {
     if (mbb.irBlock) {
       state.blockLabels[mbb.irBlock] = mbb.label;

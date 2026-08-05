@@ -33,6 +33,7 @@ int findBlockIndex(const MachineFunction &mf, const std::string &label);
 bool isTerminator(Opcode opcode) {
   switch (opcode) {
   case Opcode::RET:
+  case Opcode::TAILCALL:
   case Opcode::BEQZ:
   case Opcode::BNEZ:
   case Opcode::BEQ:
@@ -46,9 +47,10 @@ bool isTerminator(Opcode opcode) {
   }
 }
 
-// 无条件跳转 J 与返回 RET 不会顺序落入下一块。
+// 无条件跳转 J、返回 RET 与尾调用 TAILCALL 不会顺序落入下一块。
 bool isNoFallthroughTerminator(Opcode opcode) {
-  return opcode == Opcode::RET || opcode == Opcode::J;
+  return opcode == Opcode::RET || opcode == Opcode::J ||
+         opcode == Opcode::TAILCALL;
 }
 
 // 指令是否为终结指令:显式 terminator 标记或操作码属于终结类。
