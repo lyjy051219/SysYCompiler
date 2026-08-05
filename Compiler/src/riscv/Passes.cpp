@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <map>
@@ -501,15 +502,60 @@ bool conditionProducerFoldsIntoBranch(
   }
 }
 
+// 在已降级指令序列中倒序查找定义某寄存器的最后一条指令。
+// 命中返回指向该指令的逆向迭代器;未找到返回 rend()。虚拟寄存器是单赋值
+// (SSA),故块内任意位置的定义即为唯一定义,不存在被覆盖问题。
+std::vector<MachineInstr>::const_reverse_iterator
+findLastDefInLowered(const std::vector<MachineInstr> &lowered,
+                     const MachineReg &reg) {
+  for (auto it = lowered.rbegin(); it != lowered.rend(); ++it) {
+    if (it->defs.size() == 1 && it->defs.front().kind == OperandKind::Reg &&
+        sameMachineReg(it->defs.front().regValue, reg)) {
+      return it;
+    }
+  }
+  return lowered.rend();
+}
+
+// 判断 SELECT 是否为最小/最大形态:条件由 SLT/SLTU(a, b) 产生,且两分支值
+// 恰为 a 与 b(任一顺序),即 dst = (a<b) ? a : b 或 (a<b) ? b : a。
+// 该形态的掩码展开固定 4 条纯算术指令、无分支无跳转,在热循环(数组下标
+// 夹取 max(i,0)、min/max 归约)中实测收益明确,列入白名单形态。
+bool isMinMaxShape(const std::vector<MachineInstr> &lowered,
+                   const MachineReg &cond, const MachineReg &trueValue,
+                   const MachineReg &falseValue) {
+  auto producer = findLastDefInLowered(lowered, cond);
+  if (producer == lowered.rend() ||
+      (producer->opcode != Opcode::SLT && producer->opcode != Opcode::SLTU) ||
+      producer->uses.size() != 2 || !isRegUse(*producer, 0) ||
+      !isRegUse(*producer, 1)) {
+    return false;
+  }
+  const MachineReg a = producer->uses[0].regValue;
+  const MachineReg b = producer->uses[1].regValue;
+  return (sameMachineReg(trueValue, a) && sameMachineReg(falseValue, b)) ||
+         (sameMachineReg(trueValue, b) && sameMachineReg(falseValue, a));
+}
+
 // 无分支 SELECT 降级:把 dst = SELECT(cond, trueValue, falseValue) 用算术+掩码
 // 实现,避免生成条件分支。仅当结果为整型 GPR、cond 是已知布尔(0/1)、两分支
 // 寄存器类一致时适用。掩码 mask = 0 - cond(cond=1 得全 1,cond=0 得全 0):
 //   - 若两分支相差一个增量(true = false + inc),则 dst = false + (inc & mask);
 //   - 否则用异或差值法 dst = false ^ ((true ^ false) & mask);
 //   - 若条件可折叠进分支则保留原 SELECT 交给后续处理。
+// P1#7 整改(默认关 + 白名单):RISC-V 无 csel,掩码展开固定 3~4 条指令且形成
+// 串行依赖链,qemu/分支友好的分支实现往往更短,全量掩码展开实测负收益。
+// 故掩码展开默认只对白名单形态开启:
+//   A. 条件累加(true = false + inc):3 条指令,热循环实测大赢(matmul 2.2x);
+//   B. 最小/最大(min/max):仅当条件不能折叠进分支时启用,4 条指令无跳转;
+// 其余形态一律保留 SELECT 交给后续分支实现。设置环境变量
+// BACKEND_ENABLE_BRANCHLESS_SELECT_ALL=1 可恢复旧的"全量展开"行为(A/B 用)。
 // 逐块重建指令序列,同时维护已知布尔集合。返回是否发生过改写。
 bool lowerBranchlessSelects(MachineFunction &mf) {
   bool changed = false;
+  // 恢复旧行为的环境开关(仅用于 A/B 对照,非默认路径)。
+  const bool aggressive =
+      std::getenv("BACKEND_ENABLE_BRANCHLESS_SELECT_ALL") != nullptr;
   const auto useCounts = collectVirtualUseCounts(mf);
   for (MachineBasicBlock &block : mf.blocks) {
     std::vector<MachineReg> knownBooleans;
@@ -545,8 +591,11 @@ bool lowerBranchlessSelects(MachineFunction &mf) {
             lowered.push_back(
                 makeRegInstr(addOpcode, dst, {falseValue, selected}));
           } else if (!conditionProducerFoldsIntoBranch(lowered, cond,
-                                                       useCounts)) {
+                                                       useCounts) &&
+                     (aggressive ||
+                      isMinMaxShape(lowered, cond, trueValue, falseValue))) {
             // 通用异或差值法:mask = 0-cond,dst = false ^ ((true ^ false) & mask)。
+            // 默认仅白名单形态 B(min/max)启用;aggressive 时恢复旧全量展开。
             const MachineReg mask = mf.createVReg(dst.rc);
             const MachineReg difference = mf.createVReg(dst.rc);
             const MachineReg selected = mf.createVReg(dst.rc);
