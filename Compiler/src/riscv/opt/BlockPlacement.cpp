@@ -4,11 +4,13 @@
 #include "riscv/Target.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,10 +51,15 @@ struct WeightedEdge {
 };
 
 // 一种候选布局的代价，按字典序比较；靠前的维度权重更高。
+// P1#10:新增 brokenUnknownFallthroughWeight(方向未知 50/50 的条件分支上被
+// 打断的 fallthrough 边权——这类分支按"不推翻原方向"规则保持原方向)与
+// takenConditionalWeight(条件分支被实际执行侧的总边权,诊断用)。
 struct LayoutCost {
   uint64_t dynamicJumpExecutions = 0;   // 显式跳转的动态执行次数（最重要）
   uint64_t staticJumpCount = 0;         // 静态跳转指令条数（代码体积）
   uint64_t brokenFallthroughWeight = 0; // 未能成为 fallthrough 的边权之和
+  uint64_t brokenUnknownFallthroughWeight = 0; // 方向未知分支上的断边权
+  uint64_t takenConditionalWeight = 0;  // 条件分支执行侧总权重
   uint64_t blockDisplacement = 0;       // 块相对原位置的总位移（稳定性 tie-break）
 
   bool operator<(const LayoutCost &other) const {
@@ -132,6 +139,96 @@ bool verificationEnabled() {
 // 是否输出布局统计信息（由环境变量控制），用于调参与诊断。
 bool statisticsEnabled() {
   return std::getenv("BACKEND_BLOCK_PLACEMENT_STATS") != nullptr;
+}
+
+// P1#10 A/B 开关:BACKEND_DISABLE_PASSES 含 block-placement-rotate(或 all)时,
+// 关闭"真循环旋转 + trip count 注入"(供 backend_ab.py 的 disable:block-placement-rotate
+// 配置做 A/B 对照);与 MachineAnalysis 中 blockPlacementRotateDisabled 保持同一语义。
+bool blockPlacementRotateDisabled() {
+  const char *raw = std::getenv("BACKEND_DISABLE_PASSES");
+  if (raw == nullptr) {
+    return false;
+  }
+  std::string text(raw);
+  for (char &ch : text) {
+    if (ch == ',' || ch == ';') {
+      ch = ' ';
+    }
+  }
+  std::istringstream input(text);
+  std::string name;
+  while (input >> name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (char ch : name) {
+      normalized.push_back(
+          ch == '_'
+              ? '-'
+              : static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (normalized == "all" || normalized == "block-placement-rotate") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 布局后分支位移检查:按每条指令 4 字节的保守估计,计算所有条件分支到目标块
+// 的距离。任一条件分支超出 RISC-V 条件分支范围(±4KB,留 64 字节余量)即返回
+// false,由调用方回退到原始顺序。AArch64 的条件分支范围为 ±1MB,同一检查对
+// 其更保守,不会误判合法布局。
+bool branchesInRange(const MachineFunction &mf) {
+  const std::size_t blockCount = mf.blocks.size();
+  if (blockCount == 0) {
+    return true;
+  }
+  std::vector<uint64_t> blockOffset(blockCount, 0);
+  uint64_t offset = 0;
+  for (std::size_t block = 0; block < blockCount; ++block) {
+    blockOffset[block] = offset;
+    offset += static_cast<uint64_t>(mf.blocks[block].instrs.size()) * 4;
+  }
+  constexpr int64_t kBranchRangeLimit = 4096 - 64;
+  for (std::size_t block = 0; block < blockCount; ++block) {
+    const MachineBasicBlock &bb = mf.blocks[block];
+    for (std::size_t instr = 0; instr < bb.instrs.size(); ++instr) {
+      const MachineInstr &mi = bb.instrs[instr];
+      if (!isConditionalBranch(mi.opcode)) {
+        continue;
+      }
+      std::string target;
+      for (const MachineOperand &use : mi.uses) {
+        if (use.kind == OperandKind::Block) {
+          target = use.blockLabel;
+          break;
+        }
+      }
+      if (target.empty()) {
+        throw BackendError("machine conditional branch has no block target");
+      }
+      const uint64_t branchOffset = blockOffset[block] + instr * 4;
+      bool found = false;
+      for (std::size_t targetBlock = 0; targetBlock < blockCount;
+           ++targetBlock) {
+        if (mf.blocks[targetBlock].label != target) {
+          continue;
+        }
+        found = true;
+        const int64_t delta =
+            static_cast<int64_t>(blockOffset[targetBlock]) -
+            static_cast<int64_t>(branchOffset);
+        if (delta > kBranchRangeLimit || delta < -kBranchRangeLimit) {
+          return false;
+        }
+        break;
+      }
+      if (!found) {
+        throw BackendError("machine branch targets unknown block " + target);
+      }
+    }
+  }
+  return true;
 }
 
 // 以下 same* 系列用于逐字段比较指令/操作数/整个程序，供“变换前后是否真正改变
@@ -602,10 +699,6 @@ LayoutCost computeLayoutCost(
       }
       break;
     case ControlKind::Conditional: {
-      if (saved.trueTarget == next || saved.falseTarget == next) {
-        break;
-      }
-      ++cost.staticJumpCount;
       const std::size_t from = saved.originalIndex;
       const std::size_t trueTarget =
           controls.at(saved.trueTarget).originalIndex;
@@ -615,6 +708,28 @@ LayoutCost computeLayoutCost(
           edgeWeightForTarget(frequencies, from, trueTarget);
       const uint64_t falseWeight =
           edgeWeightForTarget(frequencies, from, falseTarget);
+      // 条件分支执行侧的总权重(诊断:条件分支的动态执行量)。
+      cost.takenConditionalWeight = saturatingAdd(
+          cost.takenConditionalWeight, trueWeight);
+      // 方向未知(两侧等权 0.5/0.5)的条件分支:按"不推翻原方向"规则保持原
+      // 方向,统计其被打断的 fallthrough 边权(非相邻一侧),用于诊断未知方向
+      // 分支在布局中的代价。
+      if (trueWeight == falseWeight) {
+        if (saved.trueTarget == next) {
+          cost.brokenUnknownFallthroughWeight = saturatingAdd(
+              cost.brokenUnknownFallthroughWeight, falseWeight);
+        } else if (saved.falseTarget == next) {
+          cost.brokenUnknownFallthroughWeight = saturatingAdd(
+              cost.brokenUnknownFallthroughWeight, trueWeight);
+        } else {
+          cost.brokenUnknownFallthroughWeight = saturatingAdd(
+              cost.brokenUnknownFallthroughWeight, trueWeight);
+        }
+      }
+      if (saved.trueTarget == next || saved.falseTarget == next) {
+        break;
+      }
+      ++cost.staticJumpCount;
       if (useWeightedOrientation) {
         cost.dynamicJumpExecutions = saturatingAdd(
             cost.dynamicJumpExecutions, std::min(trueWeight, falseWeight));
@@ -640,57 +755,82 @@ void considerBackedgeFallthroughOrders(
     const MachineBlockFrequencyAnalysis::Result &frequencies,
     const std::map<std::string, SavedControl> &controls,
     bool useWeightedOrientation, std::vector<int> &bestOrder,
-    LayoutCost &bestCost) {
+    LayoutCost &bestCost, std::size_t &rotations) {
   if (!useWeightedOrientation ||
+      blockPlacementRotateDisabled() ||
       std::getenv("BACKEND_DISABLE_BACKEDGE_FALLTHROUGH_PLACEMENT") !=
           nullptr) {
     return;
   }
 
-  for (const auto &[latch, header] : loops.backedges) {
-    if (latch < 0 || header <= 0 || latch == header ||
-        latch >= static_cast<int>(mf.blocks.size()) ||
-        header >= static_cast<int>(mf.blocks.size())) {
-      continue;
-    }
+  // 迭代应用循环旋转:每轮在"当前最优顺序"上尝试所有回边的 latch 前置 header
+  // 旋转,把回边变成 fallthrough、header 的 guard 分支落在循环末尾(检查-执行
+  // 结构,每次迭代不再执行显式 J);只接受动态跳转严格下降的旋转,重复直到不再
+  // 改进。旧实现每函数只采纳一次旋转;迭代使一个函数内的多个循环都能旋转,
+  // 且每个旋转都在前序旋转结果上重新计价,保证总代价单调下降。
+  std::vector<int> current = seed;
+  LayoutCost currentCost = seedCost;
+  bool improved = true;
+  while (improved) {
+    improved = false;
+    int bestLatch = -1;
+    std::vector<int> bestTrial;
+    LayoutCost bestTrialCost = currentCost;
+    for (const auto &[latch, header] : loops.backedges) {
+      if (latch < 0 || header <= 0 || latch == header ||
+          latch >= static_cast<int>(mf.blocks.size()) ||
+          header >= static_cast<int>(mf.blocks.size())) {
+        continue;
+      }
 
-    const std::string &latchLabel =
-        mf.blocks[static_cast<std::size_t>(latch)].label;
-    const std::string &headerLabel =
-        mf.blocks[static_cast<std::size_t>(header)].label;
-    const auto saved = controls.find(latchLabel);
-    if (saved == controls.end() ||
-        saved->second.kind != ControlKind::Unconditional ||
-        saved->second.trueTarget != headerLabel) {
-      continue;
-    }
+      const std::string &latchLabel =
+          mf.blocks[static_cast<std::size_t>(latch)].label;
+      const std::string &headerLabel =
+          mf.blocks[static_cast<std::size_t>(header)].label;
+      const auto saved = controls.find(latchLabel);
+      if (saved == controls.end() ||
+          saved->second.kind != ControlKind::Unconditional ||
+          saved->second.trueTarget != headerLabel) {
+        continue;
+      }
 
-    std::vector<int> trial = seed;
-    const auto latchPosition = std::find(trial.begin(), trial.end(), latch);
-    if (latchPosition == trial.end()) {
-      throw BackendError("backedge latch missing from placement order");
-    }
-    trial.erase(latchPosition);
-    const auto headerPosition = std::find(trial.begin(), trial.end(), header);
-    if (headerPosition == trial.end()) {
-      throw BackendError("backedge header missing from placement order");
-    }
-    trial.insert(headerPosition, latch);
+      std::vector<int> trial = current;
+      const auto latchPosition = std::find(trial.begin(), trial.end(), latch);
+      if (latchPosition == trial.end()) {
+        throw BackendError("backedge latch missing from placement order");
+      }
+      trial.erase(latchPosition);
+      const auto headerPosition = std::find(trial.begin(), trial.end(), header);
+      if (headerPosition == trial.end()) {
+        throw BackendError("backedge header missing from placement order");
+      }
+      trial.insert(headerPosition, latch);
 
-    const LayoutCost trialCost = computeLayoutCost(
-        mf, trial, controls, frequencies, useWeightedOrientation);
-    // A loop rotation changes the branch direction and code adjacency.  Only
-    // accept it for the primary objective: replacing a more frequently
-    // executed explicit jump with a cheaper one.  Static-size or displacement
-    // tie breakers alone are not sufficient evidence for rotating a loop.
-    if (trialCost.dynamicJumpExecutions >=
-        seedCost.dynamicJumpExecutions) {
-      continue;
+      const LayoutCost trialCost = computeLayoutCost(
+          mf, trial, controls, frequencies, useWeightedOrientation);
+      // 旋转会改变分支方向与代码相邻关系。只在主目标上接受它:用一个更便宜的
+      // 形态替换更高频的显式跳转(动态跳转严格下降)。静态体积或位移 tie-break
+      // 单独不足以作为旋转依据。
+      if (trialCost.dynamicJumpExecutions >=
+          currentCost.dynamicJumpExecutions) {
+        continue;
+      }
+      if (trialCost < bestTrialCost) {
+        bestLatch = latch;
+        bestTrial = std::move(trial);
+        bestTrialCost = trialCost;
+      }
     }
-    if (trialCost < bestCost) {
-      bestOrder = std::move(trial);
-      bestCost = trialCost;
+    if (bestLatch >= 0 && bestTrialCost < currentCost) {
+      current = std::move(bestTrial);
+      currentCost = bestTrialCost;
+      ++rotations;
+      improved = true;
     }
+  }
+  if (currentCost < bestCost) {
+    bestOrder = std::move(current);
+    bestCost = currentCost;
   }
 }
 
@@ -913,6 +1053,7 @@ void verifyPlacedFunction(const MachineFunction &mf,
 bool runBlockPlacement(
     MachineFunction &mf, const MachineLoopAnalysis::Result &loops,
     const MachineBlockFrequencyAnalysis::Result &frequencies) {
+  std::size_t placementRotations = 0;
   if (mf.blocks.empty()) {
     return false;
   }
@@ -947,12 +1088,14 @@ bool runBlockPlacement(
   if (useWeightedOrientation) {
     const std::vector<int> pettisHansenOrder = candidateOrder;
     const LayoutCost pettisHansenCost = candidateCost;
+    std::size_t rotations = 0;
     considerBackedgeFallthroughOrders(
         mf, originalOrder, originalCost, loops, frequencies, controls,
-        useWeightedOrientation, candidateOrder, candidateCost);
+        useWeightedOrientation, candidateOrder, candidateCost, rotations);
     considerBackedgeFallthroughOrders(
         mf, pettisHansenOrder, pettisHansenCost, loops, frequencies, controls,
-        useWeightedOrientation, candidateOrder, candidateCost);
+        useWeightedOrientation, candidateOrder, candidateCost, rotations);
+    placementRotations = rotations;
   }
 
   const std::vector<int> *selectedOrder = &originalOrder;
@@ -986,34 +1129,70 @@ bool runBlockPlacement(
               << candidateCost.brokenFallthroughWeight
               << " broken-fallthrough-after="
               << selectedCost->brokenFallthroughWeight
+              << " expected-j-executions-before="
+              << originalCost.dynamicJumpExecutions
+              << " expected-j-executions-candidate="
+              << candidateCost.dynamicJumpExecutions
+              << " expected-j-executions-after="
+              << selectedCost->dynamicJumpExecutions
+              << " broken-unknown-fallthrough-before="
+              << originalCost.brokenUnknownFallthroughWeight
+              << " broken-unknown-fallthrough-candidate="
+              << candidateCost.brokenUnknownFallthroughWeight
+              << " broken-unknown-fallthrough-after="
+              << selectedCost->brokenUnknownFallthroughWeight
+              << " taken-conditional-before="
+              << originalCost.takenConditionalWeight
+              << " taken-conditional-candidate="
+              << candidateCost.takenConditionalWeight
+              << " taken-conditional-after="
+              << selectedCost->takenConditionalWeight
+              << " rotations=" << placementRotations
               << '\n';
   }
 
-  MachineFunction candidate;
-  candidate.blocks = mf.blocks;
-  std::vector<MachineBasicBlock> placed;
-  placed.reserve(candidate.blocks.size());
-  std::vector<bool> moved(candidate.blocks.size(), false);
-  for (int oldIndex : *selectedOrder) {
-    if (oldIndex < 0 || oldIndex >= static_cast<int>(candidate.blocks.size()) ||
-        moved[static_cast<std::size_t>(oldIndex)]) {
-      throw BackendError("invalid machine block placement order");
+  // 按给定顺序构造布局后的函数体(重建终结指令与 CFG),供选中顺序与
+  // 位移回退共用。
+  auto buildFromOrder = [&](const std::vector<int> &order) {
+    MachineFunction built;
+    built.blocks = mf.blocks;
+    std::vector<MachineBasicBlock> placed;
+    placed.reserve(built.blocks.size());
+    std::vector<bool> moved(built.blocks.size(), false);
+    for (int oldIndex : order) {
+      if (oldIndex < 0 ||
+          oldIndex >= static_cast<int>(built.blocks.size()) ||
+          moved[static_cast<std::size_t>(oldIndex)]) {
+        throw BackendError("invalid machine block placement order");
+      }
+      moved[static_cast<std::size_t>(oldIndex)] = true;
+      placed.push_back(
+          std::move(built.blocks[static_cast<std::size_t>(oldIndex)]));
     }
-    moved[static_cast<std::size_t>(oldIndex)] = true;
-    placed.push_back(
-        std::move(candidate.blocks[static_cast<std::size_t>(oldIndex)]));
-  }
-  candidate.blocks = std::move(placed);
+    built.blocks = std::move(placed);
 
-  // 从这里起不得再使用旧 block index、旧块引用或分析中的下标缓存。
-  if (candidate.blocks.size() != controls.size() ||
-      candidate.blocks.front().label != entryLabel) {
-    throw BackendError("invalid result from machine block placement");
-  }
-  rebuildTerminators(candidate, controls, frequencies, useWeightedOrientation);
-  rebuildCFG(candidate);
+    // 从这里起不得再使用旧 block index、旧块引用或分析中的下标缓存。
+    if (built.blocks.size() != controls.size() ||
+        built.blocks.front().label != entryLabel) {
+      throw BackendError("invalid result from machine block placement");
+    }
+    rebuildTerminators(built, controls, frequencies, useWeightedOrientation);
+    rebuildCFG(built);
+    return built;
+  };
+
+  MachineFunction candidate = buildFromOrder(*selectedOrder);
   if (verificationEnabled()) {
     verifyPlacedFunction(candidate, controls, oldEdges);
+  }
+  // P1#10:布局后分支位移检查——旋转/重排可能拉长条件分支到目标块的距离;
+  // 任一条件分支超出 ±4KB(保守按每条指令 4 字节估计)时回退到原始顺序,
+  // 不做 branch island(当前函数即放弃重排,语义与汇编均安全)。
+  if (!branchesInRange(candidate) && selectedOrder != &originalOrder) {
+    candidate = buildFromOrder(originalOrder);
+    if (verificationEnabled()) {
+      verifyPlacedFunction(candidate, controls, oldEdges);
+    }
   }
   if (sameProgram(mf.blocks, candidate.blocks)) {
     return false;
