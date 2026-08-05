@@ -11,4 +11,5 @@
 // 外部直接编译（不定义 ENABLE_*_BACKEND 宏）时的默认目标后端。
 // - ARM 平台提交：保持下面这行被注释（默认 AArch64）；
 // - RISC-V 平台提交：取消注释（默认 RISC-V）。
-// #define DEFAULT_BACKEND_ARCH_RISCV 1
+// 本分支为 RISC-V 平台提交，取消注释：
+#define DEFAULT_BACKEND_ARCH_RISCV 1
