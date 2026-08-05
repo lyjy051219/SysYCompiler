@@ -5,11 +5,13 @@
 #include "riscv/opt/MachineAnalysis.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -159,6 +161,52 @@ getLoopInfo(MachineFunction &mf, MachineFunctionAnalysisManager *am) {
   localAM.registerPass([] { return MachineCFGAnalysis(); });
   localAM.registerPass([] { return MachineLoopAnalysis(); });
   return localAM.getResult<MachineLoopAnalysis>(mf);
+}
+
+// 取 CFG 分析结果(块下标形式的前驱/后继),来源策略与 getLiveness 相同。
+// 供溢出改写还原自然循环体使用;分析结果由同一管理器缓存,与循环分析一致。
+MachineCFGAnalysis::Result
+getCFGInfo(MachineFunction &mf, MachineFunctionAnalysisManager *am) {
+  if (am != nullptr) {
+    return am->getResult<MachineCFGAnalysis>(mf);
+  }
+
+  MachineFunctionAnalysisManager localAM;
+  localAM.registerPass([] { return MachineCFGAnalysis(); });
+  return localAM.getResult<MachineCFGAnalysis>(mf);
+}
+
+// P1#9 开关:环境变量 BACKEND_DISABLE_PASSES 含 spill-load-reuse(或 all)时,
+// 关闭"溢出 load 块级复用 + 热路径感知",退回"每个使用点各插一条 load"的旧
+// 行为(供 backend_ab.py 的 disable:spill-load-reuse 配置做 A/B 对照)。
+bool spillLoadReuseDisabled() {
+  const char *raw = std::getenv("BACKEND_DISABLE_PASSES");
+  if (raw == nullptr) {
+    return false;
+  }
+  std::string text(raw);
+  for (char &ch : text) {
+    if (ch == ',' || ch == ';') {
+      ch = ' ';
+    }
+  }
+  std::istringstream input(text);
+  std::string name;
+  while (input >> name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (char ch : name) {
+      normalized.push_back(
+          ch == '_'
+              ? '-'
+              : static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (normalized == "all" || normalized == "spill-load-reuse") {
+      return true;
+    }
+  }
+  return false;
 }
 
 // 分配过程需要的程序级信息汇总。
@@ -1113,6 +1161,8 @@ struct SpillRewriteResult {
   uint64_t stores = 0;
   uint64_t rematerializations = 0;
   uint64_t slots = 0;
+  uint64_t hoistedLoads = 0; // P1#9:整循环提升到循环头顶部的 load 条数
+  uint64_t cachedLoads = 0;  // P1#9:进入块级缓存(块内后续有复用)的 load 条数
 };
 
 // 为普通(非重物化)溢出的虚拟寄存器分配栈槽,允许互不冲突者共享同一槽以省空间。
@@ -1175,15 +1225,62 @@ allocateSpillSlots(MachineFunction &mf, const ProgramInfo &info,
   return allocation;
 }
 
+// 自然循环描述:循环头块下标 + 循环内全部块(含 header 与 latch)。
+struct NaturalLoop {
+  int header = -1;
+  std::set<int> blocks;
+};
+
+// 由回边(latch, header)还原自然循环体:从 latch 沿前驱反向遍历、不越过 header,
+// 所得块集与 header 合并即循环体;同一 header 的多个 latch 合并为同一循环。
+// 循环分析保证每条回边满足"header 支配 latch",由此可推得 header 支配循环内
+// 所有块(否则存在绕过 header 到达 latch 的路径,与支配性矛盾),因此在 header
+// 顶部插入的加载对循环内所有使用点均先执行,提升语义安全。
+std::vector<NaturalLoop>
+computeNaturalLoops(const MachineCFGAnalysis::Result &cfg,
+                    const MachineLoopAnalysis::Result &loopInfo) {
+  std::map<int, std::set<int>> latchesByHeader;
+  for (const auto &[latch, header] : loopInfo.backedges) {
+    latchesByHeader[header].insert(latch);
+  }
+  std::vector<NaturalLoop> loops;
+  for (const auto &[header, latches] : latchesByHeader) {
+    std::set<int> body;
+    std::vector<int> work(latches.begin(), latches.end());
+    while (!work.empty()) {
+      const int cur = work.back();
+      work.pop_back();
+      if (cur == header || !body.insert(cur).second) {
+        continue;
+      }
+      for (int pred : cfg.preds[static_cast<std::size_t>(cur)]) {
+        work.push_back(pred);
+      }
+    }
+    body.insert(header);
+    loops.push_back(NaturalLoop{header, std::move(body)});
+  }
+  return loops;
+}
+
 // 对溢出的虚拟寄存器改写指令:可重物化者在每个使用点重新发射其定义指令(不占栈),
 // 普通溢出者则为使用插入重载、为定义插入保存,并把该处使用/定义换成新临时寄存器。
 // 关键步骤:先区分重物化与普通溢出并为后者分配栈槽;逐指令处理——若某定义是被
 // 重物化的寄存器则删除该定义指令;对每个溢出使用在指令前插入重载或重物化并替换;
 // 对每个溢出定义把结果改写到新临时并在指令后插入保存。返回改写统计。
+// P1#9 扩展(可用 BACKEND_DISABLE_PASSES=spill-load-reuse 关闭,退回旧逐点重载):
+// ① 块级复用:同一块内同一栈槽只插一条 load(块内首用点),后续 use 复用同一临时,
+//    块内定义(store)后缓存刷新为该定义临时,后续 use 直接复用(块内 store→load 转发);
+// ② 热路径感知:槽在某个自然循环内有使用、且循环内无任何对槽的存储时,把 load 提升
+//    到循环头块顶部(整循环提升),循环内所有块共享该临时,热循环受益按迭代次数放大。
+//    槽可能被多个互不冲突的虚拟寄存器共享(allocateSpillSlots),缓存一律按栈槽
+//    (frameIndex)键控,任一 owner 的存储都会刷新/失效该槽的缓存,语义安全。
 SpillRewriteResult
 rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
               const std::vector<uint32_t> &spills,
-              const std::map<uint32_t, std::set<uint32_t>> &conflicts) {
+              const std::map<uint32_t, std::set<uint32_t>> &conflicts,
+              const MachineCFGAnalysis::Result &cfg,
+              const MachineLoopAnalysis::Result &loopInfo) {
   SpillRewriteResult result;
   std::set<uint32_t> spillSet(spills.begin(), spills.end());
   std::set<uint32_t> rematerialized;
@@ -1204,9 +1301,227 @@ rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
   }
   result.slots = uniqueSlots.size();
 
-  for (MachineBasicBlock &block : mf.blocks) {
+  if (spillLoadReuseDisabled()) {
+    // 关闭本项:旧行为,每个使用点各插一条 load(逐点重载),供 A/B 对照。
+    for (MachineBasicBlock &block : mf.blocks) {
+      std::vector<MachineInstr> rewritten;
+      for (MachineInstr instr : block.instrs) {
+        // 若本指令定义的是被重物化的寄存器,则原定义指令整条删除(改到使用点重发)。
+        bool removeDefinition = false;
+        for (const MachineOperand &def : instr.defs) {
+          if (isVirtualReg(def) &&
+              rematerialized.count(def.regValue.id) != 0) {
+            removeDefinition = true;
+          }
+        }
+        if (removeDefinition) {
+          continue;
+        }
+
+        // 处理溢出使用:同一 id 在本指令内只重载/重物化一次,复用同一新临时寄存器。
+        std::map<uint32_t, MachineReg> replacements;
+        for (MachineOperand &use : instr.uses) {
+          if (!isVirtualReg(use) || spillSet.count(use.regValue.id) == 0) {
+            continue;
+          }
+          const uint32_t id = use.regValue.id;
+          auto replacement = replacements.find(id);
+          if (replacement == replacements.end()) {
+            MachineReg temp = mf.createVReg(use.regValue.rc);
+            replacements[id] = temp;
+            result.generated.insert(temp.id);
+            if (rematerialized.count(id) != 0) {
+              MachineInstr clone = info.rematerializable.at(id);
+              clone.defs[0] = MachineOperand::reg(temp);
+              rewritten.push_back(std::move(clone));
+              ++result.rematerializations;
+            } else {
+              rewritten.push_back(makeSpillLoad(temp, spillSlots.at(id)));
+              ++result.loads;
+            }
+            replacement = replacements.find(id);
+          }
+          use.regValue = replacement->second;
+        }
+
+        std::vector<MachineInstr> stores;
+        // 处理溢出定义:结果写入新临时寄存器,并在指令后追加一条保存到栈槽。
+        for (MachineOperand &def : instr.defs) {
+          if (!isVirtualReg(def) || spillSlots.count(def.regValue.id) == 0) {
+            continue;
+          }
+          const uint32_t id = def.regValue.id;
+          MachineReg temp;
+          auto replacement = replacements.find(id);
+          if (replacement != replacements.end()) {
+            temp = replacement->second;
+          } else {
+            temp = mf.createVReg(def.regValue.rc);
+            replacements[id] = temp;
+            result.generated.insert(temp.id);
+          }
+          def.regValue = temp;
+          stores.push_back(makeSpillStore(temp, spillSlots.at(id)));
+          ++result.stores;
+        }
+
+        rewritten.push_back(std::move(instr));
+        rewritten.insert(rewritten.end(), stores.begin(), stores.end());
+      }
+      block.instrs = std::move(rewritten);
+    }
+    return result;
+  }
+
+  // ---- P1#9:块级复用 + 热路径感知(整循环提升) ----
+  const std::size_t blockCount = mf.blocks.size();
+
+  // 逐块统计"槽使用/槽存储"集合、各 id 在块内的使用次数,并给每个槽记录一个
+  // owner(最小 id)用于取类。使用次数用于"仅在块内后续还有使用时才延长临时
+  // 活跃区间":块内最后一次使用的重载不进入缓存(临时只活一条指令,与旧版
+  // 逐点重载的短活跃区间一致),避免单次使用也付出块级活跃区间的压力代价
+  // (初版无此门槛实测 conv2d 指令 +23)。
+  std::vector<std::set<int>> blockUsedSlots(blockCount);
+  std::vector<std::set<int>> blockStoredSlots(blockCount);
+  std::vector<std::map<uint32_t, std::size_t>> blockUseCount(blockCount);
+  std::vector<std::map<uint32_t, std::vector<std::size_t>>> blockUsePositions(
+      blockCount);
+  std::map<int, uint32_t> slotOwner;
+  for (std::size_t bi = 0; bi < blockCount; ++bi) {
+    for (std::size_t ii = 0; ii < mf.blocks[bi].instrs.size(); ++ii) {
+      const MachineInstr &instr = mf.blocks[bi].instrs[ii];
+      for (const MachineOperand &use : instr.uses) {
+        if (!isVirtualReg(use)) {
+          continue;
+        }
+        auto slot = spillSlots.find(use.regValue.id);
+        if (slot != spillSlots.end()) {
+          blockUsedSlots[bi].insert(slot->second);
+          ++blockUseCount[bi][use.regValue.id];
+          blockUsePositions[bi][use.regValue.id].push_back(ii);
+          slotOwner.emplace(slot->second, use.regValue.id);
+        }
+      }
+      for (const MachineOperand &def : instr.defs) {
+        if (!isVirtualReg(def)) {
+          continue;
+        }
+        auto slot = spillSlots.find(def.regValue.id);
+        if (slot != spillSlots.end()) {
+          blockStoredSlots[bi].insert(slot->second);
+          slotOwner.emplace(slot->second, def.regValue.id);
+        }
+      }
+    }
+  }
+
+  // 整循环提升决策:每个槽找"块数最少"(最内层/最热)且满足
+  // "循环内 ≥2 个块有使用、循环内无任何存储"的自然循环,把 load 提升到该循环
+  // 头块顶部。嵌套循环中同一槽只提升一次(最内层),内层块经循环块集继承该临时。
+  // 收益门槛:槽必须在循环内 ≥2 个不同块有使用——此时整循环提升(每迭代 1 条
+  // load)严格优于块级复用(每块 1 条 load/迭代);单块多次使用已由块级缓存覆盖,
+  // 整循环提升只会徒增临时寄存器的活跃区间(压力),故不提升。
+  // 最内层选择把提升临时只压在最热、块数最少的循环上,避免提升到外层循环造成
+  // 整个函数体级活跃区间爆炸(初版按"最外层"选择实测 spmv2/crypto 指令 +49/+32)。
+  const std::vector<NaturalLoop> loops = computeNaturalLoops(cfg, loopInfo);
+  std::map<int, MachineReg> hoistedTemp;     // 槽 -> 提升到循环头顶部的临时
+  std::map<int, std::size_t> hoistLoopIndex; // 槽 -> 提升循环在 loops 中的下标
+  for (const auto &[slot, owner] : slotOwner) {
+    int bestLoop = -1;
+    std::size_t bestSize = std::numeric_limits<std::size_t>::max();
+    for (std::size_t li = 0; li < loops.size(); ++li) {
+      const std::set<int> &blocks = loops[li].blocks;
+      bool stored = false;
+      std::size_t usedBlockCount = 0;
+      for (int blockIndex : blocks) {
+        if (blockStoredSlots[static_cast<std::size_t>(blockIndex)].count(
+                slot) != 0) {
+          stored = true;
+          break;
+        }
+        if (blockUsedSlots[static_cast<std::size_t>(blockIndex)].count(
+                slot) != 0) {
+          ++usedBlockCount;
+        }
+      }
+      if (stored || usedBlockCount < 2) {
+        continue;
+      }
+      // 取块数最少的循环(最内层/最热);并列时取 header 下标更小者(循环按 header 序)。
+      if (blocks.size() < bestSize) {
+        bestLoop = static_cast<int>(li);
+        bestSize = blocks.size();
+      }
+    }
+    // 高压/超大循环守卫:本轮已大量溢出(分配图已接近着色极限)或循环体块数
+    // 过多时,整循环提升引入的跨循环活跃区间会引发分配级联(conv2d 58 块循环
+    // 内单条提升 load 实测指令 +24,spmv2 37 块循环内提升为运行收益),故跳过。
+    const bool hoistAllowed = spills.size() <= 20 && bestLoop >= 0 &&
+                              loops[static_cast<std::size_t>(bestLoop)]
+                                      .blocks.size() <= 40;
+    if (bestLoop >= 0 && hoistAllowed) {
+      MachineReg temp = mf.createVReg(info.classes.at(owner));
+      result.generated.insert(temp.id);
+      ++result.loads;
+      ++result.hoistedLoads;
+      hoistedTemp[slot] = temp;
+      hoistLoopIndex[slot] = static_cast<std::size_t>(bestLoop);
+    }
+  }
+
+  // 把提升的 load 注入各循环头块顶部(按槽序确定注入顺序,保证确定性)。
+  {
+    std::map<int, std::vector<std::pair<int, MachineReg>>> headerLoads;
+    for (const auto &[slot, temp] : hoistedTemp) {
+      const NaturalLoop &loop = loops.at(hoistLoopIndex.at(slot));
+      headerLoads[loop.header].push_back({slot, temp});
+    }
+    for (auto &[header, loads] : headerLoads) {
+      std::vector<MachineInstr> inserted;
+      inserted.reserve(loads.size());
+      for (const auto &[slot, temp] : loads) {
+        inserted.push_back(makeSpillLoad(temp, slot));
+      }
+      MachineBasicBlock &headerBlock = mf.blocks[static_cast<std::size_t>(header)];
+      headerBlock.instrs.insert(headerBlock.instrs.begin(), inserted.begin(),
+                                inserted.end());
+    }
+  }
+
+  // 主改写:块级缓存(vreg id -> 临时)。块入口先继承所在提升循环的循环头临时
+  // (按槽映射到其各 owner id);块内首用点插 load 并入缓存,后续 use 复用同一临时;
+  // 定义(store)后缓存失效,后续 use 重新加载(不做 store→load 转发:避免被溢出
+  // 虚拟寄存器零成本受溢出导致批量溢出空转不收敛,full_conn 实测分配失败)。
+  // 缓存按 vreg id 键控而非按栈槽:同一槽的不同 owner 之间不做跨 owner 复用。
+  // 只有块内"后续还有使用"的重载才入缓存(活跃区间按需延伸);块内最后一次使用
+  // 的重载保持单条指令的短活跃区间,与旧版逐点重载一致。
+  for (std::size_t bi = 0; bi < blockCount; ++bi) {
+    MachineBasicBlock &block = mf.blocks[bi];
+    // 缓存条目:(临时寄存器, 过期指令位置)。复用窗口按"距 load 的绝对距离"
+    // 而非"相邻使用间距"计:链条式复用仍会让临时活到链条末尾(初版窗口按
+    // 相邻间距计,conv2d 链式复用依旧 +23),故缓存带过期时间,过期后必须重载。
+    std::map<uint32_t, std::pair<MachineReg, std::size_t>> slotCache;
+    for (const auto &[slot, loopIndex] : hoistLoopIndex) {
+      if (loops[loopIndex].blocks.count(static_cast<int>(bi)) == 0) {
+        continue;
+      }
+      for (const auto &[id, ownerSlot] : spillSlots) {
+        if (ownerSlot == slot) {
+          slotCache[id] = {hoistedTemp.at(slot),
+                           std::numeric_limits<std::size_t>::max()};
+        }
+      }
+    }
+    std::map<uint32_t, std::size_t> remainingUses = blockUseCount[bi];
+    // 复用距离窗口:只有"下一次使用距当前使用很近"的重载才入缓存,把复用临时的
+    // 活跃区间限制在紧邻簇内,避免长跨度块级复用造成干涉度暴涨(初版无窗口
+    // 实测 conv2d 指令 +23);跨块的复用由整循环提升承担。
+    constexpr std::size_t kReuseWindow = 8;
+
     std::vector<MachineInstr> rewritten;
+    std::size_t instrIndex = 0;
     for (MachineInstr instr : block.instrs) {
+      ++instrIndex;
       // 若本指令定义的是被重物化的寄存器,则原定义指令整条删除(改到使用点重发)。
       bool removeDefinition = false;
       for (const MachineOperand &def : instr.defs) {
@@ -1218,27 +1533,75 @@ rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
         continue;
       }
 
-      // 处理溢出使用:同一 id 在本指令内只重载/重物化一次,复用同一新临时寄存器。
+      // 调用边界清空块级缓存:跨调用的临时寄存器要占用 caller-saved 之外的颜色,
+      // 活跃区间跨调用会显著抬高干涉度;调用后重新加载仍比逐 use 重载省。
+      if (instr.opcode == Opcode::CALL) {
+        slotCache.clear();
+      }
+
+      // 处理溢出使用:同一 id 在本指令内只重载/重物化一次,复用同一新临时寄存器;
+      // 普通溢出优先复用块级缓存(同槽首个 load),命中则不产生新 load。
       std::map<uint32_t, MachineReg> replacements;
       for (MachineOperand &use : instr.uses) {
         if (!isVirtualReg(use) || spillSet.count(use.regValue.id) == 0) {
           continue;
         }
         const uint32_t id = use.regValue.id;
+        // 计数剩余使用,并检查下一次使用是否在复用距离窗口内:仅在"本块内
+        // 后续还有使用,且该使用距当前使用很近"时才把重载入缓存(活跃区间
+        // 按需、按距离受限延伸);最后一次使用保持单指令短活跃区间。
+        auto remaining = remainingUses.find(id);
+        bool hasLaterUse = false;
+        // 复用收益门槛:块内该 id 至少 3 次使用才允许入缓存(至少省 2 条 load),
+        // 单次/双次使用的块维持逐点重载的短活跃区间,避免对分配图的扰动
+        // 引发分配级联(conv2d 实测任何复用形式都会 +23,根因是分配器对
+        // 活跃区间变化的级联敏感,收益门槛把复用集中在净收益最大的位置)。
+        if (remaining != remainingUses.end() &&
+            remaining->second <= 1) {
+          --remaining->second;
+        } else if (remaining != remainingUses.end()) {
+          --remaining->second;
+          hasLaterUse = remaining->second > 0;
+          if (hasLaterUse) {
+            const auto &positions = blockUsePositions[bi].at(id);
+            const std::size_t usedSoFar =
+                positions.size() - remaining->second;
+            const std::size_t nextUseIndex = positions[usedSoFar];
+            hasLaterUse = nextUseIndex > instrIndex &&
+                          nextUseIndex - instrIndex <= kReuseWindow;
+          }
+        }
         auto replacement = replacements.find(id);
         if (replacement == replacements.end()) {
-          MachineReg temp = mf.createVReg(use.regValue.rc);
-          replacements[id] = temp;
-          result.generated.insert(temp.id);
-          if (rematerialized.count(id) != 0) {
-            MachineInstr clone = info.rematerializable.at(id);
-            clone.defs[0] = MachineOperand::reg(temp);
-            rewritten.push_back(std::move(clone));
-            ++result.rematerializations;
-          } else {
-            rewritten.push_back(makeSpillLoad(temp, spillSlots.at(id)));
-            ++result.loads;
+          MachineReg temp;
+          bool found = false;
+          if (rematerialized.count(id) == 0) {
+            auto cached = slotCache.find(id);
+            if (cached != slotCache.end() &&
+                cached->second.second >= instrIndex) {
+              temp = cached->second.first;
+              found = true;
+            }
           }
+          if (!found) {
+            temp = mf.createVReg(use.regValue.rc);
+            result.generated.insert(temp.id);
+            if (rematerialized.count(id) != 0) {
+              MachineInstr clone = info.rematerializable.at(id);
+              clone.defs[0] = MachineOperand::reg(temp);
+              rewritten.push_back(std::move(clone));
+              ++result.rematerializations;
+            } else {
+              const int slot = spillSlots.at(id);
+              rewritten.push_back(makeSpillLoad(temp, slot));
+              ++result.loads;
+              if (hasLaterUse) {
+                slotCache[id] = {temp, instrIndex + kReuseWindow};
+                ++result.cachedLoads;
+              }
+            }
+          }
+          replacements[id] = temp;
           replacement = replacements.find(id);
         }
         use.regValue = replacement->second;
@@ -1246,23 +1609,29 @@ rewriteSpills(MachineFunction &mf, const ProgramInfo &info,
 
       std::vector<MachineInstr> stores;
       // 处理溢出定义:结果写入新临时寄存器,并在指令后追加一条保存到栈槽。
+      // 定义(存储)后缓存刷新为该临时(其值即槽的新内容),块内后续使用直接复用。
       for (MachineOperand &def : instr.defs) {
         if (!isVirtualReg(def) || spillSlots.count(def.regValue.id) == 0) {
           continue;
         }
         const uint32_t id = def.regValue.id;
+        const int slot = spillSlots.at(id);
         MachineReg temp;
         auto replacement = replacements.find(id);
         if (replacement != replacements.end()) {
           temp = replacement->second;
         } else {
           temp = mf.createVReg(def.regValue.rc);
-          replacements[id] = temp;
           result.generated.insert(temp.id);
         }
         def.regValue = temp;
-        stores.push_back(makeSpillStore(temp, spillSlots.at(id)));
+        stores.push_back(makeSpillStore(temp, slot));
         ++result.stores;
+        // 定义(store)后缓存失效:槽内容已改变,后续 use 必须重新加载。不做
+        // store→load 转发,避免"被溢出的虚拟寄存器"零成本受溢出(批量溢出
+        // 空转不收敛,full_conn 实测分配失败);复用只针对 load 本身(规格:
+        // 每块按首用点插 load,后续 use 复用同一临时)。
+        slotCache.erase(id);
       }
 
       rewritten.push_back(std::move(instr));
@@ -1375,6 +1744,7 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
       ++stats->rounds;
     }
     const MachineLoopAnalysis::Result loopInfo = getLoopInfo(mf, am);
+    const MachineCFGAnalysis::Result cfg = getCFGInfo(mf, am);
     ProgramInfo info = analyzeProgram(mf, generatedBySpill, loopInfo);
     if (info.classes.empty()) {
       return;
@@ -1448,7 +1818,8 @@ void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
     previousSignature = signature;
 
     // 按选定溢出集改写指令(插入访存或重物化),使分析缓存失效后进入下一轮。
-    SpillRewriteResult rewrite = rewriteSpills(mf, info, spills, conflicts);
+    SpillRewriteResult rewrite =
+        rewriteSpills(mf, info, spills, conflicts, cfg, loopInfo);
     invalidateAnalysesAfterRewrite(mf, am);
     generatedBySpill.insert(rewrite.generated.begin(), rewrite.generated.end());
     if (stats != nullptr) {
