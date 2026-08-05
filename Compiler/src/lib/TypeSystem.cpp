@@ -1,5 +1,5 @@
 #include "TypeSystem.hpp"
-#include "Target.hpp"
+#include "IRTarget.hpp"
 #include <iostream>
 #include <limits>
 #include <stdexcept>

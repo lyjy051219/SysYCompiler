@@ -2,7 +2,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/Target.hpp"
+#include "lib/IRTarget.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

@@ -1,4 +1,4 @@
-#include "Target.hpp"
+#include "IRTarget.hpp"
 
 #include "TypeSystem.hpp"
 

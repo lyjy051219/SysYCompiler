@@ -1,6 +1,6 @@
 #include "./include/yacc/Bison.hpp"
 #include "./include/lib/IRGenerator.hpp"
-#include "./include/lib/Target.hpp"
+#include "./include/lib/IRTarget.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
 #include "./include/Common.hpp"
 #include "./include/riscv/Target.hpp"
