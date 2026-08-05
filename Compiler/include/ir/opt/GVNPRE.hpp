@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+class PostDominatorTree;
+
 //InstRecord保存同一值号对应的一条候选定义记录
 struct InstRecord {
 	//Num记录候选定义所属的全局值号
@@ -324,14 +326,24 @@ private:
 //GVNPREPass获取依赖分析并运行可选择关闭PRE的全局值编号优化
 class GVNPREPass : public PassDescriptor<GVNPREPass> {
 public:
-	//构造并设置是否启用部分冗余消除
-	explicit GVNPREPass(bool EnablePRE = true);
+	//构造并设置是否启用部分冗余消除和保守路径下沉
+	explicit GVNPREPass(bool EnablePRE = true,
+		bool EnableCodeSink = false);
 	//对给定函数运行GVN及可选PRE并返回分析保留状态
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
 	//EnablePRE记录当前Pass是否执行部分冗余消除阶段
 	bool EnablePRE = true;
+	//EnableCodeSink记录当前Pass是否执行不增加代码量的路径下沉
+	bool EnableCodeSink = false;
+
+	//判断指令是否可无条件推迟执行且不引入故障或poison。
+	static bool isConservativeSinkCandidate(Instruction *I);
+	//把单用户纯表达式下沉到条件分支的独占后继中。
+	static bool runConservativeCodeSink(
+		Function &F, FunctionAnalysisPassManager &FAM,
+		LoopInfo &LI, PostDominatorTree &PDT);
 };
 
 //LocalGVNPass在单个基本块内线性消除重复纯表达式

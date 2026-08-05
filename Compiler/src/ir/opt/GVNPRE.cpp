@@ -5,8 +5,9 @@
 #include <algorithm>
 #include <tuple>
 #include <utility>
-//构造并设置是否启用部分冗余消除
-GVNPREPass::GVNPREPass(bool EnablePRE) : EnablePRE(EnablePRE) {}
+//构造并设置是否启用部分冗余消除和保守路径下沉
+GVNPREPass::GVNPREPass(bool EnablePRE, bool EnableCodeSink)
+    : EnablePRE(EnablePRE), EnableCodeSink(EnableCodeSink) {}
 //判断两个全局表达式键是否完全相同
 bool ExprKey::operator==(const ExprKey &RHS) const {
     return Opcode == RHS.Opcode && ResultType == RHS.ResultType &&
@@ -1377,6 +1378,75 @@ bool LocalGVNPass::buildLocalExprKey(Instruction *I, LocalExprKey &K) {
         });
     return OperandsOK && !K.Operands.empty();
 }
+//判断指令是否可无条件推迟执行且不引入故障或poison。
+bool GVNPREPass::isConservativeSinkCandidate(Instruction *I) {
+    //只移动无内存、无调用、无控制作用的单结果纯计算；除余、危险转换、越界GEP
+    //和不受约束的移位由通用故障/poison查询统一拒绝。
+    if (!I || !I->getIRType() || I->getIRType()->isVoid() ||
+        dynamic_cast<PhiInst *>(I) || dynamic_cast<BrInst *>(I) ||
+        dynamic_cast<RetInst *>(I) || dynamic_cast<AllocaInst *>(I) ||
+        dynamic_cast<LoadInst *>(I) || dynamic_cast<StoreInst *>(I) ||
+        dynamic_cast<CallInst *>(I) || Value::isUndef(I) ||
+        valueMayDependOnUndef(I)) {
+        return false;
+    }
+    return !dceInstructionMustBePreserved(I) &&
+           !instructionMayFaultOrProducePoison(I);
+}
+//把单用户纯表达式下沉到条件分支的独占后继中。
+bool GVNPREPass::runConservativeCodeSink(
+    Function &F, FunctionAnalysisPassManager &FAM,
+    LoopInfo &LI, PostDominatorTree &PDT) {
+    //路径下沉不克隆指令；每次都要求目标是条件边的独占后继且存在结构化绕行路径，
+    //因此动态执行次数不增加，同时缩短定义到使用的活跃区间。
+    constexpr int kMaxMovedInstructions = 32;
+    bool Changed = false;
+    int Moved = 0;
+    for (BasicBlock *Source : snapshotPointers(F)) {
+        if (!Source || Moved >= kMaxMovedInstructions) break;
+        auto *Branch = dynamic_cast<BrInst *>(Source->back());
+        if (!Branch || !Branch->isConditional()) continue;
+        BasicBlock *TrueBB = Branch->getTrueSuccessor();
+        BasicBlock *FalseBB = Branch->getFalseSuccessor();
+        if (!TrueBB || !FalseBB || TrueBB == FalseBB) continue;
+        std::vector<Instruction *> Instructions = collectInstructions(*Source);
+        for (auto It = Instructions.rbegin();
+             It != Instructions.rend() && Moved < kMaxMovedInstructions;
+             ++It) {
+            Instruction *I = *It;
+            if (!I || I->getParent() != Source ||
+                !isConservativeSinkCandidate(I) || I->countUses() != 1) {
+                continue;
+            }
+            Instruction *OnlyUser = nullptr;
+            if (I->countInstructionUses(&OnlyUser) != 1 || !OnlyUser ||
+                dynamic_cast<PhiInst *>(OnlyUser)) {
+                continue;
+            }
+            BasicBlock *Target = OnlyUser->getParent();
+            if (!Target || Target == Source ||
+                (Target != TrueBB && Target != FalseBB)) {
+                continue;
+            }
+            auto Preds = Target->getPredecessors();
+            if (Preds.size() != 1 || Preds.front() != Source ||
+                Source->countEdgesToSucc(Target) != 1) {
+                continue;
+            }
+            //不跨循环层次移动，也不在目标最终仍必经时制造无收益的代码移动。
+            if (LI.getLoopFor(Source) != LI.getLoopFor(Target) ||
+                PDT.postDominates(Target, Source)) {
+                continue;
+            }
+            if (hasOrderingBarrierOnPath(F, I, OnlyUser, FAM)) continue;
+            I->eraseFromParent();
+            if (!Instruction::insertBefore(OnlyUser, I)) continue;
+            ++Moved;
+            Changed = true;
+        }
+    }
+    return Changed;
+}
 //对给定函数运行GVN及可选PRE并返回分析保留状态
 PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
     //1. 获取支配、循环、AA 与 MemorySSA，构造求解器执行 GVN 及可选 PRE 固定点。
@@ -1386,6 +1456,10 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     GVNPRESolver Solver(F, FAM, DT, LI, AA, MSSA, EnablePRE);
     bool Changed = Solver.run();
+    if (EnableCodeSink) {
+        auto &PDT = FAM.getResult<PostDominantAnalysis>(F);
+        Changed |= runConservativeCodeSink(F, FAM, LI, PDT);
+    }
     if (!Changed) {
         return PreservationStatus::all();
     }

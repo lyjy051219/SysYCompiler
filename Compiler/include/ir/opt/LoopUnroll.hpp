@@ -5,6 +5,7 @@
 #include "ir/analysis/SCEV.hpp"
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -90,6 +91,12 @@ struct UnrollConfig {
     int SCEVExpansionBudget = 8;
     //AllowExpensiveTripCount控制是否接受超过低成本预算的次数表达式
     bool AllowExpensiveTripCount = false;
+    //ReductionAccumulatorMaxLanes限制单个整数归约同时保留的独立累加器数量
+    int ReductionAccumulatorMaxLanes = 2;
+    //ReductionRegisterBudget限制整数寄存器活跃状态和新增累加器的总预算
+    int ReductionRegisterBudget = 12;
+    //ReductionMinChainBenefit要求重关联后关键依赖链至少获得的动态净收益
+    int ReductionMinChainBenefit = 1;
 };
 
 //UnrollDecision保存成本模型为单个循环选择的展开方式和执行参数
@@ -108,6 +115,50 @@ struct UnrollDecision {
     bool IsPeeling = false;
     //TripCountIsProven标记运行时次数的固定位宽计算是否已证明无回绕
     bool TripCountIsProven = false;
+};
+
+//IntegerReductionPlan记录已决定展开循环中的一个整数结合律归约
+struct IntegerReductionPlan {
+    //Phi指向承载循环入口状态的原Header PHI
+    PhiInst *Phi = nullptr;
+    //Update指向计算一次归约更新的二元整数指令
+    BinaryInst *Update = nullptr;
+    //Contribution记录每次迭代合入累加状态的值
+    Value *Contribution = nullptr;
+    //InitialValue记录循环进入前的归约初值
+    Value *InitialValue = nullptr;
+    //Op记录可安全重关联的整数结合律操作
+    BinaryInst::Operation Op = BinaryInst::ADD;
+    //AccumulatorOperand记录Update中归约状态所在的操作数位置
+    unsigned AccumulatorOperand = 0;
+    //LaneCount记录收益与寄存器预算共同允许的累加器路数
+    int LaneCount = 1;
+    //SplitIndex记录展开副本在两条独立累加链之间的切分位置
+    int SplitIndex = 0;
+    //CriticalChainSaving记录每个展开组缩短的串行归约指令数
+    int CriticalChainSaving = 0;
+    //EstimatedNetBenefit记录扣除最终合并成本后的动态依赖链净收益
+    std::int64_t EstimatedNetBenefit = 0;
+};
+
+//IntegerReductionRewrite保存提交重关联前已完整映射的展开副本
+struct IntegerReductionRewrite {
+    //Plan指向本次重写对应的只读归约计划
+    const IntegerReductionPlan *Plan = nullptr;
+    //PrimaryPhi指向部分展开后继续承载第一条累加链的Header PHI
+    PhiInst *PrimaryPhi = nullptr;
+    //Updates按展开迭代顺序保存每个归约更新副本
+    std::vector<BinaryInst *> Updates;
+    //Contributions按展开迭代顺序保存每次迭代的归约输入
+    std::vector<Value *> Contributions;
+    //ResultUses保存最终串行更新在循环外的原有使用
+    std::vector<Use *> ResultUses;
+    //ResultPhis保存Header退出时将由最终合并值整体替换的LCSSA PHI
+    std::vector<PhiInst *> ResultPhis;
+    //OriginalResult记录这些循环外use在提交前共同引用的归约状态值
+    Value *OriginalResult = nullptr;
+    //Identity保存第二条循环携带累加链使用的结合律单位元
+    Value *Identity = nullptr;
 };
 
 //PeelPredicate保存归纳变量与常量比较对应的规范谓词
@@ -244,6 +295,14 @@ public:
     int estimateSCEVCost(const SCEVExpr *E) const;
     //判断SCEV表达式是否满足当前展开配置的物化成本限制
     bool isCheapSCEV(const SCEVExpr *E, const UnrollConfig &Config) const;
+    //判断通用整数SCEV表达式能否在指定循环预头安全物化
+    static bool canMaterializeRuntimeSCEV(
+        const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+        const DominatorTree &DT);
+    //在指定循环预头物化已经通过通用合法性检查的整数SCEV表达式
+    static Value *materializeRuntimeSCEV(
+        const SCEVExpr *E, Loop *L, BasicBlock *PreHeader,
+        const DominatorTree &DT);
     //根据循环条件和不变store收益选择安全peeling次数
     int detectPeelCount(Loop *L,
                         const InductionDescriptor &IV,
@@ -358,6 +417,38 @@ private:
     //判断值是否与给定IR类型兼容
     static bool isValueCompatibleWithType(
         Value *V, std::shared_ptr<IRType> Ty);
+    //判断操作是否属于可按整数位模式安全重关联的结合律归约
+    static bool isAssociativeIntegerReductionOp(
+        BinaryInst::Operation Op);
+    //返回整数归约操作的通用依赖延迟权重
+    static int getIntegerReductionLatency(BinaryInst::Operation Op);
+    //构造给定整数结合律操作对应的单位元
+    static Value *makeIntegerReductionIdentity(
+        BinaryInst::Operation Op, std::shared_ptr<IRType> Ty);
+    //判断归约输入是否依赖候选之外的不受支持Header循环状态
+    static bool dependsOnUnsupportedHeaderState(
+        Value *V, Loop *L, PhiInst *Candidate, PhiInst *ControlIV,
+        const std::unordered_set<PhiInst *> &HeaderPhis,
+        std::unordered_set<Value *> &Active, int Depth = 0);
+    //估算循环内同时占用整数寄存器的循环状态与不变输入数量
+    static int estimateIntegerReductionRegisterPressure(Loop *L);
+    //为已决定的整除部分展开选择整数多累加器计划
+    static std::vector<IntegerReductionPlan> collectIntegerReductionPlans(
+        Loop *L, const LoopTripCountInfo &TCI, int UnrollCount,
+        const UnrollConfig &Config, const DominatorTree &DT);
+    //判断基本块是否属于原循环或任一展开副本
+    static bool isBlockInUnrolledCore(
+        BasicBlock *BB, const UnrolledBodyCore &Core);
+    //把归约计划完整映射为各展开副本并快照循环外结果use
+    static bool buildIntegerReductionRewrite(
+        const IntegerReductionPlan &Plan, UnrolledBodyCore &Core,
+        PhiInst *PrimaryPhi, Value *ResultValue, bool NeedIdentity,
+        IntegerReductionRewrite &Rewrite);
+    //对整除部分展开后的整数归约构造两条循环携带累加链
+    static unsigned applyPartialIntegerReductionAccumulators(
+        UnrolledBodyCore &Core,
+        const std::vector<IntegerReductionPlan> &Plans,
+        const std::unordered_map<PhiInst *, Value *> &HeaderReplacements);
     //把数据值映射到指定展开迭代且拒绝基本块结果
     static Value *mapDataValueAtIteration(
         Value *V, int Iter, const UnrolledBodyCore &Core);

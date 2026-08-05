@@ -3,6 +3,7 @@
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/CFG.hpp"
 #include <unordered_map>
+#include <vector>
 
 //函数内联：将Callee的函数体拼接到Caller的相应位置
 
@@ -18,13 +19,20 @@ struct CalleeInlineProfile {
     bool SafeToMemoize = false;
     //总指令数
     int TotalInstCount = 0;
+    //基本块数量，用于估算内联后新增的控制流开销
+    int BasicBlockCount = 0;
+    //返回指令数量，返回边在内联后会被调用者汇合边替代
+    int ReturnInstCount = 0;
     //自递归调用点数
     int SelfRecursiveCallSites = 0;
+    //每个形参在函数体中的实际使用次数
+    std::vector<int> ParameterUseCounts;
 };
 
 class FuncInlinePass : public PassDescriptor<FuncInlinePass> {
 public:
-	explicit FuncInlinePass(bool enableRecursiveInline = true);
+	explicit FuncInlinePass(bool enableRecursiveInline = true,
+		bool lateCleanupMode = false);
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
@@ -35,8 +43,11 @@ private:
 	static bool isInlineSite(
 		Function &Caller, CallInst *CI, Function *Callee,
 		const std::unordered_map<Function *, int> &CalleeFrequency,
-		bool EnableRecursiveInline, FunctionAnalysisPassManager &FAM,
+		bool EnableRecursiveInline, bool LateCleanupMode,
+		bool CalleeIsRecursive, FunctionAnalysisPassManager &FAM,
 		CalleeInlineProfile &OutProfile);
 	//是否允许递归内联
 	bool EnableRecursiveInline = true;
+	//是否使用晚期低增长收益模型
+	bool LateCleanupMode = false;
 };

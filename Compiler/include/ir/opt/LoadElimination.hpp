@@ -14,6 +14,18 @@ class BasicAAResult;
 class DominatorTree;
 //LoopInfo提供循环归属与循环不变量信息
 class LoopInfo;
+//Loop表示自然循环结构
+class Loop;
+//LoopAccessInfo提供精确仿射依赖距离查询
+class LoopAccessInfo;
+//RangeInfo提供预头路径上的整数范围事实
+class RangeInfo;
+//SCEVResult提供规范归纳变量和循环次数
+class SCEVResult;
+//LoopTripCountInfo描述规范循环的退出阶段和次数
+struct LoopTripCountInfo;
+//InductionDescriptor描述Header归纳PHI及其入口值
+struct InductionDescriptor;
 //MemoryAccess表示MemorySSA中的访问节点
 class MemoryAccess;
 //MemoryLocation描述一次内存访问的指针、大小与覆盖范围
@@ -62,6 +74,18 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    //LoopCarriedForwardingCandidate保存一次距离一跨迭代转发的完整证明对象。
+    struct LoopCarriedForwardingCandidate {
+        //TargetLoop指向候选所在的规范叶子循环。
+        Loop *TargetLoop = nullptr;
+        //PreHeader和Latch记录PHI两条incoming对应的CFG边。
+        BasicBlock *PreHeader = nullptr;
+        BasicBlock *Latch = nullptr;
+        //Load读取上一迭代地址，Store发布本迭代供下一轮使用的值。
+        LoadInst *Load = nullptr;
+        StoreInst *Store = nullptr;
+    };
+
     //MSSALoadRecord保存load及其完整MemorySSA clobber签名
     struct MSSALoadRecord {
         //Load指向待分析的load指令
@@ -92,6 +116,10 @@ private:
     static constexpr int MaxDominatingQueriesPerFunction = 64;
     //MaxMSSALoadComparisons限制每条load比较相同clobber签名候选的次数
     static constexpr std::size_t MaxMSSALoadComparisons = 128;
+    //MaxLoopCarriedPairs限制单次循环枚举的store/load组合数量。
+    static constexpr std::size_t MaxLoopCarriedPairs = 256;
+    //MaxInitialAddressInstructions限制首轮地址在预头复制的纯指令数量。
+    static constexpr std::size_t MaxInitialAddressInstructions = 4;
     //判断候选值的类型形状是否与目标load结果兼容
     static bool isTypeCompatible(Value *Source, LoadInst *TargetLoad);
     //判断指令是否可能修改给定内存位置
@@ -130,4 +158,36 @@ private:
     static bool processFunction(
         Function &F, DominatorTree &DT, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
+    //根据常量次数、尾测形状或预头范围事实证明循环至少执行一次。
+    static bool isKnownNonZeroTrip(
+        const LoopTripCountInfo &Trip,
+        const InductionDescriptor &Induction,
+        RangeInfo &RI, DominatorTree &DT);
+    //验证候选循环中没有可改写转发地址的其他store或调用。
+    static bool hasNoInterferingWrite(
+        const LoopCarriedForwardingCandidate &Candidate,
+        BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
+    //递归把首轮load地址的纯SSA表达式物化到预头，Header PHI替换为入口值。
+    static Value *materializeFirstIterationValue(
+        Value *Original, const LoopCarriedForwardingCandidate &Candidate,
+        DominatorTree &DT,
+        std::unordered_map<Value *, Value *> &ValueMap,
+        std::unordered_set<Value *> &Active,
+        std::vector<Instruction *> &Created, unsigned Depth);
+    //为单个循环收集唯一且满足距离一、必执行和收益门槛的候选。
+    static bool collectLoopCarriedForwardingCandidate(
+        Loop *L, LoopAccessInfo &LA, SCEVResult &SE, RangeInfo &RI,
+        DominatorTree &DT, BasicAAResult &AA, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM,
+        LoopCarriedForwardingCandidate &Candidate);
+    //插入预头初始load和Header携带PHI，并删除循环内上一元素load。
+    static bool transformLoopCarriedForwarding(
+        const LoopCarriedForwardingCandidate &Candidate,
+        DominatorTree &DT);
+    //按循环后序尝试一次通用距离一转发，成功后立即停止使用旧分析。
+    static bool processOneLoopCarriedForwarding(
+        const LoopInfo &LI, LoopAccessInfo &LA, SCEVResult &SE,
+        RangeInfo &RI, DominatorTree &DT, BasicAAResult &AA,
+        FunctionAnalysisPassManager &FAM);
 };

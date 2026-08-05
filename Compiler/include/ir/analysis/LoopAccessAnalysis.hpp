@@ -152,6 +152,10 @@ public:
     //返回指定指令沿给定循环轴的已知字节步长
     std::optional<std::int64_t> getByteStride(Instruction *I, Loop *Scope,
                                               Loop *Axis);
+    //求源写到宿读在指定轴上的唯一常量依赖距离，宿迭代减源迭代为正。
+    std::optional<std::int64_t> getConstantDependenceDistance(
+        Instruction *Source, Instruction *Sink,
+        Loop *Scope, Loop *Axis);
     //根据本Pass及其依赖分析的保留状态判断结果是否失效
     bool invalidate(Function &F, const PreservationStatus &PA);
 

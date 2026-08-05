@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
-FuncInlinePass::FuncInlinePass(bool enableRecursiveInline): EnableRecursiveInline(enableRecursiveInline) {}
+FuncInlinePass::FuncInlinePass(bool enableRecursiveInline, bool lateCleanupMode)
+	: EnableRecursiveInline(enableRecursiveInline),
+	  LateCleanupMode(lateCleanupMode) {}
 //步骤2.2：计算Callee的收益模型
 CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	Function* Callee, FunctionAnalysisPassManager& FAM) {
@@ -17,8 +19,17 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	P.HasBody = (Callee->front() != nullptr);
 	if (!P.HasBody) return P;
     //遍历所有指令，记录总指令数，自递归调用点数，是否调用其他函数
+	P.ParameterUseCounts.resize(Callee->getParamCount(), 0);
+	for (unsigned Index = 0; Index < Callee->getParamCount(); ++Index) {
+		if (Value *Param = Callee->getParam(Index))
+			P.ParameterUseCounts[Index] = Param->countInstructionUses();
+	}
+	for (BasicBlock *BB : *Callee) {
+		if (BB) ++P.BasicBlockCount;
+	}
 	forEachInstruction(*Callee, [&](Instruction *I) {
 		++P.TotalInstCount;
+		if (dynamic_cast<RetInst *>(I)) ++P.ReturnInstCount;
 		auto *CI = dynamic_cast<CallInst *>(I);
 		if (!CI) return;
 		Function *CF = CI->getDirectCallee();
@@ -49,6 +60,8 @@ bool FuncInlinePass::isInlineSite(
 	Function* Callee,
 	const std::unordered_map<Function*, int>& FreqCallee,
 	bool EnableRecursiveInline,
+	bool LateCleanupMode,
+	bool CalleeIsRecursive,
 	FunctionAnalysisPassManager& FAM,
 	CalleeInlineProfile& OutProfile)
 {
@@ -58,6 +71,11 @@ bool FuncInlinePass::isInlineSite(
 	constexpr int kInstThreshold = 200;
     //递归函数内联最大指令支持
 	constexpr int kRecursiveExpandMaxInst = 100;
+	//晚期模型只承担低增长机会，避免重新复制已经优化过的大函数体
+	constexpr int kLateSingleUseMaxInst = 96;
+	constexpr int kLateMultiUseMaxInst = 16;
+	constexpr int kLateModuleGrowthBudget = 48;
+	constexpr int kLateMaxDirectCallSites = 8;
 	OutProfile = analyzeCallee(Callee, FAM);
 	if (!OutProfile.HasBody) return false;
 	if (OutProfile.SafeToMemoize) return false;
@@ -66,8 +84,26 @@ bool FuncInlinePass::isInlineSite(
 	int Freq = (it == FreqCallee.end()) ? 1 : std::max(1, it->second);
     //指令数
 	int InstCount = std::max(0, OutProfile.TotalInstCount - 1);
-	const bool IsRecursiveFunc = (OutProfile.SelfRecursiveCallSites > 0);
+	const bool IsRecursiveFunc = CalleeIsRecursive ||
+		(OutProfile.SelfRecursiveCallSites > 0);
 	const bool IsSelfCall = (Callee == &Caller);
+	if (LateCleanupMode) {
+		//晚期固定点不展开任何递归环，保证重复运行的代码规模单调受控。
+		if (IsRecursiveFunc || Callee == &Caller) return false;
+		if (!Callee->hasOnlyDirectCallUses()) return false;
+		int DirectCallSites = static_cast<int>(Callee->getDirectCallSites().size());
+		if (DirectCallSites <= 0 || DirectCallSites > kLateMaxDirectCallSites)
+			return false;
+		int BodyInstCount = std::max(
+			0, OutProfile.TotalInstCount - OutProfile.ReturnInstCount);
+		//单调用点内联后旧函数体会被删除，模块代码量不会增长。
+		if (DirectCallSites == 1)
+			return BodyInstCount <= kLateSingleUseMaxInst;
+		//多调用点只接受很小且全模块增长受限的函数体。
+		if (BodyInstCount > kLateMultiUseMaxInst) return false;
+		int ModuleGrowth = std::max(0, BodyInstCount - 1) * DirectCallSites;
+		return ModuleGrowth <= kLateModuleGrowthBudget;
+	}
 	if (IsRecursiveFunc) {
 		//递归函数只允许在自身调用点按更严格的总展开预算展开。
 		if (!IsSelfCall) return false;
@@ -83,13 +119,48 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 	bool Changed = false;
 	//1.收集当前函数的Call指令，并记录Callee的调用频次
 	std::unordered_map<Function*, int> FreqCallee;
+	std::unordered_map<Function*, bool> RecursiveCallees;
+	std::unordered_map<CallInst*, int> SitePriority;
+	std::unordered_map<CallInst*, int> SiteOrder;
+	FunctionCallGraph CallGraph;
+	if (Module *M = Module::getActiveModule()) CallGraph = M->buildDirectCallGraph();
+	LoopInfo *LI = LateCleanupMode ? &FAM.getResult<LoopAnalysis>(F) : nullptr;
 	std::vector<CallInst*> OriginalCallSites;
 	for (CallInst *CI : collectInstructions<CallInst>(F)) {
 		auto* Callee = CI->getDirectCallee();
 		if (!Callee) continue;
-		FreqCallee[Callee]++;
+		FreqCallee[Callee] = std::max(
+			1, static_cast<int>(Callee->getDirectCallSites().size()));
+		if (!RecursiveCallees.count(Callee)) {
+			RecursiveCallees[Callee] = !CallGraph.empty() &&
+				Module::isFunctionRecursive(Callee, CallGraph);
+		}
+		if (LateCleanupMode) {
+			Loop *CallLoop = LI ? LI->getLoopFor(CI->getParent()) : nullptr;
+			int Priority = CallLoop ? static_cast<int>(CallLoop->getDepth()) * 16 : 0;
+			CalleeInlineProfile Profile = analyzeCallee(Callee, FAM);
+			for (unsigned Index = 0; Index < CI->getArgCount() &&
+				 Index < Profile.ParameterUseCounts.size(); ++Index) {
+				if (!dynamic_cast<ConstantSystem *>(CI->getArg(Index))) continue;
+				Priority += std::min(Profile.ParameterUseCounts[Index], 8);
+			}
+			SitePriority[CI] = Priority;
+		}
+		SiteOrder[CI] = static_cast<int>(OriginalCallSites.size());
 		OriginalCallSites.push_back(CI);
 	}
+	if (LateCleanupMode) {
+		//先按循环深度和可常量化使用数排序，修改CFG后不再读取旧LoopInfo。
+		std::sort(OriginalCallSites.begin(), OriginalCallSites.end(),
+			[&SitePriority, &SiteOrder](CallInst *LHS, CallInst *RHS) {
+				if (SitePriority[LHS] != SitePriority[RHS])
+					return SitePriority[LHS] > SitePriority[RHS];
+				return SiteOrder[LHS] < SiteOrder[RHS];
+			});
+	}
+	int LateInlinedSites = 0;
+	int LateClonedInsts = 0;
+	int LateCodeGrowth = 0;
     //2.遍历刚才收集的每个Call指令
 	for (CallInst* CI : OriginalCallSites) {
 		if (!CI) continue;
@@ -106,8 +177,26 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 递归函数：调用函数频次×单次函数指令数<=100
 非递归函数：调用函数频次<3 || 调用函数频次(>=3)×单次函数指令数<=200
 */
-		if (!isInlineSite(F, CI, Callee, FreqCallee, EnableRecursiveInline, FAM, Profile)) {
+		if (!isInlineSite(F, CI, Callee, FreqCallee, EnableRecursiveInline,
+			LateCleanupMode, RecursiveCallees[Callee], FAM, Profile)) {
 			continue;
+		}
+		if (LateCleanupMode) {
+			constexpr int kLatePerCallerSiteBudget = 4;
+			constexpr int kLatePerCallerCloneBudget = 96;
+			constexpr int kLatePerCallerGrowthBudget = 48;
+			int BodyInstCount = std::max(
+				0, Profile.TotalInstCount - Profile.ReturnInstCount);
+			int SiteGrowth = Callee->getDirectCallSites().size() == 1 ? 0 :
+				std::max(0, BodyInstCount - 1);
+			if (LateInlinedSites >= kLatePerCallerSiteBudget ||
+				LateClonedInsts + BodyInstCount > kLatePerCallerCloneBudget ||
+				LateCodeGrowth + SiteGrowth > kLatePerCallerGrowthBudget) {
+				continue;
+			}
+			++LateInlinedSites;
+			LateClonedInsts += BodyInstCount;
+			LateCodeGrowth += SiteGrowth;
 		}
 		//3.1 建立形参到实参的初始映射，并一次性克隆被调函数的完整基本块区域
 		ValueToValueMap InitialMap;

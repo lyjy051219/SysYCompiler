@@ -1,5 +1,5 @@
-#include "lib/TypeSystem.hpp"
-#include "lib/Target.hpp"
+#include "TypeSystem.hpp"
+#include "Target.hpp"
 #include <iostream>
 #include <limits>
 #include <stdexcept>

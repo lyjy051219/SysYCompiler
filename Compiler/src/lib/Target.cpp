@@ -1,6 +1,6 @@
-#include "lib/Target.hpp"
+#include "Target.hpp"
 
-#include "lib/TypeSystem.hpp"
+#include "TypeSystem.hpp"
 
 #include <algorithm>
 #include <limits>

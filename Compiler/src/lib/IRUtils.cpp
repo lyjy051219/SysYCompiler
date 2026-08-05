@@ -1,6 +1,6 @@
-#include "lib/IRUtils.hpp"
-#include "lib/CFG.hpp"
-#include "lib/TypeSystem.hpp"
+#include "IRUtils.hpp"
+#include "CFG.hpp"
+#include "TypeSystem.hpp"
 
 #include <cstdint>
 #include <cstring>

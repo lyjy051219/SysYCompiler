@@ -1284,10 +1284,36 @@ bool SCEVResult::isSafeToDiscardImpl(
     if (E->Kind == SCEVExprKind::Unknown) {
         if (!E->RawValue || Value::isUndef(E->RawValue))
             return false;
+        //未知IR值只有在原计算本身无访存、调用、陷阱和poison风险时才可被代数折叠丢弃。
+        if (dynamic_cast<LoadInst *>(E->RawValue) ||
+            dynamic_cast<CallInst *>(E->RawValue)) {
+            return false;
+        }
+        auto *RawInstruction = dynamic_cast<Instruction *>(E->RawValue);
+        if (RawInstruction && RawInstruction->instType == Instruction::FPTOSI)
+            return false;
         auto *Binary = dynamic_cast<BinaryInst *>(E->RawValue);
         if (!Binary) return true;
-        return Binary->getOp() != BinaryInst::UDIV &&
-               Binary->getOp() != BinaryInst::UREM;
+        if (Binary->getOp() == BinaryInst::DIV ||
+            Binary->getOp() == BinaryInst::UDIV ||
+            Binary->getOp() == BinaryInst::MOD ||
+            Binary->getOp() == BinaryInst::UREM) {
+            return false;
+        }
+        if (Binary->getOp() == BinaryInst::SHL ||
+            Binary->getOp() == BinaryInst::LSHR ||
+            Binary->getOp() == BinaryInst::ASHR) {
+            Value *LHS = Binary->getOperand(0);
+            Value *RHS = Binary->getOperand(1);
+            int32_t Shift = 0;
+            const int Bits = LHS && LHS->getIRType() &&
+                    LHS->getIRType()->isInt()
+                ? LHS->getIRType()->getIntegerBitWidth(0)
+                : 0;
+            return RHS && Bits > 0 && RHS->tryGetIntConst(Shift) &&
+                   Shift >= 0 && Shift < Bits;
+        }
+        return true;
     }
     if (E->Kind == SCEVExprKind::Div ||
         E->Kind == SCEVExprKind::Mod) {
@@ -2048,6 +2074,18 @@ std::optional<IntRange> SCEVResult::evaluateRangeForDirection(
     default:
         return std::nullopt;
     }
+}
+//在指定程序点按Range事实保守求值一个i1或i32的SCEV表达式范围
+std::optional<IntRange> SCEVResult::evaluateRangeAt(
+    const SCEVExpr *E, BasicBlock *Context, RangeInfo &RI,
+    DominatorTree &DomTree) const {
+    if (!E || (!IRType::hasIntegerBitWidth(E->Ty, 1) &&
+               !IRType::hasIntegerBitWidth(E->Ty, 32))) {
+        return std::nullopt;
+    }
+    std::unordered_set<const SCEVExpr *> Active;
+    return evaluateRangeForDirection(
+        E, Context, RI, DomTree, Active, 0);
 }
 //根据整数范围分类步长的符号方向
 SCEVStepSign SCEVResult::classifyStepSign(

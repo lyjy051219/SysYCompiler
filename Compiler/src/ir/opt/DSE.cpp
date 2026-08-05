@@ -68,6 +68,65 @@ bool DSEPass::isNonEscapingLocalStackPointer(Value *Pointer) {
     }
     return true;
 }
+//判断store是否只是把同一基本块内先前读取的值无变化写回原地址。
+bool DSEPass::isReloadStoreBackRedundant(
+    StoreInst *Store, BasicAAResult &AA, const LoopInfo &LI,
+    FunctionAnalysisPassManager &FAM) {
+    //2.2 候选必须把一条普通load的结果完整写回完全相同的SSA地址；这种限制
+    //避免把数值相等误当成内存状态相等，也不需要猜测动态别名关系。
+    if (!Store || !Store->fullyCoversItsPointer()) return false;
+    auto *SourceLoad = dynamic_cast<LoadInst *>(Store->getValueOperand());
+    if (!SourceLoad || SourceLoad->getParent() != Store->getParent() ||
+        !SourceLoad->getPointerOperand() || !SourceLoad->getIRType() ||
+        SourceLoad->getIRType() !=
+            SourceLoad->getPointerOperand()->getPointeeType() ||
+        SourceLoad->getPointerOperand() != Store->getPointerOperand()) {
+        return false;
+    }
+    Value *TargetPointer = SourceLoad->getPointerOperand();
+    Value *StoredValue = Store->getValueOperand();
+    if (!TargetPointer || !StoredValue || StoredValue->isUndef()) return false;
+    std::shared_ptr<IRType> StoredType = StoredValue->getIRType();
+    if (!StoredType || StoredType->getSize() == 0) return false;
+    MemoryLocation TargetLocation = MemoryLocation::get(SourceLoad);
+
+    //2.3 load与回写之间允许任意读取、纯计算和不修改P的调用。中间store只有
+    //在确定不别名，或按同类型自然对齐写入同一个V时才不会破坏P原有的V。
+    bool ReachedStore = false;
+    for (Instruction *I = SourceLoad->getNext(); I; I = I->getNext()) {
+        if (I == Store) {
+            ReachedStore = true;
+            break;
+        }
+        if (auto *MiddleStore = dynamic_cast<StoreInst *>(I)) {
+            MemoryLocation MiddleLocation = MemoryLocation::get(MiddleStore);
+            AliasInfo Alias = AA.aliasWithIndexRange(
+                TargetLocation, MiddleLocation, LI);
+            if (Alias == AliasInfo::NoAlias) continue;
+            if (MiddleStore->getValueOperand() != StoredValue ||
+                !MiddleStore->fullyCoversItsPointer()) {
+                return false;
+            }
+            if (Alias == AliasInfo::MustAlias) continue;
+
+            //同型标量地址若都至少按访问宽度对齐，则两次完整访问只能完全重合
+            //或完全分离，不会出现部分覆盖；写入同一个SSA值时两种情况都安全。
+            Value *MiddlePointer = MiddleStore->getPointerOperand();
+            Value *MiddleValue = MiddleStore->getValueOperand();
+            if (!MiddlePointer || !MiddleValue ||
+                MiddleValue->getIRType() != StoredType ||
+                AA.getKnownAlignment(TargetPointer) < StoredType->getSize() ||
+                AA.getKnownAlignment(MiddlePointer) < StoredType->getSize()) {
+                return false;
+            }
+            continue;
+        }
+        ModRefInfo Effect = getInstModRefInfo(
+            TargetLocation, I, AA, LI, FAM);
+        if (isModSet(Effect)) return false;
+    }
+    return ReachedStore;
+}
 //结合AA与调用ModRef信息逆向删除块内被后续写完整覆盖的store。
 bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                                      const LoopInfo &LoopInfo,
@@ -271,10 +330,32 @@ bool DSEPass::isStoreDead(
 }
 //分层运行MemorySSA覆盖、冗余值、块内逆扫和CFG路径无效写消除。
 PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-    //1.获取AA、LoopInfo与MemorySSA，为覆盖判定、索引范围和正反向内存图证明提供依据。
+    //1.获取AA与LoopInfo，为局部语义证明、索引范围和后续内存图查询提供依据。
     bool changed = false;
     BasicAAResult *AA = &FAM.getResult<BasicAliasAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
+    //1.1 先删除把刚读取值无变化写回同一地址的store。该证明允许中间存在
+    //同值别名写，因此能覆盖通用的“复制后再自写回”数据流。
+    std::vector<StoreInst *> reloadStoreBacks;
+    for (StoreInst *SI : collectInstructions<StoreInst>(F)) {
+        if (isReloadStoreBackRedundant(SI, *AA, LI, FAM))
+            reloadStoreBacks.push_back(SI);
+    }
+    for (StoreInst *SI : reloadStoreBacks) {
+        delete SI;
+        changed = true;
+    }
+    if (!reloadStoreBacks.empty()) {
+        PreservationStatus RebuildPA;
+        RebuildPA.keep<DominantAnalysis>();
+        RebuildPA.keep<PostDominantAnalysis>();
+        RebuildPA.keep<LoopAnalysis>();
+        RebuildPA.discard<SideEffectAnalysis>();
+        RebuildPA.discard<BasicAliasAnalysis>();
+        RebuildPA.discard<MemorySSAAnalysis>();
+        FAM.invalidate(F, std::move(RebuildPA));
+        AA = &FAM.getResult<BasicAliasAnalysis>(F);
+    }
     MemorySSAResult *MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
     //2.第一层由MemorySSA统一内存语义并沿CFG证明候选写在所有路径首次读取前
     //均被完整覆盖。先收集后删除保持图稳定；不同值的分支覆盖也能删除汇合前旧写。

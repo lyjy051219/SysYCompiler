@@ -109,6 +109,109 @@ LoopAccessInfo::getByteStride(Instruction *I, Loop *Scope, Loop *Axis) {
         return std::nullopt;
     return LD->getByteStride(I, Axis);
 }
+//求源写到宿读在指定循环轴上的唯一常量依赖距离。
+std::optional<std::int64_t>
+LoopAccessInfo::getConstantDependenceDistance(
+    Instruction *Source, Instruction *Sink,
+    Loop *Scope, Loop *Axis) {
+    //1.只处理同一作用域中的标量写后读；两个访问都必须在每个有效迭代必执行，
+    //地址坐标完整可追踪、目标归纳不回绕且循环轴有限。
+    if (!Source || !Sink || !Scope || !Axis || !SE ||
+        !Scope->contains(Axis->getHeader()) ||
+        !Axis->contains(Source->getParent()) ||
+        !Axis->contains(Sink->getParent()) || !isKnownFinite(Axis)) {
+        return std::nullopt;
+    }
+    std::vector<const LoopAccessFootprint *> SourceFootprints =
+        getFootprints(Scope, Source);
+    std::vector<const LoopAccessFootprint *> SinkFootprints =
+        getFootprints(Scope, Sink);
+    if (SourceFootprints.size() != 1 || SinkFootprints.size() != 1 ||
+        !SourceFootprints.front() || !SinkFootprints.front()) {
+        return std::nullopt;
+    }
+    const LoopAccessFootprint &SourceFootprint = *SourceFootprints.front();
+    const LoopAccessFootprint &SinkFootprint = *SinkFootprints.front();
+    const LoopMemoryAccess *SourceAccess = SourceFootprint.Access;
+    const LoopMemoryAccess *SinkAccess = SinkFootprint.Access;
+    auto Induction = SE->getCanonicalInduction(Axis);
+    if (!SourceAccess || !SinkAccess || !SourceAccess->Writes ||
+        !SinkAccess->Reads || !SourceAccess->AddressExact ||
+        !SinkAccess->AddressExact ||
+        !Induction || !Induction->Valid || !Induction->Phi ||
+        !Induction->UpdateValue ||
+        !SE->isKnownNoWrapInductionValue(Axis, Induction->Phi) ||
+        !SE->isKnownNoWrapInductionValue(
+            Axis, Induction->UpdateValue) ||
+        !isMustExecuteInIterationDomain(
+            *SourceAccess, SourceFootprint.Dimensions) ||
+        !isMustExecuteInIterationDomain(
+            *SinkAccess, SinkFootprint.Dimensions)) {
+        return std::nullopt;
+    }
+    //2.要求相同底层对象、访问宽度和类型化地址布局。后续逐带正向证明
+    //Source(t) 与 Sink(t+Distance) 坐标相同，不从越界或线性地址碰撞反推别名。
+    if (!SourceAccess->Root ||
+        SourceAccess->Root != SinkAccess->Root ||
+        !SourceAccess->Location.Size || !SinkAccess->Location.Size ||
+        *SourceAccess->Location.Size == 0 ||
+        *SourceAccess->Location.Size != *SinkAccess->Location.Size ||
+        SourceAccess->ByteStrides != SinkAccess->ByteStrides ||
+        SourceAccess->Subscripts.size() !=
+            SinkAccess->Subscripts.size() ||
+        !isMixedRadixAccess(*SourceAccess) ||
+        !isMixedRadixAccess(*SinkAccess)) {
+        return std::nullopt;
+    }
+    std::optional<std::int64_t> Distance;
+    bool SawAxis = false;
+    for (std::size_t Index = 0;
+         Index < SourceAccess->Subscripts.size(); ++Index) {
+        const LoopAffineExpr &SourceExpr =
+            SourceAccess->Subscripts[Index];
+        const LoopAffineExpr &SinkExpr =
+            SinkAccess->Subscripts[Index];
+        if (!SourceExpr.Exact || !SinkExpr.Exact ||
+            !sameInvariantTerms(SourceExpr, SinkExpr) ||
+            !sameLoopTermsWithAxisMapping(
+                SourceExpr, Axis, SinkExpr, Axis)) {
+            return std::nullopt;
+        }
+        auto SourceAxis = SourceExpr.LoopCoefficients.find(Axis);
+        auto SinkAxis = SinkExpr.LoopCoefficients.find(Axis);
+        const std::int64_t SourceCoefficient =
+            SourceAxis == SourceExpr.LoopCoefficients.end()
+                ? 0 : SourceAxis->second;
+        const std::int64_t SinkCoefficient =
+            SinkAxis == SinkExpr.LoopCoefficients.end()
+                ? 0 : SinkAxis->second;
+        if (SourceCoefficient != SinkCoefficient)
+            return std::nullopt;
+        if (SourceCoefficient == 0) {
+            if (SourceExpr.Constant != SinkExpr.Constant)
+                return std::nullopt;
+            continue;
+        }
+        SawAxis = true;
+        const __int128 Difference =
+            static_cast<__int128>(SourceExpr.Constant) -
+            static_cast<__int128>(SinkExpr.Constant);
+        const __int128 Coefficient = SourceCoefficient;
+        if (Difference % Coefficient != 0)
+            return std::nullopt;
+        const __int128 ThisDistance = Difference / Coefficient;
+        if (ThisDistance < std::numeric_limits<std::int64_t>::min() ||
+            ThisDistance > std::numeric_limits<std::int64_t>::max()) {
+            return std::nullopt;
+        }
+        const std::int64_t NarrowDistance =
+            static_cast<std::int64_t>(ThisDistance);
+        if (Distance && *Distance != NarrowDistance)
+            return std::nullopt;
+        Distance = NarrowDistance;
+    }
+    return SawAxis ? Distance : std::nullopt;
+}
 //判断同一读取是否在一个循环轴复用并在另一轴变化
 bool LoopAccessInfo::hasCrossAxisReuse(Loop *Scope, Loop *ReusedAxis,
                                        Loop *VaryingAxis) {

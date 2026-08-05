@@ -38,7 +38,7 @@
 
 
 
-#include "yacc/Bison.hpp"
+#include "Bison.hpp"
 
 
 // Unqualified %code blocks.

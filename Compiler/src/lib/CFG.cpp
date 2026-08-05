@@ -1,7 +1,7 @@
 #include "../../include/lib/CFG.hpp"
 #include "../../include/lib/BaseManager.hpp"
-#include "lib/CFG.hpp"
-#include "lib/IRUtils.hpp"
+#include "CFG.hpp"
+#include "IRUtils.hpp"
 #include <cassert>
 #include <cmath>
 #include <cstring>
