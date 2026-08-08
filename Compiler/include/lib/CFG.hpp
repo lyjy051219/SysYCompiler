@@ -780,6 +780,51 @@ class ConstantSystem : public Value{
     virtual bool isConst(){return true;}
 };
 
+// 固定长度向量常量
+//支持普通常量以及Splat常量（所有lane常量都相同）
+class ConstantVector : public ConstantSystem {
+private:
+    std::vector<ConstantSystem *> elements;
+    //检查向量常量是否合法
+    static std::shared_ptr<VECTORType> validateAndGetType(
+        const std::shared_ptr<VECTORType> &type,
+        const std::vector<ConstantSystem *> &elements);
+    //生成向量常量的IR表示
+    static std::string buildIdent(
+        const std::vector<ConstantSystem *> &elements);
+    ConstantVector(std::shared_ptr<VECTORType> type,
+                   std::vector<ConstantSystem *> elements);
+
+public:
+    // 从元素列表推导 <elements.size() x element-type>。
+    static ConstantVector *get(
+        const std::vector<ConstantSystem *> &elements);
+    // 使用显式向量类型创建常量，并校验 lane 数和每个元素的类型。
+    static ConstantVector *get(
+        const std::shared_ptr<VECTORType> &type,
+        const std::vector<ConstantSystem *> &elements);
+
+    // 创建所有 lane 都等于 element 的 splat 常量。
+    static ConstantVector *getSplat(std::size_t elementCount,
+                                    ConstantSystem *element);
+    static ConstantVector *getSplat(
+        const std::shared_ptr<VECTORType> &type,
+        ConstantSystem *element);
+
+    std::size_t getNumElements() const { return elements.size(); }
+    ConstantSystem *getElement(std::size_t index) const;
+    ConstantSystem *operator[](std::size_t index) const {
+        return getElement(index);
+    }
+    const std::vector<ConstantSystem *> &getElements() const {
+        return elements;
+    }
+
+    bool isSplat() const;
+    // 非 splat 常量返回 nullptr。
+    ConstantSystem *getSplatValue() const;
+};
+
 
 class ConstBool : public ConstantSystem{
     private:

@@ -3059,6 +3059,108 @@ void Initializer::dumpIR(){
 // 常量对象工厂与驻留。
 ConstantSystem::ConstantSystem(std::shared_ptr<IRType> irtype):Value(irtype){}
 
+std::shared_ptr<VECTORType> ConstantVector::validateAndGetType(
+    const std::shared_ptr<VECTORType> &Type,
+    const std::vector<ConstantSystem *> &Elements) {
+  if (!Type)
+    throw std::invalid_argument("向量常量需要有效的向量类型");
+  if (Elements.size() != Type->getElementCount())
+    throw std::invalid_argument("向量常量的元素数量必须与 lane 数一致");
+
+  const std::shared_ptr<IRType> ElementType = Type->getElementType();
+  for (ConstantSystem *Element : Elements) {
+    if (!Element || !Element->getIRType() ||
+        !Element->getIRType()->hasSameShape(*ElementType))
+      throw std::invalid_argument(
+          "向量常量的所有元素必须与向量元素类型完全一致");
+    if (!Element->getIRType()->isScalar())
+      throw std::invalid_argument("向量常量的元素必须是标量常量");
+  }
+  return Type;
+}
+
+std::string ConstantVector::buildIdent(
+    const std::vector<ConstantSystem *> &Elements) {
+  std::stringstream Stream;
+  Stream << "<";
+  for (std::size_t Index = 0; Index < Elements.size(); ++Index) {
+    if (Index != 0) Stream << ", ";
+    const std::shared_ptr<IRType> ElementType = Elements[Index]->getIRType();
+    if (auto IntegerType = std::dynamic_pointer_cast<INTType>(ElementType))
+      Stream << "i" << IntegerType->getBitWidth();
+    else
+      Stream << "float";
+    Stream << " " << Elements[Index]->getIdent();
+  }
+  Stream << ">";
+  return Stream.str();
+}
+
+ConstantVector::ConstantVector(
+    std::shared_ptr<VECTORType> Type,
+    std::vector<ConstantSystem *> Elements)
+    : ConstantSystem(validateAndGetType(Type, Elements)),
+      elements(std::move(Elements)) {
+  ident = buildIdent(elements);
+}
+
+ConstantVector *ConstantVector::get(
+    const std::vector<ConstantSystem *> &Elements) {
+  if (Elements.empty() || !Elements.front() ||
+      !Elements.front()->getIRType())
+    throw std::invalid_argument(
+        "向量常量需要至少一个带类型的常量元素");
+  return get(VECTORType::NewVector(Elements.front()->getIRType(),
+                                   Elements.size()),
+             Elements);
+}
+
+ConstantVector *ConstantVector::get(
+    const std::shared_ptr<VECTORType> &Type,
+    const std::vector<ConstantSystem *> &Elements) {
+  validateAndGetType(Type, Elements);
+  // 标量常量和类型均已驻留，因此元素指针序列可以作为稳定的唯一键。
+  static std::map<std::vector<ConstantSystem *>, ConstantVector *> Constants;
+  auto &Constant = Constants[Elements];
+  if (!Constant)
+    Constant = new ConstantVector(Type, Elements);
+  return Constant;
+}
+
+ConstantVector *ConstantVector::getSplat(
+    std::size_t ElementCount, ConstantSystem *Element) {
+  if (!Element || !Element->getIRType())
+    throw std::invalid_argument("splat 常量需要有效的标量常量");
+  return getSplat(
+      VECTORType::NewVector(Element->getIRType(), ElementCount), Element);
+}
+
+ConstantVector *ConstantVector::getSplat(
+    const std::shared_ptr<VECTORType> &Type, ConstantSystem *Element) {
+  if (!Type)
+    throw std::invalid_argument("splat 常量需要有效的向量类型");
+  std::vector<ConstantSystem *> Elements(Type->getElementCount(), Element);
+  return get(Type, Elements);
+}
+
+ConstantSystem *ConstantVector::getElement(std::size_t Index) const {
+  if (Index >= elements.size())
+    throw std::out_of_range("向量常量的 lane 索引越界");
+  return elements[Index];
+}
+
+bool ConstantVector::isSplat() const {
+  if (elements.empty()) return false;
+  for (std::size_t Index = 1; Index < elements.size(); ++Index)
+    if (!Value::areEqualConstants(elements.front(), elements[Index]))
+      return false;
+  return true;
+}
+
+ConstantSystem *ConstantVector::getSplatValue() const {
+  return isSplat() ? elements.front() : nullptr;
+}
+
 
 ConstBool::ConstBool(bool val):ConstantSystem(INTType::getBoolTy()),val(val){
     if (val)
