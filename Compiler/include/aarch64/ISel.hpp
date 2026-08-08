@@ -1,15 +1,17 @@
 #pragma once
 
 #include "MIR.hpp"
+#include "Target.hpp"
 #include "../lib/CFG.hpp"
 
 namespace aarch64 {
 
 class IRLowering {
   Module &module_;
+  BackendOptions options_;
 
 public:
-  explicit IRLowering(Module &module);
+  IRLowering(Module &module, const BackendOptions &options);
   MachineModule lowerModule();
 
 private:

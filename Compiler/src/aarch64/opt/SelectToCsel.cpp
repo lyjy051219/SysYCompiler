@@ -1,10 +1,11 @@
 #include "aarch64/opt/MachineOptPasses.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
-// ARM64 专用条件选择下降：把 SELECT 伪指令转成 CSEL，尽量把产生条件的比较
+// ARM64 专用条件选择 lowering：把 SELECT 伪指令转成 CSEL，尽量把产生条件的比较
 // 直接折进 csel 的 cmp/fcmp，从而用「[f]cmp + csel」两条指令替代原本的
 // 无分支掩码序列（sub 掩码 + and + xor/add，3~4 条）或菱形分支。
 // 这是完全通用的优化：所有整型条件选择（min/max、按条件累加等）都受益。
@@ -13,7 +14,9 @@
 //   - 条件由同块内单次使用的比较（SLT/SLTU/SEQZ/SNEZ/FEQ/FLT/FLE）定义，
 //     且比较操作数在比较与 SELECT 之间未被重定义时，折进 CSEL 并删除比较；
 //   - 否则回退为「与零比较」：CSEL 内嵌 SNEZ，发射 cmp cond,#0 + csel ne。
-// 只处理整型 GPR 结果的 SELECT；浮点结果的 SELECT 留给原有下降。
+//   - tst 融合（沿单次使用恒等拷贝链追溯 ANDI）默认关闭，
+//     设置环境变量 BACKEND_ENABLE_CSEL_TST_FUSION 才启用。
+// 只处理整型 GPR 结果的 SELECT；浮点结果的 SELECT 留给原有 lowering。
 
 namespace aarch64 {
 namespace {
@@ -134,12 +137,13 @@ bool runSelectToCsel(MachineFunction &mf) {
               foldedCompare = true;
               removed.push_back(j);
 
-              // tst 融合：与零比较时，沿「单次使用的恒等拷贝」（等值比较下降
+              // tst 融合：与零比较时，沿「单次使用的恒等拷贝」（等值比较 lowering
               // 留下的 XORI #0、以及 COPY）向上追溯 cmpLhs 的真正定义，若最终
               // 是单次使用的 ANDI(立即数)，则把 (x & mask) 折进 tst：cmpLhs 改
               // 为 x、cmpRhs 改为 Imm(mask)，并删除沿途的恒等拷贝与该 ANDI。
               // 全程要求单次使用且源在中间未被重定义，故安全。
-              if (isZeroCompare(cmp.opcode)) {
+              if (std::getenv("BACKEND_ENABLE_CSEL_TST_FUSION") != nullptr &&
+                  isZeroCompare(cmp.opcode)) {
                 MachineOperand cur = cmpLhs;
                 std::size_t searchEnd = j; // 追溯定义须在此下标之前
                 std::vector<std::size_t> chainRemoved;

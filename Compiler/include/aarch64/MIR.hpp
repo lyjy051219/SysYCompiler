@@ -3,6 +3,7 @@
 #include "Registers.hpp"
 #include <cstdint>
 #include <iosfwd>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,7 +35,19 @@ enum class Opcode {
   SEQZ, SNEZ, FEQ_S, FLT_S, FLE_S, FADD_S, FSUB_S, FMUL_S,
   FDIV_S, FCVT_W_S, FCVT_S_W, LBU, SB, LW, SW, LD, SD, FLW, FSW, GEP,
   MEMCPY_INLINE, MEMSET_INLINE, CALL, RET, BEQZ, BNEZ, BEQ, BNE, BLT, BGE, J,
+  // ARM64 专用尾调用：把"实参 COPY 就位 + 直接跳转"一体化的出口指令。
+  // 语义 = 尾声恢复（x30/callee-saved 按 functionContainsCall 与
+  // gprCalleeSavedRegsToSave 决策）+ 回收栈帧 + 不写 x30 的 b 跳转，被调
+  // 函数直接返回给本函数的调用者。实参物理寄存器以 implicitUses 保护（与
+  // CALL 一致），使寄存器分配器保留调用点前的实参 COPY。
+  TAILCALL,
   PHI, SELECT, PARALLEL_COPY,
+  // ARM64 专用：32×32→64 有符号长乘（smull xd, wn, wm）。乘数按 w 视图读取，
+  // 结果写入 64 位 x 寄存器，与真 64 位乘法 MUL（mul xd, xn, xm）严格区分。
+  // 只有 SMULL 与 64 位 ADD/SUB 融合成 SMADDL/SMSUBL 在 ISA 语义上等价；
+  // 真 64 位 MUL 无对应的长乘加指令，任何把 MUL 当 SMULL 消费的 Pass 都是
+  // 潜在错误编译（P0 修复，见 MulAddFusion.cpp 的位宽语义契约）。
+  SMULL,
   // ARM64 专用：把 32 位有符号整数符号扩展成 64 位（用于 GEP 索引地址计算）。
   SXTW,
   // ARM64 专用乘加融合。均为 defs[0]=uses[0]*uses[1]+uses[2]（MSUB 为减）。
@@ -103,6 +116,14 @@ struct MachineBasicBlock {
   std::vector<int> succs;
 };
 
+struct GlobalObject {
+  std::string name;
+  Variable *ir = nullptr;
+  bool constant = false;
+  int64_t size = 0;
+  int64_t align = 4;
+};
+
 struct MachineFunction {
   std::string name;
   Function *irFunction = nullptr;
@@ -112,6 +133,10 @@ struct MachineFunction {
   std::vector<StackObject> stackObjects;
   std::unordered_map<Value *, MachineReg> valueRegs;
   std::unordered_map<Value *, int> valueStackObjects;
+  // 模块级全局对象快照（符号名 -> 尺寸/常量性），lowerModule 时按
+  // MachineModule::globals 填充，std::map 保证确定性遍历序。
+  // 供机器层 pass（如 machineLICM 的 load 在界/常量性查询）使用，避免依赖 IR 层。
+  std::map<std::string, GlobalObject> globals;
   std::vector<PhysReg> usedCalleeSaved;
   int64_t maxOutgoingArgs = 0;
   int64_t frameSize = 0;
@@ -119,14 +144,6 @@ struct MachineFunction {
 
   MachineReg createVReg(RegClass rc);
   int createStackObject(int64_t size, int64_t align, std::string name);
-};
-
-struct GlobalObject {
-  std::string name;
-  Variable *ir = nullptr;
-  bool constant = false;
-  int64_t size = 0;
-  int64_t align = 4;
 };
 
 struct MachineModule {

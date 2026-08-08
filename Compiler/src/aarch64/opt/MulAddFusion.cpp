@@ -6,14 +6,24 @@
 
 // ARM64 专用乘加融合：把「乘法结果只被一条加/减消费」的模式融合成单条
 // madd/msub（32 位）或 smaddl/smsubl（32x32+64，用于地址累加与 magic
-// multiply 取高位后的加法）。收益覆盖矩阵乘、fft、稀疏矩阵向量乘等所有
-// 乘累加与数组地址计算热点。
+// multiply 取高位后的加法）。适用于任意乘累加与数组地址计算的通用模式。
 //
 // 融合规则（均要求乘法结果为单次使用，且乘法在加/减之前、同一基本块内，
 // 两者之间乘数寄存器未被重定义）：
-//   ADD  d, x, mul(n,m)  或  ADD  d, mul(n,m), x  ->  MADD/SMADDL d, n, m, x
-//   SUB  d, x, mul(n,m)                            ->  MSUB/SMSUBL d, n, m, x
+//   形如 d = x + mul(n,m) 或 d = mul(n,m) + x 的加法，合并为 MADD/SMADDL d, n, m, x；
+//   形如 d = x - mul(n,m) 的减法，合并为 MSUB/SMSUBL d, n, m, x。
 // SUB 只在减数一侧是乘法时才可融合（d = x - n*m）。
+//
+// 位宽语义契约（P0 修复）：
+//   MIR 中 MULW = 32 位乘法（mul wd, wn, wm），SMULL = 32×32→64 有符号长乘
+//   （smull xd, wn, wm），MUL = 真 64 位乘法（mul xd, xn, xm）。
+//   SMADDL/SMSUBL 的 ISA 语义是 32×32→64 乘加/乘减，与「SMULL + 64 位
+//   ADD/SUB」逐位等价（含模 2^64 回绕），因此只有 SMULL 可参与长乘加融合；
+//   真 64 位 MUL 在 AArch64 上没有对应的长乘加指令，一律不融合。
+//   旧实现把 Opcode::MUL 一律按 smull 语义处理，依赖 ISel 只在 magic multiply
+//   与 GEP 索引×步长两处生成 64 位乘法的内部约定；一旦出现真 64 位乘法，
+//   MUL→SMADDL 会静默截断乘数为 w 视图，构成潜在错误编译。本次通过新增
+//   SMULL opcode 把宽度语义显式化，MUL 不再参与任何长乘加融合。
 
 namespace aarch64 {
 namespace {
@@ -38,8 +48,9 @@ std::unordered_map<uint32_t, int> collectUseCounts(const MachineFunction &mf) {
 }
 
 bool isMul32(Opcode op) { return op == Opcode::MULW; }
-bool isMul64(Opcode op) { return op == Opcode::MUL; }
-bool isMulOp(Opcode op) { return isMul32(op) || isMul64(op); }
+bool isSmull(Opcode op) { return op == Opcode::SMULL; }
+// 可融合的乘法只有 32 位 MULW 与 32×32→64 SMULL；真 64 位 MUL 不在集合内。
+bool isMulOp(Opcode op) { return isMul32(op) || isSmull(op); }
 
 // 加法（可交换）与减法的宽度是否与乘法匹配。
 bool addMatchesMul(Opcode addOp, Opcode mulOp) {
@@ -60,6 +71,25 @@ Opcode fusedAdd(Opcode mulOp) {
 }
 Opcode fusedSub(Opcode mulOp) {
   return isMul32(mulOp) ? Opcode::MSUB : Opcode::SMSUBL;
+}
+
+// 乘法指令的宽度结构校验：SMULL 定义 64 位 x 结果、MULW 定义 32 位 w 结果，
+// 且两个乘数槽必须是寄存器（虚拟或物理均可）。乘数槽若为立即数等非寄存器
+// 操作数，SMADDL/SMSUBL/MADD/MSUB 无法编码，必须拒绝。
+bool structurallyValidMul(const MachineInstr &mul) {
+  if (mul.defs.size() != 1 || mul.defs.front().kind != OperandKind::Reg ||
+      mul.uses.size() < 2 || mul.uses[0].kind != OperandKind::Reg ||
+      mul.uses[1].kind != OperandKind::Reg) {
+    return false;
+  }
+  const RegClass defRc = mul.defs.front().regValue.rc;
+  if (isSmull(mul.opcode) && defRc != RegClass::GPR64) {
+    return false;
+  }
+  if (isMul32(mul.opcode) && defRc != RegClass::GPR32) {
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -137,7 +167,7 @@ bool runMulAddFusion(MachineFunction &mf) {
         if (isSub && !subMatchesMul(add.opcode, mulOp)) {
           continue;
         }
-        if (!isVReg(mul.uses[0]) && mul.uses[0].kind != OperandKind::Reg) {
+        if (!structurallyValidMul(mul)) {
           continue;
         }
 

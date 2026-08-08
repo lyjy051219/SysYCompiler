@@ -16,8 +16,26 @@
 #include <vector>
 
 namespace aarch64 {
+// CodeGenPrepare pass 的公共实现。
+//
+// 作用：在中端 IR 层面为后端做地址计算的强度削减。核心变换是把循环体内、
+// 索引为仿射归纳变量的 getelementptr（GEP，数组元素地址）改写成一个指针型
+// 归纳变量（pointer IV）：预头块里算出初始地址，header 放一个 PHI，latch 里每
+// 次迭代只做一次固定步长的指针推进，从而把每次迭代的乘法+加法地址计算削减为
+// 一次加法。此外把 base、可变索引、步长都相同、常量字节偏移在立即数范围内的
+// 一簇 GEP 聚类，让它们共享同一个指针 IV（配合常量偏移）。
+//
+// 正确性依赖：借助 SCEV 与区间分析证明索引在整型范围内不会溢出/回绕
+// （no-wrap），否则用指针推进替换重新计算可能改变结果，因此这里做了大量保守
+// 的区间与支配性检查，任何无法证明安全的候选都会被放弃。
+//
+// RISC-V 与 ARM64 两后端使用相同实现
+// 两后端各保留一份相同实现。
+
 namespace {
 
+// 一个待改写的候选：一个（或一簇）循环内 GEP，连同其归纳变量、起点、步长、
+// 预头/latch 位置以及需要在预头克隆的中间值集合。
 struct PrepareCandidate {
   struct ClusterMember {
     GetElementPtrInst *gep = nullptr;
@@ -39,6 +57,8 @@ struct PrepareCandidate {
   std::vector<ClusterMember> clusterMembers;
 };
 
+// 一个 GEP 展开成线性地址后的签名：base 指针 + 各原子项的系数 + 常量字节偏移，
+// 用于判断两个 GEP 是否只相差一个常量偏移，从而可以聚类共享指针 IV。
 struct LinearAddressSignature {
   Value *base = nullptr;
   std::map<Value *, int64_t> terms;
@@ -46,12 +66,15 @@ struct LinearAddressSignature {
   std::shared_ptr<IRType> pointeeType;
 };
 
+// 对某个索引值做仿射分析的结果：它相对哪个归纳变量、系数、以及归纳变量出现次数
+// （出现超过一次说明非线性，不可用）。
 struct AffineIndexInfo {
   Value *induction = nullptr;
   int coefficient = 0;
   unsigned occurrences = 0;
 };
 
+// 一个带符号整数区间 [min, max]，均限制在 i32 范围内。
 struct SignedRange {
   int64_t min = 0;
   int64_t max = 0;
@@ -65,6 +88,8 @@ using KnownSCEVRangeMap = std::unordered_map<const SCEVExpr *, SignedRange>;
 using AffineIndexCache =
     std::unordered_map<Value *, std::optional<AffineIndexInfo>>;
 
+// 一个不标记 inbounds 的 GEP 指令类型。指针 IV 推进可能临时越过数组边界（下一
+// 迭代才回到范围内），因此新造的 GEP 不能声称 inbounds，以免误导后续优化。
 class NonInBoundsGEPInst final : public GetElementPtrInst {
 public:
   explicit NonInBoundsGEPInst(Value *Base) : GetElementPtrInst(Base) {}
@@ -101,11 +126,13 @@ public:
   }
 };
 
+// 值是否能放入 int32。
 bool fitsInt32(int64_t value) {
   return value >= std::numeric_limits<int>::min() &&
          value <= std::numeric_limits<int>::max();
 }
 
+// 是否是函数参数或全局变量（视为循环不变、在预头之前即可用）。
 bool isParamOrGlobal(Value *V) {
   if (dynamic_cast<Param *>(V)) {
     return true;
@@ -114,6 +141,8 @@ bool isParamOrGlobal(Value *V) {
   return Var && Var->isGlobal();
 }
 
+// 值 V 是否在预头之前就已定义（循环不变），使其可安全用于预头处算初始地址。
+// 常量、参数、全局都算是；否则要求其定义支配预头末尾。
 bool dominatesPreheader(Value *V, BasicBlock *PreHeader,
                         const DominatorTree &DT) {
   if (!V)
@@ -126,16 +155,20 @@ bool dominatesPreheader(Value *V, BasicBlock *PreHeader,
   return DT.dominatesValue(V, PreHeader->back());
 }
 
+// 是否是本 pass 支持作为索引处理的整型值（4 或 8 字节整数）。
 bool isSupportedIndexValue(Value *V) {
   return V && V->getIRType() && V->getIRType()->getTypeSystem() == IR_INT &&
          (V->getIRType()->getSize() == 4 || V->getIRType()->getSize() == 8);
 }
 
+// 区间 [Min, Max] 是否整体落在 i32 范围内（用 128 位中间量避免溢出）。
 bool rangeFitsI32(__int128 Min, __int128 Max) {
   return Min >= std::numeric_limits<int>::min() &&
          Max <= std::numeric_limits<int>::max();
 }
 
+// 求比较谓词的逻辑取反（如 E 变 NE、GE 变 L），用于把“退出条件”换算为
+// “继续循环条件”。
 BinaryInst::Operation invertPredicate(BinaryInst::Operation Op) {
   switch (Op) {
   case BinaryInst::E:
@@ -155,6 +188,8 @@ BinaryInst::Operation invertPredicate(BinaryInst::Operation Op) {
   }
 }
 
+// 交换比较两侧操作数时对应的谓词变换（如 GE 与 LE 互换），用于把归纳变量统一
+// 挪到比较左侧。
 BinaryInst::Operation swapPredicate(BinaryInst::Operation Op) {
   switch (Op) {
   case BinaryInst::GE:
@@ -170,6 +205,7 @@ BinaryInst::Operation swapPredicate(BinaryInst::Operation Op) {
   }
 }
 
+// 递归收集循环 L 及其所有子循环的基本块。
 void collectLoopBlocks(const Loop *L, std::vector<BasicBlock *> &Blocks) {
   if (!L)
     return;
@@ -179,9 +215,11 @@ void collectLoopBlocks(const Loop *L, std::vector<BasicBlock *> &Blocks) {
   }
 }
 
+// SCEV 展开的规模上限，防止病态输入导致指数级递归/内存爆炸。
 constexpr std::size_t kMaxSCEVExpansionCost = 16384;
 constexpr std::size_t kMaxSCEVRecursionDepth = 512;
 
+// 值是否是可能参与 SCEV 表达式展开的指令类型。
 bool isSCEVExpressionValue(Value *V) {
   return dynamic_cast<BinaryInst *>(V) || dynamic_cast<PhiInst *>(V) ||
          dynamic_cast<SelectInst *>(V) ||
@@ -190,6 +228,8 @@ bool isSCEVExpressionValue(Value *V) {
          dynamic_cast<BitCastInst *>(V);
 }
 
+// 估算把 V 完全展开为 SCEV 表达式的规模（带缓存、递归深度上限与环检测）。
+// 超过 kMaxSCEVExpansionCost 即返回一个越界值，供上层提前放弃该函数。
 std::size_t expandedSCEVCost(Value *V,
                              std::unordered_map<Value *, std::size_t> &Cache,
                              std::unordered_set<Value *> &Active,
@@ -221,6 +261,9 @@ std::size_t expandedSCEVCost(Value *V,
   return Cost;
 }
 
+// 预检查：整个函数里所有循环归纳 PHI 与决定循环去留的退出条件的 SCEV 展开规模
+// 是否都在可控范围内。任一超限就返回 false，让调用方整体跳过该函数，避免后续
+// 分析开销失控。
 bool hasManageableSCEVInputs(const LoopInfo &LI) {
   std::unordered_map<Value *, std::size_t> Cache;
   std::vector<const Loop *> Worklist;
@@ -272,6 +315,8 @@ bool hasManageableSCEVInputs(const LoopInfo &LI) {
   return true;
 }
 
+// 从 Root 出发遍历其计算树，判断是否含有对区间/回绕推理不安全的运算：除法、
+// 无符号除/取余，以及各种类型转换/select 等（它们会破坏“线性、无回绕”前提）。
 bool containsUnsafeSCEVOperation(Value *Root) {
   std::vector<Value *> Worklist{Root};
   std::unordered_set<Value *> Visited;
@@ -305,6 +350,8 @@ bool containsUnsafeSCEVOperation(Value *Root) {
   return false;
 }
 
+// SCEV 表达式是否递归提及循环 L（即含以 L 为归纳循环的递推项）。用于判断循环
+// 上界是否真的是循环不变量。深度超限时保守返回 true（视为提及，放弃变换）。
 bool scevMentionsLoop(const SCEVExpr *Expr, const Loop *L,
                       std::unordered_set<const SCEVExpr *> &Visited,
                       std::size_t Depth = 0) {
@@ -325,6 +372,8 @@ bool scevMentionsLoop(const SCEVExpr *Expr, const Loop *L,
   return false;
 }
 
+// 一个循环的“可靠 trip count信息”：退出上界表达式、归纳递推的起点
+// 与步长、化为“继续循环”后的谓词，以及退出测试在 header 还是 latch 上。
 struct ReliableTripCountInfo {
   const SCEVExpr *bound = nullptr;
   int64_t recurrenceStart = 0;
@@ -334,6 +383,10 @@ struct ReliableTripCountInfo {
   bool latchTested = false;
 };
 
+// 分析循环 L 的退出条件，尝试提取可靠的迭代次数信息。要求循环只有唯一退出块、
+// 退出条件是一个把归纳变量与循环不变上界比较的二元比较，且该比较能被精确判定
+// （步长方向与谓词一致，或 NE 情形能整除），否则返回 nullopt。这里刻意保守：
+// 只接受“恰好一次到达边界即退出”的规范形态，作为后续区间推导的可信基础。
 std::optional<ReliableTripCountInfo> getReliableTripCountInfo(SCEVResult &SCEV,
                                                               const Loop *L) {
   BasicBlock *Exiting = nullptr;
@@ -392,6 +445,9 @@ std::optional<ReliableTripCountInfo> getReliableTripCountInfo(SCEVResult &SCEV,
 
   const int64_t Step = *Affine->ConstantStep;
   bool Exact = false;
+  // 判断“步长方向与谓词是否保证恰好一次跨过边界后退出”。< / <= 需步长为正，
+  // > / >= 需步长为负；NE 则要求上界为常量且步长能整除起点到上界的距离，
+  // 否则可能跳过边界形成事实上的无限循环，不能视为可靠迭代次数。
   switch (Predicate) {
   case BinaryInst::L:
   case BinaryInst::LE:
@@ -428,6 +484,10 @@ std::optional<ReliableTripCountInfo> getReliableTripCountInfo(SCEVResult &SCEV,
                                    Backedges.front() == Exiting};
 }
 
+// 当无法从 SCEV 拿到 trip count 上界时的兜底：对“步长为 +1 且谓词为 <”或
+// “步长为 -1 且谓词为 >”这两种单位步长严格比较的规范循环，直接给出归纳变量
+// 的保守取值区间（从初值到 i32 边界），供上层证明索引不回绕。区分 header 测试
+// 与 latch 测试两种约定（旋转前后差一次迭代），并小心边界避免自身溢出。
 std::optional<SignedRange>
 getDynamicStrictUnitRange(const ReliableTripCountInfo &TripInfo,
                           const LoopInductionInfo &Induction) {
@@ -464,10 +524,15 @@ getDynamicStrictUnitRange(const ReliableTripCountInfo &TripInfo,
   return std::nullopt;
 }
 
+// 前向声明：按值/按 SCEV 计算保守的“不回绕”区间，两者互相递归。
 std::optional<SignedRange>
 computeNoWrapRange(Value *V, const InductionRangeMap &InductionRanges,
                    std::unordered_set<Value *> &Active, ValueRangeCache &Cache);
 
+// 递归计算 SCEV 表达式的带符号区间。对常量、未知值（转交按值分析）、加减乘、
+// 除（仅当除数区间不含 0）、min/max 分别做区间算术，任何中间结果超出 i32 即
+// 放弃（返回 nullopt）。带缓存、活跃集环检测与递归深度上限。KnownRanges 提供
+// 已确定的归纳变量区间作为已知事实。
 std::optional<SignedRange>
 computeSCEVRange(const SCEVExpr *Expr, const InductionRangeMap &InductionRanges,
                  std::unordered_set<const SCEVExpr *> &Active,
@@ -556,6 +621,10 @@ computeSCEVRange(const SCEVExpr *Expr, const InductionRangeMap &InductionRanges,
       SignedRange{static_cast<int64_t>(Min), static_cast<int64_t>(Max)});
 }
 
+// 为所有归纳变量迭代地建立取值区间表。多轮不动点求解：每轮利用已确定区间作为
+// 已知事实，尝试为尚未确定的归纳变量推出区间——先算 trip count 区间，据此从初值
+// 与步长外推归纳变量的终值端点，取初值到终值的包络作为区间；trip count 拿不到
+// 时退回单位步长兜底。直到某一轮没有新增即停止。
 InductionRangeMap buildInductionRanges(
     SCEVResult &SCEV,
     const std::unordered_map<Value *, LoopInductionInfo> &LoopInductions) {
@@ -625,6 +694,9 @@ InductionRangeMap buildInductionRanges(
   return Result;
 }
 
+// 按值（而非 SCEV）计算保守的“不回绕”i32 区间。只处理 4 字节整数：常量、
+// 已知归纳变量取表中区间、加/减/乘按区间算术、取模按除数量级给出界。任何中间
+// 结果超出 i32 即返回 nullopt，表示无法证明不回绕。带缓存与环检测。
 std::optional<SignedRange>
 computeNoWrapRange(Value *V, const InductionRangeMap &InductionRanges,
                    std::unordered_set<Value *> &Active,
@@ -665,6 +737,7 @@ computeNoWrapRange(Value *V, const InductionRangeMap &InductionRanges,
     Active.erase(V);
     if (!RHS || RHS->min != RHS->max || RHS->min == 0)
       return Remember(std::nullopt);
+    // 除数为 -1 且被除数可能是 INT_MIN 时，取模/取商会溢出，保守放弃。
     if (RHS->min == -1 && (!LHS || LHS->min == std::numeric_limits<int>::min()))
       return Remember(std::nullopt);
 
@@ -715,12 +788,16 @@ computeNoWrapRange(Value *V, const InductionRangeMap &InductionRanges,
       SignedRange{static_cast<int64_t>(Min), static_cast<int64_t>(Max)});
 }
 
+// 索引 V 是否可证明在 i32 内不回绕（即 computeNoWrapRange 能给出区间）。这是把
+// 重复地址计算安全替换为指针 IV 推进的关键前提。
 bool indexDoesNotWrap(Value *V, const InductionRangeMap &InductionRanges) {
   std::unordered_set<Value *> Active;
   ValueRangeCache Cache;
   return computeNoWrapRange(V, InductionRanges, Active, Cache).has_value();
 }
 
+// 计算某类型在代码生成时的字节大小（int/bool/float/指针/数组），供 GEP 各级
+// 索引换算字节步长。无法确定或溢出时返回 nullopt。
 std::optional<int64_t> codegenTypeSize(const std::shared_ptr<IRType> &Type) {
   if (!Type)
     return std::nullopt;
@@ -751,6 +828,8 @@ std::optional<int64_t> codegenTypeSize(const std::shared_ptr<IRType> &Type) {
   }
 }
 
+// 把原子项 Atom 的系数累加 Coefficient 进线性签名的 terms（系数归零则删项）。
+// 溢出 int64 则返回 false。
 bool addLinearCoefficient(std::map<Value *, int64_t> &Terms, Value *Atom,
                           int64_t Coefficient) {
   const __int128 Sum = static_cast<__int128>(Terms[Atom]) + Coefficient;
@@ -765,6 +844,9 @@ bool addLinearCoefficient(std::map<Value *, int64_t> &Terms, Value *Atom,
   return true;
 }
 
+// 把索引值 V（乘以字节比例 Scale）展开进线性地址签名。常量并入常量偏移；对可
+// 证明不回绕的加/减，递归分解左右子式（减法翻转右侧比例）；否则把 V 整体作为
+// 一个原子项计入。Budget/Depth 限制展开规模，防止病态深链。
 bool addLinearIndex(Value *V, int64_t Scale,
                     const InductionRangeMap &InductionRanges,
                     LinearAddressSignature &Signature,
@@ -804,6 +886,9 @@ bool addLinearIndex(Value *V, int64_t Scale,
   return addLinearCoefficient(Signature.terms, V, Scale);
 }
 
+// 把整条 GEP 展开成线性地址签名（base + 各项系数 + 常量字节偏移）。逐级索引按
+// 其被索引类型的字节大小换算比例，任何一步无法确定或展开失败即返回 nullopt。
+// 用于后续判断两条 GEP 是否仅相差常量偏移而可聚类共享指针 IV。
 std::optional<LinearAddressSignature>
 buildLinearAddressSignature(GetElementPtrInst &GEP,
                             const InductionRangeMap &InductionRanges) {
@@ -842,6 +927,11 @@ buildLinearAddressSignature(GetElementPtrInst &GEP,
   return Signature;
 }
 
+// 分析索引值 V 是否是关于循环 L 的仿射表达式（coefficient*induction + 不变量）。
+// 归纳变量本身系数为 1、出现 1 次；循环不变量出现 0 次；加/减线性组合系数相加减；
+// 乘法仅当整棵子树都是循环不变量（出现 0 次）时可克隆，系数记 0。要求整条表达式
+// 里归纳变量最多出现一次且唯一，否则拒绝。可克隆的中间值记入 CloneValues，稍后
+// 会在预头以初值重建。带缓存与活跃集环检测。
 bool analyzeAffineIndex(
     Value *V, const Loop *L, BasicBlock *PreHeader, const DominatorTree &DT,
     const std::unordered_map<Value *, LoopInductionInfo> &LoopInductions,
@@ -925,6 +1015,7 @@ bool analyzeAffineIndex(
   return true;
 }
 
+// 按“先父后子”的先序收集循环 L 及其子循环。
 bool collectLoopOrder(const Loop *L, std::vector<const Loop *> &Loops) {
   if (!L)
     return false;
@@ -935,6 +1026,8 @@ bool collectLoopOrder(const Loop *L, std::vector<const Loop *> &Loops) {
   return true;
 }
 
+// 扫描各循环 header 里的 PHI，借助 SCEV 识别出常量起点与常量步长的归纳变量，
+// 建立“PHI 值 -> 归纳信息（初值、步长、所属循环）”映射。
 std::unordered_map<Value *, LoopInductionInfo>
 collectLoopInductions(SCEVResult &SCEV,
                       const std::vector<const Loop *> &Loops) {
@@ -962,6 +1055,7 @@ collectLoopInductions(SCEVResult &SCEV,
   return Result;
 }
 
+// 把指令插到块的终结指令之前（用于在预头/latch 末尾插入地址计算）。
 bool insertBeforeTerminator(BasicBlock *BB, Instruction *Inst) {
   if (!BB || !Inst || BB->empty())
     return false;
@@ -972,6 +1066,8 @@ bool insertBeforeTerminator(BasicBlock *BB, Instruction *Inst) {
   return true;
 }
 
+// 把指令插到块里第一条非 PHI 指令之前（PHI 必须保持在块首，指针 IV 的 PHI
+// 需插在它们之后、其余指令之前）。
 bool insertBeforeFirstNonPhi(BasicBlock *BB, Instruction *Inst) {
   if (!BB || !Inst)
     return false;
@@ -993,6 +1089,7 @@ bool insertBeforeFirstNonPhi(BasicBlock *BB, Instruction *Inst) {
   return true;
 }
 
+// 把 Inst 插到块中指定的 Before 指令之前。
 bool insertBeforeInstruction(BasicBlock *BB, Instruction *Before,
                              Instruction *Inst) {
   if (!BB || !Before || !Inst)
@@ -1006,6 +1103,11 @@ bool insertBeforeInstruction(BasicBlock *BB, Instruction *Before,
   return false;
 }
 
+// 尝试为单个 GEP 构造改写候选。要求：base 与所有非可变索引都循环不变；恰有
+// 最后一个索引是关于某归纳变量的仿射式，系数为 +1/-1，类型 4 字节且可证明不
+// 回绕；归纳变量初值/步长在 i32 内、区间跨度大于步长量级（否则收益不足）。
+// 还检查 GEP 的所有使用者要么在循环内、要么被原 GEP 所在块支配（允许展开后
+// 残余循环复用末尾地址），且不能是 PHI。满足则返回候选。
 std::optional<PrepareCandidate> tryBuildCandidate(
     GetElementPtrInst &GEP, const Loop *L, BasicBlock *PreHeader,
     BasicBlock *Latch, const DominatorTree &DT,
@@ -1143,6 +1245,11 @@ std::optional<PrepareCandidate> tryBuildCandidate(
   return Candidate;
 }
 
+// 收集循环 L 的所有候选并做聚类。先要求循环是 loop-simplify 规范形（有唯一预头
+// 与 latch），逐块扫描 GEP 生成候选；再计算每个候选的线性地址签名，把 base、
+// terms、指针元素类型、归纳变量、步长都相同、且常量字节偏移落在立即数范围内、
+// 能被元素大小整除的候选聚为一簇（贪心选取能带最多成员的锚点）。最终按分数
+// （使用次数，聚类会累加成员分）从高到低稳定排序。可用环境变量关闭聚类。
 std::vector<PrepareCandidate> collectCandidatesForLoop(
     const Loop *L, const DominatorTree &DT,
     const InductionRangeMap &InductionRanges,
@@ -1153,7 +1260,10 @@ std::vector<PrepareCandidate> collectCandidatesForLoop(
     return {};
 
   std::vector<PrepareCandidate> Candidates;
-  for (BasicBlock *BB : L->getBlocks()) {
+  // 使用 RPO 序（只含当前循环层、由 CFG 确定性遍历生成）而不是
+  // L->getBlocks()（其填充顺序来自 LoopInfo 内部 unordered_map 的哈希遍历，
+  // 随进程 ASLR 变化），保证候选收集顺序可复现：同输入多次编译 .s 一致。
+  for (BasicBlock *BB : L->getBlocksInRPO()) {
     if (!BB)
       continue;
     for (Instruction *Inst : *BB) {
@@ -1183,6 +1293,9 @@ std::vector<PrepareCandidate> collectCandidatesForLoop(
     return Candidates;
   }
 
+  // 计算成员 GEP 相对锚点 GEP 的元素偏移：仅当二者线性签名的 base/terms/元素
+  // 类型/归纳变量/步长完全一致，且字节偏移在 12 位立即数范围（-2048..2047）内、
+  // 能整除元素大小时才可聚类，否则无法用“基址+常量偏移”共享同一指针 IV。
   auto ClusterOffset = [&](std::size_t Anchor,
                            std::size_t Member) -> std::optional<int64_t> {
     if (!Signatures[Anchor] || !Signatures[Member])
@@ -1257,6 +1370,9 @@ std::vector<PrepareCandidate> collectCandidatesForLoop(
   return Candidates;
 }
 
+// 决定单个循环最多做几个变换。候选很少时全做；否则限制新增指针 IV 的数量以
+// 控制寄存器压力：聚类过则允许 3 个锚点（每个替代多条临时地址，活跃区间增量
+// 可控），无聚类的宽循环仍维持 2 个的上限。
 std::size_t maxTransformsForLoop(
     const std::vector<PrepareCandidate> &Candidates) {
   if (Candidates.size() <= 2) {
@@ -1273,6 +1389,8 @@ std::size_t maxTransformsForLoop(
   return HasCluster ? 3 : 2;
 }
 
+// 克隆一个 GEP，同时把第 ReplacedIndex 个索引替换为 Replacement。用于在预头
+// 生成初始地址（把可变索引替换为初值表达式）。产出的是 non-inbounds GEP。
 GetElementPtrInst *cloneGEPWithReplacement(GetElementPtrInst &Orig,
                                            unsigned ReplacedIndex,
                                            Value *Replacement) {
@@ -1293,6 +1411,9 @@ GetElementPtrInst *cloneGEPWithReplacement(GetElementPtrInst &Orig,
   return Clone;
 }
 
+// 在预头把可变索引表达式按“归纳变量取初值 Start”重建出初始索引值。归纳变量
+// 本身替换为 Start；循环不变量原样保留；仿射分析标记为可克隆的中间二元运算
+// 递归重建并插到预头末尾。返回重建后的初始索引值（失败返回 nullptr）。
 Value *
 materializeInitialIndex(Value *V, const PrepareCandidate &Candidate,
                         Value *Start,
@@ -1324,6 +1445,13 @@ materializeInitialIndex(Value *V, const PrepareCandidate &Candidate,
   return Clone;
 }
 
+// 真正落地一个候选的强度削减改写：
+// 1. 预头算出初始地址 InitGEP（可变索引取初值）；
+// 2. header 插入指针型 PHI，两个入边分别是预头的 InitGEP 与 latch 的推进结果；
+// 3. latch 用一条固定步长的 GEP 对 PHI 做一次推进（步长以元素为单位）；
+// 4. 对聚类成员，用 PHI（或 PHI 加常量元素偏移的 GEP）替换其全部使用后删除；
+// 5. 最后用 PHI 替换原 GEP 的所有使用并删除原 GEP。
+// 任何一步失败即返回 false。
 bool rewriteCandidate(const PrepareCandidate &Candidate) {
   GetElementPtrInst *Orig = Candidate.gep;
   if (!Orig || !Candidate.loop || !Candidate.preheader || !Candidate.latch)
@@ -1400,6 +1528,9 @@ bool rewriteCandidate(const PrepareCandidate &Candidate) {
 
 } // namespace
 
+// pass 入口：遍历模块每个函数，注册并取用支配树/循环/SCEV 分析，预检查 SCEV
+// 规模，收集归纳变量与其区间，按循环深度从内到外处理每个循环，收集候选、限制
+// 数量后逐个改写。返回是否修改了模块。可用环境变量整体关闭本 pass。
 bool runCodeGenPrepare(Module &module) {
   if (std::getenv("BACKEND_DISABLE_CODEGEN_PREPARE") != nullptr) {
     return false;
@@ -1430,10 +1561,11 @@ bool runCodeGenPrepare(Module &module) {
     }
     std::stable_sort(Loops.begin(), Loops.end(),
                      [](const Loop *A, const Loop *B) {
-                       if (A->getDepth() != B->getDepth()) {
-                         return A->getDepth() > B->getDepth();
-                       }
-                       return A->getHeader() < B->getHeader();
+                       // 仅按深度从内到外排序；同深度循环保持 collectLoopOrder
+                       // 的确定输入序（stable_sort 不交换相等元素）。不要用
+                       // 指针地址做平局比较，否则同深度兄弟循环的相对顺序随
+                       // ASLR 变化，导致改写结果抖动。
+                       return A->getDepth() > B->getDepth();
                      });
     const auto LoopInductions = collectLoopInductions(SCEV, Loops);
     const auto InductionRanges = buildInductionRanges(SCEV, LoopInductions);

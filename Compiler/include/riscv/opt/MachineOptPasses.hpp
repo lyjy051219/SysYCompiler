@@ -11,10 +11,13 @@ bool runBranchCompareFolding(MachineFunction &mf);
 bool runPreRAGlobalAddressReuse(MachineFunction &mf);
 bool runPreRAAffineCombine(MachineFunction &mf);
 bool runPreRAAddressCombine(MachineFunction &mf);
-bool runPreRACopyPropagation(MachineFunction &mf);
+bool runPreRACopyPropagation(MachineFunction &mf,
+                             MachineFunctionAnalysisManager &am);
 bool runPreRALocalCSE(MachineFunction &mf);
 bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
                                   MachineFunctionAnalysisManager &am);
+bool runPreRAMachineLICM(MachineFunction &mf,
+                         MachineFunctionAnalysisManager &am);
 bool runPreRAMachineDCE(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);

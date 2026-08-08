@@ -2,7 +2,7 @@
 %option yylineno
 
 %{
-#include "Bison.hpp"
+#include "yacc/Bison.hpp"
 // Flex 生成的扫描器向 Bison 返回强类型令牌。
 #define YY_DECL yy::parser::symbol_type yylex(void)
 %}

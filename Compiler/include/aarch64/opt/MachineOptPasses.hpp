@@ -15,10 +15,13 @@ bool runSelectToCsel(MachineFunction &mf);
 bool runRedundantSxtwElim(MachineFunction &mf);
 bool runAddressIndexFold(MachineFunction &mf);
 bool runPreRAAddressCombine(MachineFunction &mf);
-bool runPreRACopyPropagation(MachineFunction &mf);
+bool runPreRACopyPropagation(MachineFunction &mf,
+                             MachineFunctionAnalysisManager &am);
 bool runPreRALocalCSE(MachineFunction &mf);
 bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
                                   MachineFunctionAnalysisManager &am);
+bool runPreRAMachineLICM(MachineFunction &mf,
+                         MachineFunctionAnalysisManager &am);
 bool runPreRAMachineDCE(MachineFunction &mf,
                         MachineFunctionAnalysisManager &am);
 bool cleanupMachineCFG(MachineFunction &mf);

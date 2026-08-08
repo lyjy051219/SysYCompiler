@@ -558,7 +558,7 @@ int yy_flex_debug = 0;
 char *yytext;
 #line 1 "src/yacc/sysy.l"
 #line 5 "src/yacc/sysy.l"
-#include "Bison.hpp"
+#include "yacc/Bison.hpp"
 // Flex 生成的扫描器向 Bison 返回强类型令牌。
 #define YY_DECL yy::parser::symbol_type yylex(void)
 #line 565 "src/yacc/Flex.cpp"
@@ -2100,4 +2100,3 @@ void yyfree (void * ptr )
 int yywrap() {
     return 1;
 }
-

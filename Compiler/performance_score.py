@@ -618,7 +618,7 @@ def compile_ours(case: Path, case_dir: Path, runtime_obj: Path, args: argparse.N
             f"{existing},{requested}" if existing else requested
         )
 
-    ret = run_command([str(COMPILER), "-S", "-o", str(asm_file), str(case)],
+    ret = run_command([str(COMPILER), str(case), "-S", "-o", str(asm_file)],
                       timeout=args.compile_timeout, env=compile_env)
     if ret.returncode != 0:
         raise RuntimeError("compiler error\n" + ret.stderr.decode("utf-8", errors="replace")[-3000:])
@@ -744,7 +744,7 @@ def prepare_llvm_ir_baseline(case: Path, case_dir: Path,
     ir_file = case_dir / "baseline.ll"
     llvm_ir_file = case_dir / "baseline_sanitized.ll"
 
-    ret = run_command([str(MIDDLE_COMPILER), "-S", "-o", str(ir_file), str(case)],
+    ret = run_command([str(MIDDLE_COMPILER), str(case), "-S", "-o", str(ir_file)],
                       timeout=args.compile_timeout)
     if ret.returncode != 0:
         raise RuntimeError(
