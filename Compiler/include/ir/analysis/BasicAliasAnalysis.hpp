@@ -14,6 +14,10 @@ class LoopInfo;
 class Loop;
 //SCEVResult提供归纳变量和无回绕证明
 class SCEVResult;
+//RangeInfo提供指定程序点成立的整数范围事实
+class RangeInfo;
+//DominatorTree提供范围事实消费所需的支配关系
+class DominatorTree;
 
 //AliasInfo表示一次别名查询可证明的最强关系，证据不足时返回MayAlias
 enum class AliasInfo {
@@ -126,6 +130,18 @@ public:
     std::optional<std::size_t> getObjectSize(Value *V) const;
     //返回指针至少满足的已知字节对齐
     std::size_t getKnownAlignment(Value *V) const;
+    //证明一次完整内存访问在指定程序点始终位于唯一栈或全局对象内
+    bool isLocationProvablyInBoundsAt(
+        const MemoryLocation &Location, Instruction *Context,
+        SCEVResult &SE, RangeInfo &RI,
+        const DominatorTree &DT) const;
+    //累计规范start0/step1访问所需的共同运行时上界和对象安全容量
+    bool accumulateLocationSafeUpperBound(
+        const MemoryLocation &Location, Instruction *Context,
+        const DominatorTree &DT, const LoopInfo &LI,
+        SCEVResult &SE, Value *&SharedBound,
+        std::int64_t &SafeUpperBound,
+        Value *AdditionalNonNegativeStart = nullptr) const;
 
 private:
     //允许Pass入口构造并播种BasicAAResult
@@ -141,6 +157,8 @@ private:
     static constexpr std::size_t MaxProvenanceQueryNodes = 4096;
     //MaxIntegerMultipleQueryNodes限制单次整数倍数查询访问的SSA节点数
     static constexpr std::size_t MaxIntegerMultipleQueryNodes = 4096;
+    //MaxGuardGEPChainDepth限制运行时对象边界守卫分解的带类型GEP层数
+    static constexpr std::size_t MaxGuardGEPChainDepth = 12;
 
     //执行带溢出检查的有符号加法
     static bool checkedAdd(long long A, long long B, long long &Result);
@@ -151,6 +169,12 @@ private:
     //递归检查透明指针来源中是否出现undef
     static bool hasUndefPointerOrigin(
         Value *V, std::unordered_set<Value *> &Active, unsigned Depth = 0);
+    //从由header或latch控制回边的规范归纳下标提取严格上界
+    static bool getCanonicalIndexUpperBound(
+        Value *Index, Instruction *Context,
+        const DominatorTree &DT, const LoopInfo &LI,
+        SCEVResult &SE, Value *&Bound,
+        Value *AdditionalNonNegativeStart);
 
     //ValuePairHash为规范化Value指针对提供哈希值
     struct ValuePairHash {

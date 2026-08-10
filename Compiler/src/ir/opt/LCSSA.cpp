@@ -103,12 +103,6 @@ bool LCSSAPass::runLCSSA(Instruction *I,
                                    const std::unordered_set<BasicBlock *> &Reachable,
                                    InstructionWorkList &WorkList) {
     if (!I) return false;
-    if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
-        //本 pass 生成的 PHI 已满足当前层边界，不重复为其构造同层出口 PHI
-        if (Phi->getIdent().find(".lcssa") != std::string::npos) {
-            return false;
-        }
-    }
     BasicBlock *DefBB = I->getParent();
     if (!DefBB) return false;
     if (!I->hasUses()) return false;
@@ -231,15 +225,12 @@ PreservationStatus LCSSAPass::run(Function &F, FunctionAnalysisPassManager &FAM)
                     return TraversalControl::SkipSuccessors;
                 return TraversalControl::Continue;
             });
-        //2.2候选块中指令加入工作队列
+        //2.2候选块中指令加入工作队列。内层生成的LCSSA PHI定义在父层块中，
+        //仍须继续跨父循环闭合；是否已越过当前层由块归属决定，不按名字跳过。
         forEachInstructionInBlocks(
             ExitDominatingBlocks,
             [&LI, L, &WorkList](BasicBlock *BB, Instruction *Inst) {
                 if (LI.getLoopFor(BB) != L || !Inst->hasUses()) return;
-                if (auto *Phi = dynamic_cast<PhiInst *>(Inst)) {
-                    if (Phi->getIdent().find(".lcssa") != std::string::npos)
-                        return;
-                }
                 WorkList.push(Inst);
             });
         //3—4.进行LCSSA

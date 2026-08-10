@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -2086,6 +2087,344 @@ std::optional<IntRange> SCEVResult::evaluateRangeAt(
     std::unordered_set<const SCEVExpr *> Active;
     return evaluateRangeForDirection(
         E, Context, RI, DomTree, Active, 0);
+}
+//在循环体程序点证明变量起点仿射归纳PHI的完整活动范围
+std::optional<IntRange> SCEVResult::evaluateInductionRangeAt(
+    PhiInst *Phi, BasicBlock *Context, RangeInfo &RI,
+    const DominatorTree &DomTree) {
+    //1.只处理单预头、单回边且由header或latch约束回边的i32仿射PHI；允许
+    //其他只会缩短序列的提前退出。变量起点必须已有有限范围，无法识别则失败。
+    if (!Phi || !Context || !Phi->getParent() || !LI ||
+        !IRType::hasIntegerBitWidth(Phi->getIRType(), 32)) {
+        return std::nullopt;
+    }
+    auto Affine = getAffine(Phi);
+    const Loop *L = Affine ? Affine->RecLoop : nullptr;
+    if (!L || Phi->getParent() != L->getHeader() ||
+        !L->contains(Context) || !Affine->ConstantStep ||
+        *Affine->ConstantStep == 0) {
+        return std::nullopt;
+    }
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return std::nullopt;
+    }
+    Value *StartValue = nullptr;
+    Value *UpdateValue = nullptr;
+    for (unsigned Index = 0; Index < Phi->getNumIncomingValues(); ++Index) {
+        Value *Incoming = Phi->getIncomingValue(Index);
+        BasicBlock *Pred = Phi->getIncomingBlock(Index);
+        if (!Incoming || !Pred) return std::nullopt;
+        if (L->contains(Pred)) {
+            if (Pred != Latch || UpdateValue) return std::nullopt;
+            UpdateValue = Incoming;
+        } else {
+            if (Pred != PreHeader || StartValue) return std::nullopt;
+            StartValue = Incoming;
+        }
+    }
+    if (!StartValue || !UpdateValue) return std::nullopt;
+    //2.把回边更新和latch比较统一为“Phi + 一个常量偏移”。这里只接受直接
+    //加减，避免把多个可能各自回绕的IR运算错误折叠成数学整数恒等式。
+    auto ExtractPhiOffset =
+        [&](Value *V) -> std::optional<std::pair<bool, int64_t>> {
+            if (!V || Value::isUndef(V) ||
+                !IRType::hasIntegerBitWidth(V->getIRType(), 32)) {
+                return std::nullopt;
+            }
+            if (V == Phi) return std::make_pair(true, int64_t{0});
+            int64_t Constant = 0;
+            if (V->tryGetInt64Const(Constant))
+                return std::make_pair(false, Constant);
+            auto *Binary = dynamic_cast<BinaryInst *>(V);
+            if (!Binary) return std::nullopt;
+            Value *LeftValue = nullptr;
+            Value *RightValue = nullptr;
+            if (!Binary->getOperands(LeftValue, RightValue) ||
+                !LeftValue || !RightValue)
+                return std::nullopt;
+            int64_t LeftConstant = 0;
+            int64_t RightConstant = 0;
+            if (Binary->getOp() == BinaryInst::ADD) {
+                if (LeftValue == Phi &&
+                    RightValue->tryGetInt64Const(RightConstant)) {
+                    return std::make_pair(true, RightConstant);
+                }
+                if (RightValue == Phi &&
+                    LeftValue->tryGetInt64Const(LeftConstant)) {
+                    return std::make_pair(true, LeftConstant);
+                }
+            }
+            if (Binary->getOp() == BinaryInst::SUB && LeftValue == Phi &&
+                RightValue->tryGetInt64Const(RightConstant) &&
+                RightConstant != std::numeric_limits<int64_t>::min()) {
+                return std::make_pair(true, -RightConstant);
+            }
+            return std::nullopt;
+        };
+    auto UpdateOffset = ExtractPhiOffset(UpdateValue);
+    if (!UpdateOffset || !UpdateOffset->first ||
+        UpdateOffset->second != *Affine->ConstantStep) {
+        return std::nullopt;
+    }
+    //3.优先使用latch上的回边条件约束归纳范围。循环可以另有提前退出；这些
+    //出口只会缩短执行，不会引入新的PHI值，因此不妨碍由唯一回边建立上界。
+    //没有latch出口时再接受header前测条件。
+    BasicBlock *Exiting = nullptr;
+    if (L->isExitingBlock(Latch)) {
+        Exiting = Latch;
+    } else if (L->isExitingBlock(L->getHeader())) {
+        Exiting = L->getHeader();
+    }
+    if (!Exiting) return std::nullopt;
+    BrInst *Branch = Exiting->getBranchTerminator();
+    if (!BasicBlock::isCondBr(Branch)) return std::nullopt;
+    const bool ContinueOnTrue =
+        L->contains(Branch->getTrueSuccessor());
+    const bool ContinueOnFalse =
+        L->contains(Branch->getFalseSuccessor());
+    if (ContinueOnTrue == ContinueOnFalse) return std::nullopt;
+    BasicBlock *ContinueSuccessor = ContinueOnTrue
+        ? Branch->getTrueSuccessor()
+        : Branch->getFalseSuccessor();
+    auto *Compare = dynamic_cast<BinaryInst *>(Branch->getCondition());
+    if (!Compare || !BinaryInst::isCompareOp(Compare->getOp()))
+        return std::nullopt;
+    BinaryInst::Operation Predicate = ContinueOnTrue
+        ? Compare->getOp()
+        : BinaryInst::negatePredicate(Compare->getOp());
+    Value *ComparedValue = Compare->getOperand(0);
+    Value *BoundValue = Compare->getOperand(1);
+    auto ComparedOffset = ExtractPhiOffset(ComparedValue);
+    if (!ComparedOffset || !ComparedOffset->first) {
+        auto ReverseOffset = ExtractPhiOffset(BoundValue);
+        if (!ReverseOffset || !ReverseOffset->first)
+            return std::nullopt;
+        std::swap(ComparedValue, BoundValue);
+        ComparedOffset = ReverseOffset;
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (!LoopInfo::isLoopInvariant(BoundValue, L))
+        return std::nullopt;
+    const int64_t Step = *Affine->ConstantStep;
+    const bool Increasing = Step > 0;
+    if ((Increasing && Predicate != BinaryInst::L &&
+         Predicate != BinaryInst::LE) ||
+        (!Increasing && Predicate != BinaryInst::G &&
+         Predicate != BinaryInst::GE)) {
+        return std::nullopt;
+    }
+    IntRange StartRange =
+        RI.queryOnEdge(StartValue, PreHeader, L->getHeader(), DomTree);
+    //嵌套循环的起点常由父循环归纳值加常量构成。仅查询当前入边会丢失父循环
+    //活动区间，因此在真实预头程序点递归求值一次，并与边事实取交集；起点对
+    //当前循环不变，递归只会沿父循环向外推进，不会消费本循环尚未成立的条件。
+    if (Instruction *PreHeaderTerminator = PreHeader->back()) {
+        IntRange DerivedStart = evaluateValueRangeAt(
+            StartValue, PreHeaderTerminator, RI, DomTree);
+        if (!DerivedStart.isBottom() && !DerivedStart.isTop())
+            StartRange = StartRange.intersectWith(DerivedStart);
+    }
+    IntRange BoundRange = RI.query(BoundValue, Exiting, DomTree);
+    if (StartRange.isBottom() || StartRange.isTop() ||
+        BoundRange.isBottom() || BoundRange.isTop()) {
+        return std::nullopt;
+    }
+    //Header前测循环的body只观察已经通过继续条件的PHI值；若继续后继支配
+    //查询点，可排除仅存在于退出header上的最后一个失败值。Header本身仍保留
+    //完整范围，避免向比较之前错误传播分支事实。
+    const bool RestrictToContinuedValues =
+        Exiting == L->getHeader() &&
+        ContinueSuccessor != L->getHeader() &&
+        DomTree.dominates(ContinueSuccessor, Context);
+    //4.以数学整数构造候选不变量：首值来自preheader；后续值只可能由满足
+    //继续条件的当前值加一步得到。随后分别验证比较、更新均不发生i32回绕。
+    const __int128 Offset = ComparedOffset->second;
+    __int128 Minimum = StartRange.min;
+    __int128 Maximum = StartRange.max;
+    __int128 ContinueLimit = 0;
+    if (Increasing) {
+        ContinueLimit = static_cast<__int128>(BoundRange.max) - Offset -
+            (Predicate == BinaryInst::L ? 1 : 0);
+        if (RestrictToContinuedValues) {
+            Maximum = ContinueLimit;
+        } else {
+            Maximum = std::max(
+                Maximum, ContinueLimit + static_cast<__int128>(Step));
+        }
+    } else {
+        ContinueLimit = static_cast<__int128>(BoundRange.min) - Offset +
+            (Predicate == BinaryInst::G ? 1 : 0);
+        if (RestrictToContinuedValues) {
+            Minimum = ContinueLimit;
+        } else {
+            Minimum = std::min(
+                Minimum, ContinueLimit + static_cast<__int128>(Step));
+        }
+    }
+    if (Minimum < IntRange::I32_MIN || Maximum > IntRange::I32_MAX ||
+        Minimum > Maximum) {
+        return std::nullopt;
+    }
+    const __int128 ComparedMinimum = Minimum + Offset;
+    const __int128 ComparedMaximum = Maximum + Offset;
+    const __int128 UpdatedMinimum = Minimum + Step;
+    const __int128 UpdatedMaximum = Maximum + Step;
+    if (ComparedMinimum < IntRange::I32_MIN ||
+        ComparedMaximum > IntRange::I32_MAX ||
+        UpdatedMinimum < IntRange::I32_MIN ||
+        UpdatedMaximum > IntRange::I32_MAX) {
+        return std::nullopt;
+    }
+    //前测循环还会在初始header和body完成后的下一次header上执行比较；即使
+    //这些失败值不属于查询点活动范围，其比较表达式也不得回绕后重新进入body。
+    if (RestrictToContinuedValues) {
+        const __int128 HeaderMinimum = std::min(
+            static_cast<__int128>(StartRange.min), UpdatedMinimum);
+        const __int128 HeaderMaximum = std::max(
+            static_cast<__int128>(StartRange.max), UpdatedMaximum);
+        if (HeaderMinimum + Offset < IntRange::I32_MIN ||
+            HeaderMaximum + Offset > IntRange::I32_MAX) {
+            return std::nullopt;
+        }
+    }
+    //5.显式验证归纳闭包，防止仅由退出常量反推一个看似在界、实际不能覆盖
+    //全部回边值的区间。无可行回边时首值范围本身就是完整结论。
+    if (Increasing && RestrictToContinuedValues) {
+        const __int128 ReenterLimit =
+            ContinueLimit - static_cast<__int128>(Step);
+        const __int128 ContinuedMaximum =
+            std::min(Maximum, ReenterLimit);
+        if (ContinuedMaximum >= Minimum &&
+            ContinuedMaximum + Step > Maximum) {
+            return std::nullopt;
+        }
+    } else if (!Increasing && RestrictToContinuedValues) {
+        const __int128 ReenterLimit =
+            ContinueLimit - static_cast<__int128>(Step);
+        const __int128 ContinuedMinimum =
+            std::max(Minimum, ReenterLimit);
+        if (ContinuedMinimum <= Maximum &&
+            ContinuedMinimum + Step < Minimum) {
+            return std::nullopt;
+        }
+    } else if (Increasing) {
+        const __int128 ContinuedMaximum =
+            std::min(Maximum, ContinueLimit);
+        if (ContinuedMaximum >= Minimum &&
+            ContinuedMaximum + Step > Maximum) {
+            return std::nullopt;
+        }
+    } else {
+        const __int128 ContinuedMinimum =
+            std::max(Minimum, ContinueLimit);
+        if (ContinuedMinimum <= Maximum &&
+            ContinuedMinimum + Step < Minimum) {
+            return std::nullopt;
+        }
+    }
+    return IntRange(
+        static_cast<int64_t>(Minimum),
+        static_cast<int64_t>(Maximum));
+}
+//在指定指令处结合Range与归纳事实递归求值无副作用整数地址表达式
+IntRange SCEVResult::evaluateValueRangeAt(
+    Value *V, Instruction *Context, RangeInfo &RI,
+    const DominatorTree &DomTree) {
+    //1.先保留RangeAnalysis在真实程序点发布的控制流事实；递归深度和活动集合
+    //共同截断异常表达式图，任何无法证明的节点都退回已有保守范围。
+    if (!V || !Context || !Context->getParent()) return IntRange();
+    std::unordered_set<Value *> Active;
+    std::function<IntRange(Value *, unsigned)> Evaluate =
+        [&](Value *Current, unsigned Depth) -> IntRange {
+            if (!Current) return IntRange();
+            IntRange Known = RI.query(Current, Context, DomTree);
+            if (Depth > 32 ||
+                !IRType::hasIntegerBitWidth(Current->getIRType(), 32)) {
+                return Known;
+            }
+            //2.循环体内的全局范围可能额外包含退出后的归纳值；在当前指令处
+            //消费SCEV证明的活动区间，并与路径范围取交集而不是直接覆盖。
+            if (auto *Phi = dynamic_cast<PhiInst *>(Current)) {
+                auto InductionRange = evaluateInductionRangeAt(
+                    Phi, Context->getParent(), RI, DomTree);
+                if (InductionRange)
+                    Known = Known.intersectWith(*InductionRange);
+                //PHI的当前值来自某一条真实入边。分别在对应前驱边查询incoming，
+                //再取并集；若incoming本身是另一个已证明的归纳PHI，可叠加它的
+                //完整活动范围以识别结构化lag-PHI。禁止在当前Context递归求上一
+                //迭代值，否则当前路径条件可能错误收窄回边incoming。
+                if (Phi->getNumIncomingValues() <= 8) {
+                    bool HasIncomingRange = false;
+                    IntRange IncomingUnion = IntRange::bottom();
+                    for (unsigned Index = 0;
+                         Index < Phi->getNumIncomingValues(); ++Index) {
+                        Value *Incoming = Phi->getIncomingValue(Index);
+                        BasicBlock *IncomingBlock =
+                            Phi->getIncomingBlock(Index);
+                        BasicBlock *PhiBlock = Phi->getParent();
+                        if (!Incoming || !IncomingBlock || !PhiBlock ||
+                            IncomingBlock->countEdgesToSucc(PhiBlock) == 0) {
+                            HasIncomingRange = false;
+                            break;
+                        }
+                        IntRange IncomingRange = RI.queryOnEdge(
+                            Incoming, IncomingBlock, PhiBlock, DomTree);
+                        if (auto *IncomingPhi =
+                                dynamic_cast<PhiInst *>(Incoming)) {
+                            if (IncomingPhi != Phi) {
+                                auto SourceInduction =
+                                    evaluateInductionRangeAt(
+                                        IncomingPhi, IncomingBlock,
+                                        RI, DomTree);
+                                if (SourceInduction)
+                                    IncomingRange =
+                                        IncomingRange.intersectWith(
+                                            *SourceInduction);
+                            }
+                        }
+                        IncomingUnion = HasIncomingRange
+                            ? IncomingUnion.unionWith(IncomingRange)
+                            : IncomingRange;
+                        HasIncomingRange = true;
+                    }
+                    if (HasIncomingRange)
+                        Known = Known.intersectWith(IncomingUnion);
+                }
+                return Known;
+            }
+            auto *Binary = dynamic_cast<BinaryInst *>(Current);
+            if (!Binary || !Active.insert(Current).second) return Known;
+            Value *LeftValue = nullptr;
+            Value *RightValue = nullptr;
+            IntRange Derived;
+            bool Supported = Binary->getOperands(LeftValue, RightValue);
+            if (Supported) {
+                IntRange Left = Evaluate(LeftValue, Depth + 1);
+                IntRange Right = Evaluate(RightValue, Depth + 1);
+                switch (Binary->getOp()) {
+                case BinaryInst::ADD:
+                    Derived = Left.add(Right);
+                    break;
+                case BinaryInst::SUB:
+                    Derived = Left.sub(Right);
+                    break;
+                case BinaryInst::MUL:
+                    Derived = Left.mul(Right);
+                    break;
+                default:
+                    Supported = false;
+                    break;
+                }
+            }
+            Active.erase(Current);
+            //3.IntRange在可能发生i32回绕时自动退化为Top，因此相交只会保留
+            //已证明的定义域，不会把数学整数恒等式误当成IR回绕语义。
+            return Supported ? Known.intersectWith(Derived) : Known;
+        };
+    return Evaluate(V, 0);
 }
 //根据整数范围分类步长的符号方向
 SCEVStepSign SCEVResult::classifyStepSign(

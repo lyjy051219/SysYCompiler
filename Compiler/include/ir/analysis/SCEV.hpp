@@ -346,6 +346,14 @@ public:
     std::optional<IntRange> evaluateRangeAt(
         const SCEVExpr *E, BasicBlock *Context, RangeInfo &RI,
         DominatorTree &DT) const;
+    //在循环体程序点证明变量起点仿射归纳PHI的完整活动范围
+    std::optional<IntRange> evaluateInductionRangeAt(
+        PhiInst *Phi, BasicBlock *Context, RangeInfo &RI,
+        const DominatorTree &DT);
+    //在指定指令处结合Range与归纳事实递归求值无副作用整数地址表达式
+    IntRange evaluateValueRangeAt(Value *V, Instruction *Context,
+                                  RangeInfo &RI,
+                                  const DominatorTree &DT);
     //将给定循环递推表达式求值到指定迭代表达式
     const SCEVExpr *getSCEVAtIteration(const SCEVExpr *E,
                                        const SCEVExpr *Iter,

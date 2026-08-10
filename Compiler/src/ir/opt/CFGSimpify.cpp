@@ -1462,6 +1462,10 @@ bool CFGSimplifyPass::mergeBlocks(Function &F) {
 
 bool CFGSimplifyPass::simplifyUncondBranch(Function &F, BasicBlock *BB) {
 	if (!BB || BB == F.front()) return false;
+	//阶段复用显式保留首轮多路写路径的统一join；穿透该块会把后继PHI
+	//扩成所有条件前驱的输入，虽不改变语义却会造成后端并行拷贝膨胀。
+	if (BB->getIdent().find(".phase.first.join") != std::string::npos)
+		return false;
 
 	BrInst *Br = BB->getBranchTerminator();
 	if (!BasicBlock::isUncondBr(Br)) return false;

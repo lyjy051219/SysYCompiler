@@ -1,6 +1,7 @@
 #include "ir/opt/LICM.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/MemorySSA.hpp"
+#include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
@@ -16,6 +17,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+//构造完整LICM或仅移动纯地址的晚期LICM。
+LICMPass::LICMPass(LICMMode Mode) : Mode(Mode) {}
 //计算出口基本块和SSA值组合键的哈希值
 std::size_t ExitValueKeyHash::operator()(const ExitValueKey &K) const {
 	auto A = reinterpret_cast<std::uintptr_t>(K.first);
@@ -73,9 +76,18 @@ bool LICMPass::hasPreheaderDereferenceProof(
 	}
 	return Proven;
 }
+//证明内存位置的完整地址区间始终落在已知栈或全局对象内
+bool LICMPass::isMemoryLocationProvablyInBounds(
+	const MemoryLocation &Location, Instruction *Access,
+	BasicAAResult &AA, SCEVResult &SE,
+	RangeInfo &RI, const DominatorTree &DT) {
+	//2.3 对象边界证明由BasicAA统一发布，LICM只选择真实访存程序点作为上下文。
+	return AA.isLocationProvablyInBoundsAt(
+		Location, Access, SE, RI, DT);
+}
 //判断除法或余数指令能否在不引入异常的情况下推测执行
 bool LICMPass::isSpeculatableDivisionOrRemainder(Instruction *I) {
-	//2.3 除数必须是非零常量；有符号除余还排除 -1，避免最小整数溢出情形。
+	//2.4 除数必须是非零常量；有符号除余还排除 -1，避免最小整数溢出情形。
 	auto *BI = dynamic_cast<BinaryInst *>(I);
 	Value *Dividend = nullptr;
 	Value *Divisor = nullptr;
@@ -412,6 +424,24 @@ bool LICMPass::planLoopMemoryPromotion(
 		MinimumTripCount = 1;
 	}
 	if (MinimumTripCount <= 0) return false;
+	//4.8 前测循环的body不按纯CFG支配header退出边；只有唯一退出条件和同一
+	//SCEV结果证明常量正次数时，才把“至少先经过一次latch”纳入必执行证明。
+	std::vector<BasicBlock *> ExitingBlocks;
+	for (BasicBlock *BB : L->getBlocksIncludingSubLoops())
+		if (BB && L->isExitingBlock(BB)) ExitingBlocks.push_back(BB);
+	const bool HasPositiveHeaderTrip =
+		ExitingBlocks.size() == 1 &&
+		ExitingBlocks.front() == L->getHeader() &&
+		Trip->ExitingBlock == L->getHeader() &&
+		Trip->ConstantTripCount && *Trip->ConstantTripCount > 0;
+	auto AccessExecutesBeforeExitEdge =
+		[&](Instruction *Access, BasicBlock *ExitPred) {
+			if (!Access || !Access->getParent() || !ExitPred) return false;
+			if (DT.dominates(Access->getParent(), ExitPred)) return true;
+			return HasPositiveHeaderTrip &&
+				ExitPred == L->getHeader() &&
+				DT.dominates(Access->getParent(), Latch);
+		};
 	std::vector<Instruction *> LoopInstructions;
 	for (BasicBlock *BB : L->getBlocksInFunctionOrder()) {
 		if (!BB) return false;
@@ -420,6 +450,9 @@ bool LICMPass::planLoopMemoryPromotion(
 			//任何调用都可能形成I/O、计时或未知顺序屏障；即使别名摘要声称NoModRef，
 			//内存状态提升也不跨越它，防止延迟写回改变可观察时序。
 			if (dynamic_cast<CallInst *>(I)) return false;
+			//循环内return没有CFG后继，不会出现在普通ExitBlocks中；若允许它，延迟
+			//写回会沿该路径丢失。当前先保守拒绝，避免为单一热点复制函数出口规范化。
+			if (dynamic_cast<RetInst *>(I)) return false;
 			LoopInstructions.push_back(I);
 		}
 	}
@@ -430,14 +463,14 @@ bool LICMPass::planLoopMemoryPromotion(
 			!DT.dominates(Seed->getParent(), Latch)) {
 			continue;
 		}
-		//4.8 初始load会被移到预头，因此还必须证明原程序在每条真实退出路径上
+		//4.9 初始load会被移到预头，因此还必须证明原程序在每条真实退出路径上
 		//都会先执行该load；仅支配latch无法排除提前退出。与此同时沿用普通
 		//LICM的安全前缀/已有解引用证明，避免改变潜在故障相对顺序。
 		bool DominatesEveryExitEdge = true;
 		for (BasicBlock *Exit : ExitBlocks) {
 			for (BasicBlock *Pred : Exit->getPredecessors()) {
 				if (!Pred || !L->contains(Pred) ||
-					!DT.dominates(Seed->getParent(), Pred)) {
+					!AccessExecutesBeforeExitEdge(Seed, Pred)) {
 					DominatesEveryExitEdge = false;
 					break;
 				}
@@ -457,6 +490,10 @@ bool LICMPass::planLoopMemoryPromotion(
 			!isAvailableAtPreheader(Pointer, PreHeader, DT)) {
 			continue;
 		}
+		auto &RI = FAM.getResult<RangeAnalysis>(F);
+		const bool CandidateInBounds =
+			isMemoryLocationProvablyInBounds(
+				Location, Seed, AA, SE, RI, DT);
 		std::vector<LoadInst *> Loads;
 		std::vector<StoreInst *> Stores;
 		bool Valid = true;
@@ -465,12 +502,23 @@ bool LICMPass::planLoopMemoryPromotion(
 			if (auto *Load = dynamic_cast<LoadInst *>(I)) {
 				Other = MemoryLocation::get(Load);
 				AliasInfo Alias = AA.aliasWithIndexRange(Location, Other, LI);
-				//4.9 首版不把目标位置的延迟写回跨过其他读取。即使两者
-				//不别名，另一次读取仍可能故障；拒绝这种交错可避免通过
-				//异常地址或越界行为改变原有执行顺序。
+				//4.10 仅当两次访问都在已知对象内时才允许跨越NoAlias读取；
+				//BasicAA因动态GEP退化为MayAlias时，再以唯一对象互斥事实补强，
+				//不依据测试名、输入值或未定义越界行为发布结论。
+				const bool OtherInBounds =
+					isMemoryLocationProvablyInBounds(
+						Other, Load, AA, SE, RI, DT);
+				if (Alias == AliasInfo::MayAlias && CandidateInBounds &&
+					OtherInBounds && AA.haveKnownDistinctUnderlyingObjects(
+						Location.Pointer, Other.Pointer)) {
+					Alias = AliasInfo::NoAlias;
+				}
 				if (Alias == AliasInfo::NoAlias) {
-					Valid = false;
-					break;
+					if (!CandidateInBounds || !OtherInBounds) {
+						Valid = false;
+						break;
+					}
+					continue;
 				}
 				if (Alias != AliasInfo::MustAlias || !Other.Size ||
 					*Other.Size != *Location.Size ||
@@ -485,11 +533,22 @@ bool LICMPass::planLoopMemoryPromotion(
 			if (auto *Store = dynamic_cast<StoreInst *>(I)) {
 				Other = MemoryLocation::get(Store);
 				AliasInfo Alias = AA.aliasWithIndexRange(Location, Other, LI);
-				//其他位置的写入同样属于不可跨越的内存顺序边界；当前计划
-				//只标量化一个精确位置，不猜测多个对象发生故障的先后关系。
+				//其他位置的写入也必须同时满足不别名和完整对象内证明；未知
+				//指针仍作为顺序边界，避免延迟写回改变故障前的可观察内存状态。
+				const bool OtherInBounds =
+					isMemoryLocationProvablyInBounds(
+						Other, Store, AA, SE, RI, DT);
+				if (Alias == AliasInfo::MayAlias && CandidateInBounds &&
+					OtherInBounds && AA.haveKnownDistinctUnderlyingObjects(
+						Location.Pointer, Other.Pointer)) {
+					Alias = AliasInfo::NoAlias;
+				}
 				if (Alias == AliasInfo::NoAlias) {
-					Valid = false;
-					break;
+					if (!CandidateInBounds || !OtherInBounds) {
+						Valid = false;
+						break;
+					}
+					continue;
 				}
 				Value *Stored = Store->getValueOperand();
 				if (Alias != AliasInfo::MustAlias || !Other.Size ||
@@ -510,7 +569,7 @@ bool LICMPass::planLoopMemoryPromotion(
 			}
 		}
 		if (!Valid || Loads.empty() || Stores.empty()) continue;
-		//4.10 出口写回只能替代原本必然发生的写入。每条真实退出边都必须
+		//4.11 出口写回只能替代原本必然发生的写入。每条真实退出边都必须
 		//已由至少一条候选store支配，不能在提前退出路径凭空增加一次写操作。
 		bool StoreBeforeEveryExitEdge = true;
 		for (BasicBlock *Exit : ExitBlocks) {
@@ -522,7 +581,7 @@ bool LICMPass::planLoopMemoryPromotion(
 				bool HasDominatingStore = false;
 				for (StoreInst *Store : Stores) {
 					if (Store && Store->getParent() &&
-						DT.dominates(Store->getParent(), Pred)) {
+						AccessExecutesBeforeExitEdge(Store, Pred)) {
 						HasDominatingStore = true;
 						break;
 					}
@@ -535,7 +594,7 @@ bool LICMPass::planLoopMemoryPromotion(
 			if (!StoreBeforeEveryExitEdge) break;
 		}
 		if (!StoreBeforeEveryExitEdge) continue;
-		//4.11 每个旧load/store按现有循环成本模型计2；新方案每次迭代保守计一份
+		//4.12 每个旧load/store按现有循环成本模型计2；新方案每次迭代保守计一份
 		//循环携带值成本，循环外固定支付一次load和一次store。只接受严格正下界。
 		const std::int64_t AccessCount = static_cast<std::int64_t>(
 			Loads.size() + Stores.size());
@@ -561,11 +620,163 @@ bool LICMPass::planLoopMemoryPromotion(
 	Plan = std::move(Best);
 	return true;
 }
-//通过临时标量槽复用Mem2Reg构造完整SSA并在全部出口写回
+//为条件更新位置选择保留真实Store的循环携带读取缓存计划
+bool LICMPass::planStoreSynchronizedLoadCache(
+	Function &F, Loop *L, BasicAAResult &AA, const LoopInfo &LI,
+	const DominatorTree &DT, FunctionAnalysisPassManager &FAM,
+	LoopMemoryPromotionPlan &Plan) {
+	Plan = LoopMemoryPromotionPlan{};
+	//4.13 首版只处理嵌套的叶子规范循环。preheader必须无条件仅通往header，
+	//且原Seed在每次header执行时必经；因此初值load与原Seed具有相同动态执行域。
+	if (!L || !L->getHeader() || !L->getSubLoops().empty() ||
+		L->getDepth() < 2 || !LCSSAPass::isLCSSAForm(L)) {
+		return false;
+	}
+	BasicBlock *PreHeader = nullptr;
+	BasicBlock *Latch = nullptr;
+	if (!L->getLoopSimplifyForm(PreHeader, Latch) ||
+		!PreHeader || !Latch || !PreHeader->getTerminator()) {
+		return false;
+	}
+	auto *PreHeaderBranch = dynamic_cast<BrInst *>(PreHeader->getTerminator());
+	auto PreHeaderSuccessors = PreHeader->getSuccessors();
+	if (!PreHeaderBranch || PreHeaderBranch->isConditional() ||
+		PreHeaderSuccessors.size() != 1 ||
+		PreHeaderSuccessors.front() != L->getHeader()) {
+		return false;
+	}
+	auto ExitBlocks = L->getExitBlocks();
+	if (ExitBlocks.size() != 1 || !ExitBlocks.front() ||
+		!ExitBlocks.front()->getTerminator()) {
+		return false;
+	}
+	for (BasicBlock *Pred : ExitBlocks.front()->getPredecessors())
+		if (!Pred || !L->contains(Pred)) return false;
+	auto LoopBlocks = L->getBlocksInFunctionOrder();
+	constexpr std::size_t MaxCacheLoopBlocks = 8;
+	if (LoopBlocks.empty() || LoopBlocks.size() > MaxCacheLoopBlocks)
+		return false;
+	//已知最多执行一次时缓存没有循环复用价值；未知次数只在嵌套、低压力
+	//形态下保守尝试，最终仍由对应热点的机器码和实测收益验收。
+	auto &SE = FAM.getResult<SCEVAnalysis>(F);
+	auto KnownTripCount = SE.getSmallConstantTripCount(L);
+	if (KnownTripCount && *KnownTripCount <= 1) return false;
+	//新增一个循环携带标量会延长活跃区间；用header现有PHI数量限制通用
+	//寄存器压力，而不是依据测试规模或输入次数猜测收益。
+	constexpr unsigned MaxExistingHeaderPhis = 4;
+	unsigned HeaderPhiCount = 0;
+	Instruction *FirstNonPhi = nullptr;
+	for (Instruction *I : *L->getHeader()) {
+		if (dynamic_cast<PhiInst *>(I)) {
+			++HeaderPhiCount;
+			continue;
+		}
+		FirstNonPhi = I;
+		break;
+	}
+	if (!FirstNonPhi || HeaderPhiCount > MaxExistingHeaderPhis) return false;
+	std::vector<Instruction *> LoopInstructions;
+	for (BasicBlock *BB : LoopBlocks) {
+		if (!BB) return false;
+		for (Instruction *I : *BB) {
+			if (!I || dynamic_cast<CallInst *>(I) ||
+				dynamic_cast<RetInst *>(I) ||
+				dynamic_cast<AllocaInst *>(I)) {
+				return false;
+			}
+			LoopInstructions.push_back(I);
+		}
+	}
+	LoopMemoryPromotionPlan Best;
+	for (Instruction *SeedI : LoopInstructions) {
+		auto *Seed = dynamic_cast<LoadInst *>(SeedI);
+		//初值load必须正是header的第一条非PHI指令。它只跨越进入桥的无条件
+		//分支和header PHI，保持第一次潜在故障及所有可观察操作的先后关系。
+		if (!Seed || Seed != FirstNonPhi || !Seed->hasUses() ||
+			Seed->getParent() != L->getHeader() ||
+			!hasSafeExecutionPrefix(Seed)) {
+			continue;
+		}
+		Value *Pointer = Seed->getPointerOperand();
+		auto ValueType = Seed->getIRType();
+		MemoryLocation Location = MemoryLocation::get(Seed);
+		if (!Pointer || valueMayDependOnUndef(Pointer) || !ValueType ||
+			!ValueType->isScalar() || ValueType->getSize() == 0 ||
+			ValueType->getSize() > 8 || !Location.Size ||
+			!isAvailableAtPreheader(Pointer, PreHeader, DT)) {
+			continue;
+		}
+		std::vector<LoadInst *> Loads;
+		std::vector<StoreInst *> Stores;
+		bool Valid = true;
+		for (Instruction *I : LoopInstructions) {
+			if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+				MemoryLocation Other = MemoryLocation::get(Load);
+				AliasInfo Alias = AA.aliasWithIndexRange(Location, Other, LI);
+				//只把完整同址同型load接入缓存。其他只读访问保持原位；即使
+				//BasicAA只能给出MayAlias，它仍观察未改动的真实Store序列。
+				if (Alias != AliasInfo::MustAlias) continue;
+				if (!Other.Size || *Other.Size != *Location.Size ||
+					Load->getIRType() != ValueType ||
+					valueMayDependOnUndef(Load->getPointerOperand()) ||
+					!DT.dominates(L->getHeader(), Load->getParent()) ||
+					(Load->getParent() == L->getHeader() &&
+					 Load != Seed && !Seed->comesBefore(Load))) {
+					Valid = false;
+					break;
+				}
+				Loads.push_back(Load);
+				continue;
+			}
+			if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+				MemoryLocation Other = MemoryLocation::get(Store);
+				Value *Stored = Store->getValueOperand();
+				//首版要求循环内每一条真实写都完整更新候选位置。任何无关写、
+				//部分覆盖或MayAlias写都拒绝，保证不存在绕过私有缓存的修改。
+				if (AA.aliasWithIndexRange(Location, Other, LI) !=
+						AliasInfo::MustAlias ||
+					!Other.Size || *Other.Size != *Location.Size || !Stored ||
+					Stored->getIRType() != ValueType ||
+					valueMayDependOnUndef(Store->getPointerOperand()) ||
+					valueMayDependOnUndef(Stored)) {
+					Valid = false;
+					break;
+				}
+				Stores.push_back(Store);
+			}
+		}
+		constexpr std::size_t MaxCachedLoads = 16;
+		constexpr std::size_t MaxMirroredStores = 8;
+		if (!Valid || Loads.empty() || Stores.empty() ||
+			Loads.size() > MaxCachedLoads ||
+			Stores.size() > MaxMirroredStores) {
+			continue;
+		}
+		//初值load由首轮原load平移而来。执行N次时真实读取由N次降为1次，
+		//N为0或1均不增加访存；嵌套与PHI预算负责约束未知次数下的收益风险。
+		const std::int64_t Benefit = static_cast<std::int64_t>(Loads.size());
+		if (Best.L && Benefit <= Best.EstimatedNetBenefit) continue;
+		Best.L = L;
+		Best.Pointer = Pointer;
+		Best.ValueType = ValueType;
+		Best.PreHeader = PreHeader;
+		Best.Latch = Latch;
+		Best.ExitBlocks = ExitBlocks;
+		Best.Loads = std::move(Loads);
+		Best.Stores = std::move(Stores);
+		Best.PreserveOriginalStores = true;
+		Best.MandatoryAccesses = static_cast<unsigned>(Best.Loads.size());
+		Best.EstimatedNetBenefit = Benefit;
+	}
+	if (!Best.L) return false;
+	Plan = std::move(Best);
+	return true;
+}
+//通过临时标量槽复用Mem2Reg，按计划同步真实Store或在出口写回
 bool LICMPass::applyLoopMemoryPromotion(
 	Function &F, LoopMemoryPromotionPlan &Plan,
 	FunctionAnalysisPassManager &FAM) {
-	//4.12 提交前重新验证全部节点和挂接点；临时alloca只接受直接load/store使用，
+	//4.14 提交前重新验证全部节点和挂接点；临时alloca只接受直接load/store使用，
 	//随后由既有Mem2Reg统一放置PHI和重命名，避免在LICM中复制一套不完整SSA算法。
 	BasicBlock *Entry = F.front();
 	if (!Entry || !Entry->getTerminator() || !Plan.L || !Plan.Pointer ||
@@ -593,16 +804,25 @@ bool LICMPass::applyLoopMemoryPromotion(
 	Plan.PreHeader->insertBeforeTerminator(InitialStore);
 	for (LoadInst *Load : Plan.Loads)
 		Load->replaceOperand(0, Slot);
-	for (StoreInst *Store : Plan.Stores)
-		Store->replaceOperand(1, Slot);
-	for (BasicBlock *Exit : Plan.ExitBlocks) {
-		auto *ExitLoad = new LoadInst(Slot);
-		ExitLoad->setIdent(ExitLoad->getIdent() + ".licm.exit");
-		Exit->insertAfterPhiNodes(ExitLoad);
-		auto *WriteBack = new StoreInst(ExitLoad, Plan.Pointer);
-		Instruction::insertAfter(ExitLoad, WriteBack);
+	if (Plan.PreserveOriginalStores) {
+		//4.15 真实Store保持原地址和原控制位置；先完成可能故障的真实写，再把
+		//同值写入私有槽。Mem2Reg随后把镜像写折成条件SSA更新，不新增内存操作。
+		for (StoreInst *Store : Plan.Stores) {
+			auto *Mirror = new StoreInst(Store->getValueOperand(), Slot);
+			Instruction::insertAfter(Store, Mirror);
+		}
+	} else {
+		for (StoreInst *Store : Plan.Stores)
+			Store->replaceOperand(1, Slot);
+		for (BasicBlock *Exit : Plan.ExitBlocks) {
+			auto *ExitLoad = new LoadInst(Slot);
+			ExitLoad->setIdent(ExitLoad->getIdent() + ".licm.exit");
+			Exit->insertAfterPhiNodes(ExitLoad);
+			auto *WriteBack = new StoreInst(ExitLoad, Plan.Pointer);
+			Instruction::insertAfter(ExitLoad, WriteBack);
+		}
 	}
-	//4.13 CFG未改变，现有支配树仍可供Mem2Reg构造裁剪SSA；调用后LICM立即停止，
+	//4.16 CFG未改变，现有支配树仍可供Mem2Reg构造裁剪SSA；调用后LICM立即停止，
 	//由外层PassManager按none状态重建AA、MemorySSA、SCEV和范围分析。
 	PromotePass Promoter;
 	PassResult Result = Promoter.run(F, FAM);
@@ -759,8 +979,12 @@ bool LICMPass::isSafeToMove(
 PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
 	//1. 获取支配、循环、AA 与 MemorySSA；一旦移动内存指令，旧 MemorySSA 不再用于
 	//后续证明，避免以陈旧内存版本继续优化。
+	const bool AddressOnly = Mode == LICMMode::AddressOnly;
 	auto &DT = FAM.getResult<DominantAnalysis>(F);
 	auto &LI = FAM.getResult<LoopAnalysis>(F);
+	SCEVResult *AddressSE = AddressOnly
+		? &FAM.getResult<SCEVAnalysis>(F)
+		: nullptr;
 	auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
 	auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
 	bool MemorySSAUsable = true;
@@ -798,7 +1022,18 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			Latch = InsidePreds.front();
 		}
 		if (!PreHeader || !Latch) return LocalChanged;
-		const bool CanSink = HasLoopSimplifyForm && InLCSSA;
+		//晚期纯地址模式只接受规范循环，并关闭store下沉、调用缓存和内存提升，
+		//避免为消费最终GEP形态而扩大整套LICM的行为范围。
+		if (AddressOnly && !HasLoopSimplifyForm) return LocalChanged;
+		if (AddressOnly) {
+			//纯地址模式只处理已证明至少执行两次且归纳不回绕的循环，确保
+			//把每迭代必经GEP移到预头会严格减少动态地址计算，而不是猜测热度。
+			auto TripCount = AddressSE
+				? AddressSE->getSmallConstantTripCount(L)
+				: std::nullopt;
+			if (!TripCount || *TripCount < 2) return LocalChanged;
+		}
+		const bool CanSink = !AddressOnly && HasLoopSimplifyForm && InLCSSA;
 		auto ExitBlocks = L->getExitBlocks();
 		if (ExitBlocks.empty()) return LocalChanged;
 		auto Latches = L->getBackedgeSrcs();
@@ -948,6 +1183,22 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 			auto Insts = collectInstructions(*BB);
 			for (Instruction *I : Insts) {
 				if (!I || I->getParent() != BB) continue;
+				if (AddressOnly &&
+					!dynamic_cast<GetElementPtrInst *>(I)) {
+					continue;
+				}
+				if (AddressOnly) {
+					//候选原块必须支配全部回边，保证它在每次完成的迭代中都会
+					//执行；无用户地址和条件地址不会因静态次数被误判为收益。
+					bool ExecutesEveryIteration = I->hasUses() && !Latches.empty();
+					for (BasicBlock *LatchBB : Latches) {
+						if (!LatchBB || !DT.dominates(BB, LatchBB)) {
+							ExecutesEveryIteration = false;
+							break;
+						}
+					}
+					if (!ExecutesEveryIteration) continue;
+				}
 				if (!HasLoopSimplifyForm &&
 					!dynamic_cast<BinaryInst *>(I) &&
 					!dynamic_cast<SelectInst *>(I)) {
@@ -983,6 +1234,7 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				//4.1 非必执行的不变量调用不能直接提前；在完整 LoopSimplify+LCSSA 形态下，
 				//尝试改写为首轮按需计算、后续迭代复用的缓存 CFG。
 				if (!SafeToPreheader) {
+					if (AddressOnly) continue;
 					auto *CI = dynamic_cast<CallInst *>(I);
 					if (!HasLoopSimplifyForm || !InLCSSA ||
 						!CI || BB == L->getHeader() ||
@@ -1021,10 +1273,15 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 		}
 		//4.5 普通提升完成后再检查同址load-update-store；此时其循环不变GEP已可能
 		//进入preheader。一次只提交一个位置，Mem2Reg改写SSA后立即停止使用旧分析。
-		if (HasLoopSimplifyForm && InLCSSA) {
+		if (!AddressOnly && HasLoopSimplifyForm && InLCSSA) {
 			LoopMemoryPromotionPlan Promotion;
-			if (planLoopMemoryPromotion(
-					F, L, AA, LI, DT, FAM, Promotion) &&
+			bool HasPromotion = planLoopMemoryPromotion(
+				F, L, AA, LI, DT, FAM, Promotion);
+			if (!HasPromotion) {
+				HasPromotion = planStoreSynchronizedLoadCache(
+					F, L, AA, LI, DT, FAM, Promotion);
+			}
+			if (HasPromotion &&
 				applyLoopMemoryPromotion(F, Promotion, FAM)) {
 				MemoryPromotionChanged = true;
 				LocalChanged = true;

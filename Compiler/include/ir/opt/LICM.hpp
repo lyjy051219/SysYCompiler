@@ -13,6 +13,10 @@
 
 //MemorySSAResult提供循环内存读写干扰的稀疏证明
 class MemorySSAResult;
+//RangeInfo提供带控制流上下文的整数范围证明
+class RangeInfo;
+//SCEVResult提供变量起点归纳范围和循环次数证明
+class SCEVResult;
 
 //ExitValueKey使用循环出口块和循环内SSA值标识LCSSA桥接值
 using ExitValueKey = std::pair<BasicBlock *, Value *>;
@@ -39,27 +43,46 @@ struct LoopMemoryPromotionPlan {
     std::vector<BasicBlock *> ExitBlocks;
     //所有读写该精确位置且将被统一标量化的Load
     std::vector<LoadInst *> Loads;
-    //所有读写该精确位置且将被统一标量化的Store
+    //所有完整写入该精确位置且将被改写或同步到缓存的Store
     std::vector<StoreInst *> Stores;
+    //为真时保留原Store，仅用紧随其后的私有写同步循环携带缓存
+    bool PreserveOriginalStores = false;
     //每次完成迭代必经的内存访问数量
     unsigned MandatoryAccesses = 0;
-    //按通用访存成本估算的严格最小净收益
+    //完整提升记录严格净收益下界，读取缓存记录受压力门约束的收益评分
     std::int64_t EstimatedNetBenefit = 0;
+};
+
+//LICMMode区分完整循环不变量优化和流水线末尾的纯地址提升模式
+enum class LICMMode {
+    //Full启用标量提升、内存提升、store下沉和不变量调用缓存
+    Full,
+    //AddressOnly只移动循环不变GEP，不改写任何内存访问或控制流
+    AddressOnly,
 };
 
 //LICMPass提升或下沉经过支配、内存和可执行性证明的循环不变量
 class LICMPass : public PassDescriptor<LICMPass> {
 public:
+    //选择完整LICM或仅消费晚期地址规范化暴露的不变GEP
+    explicit LICMPass(LICMMode Mode = LICMMode::Full);
     //按由内到外的循环顺序运行LICM并返回分析保留状态
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    //Mode记录本次运行允许处理的候选类别
+    LICMMode Mode = LICMMode::Full;
     //判断候选之前的块内前缀是否可安全提前执行
     static bool hasSafeExecutionPrefix(const Instruction *Candidate);
     //判断preheader是否已有同址内存访问证明Load地址可解引用
     static bool hasPreheaderDereferenceProof(
         LoadInst *Load, const Loop &L, BasicAAResult &AA,
         const LoopInfo &LI);
+    //证明内存位置的完整地址区间始终落在已知栈或全局对象内
+    static bool isMemoryLocationProvablyInBounds(
+        const MemoryLocation &Location, Instruction *Access,
+        BasicAAResult &AA, SCEVResult &SE,
+        RangeInfo &RI, const DominatorTree &DT);
     //判断除法或余数指令能否在不引入异常的情况下推测执行
     static bool isSpeculatableDivisionOrRemainder(Instruction *I);
     //判断Store目标是否为可在循环出口安全写入的在界对象
@@ -85,7 +108,12 @@ private:
         Function &F, Loop *L, BasicAAResult &AA, const LoopInfo &LI,
         const DominatorTree &DT, FunctionAnalysisPassManager &FAM,
         LoopMemoryPromotionPlan &Plan);
-    //通过临时标量槽复用Mem2Reg构造完整SSA并在全部出口写回
+    //为条件更新位置选择保留真实Store的循环携带读取缓存计划
+    static bool planStoreSynchronizedLoadCache(
+        Function &F, Loop *L, BasicAAResult &AA, const LoopInfo &LI,
+        const DominatorTree &DT, FunctionAnalysisPassManager &FAM,
+        LoopMemoryPromotionPlan &Plan);
+    //通过临时标量槽复用Mem2Reg，按计划同步真实Store或在出口写回
     static bool applyLoopMemoryPromotion(
         Function &F, LoopMemoryPromotionPlan &Plan,
         FunctionAnalysisPassManager &FAM);

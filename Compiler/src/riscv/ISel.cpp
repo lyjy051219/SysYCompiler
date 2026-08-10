@@ -408,6 +408,33 @@ bool intConstant(Value *value, int64_t &out) {
   return intConstantImpl(value, out, 0);
 }
 
+// 判断有限常量表达式是否依赖 undef。常量除数 lowering 必须拒绝这类值，
+// 不能把后端为普通 undef 选取的占位位模式当成可证明的数学除数。
+bool constantDivisorMayDependOnUndef(Value *value, unsigned depth) {
+  if (!value || Value::isUndef(value)) {
+    return true;
+  }
+  if (dynamic_cast<ConstInt *>(value) ||
+      dynamic_cast<ConstBool *>(value) ||
+      dynamic_cast<ConstPtr *>(value)) {
+    return false;
+  }
+  if (depth >= 4) {
+    return true;
+  }
+  auto *binary = dynamic_cast<BinaryInst *>(value);
+  if (!binary || binary->getUserList().size() != 2) {
+    return false;
+  }
+  for (const auto &operand : binary->getUserList()) {
+    if (!operand || constantDivisorMayDependOnUndef(
+                        operand->getValue(), depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // 判断是否为正的 2 的幂(用于乘/除/取模的移位强度削减)。
 bool positivePowerOfTwo(int64_t value) {
   return value > 0 && (value & (value - 1)) == 0;
@@ -623,8 +650,10 @@ bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
         Bin->getUserList()[0]->getValue() != lhs) {
       continue;
     }
+    Value *OtherRHS = Bin->getUserList()[1]->getValue();
     int64_t OtherDivisor = 0;
-    if (intConstant(Bin->getUserList()[1]->getValue(), OtherDivisor) &&
+    if (!constantDivisorMayDependOnUndef(OtherRHS, 0) &&
+        intConstant(OtherRHS, OtherDivisor) &&
         OtherDivisor == divisor) {
       return true;
     }
@@ -712,6 +741,11 @@ bool lowerIntegerPowerOfTwoOp(MachineFunction &mf, MachineBasicBlock &mbb,
                               LoweringState &state, BinaryInst &inst,
                               Value *lhs, Value *rhs) {
   int64_t rhsValue = 0;
+  if ((inst.getOp() == BinaryInst::DIV ||
+       inst.getOp() == BinaryInst::MOD) &&
+      constantDivisorMayDependOnUndef(rhs, 0)) {
+    return false;
+  }
   if (!intConstant(rhs, rhsValue) || !positivePowerOfTwo(rhsValue)) {
     return false;
   }
@@ -797,7 +831,8 @@ bool lowerIntegerPositiveConstantDivRem(MachineFunction &mf,
                                         BinaryInst &inst, Value *lhs,
                                         Value *rhs) {
   int64_t rhsValue = 0;
-  if (!intConstant(rhs, rhsValue) || rhsValue <= 1 ||
+  if (constantDivisorMayDependOnUndef(rhs, 0) ||
+      !intConstant(rhs, rhsValue) || rhsValue <= 1 ||
       positivePowerOfTwo(rhsValue)) {
     return false;
   }

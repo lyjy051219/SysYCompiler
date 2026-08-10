@@ -112,6 +112,28 @@ struct OffsetReuseGroup {
     std::shared_ptr<IRType> ResultTy;
 };
 
+//CrossBaseLSRGroup保存由同一个归纳下标驱动的两个不同基址地址流
+struct CrossBaseLSRGroup {
+    //Order记录该组在稳定候选顺序中的位置
+    size_t Order = 0;
+    //Items保存必须原子改写的两个跨基址候选
+    std::vector<LSRCandidate *> Items;
+    //L记录两个地址流共同所属的最内层循环
+    Loop *L = nullptr;
+    //PreHeader记录两个起始地址共同插入的循环预头块
+    BasicBlock *PreHeader = nullptr;
+    //Header记录两个指针PHI共同插入的循环头块
+    BasicBlock *Header = nullptr;
+    //Latch记录两个指针递推共同插入的循环回边块
+    BasicBlock *Latch = nullptr;
+    //Index记录两个地址流共享的原始整数归纳值
+    Value *Index = nullptr;
+    //Step记录按末级元素计量的单位地址步长
+    int64_t Step = 0;
+    //ElementByteStride记录每个末级元素占用的字节数
+    int64_t ElementByteStride = 0;
+};
+
 //PointerIV保存强度削减后指针递推的起点、PHI和回边更新
 struct PointerIV {
     //Start是在循环预头计算的初始地址
@@ -153,16 +175,24 @@ struct LSRCostEstimate {
 class LoopStrengthReductionPass
     : public PassDescriptor<LoopStrengthReductionPass> {
 public:
+    //构造常规LSR或仅在流水线末尾运行的RV64跨基址模式
+    explicit LoopStrengthReductionPass(bool EnableCrossBase = false);
     //运行循环地址强度削减并返回实际保留的分析集合
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    //EnableCrossBase只允许最终阶段创建non-inbounds跨基址指针IV
+    bool EnableCrossBase = false;
     //UnsupportedMaterializeCost表示无法安全物化SCEV时使用的拒绝成本
     static constexpr int UnsupportedMaterializeCost = 1000000;
     //MaxPointerIVsPerInnerLoop限制最内层循环创建的指针IV数量
     static constexpr int MaxPointerIVsPerInnerLoop = 8;
     //MaxPointerIVsPerOuterLoop限制非最内层循环创建的指针IV数量
     static constexpr int MaxPointerIVsPerOuterLoop = 4;
+    //CrossBaseStreamCount限制首版跨基址原子组只处理两个直接地址流
+    static constexpr int CrossBaseStreamCount = 2;
+    //RiscvUnknownTripEstimate是RV64未知次数内层循环的通用成本估计
+    static constexpr int RiscvUnknownTripEstimate = 4;
     //返回SCEV表达式用于候选分组的稳定结构键
     static std::string scevKey(const SCEVExpr *E);
     //判断原始IR值是否能在循环预头直接使用
@@ -210,11 +240,14 @@ private:
         Value *&Index, std::vector<IndexComponent> &Prefix,
         std::vector<IndexComponent> &Suffix, int64_t &ActiveIndexStride,
         int64_t &FinalPointeeStride, bool &HasLeadingZero,
-        bool &AllowOffsetReuse);
+        bool &AllowOffsetReuse, bool AllowDirectScalarFallback);
+    //证明两块头测单位步长循环中每次实际执行的整数更新都不会回绕
+    static bool hasStrictGuardedUnitStepNoWrap(
+        Loop *L, Value *Index, int64_t Step);
     //按照稳定函数顺序收集所有满足安全条件的地址强度削减候选
     static std::vector<LSRCandidate> collectCandidates(
         Function &F, LoopInfo &LI, SCEVResult &SE,
-        const DominatorTree &DT);
+        const DominatorTree &DT, bool EnableCrossBase);
     //生成编码循环、基址、步长、布局和可选起点的候选形状键
     static std::string candidateShapeKey(const LSRCandidate &Candidate,
                                          bool IncludeStart);
@@ -224,6 +257,10 @@ private:
     //按照包含起点的完整形状键构造完全同形分组
     static std::vector<LSRGroup> buildExactGroups(
         std::vector<LSRCandidate> &Candidates);
+    //按照同一整数归纳值构造两个不同基址的RV64原子地址流分组
+    static std::vector<CrossBaseLSRGroup> buildCrossBaseGroups(
+        std::vector<LSRCandidate> &Candidates,
+        const DominatorTree &DT);
     //判断指令是否属于能够递归删除的纯整数索引计算
     static bool isRemovableIndexInst(Instruction *I);
     //收集使用完全封闭在允许子图中的可删除索引计算链
@@ -244,6 +281,9 @@ private:
     //估算常量偏移分组使用锚点指针IV后的新旧成本
     static LSRCostEstimate estimateOffsetGroupCost(
         const OffsetReuseGroup &Group, const DominatorTree &DT);
+    //估算RV64跨基址组共享缩放地址后的目标相关成本
+    static LSRCostEstimate estimateCrossBaseGroupCost(
+        const CrossBaseLSRGroup &Group);
     //结合循环次数判断一次性设置成本能否由每轮收益摊销
     static bool isCostModelProfitable(
         const LSRCostEstimate &Cost, Loop *L, SCEVResult &SE);
@@ -260,11 +300,14 @@ private:
     static bool shouldRewriteOffsetGroup(const OffsetReuseGroup &Group,
                                          const DominatorTree &DT,
                                          SCEVResult &SE);
+    //判断跨基址原子组在RV64目标成本模型下是否值得改写
+    static bool shouldRewriteCrossBaseGroup(
+        const CrossBaseLSRGroup &Group, SCEVResult &SE);
     //在预头、循环头和回边块创建结构完整的指针归纳变量
     static PointerIV createPointerIV(
         Value *Base, const std::vector<Value *> &StartIndices, int64_t Step,
         const std::shared_ptr<IRType> &ResultTy, BasicBlock *PreHeader,
-        BasicBlock *Header, BasicBlock *Latch);
+        BasicBlock *Header, BasicBlock *Latch, bool InBounds = true);
     //使用一个共享指针IV替换完全同形分组中的全部旧GEP
     static bool rewriteExactGroup(
         LSRGroup &Group, const DominatorTree &DT,
@@ -273,9 +316,13 @@ private:
     static bool rewriteOffsetGroup(
         OffsetReuseGroup &Group, const DominatorTree &DT,
         std::vector<Instruction *> &DeadSeeds);
+    //原子创建两个non-inbounds指针IV并替换跨基址地址流
+    static bool rewriteCrossBaseGroup(
+        CrossBaseLSRGroup &Group, const DominatorTree &DT,
+        std::vector<Instruction *> &DeadSeeds);
     //返回给定循环允许创建的最大指针IV数量
     static int pointerIVLimit(const Loop *L);
     //执行候选发现、分组、成本选择、改写和死索引清理主流程
     static bool runAddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
-                              DominatorTree &DT);
+                              DominatorTree &DT, bool EnableCrossBase);
 };

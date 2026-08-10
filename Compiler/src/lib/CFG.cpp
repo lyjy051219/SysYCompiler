@@ -1915,7 +1915,8 @@ GetElementPtrInst::GetElementPtrInst(std::shared_ptr<IRType> irtype):Instruction
 void GetElementPtrInst::dumpIR() {
     // 先输出结果值，再按操作数顺序输出基指针和全部索引。
     this->Value::dumpIR();
-    std::cout << " = getelementptr inbounds ";
+    std::cout << " = getelementptr ";
+    if (inBounds) std::cout << "inbounds ";
 
     Value* basePtr = userList[0]->getValue();
     auto baseType = basePtr->getIRType();
@@ -1943,6 +1944,14 @@ void GetElementPtrInst::dumpIR() {
         index->dumpIR();
     }
     std::cout << "\n";
+}
+
+void GetElementPtrInst::setInBounds(bool InBounds) {
+    inBounds = InBounds;
+}
+
+bool GetElementPtrInst::isInBounds() const {
+    return inBounds;
 }
 
 void GetElementPtrInst::updateType() {
@@ -3399,7 +3408,9 @@ Instruction* GetElementPtrInst::clone(const std::unordered_map<Value*, Value*>& 
     Indices.reserve(getNumIndices());
     for (size_t I = 0; I < getNumIndices(); ++I)
         Indices.push_back(remapVal(getIndex(I), VMap));
-    return new GetElementPtrInst(Base, Indices);
+    auto *Cloned = new GetElementPtrInst(Base, Indices);
+    Cloned->setInBounds(isInBounds());
+    return Cloned;
 }
 
 Instruction* ExtractElementInst::clone(

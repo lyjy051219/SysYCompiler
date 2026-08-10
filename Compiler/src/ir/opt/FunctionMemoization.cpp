@@ -1,5 +1,6 @@
 #include "ir/opt/FunctionMemoization.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -31,7 +32,7 @@ bool FunctionMemoizationPass::hasUnsafeOrUndefinedOperation(
     if (!Inst) return true;
     for (const auto &OperandUse : Inst->getUserList()) {
         Value *Operand = OperandUse ? OperandUse->getValue() : nullptr;
-        if (!Operand || Operand->isUndef()) return true;
+        if (!Operand || valueMayDependOnUndef(Operand)) return true;
     }
     if (Inst->instType == Instruction::BinaryUnknown) return true;
     if (Inst->instType == Instruction::FPTOSI) return true;
@@ -87,6 +88,204 @@ bool FunctionMemoizationPass::isTrackedReadGlobalPointer(
             return false;
         }
     }
+    return true;
+}
+//在不识别函数名、参数位置或常量取值的前提下，寻找“便宜直接返回守卫链
+//之后才进入单块递归核心”的形态。成功时缓存只覆盖递归核心，基例原样直返。
+bool FunctionMemoizationPass::collectDeferredLookupPlan(
+    Function &F, FunctionMemoizationCandidate &Candidate) {
+    Candidate.DeferredLookupPredecessor = nullptr;
+    Candidate.DeferredLookupMissEntry = nullptr;
+    Candidate.DeferredCachedReturns.clear();
+    if (Candidate.Target != &F || Candidate.RecursiveCalls.size() < 2 ||
+        Candidate.Returns.size() < 2 ||
+        !Candidate.MutableReadGlobals.empty()) {
+        return false;
+    }
+    //1.6.0 首版把守卫下沉限制在完整i32签名，避免把浮点异常环境、NaN
+    //比较或隐式类型转换引入新的控制流等价证明。
+    if (!F.getIRType() ||
+        !F.getIRType()->hasIntegerBitWidth(32)) {
+        return false;
+    }
+    for (const auto &Parameter : F.getParams()) {
+        if (!Parameter || !Parameter->getIRType() ||
+            !Parameter->getIRType()->hasIntegerBitWidth(32)) {
+            return false;
+        }
+    }
+    //1.6.1 首版只处理全部自递归调用位于同一直接返回块的严格形态；该块必须
+    //无PHI、只有一条普通入边，保证下沉后的lookup支配缓存发布所用全部值。
+    BasicBlock *Core = Candidate.RecursiveCalls.front()->getParent();
+    if (!Core || Core == F.front() || !Core->collectPhiNodes().empty())
+        return false;
+    for (CallInst *Call : Candidate.RecursiveCalls)
+        if (!Call || Call->getParent() != Core) return false;
+    auto *CoreReturn = dynamic_cast<RetInst *>(Core->getTerminator());
+    if (!CoreReturn) return false;
+    std::vector<RetInst *> CoreReturns;
+    for (RetInst *Return : Candidate.Returns)
+        if (Return && Return->getParent() == Core)
+            CoreReturns.push_back(Return);
+    if (CoreReturns.size() != 1 || CoreReturns.front() != CoreReturn)
+        return false;
+    std::vector<BasicBlock *> CorePredecessors = Core->getPredecessors();
+    if (CorePredecessors.size() != 1) return false;
+    BasicBlock *CorePredecessor = CorePredecessors.front();
+    if (!CorePredecessor ||
+        CorePredecessor->countEdgesToSucc(Core) != 1) {
+        return false;
+    }
+
+    //1.6.2 从真实入口正向匹配1至4层守卫。每层恰为一次参数与同类型常量
+    //比较和条件分支；一边直达便宜返回，另一边继续到下一层或递归核心。
+    BasicBlock *Current = F.front();
+    BasicBlock *Previous = nullptr;
+    std::unordered_set<BasicBlock *> GuardBlocks;
+    std::unordered_set<BasicBlock *> BypassBlocks;
+    std::unordered_set<RetInst *> BypassReturns;
+    std::size_t CheapInstructionCost = 0;
+    unsigned GuardDepth = 0;
+    bool ReachedCore = false;
+    while (Current && GuardDepth < MaxDeferredGuardDepth) {
+        if (!GuardBlocks.insert(Current).second ||
+            !Current->collectPhiNodes().empty() || Current->size() != 2) {
+            return false;
+        }
+        if (Previous) {
+            std::vector<BasicBlock *> Predecessors =
+                Current->getPredecessors();
+            if (Predecessors.size() != 1 ||
+                Predecessors.front() != Previous ||
+                Previous->countEdgesToSucc(Current) != 1) {
+                return false;
+            }
+        } else if (!Current->getPredecessors().empty()) {
+            return false;
+        }
+        auto *Branch = Current->getBranchTerminator();
+        auto *Compare = Branch
+            ? dynamic_cast<BinaryInst *>(Branch->getCondition()) : nullptr;
+        if (!BasicBlock::isCondBr(Branch) || !Compare ||
+            Current->front() != Compare || Current->back() != Branch ||
+            Compare->getParent() != Current ||
+            !BinaryInst::isCompareOp(Compare->getOp()) ||
+            Compare->countUses() != 1 ||
+            valueMayDependOnUndef(Compare) ||
+            instructionMayFaultOrProducePoison(Compare)) {
+            return false;
+        }
+        Value *Left = nullptr;
+        Value *Right = nullptr;
+        if (!Compare->getOperands(Left, Right) || !Left || !Right ||
+            !Left->getIRType() || !Right->getIRType() ||
+            !Left->getIRType()->hasIntegerBitWidth(32) ||
+            !Right->getIRType()->hasIntegerBitWidth(32) ||
+            !IRType::hasSameScalarType(
+                Left->getIRType(), Right->getIRType()) ||
+            !((Left->isParam() && Right->isConst()) ||
+              (Right->isParam() && Left->isConst()))) {
+            return false;
+        }
+        BasicBlock *TrueSuccessor = Branch->getTrueSuccessor();
+        BasicBlock *FalseSuccessor = Branch->getFalseSuccessor();
+        if (!TrueSuccessor || !FalseSuccessor ||
+            TrueSuccessor == FalseSuccessor) {
+            return false;
+        }
+        auto IsDirectReturnBlock = [Core](BasicBlock *Block) {
+            return Block && Block != Core &&
+                   Block->getSuccessors().empty() &&
+                   dynamic_cast<RetInst *>(Block->getTerminator());
+        };
+        bool TrueReturns = IsDirectReturnBlock(TrueSuccessor);
+        bool FalseReturns = IsDirectReturnBlock(FalseSuccessor);
+        if (TrueReturns == FalseReturns) return false;
+        BasicBlock *Bypass =
+            TrueReturns ? TrueSuccessor : FalseSuccessor;
+        BasicBlock *Continuation =
+            TrueReturns ? FalseSuccessor : TrueSuccessor;
+        auto *BypassReturn =
+            dynamic_cast<RetInst *>(Bypass->getTerminator());
+        if (!BypassReturn) return false;
+        BypassBlocks.insert(Bypass);
+        BypassReturns.insert(BypassReturn);
+        CheapInstructionCost += 2;
+        ++GuardDepth;
+        if (Continuation == Core) {
+            if (Current != CorePredecessor) return false;
+            ReachedCore = true;
+            break;
+        }
+        Previous = Current;
+        Current = Continuation;
+    }
+    if (!ReachedCore || GuardDepth == 0) return false;
+
+    //1.6.3 共享基例块可被多层守卫复用，但其全部前驱必须来自本计划；结果
+    //反向闭包仅允许参数、常量和块内先定义的安全纯标量二元运算。
+    for (BasicBlock *Bypass : BypassBlocks) {
+        if (!Bypass || !Bypass->collectPhiNodes().empty()) return false;
+        for (BasicBlock *Predecessor : Bypass->getPredecessors()) {
+            if (!GuardBlocks.count(Predecessor) ||
+                Predecessor->countEdgesToSucc(Bypass) != 1) {
+                return false;
+            }
+        }
+        std::unordered_set<Value *> Available;
+        for (Instruction *Inst : *Bypass) {
+            if (auto *Return = dynamic_cast<RetInst *>(Inst)) {
+                Value *Result = Return->getReturnValue();
+                if (!Result ||
+                    !(Result->isParam() || Result->isConst() ||
+                      Available.count(Result)) ||
+                    !IRType::hasSameScalarType(
+                        Result->getIRType(), F.getIRType())) {
+                    return false;
+                }
+                continue;
+            }
+            auto *Binary = dynamic_cast<BinaryInst *>(Inst);
+            Value *Left = nullptr;
+            Value *Right = nullptr;
+            if (!Binary || BinaryInst::isCompareOp(Binary->getOp()) ||
+                !Binary->getOperands(Left, Right) || !Left || !Right ||
+                Binary->isPointerValue() ||
+                !Binary->getIRType() ||
+                !Binary->getIRType()->hasIntegerBitWidth(32) ||
+                !((Left->isParam() || Left->isConst() ||
+                   Available.count(Left)) &&
+                  (Right->isParam() || Right->isConst() ||
+                   Available.count(Right))) ||
+                hasUnsafeOrUndefinedOperation(Binary) ||
+                valueMayDependOnUndef(Binary) ||
+                instructionMayFaultOrProducePoison(Binary)) {
+                return false;
+            }
+            Available.insert(Binary);
+            ++CheapInstructionCost;
+        }
+    }
+    //1.6.4 所有返回与可达块都必须被“守卫、基例、核心”完整覆盖，排除未建模
+    //的第三条路径、回边或复杂汇合；成本只使用IR结构与参数数统一估计。
+    for (RetInst *Return : Candidate.Returns) {
+        if (!Return) return false;
+        if (Return == CoreReturn) continue;
+        if (!BypassReturns.count(Return)) return false;
+    }
+    std::unordered_set<BasicBlock *> CoveredBlocks = GuardBlocks;
+    CoveredBlocks.insert(BypassBlocks.begin(), BypassBlocks.end());
+    CoveredBlocks.insert(Core);
+    const std::size_t EstimatedLookupCost =
+        7 + 7 * F.getParamCount();
+    if (CoveredBlocks.size() != static_cast<std::size_t>(F.size()) ||
+        CheapInstructionCost > MaxCheapBypassInstructions ||
+        CheapInstructionCost >= EstimatedLookupCost) {
+        return false;
+    }
+    Candidate.DeferredLookupPredecessor = CorePredecessor;
+    Candidate.DeferredLookupMissEntry = Core;
+    Candidate.DeferredCachedReturns = {CoreReturn};
     return true;
 }
 //验证函数纯度、递归结构与标量语义并建立稳定的候选快照。
@@ -183,7 +382,7 @@ bool FunctionMemoizationPass::collectCandidate(
             }
             if (auto *Return = dynamic_cast<RetInst *>(Inst)) {
                 Value *Result = Return->getReturnValue();
-                if (!Result || Result->isUndef() ||
+                if (!Result || valueMayDependOnUndef(Result) ||
                     !isSupportedScalarType(Result->getIRType()) ||
                     !IRType::hasSameScalarType(
                         Result->getIRType(), F.getIRType())) {
@@ -210,7 +409,7 @@ bool FunctionMemoizationPass::collectCandidate(
         }
         for (unsigned Index = 0; Index < Call->getArgCount(); ++Index) {
             Value *Argument = Call->getArg(Index);
-            if (!Argument || Argument->isUndef()) return false;
+            if (!Argument || valueMayDependOnUndef(Argument)) return false;
         }
     }
     if (!HasExternalCallSite) return false;
@@ -227,6 +426,9 @@ bool FunctionMemoizationPass::collectCandidate(
     if (EstimatedAddedInstructions > MaxAddedInstructions)
         return false;
     Candidate.Target = &F;
+    //1.6 下沉计划是可选增强：严格形态不满足时保留原入口查找，不放宽
+    //记忆化候选本身的任何正确性条件。
+    (void)collectDeferredLookupPlan(F, Candidate);
     return true;
 }
 //生成同时避开模块函数和全局变量名称的唯一缓存符号。
@@ -357,6 +559,39 @@ bool FunctionMemoizationPass::transformCandidate(
         return false;
     }
     BasicBlock *OriginalEntry = F->front();
+    const bool HasAnyDeferredState =
+        Candidate.DeferredLookupPredecessor ||
+        Candidate.DeferredLookupMissEntry ||
+        !Candidate.DeferredCachedReturns.empty();
+    const bool HasDeferredLookup =
+        Candidate.DeferredLookupPredecessor &&
+        Candidate.DeferredLookupMissEntry &&
+        !Candidate.DeferredCachedReturns.empty();
+    if (HasAnyDeferredState != HasDeferredLookup) return false;
+    if (HasDeferredLookup) {
+        BasicBlock *Predecessor =
+            Candidate.DeferredLookupPredecessor;
+        BasicBlock *MissEntry = Candidate.DeferredLookupMissEntry;
+        std::vector<BasicBlock *> MissPredecessors =
+            MissEntry->getPredecessors();
+        if (!Candidate.MutableReadGlobals.empty() ||
+            Predecessor->getParent() != F || MissEntry->getParent() != F ||
+            MissPredecessors.size() != 1 ||
+            MissPredecessors.front() != Predecessor ||
+            Predecessor->countEdgesToSucc(MissEntry) != 1 ||
+            !MissEntry->collectPhiNodes().empty()) {
+            return false;
+        }
+        for (RetInst *Return : Candidate.DeferredCachedReturns) {
+            if (!Return || Return->getParent() != MissEntry ||
+                Return != MissEntry->getTerminator()) {
+                return false;
+            }
+        }
+        for (CallInst *RecursiveCall : Candidate.RecursiveCalls)
+            if (!RecursiveCall || RecursiveCall->getParent() != MissEntry)
+                return false;
+    }
     auto *LookupBlock = new BasicBlock();
     auto *HitBlock = new BasicBlock();
     LookupBlock->setIdent(F->makeUniqueBlockIdent(".memo.lookup"));
@@ -432,7 +667,7 @@ bool FunctionMemoizationPass::transformCandidate(
     GetElementPtrInst *ResultPointer =
         appendSlotPointer(*LookupBlock, ResultCache, SlotIndex);
     //2.6 命中条件要求槽位代际等于当前活动代际，且所有存储键逐一相等；
-    //命中块读取缓存结果并返回，未命中边进入原函数入口执行正常递归计算。
+    //严格基例计划把未命中边接到递归核心，否则保持进入原函数入口。
     auto *SlotEpoch = new LoadInst(SlotEpochPointer);
     LookupBlock->pushBack(SlotEpoch);
     Value *ActiveEpoch = ConstInt::newConstInt(1);
@@ -456,19 +691,37 @@ bool FunctionMemoizationPass::transformCandidate(
         LookupBlock->pushBack(AllMatch);
         IsHit = AllMatch;
     }
-    LookupBlock->genCondInst(IsHit, HitBlock, OriginalEntry);
+    BasicBlock *MissEntry = HasDeferredLookup
+        ? Candidate.DeferredLookupMissEntry : OriginalEntry;
+    LookupBlock->genCondInst(IsHit, HitBlock, MissEntry);
     auto *CachedResult = new LoadInst(ResultPointer);
     HitBlock->pushBack(CachedResult);
     HitBlock->pushBack(new RetInst(CachedResult));
-    //2.7 完整 lookup/hit CFG 构造完成后才接入函数，并撤销递归调用的 tail 标记。
-    F->pushFront(LookupBlock);
-    F->pushBlock(HitBlock);
+    //2.7 完整 lookup/hit CFG 构造完成后才接入函数。严格基例计划仅改写
+    //守卫尾到递归核心的唯一边并保留原入口；普通计划仍把lookup设为新入口。
+    if (HasDeferredLookup) {
+        bool Redirected = BasicBlock::redirectBranchTarget(
+            Candidate.DeferredLookupPredecessor,
+            Candidate.DeferredLookupMissEntry, LookupBlock);
+        if (!Redirected) {
+            delete LookupBlock;
+            delete HitBlock;
+            return false;
+        }
+        F->pushBlock(LookupBlock);
+        F->pushBlock(HitBlock);
+    } else {
+        F->pushFront(LookupBlock);
+        F->pushBlock(HitBlock);
+    }
     for (CallInst *RecursiveCall : Candidate.RecursiveCalls) {
         if (RecursiveCall) RecursiveCall->setTailCall(false);
     }
-    //2.8 每个原返回点按“槽代际清零 → 写全部键 → 写结果 → 发布活动代际”
-    //的顺序更新，防止尚未完整写入的直接映射槽被后续递归命中。
-    for (RetInst *Return : Candidate.Returns) {
+    //2.8 每个被lookup支配的返回点按“槽代际清零 → 写全部键 → 写结果 →
+    //发布活动代际”的顺序更新；便宜基例返回不读写编译器私有缓存。
+    const std::vector<RetInst *> &PublishedReturns = HasDeferredLookup
+        ? Candidate.DeferredCachedReturns : Candidate.Returns;
+    for (RetInst *Return : PublishedReturns) {
         if (!Return || !Return->getParent()) continue;
         Value *Result = Return->getReturnValue();
         if (!Result) continue;

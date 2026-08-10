@@ -17,17 +17,23 @@ struct FunctionMemoizationCandidate {
     Function *Target = nullptr;
     //快照目标函数中的全部直接自递归调用点。
     std::vector<CallInst *> RecursiveCalls;
-    //快照目标函数中需要发布缓存结果的全部返回点。
+    //快照目标函数的全部原始返回点，供普通发布与严格路径划分共同使用。
     std::vector<RetInst *> Returns;
     //快照函数外的全部直接调用点；读取可变全局时在这些入口前使缓存失效。
     std::vector<CallInst *> ExternalCalls;
     //记录目标函数读取的可变全局对象；非空表示缓存不能跨顶层调用复用。
     std::vector<Variable *> MutableReadGlobals;
+    //记录已证明便宜基例之后、进入递归核心前的唯一查找插入块。
+    BasicBlock *DeferredLookupPredecessor = nullptr;
+    //记录递归核心入口；缓存未命中时从下沉后的查找块进入这里。
+    BasicBlock *DeferredLookupMissEntry = nullptr;
+    //记录只有经过下沉查找才可达、因而允许发布缓存的递归核心返回点。
+    std::vector<RetInst *> DeferredCachedReturns;
 };
 
 //流程：1. 验证纯标量、无写入、多分支递归函数及全部只读全局来源；
 //2. 在模块缓存预算内创建键/结果数组；3. 读取可变全局时用代际隔离顶层调用；
-//4. 插入 lookup/hit 入口 CFG；5. 在每个原返回点按发布顺序写入直接映射缓存。
+//4. 插入 lookup/hit CFG；5. 普通模式发布全部返回，严格守卫模式只发布递归核心返回。
 class FunctionMemoizationPass
     : public PassDescriptor<FunctionMemoizationPass> {
 public:
@@ -48,6 +54,10 @@ private:
     static constexpr unsigned MaxExternalCallSites = 16;
     //限制单个候选预计新增的查找、发布和失效指令数量。
     static constexpr std::size_t MaxAddedInstructions = 128;
+    //限制缓存查找前允许保留的便宜守卫层数。
+    static constexpr unsigned MaxDeferredGuardDepth = 4;
+    //限制绕过缓存的比较与基例结果计算总指令数。
+    static constexpr std::size_t MaxCheapBypassInstructions = 16;
     //给出非法配置回退采用的默认缓存槽数量。
     static constexpr unsigned DefaultCacheEntries = 4096;
     //限制单个模块为所有记忆化函数创建的全局缓存总字节数。
@@ -68,6 +78,9 @@ private:
     static bool collectCandidate(
         Function &F, FunctionAnalysisPassManager &FAM,
         FunctionMemoizationCandidate &Candidate);
+    //识别便宜直接返回守卫链，并为递归核心建立缓存查找下沉计划。
+    static bool collectDeferredLookupPlan(
+        Function &F, FunctionMemoizationCandidate &Candidate);
     //生成同时避开模块函数与全局变量名称的唯一缓存符号。
     static std::string makeUniqueGlobalName(
         Module &M, const std::string &Stem);

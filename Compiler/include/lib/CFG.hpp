@@ -508,6 +508,8 @@ class LoadInst : public Instruction{
 // IR 结构：%p = getelementptr inbounds [10 x i32], [10 x i32]* %arr, i64 0, i64 3。
 class GetElementPtrInst : public Instruction{
     private:
+    //inBounds记录当前GEP是否承诺结果始终位于同一分配对象内。
+    bool inBounds = true;
     static std::shared_ptr<IRType> getAggregateElementType(
         const std::shared_ptr<IRType> &Type);
     static bool tryDeriveResultType(
@@ -522,6 +524,9 @@ class GetElementPtrInst : public Instruction{
     GetElementPtrInst(Value* v,std::vector<Value*>& vv);
     GetElementPtrInst(std::shared_ptr<IRType> irtype);
     void dumpIR() override;
+    //设置或查询GEP的inbounds语义标记。
+    void setInBounds(bool InBounds);
+    bool isInBounds() const;
     Value *getBasePointer() const;
     size_t getNumIndices() const;
     Value *getIndex(size_t Index) const;

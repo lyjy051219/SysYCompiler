@@ -18,6 +18,8 @@ class DominatorTree;
 class LoopInfo;
 //MemorySSAResult提供局部聚合读写的内存版本证明
 class MemorySSAResult;
+//RangeInfo提供动态数组下标的完整定义域证明
+class RangeInfo;
 
 //LocalAggregatePointerPath描述指针相对局部alloca的常量聚合路径
 struct LocalAggregatePointerPath {
@@ -88,6 +90,8 @@ public:
 private:
     //MaxSynthArrayElements限制允许综合的常量表元素数量
     static constexpr int MaxSynthArrayElements = 32;
+    //MaxFastSynthArrayElements限制线性扫描可验证的大型简单整数表
+    static constexpr int MaxFastSynthArrayElements = 256;
     //MaxSynthConstants限制综合搜索使用的不同常量数量
     static constexpr int MaxSynthConstants = 12;
     //MaxSynthExpressionCost限制候选表达式的二元指令成本
@@ -112,6 +116,10 @@ private:
     static bool evaluateSynthExpression(
         const std::shared_ptr<LocalAggregateSynthExpression> &Expression,
         int32_t Index, int32_t &Result);
+    //线性扫描完整定义域并识别索引、常量和一次加减表
+    static std::shared_ptr<LocalAggregateSynthExpression>
+    synthesizeFastInt32TableExpression(
+        const std::vector<int32_t> &Values);
     //搜索覆盖完整常量表定义域的低成本整数表达式
     static std::shared_ptr<LocalAggregateSynthExpression>
     synthesizeInt32TableExpression(const std::vector<int32_t> &Values);
@@ -182,6 +190,14 @@ private:
         Function &F, AllocaInst *AI, const DominatorTree &DT,
         const MemorySSAResult &MSSA, BasicAAResult &AA,
         const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
+    //判断调用是否为已注册且明确非volatile的memset语义
+    static bool isNonVolatileMemset(CallInst *CI);
+    //判断memset是否以零完整覆盖给定局部聚合对象
+    static bool isWholeZeroMemset(CallInst *CI, AllocaInst *AI);
+    //折叠“完整清零+常量下标补丁”构造的有界局部动态查表
+    static bool foldPatchedLocalArrayLoads(
+        AllocaInst *AI, const DominatorTree &DT,
+        RangeInfo &RI, const LoopInfo &LI);
     //为常量聚合路径登记标量槽类型并检查类型一致性和数量预算
     static bool addScalarSlot(
         std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,

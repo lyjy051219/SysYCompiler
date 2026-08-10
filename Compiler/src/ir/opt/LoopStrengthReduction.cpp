@@ -7,7 +7,9 @@
 #include "ir/analysis/SCEV.hpp"
 #include "ir/analysis/SCEVExpander.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/Target.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -18,6 +20,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+//构造常规地址LSR或仅执行RV64跨基址原子组的最终模式。
+LoopStrengthReductionPass::LoopStrengthReductionPass(bool EnableCrossBase)
+    : EnableCrossBase(EnableCrossBase) {}
 //步骤 3 的分组辅助：优先使用 SCEV 的稳定结构键，缺失时才以表达式对象标识
 //区分，避免把未经证明相等的表达式放入同组。
 std::string LoopStrengthReductionPass::scevKey(const SCEVExpr *E) {
@@ -181,7 +186,7 @@ bool LoopStrengthReductionPass::collectAddressGEPFamily(
 bool LoopStrengthReductionPass::isSingleIndexArrayStep(Value *Base, size_t NumIndices) {
     if (NumIndices != 1 || !Base) return false;
     auto PointeeTy = IRType::getPointeeType(Base->getIRType());
-    return PointeeTy && PointeeTy->isArray();
+    return PointeeTy && (PointeeTy->isInt() || PointeeTy->isFloat());
 }
 //步骤 1.4：把零基 GEP 链展平，要求恰有一个维度随当前循环变化；返回该
 //活跃索引及前后不变量维度，并验证字节步长可换算为末级元素步长。
@@ -192,7 +197,8 @@ bool LoopStrengthReductionPass::matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVRe
                      int64_t &ActiveIndexStride,
                      int64_t &FinalPointeeStride,
                      bool &HasLeadingZero,
-                     bool &AllowOffsetReuse) {
+                     bool &AllowOffsetReuse,
+                     bool AllowDirectScalarFallback) {
     Base = nullptr;
     Index = nullptr;
     Prefix.clear();
@@ -203,7 +209,14 @@ bool LoopStrengthReductionPass::matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVRe
     AllowOffsetReuse = false;
     if (!GEP || !L) return false;
     std::vector<Value *> Indices;
-    if (!GEP->flattenZeroBasedChain(Base, Indices)) return false;
+    if (!GEP->flattenZeroBasedChain(Base, Indices)) {
+        //标量元素指针上的直接动态下标无需跨越父GEP重解释类型；保留当前
+        //基址即可完整表达原地址，也避免错误合并非零父链。
+        if (!AllowDirectScalarFallback) return false;
+        Base = GEP->getBasePointer();
+        Indices = GEP->getIndices();
+        if (!isSingleIndexArrayStep(Base, Indices.size())) return false;
+    }
     if (Indices.empty()) return false;
     std::vector<int64_t> IndexStrides;
     if (!GetElementPtrInst::getIndexStrides(Base, Indices, IndexStrides,
@@ -246,10 +259,102 @@ bool LoopStrengthReductionPass::matchGEP(GetElementPtrInst *GEP, Loop *L, SCEVRe
                      Prefix.front().Raw->isConstIntZero();
     return true;
 }
+
+//证明两块头测单位步长循环中每次真实执行的更新均不会发生i32回绕。
+bool LoopStrengthReductionPass::hasStrictGuardedUnitStepNoWrap(
+    Loop *L, Value *Index, int64_t Step) {
+    //动态边界可以每轮重新读取；证明只使用“本轮条件为真”这一局部事实，
+    //不把它提升为循环不变量，也不向其他循环变换发布trip-count结论。
+    if (!L || !Index || (Step != 1 && Step != -1) ||
+        !L->getSubLoops().empty() ||
+        !IRType::hasIntegerBitWidth(Index->getIRType(), 32)) {
+        return false;
+    }
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) || !PreHeader ||
+        !Latch || Latch == L->getHeader()) {
+        return false;
+    }
+    BasicBlock *Header = L->getHeader();
+    auto Blocks = L->getBlocksIncludingSubLoops();
+    auto Exits = L->getExitBlocks();
+    if (!Header || Blocks.size() != 2 || Exits.size() != 1 ||
+        !Exits.front()) {
+        return false;
+    }
+    for (BasicBlock *BB : Blocks) {
+        if (BB != Header && BB != Latch) return false;
+    }
+    BasicBlock *Exit = Exits.front();
+    auto *HeaderBranch = Header->getBranchTerminator();
+    auto *LatchBranch = Latch->getBranchTerminator();
+    if (!BasicBlock::isCondBr(HeaderBranch) ||
+        !BasicBlock::isUncondBr(LatchBranch) ||
+        LatchBranch->getSuccessor(0) != Header ||
+        PreHeader->countEdgesToSucc(Header) != 1 ||
+        Header->countEdgesToSucc(Latch) != 1 ||
+        Header->countEdgesToSucc(Exit) != 1 ||
+        Latch->countEdgesToSucc(Header) != 1) {
+        return false;
+    }
+    bool ContinueOnTrue = HeaderBranch->getTrueSuccessor() == Latch;
+    if ((!ContinueOnTrue &&
+         HeaderBranch->getFalseSuccessor() != Latch) ||
+        (ContinueOnTrue &&
+         HeaderBranch->getFalseSuccessor() != Exit) ||
+        (!ContinueOnTrue &&
+         HeaderBranch->getTrueSuccessor() != Exit)) {
+        return false;
+    }
+    auto *Phi = dynamic_cast<PhiInst *>(Index);
+    Value *Start = Phi ? Phi->getIncomingFromPred(PreHeader) : nullptr;
+    Value *UpdateValue = Phi ? Phi->getIncomingFromPred(Latch) : nullptr;
+    auto *Update = dynamic_cast<BinaryInst *>(UpdateValue);
+    if (!Phi || Phi->getParent() != Header ||
+        Phi->getNumIncomingValues() != 2 || !Start || !Update ||
+        Update->getParent() != Latch || valueMayDependOnUndef(Start)) {
+        return false;
+    }
+    Value *UpdateL = nullptr;
+    Value *UpdateR = nullptr;
+    if (!Update->getOperands(UpdateL, UpdateR)) return false;
+    auto IsOne = [](Value *V) {
+        auto C = V ? V->getIntConstant() : std::nullopt;
+        return C && *C == 1;
+    };
+    bool DirectUpdate = false;
+    if (Step == 1 && Update->getOp() == BinaryInst::ADD) {
+        DirectUpdate =
+            (UpdateL == Phi && IsOne(UpdateR)) ||
+            (UpdateR == Phi && IsOne(UpdateL));
+    } else if (Step == -1 && Update->getOp() == BinaryInst::SUB) {
+        DirectUpdate = UpdateL == Phi && IsOne(UpdateR);
+    }
+    if (!DirectUpdate) return false;
+    auto *Compare = dynamic_cast<BinaryInst *>(HeaderBranch->getCondition());
+    Value *Left = nullptr;
+    Value *Right = nullptr;
+    if (!Compare || !Compare->getOperands(Left, Right)) return false;
+    BinaryInst::Operation Predicate = ContinueOnTrue
+        ? Compare->getOp()
+        : BinaryInst::negatePredicate(Compare->getOp());
+    if (Right == Phi) {
+        std::swap(Left, Right);
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (Left != Phi || !Right || Right == Phi ||
+        !IRType::hasIntegerBitWidth(Right->getIRType(), 32) ||
+        valueMayDependOnUndef(Right)) {
+        return false;
+    }
+    return (Step == 1 && Predicate == BinaryInst::L) ||
+           (Step == -1 && Predicate == BinaryInst::G);
+}
 //按照稳定循环和程序顺序收集通过结构、安全性与无回绕验证的GEP候选
 std::vector<LSRCandidate>
 LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResult &SE,
-                  const DominatorTree &DT) {
+                  const DominatorTree &DT, bool EnableCrossBase) {
     //1.建立确定的块次序，并按“循环深度降序、头部程序次序升序”扫描，使
     //内层地址族优先占用每循环的指针 IV 预算。
     std::unordered_map<BasicBlock *, size_t> BlockOrder;
@@ -281,7 +386,8 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
         BasicBlock *Latch = nullptr;
         if (!L || !L->getLoopSimplifyForm(PreHeader, Latch)) continue;
         auto Trip = SE.analyzeLoopTripCount(L);
-        if (!Trip || !Trip->Valid || !Trip->ProvenNoWrap) continue;
+        bool WholeLoopNoWrap =
+            Trip && Trip->Valid && Trip->ProvenNoWrap;
         BasicBlock *Header = L->getHeader();
         if (!PreHeader || !Header || !Latch) continue;
         std::vector<BasicBlock *> LoopBlocks = L->getBlocksIncludingSubLoops();
@@ -311,7 +417,8 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
                 bool AllowOffsetReuse = false;
                 if (!matchGEP(GEP, L, SE, Base, Index, Prefix, Suffix,
                               ActiveIndexStride, FinalPointeeStride,
-                              HasLeadingZero, AllowOffsetReuse)) {
+                              HasLeadingZero, AllowOffsetReuse,
+                              EnableCrossBase)) {
                     continue;
                 }
                 //2.2 活跃索引必须是当前循环的仿射递推，具有非零常量步长。
@@ -323,6 +430,14 @@ LoopStrengthReductionPass::collectCandidates(Function &F, LoopInfo &LI, SCEVResu
                 int64_t Step = *Affine->ConstantStep;
                 if (Step == 0 || Step < std::numeric_limits<int>::min() ||
                     Step > std::numeric_limits<int>::max()) {
+                    continue;
+                }
+                if (!WholeLoopNoWrap &&
+                    !EnableCrossBase) {
+                    continue;
+                }
+                if (!WholeLoopNoWrap &&
+                    !hasStrictGuardedUnitStepNoWrap(L, Index, Step)) {
                     continue;
                 }
                 int64_t AddressScale = ActiveIndexStride / FinalPointeeStride;
@@ -541,6 +656,141 @@ LoopStrengthReductionPass::buildExactGroups(std::vector<LSRCandidate> &Candidate
               });
     return Groups;
 }
+
+//构造同一i32单位归纳值驱动的两个RV64跨基址直接地址流。
+std::vector<CrossBaseLSRGroup>
+LoopStrengthReductionPass::buildCrossBaseGroups(
+    std::vector<LSRCandidate> &Candidates, const DominatorTree &DT) {
+    std::vector<CrossBaseLSRGroup> Groups;
+    if (TargetInfo::get().getArch() != TargetArch::RISCV64) return Groups;
+    std::unordered_map<std::string, size_t> GroupIndex;
+    for (LSRCandidate &C : Candidates) {
+        if (C.Used || !C.L || !C.L->isInnermost() || !C.PreHeader ||
+            !C.Header || !C.Latch || C.Step != 1 ||
+            !hasStrictGuardedUnitStepNoWrap(C.L, C.Index, C.Step) ||
+            C.LastIndexStride != 4 || !C.AllowOffsetReuse ||
+            !C.Prefix.empty() || !C.Suffix.empty() || !C.OldGEP ||
+            C.OldGEP->getParent() != C.Latch ||
+            C.OldGEP->getNumIndices() != 1 ||
+            C.OldGEP->getIndex(0) != C.Index ||
+            C.OldGEP->getBasePointer() != C.Base ||
+            !IRType::hasIntegerBitWidth(
+                C.Index ? C.Index->getIRType() : nullptr, 32) ||
+            valueMayDependOnUndef(C.Index) ||
+            valueMayDependOnUndef(C.Base) ||
+            !DT.dominates(C.OldGEP->getParent(), C.Latch)) {
+            continue;
+        }
+        auto Pointee = IRType::getPointeeType(C.OldGEP->getIRType());
+        if (!Pointee ||
+            TargetInfo::get().getDataLayout().getTypeStoreSize(Pointee) != 4) {
+            continue;
+        }
+        std::ostringstream Key;
+        Key << "L=" << IRKey::pointer(C.L)
+            << ";I=" << IRKey::pointer(C.Index)
+            << ";Step=" << C.Step
+            << ";Stride=" << C.LastIndexStride
+            << ";Ty=" << IRKey::type(C.OldGEP->getIRType());
+        auto It = GroupIndex.find(Key.str());
+        if (It == GroupIndex.end()) {
+            size_t Index = Groups.size();
+            GroupIndex.emplace(Key.str(), Index);
+            CrossBaseLSRGroup Group;
+            Group.Order = Index;
+            Group.L = C.L;
+            Group.PreHeader = C.PreHeader;
+            Group.Header = C.Header;
+            Group.Latch = C.Latch;
+            Group.Index = C.Index;
+            Group.Step = C.Step;
+            Group.ElementByteStride = C.LastIndexStride;
+            Groups.push_back(std::move(Group));
+            It = GroupIndex.find(Key.str());
+        }
+        Groups[It->second].Items.push_back(&C);
+    }
+    Groups.erase(
+        std::remove_if(
+            Groups.begin(), Groups.end(),
+            [&](const CrossBaseLSRGroup &Group) {
+                if (Group.Items.size() != CrossBaseStreamCount || !Group.L ||
+                    !Group.Index || !Group.Latch) {
+                    return true;
+                }
+                std::unordered_set<Value *> Bases;
+                std::unordered_set<GetElementPtrInst *> Members;
+                for (LSRCandidate *C : Group.Items) {
+                    if (!C || !Bases.insert(C->Base).second ||
+                        !Members.insert(C->OldGEP).second) {
+                        return true;
+                    }
+                }
+                auto *IndexPhi = dynamic_cast<PhiInst *>(Group.Index);
+                auto *Compare = Group.Header
+                    ? dynamic_cast<BinaryInst *>(
+                          Group.Header->getBranchTerminator()
+                              ? Group.Header->getBranchTerminator()
+                                    ->getCondition()
+                              : nullptr)
+                    : nullptr;
+                Value *Update = IndexPhi
+                    ? IndexPhi->getIncomingFromPred(Group.Latch)
+                    : nullptr;
+                if (!IndexPhi || !Compare || !Update) return true;
+                //下标除退出比较、直接更新和这两个GEP外不得再有用户；否则
+                //显式缩放用户仍可能迫使后端保留旧slli，目标成本将不再成立。
+                for (Use *U : Group.Index->getUses()) {
+                    auto *UserI = U
+                        ? dynamic_cast<Instruction *>(U->getUser())
+                        : nullptr;
+                    auto *UserGEP = dynamic_cast<GetElementPtrInst *>(UserI);
+                    if (!UserI ||
+                        (UserI != Compare && UserI != Update &&
+                         (!UserGEP || !Members.count(UserGEP)))) {
+                        return true;
+                    }
+                }
+                //同一原始下标若还有第三条直接缩放GEP，后端仍需保留共享slli，
+                //此时两流改写不再有每轮净收益，因此整组必须拒绝。
+                for (BasicBlock *BB : Group.L->getBlocksIncludingSubLoops()) {
+                    if (!BB) return true;
+                    for (Instruction *I : *BB) {
+                        if (dynamic_cast<CallInst *>(I)) return true;
+                        auto *GEP = dynamic_cast<GetElementPtrInst *>(I);
+                        if (!GEP) continue;
+                        Value *Base = nullptr;
+                        std::vector<Value *> Indices;
+                        std::vector<int64_t> Strides;
+                        int64_t FinalStride = 0;
+                        if (!GEP->getBaseAndIndices(Base, Indices) ||
+                            !GetElementPtrInst::getIndexStrides(
+                                Base, Indices, Strides, FinalStride) ||
+                            Indices.size() != Strides.size()) {
+                            continue;
+                        }
+                        for (size_t I = 0; I < Indices.size(); ++I) {
+                            if (Indices[I] == Group.Index &&
+                                Strides[I] == Group.ElementByteStride &&
+                                !Members.count(GEP)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }),
+        Groups.end());
+    std::sort(
+        Groups.begin(), Groups.end(),
+        [](const CrossBaseLSRGroup &A, const CrossBaseLSRGroup &B) {
+            unsigned AD = A.L ? A.L->getDepth() : 0;
+            unsigned BD = B.L ? B.L->getDepth() : 0;
+            if (AD != BD) return AD > BD;
+            return A.Order < B.Order;
+        });
+    return Groups;
+}
 //步骤 3.4 的死链范围只包含无副作用的整数、地址、选择和转换指令。
 bool LoopStrengthReductionPass::isRemovableIndexInst(Instruction *I) {
     if (!I || !I->getParent()) return false;
@@ -736,6 +986,24 @@ LSRCostEstimate LoopStrengthReductionPass::estimateOffsetGroupCost(
     Cost.Valid = true;
     return Cost;
 }
+
+//RV64对两个相同i32下标的4字节地址流会共享一条slli：旧循环为
+//slli+两条base-add，新循环为两条pointer-addi；预头初始化仍需三条。
+LSRCostEstimate LoopStrengthReductionPass::estimateCrossBaseGroupCost(
+    const CrossBaseLSRGroup &Group) {
+    LSRCostEstimate Cost;
+    if (TargetInfo::get().getArch() != TargetArch::RISCV64 ||
+        Group.Items.size() != CrossBaseStreamCount || !Group.L ||
+        !Group.L->isInnermost() || Group.Step != 1 ||
+        Group.ElementByteStride != 4) {
+        return Cost;
+    }
+    Cost.OldLoopCost = CrossBaseStreamCount + 1;
+    Cost.NewLoopCost = CrossBaseStreamCount;
+    Cost.NewSetupCost = CrossBaseStreamCount + 1;
+    Cost.Valid = true;
+    return Cost;
+}
 //步骤 3.7：必须先有严格的每轮节省，再用迭代次数偿还设置成本。常量迭代
 //次数用除法比较避免乘法溢出；未知次数只接受已证明至少执行一次的循环。
 bool LoopStrengthReductionPass::isCostModelProfitable(
@@ -798,6 +1066,25 @@ bool LoopStrengthReductionPass::shouldRewriteOffsetGroup(const OffsetReuseGroup 
     LSRCostEstimate Cost = estimateOffsetGroupCost(Group, DT);
     return isCostModelProfitable(Cost, Group.L, SE);
 }
+
+//RV64未知次数内层循环只把四次迭代作为静态成本窗口：它恰好超过两流
+//pointer-IV的三条设置成本，不是对输入行长度或非零次数的语义假设。
+bool LoopStrengthReductionPass::shouldRewriteCrossBaseGroup(
+    const CrossBaseLSRGroup &Group, SCEVResult &SE) {
+    LSRCostEstimate Cost = estimateCrossBaseGroupCost(Group);
+    if (!Cost.Valid || !Group.L || Group.L->getDepth() < 2 ||
+        Cost.OldLoopCost <= Cost.NewLoopCost) {
+        return false;
+    }
+    int64_t Saving = Cost.OldLoopCost - Cost.NewLoopCost;
+    auto Trip = SE.analyzeLoopTripCount(Group.L);
+    if (Trip && Trip->Valid && Trip->ConstantTripCount) {
+        int64_t Iterations = *Trip->ConstantTripCount;
+        return Iterations > 0 &&
+               Iterations > Cost.NewSetupCost / Saving;
+    }
+    return RiscvUnknownTripEstimate > Cost.NewSetupCost / Saving;
+}
 //步骤 4.2：构造规范指针递推三元组。Start GEP 位于预头，Phi 置于头部 PHI
 //序列，Next GEP 位于 latch 终结符前，两条 incoming 精确对应预头与回边。
 PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
@@ -805,10 +1092,11 @@ PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
                                  int64_t Step,
                                  const std::shared_ptr<IRType> &ResultTy,
                                  BasicBlock *PreHeader, BasicBlock *Header,
-                                 BasicBlock *Latch) {
+                                 BasicBlock *Latch, bool InBounds) {
     PointerIV Result;
     std::vector<Value *> Indices = StartIndices;
     Result.Start = new GetElementPtrInst(Base, Indices);
+    Result.Start->setInBounds(InBounds);
     Result.Start->updateType();
     PreHeader->insertBeforeTerminator(Result.Start);
     Result.Phi = new PhiInst(ResultTy);
@@ -817,6 +1105,7 @@ PointerIV LoopStrengthReductionPass::createPointerIV(Value *Base,
     NextIndices.push_back(
         ConstInt::newConstInt(static_cast<int>(Step)));
     Result.Next = new GetElementPtrInst(Result.Phi, NextIndices);
+    Result.Next->setInBounds(InBounds);
     Result.Next->updateType();
     Latch->insertBeforeTerminator(Result.Next);
     Result.Phi->addIncoming(Result.Start, PreHeader);
@@ -946,6 +1235,57 @@ bool LoopStrengthReductionPass::rewriteOffsetGroup(OffsetReuseGroup &Group,
     }
     return true;
 }
+
+//原子改写两个跨基址地址流；预检阶段只复用已经支配预头的动态起点，不在
+//第一条流提交后再尝试可能失败的SCEV物化。
+bool LoopStrengthReductionPass::rewriteCrossBaseGroup(
+    CrossBaseLSRGroup &Group, const DominatorTree &DT,
+    std::vector<Instruction *> &DeadSeeds) {
+    if (Group.Items.size() != CrossBaseStreamCount || !Group.L ||
+        !Group.PreHeader || !Group.Header || !Group.Latch ||
+        !Group.Index) {
+        return false;
+    }
+    auto *IndexPhi = dynamic_cast<PhiInst *>(Group.Index);
+    Value *Start = IndexPhi
+        ? IndexPhi->getIncomingFromPred(Group.PreHeader)
+        : nullptr;
+    if (!IndexPhi || IndexPhi->getParent() != Group.Header || !Start ||
+        valueMayDependOnUndef(Start) ||
+        !canUseInPreheader(Start, Group.PreHeader, DT)) {
+        return false;
+    }
+    std::unordered_set<Value *> Bases;
+    for (LSRCandidate *C : Group.Items) {
+        if (!C || C->Used || !C->OldGEP ||
+            C->OldGEP->getParent() != Group.Latch ||
+            C->OldGEP->getBasePointer() != C->Base ||
+            C->OldGEP->getNumIndices() != 1 ||
+            C->OldGEP->getIndex(0) != Group.Index ||
+            !C->OldGEP->getIRType() ||
+            !Bases.insert(C->Base).second) {
+            return false;
+        }
+    }
+    std::vector<PointerIV> PointerIVs;
+    PointerIVs.reserve(Group.Items.size());
+    for (LSRCandidate *C : Group.Items) {
+        std::vector<Value *> StartIndices{Start};
+        PointerIVs.push_back(createPointerIV(
+            C->Base, StartIndices, C->Step, C->OldGEP->getIRType(),
+            Group.PreHeader, Group.Header, Group.Latch, false));
+    }
+    //所有类型、边和插入点均已验证，以下提交不再含失败分支，避免只改一条流。
+    for (size_t I = 0; I < Group.Items.size(); ++I) {
+        LSRCandidate *C = Group.Items[I];
+        if (auto *IndexI = dynamic_cast<Instruction *>(C->Index))
+            DeadSeeds.push_back(IndexI);
+        C->OldGEP->replaceAllUsesWith(PointerIVs[I].Phi);
+        delete C->OldGEP;
+        C->Used = true;
+    }
+    return true;
+}
 //内层循环动态收益更高，允许的指针 IV 数量也更大；预算限制寄存器压力和
 //单次 pass 的代码增长。
 int LoopStrengthReductionPass::pointerIVLimit(const Loop *L) {
@@ -955,14 +1295,31 @@ int LoopStrengthReductionPass::pointerIVLimit(const Loop *L) {
 //地址 LSR 主流程按“发现—偏移共享组—完全同形组—死链清理”提交；先处理
 //偏移组可让多个起点优先共享一个 IV，Used 标志防止候选被二次改写。
 bool LoopStrengthReductionPass::runAddressLSR(Function &F, LoopInfo &LI, SCEVResult &SE,
-                       DominatorTree &DT) {
+                       DominatorTree &DT, bool EnableCrossBase) {
     //1—2.发现候选并完成结构、SCEV、支配和无回绕验证。
     std::vector<LSRCandidate> Candidates =
-        collectCandidates(F, LI, SE, DT);
+        collectCandidates(F, LI, SE, DT, EnableCrossBase);
     if (Candidates.empty()) return false;
     std::unordered_map<Loop *, int> LoopPointerIVs;
     std::vector<Instruction *> DeadSeeds;
     bool Changed = false;
+    //3—4.先按RV64真实地址成本处理两个跨基址流；两条指针IV必须一次性预算和
+    //提交，防止只改一条后仍保留共享缩放而形成负优化。
+    if (EnableCrossBase) {
+        std::vector<CrossBaseLSRGroup> CrossBaseGroups =
+            buildCrossBaseGroups(Candidates, DT);
+        for (CrossBaseLSRGroup &Group : CrossBaseGroups) {
+            if (!shouldRewriteCrossBaseGroup(Group, SE)) continue;
+            //首版每个内层循环最多接纳一个两流原子组，避免多个归纳轴同时
+            //延长八条指针活跃区间而让尚未建模的寄存器压力吞掉地址收益。
+            if (LoopPointerIVs[Group.L] != 0) continue;
+            if (!rewriteCrossBaseGroup(Group, DT, DeadSeeds)) continue;
+            LoopPointerIVs[Group.L] += CrossBaseStreamCount;
+            Changed = true;
+        }
+        cleanupDeadIndexChains(DeadSeeds);
+        return Changed;
+    }
     //3—4.优先选择有收益的常量偏移共享组，并执行每循环 IV 数量预算。
     std::vector<OffsetReuseGroup> OffsetGroups =
         buildOffsetReuseGroups(Candidates);
@@ -993,7 +1350,7 @@ PreservationStatus LoopStrengthReductionPass::run(
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     //1—5.执行完整地址强度削弱流程。
-    bool Changed = runAddressLSR(F, LI, SE, DT);
+    bool Changed = runAddressLSR(F, LI, SE, DT, EnableCrossBase);
     if (!Changed) return PreservationStatus::all();
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();

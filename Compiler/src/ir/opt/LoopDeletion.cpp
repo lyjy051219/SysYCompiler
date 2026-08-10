@@ -4,6 +4,8 @@
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/IRUtils.hpp"
+#include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -94,6 +96,215 @@ bool LoopDeletionPass::isProvablyFiniteStrictUnitStepLoop(
     if (LHS != IV->Phi || !IsI32(RHS)) return false;
     return (*IV->ConstantStep == 1 && Pred == BinaryInst::L) ||
            (*IV->ConstantStep == -1 && Pred == BinaryInst::G);
+}
+//识别由前置guard保护的单块旋转单位步长有限循环。
+std::optional<LoopTripCountInfo>
+LoopDeletionPass::matchProvablyFiniteRotatedUnitStepLoop(
+    Loop *L, BasicBlock *PreHeader, BasicBlock *Latch,
+    SCEVResult &SE) {
+    //1.3 只接纳单块、单回边、专用出口的旋转循环；复杂CFG仍交给完整SCEV。
+    if (!L || !PreHeader || !Latch || L->getHeader() != Latch ||
+        !L->getSubLoops().empty() ||
+        L->getBlocksIncludingSubLoops().size() != 1) {
+        return std::nullopt;
+    }
+    BasicBlock *Header = L->getHeader();
+    auto ExitBlocks = L->getExitBlocks();
+    if (!Header || ExitBlocks.size() != 1 || !ExitBlocks.front())
+        return std::nullopt;
+    BasicBlock *Exit = ExitBlocks.front();
+    auto *LoopBranch = Header->getBranchTerminator();
+    if (!BasicBlock::isCondBr(LoopBranch) ||
+        Header->countEdgesToSucc(Header) != 1 ||
+        Header->countEdgesToSucc(Exit) != 1) {
+        return std::nullopt;
+    }
+    const bool ContinueOnTrue =
+        LoopBranch->getTrueSuccessor() == Header;
+    if ((!ContinueOnTrue &&
+         LoopBranch->getFalseSuccessor() != Header) ||
+        (ContinueOnTrue &&
+         LoopBranch->getFalseSuccessor() != Exit) ||
+        (!ContinueOnTrue &&
+         LoopBranch->getTrueSuccessor() != Exit)) {
+        return std::nullopt;
+    }
+    auto *LoopCmp = dynamic_cast<BinaryInst *>(
+        LoopBranch->getCondition());
+    auto HeaderPhis = Header->collectPhiNodes();
+    if (!LoopCmp || HeaderPhis.size() != 1 ||
+        !IRType::hasIntegerBitWidth(
+            HeaderPhis.front()->getIRType(), 32)) {
+        return std::nullopt;
+    }
+    //完整trip-count分析正因派生比较而失败，不能再通过依赖trip-count的
+    //getCanonicalInduction取值；直接从唯一Header PHI及其仿射SCEV取证。
+    PhiInst *InductionPhi = HeaderPhis.front();
+    Value *StartValue =
+        InductionPhi->getIncomingFromPred(PreHeader);
+    Value *UpdateValue =
+        InductionPhi->getIncomingFromPred(Latch);
+    auto Affine = SE.getAffine(InductionPhi);
+    auto StartConstant =
+        StartValue ? StartValue->getIntConstant() : std::nullopt;
+    if (!StartValue || !UpdateValue || !Affine ||
+        Affine->RecLoop != L || !Affine->ConstantStart ||
+        !Affine->ConstantStep || !StartConstant ||
+        *StartConstant != *Affine->ConstantStart) {
+        return std::nullopt;
+    }
+    const int64_t Step = *Affine->ConstantStep;
+    if (Step != 1 && Step != -1) return std::nullopt;
+    auto *Update = dynamic_cast<BinaryInst *>(
+        UpdateValue);
+    const auto IsOne = [](Value *V) {
+        auto C = V ? V->getIntConstant() : std::nullopt;
+        return C && *C == 1;
+    };
+    bool DirectStep = false;
+    if (Step == 1 && Update && Update->getOp() == BinaryInst::ADD) {
+        DirectStep =
+            (Update->getOperand(0) == InductionPhi &&
+             IsOne(Update->getOperand(1))) ||
+            (Update->getOperand(1) == InductionPhi &&
+             IsOne(Update->getOperand(0)));
+    } else if (Step == -1 && Update &&
+               Update->getOp() == BinaryInst::SUB) {
+        DirectStep =
+            Update->getOperand(0) == InductionPhi &&
+            IsOne(Update->getOperand(1));
+    }
+    if (!DirectStep) return std::nullopt;
+    //1.4 比较值只允许“PHI加一个常量偏移”。偏移朝前覆盖本轮更新，
+    //配合严格谓词可保证探针和值递推都在到达边界前不回绕。
+    const auto MatchPhiOffset =
+        [](Value *V, PhiInst *Phi) -> std::optional<int64_t> {
+            if (V == Phi) return 0;
+            auto *BI = dynamic_cast<BinaryInst *>(V);
+            if (!BI) return std::nullopt;
+            Value *A = BI->getOperand(0);
+            Value *B = BI->getOperand(1);
+            auto CA = A ? A->getIntConstant() : std::nullopt;
+            auto CB = B ? B->getIntConstant() : std::nullopt;
+            if (BI->getOp() == BinaryInst::ADD) {
+                if (A == Phi && CB) return static_cast<int64_t>(*CB);
+                if (B == Phi && CA) return static_cast<int64_t>(*CA);
+            }
+            if (BI->getOp() == BinaryInst::SUB && A == Phi && CB) {
+                const __int128 Negated =
+                    -static_cast<__int128>(*CB);
+                if (Negated < std::numeric_limits<int64_t>::min() ||
+                    Negated > std::numeric_limits<int64_t>::max()) {
+                    return std::nullopt;
+                }
+                return static_cast<int64_t>(Negated);
+            }
+            return std::nullopt;
+        };
+    Value *LoopLeft = nullptr;
+    Value *LoopRight = nullptr;
+    if (!LoopCmp->getOperands(LoopLeft, LoopRight) ||
+        !LoopLeft || !LoopRight) {
+        return std::nullopt;
+    }
+    BinaryInst::Operation Predicate = ContinueOnTrue
+        ? LoopCmp->getOp()
+        : BinaryInst::negatePredicate(LoopCmp->getOp());
+    auto Offset = MatchPhiOffset(LoopLeft, InductionPhi);
+    Value *Bound = LoopRight;
+    if (!Offset) {
+        Offset = MatchPhiOffset(LoopRight, InductionPhi);
+        Bound = LoopLeft;
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (!Offset || !Bound ||
+        !IRType::hasIntegerBitWidth(Bound->getIRType(), 32) ||
+        !LoopInfo::isLoopInvariant(Bound, L) ||
+        valueMayDependOnUndef(Bound) ||
+        (Step == 1 &&
+         (Predicate != BinaryInst::L || *Offset < 1)) ||
+        (Step == -1 &&
+         (Predicate != BinaryInst::G || *Offset > -1))) {
+        return std::nullopt;
+    }
+    //1.5 guard必须是preheader的唯一前驱，并用同一边界、同一严格方向
+    //判断Start+Offset-Step；这是旋转前原循环的精确首轮进入条件。
+    auto Predecessors = PreHeader->getPredecessors();
+    auto *PreHeaderBranch = PreHeader->getBranchTerminator();
+    if (Predecessors.size() != 1 || !Predecessors.front() ||
+        !BasicBlock::isUncondBr(PreHeaderBranch) ||
+        PreHeaderBranch->getSuccessor(0) != Header) {
+        return std::nullopt;
+    }
+    BasicBlock *GuardBlock = Predecessors.front();
+    auto *GuardBranch = GuardBlock->getBranchTerminator();
+    if (!BasicBlock::isCondBr(GuardBranch) ||
+        GuardBlock->countEdgesToSucc(PreHeader) != 1) {
+        return std::nullopt;
+    }
+    const bool EnterOnTrue =
+        GuardBranch->getTrueSuccessor() == PreHeader;
+    if ((!EnterOnTrue &&
+         GuardBranch->getFalseSuccessor() != PreHeader) ||
+        GuardBranch->getTrueSuccessor() ==
+            GuardBranch->getFalseSuccessor()) {
+        return std::nullopt;
+    }
+    auto *GuardCmp = dynamic_cast<BinaryInst *>(
+        GuardBranch->getCondition());
+    Value *GuardLeft = nullptr;
+    Value *GuardRight = nullptr;
+    if (!GuardCmp ||
+        !GuardCmp->getOperands(GuardLeft, GuardRight) ||
+        !GuardLeft || !GuardRight) {
+        return std::nullopt;
+    }
+    BinaryInst::Operation GuardPredicate = EnterOnTrue
+        ? GuardCmp->getOp()
+        : BinaryInst::negatePredicate(GuardCmp->getOp());
+    Value *GuardCompared = GuardLeft;
+    Value *GuardBound = GuardRight;
+    if (GuardBound != Bound && GuardLeft == Bound) {
+        GuardCompared = GuardRight;
+        GuardBound = GuardLeft;
+        GuardPredicate =
+            BinaryInst::reversePredicate(GuardPredicate);
+    }
+    auto GuardConstant =
+        GuardCompared ? GuardCompared->getIntConstant() : std::nullopt;
+    const __int128 Start = *Affine->ConstantStart;
+    const __int128 WideStep = Step;
+    const __int128 WideOffset = *Offset;
+    const __int128 ExpectedGuard = Start + WideOffset - WideStep;
+    const auto FitsI32 = [](__int128 V) {
+        return V >= std::numeric_limits<int32_t>::min() &&
+               V <= std::numeric_limits<int32_t>::max();
+    };
+    if (GuardBound != Bound || GuardPredicate != Predicate ||
+        !GuardConstant ||
+        static_cast<__int128>(*GuardConstant) != ExpectedGuard ||
+        !FitsI32(Start) || !FitsI32(Start + WideStep) ||
+        !FitsI32(Start + WideOffset) || !FitsI32(ExpectedGuard)) {
+        return std::nullopt;
+    }
+    LoopTripCountInfo Info;
+    Info.L = L;
+    Info.PreHeader = PreHeader;
+    Info.Header = Header;
+    Info.Latch = Latch;
+    Info.ExitingBlock = Header;
+    Info.ExitBlock = Exit;
+    Info.ExitCmp = LoopCmp;
+    Info.ContinueOnTrue = ContinueOnTrue;
+    Info.IndVar = InductionPhi;
+    Info.Start = SE.getSCEV(StartValue);
+    Info.Step = Affine->Step;
+    Info.Bound = SE.getSCEV(Bound);
+    Info.IsRuntime = true;
+    Info.MayBeZeroTrip = false;
+    Info.ProvenNoWrap = true;
+    Info.Valid = true;
+    return Info;
 }
 //沿循环头PHI的预头入值递归解析零次路径上的替代值。
 Value *LoopDeletionPass::resolveZeroTripValue(
@@ -249,9 +460,14 @@ PreservationStatus LoopDeletionPass::run(
             continue;
         }
         auto TCI = SE.analyzeLoopTripCount(L);
+        bool FiniteRotatedFallback = false;
         if (!TCI || !TCI->Valid || !TCI->ExitBlock) {
-            continue;
+            TCI = matchProvablyFiniteRotatedUnitStepLoop(
+                L, PreHeader, Latch, SE);
+            FiniteRotatedFallback =
+                TCI && TCI->Valid && TCI->ExitBlock;
         }
+        if (!TCI || !TCI->Valid || !TCI->ExitBlock) continue;
         //1.2 候选必须已证明有限：常量次数要求无回绕，运行期次数要求严格单位步长；
         //零次循环还要求退出测试位于 header，确保 body 从未执行。
         bool ZeroTrip = TCI->ConstantTripCount &&
@@ -259,8 +475,10 @@ PreservationStatus LoopDeletionPass::run(
         bool FiniteConstant = TCI->ConstantTripCount &&
                               *TCI->ConstantTripCount >= 0 &&
                               (ZeroTrip || TCI->ProvenNoWrap);
-        bool FiniteRuntime = !TCI->ConstantTripCount &&
-                             isProvablyFiniteStrictUnitStepLoop(SE, *TCI);
+        bool FiniteRuntime =
+            FiniteRotatedFallback ||
+            (!TCI->ConstantTripCount &&
+             isProvablyFiniteStrictUnitStepLoop(SE, *TCI));
         if ((!FiniteConstant && !FiniteRuntime) ||
             (ZeroTrip && TCI->ExitingBlock != TCI->Header)) {
             continue;

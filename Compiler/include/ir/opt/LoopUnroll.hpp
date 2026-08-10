@@ -15,6 +15,9 @@
 #include <utility>
 #include <vector>
 
+//PostDominatorTree证明条件写之后必然进入只读归约阶段
+class PostDominatorTree;
+
 //UnrollKind表示循环展开决策选用的具体变换方式
 enum class UnrollKind {
     //None表示保留原循环而不执行展开
@@ -81,6 +84,10 @@ struct UnrollConfig {
     int MaxGuardedPeelCount = 1;
     //PeelThreshold限制peeling产生的静态代码成本
     int PeelThreshold = 64;
+    //PhaseReusePeelThreshold限制“首阶段结果复用”允许克隆的最大静态成本
+    int PhaseReusePeelThreshold = 192;
+    //PhaseReuseMinNetBenefit要求删除重复计算后至少留下的动态净收益
+    int PhaseReuseMinNetBenefit = 8;
     //MaxPeelBlocks限制peeling允许克隆的循环基本块数量
     int MaxPeelBlocks = 24;
     //PeelStoreCost估算每次可删除冗余store带来的动态收益
@@ -99,6 +106,47 @@ struct UnrollConfig {
     int ReductionMinChainBenefit = 1;
 };
 
+//LoopPhaseResultReusePlan记录剥离首轮后可复用的稳定子循环结果
+struct LoopPhaseResultReusePlan {
+    //Follower指向在状态耗尽阶段之后执行的只读子循环
+    Loop *Follower = nullptr;
+    //FollowerPreHeader、FollowerHeader、FollowerContinue和FollowerExit保存精确CFG边
+    BasicBlock *FollowerPreHeader = nullptr;
+    BasicBlock *FollowerHeader = nullptr;
+    BasicBlock *FollowerContinue = nullptr;
+    BasicBlock *FollowerExit = nullptr;
+    //ResultPhis保存子循环传出且仅在残余外层中使用的LCSSA结果
+    std::vector<PhiInst *> ResultPhis;
+    //AllExitPhis保存运行时快路径新增出口边时必须逐项补齐的全部PHI
+    std::vector<PhiInst *> AllExitPhis;
+    //GuardBound和SafeUpperBound记录从对象布局统一推导的运行时访问边界
+    Value *GuardBound = nullptr;
+    std::int64_t SafeUpperBound = 0;
+    //NeedsRuntimeGuard标记边界不是已知安全常量，必须保留原Follower慢路径
+    bool NeedsRuntimeGuard = false;
+    //ConstantTripCount仅用于通用成本模型，不参与语义特判
+    std::int64_t ConstantTripCount = 0;
+};
+
+//CarriedStateExhaustionPlan记录一次可由首轮耗尽的循环携带状态
+struct CarriedStateExhaustionPlan {
+    //Inner指向消费并饱和外层状态的直接子循环
+    Loop *Inner = nullptr;
+    //InnerHeader、InnerContinue和InnerExit保存残余子循环的精确CFG边
+    BasicBlock *InnerHeader = nullptr;
+    BasicBlock *InnerContinue = nullptr;
+    BasicBlock *InnerExit = nullptr;
+    //InnerIV和OuterState分别承载子循环状态与外层循环携带状态
+    PhiInst *InnerIV = nullptr;
+    PhiInst *OuterState = nullptr;
+    //OuterInitial保存首轮进入耗尽循环时已经证明非负的携带状态
+    Value *OuterInitial = nullptr;
+    //Bound记录严格单位步长循环使用的外层不变边界
+    Value *Bound = nullptr;
+    //ResultReuse可选记录状态耗尽后能以首轮真实结果替代的只读阶段
+    std::optional<LoopPhaseResultReusePlan> ResultReuse;
+};
+
 //UnrollDecision保存成本模型为单个循环选择的展开方式和执行参数
 struct UnrollDecision {
     //Kind记录最终选中的循环展开方式
@@ -115,6 +163,8 @@ struct UnrollDecision {
     bool IsPeeling = false;
     //TripCountIsProven标记运行时次数的固定位宽计算是否已证明无回绕
     bool TripCountIsProven = false;
+    //StateExhaustion记录剥离首轮后可在残余阶段直接跳过的幂等子循环
+    std::optional<CarriedStateExhaustionPlan> StateExhaustion;
 };
 
 //IntegerReductionPlan记录已决定展开循环中的一个整数结合律归约
@@ -181,6 +231,43 @@ struct LoopExecutionShape {
     BasicBlock *Exiting = nullptr;
     //Exit指向循环唯一出口块
     BasicBlock *Exit = nullptr;
+};
+
+//InvariantStoreReductionPhasePlan保存“首轮稳定内存、后续仅递推”变换的完整证明结果
+struct InvariantStoreReductionPhasePlan {
+    //Outer和Follower分别指向待拆分的外层循环及其中的只读归约循环
+    Loop *Outer = nullptr;
+    Loop *Follower = nullptr;
+    //OuterShape和FollowerShape冻结提交前已经核验的规范CFG节点
+    LoopExecutionShape OuterShape;
+    LoopExecutionShape FollowerShape;
+    //OuterAccumulator和OuterInduction分别承载跨外层迭代的结果与控制状态
+    PhiInst *OuterAccumulator = nullptr;
+    PhiInst *OuterInduction = nullptr;
+    //FollowerAccumulator和FollowerInduction记录只读阶段的加法归约与控制PHI
+    PhiInst *FollowerAccumulator = nullptr;
+    PhiInst *FollowerInduction = nullptr;
+    //OuterInitial和InductionInitial保存原首轮使用的两个循环入口值
+    Value *OuterInitial = nullptr;
+    Value *InductionInitial = nullptr;
+    //FollowerRaw保存首轮取模前的真实归约结果
+    Value *FollowerRaw = nullptr;
+    //FollowerUpdate记录一次稳定贡献的加法，Normalizer记录逐轮保留的signed srem
+    BinaryInst *FollowerUpdate = nullptr;
+    BinaryInst *Normalizer = nullptr;
+    //InductionUpdate和ExitCompare用于逐字克隆残余循环的原控制递推
+    BinaryInst *InductionUpdate = nullptr;
+    BinaryInst *ExitCompare = nullptr;
+    //MemoryRoot记录条件写和归约读共同使用且已完整初始化的唯一对象
+    Value *MemoryRoot = nullptr;
+    //PhaseBlocks和PhaseStores记录首轮后不再回到的幂等写阶段
+    std::vector<BasicBlock *> PhaseBlocks;
+    std::vector<StoreInst *> PhaseStores;
+    //FollowerLoads记录已在真实程序点证明在界且首轮后稳定的全部读取
+    std::vector<LoadInst *> FollowerLoads;
+    //FollowerTripCount和EstimatedPerIterationBenefit仅供通用成本模型使用
+    std::int64_t FollowerTripCount = 0;
+    std::int64_t EstimatedPerIterationBenefit = 0;
 };
 
 //UnrolledBodyCore持有原循环与全部展开副本的CFG节点和值映射
@@ -345,7 +432,8 @@ public:
                                     SCEVResult &SE,
                                     LoopInfo &LI,
                                     DominatorTree &DT,
-                                    BasicAAResult &AA);
+                                    BasicAAResult &AA,
+                                    RangeInfo &RI);
 
 private:
     //Config保存当前Pass的循环展开策略和成本阈值
@@ -356,13 +444,52 @@ private:
     //递归判断值的透明计算链中是否包含undef
     static bool containsUndef(
         Value *V, std::unordered_set<Value *> &Active, int Depth = 0);
+    //递归判断值链是否包含undef，并在已经独立证明的循环状态处停止
+    static bool containsUndefOutsideRoots(
+        Value *V, const std::unordered_set<Value *> &ProvenRoots,
+        std::unordered_set<Value *> &Active, int Depth = 0);
     //递归判断值是否由循环外纯计算链构成
     static bool isStructurallyLoopInvariant(
         Value *V, Loop *L, std::unordered_set<Value *> &Active);
+    //穿过单入边PHI取得阶段边界上的真实数据值
+    static Value *stripSingleIncomingPhis(Value *V);
+    //递归判断值的数据依赖闭包是否到达指定循环状态
+    static bool valueDependsOn(
+        Value *V, Value *Needle, std::unordered_set<Value *> &Active,
+        unsigned Depth = 0);
+    //判断局部对象是否由支配候选循环的整对象非volatile memset完整初始化
+    static bool hasDominatingWholeObjectMemset(
+        AllocaInst *Object, Loop *L, const DominatorTree &DT);
+    //识别首轮条件写和只读加法归约可折叠成精确残余递推的外层循环
+    static std::optional<InvariantStoreReductionPhasePlan>
+    matchInvariantStoreReductionPhase(
+        Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+        RangeInfo &RI, const DominatorTree &DT,
+        const PostDominatorTree &PDT,
+        const UnrollConfig &Config);
+    //复用原首轮并把旧回边改接到只含标量递推的新残余循环
+    static bool applyInvariantStoreReductionPhase(
+        Function &F, const InvariantStoreReductionPhasePlan &Plan);
     //收集peeling后可由DCE删除的循环不变冗余store
     static std::vector<StoreInst *> collectPeelRedundantStoreCandidates(
         Loop *L, LoopInfo &LI, BasicAAResult &AA,
         const DominatorTree &DT);
+    //识别指定子循环对外层携带状态形成的幂等耗尽传递
+    static std::optional<CarriedStateExhaustionPlan>
+    matchExhaustingInnerLoop(
+        Loop *Outer, Loop *Inner, SCEVResult &SE, RangeInfo &RI,
+        const DominatorTree &DT);
+    //证明状态耗尽后的兄弟子循环每轮产生同一个只读结果
+    static std::optional<LoopPhaseResultReusePlan>
+    matchReusableFollowerLoop(
+        Loop *Outer, const CarriedStateExhaustionPlan &Exhaustion,
+        Loop *Follower, LoopInfo &LI, SCEVResult &SE,
+        BasicAAResult &AA, RangeInfo &RI, const DominatorTree &DT);
+    //识别严格单位步长子循环对外层携带状态形成的幂等耗尽传递
+    static std::optional<CarriedStateExhaustionPlan>
+    matchCarriedStateExhaustion(
+        Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+        RangeInfo &RI, const DominatorTree &DT);
     //证明运行时迭代次数在preheader处可用且固定位宽计算不回绕
     static bool proveRuntimeTripCountAtPreheader(
         SCEVResult &SE, const LoopTripCountInfo &TCI, RangeInfo &RI,

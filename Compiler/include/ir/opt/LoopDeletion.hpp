@@ -2,6 +2,7 @@
 
 #include "ir/opt/NewPassManager.hpp"
 
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -32,6 +33,11 @@ private:
 	//证明运行期trip count对应严格比较的无回绕i32单位步长有限循环。
 	static bool isProvablyFiniteStrictUnitStepLoop(
 		SCEVResult &SE, const LoopTripCountInfo &TCI);
+	//识别由前置guard保护的单块旋转单位步长有限循环。
+	static std::optional<LoopTripCountInfo>
+	matchProvablyFiniteRotatedUnitStepLoop(
+		Loop *L, BasicBlock *PreHeader, BasicBlock *Latch,
+		SCEVResult &SE);
 	//沿循环头PHI的预头入值递归解析零次迭代路径上的替代值。
 	static Value *resolveZeroTripValue(
 		Value *V, Loop *L, BasicBlock *PreHeader,

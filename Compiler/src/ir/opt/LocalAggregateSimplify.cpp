@@ -6,6 +6,8 @@
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
+#include "ir/opt/GepCombine.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
@@ -219,6 +221,83 @@ bool LocalAggregateSimplifyPass::evaluateSynthExpression(
         return false;
     Result = static_cast<int32_t>(Wide);
     return true;
+}
+//线性扫描完整定义域并识别索引、常量和一次加减表
+std::shared_ptr<LocalAggregateSynthExpression>
+LocalAggregateSimplifyPass::synthesizeFastInt32TableExpression(
+    const std::vector<int32_t> &Values) {
+    if (Values.empty() ||
+        Values.size() > static_cast<size_t>(MaxFastSynthArrayElements)) {
+        return nullptr;
+    }
+    auto MakeIndex = []() {
+        auto Result =
+            std::make_shared<LocalAggregateSynthExpression>();
+        Result->Kind = LocalAggregateSynthExpressionKind::Index;
+        Result->Cost = 0;
+        return Result;
+    };
+    auto MakeConstant = [](int32_t Value) {
+        auto Result =
+            std::make_shared<LocalAggregateSynthExpression>();
+        Result->Kind = LocalAggregateSynthExpressionKind::Constant;
+        Result->Constant = Value;
+        Result->Cost = 0;
+        return Result;
+    };
+    auto MakeBinary = [](
+        BinaryInst::Operation Op,
+        const std::shared_ptr<LocalAggregateSynthExpression> &Left,
+        const std::shared_ptr<LocalAggregateSynthExpression> &Right) {
+        auto Result =
+            std::make_shared<LocalAggregateSynthExpression>();
+        Result->Kind = LocalAggregateSynthExpressionKind::Binary;
+        Result->Op = Op;
+        Result->Cost = 1 + (Left ? Left->Cost : 0) +
+                       (Right ? Right->Cost : 0);
+        Result->Left = Left;
+        Result->Right = Right;
+        return Result;
+    };
+    //1.5.1 大表只做 O(N) 完整验证：索引表与常量表不产生
+    //新二元指令，不会根据局部样本或运行时输入猜测表形状。
+    bool IsIndex = true;
+    bool IsUniform = true;
+    for (size_t I = 0; I < Values.size(); ++I) {
+        IsIndex &= Values[I] == static_cast<int32_t>(I);
+        IsUniform &= Values[I] == Values.front();
+    }
+    if (IsIndex) return MakeIndex();
+    if (IsUniform) return MakeConstant(Values.front());
+
+    //1.5.2 对 index+C 和 C-index 逐点使用宽位计算，任一点超出
+    //i32定义域就拒绝，不借有符号溢出完成表达式拟合。
+    const int64_t Delta = Values.front();
+    bool IsIndexPlusConstant = true;
+    bool IsConstantMinusIndex = true;
+    for (size_t I = 0; I < Values.size(); ++I) {
+        const int64_t Index = static_cast<int64_t>(I);
+        const int64_t Added = Index + Delta;
+        const int64_t Subtracted = Delta - Index;
+        IsIndexPlusConstant &=
+            Added >= std::numeric_limits<int32_t>::min() &&
+            Added <= std::numeric_limits<int32_t>::max() &&
+            Values[I] == static_cast<int32_t>(Added);
+        IsConstantMinusIndex &=
+            Subtracted >= std::numeric_limits<int32_t>::min() &&
+            Subtracted <= std::numeric_limits<int32_t>::max() &&
+            Values[I] == static_cast<int32_t>(Subtracted);
+    }
+    if (IsIndexPlusConstant) {
+        return MakeBinary(BinaryInst::ADD, MakeIndex(),
+                          MakeConstant(static_cast<int32_t>(Delta)));
+    }
+    if (IsConstantMinusIndex) {
+        return MakeBinary(BinaryInst::SUB,
+                          MakeConstant(static_cast<int32_t>(Delta)),
+                          MakeIndex());
+    }
+    return nullptr;
 }
 //步骤 1.5：以“在完整表定义域上的结果向量”为状态做有界枚举；语义相同的
 //树只保留首个低成本代表，命中目标向量才接受表达式。
@@ -1060,6 +1139,216 @@ bool LocalAggregateSimplifyPass::expandReadOnlyConstantArrayLoads(
     delete AI;
     return true;
 }
+//步骤 3.8：只依据已注册内建函数的 memset 语义识别非 volatile 调用；
+//同名普通函数不能作为内存初始化证明。
+bool LocalAggregateSimplifyPass::isNonVolatileMemset(CallInst *CI) {
+    if (!CI || CI->getArgCount() < 4 || !CI->getBuiltinCallee() ||
+        !BuildInFunction::isMemsetName(CI->getCalleeName())) {
+        return false;
+    }
+    int32_t IsVolatile = 0;
+    return CI->getArg(3) &&
+           CI->getArg(3)->tryGetIntConst(IsVolatile) &&
+           IsVolatile == 0;
+}
+//步骤 3.9：完整清零必须从对象起点开始，并以精确字节数覆盖整个数组；
+//指针路径只允许保持起点的 bitcast 和全零 GEP。
+bool LocalAggregateSimplifyPass::isWholeZeroMemset(
+    CallInst *CI, AllocaInst *AI) {
+    if (!CI || !AI || !isNonVolatileMemset(CI)) return false;
+    int32_t FillValue = 0;
+    int64_t ByteCount = 0;
+    if (!CI->getArg(1) ||
+        !CI->getArg(1)->tryGetIntConst(FillValue) ||
+        FillValue != 0 || !CI->getArg(2) ||
+        !CI->getArg(2)->tryGetInt64Const(ByteCount) || ByteCount < 0) {
+        return false;
+    }
+    auto ObjectType = AllocaInst::getAllocatedType(AI);
+    if (!ObjectType ||
+        static_cast<uint64_t>(ByteCount) !=
+            static_cast<uint64_t>(ObjectType->getSize())) {
+        return false;
+    }
+    Value *Pointer = CI->getArg(0);
+    std::unordered_set<Value *> Seen;
+    while (Pointer && Seen.insert(Pointer).second) {
+        if (auto *BC = dynamic_cast<BitCastInst *>(Pointer)) {
+            Pointer = BC->getUnaryOperand();
+            continue;
+        }
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
+        if (!GEP) break;
+        for (Value *Index : GEP->getIndices()) {
+            int ConstantIndex = 0;
+            if (!Value::tryGetIntIndex(Index, ConstantIndex) ||
+                ConstantIndex != 0) {
+                return false;
+            }
+        }
+        Pointer = GEP->getBasePointer();
+    }
+    return Pointer == AI;
+}
+//步骤 3.10：对“整对象清零后，以常量写补齐，再进行动态读取”的一维
+//i32 局部表重建完整状态。触发条件只来自 use 闭包、支配、对象边界与表语义，
+//不依赖函数名、测试规模或运行时输入。
+bool LocalAggregateSimplifyPass::foldPatchedLocalArrayLoads(
+    AllocaInst *AI, const DominatorTree &DT, RangeInfo &RI,
+    const LoopInfo &LI) {
+    if (!AI || !AI->getParent()) return false;
+    Function *Owner = AI->getParent()->getParent();
+    if (!Owner || Owner->front() != AI->getParent()) return false;
+    auto ArrayType = std::dynamic_pointer_cast<ARRAYType>(
+        AllocaInst::getAllocatedType(AI));
+    if (!ArrayType || ArrayType->getElementCount() <= 0 ||
+        ArrayType->getElementCount() > MaxFastSynthArrayElements) {
+        return false;
+    }
+    auto ElementType = ArrayType->getElementType();
+    if (!ElementType || !ElementType->isInt() || ElementType->isBool() ||
+        ElementType->getIntegerBitWidth() != 32) {
+        return false;
+    }
+    const int Count = ArrayType->getElementCount();
+    CallInst *Initializer = nullptr;
+    std::vector<StoreInst *> PatchStores;
+    std::vector<LoadInst *> Loads;
+    std::map<int, int32_t> PatchValues;
+    size_t PointerCount = 0;
+    //3.10.1 根对象只允许派生直接 [0,index] 元素 GEP；每个元素地址只可
+    //用于读取、常量覆盖或本计划唯一的整对象清零。任一逃逸或未知 use 即拒绝。
+    for (Use *RootUse : AI->getUses()) {
+        if (!RootUse || RootUse->getValue() != AI) continue;
+        if (++PointerCount >
+            static_cast<size_t>(MaxFastSynthArrayElements * 2)) {
+            return false;
+        }
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(RootUse->getUser());
+        Value *Index = nullptr;
+        if (!GEP || GEP->getUserIndex(RootUse) != 0 ||
+            !getDirectOneDimElementIndex(AI, GEP, Index) ||
+            !gepIsProvablyWithinKnownObject(GEP, RI, DT)) {
+            return false;
+        }
+        for (Use *ElementUse : GEP->getUses()) {
+            if (!ElementUse || ElementUse->getValue() != GEP) continue;
+            auto *I = dynamic_cast<Instruction *>(ElementUse->getUser());
+            if (!I) return false;
+            int OperandIndex = I->getUserIndex(ElementUse);
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                if (OperandIndex != 0 ||
+                    !IRType::hasSameShape(
+                        Load->getIRType(), ElementType) ||
+                    Loads.size() >=
+                        static_cast<size_t>(MaxFastSynthArrayElements)) {
+                    return false;
+                }
+                Loads.push_back(Load);
+                continue;
+            }
+            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+                int ConstantIndex = 0;
+                int64_t ConstantValue = 0;
+                Value *StoredValue = Store->getValueOperand();
+                if (OperandIndex != 1 || !Store->fullyCoversItsPointer() ||
+                    !Value::tryGetIntIndex(Index, ConstantIndex) ||
+                    ConstantIndex < 0 || ConstantIndex >= Count ||
+                    !StoredValue ||
+                    !IRType::hasSameShape(
+                        StoredValue->getIRType(), ElementType) ||
+                    !StoredValue->tryGetInt64ConstAtWidth(
+                        32, ConstantValue) ||
+                    ConstantValue < std::numeric_limits<int32_t>::min() ||
+                    ConstantValue > std::numeric_limits<int32_t>::max() ||
+                    !PatchValues.emplace(
+                        ConstantIndex,
+                        static_cast<int32_t>(ConstantValue)).second) {
+                    return false;
+                }
+                PatchStores.push_back(Store);
+                continue;
+            }
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (!CI || CI->getArgIndex(ElementUse) != 0 || Initializer ||
+                !isWholeZeroMemset(CI, AI)) {
+                return false;
+            }
+            Initializer = CI;
+        }
+    }
+    if (!Initializer || Loads.empty() ||
+        Initializer->getParent() != AI->getParent() ||
+        LI.getLoopFor(Initializer->getParent())) {
+        return false;
+    }
+    //3.10.2 清零先于全部访问；每个补丁写又必须支配每个读取。因此任一
+    //动态 load 到达时，整表状态都精确等于“零表+全部常量补丁”。
+    for (StoreInst *Store : PatchStores) {
+        if (!DT.dominatesValue(Initializer, Store)) return false;
+        for (LoadInst *Load : Loads)
+            if (!DT.dominatesValue(Store, Load)) return false;
+    }
+    for (LoadInst *Load : Loads)
+        if (!DT.dominatesValue(Initializer, Load)) return false;
+
+    std::vector<int32_t> Values(static_cast<size_t>(Count), 0);
+    for (const auto &Patch : PatchValues)
+        Values[static_cast<size_t>(Patch.first)] = Patch.second;
+    auto Expression = synthesizeFastInt32TableExpression(Values);
+    if (!isSynthExpressionProfitable(Expression)) return false;
+
+    //3.10.3 全部下标必须是定义良好的 i32，且其完整 GEP 已证明落在对象内。
+    //先为所有 load 物化替换，任一失败就逆序回滚，不留下部分变换。
+    std::vector<std::pair<LoadInst *, Value *>> Replacements;
+    std::vector<Instruction *> Created;
+    Replacements.reserve(Loads.size());
+    for (LoadInst *Load : Loads) {
+        auto *GEP = dynamic_cast<GetElementPtrInst *>(
+            Load->getPointerOperand());
+        Value *Index = nullptr;
+        if (!getDirectOneDimElementIndex(AI, GEP, Index) ||
+            !Index || !Index->getIRType() ||
+            !Index->getIRType()->isInt() ||
+            Index->getIRType()->isBool() ||
+            Index->getIRType()->getIntegerBitWidth() != 32 ||
+            valueMayDependOnUndef(Index) ||
+            !gepIsProvablyWithinKnownObject(GEP, RI, DT)) {
+            for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                delete *It;
+            return false;
+        }
+        int ConstantIndex = 0;
+        Value *Replacement = nullptr;
+        if (Value::tryGetIntIndex(Index, ConstantIndex)) {
+            if (ConstantIndex < 0 || ConstantIndex >= Count) {
+                for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                    delete *It;
+                return false;
+            }
+            Replacement = Value::makeIntegerLike(
+                Load, Values[static_cast<size_t>(ConstantIndex)]);
+        } else {
+            Replacement = materializeSynthExpression(
+                Expression, Index, Load, Created);
+        }
+        if (!Replacement ||
+            !IRType::hasSameShape(
+                Load->getIRType(), Replacement->getIRType())) {
+            for (auto It = Created.rbegin(); It != Created.rend(); ++It)
+                delete *It;
+            return false;
+        }
+        Replacements.push_back({Load, Replacement});
+    }
+    //3.10.4 所有证明和构造都完成后统一提交；写入与根对象由阶段5在确认
+    //已无任何读取后删除，避免在本阶段制造半删除状态。
+    for (auto &Replacement : Replacements) {
+        Replacement.first->replaceAllUsesWith(Replacement.second);
+        delete Replacement.first;
+    }
+    return true;
+}
 //步骤 4.4：为一个精确标量路径登记槽位类型；重复路径必须保持同一标量
 //类型，新路径使总槽数超出预算时立即拒绝标量化。
 bool LocalAggregateSimplifyPass::addScalarSlot(
@@ -1344,8 +1633,10 @@ LocalAggregateDeadUses LocalAggregateSimplifyPass::collectDeadAggregateUses(
                 continue;
             }
             if (auto *CI = dynamic_cast<CallInst *>(I);
-                CI && CallInst::isNonVolatileMemcpy(CI) &&
-                OperandIndex == 1) {
+                CI && ((CallInst::isNonVolatileMemcpy(CI) &&
+                        CI->getArgIndex(U) == 0) ||
+                       (isWholeZeroMemset(CI, AI) &&
+                        CI->getArgIndex(U) == 0))) {
                 if (SeenWrites.insert(I).second) Result.Writes.push_back(I);
                 continue;
             }
@@ -1395,6 +1686,7 @@ LocalAggregateSimplifyPass::run(Function &F,
     BasicAAResult *AA = nullptr;
     LoopInfo *LI = nullptr;
     MemorySSAResult *MSSA = nullptr;
+    RangeInfo *RI = nullptr;
     auto InvalidateMemoryAnalyses = [&]() {
         PreservationStatus PA;
         PA.keep<DominantAnalysis>();
@@ -1402,12 +1694,14 @@ LocalAggregateSimplifyPass::run(Function &F,
         PA.keep<LoopAnalysis>();
         PA.discard<BasicAliasAnalysis>();
         PA.discard<MemorySSAAnalysis>();
+        PA.discard<RangeAnalysis>();
         PA.discard<SideEffectAnalysis>();
         FAM.invalidate(F, std::move(PA));
         DT = nullptr;
         AA = nullptr;
         LI = nullptr;
         MSSA = nullptr;
+        RI = nullptr;
     };
     std::vector<AllocaInst *> ReadOnlyArrays = collectArrayAllocas(F);
     if (!ReadOnlyArrays.empty() && Changed)
@@ -1421,6 +1715,12 @@ LocalAggregateSimplifyPass::run(Function &F,
             AA = &FAM.getResult<BasicAliasAnalysis>(F);
             LI = &FAM.getResult<LoopAnalysis>(F);
             MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
+            RI = &FAM.getResult<RangeAnalysis>(F);
+        }
+        if (foldPatchedLocalArrayLoads(AI, *DT, *RI, *LI)) {
+            Changed = true;
+            InvalidateMemoryAnalyses();
+            continue;
         }
         if (!expandReadOnlyConstantArrayLoads(
                 F, AI, *DT, *MSSA, *AA, *LI, FAM)) {

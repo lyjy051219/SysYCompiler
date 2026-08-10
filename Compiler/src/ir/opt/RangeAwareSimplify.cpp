@@ -2,6 +2,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
 #include <vector>
@@ -615,6 +616,12 @@ bool RangeAwareSimplifyPass::foldBoundedSignedRemainders(
         //8.1 C/SysY有符号除法向零截断；正常量下端点商保持单调，可直接界定商集合。
         const int64_t MinQuotient = LRange.min / Modulus;
         const int64_t MaxQuotient = LRange.max / Modulus;
+        //非单值商的改写会多次使用被除数；若它可能依赖undef，各次使用不保证
+        //选择同一个值，比较与校正的相关性便不成立。预算不足同样保守拒绝。
+        if (MinQuotient != MaxQuotient &&
+            valueMayDependOnUndef(lhs)) {
+            continue;
+        }
         Value *Replacement = nullptr;
         std::vector<Instruction *> NewInstructions;
         auto InsertAllBeforeRemainder = [&]() {
@@ -709,7 +716,7 @@ PreservationStatus RangeAwareSimplifyPass::run(Function &F,
     changed |= strengthReduce(F, RI, DT);
     changed |= foldBoundedSignedRemainders(F, RI, DT);
     if (!changed) return PreservationStatus::all();
-    //9. 只替换计算值、不直接改 CFG，支配与循环结构仍可保留。
+    //9. 上述改写均不改变CFG，保留支配树与循环结构；Range结果因值图变化失效。
     PreservationStatus PA;
     PA.keep<DominantAnalysis>();
     PA.keep<LoopAnalysis>();

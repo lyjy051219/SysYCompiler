@@ -14,6 +14,7 @@ class Loop;
 class LoopAccessInfo;
 class RangeInfo;
 class SCEVResult;
+class LoopPhaseRelayoutPass;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
 
@@ -25,6 +26,8 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
+    //阶段布局Pass复用本Pass已经验证过的typed GEP与完整覆盖基础证明
+    friend class LoopPhaseRelayoutPass;
     //AffineViewAccess保存一次二维typed GEP访问的根对象、完整索引和轴映射
     struct AffineViewAccess {
         //Address指向产生最终标量地址的GEP

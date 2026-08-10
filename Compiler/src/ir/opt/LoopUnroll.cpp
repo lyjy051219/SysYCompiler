@@ -1,4 +1,5 @@
 #include "ir/opt/LoopUnroll.hpp"
+#include "ir/analysis/PostDominant.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "lib/IRUtils.hpp"
@@ -213,6 +214,704 @@ bool LoopUnrollPass::isStructurallyLoopInvariant(
         });
     return OperandsInvariant;
 }
+//穿过阶段边界上只含一条入边的LCSSA PHI，得到其循环内真实来源
+Value *LoopUnrollPass::stripSingleIncomingPhis(Value *V) {
+    std::unordered_set<Value *> Seen;
+    for (unsigned Depth = 0; V && Depth < 16; ++Depth) {
+        auto *Phi = dynamic_cast<PhiInst *>(V);
+        if (!Phi || Phi->getNumIncomingValues() != 1 ||
+            !Seen.insert(V).second) {
+            break;
+        }
+        V = Phi->getIncomingValue(0);
+    }
+    return V;
+}
+//递归检查数据依赖闭包；环本身不是命中，预算耗尽则按可能依赖保守处理
+bool LoopUnrollPass::valueDependsOn(
+    Value *V, Value *Needle, std::unordered_set<Value *> &Active,
+    unsigned Depth) {
+    if (!V || !Needle) return true;
+    if (Value::isUndef(V)) return true;
+    if (V == Needle) return true;
+    if (Depth > 64) return true;
+    if (V->isConst() || V->isParam() || V->isGlobal() ||
+        dynamic_cast<Function *>(V) ||
+        dynamic_cast<BuildInFunction *>(V)) {
+        return false;
+    }
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I) return true;
+    if (!Active.insert(V).second) return false;
+    bool Depends = false;
+    forEachOperand(I, [&](size_t, Use *, Value *Operand) {
+        if (Depends || dynamic_cast<BasicBlock *>(Operand)) return true;
+        if (valueDependsOn(Operand, Needle, Active, Depth + 1))
+            Depends = true;
+        return true;
+    });
+    Active.erase(V);
+    return Depends;
+}
+//证明局部对象在进入候选循环前已经由整对象memset定义，且指针不逃逸到证明闭包之外
+bool LoopUnrollPass::hasDominatingWholeObjectMemset(
+    AllocaInst *Object, Loop *L, const DominatorTree &DT) {
+    if (!Object || !L || !L->getHeader()) return false;
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!L->getLoopSimplifyForm(PreHeader, Latch) || !PreHeader)
+        return false;
+    Function *F = L->getHeader()->getParent();
+    auto ObjectType = AllocaInst::getAllocatedType(Object);
+    if (!F || !ObjectType) return false;
+
+    CallInst *Initializer = nullptr;
+    for (BasicBlock *BB : *F) {
+        for (Instruction *I : *BB) {
+            auto *CI = dynamic_cast<CallInst *>(I);
+            if (!CI || CI->getArgCount() < 4 ||
+                !CI->getBuiltinCallee() ||
+                !BuildInFunction::isMemsetName(CI->getCalleeName())) {
+                continue;
+            }
+            bool IsVolatile = true;
+            int64_t ByteCount = -1;
+            if (!CI->getArg(3) ||
+                !CI->getArg(3)->tryGetBoolConst(IsVolatile) ||
+                IsVolatile || !CI->getArg(2) ||
+                !CI->getArg(2)->tryGetInt64Const(ByteCount) ||
+                ByteCount < 0 ||
+                static_cast<uint64_t>(ByteCount) !=
+                    static_cast<uint64_t>(ObjectType->getSize())) {
+                continue;
+            }
+            int32_t FillByte = 0;
+            if (!CI->getArg(1) ||
+                !CI->getArg(1)->tryGetIntConst(FillByte)) {
+                continue;
+            }
+            Value *Pointer = CI->getArg(0);
+            std::unordered_set<Value *> Seen;
+            bool ZeroOffset = true;
+            while (Pointer && Seen.insert(Pointer).second) {
+                if (auto *BC = dynamic_cast<BitCastInst *>(Pointer)) {
+                    Pointer = BC->getUnaryOperand();
+                    continue;
+                }
+                auto *GEP = dynamic_cast<GetElementPtrInst *>(Pointer);
+                if (!GEP) break;
+                for (Value *Index : GEP->getIndices()) {
+                    int ConstantIndex = 0;
+                    if (!Value::tryGetIntIndex(Index, ConstantIndex) ||
+                        ConstantIndex != 0) {
+                        ZeroOffset = false;
+                        break;
+                    }
+                }
+                if (!ZeroOffset) break;
+                Pointer = GEP->getBasePointer();
+            }
+            if (!ZeroOffset || Pointer != Object || !CI->getParent() ||
+                !DT.dominates(CI->getParent(), PreHeader)) {
+                continue;
+            }
+            if (CI->getParent() == PreHeader &&
+                !Instruction::comesBefore(CI, PreHeader->getTerminator())) {
+                continue;
+            }
+            if (Initializer) return false;
+            Initializer = CI;
+        }
+    }
+    if (!Initializer) return false;
+
+    //局部指针只允许形成GEP/bitcast闭包，并在候选循环内被普通load/store使用；
+    //任一未知调用、指针存储或循环外内存访问都会使初始化证明失效。
+    std::vector<Value *> Worklist{Object};
+    std::unordered_set<Value *> Visited;
+    size_t Nodes = 0;
+    while (!Worklist.empty()) {
+        Value *Current = Worklist.back();
+        Worklist.pop_back();
+        if (!Current || !Visited.insert(Current).second) continue;
+        if (++Nodes > 2048) return false;
+        for (Use *U : Current->getUses()) {
+            auto *I = U ? dynamic_cast<Instruction *>(U->getUser()) : nullptr;
+            if (!I) return false;
+            if (auto *GEP = dynamic_cast<GetElementPtrInst *>(I)) {
+                if (GEP->getBasePointer() != Current) return false;
+                Worklist.push_back(GEP);
+                continue;
+            }
+            if (auto *BC = dynamic_cast<BitCastInst *>(I)) {
+                if (BC->getUnaryOperand() != Current) return false;
+                Worklist.push_back(BC);
+                continue;
+            }
+            if (I == Initializer) {
+                if (Initializer->getArg(0) != Current) return false;
+                continue;
+            }
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                if (Load->getPointerOperand() != Current ||
+                    !L->contains(Load->getParent())) {
+                    return false;
+                }
+                continue;
+            }
+            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+                if (Store->getPointerOperand() != Current ||
+                    !L->contains(Store->getParent())) {
+                    return false;
+                }
+                continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+//识别“首轮幂等写+稳定只读加法归约”，并在任何CFG改写前闭合全部语义证明
+std::optional<InvariantStoreReductionPhasePlan>
+LoopUnrollPass::matchInvariantStoreReductionPhase(
+    Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+    RangeInfo &RI, const DominatorTree &DT,
+    const PostDominatorTree &PDT, const UnrollConfig &Config) {
+    if (!Outer || !Outer->getHeader() ||
+        !LCSSAPass::isLCSSAForm(Outer) ||
+        Outer->getSubLoops().size() != 1) {
+        return std::nullopt;
+    }
+    auto OuterShape = getLoopExecutionShape(Outer, SE);
+    auto OuterTrip = SE.analyzeLoopTripCount(Outer);
+    auto OuterIV = SE.getCanonicalInduction(Outer);
+    if (!OuterShape || !OuterTrip || !OuterTrip->Valid || !OuterIV ||
+        !OuterIV->Valid || OuterShape->Exiting != OuterShape->Latch ||
+        OuterTrip->ComparePhase != LoopExitComparePhase::BackedgeUpdate ||
+        OuterIV->Phi != OuterTrip->IndVar ||
+        !OuterIV->ConstantStep || *OuterIV->ConstantStep != 1) {
+        return std::nullopt;
+    }
+    auto IsI32 = [](Value *V) {
+        auto Ty = V ? V->getIRType() : nullptr;
+        return Ty && Ty->isInt() && !Ty->isBool() &&
+               Ty->getIntegerBitWidth() == 32;
+    };
+    auto *OuterInduction = OuterIV->Phi;
+    auto *InductionUpdate =
+        dynamic_cast<BinaryInst *>(OuterIV->UpdateValue);
+    if (!IsI32(OuterInduction) || !InductionUpdate ||
+        InductionUpdate->getOp() != BinaryInst::ADD ||
+        !InductionUpdate->getParent() ||
+        !Outer->contains(InductionUpdate->getParent())) {
+        return std::nullopt;
+    }
+    Value *IVLeft = nullptr;
+    Value *IVRight = nullptr;
+    int32_t UnitStep = 0;
+    if (!InductionUpdate->getOperands(IVLeft, IVRight) ||
+        !((IVLeft == OuterInduction && IVRight &&
+           IVRight->tryGetIntConst(UnitStep) && UnitStep == 1) ||
+          (IVRight == OuterInduction && IVLeft &&
+           IVLeft->tryGetIntConst(UnitStep) && UnitStep == 1))) {
+        return std::nullopt;
+    }
+    auto *ExitCompare = OuterTrip->ExitCmp;
+    Value *CompareLeft = nullptr;
+    Value *CompareRight = nullptr;
+    if (!ExitCompare ||
+        !ExitCompare->getOperands(CompareLeft, CompareRight) ||
+        ((CompareLeft == InductionUpdate) ==
+         (CompareRight == InductionUpdate))) {
+        return std::nullopt;
+    }
+    Value *CompareBound = CompareLeft == InductionUpdate
+                              ? CompareRight : CompareLeft;
+    std::unordered_set<Value *> Active;
+    if (!isStructurallyLoopInvariant(CompareBound, Outer, Active))
+        return std::nullopt;
+    auto *OuterBranch = OuterShape->Latch->getBranchTerminator();
+    if (!BasicBlock::isCondBr(OuterBranch) ||
+        OuterShape->Latch->countEdgesToSucc(OuterShape->Header) != 1 ||
+        OuterShape->Latch->countEdgesToSucc(OuterShape->Exit) != 1) {
+        return std::nullopt;
+    }
+
+    auto HeaderPhis = OuterShape->Header->collectPhiNodes();
+    if (HeaderPhis.size() != 2) return std::nullopt;
+    PhiInst *OuterAccumulator =
+        HeaderPhis.front() == OuterInduction
+            ? HeaderPhis.back() : HeaderPhis.front();
+    if (!OuterAccumulator || OuterAccumulator == OuterInduction ||
+        !IsI32(OuterAccumulator) ||
+        OuterAccumulator->countIncomingFromPred(OuterShape->PreHeader) != 1 ||
+        OuterAccumulator->countIncomingFromPred(OuterShape->Latch) != 1 ||
+        OuterInduction->countIncomingFromPred(OuterShape->PreHeader) != 1 ||
+        OuterInduction->countIncomingFromPred(OuterShape->Latch) != 1) {
+        return std::nullopt;
+    }
+    Value *OuterInitial =
+        OuterAccumulator->getIncomingFromPred(OuterShape->PreHeader);
+    Value *InductionInitial =
+        OuterInduction->getIncomingFromPred(OuterShape->PreHeader);
+    Value *AccumulatorBackedge =
+        OuterAccumulator->getIncomingFromPred(OuterShape->Latch);
+    if (!IsI32(OuterInitial) || !IsI32(InductionInitial) ||
+        AccumulatorBackedge == nullptr) {
+        return std::nullopt;
+    }
+    Active.clear();
+    if (containsUndef(OuterInitial, Active, 0)) return std::nullopt;
+    Active.clear();
+    if (containsUndef(InductionInitial, Active, 0)) return std::nullopt;
+    auto *Normalizer = dynamic_cast<BinaryInst *>(AccumulatorBackedge);
+    Value *FollowerRaw = nullptr;
+    Value *Divisor = nullptr;
+    int32_t DivisorValue = 0;
+    if (!Normalizer || Normalizer->getParent() != OuterShape->Latch ||
+        Normalizer->getOp() != BinaryInst::MOD ||
+        !Normalizer->getOperands(FollowerRaw, Divisor) ||
+        !IsI32(FollowerRaw) || !Divisor ||
+        !Divisor->tryGetIntConst(DivisorValue) || DivisorValue <= 1) {
+        return std::nullopt;
+    }
+
+    Loop *Follower = Outer->getSubLoops().front();
+    auto FollowerShape = getLoopExecutionShape(Follower, SE);
+    auto FollowerTrip = SE.analyzeLoopTripCount(Follower);
+    auto FollowerIV = SE.getCanonicalInduction(Follower);
+    if (!Follower || !Follower->isInnermost() ||
+        !LCSSAPass::isLCSSAForm(Follower) || !FollowerShape ||
+        !FollowerTrip || !FollowerTrip->Valid || !FollowerIV ||
+        !FollowerIV->Valid ||
+        !FollowerTrip->ConstantTripCount ||
+        *FollowerTrip->ConstantTripCount <= 0 ||
+        !FollowerIV->ConstantStep || *FollowerIV->ConstantStep != 1 ||
+        FollowerShape->Exit != OuterShape->Latch ||
+        LI.getLoopFor(FollowerShape->PreHeader) != Outer ||
+        !DT.dominates(FollowerShape->PreHeader, OuterShape->Latch) ||
+        !PDT.postDominates(FollowerShape->PreHeader,
+                           OuterShape->Header)) {
+        return std::nullopt;
+    }
+    //Follower状态每次进入都会从同一已定义起点重新开始；变换使用首轮真实结果，
+    //不把SCEV数学次数当作语义事实，因此即使首轮回绕也不会推测未执行的值。
+    Active.clear();
+    if (!FollowerIV->StartValue ||
+        containsUndef(FollowerIV->StartValue, Active, 0)) {
+        return std::nullopt;
+    }
+    auto FollowerPhis = FollowerShape->Header->collectPhiNodes();
+    if (FollowerPhis.size() != 2) return std::nullopt;
+    PhiInst *FollowerInduction = FollowerIV->Phi;
+    PhiInst *FollowerAccumulator =
+        FollowerPhis.front() == FollowerInduction
+            ? FollowerPhis.back() : FollowerPhis.front();
+    if (!FollowerAccumulator ||
+        FollowerAccumulator == FollowerInduction ||
+        !IsI32(FollowerAccumulator) ||
+        FollowerAccumulator->countIncomingFromPred(
+            FollowerShape->PreHeader) != 1 ||
+        FollowerAccumulator->countIncomingFromPred(
+            FollowerShape->Latch) != 1 ||
+        FollowerAccumulator->getIncomingFromPred(
+            FollowerShape->PreHeader) != OuterAccumulator) {
+        return std::nullopt;
+    }
+    auto *FollowerUpdate = dynamic_cast<BinaryInst *>(
+        FollowerAccumulator->getIncomingFromPred(FollowerShape->Latch));
+    Value *ReductionLeft = nullptr;
+    Value *ReductionRight = nullptr;
+    if (!FollowerUpdate ||
+        FollowerUpdate->getParent() != FollowerShape->Latch ||
+        FollowerUpdate->getOp() != BinaryInst::ADD ||
+        !FollowerUpdate->getOperands(ReductionLeft, ReductionRight) ||
+        ((ReductionLeft == FollowerAccumulator) ==
+         (ReductionRight == FollowerAccumulator))) {
+        return std::nullopt;
+    }
+    Value *Contribution = ReductionLeft == FollowerAccumulator
+                              ? ReductionRight : ReductionLeft;
+    auto DependsOnState = [&](Value *V) {
+        for (Value *State : {static_cast<Value *>(OuterAccumulator),
+                             static_cast<Value *>(OuterInduction),
+                             static_cast<Value *>(FollowerAccumulator)}) {
+            std::unordered_set<Value *> Seen;
+            if (valueDependsOn(V, State, Seen, 0)) return true;
+        }
+        return false;
+    };
+    const std::unordered_set<Value *> ProvenFollowerRoots{
+        static_cast<Value *>(FollowerInduction)};
+    Active.clear();
+    if (!Contribution || DependsOnState(Contribution) ||
+        containsUndefOutsideRoots(
+            Contribution, ProvenFollowerRoots, Active, 0))
+        return std::nullopt;
+    auto *RawPhi = dynamic_cast<PhiInst *>(FollowerRaw);
+    if (!RawPhi || RawPhi->getParent() != OuterShape->Latch ||
+        RawPhi->getNumIncomingValues() != 1 ||
+        RawPhi->getIncomingBlock(0) != FollowerShape->Exiting ||
+        stripSingleIncomingPhis(FollowerRaw) != FollowerAccumulator) {
+        return std::nullopt;
+    }
+
+    InvariantStoreReductionPhasePlan Plan;
+    Plan.Outer = Outer;
+    Plan.Follower = Follower;
+    Plan.OuterShape = *OuterShape;
+    Plan.FollowerShape = *FollowerShape;
+    Plan.OuterAccumulator = OuterAccumulator;
+    Plan.OuterInduction = OuterInduction;
+    Plan.FollowerAccumulator = FollowerAccumulator;
+    Plan.FollowerInduction = FollowerInduction;
+    Plan.OuterInitial = OuterInitial;
+    Plan.InductionInitial = InductionInitial;
+    Plan.FollowerRaw = FollowerRaw;
+    Plan.FollowerUpdate = FollowerUpdate;
+    Plan.Normalizer = Normalizer;
+    Plan.InductionUpdate = InductionUpdate;
+    Plan.ExitCompare = ExitCompare;
+    Plan.FollowerTripCount = *FollowerTrip->ConstantTripCount;
+
+    //Follower只允许由两个Header PHI、普通load和无故障纯整数地址/计算组成；
+    //任何控制或地址依赖外层状态都会使每轮贡献不再稳定。
+    for (BasicBlock *BB : Follower->getBlocks()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB) {
+            if (!I) return std::nullopt;
+            if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
+                if (BB != FollowerShape->Header ||
+                    (Phi != FollowerAccumulator &&
+                     Phi != FollowerInduction)) {
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (auto *Br = dynamic_cast<BrInst *>(I)) {
+                if (Br->isConditional()) {
+                    Active.clear();
+                    if (DependsOnState(Br->getCondition()) ||
+                        containsUndefOutsideRoots(
+                            Br->getCondition(), ProvenFollowerRoots,
+                            Active, 0)) {
+                        return std::nullopt;
+                    }
+                }
+                continue;
+            }
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                Active.clear();
+                if (!IsI32(Load) ||
+                    DependsOnState(Load->getPointerOperand()) ||
+                    containsUndefOutsideRoots(
+                        Load->getPointerOperand(), ProvenFollowerRoots,
+                        Active, 0) ||
+                    !AA.isLocationProvablyInBoundsAt(
+                        MemoryLocation::get(Load), Load, SE, RI, DT)) {
+                    return std::nullopt;
+                }
+                Plan.FollowerLoads.push_back(Load);
+                continue;
+            }
+            if (dynamic_cast<StoreInst *>(I) ||
+                dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<AllocaInst *>(I) ||
+                dynamic_cast<RetInst *>(I)) {
+                return std::nullopt;
+            }
+            bool Pure = dynamic_cast<GetElementPtrInst *>(I) ||
+                        dynamic_cast<BinaryInst *>(I) ||
+                        dynamic_cast<SelectInst *>(I) ||
+                        I->instType == Instruction::TRUNC ||
+                        I->instType == Instruction::ZEXT ||
+                        I->instType == Instruction::SEXT ||
+                        I->instType == Instruction::BITCAST;
+            if (!Pure || instructionMayFaultOrProducePoison(I) ||
+                (I != FollowerUpdate && DependsOnState(I))) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (Plan.FollowerLoads.empty()) return std::nullopt;
+
+    //外层直属区域只允许不变控制、幂等普通store以及已识别的控制/取模计算。
+    //Follower预头后支配每个store，保证原首轮仍按原顺序完成全部可能写入后才读取。
+    for (BasicBlock *BB : Outer->getBlocks()) {
+        if (!BB) return std::nullopt;
+        auto *Br = BB->getBranchTerminator();
+        if (!Br) return std::nullopt;
+        if (Br->isConditional() && BB != OuterShape->Latch) {
+            Active.clear();
+            if (!isStructurallyLoopInvariant(
+                    Br->getCondition(), Outer, Active)) {
+                return std::nullopt;
+            }
+        }
+        for (Instruction *I : *BB) {
+            if (auto *Phi = dynamic_cast<PhiInst *>(I)) {
+                if (Phi != OuterAccumulator && Phi != OuterInduction &&
+                    Phi != RawPhi) {
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (dynamic_cast<BrInst *>(I)) continue;
+            if (auto *Store = dynamic_cast<StoreInst *>(I)) {
+                Active.clear();
+                if (!isStructurallyLoopInvariant(
+                        Store->getPointerOperand(), Outer, Active)) {
+                    return std::nullopt;
+                }
+                Active.clear();
+                if (!isStructurallyLoopInvariant(
+                        Store->getValueOperand(), Outer, Active) ||
+                    !PDT.postDominates(
+                        FollowerShape->PreHeader, Store->getParent()) ||
+                    !AA.isLocationProvablyInBoundsAt(
+                        MemoryLocation::get(Store), Store, SE, RI, DT)) {
+                    return std::nullopt;
+                }
+                Value *Root = AA.getUniqueUnderlyingObject(
+                    Store->getPointerOperand());
+                if (!Root || (Plan.MemoryRoot && Plan.MemoryRoot != Root))
+                    return std::nullopt;
+                Plan.MemoryRoot = Root;
+                Plan.PhaseStores.push_back(Store);
+                if (std::find(Plan.PhaseBlocks.begin(),
+                              Plan.PhaseBlocks.end(), BB) ==
+                    Plan.PhaseBlocks.end()) {
+                    Plan.PhaseBlocks.push_back(BB);
+                }
+                continue;
+            }
+            if (dynamic_cast<LoadInst *>(I) ||
+                dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<AllocaInst *>(I) ||
+                dynamic_cast<RetInst *>(I)) {
+                return std::nullopt;
+            }
+            bool Pure = dynamic_cast<GetElementPtrInst *>(I) ||
+                        dynamic_cast<BinaryInst *>(I) ||
+                        dynamic_cast<SelectInst *>(I) ||
+                        I->instType == Instruction::TRUNC ||
+                        I->instType == Instruction::ZEXT ||
+                        I->instType == Instruction::SEXT ||
+                        I->instType == Instruction::BITCAST;
+            if (!Pure ||
+                (I != Normalizer &&
+                 instructionMayFaultOrProducePoison(I))) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (Plan.PhaseStores.empty() || !Plan.MemoryRoot)
+        return std::nullopt;
+    for (LoadInst *Load : Plan.FollowerLoads) {
+        if (AA.getUniqueUnderlyingObject(Load->getPointerOperand()) !=
+            Plan.MemoryRoot) {
+            return std::nullopt;
+        }
+    }
+    for (size_t I = 0; I < Plan.PhaseStores.size(); ++I) {
+        for (size_t J = I + 1; J < Plan.PhaseStores.size(); ++J) {
+            if (AA.aliasWithIndexRange(
+                    MemoryLocation::get(Plan.PhaseStores[I]),
+                    MemoryLocation::get(Plan.PhaseStores[J]), LI) !=
+                AliasInfo::NoAlias) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (auto *Object = dynamic_cast<AllocaInst *>(Plan.MemoryRoot)) {
+        if (!hasDominatingWholeObjectMemset(Object, Outer, DT))
+            return std::nullopt;
+    } else if (!Plan.MemoryRoot->isGlobal()) {
+        return std::nullopt;
+    }
+
+    //出口PHI必须能由残余循环中的精确状态逐项补齐，首版拒绝任意未知live-out。
+    bool ExposesAccumulator = false;
+    for (PhiInst *Phi : OuterShape->Exit->collectPhiNodes()) {
+        if (!Phi || Phi->getNumIncomingValues() != 1 ||
+            Phi->countIncomingFromPred(OuterShape->Latch) != 1) {
+            return std::nullopt;
+        }
+        Value *V = Phi->getIncomingFromPred(OuterShape->Latch);
+        if (V == Normalizer) {
+            ExposesAccumulator = true;
+            continue;
+        }
+        if (V == InductionUpdate || V == FollowerRaw ||
+            V == OuterAccumulator || V == OuterInduction) {
+            continue;
+        }
+        Active.clear();
+        if (!isStructurallyLoopInvariant(V, Outer, Active))
+            return std::nullopt;
+    }
+    if (!ExposesAccumulator) return std::nullopt;
+
+    const int64_t StoreBenefit =
+        static_cast<int64_t>(Plan.PhaseStores.size()) *
+        std::max(1, Config.PeelStoreCost);
+    const int64_t LoadBenefit =
+        Plan.FollowerTripCount *
+        static_cast<int64_t>(Plan.FollowerLoads.size());
+    Plan.EstimatedPerIterationBenefit =
+        StoreBenefit > std::numeric_limits<int64_t>::max() - LoadBenefit
+            ? std::numeric_limits<int64_t>::max()
+            : StoreBenefit + LoadBenefit;
+    if (Plan.EstimatedPerIterationBenefit <
+        std::max<int64_t>(1, Config.PhaseReuseMinNetBenefit)) {
+        return std::nullopt;
+    }
+    return Plan;
+}
+//保留原首轮路径，仅把继续边接到逐轮复现相同i32位模式的标量残余循环
+bool LoopUnrollPass::applyInvariantStoreReductionPhase(
+    Function &F, const InvariantStoreReductionPhasePlan &Plan) {
+    BasicBlock *OldHeader = Plan.OuterShape.Header;
+    BasicBlock *OldLatch = Plan.OuterShape.Latch;
+    BasicBlock *Exit = Plan.OuterShape.Exit;
+    auto *OldBranch = OldLatch ? OldLatch->getBranchTerminator() : nullptr;
+    if (!OldHeader || !OldLatch || !Exit ||
+        !BasicBlock::isCondBr(OldBranch) ||
+        OldLatch->countEdgesToSucc(OldHeader) != 1 ||
+        OldLatch->countEdgesToSucc(Exit) != 1 ||
+        !Plan.OuterAccumulator || !Plan.OuterInduction ||
+        Plan.OuterAccumulator->countIncomingFromPred(OldLatch) != 1 ||
+        Plan.OuterInduction->countIncomingFromPred(OldLatch) != 1) {
+        return false;
+    }
+    Value *IVLeft = nullptr;
+    Value *IVRight = nullptr;
+    Value *CompareLeft = nullptr;
+    Value *CompareRight = nullptr;
+    Value *RawLeft = nullptr;
+    Value *Divisor = nullptr;
+    if (!Plan.InductionUpdate ||
+        !Plan.InductionUpdate->getOperands(IVLeft, IVRight) ||
+        ((IVLeft == Plan.OuterInduction) ==
+         (IVRight == Plan.OuterInduction)) ||
+        !Plan.ExitCompare ||
+        !Plan.ExitCompare->getOperands(CompareLeft, CompareRight) ||
+        ((CompareLeft == Plan.InductionUpdate) ==
+         (CompareRight == Plan.InductionUpdate)) ||
+        !Plan.Normalizer ||
+        !Plan.Normalizer->getOperands(RawLeft, Divisor) ||
+        RawLeft != Plan.FollowerRaw || !Divisor) {
+        return false;
+    }
+    struct ExitIncomingPlan {
+        PhiInst *Phi = nullptr;
+        Value *OldValue = nullptr;
+    };
+    std::vector<ExitIncomingPlan> ExitPlans;
+    for (PhiInst *Phi : Exit->collectPhiNodes()) {
+        if (!Phi || Phi->getNumIncomingValues() != 1 ||
+            Phi->countIncomingFromPred(OldLatch) != 1) {
+            return false;
+        }
+        Value *V = Phi->getIncomingFromPred(OldLatch);
+        if (V != Plan.Normalizer && V != Plan.InductionUpdate &&
+            V != Plan.FollowerRaw && V != Plan.OuterAccumulator &&
+            V != Plan.OuterInduction &&
+            !LoopInfo::isLoopInvariant(V, Plan.Outer)) {
+            return false;
+        }
+        ExitPlans.push_back({Phi, V});
+    }
+
+    auto *ResidualPreHeader = new BasicBlock();
+    auto *ResidualHeader = new BasicBlock();
+    ResidualPreHeader->setIdent(
+        F.makeUniqueBlockIdent(".phase.residual.preheader"));
+    ResidualHeader->setIdent(
+        F.makeUniqueBlockIdent(".phase.residual.header"));
+    //保留首轮多路条件写的统一汇合点，避免后续CFG清理把一条Follower
+    //入口PHI机械展开成每个条件块一条输入并放大后端并行拷贝。
+    Plan.FollowerShape.PreHeader->setIdent(F.makeUniqueBlockIdent(
+        Plan.FollowerShape.PreHeader->getIdent() +
+        ".phase.first.join"));
+    F.pushBlock(ResidualPreHeader);
+    F.pushBlock(ResidualHeader);
+
+    //delta按i32位模式恢复首轮稳定贡献；不使用数学整数溢出假设。
+    auto *Delta = new BinaryInst(
+        Plan.FollowerRaw, BinaryInst::SUB, Plan.OuterInitial);
+    ResidualPreHeader->pushBack(Delta);
+    ResidualPreHeader->genUnCondInst(ResidualHeader);
+
+    auto *ResidualAccumulator =
+        new PhiInst(Plan.OuterAccumulator->getIRType());
+    auto *ResidualInduction =
+        new PhiInst(Plan.OuterInduction->getIRType());
+    ResidualHeader->pushBack(ResidualAccumulator);
+    ResidualHeader->pushBack(ResidualInduction);
+    auto *ResidualRaw = new BinaryInst(
+        ResidualAccumulator, BinaryInst::ADD, Delta);
+    ResidualHeader->pushBack(ResidualRaw);
+    auto *ResidualNormalized = new BinaryInst(
+        ResidualRaw, BinaryInst::MOD, Divisor);
+    ResidualHeader->pushBack(ResidualNormalized);
+    Value *NewIVLeft = IVLeft == Plan.OuterInduction
+                           ? static_cast<Value *>(ResidualInduction)
+                           : IVLeft;
+    Value *NewIVRight = IVRight == Plan.OuterInduction
+                            ? static_cast<Value *>(ResidualInduction)
+                            : IVRight;
+    auto *ResidualIVUpdate = new BinaryInst(
+        NewIVLeft, Plan.InductionUpdate->getOp(), NewIVRight);
+    ResidualHeader->pushBack(ResidualIVUpdate);
+    Value *NewCompareLeft = CompareLeft == Plan.InductionUpdate
+                                ? static_cast<Value *>(ResidualIVUpdate)
+                                : CompareLeft;
+    Value *NewCompareRight = CompareRight == Plan.InductionUpdate
+                                 ? static_cast<Value *>(ResidualIVUpdate)
+                                 : CompareRight;
+    auto *ResidualCompare = new BinaryInst(
+        NewCompareLeft, Plan.ExitCompare->getOp(), NewCompareRight);
+    ResidualHeader->pushBack(ResidualCompare);
+    ResidualAccumulator->addIncoming(
+        Plan.Normalizer, ResidualPreHeader);
+    ResidualAccumulator->addIncoming(
+        ResidualNormalized, ResidualHeader);
+    ResidualInduction->addIncoming(
+        Plan.InductionUpdate, ResidualPreHeader);
+    ResidualInduction->addIncoming(
+        ResidualIVUpdate, ResidualHeader);
+    if (OldBranch->getTrueSuccessor() == OldHeader) {
+        ResidualHeader->genCondInst(
+            ResidualCompare, ResidualHeader, Exit);
+    } else {
+        ResidualHeader->genCondInst(
+            ResidualCompare, Exit, ResidualHeader);
+    }
+
+    //所有出口值已在预检中分类，此处逐项添加残余循环的精确对应值。
+    for (const auto &ExitPlan : ExitPlans) {
+        Value *Mapped = ExitPlan.OldValue;
+        if (Mapped == Plan.Normalizer)
+            Mapped = ResidualNormalized;
+        else if (Mapped == Plan.InductionUpdate)
+            Mapped = ResidualIVUpdate;
+        else if (Mapped == Plan.FollowerRaw)
+            Mapped = ResidualRaw;
+        else if (Mapped == Plan.OuterAccumulator)
+            Mapped = ResidualAccumulator;
+        else if (Mapped == Plan.OuterInduction)
+            Mapped = ResidualInduction;
+        ExitPlan.Phi->addIncoming(Mapped, ResidualHeader);
+    }
+    if (!BasicBlock::redirectBranchTarget(
+            OldLatch, OldHeader, ResidualPreHeader)) {
+        return false;
+    }
+    //原Header失去唯一回边后折叠为首轮入口值；条件写和Follower因此只执行一次。
+    BasicBlock::removeEdgeFromSuccPhis(OldHeader, OldLatch, 1);
+    return true;
+}
 //收集peeling后可由DCE删除的循环不变冗余store
 std::vector<StoreInst *>
 LoopUnrollPass::collectPeelRedundantStoreCandidates(
@@ -281,6 +980,464 @@ LoopUnrollPass::collectPeelRedundantStoreCandidates(
     }
     return Result;
 }
+//识别指定子循环对外层携带状态形成的幂等耗尽传递
+std::optional<CarriedStateExhaustionPlan>
+LoopUnrollPass::matchExhaustingInnerLoop(
+    Loop *Outer, Loop *Inner, SCEVResult &SE, RangeInfo &RI,
+    const DominatorTree &DT) {
+    //3.2.5 两层循环必须保持规范SSA/LCSSA，且候选必须是直接叶子循环。
+    //该结构门禁不依赖函数名、输入值或测试规模。
+    if (!Outer || !Inner || !LCSSAPass::isLCSSAForm(Outer)) {
+        return std::nullopt;
+    }
+    if (Inner->getParentLoop() != Outer ||
+        !Inner->isInnermost() || !LCSSAPass::isLCSSAForm(Inner)) {
+        return std::nullopt;
+    }
+    auto OuterShape = getLoopExecutionShape(Outer, SE);
+    auto InnerShape = getLoopExecutionShape(Inner, SE);
+    auto InnerTrip = SE.analyzeLoopTripCount(Inner);
+    auto InnerInduction = SE.getCanonicalInduction(Inner);
+    if (!OuterShape || !InnerShape || !InnerTrip || !InnerTrip->Valid ||
+        !InnerInduction || !InnerInduction->Valid ||
+        !InnerInduction->Phi || !InnerInduction->UpdateValue ||
+        InnerShape->Exiting != InnerShape->Header ||
+        InnerTrip->ComparePhase != LoopExitComparePhase::HeaderPhi ||
+        InnerTrip->IndVar != InnerInduction->Phi ||
+        !IRType::hasIntegerBitWidth(
+            InnerInduction->Phi->getIRType(), 32) ||
+        !Outer->contains(InnerShape->Exit) ||
+        !DT.dominates(InnerShape->Header, OuterShape->Latch)) {
+        return std::nullopt;
+    }
+    auto *InnerBranch = InnerShape->Header->getBranchTerminator();
+    if (!BasicBlock::isCondBr(InnerBranch) ||
+        InnerBranch->getCondition() != InnerTrip->ExitCmp) {
+        return std::nullopt;
+    }
+    BasicBlock *InnerContinue =
+        getNonExitSuccessor(InnerShape->Header, InnerShape->Exit);
+    std::vector<BasicBlock *> InnerContinuePredecessors =
+        InnerContinue ? InnerContinue->getPredecessors()
+                      : std::vector<BasicBlock *>{};
+    if (!InnerContinue || !Inner->contains(InnerContinue) ||
+        InnerContinuePredecessors.size() != 1 ||
+        InnerContinuePredecessors.front() != InnerShape->Header ||
+        InnerShape->Header->countEdgesToSucc(InnerContinue) != 1 ||
+        (InnerBranch->getTrueSuccessor() != InnerShape->Exit &&
+         InnerBranch->getFalseSuccessor() != InnerShape->Exit)) {
+        return std::nullopt;
+    }
+    //3.2.6 规范化为“InnerIV Predicate Bound时继续”。只支持严格有符号
+    //小于配+1或严格大于配-1；条件为真时下一步必在i32范围内，不利用回绕。
+    Value *Left = nullptr;
+    Value *Right = nullptr;
+    if (!InnerTrip->ExitCmp->getOperands(Left, Right) || !Left || !Right)
+        return std::nullopt;
+    BinaryInst::Operation Predicate = InnerTrip->ContinueOnTrue
+        ? InnerTrip->ExitCmp->getOp()
+        : BinaryInst::negatePredicate(InnerTrip->ExitCmp->getOp());
+    Value *Bound = nullptr;
+    if (Left == InnerInduction->Phi) {
+        Bound = Right;
+    } else if (Right == InnerInduction->Phi) {
+        Bound = Left;
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    } else {
+        return std::nullopt;
+    }
+    if (!Bound || !IRType::hasIntegerBitWidth(Bound->getIRType(), 32) ||
+        !LoopInfo::isLoopInvariant(Bound, Outer)) {
+        return std::nullopt;
+    }
+    std::unordered_set<Value *> UndefActive;
+    if (containsUndef(Bound, UndefActive, 0)) return std::nullopt;
+    auto *Update = dynamic_cast<BinaryInst *>(InnerInduction->UpdateValue);
+    if (!Update) return std::nullopt;
+    const auto IsOne = [](Value *V) {
+        auto Constant = V ? V->getIntConstant() : std::nullopt;
+        return Constant && *Constant == 1;
+    };
+    bool HasExpectedUpdate = false;
+    if (Predicate == BinaryInst::L && Update->getOp() == BinaryInst::ADD) {
+        HasExpectedUpdate =
+            (Update->getOperand(0) == InnerInduction->Phi &&
+             IsOne(Update->getOperand(1))) ||
+            (Update->getOperand(1) == InnerInduction->Phi &&
+             IsOne(Update->getOperand(0)));
+    } else if (Predicate == BinaryInst::G &&
+               Update->getOp() == BinaryInst::SUB) {
+        HasExpectedUpdate =
+            Update->getOperand(0) == InnerInduction->Phi &&
+            IsOne(Update->getOperand(1));
+    }
+    if (!HasExpectedUpdate || !InnerInduction->ConstantStep ||
+        ((Predicate == BinaryInst::L &&
+          *InnerInduction->ConstantStep != 1) ||
+         (Predicate == BinaryInst::G &&
+          *InnerInduction->ConstantStep != -1))) {
+        return std::nullopt;
+    }
+    //3.2.7 穿过至多八层单入边LCSSA转发，随后要求内层起点精确来自某个
+    //外层Header PHI，内层退出值又精确回送该PHI的唯一外层回边。
+    auto StripSingleIncomingPhi = [](Value *V) -> Value * {
+        std::unordered_set<Value *> Seen;
+        for (unsigned Depth = 0; V && Depth < 8; ++Depth) {
+            auto *Phi = dynamic_cast<PhiInst *>(V);
+            if (!Phi || Phi->getNumIncomingValues() != 1 ||
+                !Seen.insert(V).second) {
+                break;
+            }
+            V = Phi->getIncomingValue(0);
+        }
+        return V;
+    };
+    Value *InnerStart = InnerInduction->Phi->getIncomingFromPred(
+        InnerShape->PreHeader);
+    if (!InnerStart) return std::nullopt;
+    InnerStart = StripSingleIncomingPhi(InnerStart);
+    PhiInst *OuterState = nullptr;
+    for (PhiInst *Phi : OuterShape->Header->collectPhiNodes()) {
+        if (!Phi || Phi != InnerStart ||
+            !IRType::hasIntegerBitWidth(Phi->getIRType(), 32) ||
+            Phi->getNumIncomingValues() != 2 ||
+            !Phi->getIncomingFromPred(OuterShape->PreHeader)) {
+            continue;
+        }
+        Value *OuterBackedge =
+            Phi->getIncomingFromPred(OuterShape->Latch);
+        if (StripSingleIncomingPhi(OuterBackedge) ==
+            InnerInduction->Phi) {
+            OuterState = Phi;
+            break;
+        }
+    }
+    if (!OuterState) return std::nullopt;
+    //3.2.8 外层初值也必须完全定义。比较边界无undef并不足以保证首次
+    //耗尽过程有确定语义；这里仅检查preheader入值，避免沿循环PHI递归成环。
+    Value *OuterInitial =
+        OuterState->getIncomingFromPred(OuterShape->PreHeader);
+    std::unordered_set<Value *> InitialUndefActive;
+    if (!OuterInitial ||
+        containsUndef(OuterInitial, InitialUndefActive, 0)) {
+        return std::nullopt;
+    }
+    IntRange InitialRange =
+        RI.query(OuterInitial, OuterShape->PreHeader, DT);
+    if (InitialRange.isBottom() || !InitialRange.isNonNegative())
+        return std::nullopt;
+    CarriedStateExhaustionPlan Plan;
+    Plan.Inner = Inner;
+    Plan.InnerHeader = InnerShape->Header;
+    Plan.InnerContinue = InnerContinue;
+    Plan.InnerExit = InnerShape->Exit;
+    Plan.InnerIV = InnerInduction->Phi;
+    Plan.OuterState = OuterState;
+    Plan.OuterInitial = OuterInitial;
+    Plan.Bound = Bound;
+    return Plan;
+}
+//证明状态耗尽后的兄弟子循环每轮产生同一个只读结果
+std::optional<LoopPhaseResultReusePlan>
+LoopUnrollPass::matchReusableFollowerLoop(
+    Loop *Outer, const CarriedStateExhaustionPlan &Exhaustion,
+    Loop *Follower, LoopInfo &LI, SCEVResult &SE,
+    BasicAAResult &AA, RangeInfo &RI, const DominatorTree &DT) {
+    //3.2.9 首版只接受“耗尽循环 -> 只读循环 -> 外层latch”
+    //的直线阶段。三个节点的精确相等同时排除旁路和提前continue。
+    if (!Outer || !Exhaustion.Inner || !Exhaustion.InnerExit ||
+        !Follower || Follower == Exhaustion.Inner ||
+        Follower->getParentLoop() != Outer || !Follower->isInnermost() ||
+        !LCSSAPass::isLCSSAForm(Follower)) {
+        return std::nullopt;
+    }
+    auto OuterShape = getLoopExecutionShape(Outer, SE);
+    auto FollowerShape = getLoopExecutionShape(Follower, SE);
+    auto FollowerTrip = SE.analyzeLoopTripCount(Follower);
+    if (!OuterShape || !FollowerShape || !FollowerTrip ||
+        !FollowerTrip->Valid || !SE.isKnownFiniteLoop(Follower) ||
+        (FollowerTrip->ConstantTripCount &&
+         *FollowerTrip->ConstantTripCount < 0) ||
+        FollowerShape->PreHeader != Exhaustion.InnerExit ||
+        FollowerShape->Exiting != FollowerShape->Header ||
+        FollowerShape->Exit != OuterShape->Latch ||
+        !DT.dominates(Exhaustion.InnerHeader,
+                      FollowerShape->PreHeader)) {
+        return std::nullopt;
+    }
+    auto *FollowerBranch =
+        FollowerShape->Header->getBranchTerminator();
+    auto *FollowerPreBranch =
+        FollowerShape->PreHeader->getBranchTerminator();
+    if (!BasicBlock::isCondBr(FollowerBranch) ||
+        FollowerBranch->getCondition() != FollowerTrip->ExitCmp ||
+        !BasicBlock::isUncondBr(FollowerPreBranch) ||
+        FollowerPreBranch->getSuccessor(0) != FollowerShape->Header) {
+        return std::nullopt;
+    }
+    BasicBlock *FollowerContinue = getNonExitSuccessor(
+        FollowerShape->Header, FollowerShape->Exit);
+    std::vector<BasicBlock *> ContinuePredecessors =
+        FollowerContinue ? FollowerContinue->getPredecessors()
+                         : std::vector<BasicBlock *>{};
+    if (!FollowerContinue || !Follower->contains(FollowerContinue) ||
+        ContinuePredecessors.size() != 1 ||
+        ContinuePredecessors.front() != FollowerShape->Header ||
+        FollowerShape->Header->countEdgesToSucc(FollowerContinue) != 1 ||
+        (FollowerBranch->getTrueSuccessor() != FollowerShape->Exit &&
+         FollowerBranch->getFalseSuccessor() != FollowerShape->Exit)) {
+        return std::nullopt;
+    }
+
+    Value *SharedGuardBound = nullptr;
+    std::int64_t SafeUpperBound =
+        std::numeric_limits<int32_t>::max();
+    int32_t ConstantBound = 0;
+    const bool HasConstantBound =
+        Exhaustion.Bound &&
+        Exhaustion.Bound->tryGetIntConst(ConstantBound);
+    //首轮将执行的耗尽body写入也必须被同一个对象容量守卫覆盖；
+    //OuterState只在已证明首轮入口非负后作为允许的动态起点。
+    for (BasicBlock *BB : Exhaustion.Inner->getBlocksIncludingSubLoops()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB) {
+            auto *Store = dynamic_cast<StoreInst *>(I);
+            if (!Store || BB == Exhaustion.InnerHeader) continue;
+            MemoryLocation Location = MemoryLocation::get(Store);
+            if (HasConstantBound) {
+                //耗尽循环的携带起点不是普通canonical start，直接复用
+                //对象布局上界分析，并由已证明非负的OuterState封闭下界。
+                if (!AA.accumulateLocationSafeUpperBound(
+                        Location, Store, DT, LI, SE,
+                        SharedGuardBound, SafeUpperBound,
+                        Exhaustion.OuterState)) {
+                    return std::nullopt;
+                }
+            } else if (!AA.accumulateLocationSafeUpperBound(
+                           Location, Store, DT, LI, SE,
+                           SharedGuardBound, SafeUpperBound,
+                           Exhaustion.OuterState)) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    //3.2.10 候选区域只允许确定性纯计算和普通load。任一
+    //store、call、return、alloca、未知指令或可能产生poison的运算都拒绝。
+    std::vector<LoadInst *> FollowerLoads;
+    for (BasicBlock *BB : Follower->getBlocksIncludingSubLoops()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB) {
+            if (!I) return std::nullopt;
+            if (auto *Load = dynamic_cast<LoadInst *>(I)) {
+                //Header在残余外层中仍会执行，因此只允许在将被
+                //截断的continue区域中出现load，不隐藏重复访存或故障时序。
+                if (BB == FollowerShape->Header)
+                    return std::nullopt;
+                const PointerProvenanceInfo &Provenance =
+                    AA.getPointerProvenance(Load->getPointerOperand());
+                //首版只复用来源唯一的全局对象，避免未初始化局部
+                //内存和形参逃逸语义混入证明。
+                if (!Provenance.hasUniqueBase() ||
+                    !Provenance.isMustGlobal()) {
+                    return std::nullopt;
+                }
+                MemoryLocation Location = MemoryLocation::get(Load);
+                if (HasConstantBound) {
+                    if (!AA.isLocationProvablyInBoundsAt(
+                            Location, Load, SE, RI, DT)) {
+                        return std::nullopt;
+                    }
+                } else if (!AA.accumulateLocationSafeUpperBound(
+                               Location, Load, DT, LI, SE,
+                               SharedGuardBound, SafeUpperBound)) {
+                    return std::nullopt;
+                }
+                FollowerLoads.push_back(Load);
+            } else if (dynamic_cast<PhiInst *>(I) ||
+                       dynamic_cast<BrInst *>(I)) {
+                //PHI和分支只表达原有循环的状态与控制。
+            } else if (dynamic_cast<StoreInst *>(I) ||
+                       dynamic_cast<CallInst *>(I) ||
+                       dynamic_cast<RetInst *>(I) ||
+                       dynamic_cast<AllocaInst *>(I) ||
+                       dceInstructionMustBePreserved(I) ||
+                       instructionMayFaultOrProducePoison(I)) {
+                return std::nullopt;
+            }
+            //每个来自候选循环外的数据值都必须相对外层不变，
+            //并且不能依赖undef；基本块操作数仅是CFG边，不参与数据证明。
+            for (std::size_t OperandIndex = 0;
+                 OperandIndex < I->getNumOperands(); ++OperandIndex) {
+                Value *Operand = I->getOperand(OperandIndex);
+                if (dynamic_cast<BasicBlock *>(Operand)) continue;
+                auto *Def = dynamic_cast<Instruction *>(Operand);
+                if (Def && Def->getParent() &&
+                    Follower->contains(Def->getParent())) {
+                    continue;
+                }
+                if (!LoopInfo::isLoopInvariant(Operand, Outer) ||
+                    valueMayDependOnUndef(Operand)) {
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+    if (FollowerLoads.empty()) return std::nullopt;
+    if (HasConstantBound) {
+        if (SharedGuardBound &&
+            SharedGuardBound != Exhaustion.Bound) {
+            return std::nullopt;
+        }
+        SharedGuardBound = Exhaustion.Bound;
+    }
+    if (!SharedGuardBound || SharedGuardBound != Exhaustion.Bound ||
+        SafeUpperBound <= 0 ||
+        SafeUpperBound > std::numeric_limits<int32_t>::max()) {
+        return std::nullopt;
+    }
+    //守卫值必须在外层预头可用，不能把只在某条首轮路径成立的SSA值
+    //泄漏到所有残余迭代。
+    if (auto *BoundDef = dynamic_cast<Instruction *>(SharedGuardBound)) {
+        if (!BoundDef->getParent() || !OuterShape->PreHeader ||
+            (BoundDef->getParent() == OuterShape->PreHeader
+                 ? !Instruction::comesBefore(
+                       BoundDef, OuterShape->PreHeader->getTerminator())
+                 : !DT.dominates(
+                       BoundDef->getParent(), OuterShape->PreHeader))) {
+            return std::nullopt;
+        }
+    }
+
+    //3.2.11 残余外层中不得存在调用，且除已证明从第二轮起
+    //不再进入的耗尽body外，任一store都必须与所有候选load确定NoAlias。
+    for (BasicBlock *BB : Outer->getBlocksIncludingSubLoops()) {
+        if (!BB) return std::nullopt;
+        for (Instruction *I : *BB) {
+            if (dynamic_cast<CallInst *>(I)) return std::nullopt;
+            auto *Store = dynamic_cast<StoreInst *>(I);
+            if (!Store) continue;
+            const bool IsSkippedExhaustionBody =
+                Exhaustion.Inner->contains(BB) &&
+                BB != Exhaustion.InnerHeader;
+            if (IsSkippedExhaustionBody) continue;
+            MemoryLocation StoreLocation = MemoryLocation::get(Store);
+            for (LoadInst *Load : FollowerLoads) {
+                if (AA.alias(StoreLocation, MemoryLocation::get(Load), LI) !=
+                    AliasInfo::NoAlias) {
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+
+    //3.2.12 所有跨子循环use都必须经过唯一出口的LCSSA PHI；
+    //有效结果又只能在当前外层内使用，使首轮克隆值必然支配替换点。
+    std::unordered_set<PhiInst *> ExitPhis;
+    std::vector<PhiInst *> ResultPhis;
+    std::vector<PhiInst *> AllExitPhis;
+    for (PhiInst *Phi : FollowerShape->Exit->collectPhiNodes()) {
+        if (!Phi || Phi->getNumIncomingValues() == 0)
+            return std::nullopt;
+        for (unsigned Index = 0;
+             Index < Phi->getNumIncomingValues(); ++Index) {
+            BasicBlock *Pred = Phi->getIncomingBlock(Index);
+            if (!Pred || !Follower->contains(Pred))
+                return std::nullopt;
+            Value *Incoming = Phi->getIncomingValue(Index);
+            auto *IncomingDef =
+                dynamic_cast<Instruction *>(Incoming);
+            const bool DefinedByFollower =
+                IncomingDef && IncomingDef->getParent() &&
+                Follower->contains(IncomingDef->getParent());
+            if (!DefinedByFollower &&
+                (!LoopInfo::isLoopInvariant(Incoming, Outer) ||
+                 valueMayDependOnUndef(Incoming))) {
+                return std::nullopt;
+            }
+        }
+        ExitPhis.insert(Phi);
+        AllExitPhis.push_back(Phi);
+        if (!Phi->hasUses()) continue;
+        for (Use *U : Phi->getUses()) {
+            auto *User = U ? dynamic_cast<Instruction *>(U->getUser())
+                           : nullptr;
+            if (!User || !User->getParent() ||
+                !Outer->contains(User->getParent()) ||
+                Follower->contains(User->getParent())) {
+                return std::nullopt;
+            }
+        }
+        ResultPhis.push_back(Phi);
+    }
+    if (ResultPhis.empty()) return std::nullopt;
+    for (BasicBlock *BB : Follower->getBlocksIncludingSubLoops()) {
+        for (Instruction *I : *BB) {
+            for (Use *U : I->getUses()) {
+                auto *User = U ? dynamic_cast<Instruction *>(U->getUser())
+                               : nullptr;
+                if (!User || !User->getParent()) return std::nullopt;
+                if (Follower->contains(User->getParent())) continue;
+                auto *ExitPhi = dynamic_cast<PhiInst *>(User);
+                if (!ExitPhi || ExitPhis.count(ExitPhi) == 0)
+                    return std::nullopt;
+            }
+        }
+    }
+
+    LoopPhaseResultReusePlan Plan;
+    Plan.Follower = Follower;
+    Plan.FollowerPreHeader = FollowerShape->PreHeader;
+    Plan.FollowerHeader = FollowerShape->Header;
+    Plan.FollowerContinue = FollowerContinue;
+    Plan.FollowerExit = FollowerShape->Exit;
+    Plan.ResultPhis = std::move(ResultPhis);
+    Plan.AllExitPhis = std::move(AllExitPhis);
+    Plan.GuardBound = SharedGuardBound;
+    Plan.SafeUpperBound = SafeUpperBound;
+    if (HasConstantBound) {
+        if (ConstantBound < 0 || ConstantBound > SafeUpperBound)
+            return std::nullopt;
+        Plan.NeedsRuntimeGuard = false;
+    } else {
+        Plan.NeedsRuntimeGuard = true;
+    }
+    Plan.ConstantTripCount =
+        FollowerTrip->ConstantTripCount.value_or(0);
+    return Plan;
+}
+//识别严格单位步长子循环对外层携带状态形成的幂等耗尽传递
+std::optional<CarriedStateExhaustionPlan>
+LoopUnrollPass::matchCarriedStateExhaustion(
+    Loop *Outer, LoopInfo &LI, SCEVResult &SE, BasicAAResult &AA,
+    RangeInfo &RI, const DominatorTree &DT) {
+    if (!Outer || !LCSSAPass::isLCSSAForm(Outer))
+        return std::nullopt;
+    const auto &SubLoops = Outer->getSubLoops();
+    if (SubLoops.size() == 1)
+        return matchExhaustingInnerLoop(
+            Outer, SubLoops.front(), SE, RI, DT);
+    if (SubLoops.size() != 2) return std::nullopt;
+
+    //3.2.13 两个兄弟子循环时逐一尝试“耗尽者+只读跟随者”，
+    //仅在规范CFG、SSA不变性和NoAlias证明全部闭合时返回计划。
+    std::optional<CarriedStateExhaustionPlan> Match;
+    for (std::size_t Index = 0; Index < SubLoops.size(); ++Index) {
+        Loop *Exhaustor = SubLoops[Index];
+        Loop *Follower = SubLoops[1 - Index];
+        auto Candidate =
+            matchExhaustingInnerLoop(
+                Outer, Exhaustor, SE, RI, DT);
+        if (!Candidate) continue;
+        auto Reuse = matchReusableFollowerLoop(
+            Outer, *Candidate, Follower, LI, SE, AA, RI, DT);
+        if (!Reuse) continue;
+        if (Match) return std::nullopt;
+        Candidate->ResultReuse = std::move(Reuse);
+        Match = std::move(Candidate);
+    }
+    return Match;
+}
 //证明运行时迭代次数在preheader处可用且固定位宽计算不回绕
 bool LoopUnrollPass::proveRuntimeTripCountAtPreheader(
     SCEVResult &SE, const LoopTripCountInfo &TCI, RangeInfo &RI,
@@ -300,6 +1457,26 @@ bool LoopUnrollPass::containsUndef(
         I, [&Active, Depth](size_t, Use *, Value *Operand) {
             if (dynamic_cast<BasicBlock *>(Operand)) return true;
             return !containsUndef(Operand, Active, Depth + 1);
+        });
+    return !NoOperandContainsUndef;
+}
+//递归扫描可观察值链；已独立证明入口与递推的循环状态作为闭包叶子处理
+bool LoopUnrollPass::containsUndefOutsideRoots(
+    Value *V, const std::unordered_set<Value *> &ProvenRoots,
+    std::unordered_set<Value *> &Active, int Depth) {
+    if (!V || Value::isUndef(V)) return true;
+    if (ProvenRoots.count(V)) return false;
+    if (Depth > 32) return true;
+    auto *I = dynamic_cast<Instruction *>(V);
+    if (!I) return false;
+    ScopedActiveMark ActiveMark(Active, V);
+    if (!ActiveMark.inserted()) return true;
+    const bool NoOperandContainsUndef = forEachOperand(
+        I, [&ProvenRoots, &Active, Depth](
+               size_t, Use *, Value *Operand) {
+            if (dynamic_cast<BasicBlock *>(Operand)) return true;
+            return !containsUndefOutsideRoots(
+                Operand, ProvenRoots, Active, Depth + 1);
         });
     return !NoOperandContainsUndef;
 }
@@ -2347,6 +3524,13 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
     if (!L) {
         return LoopUnrollResult::Unmodified;
     }
+    //LoopLoadElimination生成的slow版本只用于越界保护失败时保持原语义；
+    //它是冷回退路径，继续展开只会复制保守代码并挤占函数级展开预算。
+    if (L->getHeader() &&
+        L->getHeader()->getIdent().find(".lle.slow") !=
+            std::string::npos) {
+        return LoopUnrollResult::Unmodified;
+    }
     //2.依次证明规范 CFG/LCSSA、可用 trip-count 和全循环指令可克隆，再估算直属循环体成本。
     if (!isCanonicalLoop(L)) {
         return LoopUnrollResult::Unmodified;
@@ -2376,7 +3560,7 @@ LoopUnrollResult LoopUnrollPass::tryToUnrollLoop(Loop *L,
     case UnrollKind::Runtime:
         return executeRuntimeUnroll(L, Decision, SE, LI, DT);
     case UnrollKind::Peeling:
-        return executePeeling(L, Decision, SE, LI, DT, AA);
+        return executePeeling(L, Decision, SE, LI, DT, AA, RI);
     case UnrollKind::None:
         break;
     }
@@ -2457,12 +3641,23 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         }
     }
     if (Config.AllowPeeling &&
-        Config.PeelThreshold > 0 &&
+        (Config.PeelThreshold > 0 ||
+         Config.PhaseReusePeelThreshold > 0) &&
         Config.MaxPeelBlocks > 0) {
-        //3.2 peeling 次之：一方面匹配 IV==0/IV<1 等首轮特化谓词，另一方面统计剥离后可从残余循环删除的不变 store。
+        //3.2 peeling 次之：除首轮谓词和不变store外，还识别“首轮内层循环
+        //耗尽外层携带状态”的幂等阶段；三者共用同一受控克隆与guard框架。
         auto IV = SE.getCanonicalInduction(L);
-        int PeelCount =
-            (IV && IV->Valid) ? detectPeelCount(L, *IV, Config) : 0;
+        auto StateExhaustion =
+            matchCarriedStateExhaustion(L, LI, SE, AA, RI, DT);
+        const bool HasPhaseReuse =
+            StateExhaustion && StateExhaustion->ResultReuse.has_value();
+        const int PeelCostLimit = HasPhaseReuse
+            ? Config.PhaseReusePeelThreshold
+            : Config.PeelThreshold;
+        int PeelCount = StateExhaustion
+            ? 1
+            : ((IV && IV->Valid)
+                   ? detectPeelCount(L, *IV, Config) : 0);
         const std::size_t InvariantStoreCount =
             collectPeelRedundantStoreCandidates(L, LI, AA, DT).size();
         int64_t PeelCloneCost = 0;
@@ -2470,7 +3665,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         for (BasicBlock *BB : L->getBlocksIncludingSubLoops()) {
             if (!BB) {
                 PeelCloneCost =
-                    static_cast<int64_t>(Config.PeelThreshold) + 1;
+                    static_cast<int64_t>(PeelCostLimit) + 1;
                 break;
             }
             ++PeelBlockCount;
@@ -2502,9 +3697,9 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                     break;
                 }
                 if (PeelCloneCost >
-                    Config.PeelThreshold - LocalCost) {
+                    PeelCostLimit - LocalCost) {
                     PeelCloneCost =
-                        static_cast<int64_t>(Config.PeelThreshold) + 1;
+                        static_cast<int64_t>(PeelCostLimit) + 1;
                     break;
                 }
                 PeelCloneCost += LocalCost;
@@ -2513,7 +3708,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         if (IV && IV->Valid &&
             PeelBlockCount <= Config.MaxPeelBlocks &&
             PeelCloneCost > 0 &&
-            PeelCloneCost <= Config.PeelThreshold) {
+            PeelCloneCost <= PeelCostLimit) {
             //3.2.1 若无首轮谓词需要 peeling，只有已证 no-wrap 的精确常量 trip count 才能用不变 store 动态收益触发一次剥离。
             if (PeelCount == 0 && TCI.ProvenNoWrap &&
                 TCI.ConstantTripCount &&
@@ -2547,6 +3742,53 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                     PeelCount = 1;
                 }
             }
+            //3.2.3 首阶段结果复用单独使用饱和收益模型：只消费
+            //SCEV已经证明的常量次数和通用opcode成本，不匹配任何用例规模。
+            bool PhaseReuseProfitable = true;
+            if (HasPhaseReuse) {
+                PhaseReuseProfitable =
+                    TCI.ProvenNoWrap && TCI.ConstantTripCount &&
+                    *TCI.ConstantTripCount > 1;
+                int FollowerBodyCost = PhaseReuseProfitable
+                    ? estimateLoopBodyCost(
+                          StateExhaustion->ResultReuse->Follower, LI)
+                    : 0;
+                PhaseReuseProfitable &= FollowerBodyCost > 0;
+                if (PhaseReuseProfitable) {
+                    const int64_t Limit =
+                        std::numeric_limits<int64_t>::max();
+                    auto SaturatingMultiply =
+                        [Limit](int64_t Left, int64_t Right) {
+                            if (Left <= 0 || Right <= 0)
+                                return int64_t{0};
+                            if (Left > Limit / Right) return Limit;
+                            return Left * Right;
+                        };
+                    //运行时Follower不猜测输入次数，只按一次条件/结果选择的
+                    //最低收益计费；常量次数仍使用精确循环体成本。
+                    int64_t FollowerBenefit = 1;
+                    if (StateExhaustion->ResultReuse->
+                            ConstantTripCount > 0) {
+                        FollowerBenefit = SaturatingMultiply(
+                            StateExhaustion->ResultReuse->
+                                ConstantTripCount,
+                            FollowerBodyCost);
+                    }
+                    int64_t DynamicBenefit = SaturatingMultiply(
+                        *TCI.ConstantTripCount - 1,
+                        FollowerBenefit);
+                    int64_t RequiredBenefit = PeelCloneCost;
+                    const int64_t Margin =
+                        std::max(0, Config.PhaseReuseMinNetBenefit);
+                    if (RequiredBenefit > Limit - Margin) {
+                        RequiredBenefit = Limit;
+                    } else {
+                        RequiredBenefit += Margin;
+                    }
+                    PhaseReuseProfitable =
+                        DynamicBenefit >= RequiredBenefit;
+                }
+            }
             bool ConstantLongEnough =
                 TCI.ProvenNoWrap && TCI.ConstantTripCount &&
                 *TCI.ConstantTripCount > PeelCount;
@@ -2555,9 +3797,10 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 PeelCount <= Config.MaxGuardedPeelCount;
             if (PeelCount > 0 &&
                 PeelCount <= Config.MaxPeelCount &&
+                PhaseReuseProfitable &&
                 (ConstantLongEnough || CanGuardRuntime) &&
                 PeelCloneCost * PeelCount <=
-                    Config.PeelThreshold) {
+                    PeelCostLimit) {
                 UnrollDecision Decision;
                 Decision.Kind = UnrollKind::Peeling;
                 Decision.Count = PeelCount;
@@ -2565,6 +3808,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 Decision.NeedRemainder = false;
                 Decision.IsRuntime = false;
                 Decision.IsPeeling = true;
+                Decision.StateExhaustion = StateExhaustion;
                 return Decision;
             }
         }
@@ -2929,7 +4173,8 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     SCEVResult &SE,
     LoopInfo &LI,
     DominatorTree &DT,
-    BasicAAResult &AA) {
+    BasicAAResult &AA,
+    RangeInfo &RI) {
     if (!L || Decision.Count <= 0) {
         return LoopUnrollResult::Unmodified;
     }
@@ -2952,9 +4197,59 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
     if (!TCI || !TCI->Valid) {
         return LoopUnrollResult::Unmodified;
     }
+    //6.0 阶段耗尽计划在执行点重新匹配，避免决策后缓存变化或失效指针使
+    //残余子循环被错误跳过；该模式固定只剥离一次真实外层迭代。
+    std::optional<CarriedStateExhaustionPlan> StateExhaustion;
+    if (Decision.StateExhaustion) {
+        if (PeelCount != 1) return LoopUnrollResult::Unmodified;
+        StateExhaustion =
+            matchCarriedStateExhaustion(L, LI, SE, AA, RI, DT);
+        if (!StateExhaustion ||
+            StateExhaustion->Inner != Decision.StateExhaustion->Inner ||
+            StateExhaustion->InnerHeader !=
+                Decision.StateExhaustion->InnerHeader ||
+            StateExhaustion->InnerContinue !=
+                Decision.StateExhaustion->InnerContinue ||
+            StateExhaustion->InnerExit !=
+                Decision.StateExhaustion->InnerExit ||
+            StateExhaustion->InnerIV !=
+                Decision.StateExhaustion->InnerIV ||
+            StateExhaustion->OuterState !=
+                Decision.StateExhaustion->OuterState ||
+            StateExhaustion->OuterInitial !=
+                Decision.StateExhaustion->OuterInitial ||
+            StateExhaustion->Bound != Decision.StateExhaustion->Bound ||
+            StateExhaustion->ResultReuse.has_value() !=
+                Decision.StateExhaustion->ResultReuse.has_value()) {
+            return LoopUnrollResult::Unmodified;
+        }
+        if (StateExhaustion->ResultReuse) {
+            const auto &Current = *StateExhaustion->ResultReuse;
+            const auto &Decided = *Decision.StateExhaustion->ResultReuse;
+            if (Current.Follower != Decided.Follower ||
+                Current.FollowerPreHeader !=
+                    Decided.FollowerPreHeader ||
+                Current.FollowerHeader != Decided.FollowerHeader ||
+                Current.FollowerContinue != Decided.FollowerContinue ||
+                Current.FollowerExit != Decided.FollowerExit ||
+                Current.ConstantTripCount != Decided.ConstantTripCount ||
+                Current.ResultPhis != Decided.ResultPhis ||
+                Current.AllExitPhis != Decided.AllExitPhis ||
+                Current.GuardBound != Decided.GuardBound ||
+                Current.SafeUpperBound != Decided.SafeUpperBound ||
+                Current.NeedsRuntimeGuard !=
+                    Decided.NeedsRuntimeGuard) {
+                return LoopUnrollResult::Unmodified;
+            }
+        }
+    }
     //6.1 只有已证 no-wrap 的常量次数才能证明前 PeelCount 次一定执行并删除克隆退出检查；否则只允许少量 guarded peeling。
     const bool GuardedPeeling =
         !TCI->ConstantTripCount.has_value() || !TCI->ProvenNoWrap;
+    if (StateExhaustion && StateExhaustion->ResultReuse &&
+        GuardedPeeling) {
+        return LoopUnrollResult::Unmodified;
+    }
     if (GuardedPeeling) {
         if ((!TCI->IsRuntime && TCI->ProvenNoWrap) ||
             PeelCount > Config.MaxGuardedPeelCount)
@@ -2989,6 +4284,65 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
         discardUncommittedPeelClones(*Core);
         return LoopUnrollResult::Unmodified;
     };
+    //6.2.1 阶段结果必须在任何CFG提交之前严格命中首轮克隆
+    //ValueMap；禁止使用“未命中则返回原值”的宽松映射语义。
+    std::vector<std::pair<PhiInst *, Value *>> PhaseResultMappings;
+    int PhaseFollowerRemovedEdges = 0;
+    if (StateExhaustion && StateExhaustion->ResultReuse) {
+        const auto &Reuse = *StateExhaustion->ResultReuse;
+        if (Core->ValueMaps.empty() || !Core->Latches.front())
+            return FailUncommitted();
+        const std::vector<PhiInst *> &RequiredPhis =
+            Reuse.NeedsRuntimeGuard
+                ? Reuse.AllExitPhis : Reuse.ResultPhis;
+        for (PhiInst *Phi : RequiredPhis) {
+            if (!Phi) return FailUncommitted();
+            auto It = Core->ValueMaps.front().find(Phi);
+            if (It == Core->ValueMaps.front().end() ||
+                !It->second || It->second == Phi ||
+                !isValueCompatibleWithPhi(It->second, Phi)) {
+                return FailUncommitted();
+            }
+            auto *MappedInst =
+                dynamic_cast<Instruction *>(It->second);
+            if (!MappedInst ||
+                MappedInst->getParent() != Core->Latches.front()) {
+                return FailUncommitted();
+            }
+            PhaseResultMappings.push_back({Phi, It->second});
+        }
+        auto *FollowerBranch =
+            Reuse.FollowerHeader
+                ? Reuse.FollowerHeader->getBranchTerminator()
+                : nullptr;
+        PhaseFollowerRemovedEdges = Reuse.FollowerHeader
+            ? Reuse.FollowerHeader->countEdgesToSucc(
+                  Reuse.FollowerContinue)
+            : 0;
+        if (!BasicBlock::isCondBr(FollowerBranch) ||
+            PhaseFollowerRemovedEdges <= 0 ||
+            Reuse.FollowerHeader->countEdgesToSucc(
+                Reuse.FollowerExit) <= 0 ||
+            PhaseResultMappings.size() != RequiredPhis.size()) {
+            return FailUncommitted();
+        }
+        if (Reuse.NeedsRuntimeGuard) {
+            auto *FollowerPreBranch = Reuse.FollowerPreHeader
+                ? Reuse.FollowerPreHeader->getBranchTerminator()
+                : nullptr;
+            if (!Reuse.GuardBound || Reuse.SafeUpperBound <= 0 ||
+                !IRType::hasIntegerBitWidth(
+                    Reuse.GuardBound->getIRType(), 32) ||
+                !BasicBlock::isUncondBr(FollowerPreBranch) ||
+                FollowerPreBranch->getSuccessor(0) !=
+                    Reuse.FollowerHeader) {
+                return FailUncommitted();
+            }
+        }
+        if (Reuse.AllExitPhis.empty()) {
+            return FailUncommitted();
+        }
+    }
     if (!rewriteOriginalHeaderPhisAfterPeeling(
             *Core, true)) {
         return FailUncommitted();
@@ -3089,7 +4443,67 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
             *Core, false)) {
         return LoopUnrollResult::Unmodified;
     }
-    //6.5 所有进入残余循环的路径已完成剥离；阶段 3 证明控制、地址和写值不变且无竞争别名的 store 在残余迭代中仅重复同一写入，此处只删 store 不删 load。
+    //6.5 首个克隆迭代已经把状态传递到严格比较的稳定假值；只在残余原
+    //子循环上删除继续边，剥离副本仍完整执行原有浮点、调用与内存顺序。
+    if (StateExhaustion) {
+        const int RemovedEdges =
+            StateExhaustion->InnerHeader->countEdgesToSucc(
+                StateExhaustion->InnerContinue);
+        if (RemovedEdges <= 0 ||
+            !BasicBlock::replaceCondBrWithUncond(
+                StateExhaustion->InnerHeader,
+                StateExhaustion->InnerExit)) {
+            SE.clear();
+            return LoopUnrollResult::PartiallyUnrolled;
+        }
+        BasicBlock::removeEdgeFromSuccPhis(
+            StateExhaustion->InnerContinue,
+            StateExhaustion->InnerHeader, RemovedEdges);
+    }
+    //6.6 候选只读阶段已由首轮真实执行产生结果。常量边界已经静态证明
+    //安全时保持原有直接删除；运行时边界则在Follower预头生成对象容量守卫，
+    //安全路径选择首轮克隆值，失败路径完整执行原循环。两条路径都保留外层
+    //逐轮浮点累加，不作乘法化、重关联或任何精度改写。
+    if (StateExhaustion && StateExhaustion->ResultReuse) {
+        const auto &Reuse = *StateExhaustion->ResultReuse;
+        if (Reuse.NeedsRuntimeGuard) {
+            Value *Zero = makeTypedIntConstant(
+                0, Reuse.GuardBound->getIRType());
+            Value *SafeUpper = makeTypedIntConstant(
+                Reuse.SafeUpperBound, Reuse.GuardBound->getIRType());
+            auto *NonNegative = new BinaryInst(
+                Reuse.GuardBound, BinaryInst::GE, Zero);
+            auto *WithinObject = new BinaryInst(
+                Reuse.GuardBound, BinaryInst::LE, SafeUpper);
+            auto *UseCachedResult = new BinaryInst(
+                NonNegative, BinaryInst::AND, WithinObject);
+            //预检已固定预头、类型和全部出口PHI，此处提交后不再调用可能
+            //失败的分析接口，避免留下只有半条快路径的CFG。
+            Reuse.FollowerPreHeader->insertBeforeTerminator(NonNegative);
+            Reuse.FollowerPreHeader->insertBeforeTerminator(WithinObject);
+            Reuse.FollowerPreHeader->insertBeforeTerminator(UseCachedResult);
+            for (const auto &Mapping : PhaseResultMappings)
+                Mapping.first->addIncoming(
+                    Mapping.second, Reuse.FollowerPreHeader);
+            Reuse.FollowerPreHeader->replaceTerminator(
+                new BrInst(UseCachedResult, Reuse.FollowerExit,
+                           Reuse.FollowerHeader));
+        } else {
+            if (!BasicBlock::replaceCondBrWithUncond(
+                    Reuse.FollowerHeader, Reuse.FollowerExit)) {
+                SE.clear();
+                return LoopUnrollResult::PartiallyUnrolled;
+            }
+            BasicBlock::removeEdgeFromSuccPhis(
+                Reuse.FollowerContinue, Reuse.FollowerHeader,
+                PhaseFollowerRemovedEdges);
+            for (const auto &Mapping : PhaseResultMappings) {
+                if (Mapping.first && Mapping.second)
+                    Mapping.first->replaceAllUsesWith(Mapping.second);
+            }
+        }
+    }
+    //6.7 所有进入残余循环的路径已完成剥离；阶段 3 证明控制、地址和写值不变且无竞争别名的 store 在残余迭代中仅重复同一写入，此处只删 store不删load。
     for (StoreInst *SI : RedundantResidualStores) {
         if (!SI || !SI->getParent() || !L->contains(SI->getParent()))
             continue;
@@ -3102,8 +4516,67 @@ LoopUnrollResult LoopUnrollPass::executePeeling(
 //遍历函数内循环并提交至多四次安全展开
 PreservationStatus LoopUnrollPass::run(Function &F,
                                        FunctionAnalysisPassManager &FAM) {
+    //1.普通展开前按外层优先识别“首轮建立稳定内存、后续只剩标量递推”的阶段；
+    //成功后CFG和SSA均已改变，立即停止本轮并让固定点重建全部分析。
+    {
+        auto &PhaseLI = FAM.getResult<LoopAnalysis>(F);
+        auto &PhaseDT = FAM.getResult<DominantAnalysis>(F);
+        auto &PhasePDT = FAM.getResult<PostDominantAnalysis>(F);
+        auto &PhaseSE = FAM.getResult<SCEVAnalysis>(F);
+        auto &PhaseAA = FAM.getResult<BasicAliasAnalysis>(F);
+        auto &PhaseRI = FAM.getResult<RangeAnalysis>(F);
+        auto PhaseLoops = PhaseLI.getLoopsInPostOrder(true);
+        std::reverse(PhaseLoops.begin(), PhaseLoops.end());
+        for (Loop *Outer : PhaseLoops) {
+            auto Plan = matchInvariantStoreReductionPhase(
+                Outer, PhaseLI, PhaseSE, PhaseAA, PhaseRI,
+                PhaseDT, PhasePDT, Config);
+            if (!Plan) continue;
+            if (!applyInvariantStoreReductionPhase(F, *Plan)) continue;
+            PhaseSE.clear();
+            FAM.invalidate(F, PreservationStatus::none());
+            return PreservationStatus::none();
+        }
+    }
     auto &AlreadyTransformed = TransformedLoopHeaders[&F];
-    //1.只快照Pass入口时存在且未记录的循环头，避免同一原循环被固定点重复倍增
+    //2.普通子循环展开前再按外层优先处理“首轮耗尽状态、只读阶段结果
+    //可复用”的peeling。提前提交这一通用形状，避免先展开Follower后丢失
+    //兄弟循环关系；一次成功后立即重建全部分析。
+    {
+        auto &PhaseLI = FAM.getResult<LoopAnalysis>(F);
+        auto &PhaseDT = FAM.getResult<DominantAnalysis>(F);
+        auto &PhaseSE = FAM.getResult<SCEVAnalysis>(F);
+        auto &PhaseAA = FAM.getResult<BasicAliasAnalysis>(F);
+        auto &PhaseRI = FAM.getResult<RangeAnalysis>(F);
+        auto PhaseLoops = PhaseLI.getLoopsInPostOrder(true);
+        std::reverse(PhaseLoops.begin(), PhaseLoops.end());
+        for (Loop *Outer : PhaseLoops) {
+            if (!Outer || !Outer->getHeader() ||
+                AlreadyTransformed.count(
+                    Outer->getHeader()->getIdent()) != 0) {
+                continue;
+            }
+            auto Plan = matchCarriedStateExhaustion(
+                Outer, PhaseLI, PhaseSE, PhaseAA, PhaseRI, PhaseDT);
+            //常量Follower沿用既有固定点顺序，避免改变已经通过验证的
+            //稳定代码形态；只有需要容量守卫的运行时Follower必须抢在
+            //普通子循环展开前提交。
+            if (!Plan || !Plan->ResultReuse ||
+                !Plan->ResultReuse->NeedsRuntimeGuard) {
+                continue;
+            }
+            const std::string HeaderIdent =
+                Outer->getHeader()->getIdent();
+            LoopUnrollResult Result = tryToUnrollLoop(
+                Outer, PhaseLI, PhaseDT, PhaseSE, PhaseAA, PhaseRI);
+            if (Result == LoopUnrollResult::Unmodified) continue;
+            AlreadyTransformed.insert(HeaderIdent);
+            PhaseSE.clear();
+            FAM.invalidate(F, PreservationStatus::none());
+            return PreservationStatus::none();
+        }
+    }
+    //3.只快照Pass入口时存在且未记录的循环头，避免同一原循环被固定点重复倍增
     std::vector<BasicBlock *> CandidateHeaders;
     {
         auto &InitialLI = FAM.getResult<LoopAnalysis>(F);
@@ -3114,12 +4587,12 @@ PreservationStatus LoopUnrollPass::run(Function &F,
         }
     }
     if (CandidateHeaders.empty()) return PreservationStatus::all();
-    //2.每次调用最多成功四个循环，统一限制函数级代码增长和分析重建成本
+    //4.每次调用最多成功四个循环，统一限制函数级代码增长和分析重建成本
     static constexpr size_t MaxTransformsPerRun = 4;
     size_t TransformCount = 0;
     bool Changed = false;
     for (BasicBlock *Header : CandidateHeaders) {
-        //3.早先的外循环展开可能删除快照内头，解引用前先按指针身份确认存活
+        //5.早先的外循环展开可能删除快照内头，解引用前先按指针身份确认存活
         bool HeaderIsLive = false;
         for (BasicBlock *BB : F) {
             if (BB == Header) {
@@ -3143,7 +4616,7 @@ PreservationStatus LoopUnrollPass::run(Function &F,
         Changed = true;
         ++TransformCount;
         SE.clear();
-        //4.克隆及CFG/SSA改写会使现有分析引用过期，处理下一候选前全部失效
+        //6.克隆及CFG/SSA改写会使现有分析引用过期，处理下一候选前全部失效
         FAM.invalidate(F, PreservationStatus::none());
         if (TransformCount >= MaxTransformsPerRun) break;
     }

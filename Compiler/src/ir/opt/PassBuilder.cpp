@@ -6,11 +6,13 @@
 #include "ir/opt/DSE.hpp"
 #include "ir/opt/StoreMerge.hpp"
 #include "ir/opt/LoadElimination.hpp"
+#include "ir/opt/LoopLoadElimination.hpp"
 #include "ir/opt/CFGSimpify.hpp"
 #include "ir/opt/SCCP.hpp"
 #include "ir/opt/InstSimplify.hpp"
 #include "ir/opt/FuncInline.hpp"
 #include "ir/opt/FunctionMemoization.hpp"
+#include "ir/opt/RecursiveHalvingReplay.hpp"
 #include "ir/opt/LoopSimplify.hpp"
 #include "ir/opt/LCSSA.hpp"
 #include "ir/opt/LoopRotate.hpp"
@@ -47,6 +49,7 @@
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/opt/GlobalInitializerFold.hpp"
 #include "ir/opt/LoopIdiomRecognize.hpp"
+#include "ir/opt/LoopPhaseRelayout.hpp"
 #include "ir/opt/LoopInterchange.hpp"
 #include "ir/opt/LoopDistribution.hpp"
 #include "ir/opt/LoopFusion.hpp"
@@ -195,6 +198,8 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(IndVarSimplifyPass());
     FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(LICMPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopLoadEliminationPass(), 4));
     //4. Unswitch克隆CFG后消费新产生的边约束，再次恢复LoopSimplify+LCSSA。
     FPM.addPass(LoopUnswitchPass());
     FPM.addPass(CFGSimplifyPass());
@@ -219,7 +224,12 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(DCEPass());
     FPM.addPass(LoopDeletionPass());
     FPM.addPass(LoopStrengthReductionPass());
-    //6. 最后展开剩余适合循环，并对展开结果运行最多两轮专用清理，末尾关闭 CFG/死值。
+    //6. 前面的CFG清理可能把空预头重新并入条件入口；展开前再次恢复
+    //LoopSimplify+LCSSA，保证运行时版本化产生的快慢循环也能独立参与成本模型。
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 8));
+    FPM.addPass(LCSSAPass());
+    //7. 最后展开剩余适合循环，并对展开结果运行最多两轮专用清理，末尾关闭 CFG/死值。
     FPM.addPass(LoopUnrollPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildPostUnrollCleanupPipeline(), 2));
@@ -270,6 +280,8 @@ FunctionPassManager PassBuilder::buildLateLoopRediscoveryPipeline() {
         LoopSimplifyPass(), 2));
     FPM.addPass(LCSSAPass());
     FPM.addPass(LICMPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopLoadEliminationPass(), 4));
     FPM.addPass(LoopIdiomRecognizePass());
     FPM.addPass(InstSimplifyPass());
     FPM.addPass(ReassociatePass( true));
@@ -371,12 +383,23 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     //8. 在重型内存阶段前先做一次 if-conversion，再依次运行 GVN/PRE、load、DSE、ADCE。
     MPM.addPass(createModuleFunctionBridge(IfConversionPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildHeavyMemoryPipeline(), FAM));
-    //9. 循环主 pipeline 以模块级三轮固定点运行，随后做一次专用 post-loop 闭合。
+    //9. 先恢复统一的LoopSimplify/LCSSA/IV形态，再把完整二维生产阶段的最终值
+    //镜像成消费者友好布局；该Pass只依据循环、地址和缓存成本建模。
+    MPM.addPass(createModuleFunctionBridge(BreakCriticalEdgesPass(), FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        createModuleFunctionBridge(LoopSimplifyPass(), FAM), 4));
+    MPM.addPass(createModuleFunctionBridge(LCSSAPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(IndVarSimplifyPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
+    MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
+        LoopPhaseRelayoutPass(FAM), 4));
+    //10. 循环主 pipeline 以模块级三轮固定点运行，随后做一次专用 post-loop 闭合。
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLoopPipeline(), FAM), 3));
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildPostLoopCleanupPipeline(), FAM), 1));
-    //10. 循环变换改变调用参数与常量后再运行DAE/标量清理；随后用低增长模型
+    //11. 循环变换改变调用参数与常量后再运行DAE/标量清理；随后用低增长模型
     //内联新生成的专用小函数，并立即删除旧函数体与清理克隆表达式。
     MPM.addPass(DAEPass());
     MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
@@ -387,10 +410,12 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(createModuleFunctionBridge(buildLightCleanupPipeline(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM));
     MPM.addPass(DeadFunctionEliminationPass(FAM));
-    //11. 在主要内联/循环优化完成后为合适递归函数插入 memoization，避免早期缓存 CFG
+    //12. 在主要内联/循环优化完成后为合适递归函数插入 memoization，避免早期缓存 CFG
     //干扰结构变换。
     MPM.addPass(FunctionMemoizationPass(FAM));
-    //12. 宽松 Global2Local 与 Mem2Reg 再标量化缓存/模块清理暴露的小全局，随后运行
+    //仅在主要 DAE、内联和 memoization 完成后改写一次有界折半自递归，避免放大早期相位。
+    MPM.addPass(createModuleFunctionBridge(RecursiveHalvingReplayPass(), FAM));
+    //13. 宽松 Global2Local 与 Mem2Reg 再标量化缓存/模块清理暴露的小全局，随后运行
     //标量固定点和 late 循环再发现。
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(
          true), FAM));
@@ -404,16 +429,26 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
         createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
     MPM.addPass(createModuleFunctionBridge(
         buildLateLoopRediscoveryPipeline(), FAM));
-    //13. 最后一轮地址、store合流、load、DSE、死值和CFG清理后进入late控制流。
-    MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
-    MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
-    MPM.addPass(createModuleFunctionBridge(StoreMergePass(), FAM));
+	//13. 最后一轮地址规范化后，只提升由该阶段重新暴露的循环不变GEP；随后执行
+	//store合流、load、DSE、死值和CFG清理并进入late控制流。
+	MPM.addPass(createModuleFunctionBridge(GepCombinePass(), FAM));
+	MPM.addPass(createModuleFunctionBridge(GepEvaluatePass(), FAM));
+	MPM.addPass(createModuleFunctionBridge(
+		LICMPass(LICMMode::AddressOnly), FAM));
+	MPM.addPass(createModuleFunctionBridge(StoreMergePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(LoadEliminationPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DSEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));
-    //14. 模块收尾删除只写/无 use 全局与死函数，确保新增特化、缓存和内联残骸不输出。
+    //14. 所有GEP/GVN重建结束后再运行RV64跨基址原子LSR，使新建的
+    //non-inbounds指针递推不再经过会重建地址语义的中端变换。
+    MPM.addPass(createModuleFunctionBridge(
+        LoopStrengthReductionPass( true), FAM));
+    MPM.addPass(createModuleFunctionBridge(
+        createFixedPointPass<Function, FunctionAnalysisPassManager>(
+            LoopLoadEliminationPass(), 4), FAM));
+    //15. 模块收尾删除只写/无 use 全局与死函数，确保新增特化、缓存和内联残骸不输出。
     MPM.addPass(DeadGlobalCleanupPass());
     MPM.addPass(DeadFunctionEliminationPass(FAM));
     return MPM;

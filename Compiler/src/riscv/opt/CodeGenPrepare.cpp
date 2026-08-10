@@ -92,7 +92,9 @@ using AffineIndexCache =
 // 迭代才回到范围内），因此新造的 GEP 不能声称 inbounds，以免误导后续优化。
 class NonInBoundsGEPInst final : public GetElementPtrInst {
 public:
-  explicit NonInBoundsGEPInst(Value *Base) : GetElementPtrInst(Base) {}
+  explicit NonInBoundsGEPInst(Value *Base) : GetElementPtrInst(Base) {
+    setInBounds(false);
+  }
 
   void dumpIR() override {
     Value::dumpIR();

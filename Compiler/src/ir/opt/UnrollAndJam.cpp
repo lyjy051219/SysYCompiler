@@ -2372,7 +2372,7 @@ PassResult UnrollAndJamPass::run(Function &F,
             Decision.IsPeeling = true;
             Decision.TripCountIsProven = true;
             const LoopUnrollResult Result = Peeler.executePeeling(
-                Shape->Outer, Decision, SE, LI, DT, AA);
+                Shape->Outer, Decision, SE, LI, DT, AA, RI);
             if (Result != LoopUnrollResult::Unmodified) {
                 return PassResult::changed(PreservationStatus::none());
             }

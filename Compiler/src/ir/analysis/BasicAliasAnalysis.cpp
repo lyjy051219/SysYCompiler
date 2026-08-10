@@ -1,5 +1,7 @@
 #include "ir/analysis/BasicAliasAnalysis.hpp"
+#include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
 #include "lib/Target.hpp"
@@ -156,6 +158,366 @@ BasicAAResult::getObjectSize(Value *V) const {
 //返回指针至少满足的已知字节对齐
 std::size_t BasicAAResult::getKnownAlignment(Value *V) const {
     return getPointerProvenance(V).KnownAlignment;
+}
+//证明一次完整内存访问在指定程序点始终位于唯一栈或全局对象内
+bool BasicAAResult::isLocationProvablyInBoundsAt(
+    const MemoryLocation &Location, Instruction *Context,
+    SCEVResult &SE, RangeInfo &RI,
+    const DominatorTree &DT) const {
+    //1. 只消费具有确定宽度、确定程序点且不依赖undef的访问；零字节访问天然在界。
+    if (!Location.Pointer || !Location.Size || !Context ||
+        !Context->getParent()) {
+        return false;
+    }
+    std::unordered_set<Value *> UndefActive;
+    if (hasUndefPointerOrigin(Location.Pointer, UndefActive)) return false;
+    if (*Location.Size == 0) return true;
+    const PointerProvenanceInfo &Provenance =
+        getPointerProvenance(Location.Pointer);
+    Value *ObjectRoot = Provenance.getUniqueBase();
+    //2. 对象大小和自然对齐都必须覆盖真实访问，避免把只证明字节区间的地址
+    //误当成目标机器上不会触发未对齐异常的地址。
+    if (!ObjectRoot || !Provenance.ObjectSize ||
+        Provenance.KnownAlignment < *Location.Size) {
+        return false;
+    }
+    auto *RootGlobal = dynamic_cast<Variable *>(ObjectRoot);
+    if (!dynamic_cast<AllocaInst *>(ObjectRoot) &&
+        (!RootGlobal || !RootGlobal->isGlobal())) {
+        return false;
+    }
+    //3. 反向收集透明bitcast/GEP链，最终根必须与来源分析发布的唯一对象一致。
+    std::vector<GetElementPtrInst *> AddressChain;
+    std::unordered_set<Value *> Seen;
+    Value *Current = Location.Pointer;
+    while (Current && Seen.insert(Current).second) {
+        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Current)) {
+            AddressChain.push_back(GEP);
+            Current = GEP->getBasePointer();
+            continue;
+        }
+        if (auto *BitCast = dynamic_cast<BitCastInst *>(Current)) {
+            Value *Source = BitCast->getUnaryOperand();
+            if (!Source || !Source->isPointerValue()) return false;
+            Current = Source;
+            continue;
+        }
+        break;
+    }
+    if (Current != ObjectRoot) return false;
+    //4. 从对象根开始逐级累加typed GEP字节区间；每一级都必须留在同一对象内，
+    //从而拒绝“先越界、再折返”的地址表达式。
+    std::reverse(AddressChain.begin(), AddressChain.end());
+    __int128 MinimumOffset = 0;
+    __int128 MaximumOffset = 0;
+    const __int128 ObjectBytes =
+        static_cast<__int128>(*Provenance.ObjectSize);
+    for (GetElementPtrInst *GEP : AddressChain) {
+        if (!GEP || !GEP->getParent()) return false;
+        Value *Base = nullptr;
+        std::vector<Value *> Indices;
+        std::vector<int64_t> Strides;
+        int64_t FinalPointeeStride = 0;
+        if (!GEP->getBaseAndIndices(Base, Indices) ||
+            !GetElementPtrInst::getIndexStrides(
+                Base, Indices, Strides, FinalPointeeStride) ||
+            Indices.size() != Strides.size()) {
+            return false;
+        }
+        (void)FinalPointeeStride;
+        for (std::size_t Index = 0; Index < Indices.size(); ++Index) {
+            Value *IndexValue = Indices[Index];
+            int64_t Lower = 0;
+            int64_t Upper = 0;
+            if (!IndexValue) return false;
+            if (!IndexValue->tryGetInt64Const(Lower)) {
+                //范围必须在新访存实际插入的程序点成立；循环体条件事实不能泄漏到预头。
+                IntRange Range = SE.evaluateValueRangeAt(
+                    IndexValue, Context, RI, DT);
+                if (Range.isBottom() || Range.isTop()) return false;
+                Lower = Range.min;
+                Upper = Range.max;
+            } else {
+                Upper = Lower;
+            }
+            const __int128 First =
+                static_cast<__int128>(Strides[Index]) * Lower;
+            const __int128 Second =
+                static_cast<__int128>(Strides[Index]) * Upper;
+            const __int128 TermMinimum = std::min(First, Second);
+            const __int128 TermMaximum = std::max(First, Second);
+            if (TermMinimum < -MinimumOffset ||
+                TermMaximum > ObjectBytes - MaximumOffset) {
+                return false;
+            }
+            MinimumOffset += TermMinimum;
+            MaximumOffset += TermMaximum;
+        }
+        if (MinimumOffset < 0 || MaximumOffset < MinimumOffset ||
+            MaximumOffset > ObjectBytes) {
+            return false;
+        }
+    }
+    const __int128 AccessBytes =
+        static_cast<__int128>(*Location.Size);
+    return AccessBytes <= ObjectBytes && MinimumOffset >= 0 &&
+        MaximumOffset <= ObjectBytes - AccessBytes;
+}
+//从规范start0/step1且由header或latch控制回边的归纳下标提取严格i32上界
+bool BasicAAResult::getCanonicalIndexUpperBound(
+    Value *Index, Instruction *Context,
+    const DominatorTree &DT, const LoopInfo &LI,
+    SCEVResult &SE, Value *&Bound,
+    Value *AdditionalNonNegativeStart) {
+    (void)SE;
+    auto *Phi = dynamic_cast<PhiInst *>(Index);
+    if (!Phi || !Phi->getParent() || !Context ||
+        !Context->getParent() ||
+        !IRType::hasIntegerBitWidth(Phi->getIRType(), 32)) {
+        return false;
+    }
+    Loop *IndexLoop = LI.getLoopFor(Phi->getParent());
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Latch = nullptr;
+    if (!IndexLoop || IndexLoop->getHeader() != Phi->getParent() ||
+        Phi->getNumIncomingValues() != 2) {
+        return false;
+    }
+    Value *Start = nullptr;
+    Value *UpdateValue = nullptr;
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        BasicBlock *Pred = Phi->getIncomingBlock(I);
+        Value *Incoming = Phi->getIncomingValue(I);
+        if (!Pred || !Incoming) return false;
+        if (IndexLoop->contains(Pred)) {
+            if (Latch) return false;
+            Latch = Pred;
+            UpdateValue = Incoming;
+        } else {
+            if (PreHeader) return false;
+            PreHeader = Pred;
+            Start = Incoming;
+        }
+    }
+    if (!PreHeader || !Latch ||
+        Latch->countEdgesToSucc(Phi->getParent()) != 1) {
+        return false;
+    }
+    Value *NormalizedStart = Start;
+    std::unordered_set<Value *> StartSeen;
+    for (unsigned Depth = 0; NormalizedStart && Depth < 8; ++Depth) {
+        auto *StartPhi = dynamic_cast<PhiInst *>(NormalizedStart);
+        if (!StartPhi || StartPhi->getNumIncomingValues() != 1 ||
+            !StartSeen.insert(NormalizedStart).second) {
+            break;
+        }
+        NormalizedStart = StartPhi->getIncomingValue(0);
+    }
+    int64_t StartConstant = 0;
+    const bool StartsAtZero =
+        NormalizedStart &&
+        NormalizedStart->tryGetInt64Const(StartConstant) &&
+        StartConstant == 0;
+    const bool HasProvenNonNegativeStart =
+        AdditionalNonNegativeStart &&
+        NormalizedStart == AdditionalNonNegativeStart;
+    if ((!StartsAtZero && !HasProvenNonNegativeStart) || !UpdateValue) {
+        return false;
+    }
+    auto IsUnitIncrement = [Phi](Value *V) {
+        auto *Add = dynamic_cast<BinaryInst *>(V);
+        if (!Add || Add->getOp() != BinaryInst::ADD) return false;
+        Value *A = Add->getOperand(0);
+        Value *B = Add->getOperand(1);
+        int64_t Step = 0;
+        return ((A == Phi && B && B->tryGetInt64Const(Step)) ||
+                (B == Phi && A && A->tryGetInt64Const(Step))) &&
+            Step == 1;
+    };
+    bool HasUnitUpdate = IsUnitIncrement(UpdateValue);
+    if (!HasUnitUpdate) {
+        auto *MergeUpdate = dynamic_cast<PhiInst *>(UpdateValue);
+        HasUnitUpdate = MergeUpdate &&
+            MergeUpdate->getParent() == Latch &&
+            MergeUpdate->getNumIncomingValues() > 0;
+        if (MergeUpdate) {
+            for (unsigned I = 0;
+                 HasUnitUpdate && I < MergeUpdate->getNumIncomingValues();
+                 ++I) {
+                BasicBlock *Pred = MergeUpdate->getIncomingBlock(I);
+                HasUnitUpdate = Pred && IndexLoop->contains(Pred) &&
+                    IsUnitIncrement(MergeUpdate->getIncomingValue(I));
+            }
+        }
+    }
+    if (!HasUnitUpdate) return false;
+    BasicBlock *Exiting = nullptr;
+    BasicBlock *InsideSuccessor = nullptr;
+    for (BasicBlock *BB : IndexLoop->getBlocks()) {
+        if (!BB) return false;
+        bool HasInside = false;
+        bool HasOutside = false;
+        for (BasicBlock *Succ : BB->getSuccessors()) {
+            if (!Succ) return false;
+            if (IndexLoop->contains(Succ)) HasInside = true;
+            else HasOutside = true;
+        }
+        if (!HasOutside) continue;
+        if (Exiting || !HasInside) return false;
+        Exiting = BB;
+        for (BasicBlock *Succ : BB->getSuccessors())
+            if (IndexLoop->contains(Succ)) InsideSuccessor = Succ;
+    }
+    BrInst *ExitBranch = Exiting ? Exiting->getBranchTerminator() : nullptr;
+    if (!Exiting || !InsideSuccessor ||
+        !BasicBlock::isCondBr(ExitBranch)) {
+        return false;
+    }
+    //边界比较必须控制每一次回边；前测循环还要求continue边支配真实访问。
+    if (Exiting != Phi->getParent() && Exiting != Latch) return false;
+    if (Exiting == Latch && InsideSuccessor != Phi->getParent())
+        return false;
+    //非零动态起点只用于前测耗尽循环。latch-tested形状在第一次比较前
+    //已经执行一次访问，单凭起点非负不足以证明它不超过对象容量。
+    if (AdditionalNonNegativeStart && Exiting == Latch)
+        return false;
+    if (Exiting == Phi->getParent() &&
+        !DT.dominates(InsideSuccessor, Context->getParent())) {
+        return false;
+    }
+    auto *Compare = dynamic_cast<BinaryInst *>(
+        ExitBranch->getCondition());
+    if (!Compare || !BinaryInst::isCompareOp(Compare->getOp()))
+        return false;
+    const bool ContinueOnTrue =
+        ExitBranch->getTrueSuccessor() == InsideSuccessor;
+    BinaryInst::Operation Predicate = ContinueOnTrue
+        ? Compare->getOp()
+        : BinaryInst::negatePredicate(Compare->getOp());
+    Value *LHS = Compare->getOperand(0);
+    Value *RHS = Compare->getOperand(1);
+    Value *Compared = Exiting == Phi->getParent()
+        ? static_cast<Value *>(Phi) : UpdateValue;
+    if (RHS == Compared) {
+        std::swap(LHS, RHS);
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    std::unordered_set<Value *> UndefActive;
+    if (LHS != Compared || Predicate != BinaryInst::L || !RHS ||
+        !IRType::hasIntegerBitWidth(RHS->getIRType(), 32) ||
+        !LoopInfo::isLoopInvariant(RHS, IndexLoop) ||
+        hasUndefPointerOrigin(RHS, UndefActive)) {
+        return false;
+    }
+    if (Bound && Bound != RHS) return false;
+    Bound = RHS;
+    return true;
+}
+//用typed GEP、对象大小和访问宽度累计共同运行时上界允许的最大容量
+bool BasicAAResult::accumulateLocationSafeUpperBound(
+    const MemoryLocation &Location, Instruction *Context,
+    const DominatorTree &DT, const LoopInfo &LI,
+    SCEVResult &SE, Value *&SharedBound,
+    std::int64_t &SafeUpperBound,
+    Value *AdditionalNonNegativeStart) const {
+    if (!Location.Pointer || !Location.Size || *Location.Size == 0 ||
+        !Context || !Context->getParent()) {
+        return false;
+    }
+    const PointerProvenanceInfo &Provenance =
+        getPointerProvenance(Location.Pointer);
+    Value *Root = Provenance.getUniqueBase();
+    if (!Root || !Provenance.ObjectSize ||
+        Provenance.KnownAlignment < *Location.Size) {
+        return false;
+    }
+    auto *RootGlobal = dynamic_cast<Variable *>(Root);
+    if (!dynamic_cast<AllocaInst *>(Root) &&
+        (!RootGlobal || !RootGlobal->isGlobal())) {
+        return false;
+    }
+    std::vector<GetElementPtrInst *> Chain;
+    std::unordered_set<Value *> Seen;
+    Value *Cursor = Location.Pointer;
+    while (Cursor && Seen.insert(Cursor).second) {
+        if (auto *GEP = dynamic_cast<GetElementPtrInst *>(Cursor)) {
+            if (Chain.size() >= MaxGuardGEPChainDepth) return false;
+            Chain.push_back(GEP);
+            Cursor = GEP->getBasePointer();
+            continue;
+        }
+        if (auto *Cast = dynamic_cast<BitCastInst *>(Cursor)) {
+            Value *Source = Cast->getUnaryOperand();
+            if (!Source || !Source->isPointerValue()) return false;
+            Cursor = Source;
+            continue;
+        }
+        break;
+    }
+    if (Cursor != Root || Chain.empty()) return false;
+    std::reverse(Chain.begin(), Chain.end());
+    __int128 ConstantOffset = 0;
+    __int128 DynamicStride = 0;
+    const __int128 MaxSigned128 = static_cast<__int128>(
+        static_cast<unsigned __int128>(-1) >> 1U);
+    Value *LocationBound = nullptr;
+    for (GetElementPtrInst *GEP : Chain) {
+        Value *Base = nullptr;
+        std::vector<Value *> Indices;
+        std::vector<int64_t> Strides;
+        int64_t FinalStride = 0;
+        if (!GEP || !GEP->getBaseAndIndices(Base, Indices) ||
+            !GetElementPtrInst::getIndexStrides(
+                Base, Indices, Strides, FinalStride) ||
+            Indices.size() != Strides.size()) {
+            return false;
+        }
+        (void)FinalStride;
+        for (std::size_t I = 0; I < Indices.size(); ++I) {
+            if (Strides[I] <= 0 || !Indices[I]) return false;
+            int64_t ConstantIndex = 0;
+            if (Indices[I]->tryGetInt64Const(ConstantIndex)) {
+                if (ConstantIndex < 0) return false;
+                const __int128 Term =
+                    static_cast<__int128>(Strides[I]) *
+                    static_cast<__int128>(ConstantIndex);
+                if (Term < 0 || ConstantOffset > MaxSigned128 - Term)
+                    return false;
+                ConstantOffset += Term;
+            } else {
+                if (!getCanonicalIndexUpperBound(
+                        Indices[I], Context, DT, LI, SE,
+                        LocationBound,
+                        AdditionalNonNegativeStart)) {
+                    return false;
+                }
+                const __int128 Term =
+                    static_cast<__int128>(Strides[I]);
+                if (DynamicStride > MaxSigned128 - Term)
+                    return false;
+                DynamicStride += Term;
+            }
+        }
+    }
+    if (!LocationBound || DynamicStride <= 0 || ConstantOffset < 0)
+        return false;
+    if (SharedBound && SharedBound != LocationBound) return false;
+    const __int128 ObjectBytes =
+        static_cast<__int128>(*Provenance.ObjectSize);
+    const __int128 AccessBytes =
+        static_cast<__int128>(*Location.Size);
+    const __int128 Numerator =
+        ObjectBytes - AccessBytes - ConstantOffset;
+    if (Numerator < 0) return false;
+    __int128 Capacity = Numerator / DynamicStride + 1;
+    Capacity = std::min(
+        Capacity,
+        static_cast<__int128>(std::numeric_limits<int32_t>::max()));
+    if (Capacity < 1) return false;
+    SharedBound = LocationBound;
+    SafeUpperBound = std::min(
+        SafeUpperBound, static_cast<std::int64_t>(Capacity));
+    return SafeUpperBound >= 1;
 }
 //判断两个指针的所有已知底层对象是否两两互斥
 bool BasicAAResult::haveKnownDistinctUnderlyingObjects(Value* V1,
@@ -738,19 +1100,13 @@ AliasInfo BasicAAResult::enforceLocationObjectBounds(
     }
     return AliasInfo::MayAlias;
 }
-//防御性溯源只穿过透明指针节点，发现undef或深度超限时禁止发布强结论
+//防御性溯源遍历地址依赖的完整操作数闭包，发现undef或深度超限时禁止发布强结论
 bool BasicAAResult::hasUndefPointerOrigin(
     Value *V, std::unordered_set<Value *> &Active, unsigned Depth) {
     if (!V || Value::isUndef(V)) return true;
     if (Depth > 32) return true;
     auto *I = dynamic_cast<Instruction *>(V);
     if (!I) return false;
-    const bool TransparentPointerProducer =
-        dynamic_cast<GetElementPtrInst *>(I) ||
-        dynamic_cast<BitCastInst *>(I) ||
-        dynamic_cast<PhiInst *>(I) ||
-        dynamic_cast<SelectInst *>(I);
-    if (!TransparentPointerProducer) return false;
     ScopedActiveMark ActiveMark(Active, V);
     if (!ActiveMark.inserted()) return false;
     bool HasUndefOrigin = false;
