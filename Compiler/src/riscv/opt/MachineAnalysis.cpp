@@ -21,8 +21,7 @@
 namespace riscv {
 // Machine Analysis 的实现：统计信息、控制流图(CFG)、活跃变量、自然循环
 // 与循环深度、以及块执行频率估计。这些分析被寄存器分配、机器 DCE、CFG 清理
-// 等 pass 通过分析管理器按需取用并缓存。此为 RISC-V 与 ARM64 两后端
-// 相同的公共实现,两后端各保留一份相同实现。
+// 等 RISC-V 机器 pass 通过分析管理器按需取用并缓存。
 
 namespace {
 

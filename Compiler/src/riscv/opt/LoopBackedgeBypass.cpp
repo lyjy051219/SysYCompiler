@@ -8,7 +8,7 @@
 #include <vector>
 
 namespace riscv {
-// Loop Backedge Bypass pass 的公共实现。
+// Loop Backedge Bypass pass 的 RISC-V 实现。
 //
 // 作用：消除“每次迭代都先无条件跳回 header、再由 header 的分支判断是否继续”的
 // 冗余控制流。对于 header 仅包含一个条件分支（或一个可重放的整数 load 加一个对
@@ -18,10 +18,6 @@ namespace riscv {
 //
 // 流水线位置：寄存器分配之后（Post-RA），因此只处理物理寄存器、需要保持已定的
 // 寄存器约定。变换只追加/改写 latch 末尾指令，header 保留，保证语义等价。
-//
-// RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。
-
 namespace {
 
 // 是否是条件分支操作码。

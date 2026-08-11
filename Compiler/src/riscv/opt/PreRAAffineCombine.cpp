@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace riscv {
-// Pre-RA Affine Combine pass 的公共实现。
+// Pre-RA Affine Combine pass 的 RISC-V 实现。
 //
 // 本 pass 有两大部分：
 // 1. 带符号 2 的幂除法 bias 序列的折叠：指令选择为 "有符号数除以 2 的幂" 生成的
@@ -30,8 +30,7 @@ namespace riscv {
 // bias 折叠的每处化简都附有其成立的取值范围前提（见各函数内注释），越界即放弃。
 //
 // 流水线位置：寄存器分配前（Pre-RA），产出带虚拟寄存器的新指令，保留块结构类
-// 分析。RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。
+// 分析。
 
 namespace {
 

@@ -241,15 +241,12 @@ bool CodeMotionPass::isProfitable(
     if (BFI.isReliable() && Candidate.Frequency > SourceFrequency)
         return false;
 
-    //RV64GC使用真实目标吞吐代价；其他后端使用单位代价，避免读取RV专属规则。
-    int Cost = 1;
-    unsigned RegisterBudget = GenericRegisterBudget;
-    if (TargetCost.isRISCV64()) {
-        Cost = TargetCost.getInstructionCost(I, TargetCostKind::Throughput);
-        RegisterBudget = TargetCost.getActiveRegisterBudget(
-            TargetRegisterClass::GeneralPurpose);
-        if (Cost <= 0 || Cost >= TargetCostInfo::InvalidCost) return false;
-    }
+    //RV64GC使用真实目标吞吐代价与活跃寄存器预算。
+    const int Cost = TargetCost.getInstructionCost(
+        I, TargetCostKind::Throughput);
+    const unsigned RegisterBudget = TargetCost.getActiveRegisterBudget(
+        TargetRegisterClass::GeneralPurpose);
+    if (Cost <= 0 || Cost >= TargetCostInfo::InvalidCost) return false;
     const unsigned Extended = estimateExtendedOperands(I, Candidate.Block);
     const unsigned PressureLimit = std::max(
         1U, std::min(MaxExtendedOperands, RegisterBudget / 4U));

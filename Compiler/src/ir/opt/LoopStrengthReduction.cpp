@@ -662,7 +662,6 @@ std::vector<CrossBaseLSRGroup>
 LoopStrengthReductionPass::buildCrossBaseGroups(
     std::vector<LSRCandidate> &Candidates, const DominatorTree &DT) {
     std::vector<CrossBaseLSRGroup> Groups;
-    if (TargetInfo::get().getArch() != TargetArch::RISCV64) return Groups;
     std::unordered_map<std::string, size_t> GroupIndex;
     for (LSRCandidate &C : Candidates) {
         if (C.Used || !C.L || !C.L->isInnermost() || !C.PreHeader ||
@@ -992,8 +991,7 @@ LSRCostEstimate LoopStrengthReductionPass::estimateOffsetGroupCost(
 LSRCostEstimate LoopStrengthReductionPass::estimateCrossBaseGroupCost(
     const CrossBaseLSRGroup &Group) {
     LSRCostEstimate Cost;
-    if (TargetInfo::get().getArch() != TargetArch::RISCV64 ||
-        Group.Items.size() != CrossBaseStreamCount || !Group.L ||
+    if (Group.Items.size() != CrossBaseStreamCount || !Group.L ||
         !Group.L->isInnermost() || Group.Step != 1 ||
         Group.ElementByteStride != 4) {
         return Cost;

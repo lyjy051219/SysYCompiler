@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
-#include "lib/Target.hpp"
 #include <cstddef>
 #include <cstdint>
 
@@ -42,17 +41,13 @@ enum class TargetStaticAddressKind {
     Unknown,
 };
 
-// TargetCostInfo是轻量、只读的目标代价视图。当前精确模型面向RV64GC，
-// 其余目标只返回保守结果，避免RISC-V中端决策意外污染其他后端。
+// TargetCostInfo是轻量、只读的 RV64GC 目标代价视图。
 class TargetCostInfo {
 public:
     // InvalidCost表示当前目标无法直接合法化该IR操作。
     static constexpr int InvalidCost = 1 << 28;
 
-    explicit TargetCostInfo(TargetArch Arch);
-
-    TargetArch getArch() const noexcept;
-    bool isRISCV64() const noexcept;
+    TargetCostInfo() = default;
 
     // 查询一个整数常量脱离具体使用点时所需的最少物化指令数。
     int getIntImmediateCost(
@@ -140,8 +135,6 @@ public:
                     const PreservationStatus &Preserved) const;
 
 private:
-    TargetArch Arch;
-
     static bool fitsSignedBits(std::int64_t Value, unsigned Bits);
     static std::int64_t normalizeImmediate(std::int64_t Value,
                                            unsigned BitWidth);
@@ -156,7 +149,7 @@ private:
                                unsigned BitWidth) const;
 };
 
-// TargetCostAnalysis把进程级TargetInfo快照接入函数分析管理器。
+// TargetCostAnalysis把固定 RV64GC 代价视图接入函数分析管理器。
 class TargetCostAnalysis : public AnalysisDescriptor<TargetCostAnalysis> {
 public:
     using Result = TargetCostInfo;

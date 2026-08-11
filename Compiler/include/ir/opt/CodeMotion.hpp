@@ -51,9 +51,6 @@ private:
     static constexpr std::size_t UseBudget = 256;
     //限制因下沉而延长活跃区间的不同SSA操作数数量。
     static constexpr unsigned MaxExtendedOperands = 4;
-    //非RISC-V目标只使用通用保守预算，不读取RV64GC寄存器规则。
-    static constexpr unsigned GenericRegisterBudget = 8;
-
     //证明常量下标inbounds GEP的结果仍位于唯一已知对象或其one-past位置。
     static bool isProvablySafeGEP(GetElementPtrInst *GEP,
                                   BasicAAResult &AA);

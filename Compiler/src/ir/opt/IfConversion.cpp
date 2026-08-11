@@ -46,21 +46,6 @@ int IfConversionPass::instructionCost(
 	const Instruction *I, const TargetCostInfo &TargetCost) {
 	//2.2 推测执行成本统一取自RV64GC目标模型，包括常量物化和浮点延迟。
 	if (!I) return TargetCostInfo::InvalidCost;
-	if (!TargetCost.isRISCV64()) {
-		//非RISC-V后端完整保留接入目标分析前的轻量权重表。
-		switch (I->instType) {
-		case Instruction::MUL:
-		case Instruction::FMUL:
-		case Instruction::FADD:
-		case Instruction::FSUB:
-		case Instruction::FCMP:
-			return 2;
-		case Instruction::SITOFP:
-			return 3;
-		default:
-			return 1;
-		}
-	}
 	return TargetCost.getInstructionCost(I, TargetCostKind::Throughput);
 }
 //统计基本块中除PHI和终结指令外的候选指令数量。
@@ -223,12 +208,10 @@ bool IfConversionPass::matchPattern(
 	if (InstCnt > 4) return false;
 	int SelectCost = 0;
 	for (PhiInst *Phi : SuccPhis) {
-		const int LocalCost = TargetCost.isRISCV64()
-			? TargetCost.getSelectCost(
-				  Phi ? Phi->getIRType().get() : nullptr,
-				  TargetSelectShape::Generic,
-				  TargetCostKind::Throughput)
-			: 1;
+		const int LocalCost = TargetCost.getSelectCost(
+			Phi ? Phi->getIRType().get() : nullptr,
+			TargetSelectShape::Generic,
+			TargetCostKind::Throughput);
 		if (LocalCost >= TargetCostInfo::InvalidCost ||
 			SelectCost > TargetCostInfo::InvalidCost - LocalCost)
 			return false;

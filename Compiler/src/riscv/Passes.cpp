@@ -14,11 +14,10 @@
 #include <vector>
 
 namespace riscv {
-// 本文件实现若干机器级 pass 的公共正文:重建 CFG、消除 PHI(把 SSA 的 PHI
+// 本文件实现若干 RISC-V 机器级 pass:重建 CFG、消除 PHI(把 SSA 的 PHI
 // lower 为前驱块中的并行拷贝,必要时拆分关键边)、以及降级 SELECT 伪指令
 // (提供无分支算术实现与基于分支的实现两条路径)。位于指令选择之后、寄存器
-// 分配之前(消 PHI 与降 SELECT 都要求操作数仍是虚拟寄存器)。此为 RISC-V 与
-// ARM64 两后端相同的实现,两后端各保留一份相同实现。
+// 分配之前(消 PHI 与降 SELECT 都要求操作数仍是虚拟寄存器)。
 
 namespace {
 

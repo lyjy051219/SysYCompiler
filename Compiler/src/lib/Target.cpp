@@ -25,10 +25,6 @@ std::size_t nextPowerOfTwo(std::size_t Value) {
     return std::min<std::size_t>(Result, 16);
 }
 
-bool isPowerOfTwo(std::size_t Value) {
-    return Value != 0 && (Value & (Value - 1U)) == 0;
-}
-
 std::size_t alignTo(std::size_t Value, std::size_t Alignment) {
     if (Alignment <= 1)
         return Value;
@@ -43,13 +39,13 @@ std::size_t alignTo(std::size_t Value, std::size_t Alignment) {
 
 } // 匿名命名空间
 
-DataLayout DataLayout::forTarget(TargetArch Arch) {
-    return DataLayout(Arch);
+DataLayout DataLayout::forTarget() {
+    return DataLayout();
 }
 
 unsigned DataLayout::getPointerBitWidth(unsigned AddressSpace) const noexcept {
     (void)AddressSpace;
-    // SysY2026 的两个初赛目标均使用 64 位地址。
+    // SysY2026 RV64 目标使用 64 位地址。
     return 64;
 }
 
@@ -161,61 +157,36 @@ std::size_t DataLayout::getTypeAlign(const IRType *Type) const {
 }
 
 unsigned DataLayout::getNativeVectorBitWidth() const noexcept {
-    // Cortex-A53 提供 128 位 NEON。初赛 RV64GC 禁止 SIMD，因此返回 0；
-    // 决赛发布 RISC-V SIMD 规范后只需在此处更新，不影响 IR 类型系统。
-    return Arch == TargetArch::AArch64 ? 128U : 0U;
+    // 当前 RV64GC 不含 V 扩展。
+    return 0;
 }
 
 bool DataLayout::supportsNativeVectorType(const IRType *Type) const {
-    const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-    if (!Vector || Arch != TargetArch::AArch64 ||
-        getNativeVectorBitWidth() == 0)
-        return false;
-    const std::size_t ElementBits =
-        getScalarBitWidth(Vector->getElementType().get());
-    const std::size_t Count = Vector->getElementCount();
-    if (!isPowerOfTwo(Count) ||
-        (ElementBits != 8 && ElementBits != 16 &&
-         ElementBits != 32 && ElementBits != 64))
-        return false;
-    if (Vector->getElementType()->isFloat() && ElementBits != 32)
-        return false;
-    const std::size_t TotalBits = ElementBits * Count;
-    return TotalBits == 64 || TotalBits == 128;
+    (void)Type;
+    return false;
 }
 
 TargetInfo::TargetInfo()
-    : Arch(TargetArch::RISCV64), Layout(DataLayout::forTarget(Arch)) {}
+    : Layout(DataLayout::forTarget()) {}
 
 TargetInfo &TargetInfo::get() {
     static TargetInfo Instance;
     return Instance;
 }
 
-void TargetInfo::setArch(TargetArch NewArch) {
-    Arch = NewArch;
-    Layout = DataLayout::forTarget(NewArch);
-}
-
 TargetABI TargetInfo::getABI() const noexcept {
-    return Arch == TargetArch::AArch64 ? TargetABI::AAPCS64
-                                      : TargetABI::LP64D;
+    return TargetABI::LP64D;
 }
 
 TargetCodeModel TargetInfo::getCodeModel() const noexcept {
-    return Arch == TargetArch::RISCV64 ? TargetCodeModel::MediumAny
-                                      : TargetCodeModel::Small;
+    return TargetCodeModel::MediumAny;
 }
 
 const char *TargetInfo::getLLVMTargetTriple() const noexcept {
-    return Arch == TargetArch::AArch64
-               ? "aarch64-unknown-linux-gnu"
-               : "riscv64-unknown-linux-gnu";
+    return "riscv64-unknown-linux-gnu";
 }
 
 const char *TargetInfo::getLLVMDataLayoutString() const noexcept {
     // 字符串与当前竞赛工具链的 Clang/LLVM 默认布局保持一致。
-    return Arch == TargetArch::AArch64
-               ? "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
-               : "e-m:e-p:64:64-i64:64-i128:128-n64-S128";
+    return "e-m:e-p:64:64-i64:64-i128:128-n64-S128";
 }

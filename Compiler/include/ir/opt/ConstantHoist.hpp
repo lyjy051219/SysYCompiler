@@ -54,8 +54,6 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    //非RISC-V目标沿用接入目标分析前的常量绝对值/分组窗口阈值。
-    static constexpr int64_t LegacyImmediateThreshold = 2048;
     //限定循环内候选组获得收益所需的最少动态使用次数。
     static constexpr int UseThreshold = 2;
     //限定直线代码候选组获得收益所需的最少静态使用次数。

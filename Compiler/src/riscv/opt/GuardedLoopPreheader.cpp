@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace riscv {
-// Guarded Loop Preheader pass 的公共实现。
+// Guarded Loop Preheader pass 的 RISC-V 实现。
 //
 // 作用：针对可能零次执行（zero-trip）的循环，避免在“循环体一次都不进”时白白
 // 执行预头里那些较昂贵但可推测的计算。做法是把预头拆成两部分：计算循环 guard
@@ -22,10 +22,6 @@ namespace riscv {
 //
 // 流水线位置：寄存器分配前（Pre-RA）的机器函数级 pass，依赖机器 CFG、活跃性、
 // 循环分析。要求预头里被搬移的指令都是无副作用、可推测执行的纯虚拟寄存器运算。
-//
-// RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。
-
 namespace {
 
 // 只有当可搬移计算的总开销达到此阈值时才值得插入 guard，避免为省一点点计算反而

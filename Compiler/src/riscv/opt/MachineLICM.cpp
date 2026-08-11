@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace riscv {
-// Machine LICM（机器层循环不变量外提）pass 的公共实现。
+// Machine LICM（机器层循环不变量外提）pass 的 RISC-V 实现。
 //
 // 作用：把循环内"每轮迭代计算值相同"且可安全推测执行的机器指令移动到循环
 // 入口之前的 preheader，使这些计算每轮循环只执行一次。中端 IR LICM 已处理
@@ -24,7 +24,7 @@ namespace riscv {
 // 地址链（ADDI/ADD/COPY）、机器化简后新出现的不变值，以及少量可证安全的
 // 循环不变 load（T1a/T2 分层证明）。
 //
-// 候选白名单：目标无关纯计算（LI/LA/COPY/FMV/算术/逻辑/移位/比较/浮点/FCVT/
+// 候选白名单：纯计算（LI/LA/COPY/FMV/算术/逻辑/移位/比较/浮点/FCVT/
 // GEP）+ load（LBU/LW/LD/FLW，走内存安全分层）；默认禁 DIV/REM 族（零 trip
 // 除零 trap 风险，BACKEND_MACHINE_LICM_TRAP_OPS 且除数可证非零才放行）；
 // store/call/terminator/隐式寄存器指令一律不外提。
@@ -40,9 +40,6 @@ namespace riscv {
 //   BACKEND_MACHINE_LICM_MIN_PROFIT=N      收益阈值（默认 1024，频率定点刻度）
 //   BACKEND_MACHINE_LICM_PRESSURE=N        循环级压力守卫（默认 20）
 //   BACKEND_MACHINE_LICM_MAX_LOOP_BLOCKS=N 循环体块数上限（默认 64）
-//
-// RISC-V 与 ARM64 两后端使用相同实现；两后端各保留一份相同实现。
-
 namespace {
 
 // ==== 环境变量开关 ====

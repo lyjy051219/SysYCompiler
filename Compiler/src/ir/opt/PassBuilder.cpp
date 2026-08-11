@@ -234,10 +234,8 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(LCSSAPass());
     //7. 最后展开剩余适合循环，并对展开结果运行最多两轮专用清理，末尾关闭 CFG/死值。
     UnrollConfig LoopUnrollConfig;
-    if (TargetInfo::get().getArch() == TargetArch::RISCV64) {
-        //竞赛O1就是完整优化级别；通用runtime主段和尾副本使用完整RV64预算。
-        LoopUnrollConfig.RuntimeThreshold = 192;
-    }
+    //竞赛O1就是完整优化级别；通用runtime主段和尾副本使用完整RV64预算。
+    LoopUnrollConfig.RuntimeThreshold = 192;
     FPM.addPass(LoopUnrollPass(LoopUnrollConfig));
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildPostUnrollCleanupPipeline(), 2));
@@ -254,8 +252,7 @@ FunctionPassManager PassBuilder::buildPostLoopCleanupPipeline() {
     FPM.addPass(GepCombinePass());
     FPM.addPass(GepEvaluatePass());
     FPM.addPass(LocalGVNPass());
-    if (TargetInfo::get().getArch() == TargetArch::RISCV64)
-        FPM.addPass(CodeMotionPass());
+    FPM.addPass(CodeMotionPass());
     FPM.addPass(DCEPass());
     FPM.addPass(LateStrengthReducePass());
     //2. 强度削减产生的新地址与内存机会再走一轮化简、GEP、store合流和load/DSE；
@@ -358,16 +355,14 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(Local2GlobalPass());
     MPM.addPass(GlobalInitializerFoldPass());
     MPM.addPass(StoreOnlyGlobalEliminationPass(FAM));
-    if (TargetInfo::get().getArch() == TargetArch::RISCV64) {
-        //4.RV64 IPO只传播全部调用共同成立的常量形参与常量返回值；
-        //随后让函数内SCCP消费新常量，再交给已有DAE收缩签名。
-        MPM.addPass(IPSCCPPass());
-        MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
-        MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
-        MPM.addPass(DAEPass());
-        MPM.addPass(createModuleFunctionBridge(
-            buildLightCleanupPipeline(), FAM));
-    }
+    //4.RV64 IPO只传播全部调用共同成立的常量形参与常量返回值；
+    //随后让函数内SCCP消费新常量，再交给已有DAE收缩签名。
+    MPM.addPass(IPSCCPPass());
+    MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));
+    MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
+    MPM.addPass(DAEPass());
+    MPM.addPass(createModuleFunctionBridge(
+        buildLightCleanupPipeline(), FAM));
     //5. 先消除尾递归并做低成本 GVN，再积极内联；随后删除死函数并以标量固定点
     //消费内联暴露的表达式图。
     MPM.addPass(createModuleFunctionBridge(TailRecursionEliminationPass(), FAM));
@@ -376,9 +371,8 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
         GVNPREPass( false), FAM));
     MPM.addPass(createModuleFunctionBridge(FuncInlinePass( true), FAM));
     MPM.addPass(DeadFunctionEliminationPass(FAM));
-    if (TargetInfo::get().getArch() == TargetArch::RISCV64)
-        MPM.addPass(createModuleFunctionBridge(
-            buildLightCleanupPipeline(), FAM));
+    MPM.addPass(createModuleFunctionBridge(
+        buildLightCleanupPipeline(), FAM));
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
     //5. 保守 Global2Local 把小全局放回 main 栈，紧接 CFG/Mem2Reg 让标量进入 SSA。
@@ -440,12 +434,10 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     //标量固定点和 late 循环再发现。
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(
          true), FAM));
-    if (TargetInfo::get().getArch() == TargetArch::RISCV64) {
-        //late Global2Local可能重新暴露小局部聚合；直接复用已有的
-        //常量路径标量化，再交给Mem2Reg进入SSA。
-        MPM.addPass(createModuleFunctionBridge(
-            LocalAggregateSimplifyPass(), FAM));
-    }
+    //late Global2Local可能重新暴露小局部聚合；直接复用已有的
+    //常量路径标量化，再交给Mem2Reg进入SSA。
+    MPM.addPass(createModuleFunctionBridge(
+        LocalAggregateSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(PromotePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(SCCPPass(), FAM));

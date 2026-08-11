@@ -31,11 +31,8 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	}
 	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(*Callee);
 	forEachInstruction(*Callee, [&](Instruction *I) {
-		++P.TotalInstCount;
-		int LocalCodeSize = TargetCost.isRISCV64()
-			? TargetCost.getInstructionCost(
-				  I, TargetCostKind::CodeSize)
-			: 1;
+		int LocalCodeSize = TargetCost.getInstructionCost(
+			I, TargetCostKind::CodeSize);
 		//未建模IR保持旧模型的一指令估价，不把成本查询变成合法性门禁。
 		if (LocalCodeSize < 0 ||
 			LocalCodeSize >= TargetCostInfo::InvalidCost)
@@ -46,7 +43,6 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 		else
 			P.TotalCodeSizeCost += LocalCodeSize;
 		if (dynamic_cast<RetInst *>(I)) {
-			++P.ReturnInstCount;
 			if (P.ReturnCodeSizeCost >
 				std::numeric_limits<int>::max() - LocalCodeSize)
 				P.ReturnCodeSizeCost = std::numeric_limits<int>::max();
@@ -106,26 +102,16 @@ bool FuncInlinePass::isInlineSite(
     //调用Callee频次
 	int Freq = (it == FreqCallee.end()) ? 1 : std::max(1, it->second);
 	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(Caller);
-	const bool UseTargetCost = TargetCost.isRISCV64();
-	//RV64GC使用目标静态代价；其他目标保留原有的指令计数
-	//差异：常规模式只减一条，晚期模式减去全部return。
+	//RV64GC使用目标静态代价，并扣除内联后会被汇合边替代的return。
 	const int TargetBodyCodeSizeCost = std::max(
 		0, OutProfile.TotalCodeSizeCost - OutProfile.ReturnCodeSizeCost);
-	const int RegularBodyCost = UseTargetCost
-		? TargetBodyCodeSizeCost
-		: std::max(0, OutProfile.TotalInstCount - 1);
-	const int LateBodyCost = UseTargetCost
-		? TargetBodyCodeSizeCost
-		: std::max(
-			0, OutProfile.TotalInstCount - OutProfile.ReturnInstCount);
-	int CallCodeSizeCost = 1;
-	if (UseTargetCost) {
-		CallCodeSizeCost = TargetCost.getCallCost(
-			CI, TargetCostKind::CodeSize);
-		if (CallCodeSizeCost <= 0 ||
-			CallCodeSizeCost >= TargetCostInfo::InvalidCost)
-			CallCodeSizeCost = 1;
-	}
+	const int RegularBodyCost = TargetBodyCodeSizeCost;
+	const int LateBodyCost = TargetBodyCodeSizeCost;
+	int CallCodeSizeCost = TargetCost.getCallCost(
+		CI, TargetCostKind::CodeSize);
+	if (CallCodeSizeCost <= 0 ||
+		CallCodeSizeCost >= TargetCostInfo::InvalidCost)
+		CallCodeSizeCost = 1;
 	const bool IsRecursiveFunc = CalleeIsRecursive ||
 		(OutProfile.SelfRecursiveCallSites > 0);
 	const bool IsSelfCall = (Callee == &Caller);
@@ -232,20 +218,13 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			constexpr int kLatePerCallerCloneCostBudget = 96;
 			constexpr int kLatePerCallerGrowthBudget = 48;
 			const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
-			const bool UseTargetCost = TargetCost.isRISCV64();
-			int BodyCost = UseTargetCost
-				? std::max(0, Profile.TotalCodeSizeCost -
-							  Profile.ReturnCodeSizeCost)
-				: std::max(0, Profile.TotalInstCount -
-							  Profile.ReturnInstCount);
-			int CallCost = 1;
-			if (UseTargetCost) {
-				CallCost = TargetCost.getCallCost(
-					CI, TargetCostKind::CodeSize);
-				if (CallCost <= 0 ||
-					CallCost >= TargetCostInfo::InvalidCost)
-					CallCost = 1;
-			}
+			int BodyCost = std::max(0, Profile.TotalCodeSizeCost -
+									 Profile.ReturnCodeSizeCost);
+			int CallCost = TargetCost.getCallCost(
+				CI, TargetCostKind::CodeSize);
+			if (CallCost <= 0 ||
+				CallCost >= TargetCostInfo::InvalidCost)
+				CallCost = 1;
 			int SiteGrowth = Callee->getDirectCallSites().size() == 1 ? 0 :
 				std::max(0, BodyCost - CallCost);
 			if (LateInlinedSites >= kLatePerCallerSiteBudget ||

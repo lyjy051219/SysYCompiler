@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace riscv {
-// CodeGenPrepare pass 的公共实现。
+// CodeGenPrepare pass 的 RISC-V 实现。
 //
 // 作用：在中端 IR 层面为后端做地址计算的强度削减。核心变换是把循环体内、
 // 索引为仿射归纳变量的 getelementptr（GEP，数组元素地址）改写成一个指针型
@@ -28,10 +28,6 @@ namespace riscv {
 // 正确性依赖：借助 SCEV 与区间分析证明索引在整型范围内不会溢出/回绕
 // （no-wrap），否则用指针推进替换重新计算可能改变结果，因此这里做了大量保守
 // 的区间与支配性检查，任何无法证明安全的候选都会被放弃。
-//
-// RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。
-
 namespace {
 
 // 一个待改写的候选：一个（或一簇）循环内 GEP，连同其归纳变量、起点、步长、

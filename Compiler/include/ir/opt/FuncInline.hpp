@@ -17,16 +17,12 @@ struct CalleeInlineProfile {
     bool SideEffectFreeLocalOnly = false;
     //标记递归函数是否更适合由记忆化Pass处理。
     bool SafeToMemoize = false;
-    //总指令数
-    int TotalInstCount = 0;
     //按当前目标静态指令单位估算的函数总代价。
     int TotalCodeSizeCost = 0;
     //全部返回指令对应的静态代价，用于得到可克隆函数体成本。
     int ReturnCodeSizeCost = 0;
     //基本块数量，用于估算内联后新增的控制流开销
     int BasicBlockCount = 0;
-    //返回指令数量，返回边在内联后会被调用者汇合边替代
-    int ReturnInstCount = 0;
     //自递归调用点数
     int SelfRecursiveCallSites = 0;
     //每个形参在函数体中的实际使用次数

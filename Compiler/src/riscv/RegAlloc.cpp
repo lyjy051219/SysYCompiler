@@ -23,9 +23,8 @@ namespace riscv {
 // 本文件实现基于图着色的寄存器分配(Iterated Register Coalescing 风格)。
 // 流程:分析程序(收集虚拟寄存器类、热度、可重物化定义、循环回边)->为整型与
 // 浮点两个寄存器体各自构建干涉图(依赖活跃分析)->运行简化/合并/冻结/溢出选择
-// 与着色->对溢出的虚拟寄存器改写为访存或重物化,循环直到无溢出。位于后端流水线
-// 中消 PHI/降 SELECT 之后。RISC-V 与 ARM64 两后端使用相同实现,
-// 两后端各保留一份相同实现。
+// 与着色->对溢出的虚拟寄存器改写为访存或重物化,循环直到无溢出。位于 RISC-V
+// 后端流水线中消 PHI/降 SELECT 之后。
 
 namespace {
 
@@ -366,7 +365,7 @@ bool nodeMatchesBank(Node node, bool floatBank,
 }
 
 // 判断节点是否为 fa0-fa7(浮点参数/返回值寄存器)的预着色节点。
-// RISC-V 与 AArch64 的 PhysReg 枚举中 FA0-FA7 连续排列。
+// PhysReg 枚举中的 FA0-FA7 连续排列。
 bool isFprArgReturnNode(Node node) {
   if (!isPhysicalNode(node)) {
     return false;

@@ -1,17 +1,8 @@
 #include "ir/analysis/TargetCostAnalysis.hpp"
+#include "lib/Target.hpp"
 #include <algorithm>
 #include <limits>
 #include <vector>
-
-TargetCostInfo::TargetCostInfo(TargetArch Arch) : Arch(Arch) {}
-
-TargetArch TargetCostInfo::getArch() const noexcept {
-    return Arch;
-}
-
-bool TargetCostInfo::isRISCV64() const noexcept {
-    return Arch == TargetArch::RISCV64;
-}
 
 bool TargetCostInfo::fitsSignedBits(std::int64_t Value, unsigned Bits) {
     if (Bits == 0)
@@ -125,8 +116,6 @@ int TargetCostInfo::getIntImmediateCost(std::int64_t Value,
                                         unsigned BitWidth,
                                         TargetCostKind Kind) const {
     (void)Kind;
-    if (!isRISCV64())
-        return InvalidCost;
     return getRISCV64ImmediateCost(Value, BitWidth);
 }
 
@@ -134,8 +123,6 @@ bool TargetCostInfo::isLegalIntImmediate(Instruction::InstType Opcode,
                                          unsigned OperandIndex,
                                          std::int64_t Value,
                                          unsigned OperandBitWidth) const {
-    if (!isRISCV64())
-        return false;
     Value = normalizeImmediate(Value, OperandBitWidth);
     switch (Opcode) {
     case Instruction::ADD:
@@ -173,7 +160,7 @@ int TargetCostInfo::getIntImmediateOperandCost(
 int TargetCostInfo::getArithmeticCost(Instruction::InstType Opcode,
                                       const IRType *Type,
                                       TargetCostKind Kind) const {
-    if (!isRISCV64() || !Type)
+    if (!Type)
         return InvalidCost;
     if (Type->isVector() && !isLegalVectorType(Type))
         return InvalidCost;
@@ -262,8 +249,6 @@ int TargetCostInfo::getArithmeticCost(Instruction::InstType Opcode,
 
 int TargetCostInfo::getCompareCost(const IRType *Type,
                                    TargetCostKind Kind) const {
-    if (!isRISCV64())
-        return InvalidCost;
     if (Type && Type->isVector() && !isLegalVectorType(Type))
         return InvalidCost;
     if (Type && !Type->isVector() && !isDirectScalarType(Type))
@@ -277,7 +262,7 @@ int TargetCostInfo::getBranchCost(bool IsConditional,
                                   TargetCostKind Kind) const {
     (void)IsConditional;
     (void)Kind;
-    return isRISCV64() ? 1 : InvalidCost;
+    return 1;
 }
 
 int TargetCostInfo::getSelectCost(const IRType *Type,
@@ -288,7 +273,7 @@ int TargetCostInfo::getSelectCost(const IRType *Type,
 int TargetCostInfo::getSelectCost(const IRType *Type,
                                   TargetSelectShape Shape,
                                   TargetCostKind Kind) const {
-    if (!isRISCV64() || !Type)
+    if (!Type)
         return InvalidCost;
     if (Type->isVector() && !isLegalVectorType(Type))
         return InvalidCost;
@@ -317,7 +302,7 @@ int TargetCostInfo::getMemoryCost(TargetMemoryOperation Operation,
                                   std::size_t Alignment,
                                   bool IsVolatile,
                                   TargetCostKind Kind) const {
-    if (!isRISCV64() || !Type)
+    if (!Type)
         return InvalidCost;
     if (Type->isVector() && !isLegalVectorType(Type))
         return InvalidCost;
@@ -327,7 +312,7 @@ int TargetCostInfo::getMemoryCost(TargetMemoryOperation Operation,
     if (Kind == TargetCostKind::CodeSize)
         return 1;
 
-    const DataLayout Layout = DataLayout::forTarget(Arch);
+    const DataLayout Layout = DataLayout::forTarget();
     const std::size_t NaturalAlignment = Layout.getABITypeAlign(Type);
     int Cost = Operation == TargetMemoryOperation::Load ? 2 : 1;
     if (Alignment != 0 && Alignment < NaturalAlignment)
@@ -340,9 +325,6 @@ int TargetCostInfo::getMemoryCost(TargetMemoryOperation Operation,
 int TargetCostInfo::getStaticAddressCost(
     TargetStaticAddressKind AddressKind, std::int64_t ByteOffset,
     TargetCostKind Kind) const {
-    if (!isRISCV64())
-        return InvalidCost;
-
     switch (AddressKind) {
     case TargetStaticAddressKind::StackObject:
         if (fitsSignedBits(ByteOffset, 12))
@@ -382,8 +364,6 @@ int TargetCostInfo::getStaticAddressCost(const Value *Base,
 
 unsigned TargetCostInfo::getRegisterBitWidth(
     TargetRegisterClass RegisterClass) const {
-    if (!isRISCV64())
-        return 0;
     switch (RegisterClass) {
     case TargetRegisterClass::GeneralPurpose:
         return 64;
@@ -398,8 +378,6 @@ unsigned TargetCostInfo::getRegisterBitWidth(
 
 unsigned TargetCostInfo::getRegisterCount(
     TargetRegisterClass RegisterClass) const {
-    if (!isRISCV64())
-        return 0;
     switch (RegisterClass) {
     case TargetRegisterClass::GeneralPurpose:
         // 与RISC-V寄存器分配器公开的t0-t5、a0-a7、s1-s11一致。
@@ -423,8 +401,6 @@ unsigned TargetCostInfo::getActiveRegisterBudget(
 
 unsigned TargetCostInfo::getArgumentRegisterCount(
     TargetRegisterClass RegisterClass) const {
-    if (!isRISCV64())
-        return 0;
     switch (RegisterClass) {
     case TargetRegisterClass::GeneralPurpose:
     case TargetRegisterClass::FloatingPoint:
@@ -436,7 +412,7 @@ unsigned TargetCostInfo::getArgumentRegisterCount(
 }
 
 unsigned TargetCostInfo::getCacheLineSize() const noexcept {
-    return isRISCV64() ? 64U : 0U;
+    return 64U;
 }
 
 unsigned TargetCostInfo::getEstimatedL1DataCacheSize() const noexcept {
@@ -448,8 +424,6 @@ int TargetCostInfo::getCallCost(unsigned IntegerArguments,
                                 unsigned FloatingArguments,
                                 bool IsIndirect,
                                 TargetCostKind Kind) const {
-    if (!isRISCV64())
-        return InvalidCost;
     const unsigned IntegerRegisterArguments = getArgumentRegisterCount(
         TargetRegisterClass::GeneralPurpose);
     const unsigned FloatingRegisterArguments = getArgumentRegisterCount(
@@ -499,16 +473,14 @@ int TargetCostInfo::getCallCost(const CallInst *Call,
 }
 
 bool TargetCostInfo::isLegalVectorType(const IRType *Type) const {
-    if (!isRISCV64() || !Type || !Type->isVector())
+    if (!Type || !Type->isVector())
         return false;
-    const DataLayout Layout = DataLayout::forTarget(Arch);
+    const DataLayout Layout = DataLayout::forTarget();
     return Layout.supportsNativeVectorType(Type);
 }
 
 unsigned TargetCostInfo::getNativeVectorBitWidth() const noexcept {
-    if (!isRISCV64())
-        return 0;
-    return DataLayout::forTarget(Arch).getNativeVectorBitWidth();
+    return DataLayout::forTarget().getNativeVectorBitWidth();
 }
 
 int TargetCostInfo::getInstructionCost(const Instruction *Inst,
@@ -545,10 +517,6 @@ int TargetCostInfo::getInstructionCost(const Instruction *Inst,
         break;
     }
     case Instruction::GEP: {
-        if (!isRISCV64()) {
-            Cost = 1;
-            break;
-        }
         auto *GEP = dynamic_cast<const GetElementPtrInst *>(Inst);
         Value *Base = nullptr;
         std::vector<Value *> Indices;
@@ -730,5 +698,5 @@ TargetCostInfo TargetCostAnalysis::run(
     FunctionAnalysisPassManager &AnalysisManager) const {
     (void)Function;
     (void)AnalysisManager;
-    return TargetCostInfo(TargetInfo::get().getArch());
+    return TargetCostInfo();
 }

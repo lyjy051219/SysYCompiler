@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace riscv {
-// Post-RA List Scheduling pass 的公共实现。
+// Post-RA List Scheduling pass 的 RISC-V 实现。
 //
 // 作用：在寄存器分配之后，对每个基本块内部按依赖与指令延迟重排指令，尽量让长
 // 延迟指令（乘除、访存、浮点、调用）的结果在被使用前有时间就绪，从而隐藏流水线
@@ -23,10 +23,6 @@ namespace riscv {
 //
 // 流水线位置：寄存器分配之后（Post-RA），因此按物理寄存器建立依赖，调用会污染
 // caller-saved 寄存器。只重排块内指令顺序，不改变指令本身，语义保持等价。
-//
-// RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。
-
 namespace {
 
 // 依赖跟踪用的寄存器键：物理寄存器按 phys 区分，虚拟寄存器按 id 区分。

@@ -16,17 +16,14 @@
 #include <vector>
 
 namespace riscv {
-// Block Placement pass 的公共实现。
+// Block Placement pass 的 RISC-V 实现。
 //
 // 作用：在保持逻辑 CFG 完全不变的前提下，按分支频率与 fallthrough 收益重排
 // 机器基本块的线性顺序，让高频边尽量成为相邻块之间的 fallthrough，从而减少
 // 显式跳转（尤其是动态执行次数多的跳转），并在需要时反转条件分支方向。
 //
-// 流水线位置：属于机器无关后端流水线的后期布局阶段，依赖机器循环分析
+// 流水线位置：属于 RISC-V 后端流水线的后期布局阶段，依赖机器循环分析
 // （MachineLoopAnalysis）与机器块频率分析（MachineBlockFrequencyAnalysis）。
-//
-// RISC-V 与 ARM64 两后端使用相同实现
-// 两后端各保留一份相同实现。文件内不含 namespace 包裹，直接是命名空间内的正文。
 
 namespace {
 
@@ -176,8 +173,7 @@ bool blockPlacementRotateDisabled() {
 
 // 布局后分支位移检查:按每条指令 4 字节的保守估计,计算所有条件分支到目标块
 // 的距离。任一条件分支超出 RISC-V 条件分支范围(±4KB,留 64 字节余量)即返回
-// false,由调用方回退到原始顺序。AArch64 的条件分支范围为 ±1MB,同一检查对
-// 其更保守,不会误判合法布局。
+// false,由调用方回退到原始顺序。
 bool branchesInRange(const MachineFunction &mf) {
   const std::size_t blockCount = mf.blocks.size();
   if (blockCount == 0) {

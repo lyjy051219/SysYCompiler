@@ -2287,68 +2287,63 @@ PassResult UnrollAndJamPass::run(Function &F,
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &PDT = FAM.getResult<PostDominantAnalysis>(F);
     const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
-    //非RISC-V完整保留接入TTI前的Config行为；RV64GC才从
-    //目标模型生成本轮有效配置。
+    //从RV64GC目标模型生成本轮有效配置。
     UnrollAndJamConfig EffectiveConfig = Config;
-    if (TargetCost.isRISCV64()) {
-        const unsigned TargetFPRBudget =
-            TargetCost.getActiveRegisterBudget(
-                TargetRegisterClass::FloatingPoint);
-        const unsigned TargetGPRBudget =
-            TargetCost.getActiveRegisterBudget(
-                TargetRegisterClass::GeneralPurpose);
-        //零表示直接使用目标预算；显式值是用户上限，
-        //不得放宽RV64GC的保守活跃寄存器预算。
-        EffectiveConfig.FPRBudget = EffectiveConfig.FPRBudget == 0
-            ? TargetFPRBudget
-            : std::min(EffectiveConfig.FPRBudget, TargetFPRBudget);
-        EffectiveConfig.GPRBudget = EffectiveConfig.GPRBudget == 0
-            ? TargetGPRBudget
-            : std::min(EffectiveConfig.GPRBudget, TargetGPRBudget);
-        if (EffectiveConfig.CacheLineBytes == 0 ||
-            EffectiveConfig.CacheLineBytes == 64)
-            EffectiveConfig.CacheLineBytes = TargetCost.getCacheLineSize();
-        if (EffectiveConfig.EstimatedFPAddLatency == 0 ||
-            EffectiveConfig.EstimatedFPAddLatency == 3) {
-            const int Cost = TargetCost.getArithmeticCost(
-                Instruction::FADD, FLOATType::NewFloat().get(),
-                TargetCostKind::Throughput);
-            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
-                EffectiveConfig.EstimatedFPAddLatency =
-                    static_cast<unsigned>(Cost);
-        }
-        if (EffectiveConfig.EstimatedSharedLoadCost == 0 ||
-            EffectiveConfig.EstimatedSharedLoadCost == 2) {
-            const int Cost = TargetCost.getMemoryCost(
-                TargetMemoryOperation::Load,
-                FLOATType::NewFloat().get(), 4, false,
-                TargetCostKind::Throughput);
-            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
-                EffectiveConfig.EstimatedSharedLoadCost =
-                    static_cast<unsigned>(Cost);
-        }
-        if (EffectiveConfig.EstimatedInnerControlCost == 0 ||
-            EffectiveConfig.EstimatedInnerControlCost == 1) {
-            const int Cost = TargetCost.getBranchCost(
-                true, TargetCostKind::Throughput);
-            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
-                EffectiveConfig.EstimatedInnerControlCost =
-                    static_cast<unsigned>(Cost);
-        }
-        if (EffectiveConfig.EstimatedRuntimeDispatchCost == 0 ||
-            EffectiveConfig.EstimatedRuntimeDispatchCost == 8) {
-            const int BranchCost = TargetCost.getBranchCost(
-                true, TargetCostKind::Throughput);
-            const int ArithmeticCost = TargetCost.getArithmeticCost(
-                Instruction::ADD, INTType::getInt32Ty().get(),
-                TargetCostKind::Throughput);
-            if (BranchCost > 0 && ArithmeticCost > 0 &&
-                BranchCost < TargetCostInfo::InvalidCost &&
-                ArithmeticCost < TargetCostInfo::InvalidCost) {
-                EffectiveConfig.EstimatedRuntimeDispatchCost =
-                    static_cast<unsigned>(
-                        4 * (BranchCost + ArithmeticCost));
-            }
+    const unsigned TargetFPRBudget = TargetCost.getActiveRegisterBudget(
+        TargetRegisterClass::FloatingPoint);
+    const unsigned TargetGPRBudget = TargetCost.getActiveRegisterBudget(
+        TargetRegisterClass::GeneralPurpose);
+    //零表示直接使用目标预算；显式值是用户上限，
+    //不得放宽RV64GC的保守活跃寄存器预算。
+    EffectiveConfig.FPRBudget = EffectiveConfig.FPRBudget == 0
+        ? TargetFPRBudget
+        : std::min(EffectiveConfig.FPRBudget, TargetFPRBudget);
+    EffectiveConfig.GPRBudget = EffectiveConfig.GPRBudget == 0
+        ? TargetGPRBudget
+        : std::min(EffectiveConfig.GPRBudget, TargetGPRBudget);
+    if (EffectiveConfig.CacheLineBytes == 0 ||
+        EffectiveConfig.CacheLineBytes == 64)
+        EffectiveConfig.CacheLineBytes = TargetCost.getCacheLineSize();
+    if (EffectiveConfig.EstimatedFPAddLatency == 0 ||
+        EffectiveConfig.EstimatedFPAddLatency == 3) {
+        const int Cost = TargetCost.getArithmeticCost(
+            Instruction::FADD, FLOATType::NewFloat().get(),
+            TargetCostKind::Throughput);
+        if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+            EffectiveConfig.EstimatedFPAddLatency =
+                static_cast<unsigned>(Cost);
+    }
+    if (EffectiveConfig.EstimatedSharedLoadCost == 0 ||
+        EffectiveConfig.EstimatedSharedLoadCost == 2) {
+        const int Cost = TargetCost.getMemoryCost(
+            TargetMemoryOperation::Load,
+            FLOATType::NewFloat().get(), 4, false,
+            TargetCostKind::Throughput);
+        if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+            EffectiveConfig.EstimatedSharedLoadCost =
+                static_cast<unsigned>(Cost);
+    }
+    if (EffectiveConfig.EstimatedInnerControlCost == 0 ||
+        EffectiveConfig.EstimatedInnerControlCost == 1) {
+        const int Cost = TargetCost.getBranchCost(
+            true, TargetCostKind::Throughput);
+        if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+            EffectiveConfig.EstimatedInnerControlCost =
+                static_cast<unsigned>(Cost);
+    }
+    if (EffectiveConfig.EstimatedRuntimeDispatchCost == 0 ||
+        EffectiveConfig.EstimatedRuntimeDispatchCost == 8) {
+        const int BranchCost = TargetCost.getBranchCost(
+            true, TargetCostKind::Throughput);
+        const int ArithmeticCost = TargetCost.getArithmeticCost(
+            Instruction::ADD, INTType::getInt32Ty().get(),
+            TargetCostKind::Throughput);
+        if (BranchCost > 0 && ArithmeticCost > 0 &&
+            BranchCost < TargetCostInfo::InvalidCost &&
+            ArithmeticCost < TargetCostInfo::InvalidCost) {
+            EffectiveConfig.EstimatedRuntimeDispatchCost =
+                static_cast<unsigned>(
+                    4 * (BranchCost + ArithmeticCost));
         }
     }
     //1.1 分块优先于lane复制执行；成功后CFG改变，固定点下一轮会重建四层循环并继续评估jam。

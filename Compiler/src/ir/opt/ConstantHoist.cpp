@@ -111,22 +111,14 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
                             ci->getIRType(), 32))
                         return;
                     const int32_t val = static_cast<int32_t>(ci->getVal());
-                    if (TargetCost.isRISCV64()) {
-                        const int MaterializeCost =
-                            TargetCost.getIntImmediateOperandCost(
-                                I->instType,
-                                static_cast<unsigned>(OperandIndex), val, 32,
-                                TargetCostKind::CodeSize);
-                        if (MaterializeCost <= 0 ||
-                            MaterializeCost >= TargetCostInfo::InvalidCost)
-                            return;
-                    } else {
-                        //其他后端完整沿用原来的绝对值阈值，不读取RV立即数规则。
-                        const int64_t WideValue = static_cast<int64_t>(val);
-                        const int64_t Magnitude =
-                            WideValue < 0 ? -WideValue : WideValue;
-                        if (Magnitude < LegacyImmediateThreshold) return;
-                    }
+                    const int MaterializeCost =
+                        TargetCost.getIntImmediateOperandCost(
+                            I->instType,
+                            static_cast<unsigned>(OperandIndex), val, 32,
+                            TargetCostKind::CodeSize);
+                    if (MaterializeCost <= 0 ||
+                        MaterializeCost >= TargetCostInfo::InvalidCost)
+                        return;
                     auto &C = R.intBuckets[val];
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
@@ -164,10 +156,8 @@ std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
     int64_t windowMin = cur.members[0].value;
     for (size_t i = 1; i < sorted.size(); ++i) {
         int64_t diff = (int64_t)sorted[i].value - windowMin;
-        const bool FitsWindow = TargetCost.isRISCV64()
-            ? TargetCost.isLegalIntImmediate(
-                  Instruction::ADD, 1, diff, 64)
-            : diff < LegacyImmediateThreshold;
+        const bool FitsWindow = TargetCost.isLegalIntImmediate(
+            Instruction::ADD, 1, diff, 64);
         if (FitsWindow) {
             cur.members.push_back(std::move(sorted[i]));
         } else {

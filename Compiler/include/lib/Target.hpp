@@ -7,28 +7,20 @@
 class IRType;
 class INTType;
 
-// 所有依赖目标架构的 IR 布局决策统一放在此处。
-// 类型驻留层只负责类型身份；指针的存储大小和对齐由 DataLayout 决定。
-enum class TargetArch {
-    AArch64,
-    RISCV64,
-};
-
 enum class TargetABI {
-    AAPCS64,
     LP64D,
 };
 
 enum class TargetCodeModel {
-    Small,
     MediumAny,
 };
 
+// 所有依赖目标的 IR 布局决策统一放在此处。
+// 类型驻留层只负责类型身份；指针的存储大小和对齐由 DataLayout 决定。
 class DataLayout final {
 public:
-    static DataLayout forTarget(TargetArch Arch);
+    static DataLayout forTarget();
 
-    TargetArch getArch() const noexcept { return Arch; }
     unsigned getPointerBitWidth(unsigned AddressSpace = 0) const noexcept;
     unsigned getIndexBitWidth() const noexcept;
     std::shared_ptr<INTType> getIndexType() const;
@@ -65,18 +57,14 @@ public:
     bool supportsNativeVectorType(const IRType *Type) const;
 
 private:
-    explicit DataLayout(TargetArch Arch) : Arch(Arch) {}
-
-    TargetArch Arch;
+    DataLayout() = default;
 };
 
-// 进程级目标配置。驱动在生成 IR 前完成设置；纯中端构建默认使用竞赛 RV64 布局。
+// 进程级 RV64 目标配置。
 class TargetInfo final {
 public:
     static TargetInfo &get();
 
-    void setArch(TargetArch NewArch);
-    TargetArch getArch() const noexcept { return Arch; }
     TargetABI getABI() const noexcept;
     TargetCodeModel getCodeModel() const noexcept;
     const char *getLLVMTargetTriple() const noexcept;
@@ -88,6 +76,5 @@ public:
 private:
     TargetInfo();
 
-    TargetArch Arch;
     DataLayout Layout;
 };

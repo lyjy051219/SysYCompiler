@@ -1,6 +1,5 @@
 #include "ir/opt/DAE.hpp"
 #include "lib/IRUtils.hpp"
-#include "lib/Target.hpp"
 #include <algorithm>
 #include <map>
 #include <stdexcept>
@@ -1109,8 +1108,6 @@ bool DAEPass::eliminateDeadReturns(Module &M) {
 PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;
 	bool Changed = false;
-	const bool EnableRISCVDeadReturn =
-		TargetInfo::get().getArch() == TargetArch::RISCV64;
 	std::vector<Function *> Snapshot;
 	for (auto &FPtr : M.getFunctions()) {
 		if (FPtr) Snapshot.push_back(FPtr.get());
@@ -1126,7 +1123,7 @@ PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 		Changed |= tryRedundantArgMerge(F, CallSites);
 	}
 	Changed |= eliminateDeadArguments(M);
-	if (EnableRISCVDeadReturn) Changed |= eliminateDeadReturns(M);
+	Changed |= eliminateDeadReturns(M);
 
 	// 对剩余调用按局部常量/指针事实和实参等价类分组。等价关系仅在
 	// 对应副本中成立，不会错误地改写仍需通用语义的原函数。
@@ -1142,7 +1139,7 @@ PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	// 副本已直接省略特化形参；再做一次传递闭包，可继续删除因常量
 	// 替换或跨函数纯转发而变死的其他形参。
 	Changed |= eliminateDeadArguments(M);
-	if (EnableRISCVDeadReturn) Changed |= eliminateDeadReturns(M);
+	Changed |= eliminateDeadReturns(M);
 
 	return Changed ? PreservationStatus::none() : PreservationStatus::all();
 }

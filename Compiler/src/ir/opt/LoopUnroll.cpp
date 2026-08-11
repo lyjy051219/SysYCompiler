@@ -67,12 +67,9 @@ int LoopUnrollPass::estimateLoopBodyCost(
             Instruction *I = *It;
             if (!I) continue;
             if (I->instType == Instruction::PHI) continue;
-            int LocalCost = TargetCost.isRISCV64()
-                ? TargetCost.getInstructionCost(
-                      I, TargetCostKind::Throughput)
-                : getLegacyInstructionCost(I);
-            //RV代价不可用时维持旧模型的一单位保守值；
-            //非RISC-V则完整复用接入TTI前的指令权重。
+            int LocalCost = TargetCost.getInstructionCost(
+                I, TargetCostKind::Throughput);
+            //RV代价不可用时维持一单位保守值。
             if (LocalCost < 0 || LocalCost >= TargetCostInfo::InvalidCost)
                 LocalCost = 1;
             //代价以抽象指令单位饱和累加，防止超大循环的成本和发生有符号溢出
@@ -538,30 +535,6 @@ bool LoopUnrollPass::isAssociativeIntegerReductionOp(
            Op == BinaryInst::AND || Op == BinaryInst::OR ||
            Op == BinaryInst::XOR;
 }
-//返回接入目标分析前使用的单条循环指令权重
-int LoopUnrollPass::getLegacyInstructionCost(const Instruction *I) {
-    if (!I) return 1;
-    switch (I->instType) {
-    case Instruction::MUL:
-    case Instruction::FMUL:
-        return 3;
-    case Instruction::SDIV:
-    case Instruction::UDIV:
-    case Instruction::SREM:
-    case Instruction::UREM:
-    case Instruction::FDIV:
-    case Instruction::FREM:
-        return 10;
-    case Instruction::LOAD:
-    case Instruction::STORE:
-    case Instruction::GEP:
-        return 2;
-    case Instruction::CALL:
-        return 20;
-    default:
-        return 1;
-    }
-}
 //在指定迭代的常量环境中解释不会访问内存或产生副作用的标量表达式。
 Value *LoopUnrollPass::evaluateConstantForUnroll(
     Value *V, Loop *L,
@@ -660,10 +633,8 @@ int64_t LoopUnrollPass::estimateConstantFoldSavings(
                         I, L, Constants, Active);
                     if (!Folded) continue;
                 }
-                int LocalCost = TargetCost.isRISCV64()
-                    ? TargetCost.getInstructionCost(
-                          I, TargetCostKind::CodeSize)
-                    : getLegacyInstructionCost(I);
+                int LocalCost = TargetCost.getInstructionCost(
+                    I, TargetCostKind::CodeSize);
                 if (LocalCost <= 0 ||
                     LocalCost >= TargetCostInfo::InvalidCost)
                     LocalCost = 1;
@@ -744,10 +715,9 @@ UnrollRegisterPressure LoopUnrollPass::estimateUnrollRegisterPressure(
         CountType(CrossBlock, ExtraCopies);
     return Pressure;
 }
-//只在RV64GC目标上执行显式寄存器预算检查，避免改变其他后端旧决策。
+//按RV64GC活跃寄存器数量执行显式预算检查。
 bool LoopUnrollPass::fitsUnrollRegisterBudget(
     Loop *L, int UnrollCount, const TargetCostInfo &TargetCost) {
-    if (!TargetCost.isRISCV64()) return true;
     UnrollRegisterPressure Pressure =
         estimateUnrollRegisterPressure(L, UnrollCount);
     return Pressure.GeneralPurpose <= TargetCost.getActiveRegisterBudget(
@@ -850,16 +820,13 @@ LoopUnrollPass::collectIntegerReductionPlans(
     const UnrollConfig &Config, const DominatorTree &DT,
     const TargetCostInfo &TargetCost) {
     std::vector<IntegerReductionPlan> Candidates;
-    int RegisterBudget = Config.ReductionRegisterBudget;
-    if (TargetCost.isRISCV64()) {
-        const unsigned TargetRegisters = TargetCost.getActiveRegisterBudget(
-            TargetRegisterClass::GeneralPurpose);
-        // 归约展开只使用通用活跃预算的三分之二，给控制IV和地址链留空间。
-        RegisterBudget = static_cast<int>(TargetRegisters * 2U / 3U);
-        if (Config.ReductionRegisterBudget > 0)
-            RegisterBudget = std::min(RegisterBudget,
-                                      Config.ReductionRegisterBudget);
-    }
+    const unsigned TargetRegisters = TargetCost.getActiveRegisterBudget(
+        TargetRegisterClass::GeneralPurpose);
+    // 归约展开只使用通用活跃预算的三分之二，给控制IV和地址链留空间。
+    int RegisterBudget = static_cast<int>(TargetRegisters * 2U / 3U);
+    if (Config.ReductionRegisterBudget > 0)
+        RegisterBudget = std::min(RegisterBudget,
+                                  Config.ReductionRegisterBudget);
     if (!L || !L->getHeader() || !TCI.Valid || !TCI.PreHeader ||
         !TCI.Latch || !TCI.ExitBlock ||
         (TCI.ExitingBlock != TCI.Latch &&
@@ -952,10 +919,8 @@ LoopUnrollPass::collectIntegerReductionPlans(
             std::max(SplitIndex, UnrollCount - SplitIndex);
         const int ChainSaving = UnrollCount - NewChainDepth;
         if (ChainSaving <= 0) continue;
-        const int Latency = TargetCost.isRISCV64()
-            ? TargetCost.getInstructionCost(
-                  Update, TargetCostKind::Throughput)
-            : getLegacyInstructionCost(Update);
+        const int Latency = TargetCost.getInstructionCost(
+            Update, TargetCostKind::Throughput);
         if (Latency <= 0 || Latency >= TargetCostInfo::InvalidCost)
             continue;
         const std::int64_t GroupCount =
@@ -2625,8 +2590,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     bool Nested = !L->isInnermost();
     const int LoopBlockCount = static_cast<int>(
         L->getBlocksIncludingSubLoops().size());
-    if (LoopBlockCount <= 0 ||
-        (TargetCost.isRISCV64() && Config.MaxClonedBlocks <= 0))
+    if (LoopBlockCount <= 0 || Config.MaxClonedBlocks <= 0)
         return makeNoUnrollDecision();
     if (Config.AllowFull && TCI.ProvenNoWrap && TCI.ConstantTripCount) {
         //3.1 完全展开优先：trip count 必须是已证 no-wrap 的小常量，展开总成本须在阈值内，有调用/嵌套时使用更严限制。
@@ -2643,13 +2607,11 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 static_cast<int64_t>(BodyCost) * TripCount;
             //3.1.2 对小常量次数循环模拟每轮Header PHI和纯表达式；只有实际折叠为
             //已定义常量的指令才计入节省，并把估计节省夹在原成本的一半以内。
-            int64_t FoldSavings = TargetCost.isRISCV64()
-                ? estimateConstantFoldSavings(
-                      L, static_cast<int>(TripCount), TargetCost)
-                : 0;
+            int64_t FoldSavings = estimateConstantFoldSavings(
+                L, static_cast<int>(TripCount), TargetCost);
             FoldSavings = std::min(FoldSavings, TotalCost / 2);
             const int64_t ProjectedCost = TotalCost - FoldSavings;
-            const bool BlockBudgetFits = !TargetCost.isRISCV64() ||
+            const bool BlockBudgetFits =
                 TripCount <= Config.MaxClonedBlocks / LoopBlockCount;
             const bool RegisterBudgetFits = fitsUnrollRegisterBudget(
                 L, static_cast<int>(TripCount), TargetCost);
@@ -2687,10 +2649,8 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
             ++PeelBlockCount;
             for (Instruction *I : *BB) {
                 if (!I || dynamic_cast<PhiInst *>(I)) continue;
-                int LocalCost = TargetCost.isRISCV64()
-                    ? TargetCost.getInstructionCost(
-                          I, TargetCostKind::Throughput)
-                    : getLegacyInstructionCost(I);
+                int LocalCost = TargetCost.getInstructionCost(
+                    I, TargetCostKind::Throughput);
                 if (LocalCost < 0 ||
                     LocalCost >= TargetCostInfo::InvalidCost)
                     LocalCost = 1;
@@ -2708,9 +2668,7 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
             PeelCloneCost > 0 &&
             PeelCloneCost <= Config.PeelThreshold) {
             //3.2.1 若无首轮谓词需要 peeling，只有已证 no-wrap 的精确常量 trip count 才能用不变 store 动态收益触发一次剥离。
-            const bool HasStoreBenefitModel =
-                !InvariantStores.empty() &&
-                (TargetCost.isRISCV64() || Config.PeelStoreCost > 0);
+            const bool HasStoreBenefitModel = !InvariantStores.empty();
             if (PeelCount == 0 && TCI.ProvenNoWrap &&
                 TCI.ConstantTripCount &&
                 *TCI.ConstantTripCount > 1 &&
@@ -2720,29 +2678,17 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 const int64_t MaxBenefit =
                     std::numeric_limits<int64_t>::max();
                 int64_t BenefitPerIteration = 0;
-                if (TargetCost.isRISCV64()) {
-                    for (StoreInst *Store : InvariantStores) {
-                        int StoreCost = TargetCost.getInstructionCost(
-                            Store, TargetCostKind::Throughput);
-                        if (StoreCost <= 0 ||
-                            StoreCost >= TargetCostInfo::InvalidCost)
-                            StoreCost = 1;
-                        if (BenefitPerIteration > MaxBenefit - StoreCost) {
-                            BenefitPerIteration = MaxBenefit;
-                            break;
-                        }
-                        BenefitPerIteration += StoreCost;
+                for (StoreInst *Store : InvariantStores) {
+                    int StoreCost = TargetCost.getInstructionCost(
+                        Store, TargetCostKind::Throughput);
+                    if (StoreCost <= 0 ||
+                        StoreCost >= TargetCostInfo::InvalidCost)
+                        StoreCost = 1;
+                    if (BenefitPerIteration > MaxBenefit - StoreCost) {
+                        BenefitPerIteration = MaxBenefit;
+                        break;
                     }
-                } else {
-                    //非RISC-V保留原有“store数量×固定权重”收益模型。
-                    BenefitPerIteration = MaxBenefit;
-                    if (InvariantStores.size() <=
-                        static_cast<std::size_t>(
-                            MaxBenefit / Config.PeelStoreCost)) {
-                        BenefitPerIteration =
-                            static_cast<int64_t>(InvariantStores.size()) *
-                            Config.PeelStoreCost;
-                    }
+                    BenefitPerIteration += StoreCost;
                 }
                 int64_t DynamicBenefit = MaxBenefit;
                 if (BenefitPerIteration == 0) {
@@ -2803,10 +2749,10 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
         for (int Candidate : Factors) {
             const int64_t StaticCost =
                 static_cast<int64_t>(BodyCost) * Candidate;
-            const bool RVBudgetFits = !TargetCost.isRISCV64() ||
-                (Candidate <= Config.MaxClonedBlocks / LoopBlockCount &&
-                 fitsUnrollRegisterBudget(L, Candidate, TargetCost) &&
-                 withinThreshold(StaticCost, Config.PartialThreshold));
+            const bool RVBudgetFits =
+                Candidate <= Config.MaxClonedBlocks / LoopBlockCount &&
+                fitsUnrollRegisterBudget(L, Candidate, TargetCost) &&
+                withinThreshold(StaticCost, Config.PartialThreshold);
             if (TripCount >= Candidate && TripCount % Candidate == 0 &&
                 RVBudgetFits) {
                 UnrollDecision Decision;
@@ -2838,13 +2784,12 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                     *RI->ConstantRemainderCount;
                 const int64_t StaticCost =
                     static_cast<int64_t>(BodyCost) * CloneCount;
-                if (TargetCost.isRISCV64() &&
-                    (CloneCount >
-                         Config.MaxClonedBlocks / LoopBlockCount ||
-                     !fitsUnrollRegisterBudget(
-                         L, static_cast<int>(CloneCount), TargetCost) ||
-                     !withinThreshold(
-                         StaticCost, Config.ConstantTailThreshold)))
+                if (CloneCount >
+                        Config.MaxClonedBlocks / LoopBlockCount ||
+                    !fitsUnrollRegisterBudget(
+                        L, static_cast<int>(CloneCount), TargetCost) ||
+                    !withinThreshold(
+                        StaticCost, Config.ConstantTailThreshold))
                     continue;
                 UnrollDecision Decision;
                 Decision.Kind = UnrollKind::PartialWithRemainder;
@@ -2882,13 +2827,12 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                 const int64_t StaticCost =
                     static_cast<int64_t>(BodyCost) * CloneCount +
                     ExpansionCost + 4;
-                if (TargetCost.isRISCV64() &&
-                    (CloneCount >
-                         Config.MaxClonedBlocks / LoopBlockCount ||
-                     !fitsUnrollRegisterBudget(
-                         L, static_cast<int>(CloneCount), TargetCost) ||
-                     !withinThreshold(StaticCost,
-                                      Config.RuntimeThreshold)))
+                if (CloneCount >
+                        Config.MaxClonedBlocks / LoopBlockCount ||
+                    !fitsUnrollRegisterBudget(
+                        L, static_cast<int>(CloneCount), TargetCost) ||
+                    !withinThreshold(StaticCost,
+                                     Config.RuntimeThreshold))
                     return makeNoUnrollDecision();
                 UnrollDecision Decision;
                 Decision.Kind = UnrollKind::Runtime;

@@ -89,8 +89,6 @@ struct UnrollConfig {
     int PeelThreshold = 64;
     //MaxPeelBlocks限制peeling允许克隆的循环基本块数量
     int MaxPeelBlocks = 24;
-    //非RISC-V目标沿用的每次可删除冗余store动态收益；RV64GC改查TTI。
-    int PeelStoreCost = 2;
     //PeelMinNetBenefit要求不变store触发peeling时至少获得的净收益
     int PeelMinNetBenefit = 1;
     //SCEVExpansionBudget限制运行时次数表达式可新增的IR指令数量
@@ -99,7 +97,7 @@ struct UnrollConfig {
     bool AllowExpensiveTripCount = false;
     //ReductionAccumulatorMaxLanes限制单个整数归约同时保留的独立累加器数量
     int ReductionAccumulatorMaxLanes = 2;
-    //ReductionRegisterBudget保留旧目标默认预算；RV64GC还会受TTI活跃GPR限制。
+    //ReductionRegisterBudget是归约展开可使用的显式GPR预算上限。
     int ReductionRegisterBudget = 12;
     //ReductionMinChainBenefit要求重关联后关键依赖链至少获得的动态净收益
     int ReductionMinChainBenefit = 1;
@@ -438,8 +436,6 @@ private:
     //判断操作是否属于可按整数位模式安全重关联的结合律归约
     static bool isAssociativeIntegerReductionOp(
         BinaryInst::Operation Op);
-    //返回接入目标分析前使用的单条循环指令权重，供非RISC-V路径复用。
-    static int getLegacyInstructionCost(const Instruction *I);
     //在给定迭代常量环境中递归解释无副作用标量表达式。
     static Value *evaluateConstantForUnroll(
         Value *V, Loop *L,
@@ -451,7 +447,7 @@ private:
     //估算指定展开因子下的GPR/FPR活跃值压力。
     static UnrollRegisterPressure estimateUnrollRegisterPressure(
         Loop *L, int UnrollCount);
-    //用RV64GC寄存器预算判断展开是否可能导致明显溢出；其他目标保持旧行为。
+    //用RV64GC寄存器预算判断展开是否可能导致明显溢出。
     static bool fitsUnrollRegisterBudget(
         Loop *L, int UnrollCount, const TargetCostInfo &TargetCost);
     //构造给定整数结合律操作对应的单位元
