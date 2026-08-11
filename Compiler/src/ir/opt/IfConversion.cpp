@@ -4,6 +4,7 @@
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/analysis/TargetCostAnalysis.hpp"
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <vector>
@@ -41,10 +42,13 @@ bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 	}
 }
 //估算单条候选指令被推测执行的相对成本。
-int IfConversionPass::instructionCost(const Instruction *I) {
-	//2.2 用简化代价模型限制被无条件执行的工作量，浮点与转换操作提高权重。
-	if (!I) return 1000;
-	switch (I->instType) {
+int IfConversionPass::instructionCost(
+	const Instruction *I, const TargetCostInfo &TargetCost) {
+	//2.2 推测执行成本统一取自RV64GC目标模型，包括常量物化和浮点延迟。
+	if (!I) return TargetCostInfo::InvalidCost;
+	if (!TargetCost.isRISCV64()) {
+		//非RISC-V后端完整保留接入目标分析前的轻量权重表。
+		switch (I->instType) {
 		case Instruction::MUL:
 		case Instruction::FMUL:
 		case Instruction::FADD:
@@ -55,7 +59,9 @@ int IfConversionPass::instructionCost(const Instruction *I) {
 			return 3;
 		default:
 			return 1;
+		}
 	}
+	return TargetCost.getInstructionCost(I, TargetCostKind::Throughput);
 }
 //统计基本块中除PHI和终结指令外的候选指令数量。
 int IfConversionPass::countCandidateInsts(BasicBlock *BB) {
@@ -69,12 +75,17 @@ int IfConversionPass::countCandidateInsts(BasicBlock *BB) {
 	return Cnt;
 }
 //累计基本块中全部候选指令的推测执行成本。
-int IfConversionPass::candidateCost(BasicBlock *BB) {
+int IfConversionPass::candidateCost(
+	BasicBlock *BB, const TargetCostInfo &TargetCost) {
 	if (!BB) return 0;
 	int Cost = 0;
 	for (Instruction *I : *BB) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
-		Cost += instructionCost(I);
+		const int LocalCost = instructionCost(I, TargetCost);
+		if (LocalCost >= TargetCostInfo::InvalidCost ||
+			Cost > TargetCostInfo::InvalidCost - LocalCost)
+			return TargetCostInfo::InvalidCost;
+		Cost += LocalCost;
 	}
 	return Cost;
 }
@@ -121,7 +132,9 @@ bool IfConversionPass::hasExactPreds(BasicBlock *BB, BasicBlock *A, BasicBlock *
 	return SeenA && SeenB;
 }
 //完整识别并验证以给定计算臂为入口的triangle或diamond模式。
-bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
+bool IfConversionPass::matchPattern(
+	BasicBlock *TrueBB, IfConvMatch &M,
+	const TargetCostInfo &TargetCost) {
 	//1.从候选臂反向识别 triangle/diamond：控制块条件跳转，两臂至多各一块，
 	//且最终汇合块的前驱必须与该形态精确一致。
 	if (!TrueBB) return false;
@@ -208,9 +221,27 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	//4.最后应用代码尺寸与加权成本预算，避免消除分支却增加过多无条件计算。
 	int InstCnt = countCandidateInsts(TrueBB) + (HasElse ? countCandidateInsts(ElseBB) : 0);
 	if (InstCnt > 4) return false;
-	int WeightedCost = candidateCost(TrueBB) +
-		(HasElse ? candidateCost(ElseBB) : 0) +
-		static_cast<int>(SuccPhis.size());
+	int SelectCost = 0;
+	for (PhiInst *Phi : SuccPhis) {
+		const int LocalCost = TargetCost.isRISCV64()
+			? TargetCost.getSelectCost(
+				  Phi ? Phi->getIRType().get() : nullptr,
+				  TargetSelectShape::Generic,
+				  TargetCostKind::Throughput)
+			: 1;
+		if (LocalCost >= TargetCostInfo::InvalidCost ||
+			SelectCost > TargetCostInfo::InvalidCost - LocalCost)
+			return false;
+		SelectCost += LocalCost;
+	}
+	const int TrueCost = candidateCost(TrueBB, TargetCost);
+	const int ElseCost = HasElse ? candidateCost(ElseBB, TargetCost) : 0;
+	if (TrueCost >= TargetCostInfo::InvalidCost ||
+		ElseCost >= TargetCostInfo::InvalidCost ||
+		TrueCost > TargetCostInfo::InvalidCost - ElseCost ||
+		TrueCost + ElseCost > TargetCostInfo::InvalidCost - SelectCost)
+		return false;
+	int WeightedCost = TrueCost + ElseCost + SelectCost;
 	if (SuccPhis.size() > 3 || WeightedCost > 6) return false;
 	M.Pred = Pred;
 	M.TrueBB = TrueBB;
@@ -223,10 +254,12 @@ bool IfConversionPass::matchPattern(BasicBlock *TrueBB, IfConvMatch &M) {
 	return true;
 }
 //上提候选计算、以select替换汇合PHI并删除原计算臂。
-bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
+bool IfConversionPass::tryConvertOne(
+	Function &, BasicBlock *TrueBB,
+	const TargetCostInfo &TargetCost) {
 	//5.先完成整套模式与合法性检查，之后的 CFG/SSA 改写不再允许部分失败。
 	IfConvMatch M;
-	if (!matchPattern(TrueBB, M)) return false;
+	if (!matchPattern(TrueBB, M, TargetCost)) return false;
 	std::vector<Instruction *> ToMove;
 	for (Instruction *I : collectInstructions(*M.TrueBB)) {
 		if (!I || dynamic_cast<BrInst *>(I)) continue;
@@ -267,7 +300,7 @@ bool IfConversionPass::tryConvertOne(Function &, BasicBlock *TrueBB) {
 }
 //迭代提交安全且成本受限的if-conversion直到没有候选。
 PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
-	(void)FAM;
+	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
 	//1—5.每轮只转换一个候选并重新快照 CFG，避免一次改写让后续块指针或前驱信息陈旧。
 	bool ChangedAny = false;
 	while (true) {
@@ -275,7 +308,7 @@ PreservationStatus IfConversionPass::run(Function &F, FunctionAnalysisPassManage
 		auto Blocks = snapshotPointers(F);
 		for (BasicBlock *BB : Blocks) {
 			if (!BB) continue;
-			if (tryConvertOne(F, BB)) {
+			if (tryConvertOne(F, BB, TargetCost)) {
 				Changed = true;
 				ChangedAny = true;
 				break;

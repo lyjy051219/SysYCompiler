@@ -36,6 +36,10 @@ class ZextInst;
 class Variable;
 class Param;
 class PhiInst;
+class BranchProbabilityInfo;
+class BranchProbabilityAnalysis;
+class BlockFrequencyInfo;
+class BlockFrequencyAnalysis;
 
 // Use 同时记录使用者和被使用值，并作为被使用值的使用链节点。
 // 节点地址参与链表连接，因此禁止复制、移动和继承。

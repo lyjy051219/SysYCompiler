@@ -262,7 +262,9 @@ bool ConstraintEliminationPass::implies(
         case BinaryInst::L:
             switch (target.op) {
                 case BinaryInst::L:  return kB <= tB;
-                case BinaryInst::LE: return kB <= tB + 1;
+                case BinaryInst::LE:
+                    return static_cast<__int128>(kB) <=
+                           static_cast<__int128>(tB) + 1;
                 case BinaryInst::NE: return kB <= tB;
                 default: break;
             }
@@ -278,7 +280,9 @@ bool ConstraintEliminationPass::implies(
         case BinaryInst::G:
             switch (target.op) {
                 case BinaryInst::G:  return kB >= tB;
-                case BinaryInst::GE: return kB >= tB - 1;
+                case BinaryInst::GE:
+                    return static_cast<__int128>(kB) >=
+                           static_cast<__int128>(tB) - 1;
                 case BinaryInst::NE: return kB >= tB;
                 default: break;
             }

@@ -3,6 +3,7 @@
 #include "ir/analysis/LoopAccessAnalysis.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "ir/analysis/TargetCostAnalysis.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
@@ -2285,10 +2286,75 @@ PassResult UnrollAndJamPass::run(Function &F,
     auto &RI = FAM.getResult<RangeAnalysis>(F);
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &PDT = FAM.getResult<PostDominantAnalysis>(F);
+    const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
+    //非RISC-V完整保留接入TTI前的Config行为；RV64GC才从
+    //目标模型生成本轮有效配置。
+    UnrollAndJamConfig EffectiveConfig = Config;
+    if (TargetCost.isRISCV64()) {
+        const unsigned TargetFPRBudget =
+            TargetCost.getActiveRegisterBudget(
+                TargetRegisterClass::FloatingPoint);
+        const unsigned TargetGPRBudget =
+            TargetCost.getActiveRegisterBudget(
+                TargetRegisterClass::GeneralPurpose);
+        //零表示直接使用目标预算；显式值是用户上限，
+        //不得放宽RV64GC的保守活跃寄存器预算。
+        EffectiveConfig.FPRBudget = EffectiveConfig.FPRBudget == 0
+            ? TargetFPRBudget
+            : std::min(EffectiveConfig.FPRBudget, TargetFPRBudget);
+        EffectiveConfig.GPRBudget = EffectiveConfig.GPRBudget == 0
+            ? TargetGPRBudget
+            : std::min(EffectiveConfig.GPRBudget, TargetGPRBudget);
+        if (EffectiveConfig.CacheLineBytes == 0 ||
+            EffectiveConfig.CacheLineBytes == 64)
+            EffectiveConfig.CacheLineBytes = TargetCost.getCacheLineSize();
+        if (EffectiveConfig.EstimatedFPAddLatency == 0 ||
+            EffectiveConfig.EstimatedFPAddLatency == 3) {
+            const int Cost = TargetCost.getArithmeticCost(
+                Instruction::FADD, FLOATType::NewFloat().get(),
+                TargetCostKind::Throughput);
+            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+                EffectiveConfig.EstimatedFPAddLatency =
+                    static_cast<unsigned>(Cost);
+        }
+        if (EffectiveConfig.EstimatedSharedLoadCost == 0 ||
+            EffectiveConfig.EstimatedSharedLoadCost == 2) {
+            const int Cost = TargetCost.getMemoryCost(
+                TargetMemoryOperation::Load,
+                FLOATType::NewFloat().get(), 4, false,
+                TargetCostKind::Throughput);
+            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+                EffectiveConfig.EstimatedSharedLoadCost =
+                    static_cast<unsigned>(Cost);
+        }
+        if (EffectiveConfig.EstimatedInnerControlCost == 0 ||
+            EffectiveConfig.EstimatedInnerControlCost == 1) {
+            const int Cost = TargetCost.getBranchCost(
+                true, TargetCostKind::Throughput);
+            if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
+                EffectiveConfig.EstimatedInnerControlCost =
+                    static_cast<unsigned>(Cost);
+        }
+        if (EffectiveConfig.EstimatedRuntimeDispatchCost == 0 ||
+            EffectiveConfig.EstimatedRuntimeDispatchCost == 8) {
+            const int BranchCost = TargetCost.getBranchCost(
+                true, TargetCostKind::Throughput);
+            const int ArithmeticCost = TargetCost.getArithmeticCost(
+                Instruction::ADD, INTType::getInt32Ty().get(),
+                TargetCostKind::Throughput);
+            if (BranchCost > 0 && ArithmeticCost > 0 &&
+                BranchCost < TargetCostInfo::InvalidCost &&
+                ArithmeticCost < TargetCostInfo::InvalidCost) {
+                EffectiveConfig.EstimatedRuntimeDispatchCost =
+                    static_cast<unsigned>(
+                        4 * (BranchCost + ArithmeticCost));
+            }
+        }
+    }
     //1.1 分块优先于lane复制执行；成功后CFG改变，固定点下一轮会重建四层循环并继续评估jam。
     unsigned &TileCount = TileTransformCounts[&F];
     auto &AlreadyTiled = TiledHeaders[&F];
-    if (TileCount < Config.MaxTileTransformsPerFunction) {
+    if (TileCount < EffectiveConfig.MaxTileTransformsPerFunction) {
         for (Loop *Inner : LI.getLoopsInPostOrder()) {
             Loop *Outer = Inner ? Inner->getParentLoop() : nullptr;
             if (!Outer || !Outer->getHeader() || !Inner->getHeader() ||
@@ -2301,7 +2367,7 @@ PassResult UnrollAndJamPass::run(Function &F,
                     Outer, Inner, LA, SE, DT, PDT, TileShape)) {
                 continue;
             }
-            auto Choice = selectTile(TileShape, LA, Config);
+            auto Choice = selectTile(TileShape, LA, EffectiveConfig);
             if (!Choice) continue;
             std::vector<BasicBlock *> NewHeaders;
             if (!applyTiling(F, TileShape, *Choice, NewHeaders))
@@ -2313,7 +2379,7 @@ PassResult UnrollAndJamPass::run(Function &F,
         }
     }
     //1.2 jam函数级成功次数达到上限后停止，避免固定点持续复制lane。
-    if (Count >= Config.MaxTransformsPerFunction)
+    if (Count >= EffectiveConfig.MaxTransformsPerFunction)
         return PassResult::unchanged();
     auto &Headers = TransformedHeaders[&F];
     for (Loop *Inner : LI.getLoopsInPostOrder()) {
@@ -2324,19 +2390,20 @@ PassResult UnrollAndJamPass::run(Function &F,
             continue;
         }
         auto Shape = buildShape(
-            Outer, Inner, LI, SE, LA, RI, DT, PDT, Config);
+            Outer, Inner, LI, SE, LA, RI, DT, PDT, EffectiveConfig);
         if (!Shape) continue;
         //3.形状合法后才评估共享读取、内存局部性、严格归约延迟与寄存器压力，得到唯一 Factor。
         std::int64_t RuntimeMinInnerTrip = 0;
         auto Factor = selectFactor(
-            *Shape, LA, SE, Config, &RuntimeMinInnerTrip);
+            *Shape, LA, SE, EffectiveConfig, &RuntimeMinInnerTrip);
         if (!Factor) continue;
         if (Shape->OuterTrip.IsRuntime) {
-            auto Plan = buildClonePlan(*Shape, LA, *Factor, Config);
+            auto Plan = buildClonePlan(
+                *Shape, LA, *Factor, EffectiveConfig);
             if (!Plan) continue;
             if (!executeRuntimePlan(
                     F, *Shape, *Plan, SE, DT,
-                    RuntimeMinInnerTrip, Config)) {
+                    RuntimeMinInnerTrip, EffectiveConfig)) {
                 destroyClonePlan(*Plan);
                 continue;
             }
@@ -2352,7 +2419,7 @@ PassResult UnrollAndJamPass::run(Function &F,
             //6.非整除 trip count 不直接 jam：余数在预算内时复用 LoopUnroll peeling 剥掉尾数，CFG 变更后立即返回并重算全部分析。
             if (Remainder < 0 ||
                 Remainder > static_cast<std::int64_t>(
-                                Config.MaxRemainderPeel)) {
+                                EffectiveConfig.MaxRemainderPeel)) {
                 continue;
             }
             auto &AA = FAM.getResult<BasicAliasAnalysis>(F);
@@ -2363,7 +2430,7 @@ PassResult UnrollAndJamPass::run(Function &F,
             PeelConfig.AllowRemainder = false;
             PeelConfig.AllowPeeling = true;
             PeelConfig.MaxPeelCount =
-                static_cast<int>(Config.MaxRemainderPeel);
+                static_cast<int>(EffectiveConfig.MaxRemainderPeel);
             LoopUnrollPass Peeler(PeelConfig);
             UnrollDecision Decision;
             Decision.Kind = UnrollKind::Peeling;
@@ -2372,13 +2439,14 @@ PassResult UnrollAndJamPass::run(Function &F,
             Decision.IsPeeling = true;
             Decision.TripCountIsProven = true;
             const LoopUnrollResult Result = Peeler.executePeeling(
-                Shape->Outer, Decision, SE, LI, DT, AA, RI);
+                Shape->Outer, Decision, SE, LI, DT, AA);
             if (Result != LoopUnrollResult::Unmodified) {
                 return PassResult::changed(PreservationStatus::none());
             }
             continue;
         }
-        auto Plan = buildClonePlan(*Shape, LA, *Factor, Config);
+        auto Plan = buildClonePlan(
+            *Shape, LA, *Factor, EffectiveConfig);
         if (!Plan) continue;
         if (!executePlan(*Shape, *Plan)) {
             //4.3 执行前预检失败时计划仍未挂接，可完整销毁并继续尝试下一嵌套。

@@ -35,15 +35,15 @@ struct UnrollAndJamConfig {
     unsigned MaxTransformsPerFunction = 2;
     //限制可由所有lane共享的嵌套循环树深度。
     unsigned MaxSharedNestDepth = 3;
-    //给出收益模型采用的浮点加法估算延迟。
+    //保留旧目标的浮点加法估算延迟；RV64GC运行时由TTI替换默认值。
     unsigned EstimatedFPAddLatency = 3;
-    //给出变换后允许占用的浮点寄存器预算。
+    //保留旧目标的浮点寄存器预算；RV64GC显式值与目标预算取小。
     unsigned FPRBudget = 24;
-    //给出变换后允许占用的通用寄存器预算。
+    //保留旧目标的通用寄存器预算；RV64GC显式值与目标预算取小。
     unsigned GPRBudget = 18;
     //限制为处理常量余数而允许剥离的最大迭代次数。
     unsigned MaxRemainderPeel = 7;
-    //给出局部性模型采用的目标缓存行字节数。
+    //保留旧目标的缓存行字节数；RV64GC运行时由TTI替换默认值。
     std::int64_t CacheLineBytes = 64;
     //限定把lane合并访存视为有收益所需的最小共享轴迭代次数。
     std::int64_t MinCoalescedAxisTripCount = 64;
@@ -55,11 +55,11 @@ struct UnrollAndJamConfig {
     std::size_t MaxClonedInstructions = 96;
     //限制运行期jam的标量尾副本、额外lane和分派计算合计代码增长。
     std::size_t MaxRuntimeClonedInstructions = 192;
-    //给出收益模型中一次可消除共享load的抽象动态成本。
+    //保留旧目标中一次可消除共享load的抽象动态成本。
     unsigned EstimatedSharedLoadCost = 2;
-    //给出每个被共享内循环省去的规范控制抽象动态成本。
+    //保留旧目标中每个被共享内循环的规范控制成本。
     unsigned EstimatedInnerControlCost = 1;
-    //给出运行期主段、尾段分派和边界计算的固定抽象动态成本。
+    //保留旧目标中运行期分派与边界计算的固定成本。
     unsigned EstimatedRuntimeDispatchCost = 8;
     //要求运行期jam在模型中至少取得指定抽象净收益。
     unsigned MinRuntimeNetBenefit = 1;

@@ -11,7 +11,7 @@ class Instruction;
 class Loop;
 class PhiInst;
 class RangeInfo;
-class SCEVExpr;
+struct SCEVExpr;
 class SCEVResult;
 class Value;
 struct LoopTripCountInfo;

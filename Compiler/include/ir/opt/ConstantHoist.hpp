@@ -6,6 +6,7 @@
 #include <vector>
 class DominatorTree;
 class LoopInfo;
+class TargetCostInfo;
 
 //ConstantHoistUseSite描述一处可由公共基值重写的大整数常量使用。
 struct ConstantHoistUseSite {
@@ -53,8 +54,8 @@ public:
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
 
 private:
-    //限定可由目标小立即数直接编码的绝对偏移上界。
-    static constexpr int64_t ImmediateThreshold = 2048;
+    //非RISC-V目标沿用接入目标分析前的常量绝对值/分组窗口阈值。
+    static constexpr int64_t LegacyImmediateThreshold = 2048;
     //限定循环内候选组获得收益所需的最少动态使用次数。
     static constexpr int UseThreshold = 2;
     //限定直线代码候选组获得收益所需的最少静态使用次数。
@@ -73,7 +74,8 @@ private:
     //服务步骤 1：只把后端不要求保持字面量、且超出立即数范围的 i32 使用
     //纳入候选，记录所在循环深度供收益判断使用。
     static ConstantHoistCollectResult collectCandidates(
-        Function &F, const LoopInfo &LI);
+        Function &F, const LoopInfo &LI,
+        const TargetCostInfo &TargetCost);
     //完成当前常量窗口的收益筛选并选择使用最频繁的公共基值。
     static void closeGroup(
         ConstantHoistGroup &Current,
@@ -81,7 +83,8 @@ private:
     //服务步骤 2：按数值滑动窗口分组，并选择使用次数最多的成员作为基值，
     //从而保证任一成员到基值的偏移都可编码为小立即数。
     static std::vector<ConstantHoistGroup> groupByBaseOffset(
-        std::vector<ConstantHoistCandidate> &Sorted);
+        std::vector<ConstantHoistCandidate> &Sorted,
+        const TargetCostInfo &TargetCost);
     //在公共支配点物化基值并在各使用块生成、复用小偏移表达式。
     static bool materializeGroup(
         ConstantHoistGroup &Group, BasicBlock *InsertBB);

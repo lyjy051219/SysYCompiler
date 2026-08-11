@@ -2629,7 +2629,10 @@ bool CallInst::eraseArg(unsigned Index) {
 }
 
 bool CallInst::isMemcpyLike() const {
-  return BuildInFunction::isMemcpyName(getCalleeName());
+  //只有前端/中端登记的builtin才能承载memcpy语义。普通用户函数
+  //即使名字中含有memcpy，也不能被内存优化当作intrinsic。
+  BuildInFunction *Builtin = getBuiltinCallee();
+  return Builtin && BuildInFunction::isMemcpyName(Builtin->getIdent());
 }
 
 bool CallInst::isNonVolatileMemcpy() const {

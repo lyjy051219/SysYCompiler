@@ -3,8 +3,10 @@
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/PostDominant.hpp"
+#include "ir/analysis/TargetCostAnalysis.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 #include <vector>
 FuncInlinePass::FuncInlinePass(bool enableRecursiveInline, bool lateCleanupMode)
@@ -27,9 +29,30 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	for (BasicBlock *BB : *Callee) {
 		if (BB) ++P.BasicBlockCount;
 	}
+	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(*Callee);
 	forEachInstruction(*Callee, [&](Instruction *I) {
 		++P.TotalInstCount;
-		if (dynamic_cast<RetInst *>(I)) ++P.ReturnInstCount;
+		int LocalCodeSize = TargetCost.isRISCV64()
+			? TargetCost.getInstructionCost(
+				  I, TargetCostKind::CodeSize)
+			: 1;
+		//未建模IR保持旧模型的一指令估价，不把成本查询变成合法性门禁。
+		if (LocalCodeSize < 0 ||
+			LocalCodeSize >= TargetCostInfo::InvalidCost)
+			LocalCodeSize = 1;
+		if (P.TotalCodeSizeCost >
+			std::numeric_limits<int>::max() - LocalCodeSize)
+			P.TotalCodeSizeCost = std::numeric_limits<int>::max();
+		else
+			P.TotalCodeSizeCost += LocalCodeSize;
+		if (dynamic_cast<RetInst *>(I)) {
+			++P.ReturnInstCount;
+			if (P.ReturnCodeSizeCost >
+				std::numeric_limits<int>::max() - LocalCodeSize)
+				P.ReturnCodeSizeCost = std::numeric_limits<int>::max();
+			else
+				P.ReturnCodeSizeCost += LocalCodeSize;
+		}
 		auto *CI = dynamic_cast<CallInst *>(I);
 		if (!CI) return;
 		Function *CF = CI->getDirectCallee();
@@ -68,12 +91,12 @@ bool FuncInlinePass::isInlineSite(
 	if (!CI || !Callee) return false;
     //普通内联函数调用点及指令支持
 	constexpr int kCallSitesThreshold = 3;
-	constexpr int kInstThreshold = 200;
+	constexpr int kCodeSizeThreshold = 200;
     //递归函数内联最大指令支持
-	constexpr int kRecursiveExpandMaxInst = 100;
+	constexpr int kRecursiveExpandMaxCost = 100;
 	//晚期模型只承担低增长机会，避免重新复制已经优化过的大函数体
-	constexpr int kLateSingleUseMaxInst = 96;
-	constexpr int kLateMultiUseMaxInst = 16;
+	constexpr int kLateSingleUseMaxCost = 96;
+	constexpr int kLateMultiUseMaxCost = 16;
 	constexpr int kLateModuleGrowthBudget = 48;
 	constexpr int kLateMaxDirectCallSites = 8;
 	OutProfile = analyzeCallee(Callee, FAM);
@@ -82,8 +105,27 @@ bool FuncInlinePass::isInlineSite(
 	auto it = FreqCallee.find(Callee);
     //调用Callee频次
 	int Freq = (it == FreqCallee.end()) ? 1 : std::max(1, it->second);
-    //指令数
-	int InstCount = std::max(0, OutProfile.TotalInstCount - 1);
+	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(Caller);
+	const bool UseTargetCost = TargetCost.isRISCV64();
+	//RV64GC使用目标静态代价；其他目标保留原有的指令计数
+	//差异：常规模式只减一条，晚期模式减去全部return。
+	const int TargetBodyCodeSizeCost = std::max(
+		0, OutProfile.TotalCodeSizeCost - OutProfile.ReturnCodeSizeCost);
+	const int RegularBodyCost = UseTargetCost
+		? TargetBodyCodeSizeCost
+		: std::max(0, OutProfile.TotalInstCount - 1);
+	const int LateBodyCost = UseTargetCost
+		? TargetBodyCodeSizeCost
+		: std::max(
+			0, OutProfile.TotalInstCount - OutProfile.ReturnInstCount);
+	int CallCodeSizeCost = 1;
+	if (UseTargetCost) {
+		CallCodeSizeCost = TargetCost.getCallCost(
+			CI, TargetCostKind::CodeSize);
+		if (CallCodeSizeCost <= 0 ||
+			CallCodeSizeCost >= TargetCostInfo::InvalidCost)
+			CallCodeSizeCost = 1;
+	}
 	const bool IsRecursiveFunc = CalleeIsRecursive ||
 		(OutProfile.SelfRecursiveCallSites > 0);
 	const bool IsSelfCall = (Callee == &Caller);
@@ -94,24 +136,28 @@ bool FuncInlinePass::isInlineSite(
 		int DirectCallSites = static_cast<int>(Callee->getDirectCallSites().size());
 		if (DirectCallSites <= 0 || DirectCallSites > kLateMaxDirectCallSites)
 			return false;
-		int BodyInstCount = std::max(
-			0, OutProfile.TotalInstCount - OutProfile.ReturnInstCount);
+		int BodyCost = LateBodyCost;
 		//单调用点内联后旧函数体会被删除，模块代码量不会增长。
 		if (DirectCallSites == 1)
-			return BodyInstCount <= kLateSingleUseMaxInst;
+			return BodyCost <= kLateSingleUseMaxCost;
 		//多调用点只接受很小且全模块增长受限的函数体。
-		if (BodyInstCount > kLateMultiUseMaxInst) return false;
-		int ModuleGrowth = std::max(0, BodyInstCount - 1) * DirectCallSites;
+		if (BodyCost > kLateMultiUseMaxCost) return false;
+		const std::int64_t ModuleGrowth =
+			static_cast<std::int64_t>(
+				std::max(0, BodyCost - CallCodeSizeCost)) * DirectCallSites;
 		return ModuleGrowth <= kLateModuleGrowthBudget;
 	}
 	if (IsRecursiveFunc) {
 		//递归函数只允许在自身调用点按更严格的总展开预算展开。
 		if (!IsSelfCall) return false;
 		if (!EnableRecursiveInline) return false;
-		if (InstCount * Freq > kRecursiveExpandMaxInst) return false;
+		if (static_cast<std::int64_t>(RegularBodyCost) * Freq >
+			kRecursiveExpandMaxCost) return false;
 	} else {
 		//普通函数在调用点较少时直接放行，否则限制“体积 × 调用次数”。
-		if (Freq >= kCallSitesThreshold && InstCount * Freq > kInstThreshold) return false;
+		if (Freq >= kCallSitesThreshold &&
+			static_cast<std::int64_t>(RegularBodyCost) * Freq >
+				kCodeSizeThreshold) return false;
 	}
 	return true;
 }
@@ -159,7 +205,7 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 			});
 	}
 	int LateInlinedSites = 0;
-	int LateClonedInsts = 0;
+	int LateClonedCost = 0;
 	int LateCodeGrowth = 0;
     //2.遍历刚才收集的每个Call指令
 	for (CallInst* CI : OriginalCallSites) {
@@ -183,19 +229,32 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 		}
 		if (LateCleanupMode) {
 			constexpr int kLatePerCallerSiteBudget = 4;
-			constexpr int kLatePerCallerCloneBudget = 96;
+			constexpr int kLatePerCallerCloneCostBudget = 96;
 			constexpr int kLatePerCallerGrowthBudget = 48;
-			int BodyInstCount = std::max(
-				0, Profile.TotalInstCount - Profile.ReturnInstCount);
+			const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
+			const bool UseTargetCost = TargetCost.isRISCV64();
+			int BodyCost = UseTargetCost
+				? std::max(0, Profile.TotalCodeSizeCost -
+							  Profile.ReturnCodeSizeCost)
+				: std::max(0, Profile.TotalInstCount -
+							  Profile.ReturnInstCount);
+			int CallCost = 1;
+			if (UseTargetCost) {
+				CallCost = TargetCost.getCallCost(
+					CI, TargetCostKind::CodeSize);
+				if (CallCost <= 0 ||
+					CallCost >= TargetCostInfo::InvalidCost)
+					CallCost = 1;
+			}
 			int SiteGrowth = Callee->getDirectCallSites().size() == 1 ? 0 :
-				std::max(0, BodyInstCount - 1);
+				std::max(0, BodyCost - CallCost);
 			if (LateInlinedSites >= kLatePerCallerSiteBudget ||
-				LateClonedInsts + BodyInstCount > kLatePerCallerCloneBudget ||
-				LateCodeGrowth + SiteGrowth > kLatePerCallerGrowthBudget) {
+				BodyCost > kLatePerCallerCloneCostBudget - LateClonedCost ||
+				SiteGrowth > kLatePerCallerGrowthBudget - LateCodeGrowth) {
 				continue;
 			}
 			++LateInlinedSites;
-			LateClonedInsts += BodyInstCount;
+			LateClonedCost += BodyCost;
 			LateCodeGrowth += SiteGrowth;
 		}
 		//3.1 建立形参到实参的初始映射，并一次性克隆被调函数的完整基本块区域

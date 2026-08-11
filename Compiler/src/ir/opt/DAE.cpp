@@ -1,5 +1,6 @@
 #include "ir/opt/DAE.hpp"
 #include "lib/IRUtils.hpp"
+#include "lib/Target.hpp"
 #include <algorithm>
 #include <map>
 #include <stdexcept>
@@ -868,9 +869,248 @@ bool DAEPass::eliminateDeadArguments(Module &M) {
 	return Changed;
 }
 
+bool DAEPass::DeadReturnTraversalBudget::tryVisit(unsigned Depth) {
+	if (Depth > MaxDepth || VisitedNodes >= MaxNodes) return false;
+	++VisitedNodes;
+	return true;
+}
+
+bool DAEPass::collectDeadReturnFlow(
+	Value *Root, Function *Owner,
+	std::unordered_set<Instruction *> &DeadFlow,
+	std::unordered_set<Value *> &Visiting) {
+	if (!Root || !Owner) return false;
+
+	struct WorkItem {
+		Value *FlowValue = nullptr;
+		unsigned Depth = 0;
+	};
+	DeadReturnTraversalBudget Budget;
+	if (!Budget.tryVisit(0)) return false;
+	std::vector<WorkItem> WorkList{{Root, 0}};
+	Visiting.clear();
+	Visiting.insert(Root);
+
+	// 透明返回值图可能包含PHI环和长链。显式工作表既消除递归栈风险，
+	// 又让汇合节点只检查一次；预算耗尽时整个dead-return证明保守失败。
+	while (!WorkList.empty()) {
+		WorkItem Current = WorkList.back();
+		WorkList.pop_back();
+		if (!Current.FlowValue) return false;
+
+		for (Use *UseSite : Current.FlowValue->getUses()) {
+			auto *UserInstruction = dynamic_cast<Instruction *>(
+				UseSite ? UseSite->getUser() : nullptr);
+			if (!UserInstruction ||
+				UserInstruction->getParentFunction() != Owner)
+				return false;
+			if (auto *Return = dynamic_cast<RetInst *>(UserInstruction)) {
+				if (Return->getReturnValue() != Current.FlowValue ||
+					!Budget.tryVisit(Current.Depth + 1))
+					return false;
+				continue;
+			}
+
+			bool IsTransparentFlow = dynamic_cast<PhiInst *>(UserInstruction);
+			if (auto *Select = dynamic_cast<SelectInst *>(UserInstruction)) {
+				const int OperandIndex = Select->getUserIndex(UseSite);
+				IsTransparentFlow = OperandIndex == 1 || OperandIndex == 2;
+			}
+			if (UserInstruction->instType == Instruction::BITCAST ||
+				UserInstruction->instType == Instruction::ZEXT ||
+				UserInstruction->instType == Instruction::SEXT ||
+				UserInstruction->instType == Instruction::TRUNC) {
+				IsTransparentFlow =
+					UserInstruction->getUnaryOperand() == Current.FlowValue;
+			}
+			if (!IsTransparentFlow) return false;
+			DeadFlow.insert(UserInstruction);
+			if (!Visiting.insert(UserInstruction).second) continue;
+			if (Current.Depth >= DeadReturnTraversalBudget::MaxDepth ||
+				!Budget.tryVisit(Current.Depth + 1))
+				return false;
+			WorkList.push_back({UserInstruction, Current.Depth + 1});
+		}
+	}
+	return true;
+}
+
+std::unique_ptr<Function> DAEPass::cloneFunctionWithVoidReturn(
+	Function &Source,
+	const std::unordered_set<Instruction *> &DeadReturnFlow) {
+	auto Clone = std::make_unique<Function>(
+		VOIDType::NewVoid(), Source.getIdent());
+	BasicBlock *Staging = Clone->front();
+	if (!Staging) return nullptr;
+	auto Fail = [&Clone]() -> std::unique_ptr<Function> {
+		Clone->dropAllReferences();
+		return nullptr;
+	};
+
+	ValueToValueMap InitialMap;
+	for (const auto &OldParameterOwner : Source.getParams()) {
+		Param *OldParameter = OldParameterOwner.get();
+		if (!OldParameter || !OldParameter->getIRType()) return Fail();
+		auto NewParameter = std::make_unique<Param>(
+			OldParameter->getIRType(), OldParameter->getIdent());
+		Param *NewParameterValue = NewParameter.get();
+		Clone->getParams().push_back(std::move(NewParameter));
+		InitialMap[OldParameter] = NewParameterValue;
+	}
+
+	std::vector<BasicBlock *> SourceBlocks;
+	for (BasicBlock *Block : Source)
+		if (Block) SourceBlocks.push_back(Block);
+	if (SourceBlocks.empty()) return Fail();
+	auto Region = cloneBasicBlockRegion(*Clone, SourceBlocks, InitialMap);
+	if (!Region || !Region->getClonedBlock(Source.front())) return Fail();
+	delete Staging;
+
+	// 先让通用区域克隆保持旧自递归call的返回类型，避免返回专用PHI在构造
+	// 阶段接收到void。块和值映射完成后，再整体删掉返回专用数据流。
+	std::vector<RetInst *> Returns;
+	for (BasicBlock *Block : *Clone)
+		for (Instruction *I : *Block)
+			if (auto *Return = dynamic_cast<RetInst *>(I))
+				Returns.push_back(Return);
+	for (RetInst *Return : Returns) {
+		auto *VoidReturn = new RetInst();
+		if (!Return->insertBefore(VoidReturn)) {
+			delete VoidReturn;
+			return Fail();
+		}
+		Return->eraseFromParent();
+		delete Return;
+	}
+
+	std::vector<Instruction *> ClonedDeadFlow;
+	for (Instruction *OldInstruction : DeadReturnFlow) {
+		Instruction *NewInstruction =
+			Region->getClonedInstruction(OldInstruction);
+		if (!NewInstruction) return Fail();
+		ClonedDeadFlow.push_back(NewInstruction);
+	}
+	// PHI可能构成环，批量断开操作数后再删除，不能依赖某个拓扑顺序。
+	for (Instruction *InstructionToDelete : ClonedDeadFlow)
+		InstructionToDelete->clearOperands();
+	for (Instruction *InstructionToDelete : ClonedDeadFlow) {
+		if (InstructionToDelete->hasUses()) return Fail();
+		InstructionToDelete->eraseFromParent();
+		delete InstructionToDelete;
+	}
+
+	std::vector<CallInst *> SourceSelfCalls;
+	for (CallInst *Call : Source.getDirectCallSites())
+		if (Call && Call->getParentFunction() == &Source)
+			SourceSelfCalls.push_back(Call);
+	try {
+		for (CallInst *OldSelfCall : SourceSelfCalls) {
+			auto *ClonedOldCall = dynamic_cast<CallInst *>(
+				Region->getClonedInstruction(OldSelfCall));
+			if (!ClonedOldCall || ClonedOldCall->hasUses()) return Fail();
+			std::vector<Value *> Arguments = ClonedOldCall->getArgs();
+			auto *NewSelfCall = new CallInst(Clone.get(), Arguments);
+			NewSelfCall->setTailCall(ClonedOldCall->isTailCall());
+			if (!ClonedOldCall->insertBefore(NewSelfCall)) {
+				delete NewSelfCall;
+				return Fail();
+			}
+			ClonedOldCall->eraseFromParent();
+			delete ClonedOldCall;
+		}
+	} catch (const std::invalid_argument &) {
+		return Fail();
+	}
+	return Clone;
+}
+
+bool DAEPass::rewriteFunctionWithDeadReturn(
+	Module &M, std::size_t FunctionIndex) {
+	auto &Functions = M.getFunctions();
+	if (FunctionIndex >= Functions.size() || !Functions[FunctionIndex])
+		return false;
+	Function *OldFunction = Functions[FunctionIndex].get();
+	if (!OldFunction || OldFunction->hasReservedSignature() ||
+		!OldFunction->getIRType() || OldFunction->getIRType()->isVoid() ||
+		!OldFunction->hasOnlyDirectCallUses())
+		return false;
+
+	std::vector<CallInst *> Calls = OldFunction->getDirectCallSites();
+	if (Calls.empty()) return false;
+	std::unordered_set<Instruction *> DeadReturnFlow;
+	for (CallInst *Call : Calls) {
+		if (!Call || !Call->getParent() ||
+			Call->getDirectCallee() != OldFunction)
+			return false;
+		if (Call->getParentFunction() != OldFunction) {
+			// 跨函数返回值传递属于多节点SCC问题，首版只接受外部调用完全忽略结果。
+			if (Call->hasUses()) return false;
+			continue;
+		}
+		std::unordered_set<Value *> Visiting;
+		if (!collectDeadReturnFlow(
+				Call, OldFunction, DeadReturnFlow, Visiting))
+			return false;
+	}
+
+	std::unique_ptr<Function> NewFunctionOwner =
+		cloneFunctionWithVoidReturn(*OldFunction, DeadReturnFlow);
+	if (!NewFunctionOwner) return false;
+	Function *NewFunction = NewFunctionOwner.get();
+
+	struct ReplacementCall {
+		CallInst *Old = nullptr;
+		std::unique_ptr<CallInst> New;
+	};
+	std::vector<ReplacementCall> Replacements;
+	try {
+		for (CallInst *Call : Calls) {
+			// 原函数体内的自递归调用已经由克隆映射指向新函数，旧调用随旧函数销毁。
+			if (Call->getParentFunction() == OldFunction) continue;
+			std::vector<Value *> Arguments = Call->getArgs();
+			auto NewCall = std::make_unique<CallInst>(
+				NewFunction, Arguments);
+			NewCall->setTailCall(Call->isTailCall());
+			Replacements.push_back({Call, std::move(NewCall)});
+		}
+	} catch (const std::invalid_argument &) {
+		return false;
+	}
+
+	std::vector<CallInst *> InsertedCalls;
+	for (ReplacementCall &Replacement : Replacements) {
+		Instruction *NewCall = Replacement.New.release();
+		if (!Replacement.Old->insertBefore(NewCall)) {
+			delete NewCall;
+			for (CallInst *Inserted : InsertedCalls) {
+				Inserted->eraseFromParent();
+				delete Inserted;
+			}
+			return false;
+		}
+		InsertedCalls.push_back(static_cast<CallInst *>(NewCall));
+	}
+	for (ReplacementCall &Replacement : Replacements) {
+		Replacement.Old->eraseFromParent();
+		delete Replacement.Old;
+	}
+	Functions[FunctionIndex] = std::move(NewFunctionOwner);
+	return true;
+}
+
+bool DAEPass::eliminateDeadReturns(Module &M) {
+	bool Changed = false;
+	// 每个候选在提交前完整构造新函数和全部外部call；一次改写失败不会改变签名。
+	for (std::size_t Index = 0; Index < M.getFunctions().size(); ++Index)
+		Changed |= rewriteFunctionWithDeadReturn(M, Index);
+	return Changed;
+}
+
 PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	(void)MAM;
 	bool Changed = false;
+	const bool EnableRISCVDeadReturn =
+		TargetInfo::get().getArch() == TargetArch::RISCV64;
 	std::vector<Function *> Snapshot;
 	for (auto &FPtr : M.getFunctions()) {
 		if (FPtr) Snapshot.push_back(FPtr.get());
@@ -886,6 +1126,7 @@ PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 		Changed |= tryRedundantArgMerge(F, CallSites);
 	}
 	Changed |= eliminateDeadArguments(M);
+	if (EnableRISCVDeadReturn) Changed |= eliminateDeadReturns(M);
 
 	// 对剩余调用按局部常量/指针事实和实参等价类分组。等价关系仅在
 	// 对应副本中成立，不会错误地改写仍需通用语义的原函数。
@@ -901,6 +1142,7 @@ PreservationStatus DAEPass::run(Module &M, ModuleAnalysisPassManager &MAM) {
 	// 副本已直接省略特化形参；再做一次传递闭包，可继续删除因常量
 	// 替换或跨函数纯转发而变死的其他形参。
 	Changed |= eliminateDeadArguments(M);
+	if (EnableRISCVDeadReturn) Changed |= eliminateDeadReturns(M);
 
 	return Changed ? PreservationStatus::none() : PreservationStatus::all();
 }

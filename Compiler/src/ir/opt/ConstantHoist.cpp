@@ -1,6 +1,7 @@
 #include "ir/opt/ConstantHoist.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/TargetCostAnalysis.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -90,7 +91,8 @@ bool ConstantHoistPass::isLiteralSensitiveUse(
 //步骤 1.2：遍历全部非 PHI 操作数，按值为可提升的大 i32 常量建桶，同时
 //记录使用点和最大循环深度；这些信息分别服务支配性检查和动态收益估计。
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
-    Function &F, const LoopInfo &LI) {
+    Function &F, const LoopInfo &LI,
+    const TargetCostInfo &TargetCost) {
     ConstantHoistCollectResult R;
     forEachInstruction(
         F, [&](BasicBlock *BB, Instruction *I) {
@@ -103,15 +105,28 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
                 if (!u) return;
                 if (auto *ci = dynamic_cast<ConstInt *>(v)) {
                     if (isLiteralSensitiveUse(I, OperandIndex)) return;
-                    //重组表达式固定使用 i32，小于目标立即数阈值的值无需物化。
+                    //重组表达式固定使用i32；具体使用点能够直接吸收的立即数
+                    //以及零寄存器常量都无需公共物化。
                     if (!IRType::hasIntegerBitWidth(
                             ci->getIRType(), 32))
                         return;
                     const int32_t val = static_cast<int32_t>(ci->getVal());
-                    //在 i64 中计算绝对值，避免 i32 最小值取负溢出。
-                    const int64_t wideVal = static_cast<int64_t>(val);
-                    const int64_t magnitude = wideVal < 0 ? -wideVal : wideVal;
-                    if (magnitude < ImmediateThreshold) return;
+                    if (TargetCost.isRISCV64()) {
+                        const int MaterializeCost =
+                            TargetCost.getIntImmediateOperandCost(
+                                I->instType,
+                                static_cast<unsigned>(OperandIndex), val, 32,
+                                TargetCostKind::CodeSize);
+                        if (MaterializeCost <= 0 ||
+                            MaterializeCost >= TargetCostInfo::InvalidCost)
+                            return;
+                    } else {
+                        //其他后端完整沿用原来的绝对值阈值，不读取RV立即数规则。
+                        const int64_t WideValue = static_cast<int64_t>(val);
+                        const int64_t Magnitude =
+                            WideValue < 0 ? -WideValue : WideValue;
+                        if (Magnitude < LegacyImmediateThreshold) return;
+                    }
                     auto &C = R.intBuckets[val];
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
@@ -137,10 +152,11 @@ void ConstantHoistPass::closeGroup(
     if ((int)totalUses >= UseThreshold)
         groups.push_back(std::move(cur));
 }
-//步骤 2.1：按常量值排序后构造半径受限的连续窗口。窗口最大值与最小值
-//之差小于阈值，因此无论选择哪个成员作基值，所有偏移都可直接编码。
+//步骤 2.1：按常量值排序后构造立即数可编码的连续窗口。窗口最大值与最小值
+//之差可由目标ADD立即数字段吸收，因此任一成员到基值的偏移都可直接编码。
 std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
-    std::vector<ConstantHoistCandidate> &sorted) {
+    std::vector<ConstantHoistCandidate> &sorted,
+    const TargetCostInfo &TargetCost) {
     std::vector<ConstantHoistGroup> groups;
     if (sorted.empty()) return groups;
     ConstantHoistGroup cur;
@@ -148,7 +164,11 @@ std::vector<ConstantHoistGroup> ConstantHoistPass::groupByBaseOffset(
     int64_t windowMin = cur.members[0].value;
     for (size_t i = 1; i < sorted.size(); ++i) {
         int64_t diff = (int64_t)sorted[i].value - windowMin;
-        if (diff < ImmediateThreshold) {
+        const bool FitsWindow = TargetCost.isRISCV64()
+            ? TargetCost.isLegalIntImmediate(
+                  Instruction::ADD, 1, diff, 64)
+            : diff < LegacyImmediateThreshold;
+        if (FitsWindow) {
             cur.members.push_back(std::move(sorted[i]));
         } else {
             closeGroup(cur, groups);
@@ -216,8 +236,9 @@ PreservationStatus ConstantHoistPass::run(Function &F,
     if (!entry) return PreservationStatus::all();
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
+    const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
     //1.发现候选：过滤字面量敏感位置，并按大整数值汇总使用点。
-    ConstantHoistCollectResult R = collectCandidates(F, LI);
+    ConstantHoistCollectResult R = collectCandidates(F, LI, TargetCost);
     //2.合并候选：排序后按可编码偏移分组，剔除总使用次数不足的窗口。
     std::vector<ConstantHoistCandidate> intSorted;
     intSorted.reserve(R.intBuckets.size());
@@ -226,7 +247,8 @@ PreservationStatus ConstantHoistPass::run(Function &F,
               [](const ConstantHoistCandidate &a, const ConstantHoistCandidate &b) {
                   return a.value < b.value;
               });
-    std::vector<ConstantHoistGroup> intGroups = groupByBaseOffset(intSorted);
+    std::vector<ConstantHoistGroup> intGroups =
+        groupByBaseOffset(intSorted, TargetCost);
     bool changed = false;
     for (ConstantHoistGroup &G : intGroups) {
         unsigned maxDepth = 0;

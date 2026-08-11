@@ -58,6 +58,17 @@ private:
 	static constexpr std::size_t MaxClonedInstructionsPerFunction = 384;
 	static constexpr std::size_t MaxSingleCallCloneInstructions = 48;
 	static constexpr std::size_t MaxSingleCallEqualityCloneInstructions = 96;
+	//DeadReturn值流遍历同时限制节点数和链深，超限时保守放弃。
+	class DeadReturnTraversalBudget final {
+	public:
+		static constexpr std::size_t MaxNodes = 4096;
+		static constexpr unsigned MaxDepth = 128;
+
+		bool tryVisit(unsigned Depth);
+
+	private:
+		std::size_t VisitedNodes = 0;
+	};
 
 	static const std::vector<bool> *getLiveMask(
 		const ParamMaskMap &Masks, Function *F);
@@ -87,6 +98,17 @@ private:
 	static bool tryRedundantArgMerge(
 		Function *F, const std::vector<CallInst *> &CallSites);
 	bool eliminateDeadArguments(Module &M);
+	// 当全部直接调用均忽略结果时，事务式把函数、call与ret统一改成void。
+	bool eliminateDeadReturns(Module &M);
+	static bool collectDeadReturnFlow(
+		Value *Root, Function *Owner,
+		std::unordered_set<Instruction *> &DeadFlow,
+		std::unordered_set<Value *> &Visiting);
+	static std::unique_ptr<Function> cloneFunctionWithVoidReturn(
+		Function &Source,
+		const std::unordered_set<Instruction *> &DeadReturnFlow);
+	static bool rewriteFunctionWithDeadReturn(
+		Module &M, std::size_t FunctionIndex);
 
 	bool isParamLive(
 		Function *Owner,
