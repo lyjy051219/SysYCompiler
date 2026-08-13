@@ -401,12 +401,24 @@ bool MemorySSAResult::isStoreValueRedundant(
                 !PreviousStore->fullyCoversItsPointer() ||
                 PreviousStore->getValueOperand() != StoredValue)
                 return false;
+            Function *Owner = Store->getParent()
+                ? Store->getParent()->getParent() : nullptr;
+            //NoModRef计时调用不会成为MemorySSA节点，因此在接受前写同值证明前
+            //必须直接检查真实CFG路径，避免把计时区内的后写当作冗余删除。
+            if (!Owner || hasOrderingBarrierOnPath(
+                    *Owner, PreviousStore, Store, FAM)) {
+                return false;
+            }
             //如果找到这么一个Store，标记为True
             SawConcreteSameValueStore = true;
             continue;
         }
         //如果是Call
-        if (I && I->as<CallInst>()) {
+        if (auto *Call = I ? I->as<CallInst>() : nullptr) {
+            //MemorySSA只描述程序内存版本；计时等顺序屏障即使NoModRef，
+            //也必须截断“前写已经使后写冗余”的证明。
+            if (getCallEffectSummary(Call, FAM).HasOrderingBarrier)
+                return false;
             //通过BasicAA分析Call是否可能修改目标位置
             ModRefInfo MRI = getInstModRefInfo(
                 MemoryLocation::get(Store), I, AA, LI, FAM);

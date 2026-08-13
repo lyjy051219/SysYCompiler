@@ -771,6 +771,11 @@ void collectCandidates(const MachineFunction &mf, const FunctionSnapshot &snap,
                        const DominatorSets &dominators, LoopData &loop,
                        const Options &opts, const std::vector<int> &latches,
                        int &loadBlocked) {
+  //机器IR不携带中端的精细调用效果摘要。循环含调用时，纯算术外提也可能
+  //越过SysY计时边界，因此统一停止候选收集，而不只阻断load。
+  if (loop.hasCall || loop.hasMemcpy) {
+    return;
+  }
   for (int block : loop.members) {
     const MachineBasicBlock &b = mf.blocks[static_cast<std::size_t>(block)];
     for (std::size_t index = 0; index < b.instrs.size(); ++index) {

@@ -90,7 +90,7 @@ bool DSEPass::isReloadStoreBackRedundant(
     if (!StoredType || StoredType->getSize() == 0) return false;
     MemoryLocation TargetLocation = MemoryLocation::get(SourceLoad);
 
-    //2.3 load与回写之间允许任意读取、纯计算和不修改P的调用。中间store只有
+    //2.3 load与回写之间允许任意读取、纯计算和无顺序语义的不写调用。中间store只有
     //在确定不别名，或按同类型自然对齐写入同一个V时才不会破坏P原有的V。
     bool ReachedStore = false;
     for (Instruction *I = SourceLoad->getNext(); I; I = I->getNext()) {
@@ -121,6 +121,10 @@ bool DSEPass::isReloadStoreBackRedundant(
             }
             continue;
         }
+        if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            if (getCallEffectSummary(CI, FAM).HasOrderingBarrier)
+                return false;
+        }
         ModRefInfo Effect = getInstModRefInfo(
             TargetLocation, I, AA, LI, FAM);
         if (isModSet(Effect)) return false;
@@ -132,8 +136,8 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
                                      const LoopInfo &LoopInfo,
                                      FunctionAnalysisPassManager &FAM) {
     //1.从块尾逆向维护“尚未被观察的后继 store”。load 会清除所有可能别名项；
-    //当前 store 若被同覆盖范围的 MustAlias 后继 store 覆盖即可删除。调用只按
-    //程序内存 ModRef 清除冲突项；不访问程序内存的 timer 对该状态透明。
+    //当前 store 若被同覆盖范围的 MustAlias 后继 store 覆盖即可删除。顺序屏障
+    //会截断全部待定store，普通调用仍只按程序内存ModRef清除冲突项。
     if (BB == nullptr) {
         return false;
     }
@@ -210,6 +214,10 @@ bool DSEPass::eliminateInBlockWithAA(BasicBlock *BB, BasicAAResult &AA,
             continue;
         }
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            if (getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                pendingStores.clear();
+                continue;
+            }
             for (auto PendingIt = pendingStores.begin();
                  PendingIt != pendingStores.end();) {
                 StoreInst *PendingStore = PendingIt->second;
@@ -241,6 +249,10 @@ DSEBlockColor DSEPass::classifyFrom(
     Value *P = Location.Pointer;
     if (!P) return DSEBlockColor::Clobber;
     for (Instruction *I = First; I; I = I->getNext()) {
+        if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            if (getCallEffectSummary(CI, FAM).HasOrderingBarrier)
+                return DSEBlockColor::Clobber;
+        }
         if (auto *SI = dynamic_cast<StoreInst *>(I)) {
             Value *StorePtr = SI->getPointerOperand();
             if (StorePtr &&
@@ -367,7 +379,8 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         if (overwriteQueries >= MaxMemorySSAOverwriteQueries) break;
         ++overwriteQueries;
         if (MSSA->isStoreOverwrittenOnAllPaths(
-                SI, *AA, LI, FAM, MaxVisitedForwardAccesses)) {
+                SI, *AA, LI, FAM, MaxVisitedForwardAccesses) &&
+            isStoreDead(SI, *AA, LI, FAM)) {
             overwrittenStores.push_back(SI);
         }
     }
@@ -389,8 +402,8 @@ PreservationStatus DSEPass::run(Function &F, FunctionAnalysisPassManager &FAM) {
         AA = &FAM.getResult<BasicAliasAnalysis>(F);
         MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
     }
-    //3.第二层反向删除“写入值本身已冗余”的store；timer不访问SysY程序内存，
-    //walker会越过其调用节点。该阶段同样先收集后删除以保持查询快照稳定。
+    //3.第二层反向删除“写入值本身已冗余”的store；MemorySSA查询内部还会
+    //把顺序屏障作为截断点，不能仅依据程序内存版本透明越过timer。
     constexpr std::size_t MaxMemorySSAStoreQueries = 256;
     constexpr std::size_t MaxVisitedMemoryAccesses = 256;
     std::vector<StoreInst *> redundantValueStores;

@@ -71,6 +71,8 @@ private:
     void stampRank(Instruction *I);
     //把仍存活的指令加入唯一重访队列
     void pushTodo(Instruction *I);
+    //判断操作数定义到当前使用之间是否跨越计时顺序屏障
+    bool crossesOrderingBarrier(Value *Operand, Instruction *Use) const;
     //消费重访队列并汇总是否产生新的局部改写
     bool processTodo();
     //判断整数表达式是否最终参与GEP地址计算

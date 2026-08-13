@@ -20,6 +20,7 @@ class Instruction;
 class Loop;
 class LoopAccessInfo;
 class LoopInfo;
+struct LoopMemoryAccess;
 class PhiInst;
 class PostDominatorTree;
 class RangeInfo;
@@ -55,14 +56,8 @@ struct UnrollAndJamConfig {
     std::size_t MaxClonedInstructions = 96;
     //限制运行期jam的标量尾副本、额外lane和分派计算合计代码增长。
     std::size_t MaxRuntimeClonedInstructions = 192;
-    //一次可消除共享load的RV64GC抽象动态成本。
-    unsigned EstimatedSharedLoadCost = 2;
-    //每个被共享内循环的RV64GC规范控制成本。
-    unsigned EstimatedInnerControlCost = 1;
-    //RV64GC运行期分派与边界计算的固定成本。
+    //RV64GC运行期分派与边界计算的静态代码增长估值。
     unsigned EstimatedRuntimeDispatchCost = 8;
-    //要求运行期jam在模型中至少取得指定抽象净收益。
-    unsigned MinRuntimeNetBenefit = 1;
     //限制单个函数在固定点迭代期间最多执行的二维分块次数。
     unsigned MaxTileTransformsPerFunction = 1;
     //限制单个分块轴采用的最大常量tile大小。
@@ -154,10 +149,11 @@ struct UnrollAndJamShape {
     unsigned OuterExitComparedOperand = 0;
     //记录运行期外轴已在预头结合范围事实证明有限且不回绕。
     bool OuterRuntimeNoWrapProven = false;
+    //同根数组凭类型化坐标带证明lane互不相交时，记录各动态坐标的共同容量；
+    //运行期次数超过容量必须退回原形标量循环，不能借越界行为取得收益。
+    std::optional<std::int64_t> OuterIndependenceTripLimit;
     //记录运行期直接内轴已在预头结合范围事实证明有限且不回绕。
     bool InnerRuntimeNoWrapProven = false;
-    //记录直接内轴运行期次数能够在外轴预头安全物化。
-    bool InnerTripMaterializableAtOuterPreHeader = false;
     //按函数顺序记录候选嵌套涉及的全部基本块。
     std::vector<BasicBlock *> Blocks;
     //记录由所有lane共同复用的内循环树。
@@ -219,6 +215,14 @@ private:
     //记录分块产生和复用的全部循环头，阻止固定点再次对同一层级分块。
     std::unordered_map<Function *, std::unordered_set<BasicBlock *>>
         TiledHeaders;
+
+    //证明同根标量访问按类型化单位坐标带分lane时互不相交，并返回各动态坐标的共同容量。
+    static std::optional<std::int64_t>
+    proveTypedLaneBandIndependent(
+        const LoopMemoryAccess &First,
+        const LoopMemoryAccess &Second, Loop *Axis,
+        const InductionDescriptor &Induction,
+        const SCEVExpr *LaneTripCount, SCEVResult &SE);
 
     //1.5 严格二维分块只接受整除边界、完美矩形和完整可建模访存。
     //从规范头测循环提取常量起点、上界、次数及其可改写位置。
@@ -331,13 +335,11 @@ private:
     //结合显式配置、收益模式和资源预算选择最终展开因子。
     static std::optional<int> selectFactor(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
-        SCEVResult &SE, const UnrollAndJamConfig &Config,
-        std::int64_t *RuntimeMinInnerTrip = nullptr);
-    //用共享读取、内层控制、静态增长和SCEV分派成本评估运行期因子。
+        SCEVResult &SE, const UnrollAndJamConfig &Config);
+    //仅按结构收益、寄存器和静态代码增长评估运行期因子，不生成输入规模性能guard。
     static bool evaluateRuntimeFactor(
         const UnrollAndJamShape &Shape, LoopAccessInfo &LA,
-        int Factor, const UnrollAndJamConfig &Config,
-        std::int64_t &MinInnerTrip);
+        int Factor, const UnrollAndJamConfig &Config);
     //2.5 建立候选形状并把所有受外 IV 影响的非控制指令收入 lane 克隆集。
     //构造受外归纳变量影响且对使用封闭的lane指令克隆集合。
     static bool collectLaneInstructions(UnrollAndJamShape &Shape,
@@ -384,6 +386,6 @@ private:
     static bool executeRuntimePlan(
         Function &F, UnrollAndJamShape &Shape,
         UnrollAndJamClonePlan &Plan, SCEVResult &SE,
-        const DominatorTree &DT, std::int64_t MinInnerTrip,
+        const DominatorTree &DT,
         const UnrollAndJamConfig &Config);
 };

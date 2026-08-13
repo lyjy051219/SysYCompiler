@@ -22,7 +22,9 @@ public:
 
 private:
 	//2-5. 完成单循环的预检、Header 克隆、SSA 转发和 CFG 旋转。
-	bool runLoopRotate(Function &F, Loop &L, const DominatorTree &DT, const LoopInfo &LI);
+	bool runLoopRotate(
+		Function &F, Loop &L, const DominatorTree &DT,
+		const LoopInfo &LI, FunctionAnalysisPassManager &FAM);
 
 	//识别带有约定标记且不应被普通PHI折叠的LCSSA节点。
 	static bool isLCSSAPhi(PhiInst *Phi);

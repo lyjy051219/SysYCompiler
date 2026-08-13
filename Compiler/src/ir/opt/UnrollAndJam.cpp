@@ -15,6 +15,138 @@
 #include <limits>
 #include <numeric>
 #include <utility>
+
+//证明同根标量访问按类型化单位坐标带分lane时，不同lane只能落在不同元素。
+//所有其他动态坐标也必须是同次数的零起点单位递推；动态边界由提交阶段
+//用布局容量守卫，超界时完整执行原形循环，避免依赖越界或地址回绕语义。
+std::optional<std::int64_t>
+UnrollAndJamPass::proveTypedLaneBandIndependent(
+    const LoopMemoryAccess &First, const LoopMemoryAccess &Second,
+    Loop *Axis, const InductionDescriptor &Induction,
+    const SCEVExpr *LaneTripCount, SCEVResult &SE) {
+    if (!Axis || First.Root != Second.Root || !First.Root ||
+        !First.AddressExact || !Second.AddressExact ||
+        !First.Location.Size || !Second.Location.Size ||
+        *First.Location.Size == 0 ||
+        *First.Location.Size != *Second.Location.Size ||
+        First.ByteStrides != Second.ByteStrides ||
+        First.Subscripts.size() != Second.Subscripts.size() ||
+        First.ByteStrides.size() != First.Subscripts.size() ||
+        First.Subscripts.size() < 2 || !LaneTripCount ||
+        !Induction.ConstantStart || *Induction.ConstantStart != 0 ||
+        !Induction.ConstantStep || *Induction.ConstantStep != 1) {
+        return std::nullopt;
+    }
+    auto IsCanonicalAxis = [](const LoopAffineExpr &Expression,
+                              const Loop *Expected) {
+        if (!Expression.Exact || Expression.Constant != 0 ||
+            !Expression.InvariantTerms.empty() || !Expected) {
+            return false;
+        }
+        auto It = Expression.LoopCoefficients.find(Expected);
+        if (It == Expression.LoopCoefficients.end() || It->second != 1)
+            return false;
+        for (const auto &Entry : Expression.LoopCoefficients) {
+            if (Entry.first != Expected && Entry.second != 0) return false;
+        }
+        return true;
+    };
+    std::optional<std::size_t> Band;
+    for (std::size_t Index = 1; Index < First.Subscripts.size(); ++Index) {
+        const bool FirstAxis = IsCanonicalAxis(
+            First.Subscripts[Index], Axis);
+        const bool SecondAxis = IsCanonicalAxis(
+            Second.Subscripts[Index], Axis);
+        if (FirstAxis != SecondAxis || (FirstAxis && Band))
+            return std::nullopt;
+        if (FirstAxis) Band = Index;
+    }
+    if (!Band) return std::nullopt;
+    std::int64_t TripLimit = std::numeric_limits<std::int64_t>::max();
+    for (std::size_t Index = 0; Index < First.Subscripts.size(); ++Index) {
+        const std::int64_t Stride = First.ByteStrides[Index];
+        if (Stride <= 0 ||
+            (Index != 0 &&
+             (First.ByteStrides[Index - 1] <= Stride ||
+              First.ByteStrides[Index - 1] % Stride != 0))) {
+            return std::nullopt;
+        }
+        if (Index == 0) {
+            const LoopAffineExpr &A = First.Subscripts[Index];
+            const LoopAffineExpr &B = Second.Subscripts[Index];
+            if (!A.Exact || !B.Exact || A.Constant != 0 ||
+                B.Constant != 0 || !A.LoopCoefficients.empty() ||
+                !B.LoopCoefficients.empty() ||
+                !A.InvariantTerms.empty() || !B.InvariantTerms.empty()) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        const std::int64_t Capacity =
+            First.ByteStrides[Index - 1] / Stride;
+        if (Capacity <= 0) return std::nullopt;
+        for (const LoopAffineExpr *Expression :
+             {&First.Subscripts[Index], &Second.Subscripts[Index]}) {
+            if (Index == *Band) continue;
+            if (!Expression->Exact) {
+                return std::nullopt;
+            }
+            if (Expression->LoopCoefficients.empty() &&
+                Expression->InvariantTerms.empty()) {
+                if (Expression->Constant < 0 ||
+                    Expression->Constant >= Capacity) {
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (Expression->Constant != 0) {
+                return std::nullopt;
+            }
+            const Loop *CoordinateLoop = nullptr;
+            if (Expression->LoopCoefficients.size() == 1 &&
+                Expression->InvariantTerms.empty() &&
+                Expression->LoopCoefficients.begin()->second == 1) {
+                CoordinateLoop =
+                    Expression->LoopCoefficients.begin()->first;
+            } else if (Expression->LoopCoefficients.empty() &&
+                       Expression->InvariantTerms.size() == 1 &&
+                       Expression->InvariantTerms.begin()->second == 1) {
+                auto Affine = SE.getAffine(
+                    Expression->InvariantTerms.begin()->first);
+                if (!Affine || !Affine->RecLoop ||
+                    !Affine->ConstantStart ||
+                    *Affine->ConstantStart != 0 ||
+                    !Affine->ConstantStep ||
+                    *Affine->ConstantStep != 1) {
+                    return std::nullopt;
+                }
+                CoordinateLoop = Affine->RecLoop;
+            } else {
+                return std::nullopt;
+            }
+            auto CoordinateInduction =
+                SE.getCanonicalInduction(CoordinateLoop);
+            //同一SCEVResult按结构化Key驻留表达式，指针相等即总次数表达式相同。
+            if (!CoordinateInduction || !CoordinateInduction->Valid ||
+                !CoordinateInduction->ConstantStart ||
+                *CoordinateInduction->ConstantStart != 0 ||
+                !CoordinateInduction->ConstantStep ||
+                *CoordinateInduction->ConstantStep != 1 ||
+                SE.getTripCount(CoordinateLoop) != LaneTripCount) {
+                return std::nullopt;
+            }
+            TripLimit = std::min(TripLimit, Capacity);
+        }
+        if (Index == *Band)
+            TripLimit = std::min(TripLimit, Capacity);
+    }
+    if (*First.Location.Size > static_cast<std::size_t>(
+            First.ByteStrides.back()) ||
+        TripLimit == std::numeric_limits<std::int64_t>::max()) {
+        return std::nullopt;
+    }
+    return TripLimit;
+}
 //使用给定资源与收益参数构造展开并合并Pass。
 UnrollAndJamPass::UnrollAndJamPass(UnrollAndJamConfig C)
     : Config(std::move(C)) {}
@@ -1387,97 +1519,47 @@ bool UnrollAndJamPass::fitsRegisterBudget(
 bool UnrollAndJamPass::isSupportedFactor(int Factor) {
     return Factor == 2 || Factor == 4 || Factor == 8;
 }
-//使用可确定消除的动态工作和统一静态增长上限评估运行期jam因子。
+//运行期候选只做编译期结构和代码增长评估，不按实际输入规模选择快慢路径。
 bool UnrollAndJamPass::evaluateRuntimeFactor(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, int Factor,
-    const UnrollAndJamConfig &C, std::int64_t &MinInnerTrip) {
-    MinInnerTrip = 0;
+    const UnrollAndJamConfig &C) {
     if (!Shape.OuterTrip.IsRuntime ||
         !Shape.OuterRuntimeNoWrapProven ||
         !Shape.OuterTrip.TripCount || !Shape.OuterPreHeader ||
         !isSupportedFactor(Factor) || Factor > C.MaxFactor ||
-        C.EstimatedSharedLoadCost == 0 ||
-        !fitsRegisterBudget(Shape, Factor, C)) {
+        !fitsRegisterBudget(Shape, Factor, C) ||
+        C.MaxRuntimeClonedInstructions == 0) {
         return false;
     }
     std::unordered_set<Instruction *> LaneValues(
         Shape.LaneInstructions.begin(), Shape.LaneInstructions.end());
-    const unsigned SharedLoads = countGuaranteedShareableLaneReads(
-        Shape, LA, LaneValues);
-    if (SharedLoads == 0) return false;
-    //运行期内轴要么具有正的常量次数，要么同样已经证明不回绕且次数可在
-    //外预头物化；后一种情况由执行阶段生成收益阈值守卫。
-    if (Shape.InnerTrip.ConstantTripCount) {
-        if (*Shape.InnerTrip.ConstantTripCount <= 0)
-            return false;
-    } else if (!Shape.InnerTrip.IsRuntime ||
-               !Shape.InnerRuntimeNoWrapProven ||
-               !Shape.InnerTrip.TripCount ||
-               !Shape.InnerTripMaterializableAtOuterPreHeader) {
+    if (countGuaranteedShareableLaneReads(
+            Shape, LA, LaneValues) == 0) {
         return false;
     }
     LoopUnrollPass SCEVCostModel;
     const int OuterSCEVCost =
         SCEVCostModel.estimateSCEVCost(Shape.OuterTrip.TripCount);
-    const int InnerSCEVCost = Shape.InnerTrip.ConstantTripCount
-        ? 0
-        : SCEVCostModel.estimateSCEVCost(Shape.InnerTrip.TripCount);
-    if (OuterSCEVCost < 0 || InnerSCEVCost < 0 ||
-        OuterSCEVCost >= 1000000 || InnerSCEVCost >= 1000000) {
+    if (OuterSCEVCost < 0 || OuterSCEVCost >= 1000000)
         return false;
-    }
-    //静态增长统一计入完整标量尾副本、全部额外lane和运行期表达式/分派。
     __int128 NestInstructions = 0;
     for (BasicBlock *BB : Shape.Blocks) {
         if (!BB) return false;
         NestInstructions += BB->size();
     }
-    const __int128 LaneGrowth =
+    const __int128 TotalGrowth = NestInstructions +
         static_cast<__int128>(Factor - 1) *
-        Shape.LaneInstructions.size();
-    const __int128 SetupGrowth =
-        static_cast<__int128>(C.EstimatedRuntimeDispatchCost) +
-        OuterSCEVCost + InnerSCEVCost +
-        (Shape.InnerTrip.ConstantTripCount ? 0 : 2);
-    const __int128 TotalGrowth =
-        NestInstructions + LaneGrowth + SetupGrowth;
-    if (C.MaxRuntimeClonedInstructions == 0 || TotalGrowth <= 0 ||
-        TotalGrowth > C.MaxRuntimeClonedInstructions) {
-        return false;
-    }
-    //每个完整jam组至少消除Factor-1份共享load和一份规范内循环控制；
-    //用“仅有一个主组”计算阈值，使更多外迭代只会增加净收益。
-    const __int128 SavingPerInnerIteration =
-        static_cast<__int128>(Factor - 1) *
-        (static_cast<__int128>(SharedLoads) *
-             C.EstimatedSharedLoadCost +
-         C.EstimatedInnerControlCost);
-    const __int128 FixedDynamicCost =
-        static_cast<__int128>(C.EstimatedRuntimeDispatchCost) +
-        OuterSCEVCost + InnerSCEVCost +
-        (Shape.InnerTrip.ConstantTripCount ? 0 : 2);
-    if (SavingPerInnerIteration <= 0) return false;
-    const __int128 RequiredSaving = FixedDynamicCost +
-        std::max<unsigned>(1, C.MinRuntimeNetBenefit);
-    const __int128 RequiredTrip =
-        (RequiredSaving + SavingPerInnerIteration - 1) /
-        SavingPerInnerIteration;
-    if (RequiredTrip <= 0 ||
-        RequiredTrip > std::numeric_limits<std::int64_t>::max()) {
-        return false;
-    }
-    MinInnerTrip = static_cast<std::int64_t>(RequiredTrip);
-    if (Shape.InnerTrip.ConstantTripCount &&
-        *Shape.InnerTrip.ConstantTripCount < MinInnerTrip) {
-        return false;
-    }
-    return true;
+            Shape.LaneInstructions.size() +
+        C.EstimatedRuntimeDispatchCost + OuterSCEVCost +
+        (Shape.OuterIndependenceTripLimit ? 2 : 0);
+    return TotalGrowth > 0 &&
+        TotalGrowth <= C.MaxRuntimeClonedInstructions;
 }
+
 //结合共享读取、访存局部性、归约延迟和寄存器预算选择展开因子。
 std::optional<int> UnrollAndJamPass::selectFactor(
     const UnrollAndJamShape &Shape, LoopAccessInfo &LA, SCEVResult &SE,
-    const UnrollAndJamConfig &C, std::int64_t *RuntimeMinInnerTrip) {
-    if (RuntimeMinInnerTrip) *RuntimeMinInnerTrip = 0;
+    const UnrollAndJamConfig &C) {
     if (C.MaxFactor < 2)
         return std::nullopt;
     std::unordered_set<Instruction *> LaneValues(
@@ -1490,14 +1572,7 @@ std::optional<int> UnrollAndJamPass::selectFactor(
     const unsigned StrictReductions = countStrictFPReductions(Shape);
     auto IsProfitable = [&](int Factor) {
         if (RuntimeOuter) {
-            std::int64_t RequiredInnerTrip = 0;
-            if (!evaluateRuntimeFactor(
-                    Shape, LA, Factor, C, RequiredInnerTrip)) {
-                return false;
-            }
-            if (RuntimeMinInnerTrip)
-                *RuntimeMinInnerTrip = RequiredInnerTrip;
-            return true;
+            return evaluateRuntimeFactor(Shape, LA, Factor, C);
         }
         if (!isSupportedFactor(Factor) || Factor > C.MaxFactor ||
             !Shape.OuterTrip.ConstantTripCount ||
@@ -1585,6 +1660,20 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
         }
         return dynamic_cast<AllocaInst *>(Root) != nullptr;
     };
+    auto OuterTrip = SE.analyzeLoopTripCount(Outer);
+    auto InnerTrip = SE.analyzeLoopTripCount(Inner);
+    auto OuterInduction = SE.getCanonicalInduction(Outer);
+    auto InnerInduction = SE.getCanonicalInduction(Inner);
+    if (!OuterTrip || !InnerTrip || !OuterInduction || !InnerInduction ||
+        !OuterTrip->Valid || !InnerTrip->Valid ||
+        !OuterInduction->ConstantStep ||
+        *OuterInduction->ConstantStep <= 0 ||
+        !hasOnlyCanonicalHeaderPhi(Outer, OuterInduction->Phi) ||
+        !hasControlOnlyHeader(Outer, OuterInduction->Phi, *OuterTrip,
+                              false)) {
+        return std::nullopt;
+    }
+    std::optional<std::int64_t> IndependenceTripLimit;
     auto ProvesOuterIndependent = [&]() {
         if (!Outer || !LA.isRectangularNest(Outer, Inner)) return false;
         if (LA.areIterationsIndependent(Outer, Outer)) return true;
@@ -1617,6 +1706,17 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
                     IsUniqueObject(Second->Root)) {
                     continue;
                 }
+                //矩阵行坐标可不同；只有待jam坐标和其余动态坐标均满足
+                //类型化坐标带证明时，才用布局容量推出不同lane地址不等。
+                auto Limit = proveTypedLaneBandIndependent(
+                    *First, *Second, Outer, *OuterInduction,
+                    OuterTrip->TripCount, SE);
+                if (Limit) {
+                    IndependenceTripLimit = IndependenceTripLimit
+                        ? std::min(*IndependenceTripLimit, *Limit)
+                        : *Limit;
+                    continue;
+                }
                 return false;
             }
         }
@@ -1625,19 +1725,6 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
     if (!Outer || !Inner ||
         !LA.isRectangularNest(Outer, Inner) ||
         !ProvesOuterIndependent()) {
-        return std::nullopt;
-    }
-    auto OuterTrip = SE.analyzeLoopTripCount(Outer);
-    auto InnerTrip = SE.analyzeLoopTripCount(Inner);
-    auto OuterInduction = SE.getCanonicalInduction(Outer);
-    auto InnerInduction = SE.getCanonicalInduction(Inner);
-    if (!OuterTrip || !InnerTrip || !OuterInduction || !InnerInduction ||
-        !OuterTrip->Valid || !InnerTrip->Valid ||
-        !OuterInduction->ConstantStep ||
-        *OuterInduction->ConstantStep <= 0 ||
-        !hasOnlyCanonicalHeaderPhi(Outer, OuterInduction->Phi) ||
-        !hasControlOnlyHeader(Outer, OuterInduction->Phi, *OuterTrip,
-                              false)) {
         return std::nullopt;
     }
     UnrollAndJamShape Shape;
@@ -1665,18 +1752,16 @@ std::optional<UnrollAndJamShape> UnrollAndJamPass::buildShape(
         LoopUnrollPass::canMaterializeRuntimeSCEV(
             OuterTrip->TripCount, Outer, Shape.OuterPreHeader, DT);
     if (!ConstantOuter && !RuntimeOuter) return std::nullopt;
+    if (IndependenceTripLimit && ConstantOuter &&
+        *OuterTrip->ConstantTripCount > *IndependenceTripLimit) {
+        return std::nullopt;
+    }
     Shape.OuterRuntimeNoWrapProven = RuntimeOuter;
+    Shape.OuterIndependenceTripLimit = IndependenceTripLimit;
     //2.6 将控制、外回边语义、CFG/LCSSA 形状和 lane 闭包串联校验，任一步不完整都放弃整个候选。
     Shape.Blocks = Outer->getBlocksInFunctionOrder();
     if (!collectControl(Shape, SE, RI, DT, C))
         return std::nullopt;
-    if (Shape.InnerTrip.IsRuntime && Shape.InnerTrip.TripCount &&
-        Shape.InnerRuntimeNoWrapProven) {
-        Shape.InnerTripMaterializableAtOuterPreHeader =
-            LoopUnrollPass::canMaterializeRuntimeSCEV(
-                Shape.InnerTrip.TripCount, Outer,
-                Shape.OuterPreHeader, DT);
-    }
     if (!analyzeOuterControl(Shape) ||
         !validateShape(Shape, LI, SE, DT, PDT, C) ||
         !collectLaneInstructions(Shape, C)) {
@@ -1963,7 +2048,7 @@ bool UnrollAndJamPass::executePlan(UnrollAndJamShape &Shape,
 bool UnrollAndJamPass::executeRuntimePlan(
     Function &F, UnrollAndJamShape &Shape,
     UnrollAndJamClonePlan &Plan, SCEVResult &SE,
-    const DominatorTree &DT, std::int64_t MinInnerTrip,
+    const DominatorTree &DT,
     const UnrollAndJamConfig &C) {
     (void)C;
     if (!Shape.Outer || !Shape.Inner ||
@@ -1978,7 +2063,7 @@ bool UnrollAndJamPass::executeRuntimePlan(
         !Shape.OuterInduction.StartValue ||
         !Shape.OuterInduction.ConstantStep ||
         *Shape.OuterInduction.ConstantStep <= 0 ||
-        MinInnerTrip <= 0 || !validatePlanCommit(Shape, Plan)) {
+        !validatePlanCommit(Shape, Plan)) {
         return false;
     }
     BasicBlock *Header = Shape.Outer->getHeader();
@@ -2064,17 +2149,6 @@ bool UnrollAndJamPass::executeRuntimePlan(
     }
     if (!LoopUnrollPass::canMaterializeRuntimeSCEV(
             Shape.OuterTrip.TripCount, Shape.Outer, PreHeader, DT)) {
-        return false;
-    }
-    const bool DynamicInner = !Shape.InnerTrip.ConstantTripCount;
-    if (DynamicInner &&
-        (!Shape.InnerTrip.IsRuntime ||
-         !Shape.InnerRuntimeNoWrapProven ||
-         !Shape.InnerTripMaterializableAtOuterPreHeader ||
-         !Shape.InnerTrip.TripCount ||
-         !Shape.InnerTrip.TripCount->Ty ||
-         !Shape.InnerTrip.TripCount->Ty->isInt() ||
-         Shape.InnerTrip.TripCount->Ty->isBool())) {
         return false;
     }
     std::unordered_set<Instruction *> OriginalPreHeaderInstructions;
@@ -2182,27 +2256,18 @@ bool UnrollAndJamPass::executeRuntimePlan(
         TripCount, BinaryInst::SUB, Remainder);
     BasicBlock::insertBeforeTerminator(PreHeader, MainTrip);
     Value *EffectiveMainTrip = MainTrip;
-    if (DynamicInner) {
-        Value *InnerTrip = LoopUnrollPass::materializeRuntimeSCEV(
-            Shape.InnerTrip.TripCount, Shape.Outer, PreHeader, DT);
-        if (!InnerTrip || !InnerTrip->getIRType() ||
-            !InnerTrip->getIRType()->isInt() ||
-            InnerTrip->getIRType()->isBool()) {
+    if (Shape.OuterIndependenceTripLimit) {
+        Value *Limit = Value::makeIntegerForType(
+            *Shape.OuterIndependenceTripLimit, TripCount->getIRType());
+        if (!Limit) {
             DiscardRuntimeSetup();
             return false;
         }
-        Value *Threshold = Value::makeIntegerForType(
-            MinInnerTrip, InnerTrip->getIRType());
-        if (!Threshold) {
-            DiscardRuntimeSetup();
-            return false;
-        }
-        auto *EnoughInnerWork = new BinaryInst(
-            InnerTrip, BinaryInst::GE, Threshold);
-        BasicBlock::insertBeforeTerminator(
-            PreHeader, EnoughInnerWork);
+        auto *WithinObject = new BinaryInst(
+            TripCount, BinaryInst::LE, Limit);
+        BasicBlock::insertBeforeTerminator(PreHeader, WithinObject);
         auto *SelectedMainTrip = new SelectInst(
-            EnoughInnerWork, MainTrip, ZeroTrip);
+            WithinObject, EffectiveMainTrip, ZeroTrip);
         BasicBlock::insertBeforeTerminator(
             PreHeader, SelectedMainTrip);
         EffectiveMainTrip = SelectedMainTrip;
@@ -2313,24 +2378,6 @@ PassResult UnrollAndJamPass::run(Function &F,
             EffectiveConfig.EstimatedFPAddLatency =
                 static_cast<unsigned>(Cost);
     }
-    if (EffectiveConfig.EstimatedSharedLoadCost == 0 ||
-        EffectiveConfig.EstimatedSharedLoadCost == 2) {
-        const int Cost = TargetCost.getMemoryCost(
-            TargetMemoryOperation::Load,
-            FLOATType::NewFloat().get(), 4, false,
-            TargetCostKind::Throughput);
-        if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
-            EffectiveConfig.EstimatedSharedLoadCost =
-                static_cast<unsigned>(Cost);
-    }
-    if (EffectiveConfig.EstimatedInnerControlCost == 0 ||
-        EffectiveConfig.EstimatedInnerControlCost == 1) {
-        const int Cost = TargetCost.getBranchCost(
-            true, TargetCostKind::Throughput);
-        if (Cost > 0 && Cost < TargetCostInfo::InvalidCost)
-            EffectiveConfig.EstimatedInnerControlCost =
-                static_cast<unsigned>(Cost);
-    }
     if (EffectiveConfig.EstimatedRuntimeDispatchCost == 0 ||
         EffectiveConfig.EstimatedRuntimeDispatchCost == 8) {
         const int BranchCost = TargetCost.getBranchCost(
@@ -2388,17 +2435,15 @@ PassResult UnrollAndJamPass::run(Function &F,
             Outer, Inner, LI, SE, LA, RI, DT, PDT, EffectiveConfig);
         if (!Shape) continue;
         //3.形状合法后才评估共享读取、内存局部性、严格归约延迟与寄存器压力，得到唯一 Factor。
-        std::int64_t RuntimeMinInnerTrip = 0;
         auto Factor = selectFactor(
-            *Shape, LA, SE, EffectiveConfig, &RuntimeMinInnerTrip);
+            *Shape, LA, SE, EffectiveConfig);
         if (!Factor) continue;
         if (Shape->OuterTrip.IsRuntime) {
             auto Plan = buildClonePlan(
                 *Shape, LA, *Factor, EffectiveConfig);
             if (!Plan) continue;
             if (!executeRuntimePlan(
-                    F, *Shape, *Plan, SE, DT,
-                    RuntimeMinInnerTrip, EffectiveConfig)) {
+                    F, *Shape, *Plan, SE, DT, EffectiveConfig)) {
                 destroyClonePlan(*Plan);
                 continue;
             }

@@ -58,6 +58,14 @@ ReassociateEngine::ReassociateEngine(
 	bool PreserveAddressArithmetic)
 	: F(F), FAM(FAM),
 	  PreserveAddressArithmetic(PreserveAddressArithmetic) {}
+//计时调用既是内存顺序屏障，也是表达式求值顺序屏障。跨越该边界重结合会
+//改变被计时区间实际执行的工作，即使最终数值完全相同也不能接受。
+bool ReassociateEngine::crossesOrderingBarrier(
+	Value *Operand, Instruction *Use) const {
+	auto *Definition = dynamic_cast<Instruction *>(Operand);
+	if (!Definition || !Definition->getParent()) return false;
+	return hasOrderingBarrierOnPath(F, Definition, Use, FAM);
+}
 //主求解循环：先建立稳定排名，再按 RPO 扫描旧指令并处理新建指令待办项；
 //任一局部变化都会触发下一轮，直到表达式形状与代数化简同时稳定。
 bool ReassociateEngine::run() {
@@ -633,7 +641,8 @@ bool ReassociateEngine::optimizeInst(Instruction *I) {
 		}
 		auto *CurBI = dynamic_cast<BinaryInst *>(Cur);
 		if (!CurBI || CurBI->getOp() != Op ||
-			Cur->countInstructionUses() != 1) {
+			Cur->countInstructionUses() != 1 ||
+			crossesOrderingBarrier(Cur, I)) {
 			Ops.push_back(Cur);
 			continue;
 		}

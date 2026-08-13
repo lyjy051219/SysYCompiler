@@ -823,7 +823,8 @@ bool LocalAggregateSimplifyPass::hasSupportedSameBlockUses(
 }
 //步骤 2 主流程在单块程序序上维护“最近完整常量初始化 + 各元素覆盖”状态，
 //只替换能由该精确状态回答的常量路径 load。
-bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
+bool LocalAggregateSimplifyPass::forwardConstantLoads(
+    AllocaInst *AI, FunctionAnalysisPassManager &FAM) {
     BasicBlock *BB = AI ? AI->getParent() : nullptr;
     if (!BB || !hasSupportedSameBlockUses(AI, BB)) return false;
     bool Changed = false;
@@ -832,10 +833,16 @@ bool LocalAggregateSimplifyPass::forwardConstantLoads(AllocaInst *AI) {
     std::map<std::vector<int>, Value *> Overwrites;
     std::vector<LoadInst *> DeadLoads;
     auto Instructions = collectInstructions(*BB);
-    //2.2 顺序解释同块指令：timer 不修改聚合对象，状态可以跨越；完整常量
-    //memcpy 重置初值，常量路径 store 更新覆盖表，load 从覆盖或初值中转发。
+    //2.2 顺序解释同块指令；顺序屏障截断可用状态，避免把计时区内的load
+    //替换成区间外已经得到的值。其余完整memcpy和常量覆盖仍按原规则处理。
     for (Instruction *I : Instructions) {
         if (auto *CI = dynamic_cast<CallInst *>(I)) {
+            if (getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                StateValid = false;
+                InitialValue = nullptr;
+                Overwrites.clear();
+                continue;
+            }
             if (!CallInst::isMemcpyLike(CI) || CI->getArgCount() < 2) continue;
             LocalAggregatePointerPath Dest = tracePointer(CI->getArg(0));
             if (Dest.Root != AI) continue;
@@ -975,12 +982,15 @@ bool LocalAggregateSimplifyPass::collectReadOnlyConstantArrayUses(
         BasicBlock *LoadBB = Load ? Load->getParent() : nullptr;
         if (!LoadBB || LoadBB->getParent() != &F) return false;
         if (LoadBB == InitBB) {
-            if (!Instruction::comesBefore(Plan.InitCopy, Load))
+            if (!Instruction::comesBefore(Plan.InitCopy, Load) ||
+                hasOrderingBarrierOnPath(
+                    F, Plan.InitCopy, Load, FAM))
                 return false;
             continue;
         }
         MemoryAccess *LoadAccess = MSSA.getMemoryAccess(Load);
         if (!LoadAccess || !DT.dominates(InitBB, LoadBB) ||
+            hasOrderingBarrierOnPath(F, Plan.InitCopy, Load, FAM) ||
             MSSA.hasClobberBetween(
                 Plan.InitCopy, LoadAccess, MemoryLocation::get(Load),
                 AA, LI, FAM, 256)) {
@@ -1195,7 +1205,7 @@ bool LocalAggregateSimplifyPass::isWholeZeroMemset(
 //不依赖函数名、测试规模或运行时输入。
 bool LocalAggregateSimplifyPass::foldPatchedLocalArrayLoads(
     AllocaInst *AI, const DominatorTree &DT, RangeInfo &RI,
-    const LoopInfo &LI) {
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
     if (!AI || !AI->getParent()) return false;
     Function *Owner = AI->getParent()->getParent();
     if (!Owner || Owner->front() != AI->getParent()) return false;
@@ -1285,12 +1295,22 @@ bool LocalAggregateSimplifyPass::foldPatchedLocalArrayLoads(
     //3.10.2 清零先于全部访问；每个补丁写又必须支配每个读取。因此任一
     //动态 load 到达时，整表状态都精确等于“零表+全部常量补丁”。
     for (StoreInst *Store : PatchStores) {
-        if (!DT.dominatesValue(Initializer, Store)) return false;
+        if (!DT.dominatesValue(Initializer, Store) ||
+            hasOrderingBarrierOnPath(*Owner, Initializer, Store, FAM)) {
+            return false;
+        }
         for (LoadInst *Load : Loads)
-            if (!DT.dominatesValue(Store, Load)) return false;
+            if (!DT.dominatesValue(Store, Load) ||
+                hasOrderingBarrierOnPath(*Owner, Store, Load, FAM)) {
+                return false;
+            }
     }
     for (LoadInst *Load : Loads)
-        if (!DT.dominatesValue(Initializer, Load)) return false;
+        if (!DT.dominatesValue(Initializer, Load) ||
+            hasOrderingBarrierOnPath(
+                *Owner, Initializer, Load, FAM)) {
+            return false;
+        }
 
     std::vector<int32_t> Values(static_cast<size_t>(Count), 0);
     for (const auto &Patch : PatchValues)
@@ -1460,7 +1480,7 @@ bool LocalAggregateSimplifyPass::collectScalarizedPointerUses(
 //步骤 4 主流程先建立完整标量化计划，再创建槽位并替换地址；计划要求对象
 //地址不逃逸、所有访问路径恒定，且可选初始化 memcpy 的顺序完全可证明。
 bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
-    AllocaInst *AI) {
+    AllocaInst *AI, FunctionAnalysisPassManager &FAM) {
     constexpr int kMaxScalarizedElements = 32;
     if (!AI || !AllocaInst::isArrayAllocation(AI)) return false;
     CallInst *InitCopy = nullptr;
@@ -1520,8 +1540,23 @@ bool LocalAggregateSimplifyPass::scalarizeConstantIndexedAggregate(
             return false;
     }
     if (SlotTypes.empty()) return false;
+    Function *Owner = AI->getParent()
+        ? AI->getParent()->getParent() : nullptr;
+    if (!Owner) return false;
+    std::vector<Instruction *> OrderedAccesses = MemoryAccesses;
+    if (InitCopy) OrderedAccesses.push_back(InitCopy);
+    for (std::size_t I = 0; I < OrderedAccesses.size(); ++I) {
+        for (std::size_t J = I + 1; J < OrderedAccesses.size(); ++J) {
+            if (hasOrderingBarrierOnPath(
+                    *Owner, OrderedAccesses[I], OrderedAccesses[J], FAM) ||
+                hasOrderingBarrierOnPath(
+                    *Owner, OrderedAccesses[J], OrderedAccesses[I], FAM)) {
+                return false;
+            }
+        }
+    }
     //4.3 有初始化 memcpy 时，同块访问必须位于 memcpy 之后，跨块访问只在
-    //初始化位于 alloca 块时接受；timer 不访问对象，不参与内存次序判定。
+    //初始化位于 alloca 块时接受；跨屏障数组访问保持原内存形态。
     if (InitCopy) {
         for (Instruction *Access : MemoryAccesses) {
             if (!Access) return false;
@@ -1679,7 +1714,7 @@ LocalAggregateSimplifyPass::run(Function &F,
     Changed |= foldReadOnlyGlobalLoads(F, FAM);
     //2. 转发同块内由完整常量拷贝和常量覆盖确定的元素 load。
     for (AllocaInst *AI : collectArrayAllocas(F))
-        Changed |= forwardConstantLoads(AI);
+        Changed |= forwardConstantLoads(AI, FAM);
     //3. 在数组查询预算内整体展开只读常量初始化的小数组。前两阶段或前一个
     //数组一旦改写IR，就先精确失效旧AA/MemorySSA，再为下一个数组重建快照。
     DominatorTree *DT = nullptr;
@@ -1717,7 +1752,8 @@ LocalAggregateSimplifyPass::run(Function &F,
             MSSA = &FAM.getResult<MemorySSAAnalysis>(F);
             RI = &FAM.getResult<RangeAnalysis>(F);
         }
-        if (foldPatchedLocalArrayLoads(AI, *DT, *RI, *LI)) {
+        if (foldPatchedLocalArrayLoads(
+                AI, *DT, *RI, *LI, FAM)) {
             Changed = true;
             InvalidateMemoryAnalyses();
             continue;
@@ -1731,7 +1767,7 @@ LocalAggregateSimplifyPass::run(Function &F,
     }
     //4. 把剩余仅有常量路径访问的聚合拆成标量槽。
     for (AllocaInst *AI : collectArrayAllocas(F))
-        Changed |= scalarizeConstantIndexedAggregate(AI);
+        Changed |= scalarizeConstantIndexedAggregate(AI, FAM);
     //5. 删除最后仍只被写入、从未被观察的聚合对象。
     for (AllocaInst *AI : collectArrayAllocas(F))
         Changed |= deleteDeadAggregate(AI);

@@ -168,7 +168,8 @@ private:
     //判断alloca在指定基本块内是否只有受支持的常量覆盖和读取
     static bool hasSupportedSameBlockUses(AllocaInst *AI, BasicBlock *BB);
     //在单块内转发整表常量复制及常量覆盖后的load
-    static bool forwardConstantLoads(AllocaInst *AI);
+    static bool forwardConstantLoads(
+        AllocaInst *AI, FunctionAnalysisPassManager &FAM);
     //返回一维标量数组的元素数量，形状不支持时返回负值
     static int getOneDimScalarArrayCount(AllocaInst *AI);
     //判断下标类型是否能够表示数组全部合法元素编号
@@ -197,7 +198,8 @@ private:
     //折叠“完整清零+常量下标补丁”构造的有界局部动态查表
     static bool foldPatchedLocalArrayLoads(
         AllocaInst *AI, const DominatorTree &DT,
-        RangeInfo &RI, const LoopInfo &LI);
+        RangeInfo &RI, const LoopInfo &LI,
+        FunctionAnalysisPassManager &FAM);
     //为常量聚合路径登记标量槽类型并检查类型一致性和数量预算
     static bool addScalarSlot(
         std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,
@@ -214,7 +216,8 @@ private:
         std::map<std::vector<int>, std::shared_ptr<IRType>> &SlotTypes,
         int MaxScalarizedElements);
     //把仅按常量路径访问的局部聚合拆分为独立标量槽
-    static bool scalarizeConstantIndexedAggregate(AllocaInst *AI);
+    static bool scalarizeConstantIndexedAggregate(
+        AllocaInst *AI, FunctionAnalysisPassManager &FAM);
     //收集地址未逃逸且内容从未被读取的聚合写入和派生指针
     static LocalAggregateDeadUses collectDeadAggregateUses(AllocaInst *AI);
     //删除已证明不可观察的聚合及其写入和派生指针

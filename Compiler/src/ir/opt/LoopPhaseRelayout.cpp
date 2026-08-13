@@ -9,6 +9,7 @@
 #include "lib/IRUtils.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <queue>
 #include <unordered_set>
@@ -770,6 +771,424 @@ bool LoopPhaseRelayoutPass::applyCandidate(
     return true;
 }
 
+//识别零起点单位步长动态循环，并直接复用SCEV已经恢复的比较阶段
+bool LoopPhaseRelayoutPass::matchCanonicalDynamicAxis(
+    Loop *Axis, SCEVResult &SE, PhiInst *&Induction,
+    Value *&Bound, BasicBlock *&PreHeader,
+    BasicBlock *&Latch, BasicBlock *&Exit) {
+    Induction = nullptr;
+    Bound = nullptr;
+    PreHeader = nullptr;
+    Latch = nullptr;
+    Exit = nullptr;
+    if (!Axis || !Axis->getLoopSimplifyForm(PreHeader, Latch) ||
+        !PreHeader || !Latch) {
+        return false;
+    }
+    auto IV = SE.getCanonicalInduction(Axis);
+    auto Trip = SE.analyzeLoopTripCount(Axis);
+    if (!IV || !Trip || !IV->Valid || !Trip->Valid ||
+        !IV->Phi || !IV->UpdateValue || !Trip->ExitCmp ||
+        !IV->ConstantStart || *IV->ConstantStart != 0 ||
+        !IV->ConstantStep || *IV->ConstantStep != 1 ||
+        Trip->ComparePhase == LoopExitComparePhase::Unknown ||
+        !Trip->ExitBlock) {
+        return false;
+    }
+    Value *Compared = Trip->ComparePhase ==
+            LoopExitComparePhase::HeaderPhi
+        ? static_cast<Value *>(IV->Phi)
+        : IV->UpdateValue;
+    Value *Left = Trip->ExitCmp->getOperand(0);
+    Value *Right = Trip->ExitCmp->getOperand(1);
+    BinaryInst::Operation Predicate = Trip->ContinueOnTrue
+        ? Trip->ExitCmp->getOp()
+        : BinaryInst::negatePredicate(Trip->ExitCmp->getOp());
+    if (Right == Compared) {
+        std::swap(Left, Right);
+        Predicate = BinaryInst::reversePredicate(Predicate);
+    }
+    if (Left != Compared || Predicate != BinaryInst::L || !Right ||
+        !IRType::hasIntegerBitWidth(Right->getIRType(), 32) ||
+        !LoopInfo::isLoopInvariant(Right, Axis) ||
+        valueMayDependOnUndef(Right)) {
+        return false;
+    }
+    Induction = IV->Phi;
+    Bound = Right;
+    Exit = Trip->ExitBlock;
+    return true;
+}
+
+//识别A[k][j]读取和A[i][j]原位写回，不依赖符号名、具体尺寸或输入值
+bool LoopPhaseRelayoutPass::buildConsistentShadowCandidate(
+    Function &F, Loop *Outer, LoopAccessInfo &LA,
+    SCEVResult &SE, DominatorTree &DT,
+    LoopPhaseConsistentShadowCandidate &Candidate) {
+    Candidate = {};
+    if (!Outer || Outer->getParentLoop() ||
+        Outer->getSubLoops().size() != 1) {
+        return false;
+    }
+    Loop *Middle = Outer->getSubLoops().front();
+    if (!Middle || Middle->getSubLoops().size() != 1) return false;
+    Loop *Inner = Middle->getSubLoops().front();
+    if (!Inner || !Inner->isInnermost()) return false;
+
+    PhiInst *OuterIV = nullptr;
+    PhiInst *MiddleIV = nullptr;
+    PhiInst *InnerIV = nullptr;
+    Value *OuterBound = nullptr;
+    Value *MiddleBound = nullptr;
+    Value *InnerBound = nullptr;
+    BasicBlock *OuterPreHeader = nullptr;
+    BasicBlock *MiddlePreHeader = nullptr;
+    BasicBlock *InnerPreHeader = nullptr;
+    BasicBlock *OuterLatch = nullptr;
+    BasicBlock *MiddleLatch = nullptr;
+    BasicBlock *InnerLatch = nullptr;
+    BasicBlock *OuterExit = nullptr;
+    BasicBlock *MiddleExit = nullptr;
+    BasicBlock *InnerExit = nullptr;
+    if (!matchCanonicalDynamicAxis(
+            Outer, SE, OuterIV, OuterBound, OuterPreHeader,
+            OuterLatch, OuterExit) ||
+        !matchCanonicalDynamicAxis(
+            Middle, SE, MiddleIV, MiddleBound, MiddlePreHeader,
+            MiddleLatch, MiddleExit) ||
+        !matchCanonicalDynamicAxis(
+            Inner, SE, InnerIV, InnerBound, InnerPreHeader,
+            InnerLatch, InnerExit) ||
+        OuterBound != MiddleBound || OuterBound != InnerBound ||
+        !OuterPreHeader->getTerminator() ||
+        OuterPreHeader->countEdgesToSucc(Outer->getHeader()) != 1 ||
+        Outer->getExitBlocks().size() != 1 ||
+        Outer->getExitBlocks().front() != OuterExit ||
+        !OuterExit->collectPhiNodes().empty()) {
+        return false;
+    }
+    //边界必须在版本入口可用；快路径随后只用它证明真实对象范围。
+    if (auto *BoundInst = dynamic_cast<Instruction *>(OuterBound)) {
+        if (!DT.dominatesValue(
+                BoundInst, OuterPreHeader->getTerminator())) {
+            return false;
+        }
+    }
+    for (PhiInst *Phi : Outer->getHeader()->collectPhiNodes())
+        if (!Phi || Phi->countIncomingFromPred(OuterPreHeader) != 1)
+            return false;
+
+    std::vector<BasicBlock *> Blocks = Outer->getBlocksInFunctionOrder();
+    if (Blocks.empty() || Blocks.size() > 64) return false;
+    std::unordered_set<BasicBlock *> BlockSet(
+        Blocks.begin(), Blocks.end());
+    std::size_t InstructionCount = 0;
+    for (BasicBlock *BB : Blocks) {
+        if (!BB || BB->countEdgesToSucc(OuterPreHeader) != 0)
+            return false;
+        for (Instruction *I : *BB) {
+            if (!I || dynamic_cast<CallInst *>(I) ||
+                dynamic_cast<RetInst *>(I) || ++InstructionCount > 512) {
+                return false;
+            }
+            //完整慢版本必须自行产生所有SSA值；即使LCSSA暂时失效，也不允许
+            //区域外指令直接引用只存在于快版本的定义。
+            for (Instruction *User : I->getInstructionUsers())
+                if (!User || !User->getParent() ||
+                    !BlockSet.count(User->getParent())) return false;
+        }
+    }
+
+    LoopPhaseConsistentShadowCandidate Best;
+    for (BasicBlock *BB : Blocks) {
+        for (Instruction *I : *BB) {
+            auto *SeedLoad = dynamic_cast<LoadInst *>(I);
+            if (!SeedLoad || !Inner->contains(SeedLoad->getParent()))
+                continue;
+            LoopPhaseRelayoutAccess SeedAccess;
+            if (!matchTwoDimensionalAccess(
+                    SeedLoad->getPointerOperand(), SeedAccess) ||
+                SeedAccess.Indices.size() != 3 ||
+                SeedAccess.Indices[1] != InnerIV ||
+                SeedAccess.Indices[2] != MiddleIV) {
+                continue;
+            }
+            std::int64_t Leading = 0;
+            if (!SeedAccess.Indices[0] ||
+                !SeedAccess.Indices[0]->tryGetInt64Const(Leading) ||
+                Leading != 0) {
+                continue;
+            }
+            auto *Source = dynamic_cast<Variable *>(SeedAccess.Root);
+            std::int64_t Rows = 0;
+            std::int64_t Columns = 0;
+            std::int64_t ElementBytes = 0;
+            std::size_t ObjectBytes = 0;
+            std::shared_ptr<IRType> ShadowType;
+            if (!getTwoDimensionalGlobalShape(
+                    Source, Rows, Columns, ElementBytes, ObjectBytes,
+                    ShadowType) || ObjectBytes > MaxShadowBytes ||
+                SeedAccess.ByteStrides.size() != 3 ||
+                SeedAccess.ByteStrides[1] != Columns * ElementBytes ||
+                SeedAccess.ByteStrides[2] != ElementBytes ||
+                SeedAccess.ByteStrides[1] < CacheLineBytes ||
+                Rows > std::numeric_limits<int32_t>::max() ||
+                Columns > std::numeric_limits<int32_t>::max()) {
+                continue;
+            }
+            auto SeedStride = LA.getByteStride(SeedLoad, Inner, Inner);
+            if (!SeedStride || *SeedStride !=
+                    SeedAccess.ByteStrides[1]) {
+                continue;
+            }
+
+            std::vector<LoopPhaseRelayoutRewrite> Rewrites;
+            StoreInst *FinalStore = nullptr;
+            std::vector<Value *> StoreIndices;
+            bool InvalidSourceWrite = false;
+            for (BasicBlock *UseBlock : Blocks) {
+                for (Instruction *UseInst : *UseBlock) {
+                    auto *Load = dynamic_cast<LoadInst *>(UseInst);
+                    auto *Store = dynamic_cast<StoreInst *>(UseInst);
+                    Value *Pointer = Load
+                        ? Load->getPointerOperand()
+                        : Store ? Store->getPointerOperand() : nullptr;
+                    if (!Pointer) continue;
+                    //区域内不允许第二个写根；这同时排除可能经参数别名改写Source
+                    //的逃逸路径，避免shadow在下一次读取前失去同步。
+                    if (Value::stripPointerCastsAndGEP(Pointer) != Source) {
+                        if (Store) InvalidSourceWrite = true;
+                        continue;
+                    }
+                    LoopPhaseRelayoutAccess Access;
+                    if (!matchTwoDimensionalAccess(Pointer, Access) ||
+                        Access.Root != Source ||
+                        Access.Indices.size() != 3) {
+                        if (Store) InvalidSourceWrite = true;
+                        continue;
+                    }
+                    std::int64_t AccessLeading = 0;
+                    if (!Access.Indices[0] ||
+                        !Access.Indices[0]->tryGetInt64Const(
+                            AccessLeading) || AccessLeading != 0) {
+                        if (Store) InvalidSourceWrite = true;
+                        continue;
+                    }
+                    if (Load && Inner->contains(Load->getParent()) &&
+                        Access.Indices[1] == InnerIV &&
+                        Access.Indices[2] == MiddleIV) {
+                        auto Stride = LA.getByteStride(Load, Inner, Inner);
+                        if (!Stride || *Stride != Columns * ElementBytes) {
+                            InvalidSourceWrite = true;
+                            continue;
+                        }
+                        std::vector<Value *> Transposed = Access.Indices;
+                        std::swap(Transposed[1], Transposed[2]);
+                        Rewrites.push_back(
+                            {Load, std::move(Transposed), 1});
+                    }
+                    if (!Store) continue;
+                    if (FinalStore || Store->getParent() != InnerExit ||
+                        Access.Indices[1] != OuterIV ||
+                        Access.Indices[2] != MiddleIV ||
+                        !Store->getValueOperand() ||
+                        valueMayDependOnUndef(Store->getValueOperand()) ||
+                        !DT.dominates(Store->getParent(), MiddleLatch) ||
+                        !Instruction::comesBefore(
+                            Store, Store->getParent()->getTerminator())) {
+                        InvalidSourceWrite = true;
+                        continue;
+                    }
+                    FinalStore = Store;
+                    StoreIndices = Access.Indices;
+                    std::swap(StoreIndices[1], StoreIndices[2]);
+                }
+            }
+            if (InvalidSourceWrite || !FinalStore || Rewrites.empty())
+                continue;
+            //同一个结构内匹配更多跨行读取时收益不会更低，选择覆盖最多的对象。
+            if (Best.Target && Best.Rewrites.size() >= Rewrites.size())
+                continue;
+            Best.Target = &F;
+            Best.PreHeader = OuterPreHeader;
+            Best.Header = Outer->getHeader();
+            Best.Exit = OuterExit;
+            Best.Source = Source;
+            Best.Bound = OuterBound;
+            Best.FinalStore = FinalStore;
+            Best.ShadowObjectType = std::move(ShadowType);
+            Best.StoreTransposedIndices = std::move(StoreIndices);
+            Best.Rewrites = std::move(Rewrites);
+            Best.Blocks = Blocks;
+            Best.Rows = Rows;
+            Best.Columns = Columns;
+            Best.ShadowBytes = ObjectBytes;
+        }
+    }
+    if (!Best.Target) return false;
+    Candidate = std::move(Best);
+    return true;
+}
+
+//版本化动态活动域，并在快路径中维护始终与原对象一致的转置shadow
+bool LoopPhaseRelayoutPass::applyConsistentShadowCandidate(
+    Module &M, LoopPhaseConsistentShadowCandidate &Candidate,
+    unsigned Ordinal) {
+    if (Module::getActiveModule() != &M || !Candidate.Target ||
+        !Candidate.Source || !Candidate.Bound || !Candidate.FinalStore ||
+        !Candidate.PreHeader || !Candidate.Header || !Candidate.Exit ||
+        !Candidate.ShadowObjectType || Candidate.ShadowBytes == 0 ||
+        Candidate.Blocks.empty() || Candidate.Rewrites.empty() ||
+        Candidate.StoreTransposedIndices.size() != 3 ||
+        Candidate.PreHeader->countEdgesToSucc(Candidate.Header) != 1 ||
+        !Candidate.Exit->collectPhiNodes().empty()) {
+        return false;
+    }
+    for (const LoopPhaseRelayoutRewrite &Rewrite : Candidate.Rewrites)
+        if (!Rewrite.Load || !Rewrite.Load->getParent() ||
+            Rewrite.TransposedIndices.size() != 3)
+            return false;
+    for (PhiInst *Phi : Candidate.Header->collectPhiNodes())
+        if (!Phi || Phi->countIncomingFromPred(Candidate.PreHeader) != 1)
+            return false;
+
+    Function &F = *Candidate.Target;
+    auto *PositiveGuard = new BasicBlock();
+    auto *UpperGuard = new BasicBlock();
+    auto *InitOuter = new BasicBlock();
+    auto *InitInner = new BasicBlock();
+    auto *InitOuterLatch = new BasicBlock();
+    auto *FastPreHeader = new BasicBlock();
+    auto *SlowPreHeader = new BasicBlock();
+    ValueToValueMap InitialMap;
+    InitialMap[Candidate.PreHeader] = SlowPreHeader;
+    CloneBlockRegionOptions Options;
+    Options.MakeBlockIdent = [&F](const BasicBlock *BB, std::size_t) {
+        return F.makeUniqueBlockIdent(
+            (BB ? BB->getIdent() : "bb") + ".layout.slow");
+    };
+    auto Region = cloneBasicBlockRegion(
+        F, Candidate.Blocks, InitialMap, Options);
+    if (!Region) {
+        delete PositiveGuard;
+        delete UpperGuard;
+        delete InitOuter;
+        delete InitInner;
+        delete InitOuterLatch;
+        delete FastPreHeader;
+        delete SlowPreHeader;
+        return false;
+    }
+    BasicBlock *SlowHeader = Region->getClonedBlock(Candidate.Header);
+    assert(SlowHeader && "完整区域克隆必须包含外层循环头");
+
+    PositiveGuard->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.positive"));
+    UpperGuard->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.upper"));
+    InitOuter->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.init.outer"));
+    InitInner->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.init.inner"));
+    InitOuterLatch->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.init.outer.latch"));
+    FastPreHeader->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.fast.preheader"));
+    SlowPreHeader->setIdent(F.makeUniqueBlockIdent(
+        Candidate.Header->getIdent() + ".layout.slow.preheader"));
+    F.pushBlock(PositiveGuard);
+    F.pushBlock(UpperGuard);
+    F.pushBlock(InitOuter);
+    F.pushBlock(InitInner);
+    F.pushBlock(InitOuterLatch);
+    F.pushBlock(FastPreHeader);
+    F.pushBlock(SlowPreHeader);
+
+    auto *Shadow = new Variable(
+        Variable::GlobalVariable, Candidate.ShadowObjectType,
+        makeUniqueShadowName(M, Ordinal));
+    Value *Zero = Value::makeIntegerLike(Candidate.Bound, 0);
+    Value *Limit = Value::makeIntegerLike(
+        Candidate.Bound, std::min(Candidate.Rows, Candidate.Columns));
+    assert(Zero && Limit && "已验证的i32边界必须能够构造常量");
+
+    auto *Positive = new BinaryInst(
+        Candidate.Bound, BinaryInst::G, Zero);
+    PositiveGuard->pushBack(Positive);
+    PositiveGuard->genCondInst(Positive, UpperGuard, SlowPreHeader);
+    auto *WithinObject = new BinaryInst(
+        Candidate.Bound, BinaryInst::LE, Limit);
+    UpperGuard->pushBack(WithinObject);
+    UpperGuard->genCondInst(WithinObject, InitOuter, SlowPreHeader);
+
+    auto *InitI = new PhiInst(Candidate.Bound->getIRType());
+    auto *InitJ = new PhiInst(Candidate.Bound->getIRType());
+    auto *NextI = new BinaryInst(InitI, BinaryInst::ADD,
+                                 Value::makeIntegerLike(InitI, 1));
+    auto *NextJ = new BinaryInst(InitJ, BinaryInst::ADD,
+                                 Value::makeIntegerLike(InitJ, 1));
+    InitI->addIncoming(Zero, UpperGuard);
+    InitI->addIncoming(NextI, InitOuterLatch);
+    InitOuter->pushBack(InitI);
+    auto *OuterCondition = new BinaryInst(
+        InitI, BinaryInst::L, Candidate.Bound);
+    InitOuter->pushBack(OuterCondition);
+    InitOuter->genCondInst(OuterCondition, InitInner, FastPreHeader);
+    InitJ->addIncoming(Zero, InitOuter);
+    InitJ->addIncoming(NextJ, InitInner);
+    InitInner->pushBack(InitJ);
+
+    std::vector<Value *> SourceIndices{Zero, InitI, InitJ};
+    auto *SourceAddress = new GetElementPtrInst(
+        Candidate.Source, SourceIndices);
+    auto *SourceValue = new LoadInst(SourceAddress);
+    std::vector<Value *> ShadowIndices{Zero, InitJ, InitI};
+    auto *ShadowAddress = new GetElementPtrInst(Shadow, ShadowIndices);
+    auto *ShadowStore = new StoreInst(SourceValue, ShadowAddress);
+    InitInner->pushBack(SourceAddress);
+    InitInner->pushBack(SourceValue);
+    InitInner->pushBack(ShadowAddress);
+    InitInner->pushBack(ShadowStore);
+    InitInner->pushBack(NextJ);
+    auto *InnerNextCondition = new BinaryInst(
+        NextJ, BinaryInst::L, Candidate.Bound);
+    InitInner->pushBack(InnerNextCondition);
+    InitInner->genCondInst(
+        InnerNextCondition, InitInner, InitOuterLatch);
+
+    InitOuterLatch->pushBack(NextI);
+    InitOuterLatch->genUnCondInst(InitOuter);
+    FastPreHeader->genUnCondInst(Candidate.Header);
+    SlowPreHeader->genUnCondInst(SlowHeader);
+
+    //提交点之后只执行已经预检的CFG和地址替换，慢版本保持原始访存语义。
+    for (PhiInst *Phi : Candidate.Header->collectPhiNodes()) {
+        const bool Replaced = PhiInst::replaceIncomingPred(
+            Phi, Candidate.PreHeader, FastPreHeader);
+        assert(Replaced);
+        (void)Replaced;
+    }
+    const bool Redirected = BasicBlock::redirectBranchTarget(
+        Candidate.PreHeader, Candidate.Header, PositiveGuard);
+    assert(Redirected);
+    (void)Redirected;
+
+    auto *SyncAddress = new GetElementPtrInst(
+        Shadow, Candidate.StoreTransposedIndices);
+    auto *SyncStore = new StoreInst(
+        Candidate.FinalStore->getValueOperand(), SyncAddress);
+    Candidate.FinalStore->insertAfter(SyncAddress);
+    SyncAddress->insertAfter(SyncStore);
+    for (const LoopPhaseRelayoutRewrite &Rewrite : Candidate.Rewrites) {
+        std::vector<Value *> Indices = Rewrite.TransposedIndices;
+        auto *Address = new GetElementPtrInst(
+            Shadow, Indices);
+        Rewrite.Load->insertBefore(Address);
+        Rewrite.Load->replaceOperand(0, Address);
+    }
+    return true;
+}
+
 //逐函数选择一个合法且有收益的阶段布局候选并提交改写
 PreservationStatus LoopPhaseRelayoutPass::run(
     Module &M, ModuleAnalysisPassManager &MAM) {
@@ -789,22 +1208,41 @@ PreservationStatus LoopPhaseRelayoutPass::run(
         auto &DT = FAM.getResult<DominantAnalysis>(*F);
         auto &LA = FAM.getResult<LoopAccessAnalysis>(*F);
         LoopPhaseRelayoutCandidate Best;
+        LoopPhaseConsistentShadowCandidate BestConsistent;
         for (Loop *Outer : LI.getTopLevelLoops()) {
             LoopPhaseRelayoutCandidate Current;
             if (!buildCandidate(
                     *F, Outer, LA, LI, SE, RI, DT, Current)) {
-                continue;
+                Current = {};
             }
-            if (!Best.Target ||
-                Current.EstimatedNetBenefit > Best.EstimatedNetBenefit) {
+            if (Current.Target && (!Best.Target ||
+                Current.EstimatedNetBenefit > Best.EstimatedNetBenefit)) {
                 Best = std::move(Current);
             }
+            LoopPhaseConsistentShadowCandidate Consistent;
+            if (buildConsistentShadowCandidate(
+                    *F, Outer, LA, SE, DT, Consistent) &&
+                !VersionedSources.count(Consistent.Source) &&
+                (!BestConsistent.Target ||
+                 Consistent.Rewrites.size() >
+                     BestConsistent.Rewrites.size())) {
+                BestConsistent = std::move(Consistent);
+            }
+        }
+        if (BestConsistent.Target &&
+            BestConsistent.ShadowBytes <=
+                MaxTotalShadowBytes - CreatedShadowBytes &&
+            applyConsistentShadowCandidate(
+                M, BestConsistent, NextShadowOrdinal++)) {
+            CreatedShadowBytes += BestConsistent.ShadowBytes;
+            VersionedSources.insert(BestConsistent.Source);
+            Changed = true;
+            FAM.invalidate(*F, PreservationStatus::none());
+            continue;
         }
         if (!Best.Target || Best.ShadowBytes >
                 MaxTotalShadowBytes - CreatedShadowBytes ||
-            !applyCandidate(M, Best, NextShadowOrdinal++)) {
-            continue;
-        }
+            !applyCandidate(M, Best, NextShadowOrdinal++)) continue;
         CreatedShadowBytes += Best.ShadowBytes;
         Changed = true;
         FAM.invalidate(*F, PreservationStatus::none());

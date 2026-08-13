@@ -1207,8 +1207,9 @@ PreservationStatus LICMPass::run(Function &F, FunctionAnalysisPassManager &FAM) 
 				auto LoopInsts = collectLiveLoopInsts();
 				Instruction *PreHeaderTerminator = PreHeader->getTerminator();
 				if (!PreHeaderTerminator) continue;
-				if (dynamic_cast<LoadInst *>(I) &&
-					hasOrderingBarrierOnPath(
+				//插入点到原位置之间存在计时/有序调用时，任何纯计算或内存
+				//候选都不能提升；屏障不只约束load。
+				if (hasOrderingBarrierOnPath(
 						F, PreHeader, PreHeaderTerminator->getPrev(), I, FAM)) {
 					continue;
 				}

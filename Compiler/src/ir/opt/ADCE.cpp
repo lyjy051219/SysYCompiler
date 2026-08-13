@@ -21,6 +21,12 @@ bool ADCEPass::isRootLive(
         if (Function *Callee = CI->getDirectCallee()) {
             const SideEffectInfo &SEI =
                 FAM.getResult<SideEffectAnalysis>(*Callee);
+            //函数摘要中的I/O和计时不一定伴随程序内存写入，不能只按
+            //ModRef判断调用是否可作为死值删除。
+            if (SEI.hasObservableEffect || SEI.hasOrderingBarrier ||
+                SEI.hasUnknownMemory || SEI.mayCrossObjectBounds) {
+                return true;
+            }
             ModRefInfo MRI = getFunctionModRefInfo(SEI);
             if (MRI != ModRefInfo::NoModRef && MRI != ModRefInfo::Ref)
                 return true;

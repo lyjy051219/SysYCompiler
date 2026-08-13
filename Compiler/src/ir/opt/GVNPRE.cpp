@@ -311,7 +311,15 @@ void GVNPRESolver::buildAvailOut() {
             }
         }
         for (Instruction *I : *BB) {
-            if (!I || !hasResultValue(I)) continue;
+            if (!I) continue;
+            if (auto *CI = dynamic_cast<CallInst *>(I)) {
+                if (getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                    //屏障两侧不共享PRE可用表，避免把原本在计时区间内
+                    //的计算删除或提前到区间之外。
+                    Avail.clear();
+                }
+            }
+            if (!hasResultValue(I)) continue;
             auto VIt = ValueNum.find(I);
             if (VIt == ValueNum.end()) continue;
             int Num = VIt->second;
@@ -377,8 +385,11 @@ bool GVNPRESolver::isBeforeInSameBlock(Instruction *A, Instruction *B) const {
 }
 //查找在使用位置合法可用的值号代表
 Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *UseI) const {
-    //2.4 leader 必须支配 use；同块还必须位于 use 之前。
+    //2.4 leader 必须支配 use；同块还必须位于 use 之前，且所有
+    //可达路径均不能跨越顺序屏障。UseI为空时查询块出口可用性。
     if (!UseBB) return nullptr;
+    Instruction *End = UseI ? UseI : UseBB->getTerminator();
+    if (!End) return nullptr;
     auto It = LeaderTable.find(Num);
     if (It == LeaderTable.end()) return nullptr;
     Instruction *Best = nullptr;
@@ -389,6 +400,7 @@ Instruction *GVNPRESolver::findLeader(int Num, BasicBlock *UseBB, Instruction *U
         if (UseI && R.BB == UseBB && !isBeforeInSameBlock(R.Inst, UseI)) {
             continue;
         }
+        if (hasOrderingBarrierOnPath(F, R.Inst, End, FAM)) continue;
         Best = R.Inst;
         if (R.Inst->isConst()) return Best;
     }
@@ -403,6 +415,9 @@ Instruction *GVNPRESolver::findAvailLeader(int Num, BasicBlock *PredBB) const {
     if (EntIt == AOIt->second.end()) return nullptr;
     Instruction *Inst = EntIt->second.Inst;
     if (!Inst || !Inst->isInBlock(Inst->getParent())) return nullptr;
+    Instruction *End = PredBB->getTerminator();
+    if (!End || hasOrderingBarrierOnPath(F, Inst, End, FAM))
+        return nullptr;
     return Inst;
 }
 //为给定IR值分配新的唯一值号
@@ -754,7 +769,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             *StoreLocation.Size < *Location.Size ||
             !TypeCompatible(Stored) ||
             AA.aliasWithIndexRange(Location, StoreLocation, LI) !=
-                AliasInfo::MustAlias) {
+                AliasInfo::MustAlias ||
+            hasOrderingBarrierOnPath(F, Store, LIst, FAM)) {
             AllSameValueStores = false;
             break;
         }
@@ -790,6 +806,8 @@ bool GVNPRESolver::processLoad(Instruction *I) {
             if (AA.aliasWithIndexRange(Location, It->Location, LI) !=
                 AliasInfo::MustAlias)
                 continue;
+            if (hasOrderingBarrierOnPath(F, It->Load, LIst, FAM))
+                continue;
             MemoryAccess *LoadAccess = MSSA.getMemoryAccess(LIst);
             if (!LoadAccess ||
                 MSSA.hasClobberBetween(
@@ -810,7 +828,7 @@ bool GVNPRESolver::processLoad(Instruction *I) {
         return false;
     };
     //2.13 最后沿唯一前驱链做有界逆向扫描，最近 MustAlias store/load 可转发；
-    //MayAlias 写或调用 Mod 终止，timer 的调用节点按程序内存摘要透明越过。
+    //MayAlias写、调用Mod或顺序屏障均终止查询。
     BasicBlock *ScanBB = BB;
     Instruction *StartI = I->getPrev();
     int ScanCount = 0;
@@ -847,7 +865,9 @@ bool GVNPRESolver::processLoad(Instruction *I) {
                 }
                 continue;
             }
-            if (dynamic_cast<CallInst *>(Cur)) {
+            if (auto *CI = dynamic_cast<CallInst *>(Cur)) {
+                if (getCallEffectSummary(CI, FAM).HasOrderingBarrier)
+                    return RememberAndFail();
                 ModRefInfo MRI = getInstModRefInfo(
                     Location, Cur, AA, LI, FAM);
                 if (isModSet(MRI)) return RememberAndFail();
@@ -887,6 +907,8 @@ bool GVNPRESolver::processCall(Instruction *I) {
                  !Instruction::comesBefore(Previous, CI))) {
                 continue;
             }
+            if (hasOrderingBarrierOnPath(F, Previous, CI, FAM))
+                continue;
             MemoryAccess *CallAccess = MSSA.getMemoryAccess(CI);
             bool Unmodified = CallAccess != nullptr;
             for (const MemoryReadClobber &Read : Signature) {
@@ -941,6 +963,8 @@ bool GVNPRESolver::processCall(Instruction *I) {
                 continue;
             }
             if (auto *PrevCall = dynamic_cast<CallInst *>(Cur)) {
+                if (getCallEffectSummary(PrevCall, FAM).HasOrderingBarrier)
+                    return false;
                 if (identicalCall(CI, PrevCall)) {
                     I->replaceAllUsesWith(PrevCall);
                     forgetInstruction(I);
@@ -970,8 +994,8 @@ bool GVNPRESolver::processCall(Instruction *I) {
 }
 //执行一轮全局值编号、内存转发和冗余替换
 bool GVNPRESolver::runGVN() {
-    //2. 先消除递归等价 PHI，再按 RPO 扫描可达指令；timer 不清空程序内存
-    //load 缓存，常量分支即时标记死块，load/call 使用专门的内存感知路径。
+    //2. 先消除递归等价 PHI，再按 RPO 扫描可达指令；顺序屏障
+    //清空内存可用缓存，跨块候选另由CFG路径查询精确过滤。
     bool Changed = eliminateCongruentPhis();
     for (BasicBlock *BB : RPO) {
         if (isDeadBlock(BB)) continue;
@@ -983,6 +1007,12 @@ bool GVNPRESolver::runGVN() {
                 continue;
             }
             processBranchForDeadBlocks(I);
+            if (auto *CI = dynamic_cast<CallInst *>(I)) {
+                if (getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                    AvailableMemoryLoads.clear();
+                    AvailableMemoryCalls.clear();
+                }
+            }
             if (I->instType == Instruction::LOAD) {
                 if (processLoad(I)) {
                     Changed = true;
@@ -1245,6 +1275,10 @@ bool GVNPRESolver::runPRE() {
             }
             Instruction *PredTerminator = PREPred->getTerminator();
             if (!PredTerminator) continue;
+            if (hasOrderingBarrierOnPath(
+                    F, PREPred, PredTerminator, I, FAM)) {
+                continue;
+            }
             //3.7 在缺失前驱终结前克隆表达式，并逐操作数解析该边可用值；任一操作数
             //无合法 leader 时丢弃离线克隆。
             Instruction *Cloned = I->clone({});
@@ -1475,7 +1509,7 @@ PreservationStatus GVNPREPass::run(Function &F, FunctionAnalysisPassManager &FAM
 }
 //对给定函数逐块运行局部值编号并返回分析保留状态
 PreservationStatus LocalGVNPass::run(Function &F,
-                                     FunctionAnalysisPassManager &) {
+                                     FunctionAnalysisPassManager &FAM) {
     //1. 每个基本块独立维护表达式 leader 表，按程序顺序将重复纯表达式替换为首个。
     bool Changed = false;
     for (BasicBlock *BB : F) {
@@ -1484,6 +1518,12 @@ PreservationStatus LocalGVNPass::run(Function &F,
         auto Insts = collectInstructions(*BB);
         for (Instruction *I : Insts) {
             if (!I || I->getParent() != BB) continue;
+            if (auto *CI = dynamic_cast<CallInst *>(I)) {
+                if (getCallEffectSummary(CI, FAM).HasOrderingBarrier) {
+                    Leaders.clear();
+                    continue;
+                }
+            }
             LocalExprKey Key;
             if (!buildLocalExprKey(I, Key)) continue;
             auto It = Leaders.find(Key);

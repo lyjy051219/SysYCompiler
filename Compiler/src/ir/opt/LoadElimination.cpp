@@ -48,9 +48,13 @@ bool LoadEliminationPass::mayModifyPointer(
     const MemoryLocation &Location, Instruction *I, BasicAAResult &AA,
     const LoopInfo &LI,
     FunctionAnalysisPassManager &FAM) {
-    //1.1以程序内存 ModRef 为主判据；timer 自身不读写 SysY 对象，因此不会
-    //阻断值转发。跨函数固定点摘要已经包含未知指针来源，无需再按实参重复降级。
+    //1.1 顺序屏障不一定读写 SysY 对象，但删除它两侧的load会改变
+    //计时区间内的工作量；因此在值可用性证明中与内存写统一视为截断点。
     if (!Location.Pointer || !I) return true;
+    if (auto *CI = dynamic_cast<CallInst *>(I)) {
+        if (getCallEffectSummary(CI, FAM).HasOrderingBarrier)
+            return true;
+    }
     ModRefInfo MR = getInstModRefInfo(Location, I, AA, LI, FAM);
     return isModSet(MR);
 }
@@ -179,9 +183,8 @@ LoadElimQueryResult LoadEliminationPass::scanBlockBackward(
             }
         }
         else if (dynamic_cast<CallInst *>(cur)) {
-            ModRefInfo MR = getInstModRefInfo(
-                MemoryLocation::get(targetLoad), cur, AA, LI, FAM);
-            if (isModSet(MR)) {
+            if (mayModifyPointer(
+                    MemoryLocation::get(targetLoad), cur, AA, LI, FAM)) {
                 return LoadElimQueryResult::clobbered();
             }
         }
@@ -730,8 +733,8 @@ PreservationStatus LoadEliminationPass::run(Function &F,
     }
     //3.快速层：在查询预算内让MemorySSA汇总每条路径的最近clobber。若这些定义
     //全是MustAlias完整覆盖Store且写入同一个支配值，则直接计划转发；否则保留
-    //完整clobber签名来筛选支配load，再通过CFG区间证明确认可复用。查询阶段
-    //不修改IR，MemorySSA walker会依据程序内存摘要透明越过timer。
+    //完整clobber签名来筛选支配load，再通过CFG区间证明确认可复用。
+    //MemorySSA只表示程序内存版本，后续接受候选时还要单独检查顺序屏障。
     auto &MSSA = FAM.getResult<MemorySSAAnalysis>(F);
     constexpr std::size_t MaxMSSAQueries = 512;
     constexpr std::size_t MaxMSSAWalk = 256;
@@ -772,7 +775,8 @@ PreservationStatus LoadEliminationPass::run(Function &F,
                 !isTypeCompatible(Stored, Load) ||
                 AA->aliasWithIndexRange(
                     LoadLocation, MemoryLocation::get(Store), LI) !=
-                    AliasInfo::MustAlias) {
+                    AliasInfo::MustAlias ||
+                hasOrderingBarrierOnPath(F, Store, Load, FAM)) {
                 AllClobbersAreSameValueStores = false;
                 break;
             }

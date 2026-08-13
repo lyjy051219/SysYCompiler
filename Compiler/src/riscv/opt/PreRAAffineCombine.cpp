@@ -276,6 +276,14 @@ private:
     if (!isExpandableAffineInstr(definition)) {
       return leaf(reg);
     }
+    //调用可能是SysY计时边界。仿射展开只能吸收当前调用区间内的定义，
+    //否则后续死代码删除会把原本位于计时区内的加法移到区间外。
+    for (std::size_t index = found->second.instrIndex + 1;
+         index < consumerIndex; ++index) {
+      if (mf_.blocks[blockIndex_].instrs[index].opcode == Opcode::CALL) {
+        return leaf(reg);
+      }
+    }
     return buildDefinition(reg.id, found->second.instrIndex);
   }
 
@@ -979,6 +987,30 @@ bool foldNarrowSignedDivisionBias(MachineFunction &mf) {
           !isRegOperand(*narrowing, 0) || !isImmOperand(*narrowing, 1) ||
           narrowing->uses[1].immValue < correctionBits ||
           narrowing->uses[1].immValue >= 32) {
+        continue;
+      }
+      const auto signPosition = definitions.find(bias.uses[0].regValue.id);
+      const auto narrowPosition = definitions.find(narrowed.id);
+      const MachineOperand &biasDef = bias.defs.front();
+      const auto biasPosition = definitions.find(biasDef.regValue.id);
+      if (signPosition == definitions.end() ||
+          narrowPosition == definitions.end() ||
+          biasPosition == definitions.end() ||
+          signPosition->second.blockIndex != biasPosition->second.blockIndex ||
+          narrowPosition->second.blockIndex != biasPosition->second.blockIndex) {
+        continue;
+      }
+      const MachineBasicBlock &owner =
+          mf.blocks[biasPosition->second.blockIndex];
+      bool crossesCall = false;
+      for (std::size_t index = narrowPosition->second.instrIndex + 1;
+           index < biasPosition->second.instrIndex; ++index) {
+        if (owner.instrs[index].opcode == Opcode::CALL) {
+          crossesCall = true;
+          break;
+        }
+      }
+      if (crossesCall) {
         continue;
       }
 

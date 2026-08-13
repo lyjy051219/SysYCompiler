@@ -1,6 +1,7 @@
 #include "ir/opt/ConstantHoist.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/TargetCostAnalysis.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
@@ -255,11 +256,25 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         std::vector<ConstantHoistUseSite> allUses;
         for (auto &m : G.members)
             for (auto &u : m.uses) allUses.push_back(u);
-        //3.合法性验证：选择支配所有 use 的插入块。常量物化是无副作用
-        //计算，其位置不受外部调用的程序顺序约束。
+        //3.合法性验证：选择支配所有use的插入块，并拒绝把常量物化
+        //跨越计时等顺序屏障搬到区间外。
         BasicBlock *common = foldCommonDominator(DT, allUses);
         BasicBlock *insertBB = pickInsertionBlock(common, entry, LI);
         if (!insertBB) insertBB = entry;
+        Instruction *StartAfter = nullptr;
+        for (Instruction *I : *insertBB) {
+            if (!dynamic_cast<PhiInst *>(I)) break;
+            StartAfter = I;
+        }
+        bool CrossesBarrier = false;
+        for (const ConstantHoistUseSite &Use : allUses) {
+            if (!Use.inst || hasOrderingBarrierOnPath(
+                    F, insertBB, StartAfter, Use.inst, FAM)) {
+                CrossesBarrier = true;
+                break;
+            }
+        }
+        if (CrossesBarrier) continue;
         //4.IR 改写：生成公共基值、块内偏移值，并替换整组常量使用。
         changed |= materializeGroup(G, insertBB);
     }

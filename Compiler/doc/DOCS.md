@@ -1091,6 +1091,14 @@ store ..., ptr A[i]
 load  ..., ptr A[i]
 ```
 
+##### BranchProbability
+
+分支概率预测
+
+目前只有CodeMotion这个pass使用
+
+
+
 #### TransformPass
 
 ##### CFGSimplify

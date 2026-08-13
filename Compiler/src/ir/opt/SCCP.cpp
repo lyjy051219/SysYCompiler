@@ -194,7 +194,9 @@ void SCCPSolver::initializeMemoryDependencies(
                         Load->getIRType()) ||
                     AA.aliasWithIndexRange(
                         LoadLocation, StoreLocation, LI) !=
-                        AliasInfo::MustAlias) {
+                        AliasInfo::MustAlias ||
+                    hasOrderingBarrierOnPath(
+                        F, Store, Load, FAM)) {
                     Proven = false;
                     break;
                 }

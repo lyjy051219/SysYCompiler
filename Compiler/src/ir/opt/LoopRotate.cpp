@@ -18,7 +18,9 @@ Instruction *LoopRotatePass::cloneInstructionWithMap(
     return I->clone(VMap);
 }
 //完成单个头测循环的结构预检、Header克隆、SSA转发和CFG旋转。
-bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT, const LoopInfo &LI) {
+bool LoopRotatePass::runLoopRotate(
+    Function &F, Loop &L, const DominatorTree &DT,
+    const LoopInfo &LI, FunctionAnalysisPassManager &FAM) {
     (void)DT;
     (void)LI;
     BasicBlock *Header = L.getHeader();
@@ -64,6 +66,9 @@ bool LoopRotatePass::runLoopRotate(Function &F, Loop &L, const DominatorTree &DT
     for (auto *I : *Header) {
         if (dynamic_cast<PhiInst *>(I)) continue;
         if (dynamic_cast<BrInst *>(I)) continue;
+        auto *Call = dynamic_cast<CallInst *>(I);
+        if (Call && getCallEffectSummary(Call, FAM).HasOrderingBarrier)
+            return false;
         HeaderNormalInsts.push_back(I);
     }
     for (Instruction *OldI : HeaderNormalInsts) {
@@ -360,7 +365,7 @@ PreservationStatus LoopRotatePass::run(Function &F, FunctionAnalysisPassManager 
             for (auto It = Loops.rbegin(); It != Loops.rend(); ++It) {
                 Loop *Cur = *It;
                 if (!Cur || !Cur->getHeader()) continue;
-                if (runLoopRotate(F, *Cur, DT, LI)) {
+                if (runLoopRotate(F, *Cur, DT, LI, FAM)) {
                     Changed = true;
                     ChangedInRound = true;
                     //1.2 CFG 已变更，所有循环指针随即过期；立即结束本轮并重建分析。

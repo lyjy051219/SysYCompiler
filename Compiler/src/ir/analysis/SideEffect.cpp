@@ -281,13 +281,7 @@ bool hasOrderingBarrierOnPath(
         return true;
     }
 
-    struct OrderingPathState {
-        BasicBlock *Block;
-        Instruction *Next;
-        bool SawBarrier;
-    };
-
-    std::queue<OrderingPathState> WorkList;
+    std::queue<SideEffectOrderingBarrierPathState> WorkList;
     std::unordered_set<BasicBlock *> VisitedWithoutBarrier;
     std::unordered_set<BasicBlock *> VisitedWithBarrier;
     Instruction *First = StartAfter ? StartAfter->getNext()
@@ -296,7 +290,7 @@ bool hasOrderingBarrierOnPath(
     if (!StartAfter) VisitedWithoutBarrier.insert(StartBlock);
 
     while (!WorkList.empty()) {
-        OrderingPathState State = WorkList.front();
+        SideEffectOrderingBarrierPathState State = WorkList.front();
         WorkList.pop();
         if (!State.Block) continue;
 

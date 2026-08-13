@@ -5,21 +5,103 @@
 #include "ir/analysis/SCEV.hpp"
 #include "lib/CFG.hpp"
 #include <algorithm>
-#include <deque>
 #include <limits>
 #include <unordered_map>
-#include <unordered_set>
+//BranchProbabilityInfo基础接口
+BranchProbabilityInfo::BranchProbabilityInfo() = default;
+BranchProbabilityInfo::BranchProbabilityInfo(BranchProbabilityInfo &&) noexcept = default;
+BranchProbabilityInfo &BranchProbabilityInfo::operator=(BranchProbabilityInfo &&) noexcept = default;
+uint32_t BranchProbabilityInfo::getEdgeProbability(
+    BasicBlock *From, std::size_t SuccessorIndex) const {
+    auto It = EdgeProbabilities.find(From);
+    if (It == EdgeProbabilities.end() ||
+        SuccessorIndex >= It->second.size()) return 0;
+    return It->second[SuccessorIndex];
+}
+uint32_t BranchProbabilityInfo::getEdgeProbabilityTo(
+    BasicBlock *From, BasicBlock *To) const {
+    if (!From || !To) return 0;
+    auto It = EdgeProbabilities.find(From);
+    if (It == EdgeProbabilities.end()) return 0;
+    auto Successors = From->getSuccessors();
+    uint64_t Sum = 0;
+    const std::size_t Count = std::min(Successors.size(), It->second.size());
+    for (std::size_t I = 0; I < Count; ++I) {
+        if (Successors[I] == To) Sum += It->second[I];
+    }
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        Sum, ProbabilityScale));
+}
+double BranchProbabilityInfo::getEdgeProbabilityAsDouble(
+    BasicBlock *From, std::size_t SuccessorIndex) const {
+    return static_cast<double>(getEdgeProbability(From, SuccessorIndex)) /
+           static_cast<double>(ProbabilityScale);
+}
+const std::vector<uint32_t> &
+BranchProbabilityInfo::getSuccessorProbabilities(BasicBlock *From) const {
+    static const std::vector<uint32_t> Empty;
+    auto It = EdgeProbabilities.find(From);
+    return It == EdgeProbabilities.end() ? Empty : It->second;
+}
+BasicBlock *BranchProbabilityInfo::getLikelySuccessor(
+    BasicBlock *From) const {
+    if (!From) return nullptr;
+    auto Successors = From->getSuccessors();
+    auto It = EdgeProbabilities.find(From);
+    if (It == EdgeProbabilities.end() ||
+        It->second.size() != Successors.size() || Successors.empty())
+        return nullptr;
+    std::unordered_map<BasicBlock *, uint64_t> Combined;
+    for (std::size_t I = 0; I < Successors.size(); ++I)
+        Combined[Successors[I]] += It->second[I];
+    BasicBlock *Best = nullptr;
+    uint64_t BestProbability = 0;
+    bool Tied = false;
+    for (const auto &Entry : Combined) {
+        if (Entry.second > BestProbability) {
+            Best = Entry.first;
+            BestProbability = Entry.second;
+            Tied = false;
+        } else if (Entry.second == BestProbability) {
+            Tied = true;
+        }
+    }
+    return Tied ? nullptr : Best;
+}
+bool BranchProbabilityInfo::isReachable(BasicBlock *BB) const {
+    return BB && ReachableBlocks.count(BB) != 0;
+}
+bool BranchProbabilityInfo::isReliable() const { return Reliable; }
+bool BranchProbabilityInfo::usedFallback() const { return UsedFallback; }
+std::size_t BranchProbabilityInfo::getAnalyzedBlockCount() const {
+    return EdgeProbabilities.size();
+}
+std::size_t BranchProbabilityInfo::getAnalyzedEdgeCount() const {
+    return AnalyzedEdgeCount;
+}
+bool BranchProbabilityInfo::invalidate(
+    Function &, const PreservationStatus &PA) {
+    return !PA.isKept(BranchProbabilityAnalysis::ID()) ||
+           !PA.isKept(DominantAnalysis::ID()) ||
+           !PA.isKept(PostDominantAnalysis::ID()) ||
+           !PA.isKept(LoopAnalysis::ID()) ||
+           !PA.isKept(SCEVAnalysis::ID());
+}
 
+//辅助接口1：均匀分配ProbabilityScale给每个后继
+/*例子：
+ProbabilityScale = 1048576
+1048576 / 3 = 349525，余 1
+结果：[349526, 349525, 349525]
+*/
 void BranchProbabilityAnalysis::assignUniformProbabilities(
     std::size_t Count, std::vector<uint32_t> &Probabilities) {
     Probabilities.assign(Count, 0);
     if (Count == 0) return;
     const uint32_t Quotient =
-        BranchProbabilityInfo::ProbabilityScale /
-        static_cast<uint32_t>(Count);
+        BranchProbabilityInfo::ProbabilityScale / static_cast<uint32_t>(Count);
     uint32_t Remainder =
-        BranchProbabilityInfo::ProbabilityScale -
-        Quotient * static_cast<uint32_t>(Count);
+        BranchProbabilityInfo::ProbabilityScale - Quotient * static_cast<uint32_t>(Count);
     for (std::size_t I = 0; I < Count; ++I) {
         Probabilities[I] = Quotient + (Remainder != 0 ? 1u : 0u);
         if (Remainder != 0) --Remainder;
@@ -197,102 +279,12 @@ bool BranchProbabilityAnalysis::buildColdExitWeights(
     return false;
 }
 
-BranchProbabilityInfo::BranchProbabilityInfo() = default;
-BranchProbabilityInfo::BranchProbabilityInfo(
-    BranchProbabilityInfo &&) noexcept = default;
-BranchProbabilityInfo &BranchProbabilityInfo::operator=(
-    BranchProbabilityInfo &&) noexcept = default;
-
-uint32_t BranchProbabilityInfo::getEdgeProbability(
-    BasicBlock *From, std::size_t SuccessorIndex) const {
-    auto It = EdgeProbabilities.find(From);
-    if (It == EdgeProbabilities.end() ||
-        SuccessorIndex >= It->second.size()) return 0;
-    return It->second[SuccessorIndex];
-}
-
-uint32_t BranchProbabilityInfo::getEdgeProbabilityTo(
-    BasicBlock *From, BasicBlock *To) const {
-    if (!From || !To) return 0;
-    auto It = EdgeProbabilities.find(From);
-    if (It == EdgeProbabilities.end()) return 0;
-    auto Successors = From->getSuccessors();
-    uint64_t Sum = 0;
-    const std::size_t Count = std::min(Successors.size(), It->second.size());
-    for (std::size_t I = 0; I < Count; ++I) {
-        if (Successors[I] == To) Sum += It->second[I];
-    }
-    return static_cast<uint32_t>(std::min<uint64_t>(
-        Sum, ProbabilityScale));
-}
-
-double BranchProbabilityInfo::getEdgeProbabilityAsDouble(
-    BasicBlock *From, std::size_t SuccessorIndex) const {
-    return static_cast<double>(getEdgeProbability(From, SuccessorIndex)) /
-           static_cast<double>(ProbabilityScale);
-}
-
-const std::vector<uint32_t> &
-BranchProbabilityInfo::getSuccessorProbabilities(BasicBlock *From) const {
-    static const std::vector<uint32_t> Empty;
-    auto It = EdgeProbabilities.find(From);
-    return It == EdgeProbabilities.end() ? Empty : It->second;
-}
-
-BasicBlock *BranchProbabilityInfo::getLikelySuccessor(
-    BasicBlock *From) const {
-    if (!From) return nullptr;
-    auto Successors = From->getSuccessors();
-    auto It = EdgeProbabilities.find(From);
-    if (It == EdgeProbabilities.end() ||
-        It->second.size() != Successors.size() || Successors.empty())
-        return nullptr;
-
-    std::unordered_map<BasicBlock *, uint64_t> Combined;
-    for (std::size_t I = 0; I < Successors.size(); ++I)
-        Combined[Successors[I]] += It->second[I];
-    BasicBlock *Best = nullptr;
-    uint64_t BestProbability = 0;
-    bool Tied = false;
-    for (const auto &Entry : Combined) {
-        if (Entry.second > BestProbability) {
-            Best = Entry.first;
-            BestProbability = Entry.second;
-            Tied = false;
-        } else if (Entry.second == BestProbability) {
-            Tied = true;
-        }
-    }
-    return Tied ? nullptr : Best;
-}
-
-bool BranchProbabilityInfo::isReachable(BasicBlock *BB) const {
-    return BB && ReachableBlocks.count(BB) != 0;
-}
-
-bool BranchProbabilityInfo::isReliable() const { return Reliable; }
-bool BranchProbabilityInfo::usedFallback() const { return UsedFallback; }
-std::size_t BranchProbabilityInfo::getAnalyzedBlockCount() const {
-    return EdgeProbabilities.size();
-}
-std::size_t BranchProbabilityInfo::getAnalyzedEdgeCount() const {
-    return AnalyzedEdgeCount;
-}
-
-bool BranchProbabilityInfo::invalidate(
-    Function &, const PreservationStatus &PA) {
-    return !PA.isKept(BranchProbabilityAnalysis::ID()) ||
-           !PA.isKept(DominantAnalysis::ID()) ||
-           !PA.isKept(PostDominantAnalysis::ID()) ||
-           !PA.isKept(LoopAnalysis::ID()) ||
-           !PA.isKept(SCEVAnalysis::ID());
-}
 
 BranchProbabilityAnalysis::Result BranchProbabilityAnalysis::run(
     Function &F, FunctionAnalysisPassManager &FAM) const {
     BranchProbabilityInfo Result;
     if (!F.front()) return Result;
-
+    //1.收集基本块和CFG边数量
     std::vector<BasicBlock *> Blocks;
     std::size_t EdgeCount = 0;
     for (BasicBlock *BB : F) {
@@ -302,15 +294,14 @@ BranchProbabilityAnalysis::Result BranchProbabilityAnalysis::run(
     }
     Result.AnalyzedEdgeCount = EdgeCount;
 
+    //2.检查基本块和CFG边是否超预算
     const bool OverBudget = Blocks.size() > BlockBudget ||
                             EdgeCount > EdgeBudget;
     if (OverBudget) {
-        // 超预算时仍为每个现有 CFG 块提供总和正确的均匀概率，但不声称可达性或
-        // 启发式可靠，避免分析时间随巨型展开函数继续放大。
+        //超预算：直接给每个块均匀概率，降级算法
         for (BasicBlock *BB : Blocks) {
             auto Successors = BB->getSuccessors();
-            assignUniformProbabilities(
-                Successors.size(), Result.EdgeProbabilities[BB]);
+            assignUniformProbabilities(Successors.size(), Result.EdgeProbabilities[BB]);
             Result.ReachableBlocks.insert(BB);
         }
         Result.Reliable = false;
@@ -318,25 +309,19 @@ BranchProbabilityAnalysis::Result BranchProbabilityAnalysis::run(
         return Result;
     }
 
-    std::deque<BasicBlock *> Worklist;
-    Worklist.push_back(F.front());
-    Result.ReachableBlocks.insert(F.front());
-    while (!Worklist.empty()) {
-        BasicBlock *BB = Worklist.front();
-        Worklist.pop_front();
-        for (BasicBlock *Succ : BB->getSuccessors()) {
-            if (Succ && Result.ReachableBlocks.insert(Succ).second)
-                Worklist.push_back(Succ);
-        }
-    }
+    //3.收集函数入口可达块
+    F.collectReachableBlocks(Result.ReachableBlocks);
 
     auto &DT = FAM.getResult<DominantAnalysis>(F);
     auto &PDT = FAM.getResult<PostDominantAnalysis>(F);
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     auto &SE = FAM.getResult<SCEVAnalysis>(F);
 
+    //4.计算循环权重
+    //循环权重：ExitingBlock -> successor CFG边权重向量
     std::unordered_map<BasicBlock *, std::vector<uint64_t>> LoopWeights;
     std::size_t ExaminedLoops = 0;
+    //后序：先处理内层循环，再处理外层循环
     for (Loop *L : LI.getLoopsInPostOrder()) {
         if (!L) continue;
         if (++ExaminedLoops > LoopBudget) {

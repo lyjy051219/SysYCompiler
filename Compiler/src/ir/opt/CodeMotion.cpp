@@ -4,6 +4,7 @@
 #include "ir/analysis/BlockFrequencyInfo.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
+#include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/TargetCostAnalysis.hpp"
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
@@ -349,6 +350,9 @@ PreservationStatus CodeMotionPass::run(
         Placement Destination = choosePlacement(
             I, Latest, Sites, DT, LI, BFI, TargetCost);
         if (!Destination.Block) continue;
+        //即使纯SSA值不访问程序内存，也不能跨过计时调用改变区间内工作量。
+        if (hasOrderingBarrierOnPath(F, I, Destination.Before, FAM))
+            continue;
         if (moveToPlacement(I, Destination)) {
             Changed = true;
             ++Moves;

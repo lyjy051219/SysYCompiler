@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 class DominatorTree;
@@ -64,6 +65,28 @@ struct LoopPhaseRelayoutCandidate {
     //ShadowBytes记录新增对象大小，EstimatedNetBenefit记录缩放后的缓存收益
     std::size_t ShadowBytes = 0;
     std::int64_t EstimatedNetBenefit = 0;
+};
+
+//LoopPhaseConsistentShadowCandidate保存动态活动域内的原位更新转置计划
+struct LoopPhaseConsistentShadowCandidate {
+    //Target和三层循环共同限定需要版本化的完整计算区域
+    Function *Target = nullptr;
+    BasicBlock *PreHeader = nullptr;
+    BasicBlock *Header = nullptr;
+    BasicBlock *Exit = nullptr;
+    //Source、Bound和FinalStore描述原对象、共同活动边界及同步写入点
+    Variable *Source = nullptr;
+    Value *Bound = nullptr;
+    StoreInst *FinalStore = nullptr;
+    //ShadowObjectType与转置索引只保存已经完成证明的提交快照
+    std::shared_ptr<IRType> ShadowObjectType;
+    std::vector<Value *> StoreTransposedIndices;
+    std::vector<LoopPhaseRelayoutRewrite> Rewrites;
+    //Blocks是保留语义的慢版本克隆区域
+    std::vector<BasicBlock *> Blocks;
+    std::int64_t Rows = 0;
+    std::int64_t Columns = 0;
+    std::size_t ShadowBytes = 0;
 };
 
 //LoopPhaseRelayoutPass把完整二维生产阶段的最终值镜像为消费者友好布局
@@ -137,6 +160,20 @@ private:
     static bool applyCandidate(
         Module &M, LoopPhaseRelayoutCandidate &Candidate,
         unsigned Ordinal);
+    //识别零起点单位步长动态循环，并返回退出比较中的真实边界值
+    static bool matchCanonicalDynamicAxis(
+        Loop *Axis, SCEVResult &SE, PhiInst *&Induction,
+        Value *&Bound, BasicBlock *&PreHeader,
+        BasicBlock *&Latch, BasicBlock *&Exit);
+    //识别动态三层原位更新并建立带完整慢路径的转置shadow计划
+    static bool buildConsistentShadowCandidate(
+        Function &F, Loop *Outer, LoopAccessInfo &LA,
+        SCEVResult &SE, DominatorTree &DT,
+        LoopPhaseConsistentShadowCandidate &Candidate);
+    //建立边界守卫、活动域初始化、原位同步和未经改写的慢版本
+    static bool applyConsistentShadowCandidate(
+        Module &M, LoopPhaseConsistentShadowCandidate &Candidate,
+        unsigned Ordinal);
 
     //FAM提供函数级循环、范围、支配与访问分析并负责精确失效
     FunctionAnalysisPassManager &FAM;
@@ -144,4 +181,6 @@ private:
     std::size_t CreatedShadowBytes = 0;
     //NextShadowOrdinal为内部全局符号提供稳定递增编号
     unsigned NextShadowOrdinal = 0;
+    //VersionedSources避免固定点再次优化本次生成的语义慢路径
+    std::unordered_set<Variable *> VersionedSources;
 };

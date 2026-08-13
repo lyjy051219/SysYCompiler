@@ -233,6 +233,13 @@ ModRefInfo getCallProgramModRefInfo(
 CallEffectSummary getCallEffectSummary(
     CallInst *CI, FunctionAnalysisPassManager &FAM);
 
+//顺序屏障路径搜索的显式状态，声明放在头文件以保持实现文件仅含函数定义
+struct SideEffectOrderingBarrierPathState {
+    BasicBlock *Block = nullptr;
+    Instruction *Next = nullptr;
+    bool SawBarrier = false;
+};
+
 //判断两个指令位置之间是否存在一条经过通用顺序屏障且能够到达终点的CFG路径
 bool hasOrderingBarrierOnPath(
     Function &F, BasicBlock *StartBlock, const Instruction *StartAfter,
