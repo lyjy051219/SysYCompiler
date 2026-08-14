@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <style>
+      .title{font:700 42px "Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#111827}
+      .sub{font:400 21px "Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#64748b}
+      .head{font:700 26px "Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#4c1d95}
+      .code{font:500 23px "JetBrains Mono","Consolas",monospace;fill:#1f2937}
+      .node-title{font:700 21px "JetBrains Mono","Consolas",monospace;fill:#4c1d95}
+      .ir{font:500 17px "JetBrains Mono","Consolas",monospace;fill:#1f2937}
+      .note{font:500 19px "Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#475569}
+      .edge{font:700 17px "Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+      .panel{fill:#fbfaff;stroke:#c4b5fd;stroke-width:2}
+      .box{fill:#f5f3ff;stroke:#8b5cf6;stroke-width:2.2}
+      .action{fill:#fff;stroke:#a78bfa;stroke-width:2.2}
+      .term{fill:#ede9fe;stroke:#7c3aed;stroke-width:2.2}
+      .line{fill:none;stroke:#7c3aed;stroke-width:2.4}
+      .true{fill:none;stroke:#16a34a;stroke-width:2.5}
+      .false{fill:none;stroke:#ea580c;stroke-width:2.5}
+      .dash{fill:none;stroke:#a78bfa;stroke-width:2;stroke-dasharray:7 7}
+    </style>
+    <marker id="purple" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#7c3aed"/></marker>
+    <marker id="green" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#16a34a"/></marker>
+    <marker id="orange" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#ea580c"/></marker>
+  </defs>
+  <rect width="1920" height="1080" fill="#fff"/>
+  <text x="82" y="70" class="title">短路求值：从源程序到控制流图</text>
+  <text x="82" y="108" class="sub">逻辑与/或不是按位指令，而是在 IR 生成阶段直接降低为基本块与条件分支</text>
+
+  <rect x="55" y="145" width="545" height="865" rx="12" class="panel"/>
+  <text x="327" y="194" text-anchor="middle" class="head">SysY 示例</text>
+  <rect x="94" y="231" width="467" height="298" rx="10" class="box"/>
+  <text x="126" y="282" class="code">if ((a != 0 &amp;&amp;</text>
+  <text x="126" y="325" class="code">     10 / a &gt; 1) || c) {</text>
+  <text x="126" y="382" class="code">    putint(1);</text>
+  <text x="126" y="425" class="code">} else {</text>
+  <text x="126" y="468" class="code">    putint(0);</text>
+  <text x="126" y="511" class="code">}</text>
+
+  <rect x="94" y="584" width="467" height="128" rx="10" class="action"/>
+  <text x="126" y="628" class="head">&amp;&amp; 短路</text>
+  <text x="126" y="670" class="note">a == 0 时，不执行 10 / a</text>
+  <path d="M327 529V584" class="dash" marker-end="url(#purple)"/>
+
+  <rect x="94" y="762" width="467" height="128" rx="10" class="action"/>
+  <text x="126" y="806" class="head">|| 短路</text>
+  <text x="126" y="848" class="note">左侧为真时，不再读取 c</text>
+  <path d="M327 712V762" class="dash" marker-end="url(#purple)"/>
+  <text x="327" y="946" text-anchor="middle" class="note">关键效果：a == 0 时避免除零</text>
+
+  <rect x="635" y="145" width="1230" height="865" rx="12" class="panel"/>
+  <text x="1250" y="194" text-anchor="middle" class="head">IRGenerator 生成的 CFG</text>
+
+  <rect x="1110" y="222" width="280" height="62" rx="31" class="term"/>
+  <text x="1250" y="261" text-anchor="middle" class="node-title">entry</text>
+  <path d="M1250 284V320" class="line" marker-end="url(#purple)"/>
+
+  <rect x="1035" y="322" width="430" height="125" rx="9" class="box"/>
+  <text x="1250" y="355" text-anchor="middle" class="node-title">entry.cond</text>
+  <text x="1250" y="390" text-anchor="middle" class="ir">%ca = icmp ne i32 %a, 0</text>
+  <text x="1250" y="422" text-anchor="middle" class="ir">br i1 %ca, %and.rhs, %or.rhs</text>
+
+  <rect x="720" y="526" width="475" height="159" rx="9" class="box"/>
+  <text x="958" y="560" text-anchor="middle" class="node-title">and.rhs</text>
+  <text x="958" y="596" text-anchor="middle" class="ir">%div = sdiv i32 10, %a</text>
+  <text x="958" y="628" text-anchor="middle" class="ir">%cd = icmp sgt i32 %div, 1</text>
+  <text x="958" y="660" text-anchor="middle" class="ir">br i1 %cd, %then, %or.rhs</text>
+
+  <rect x="1320" y="526" width="455" height="143" rx="9" class="box"/>
+  <text x="1548" y="560" text-anchor="middle" class="node-title">or.rhs</text>
+  <text x="1548" y="598" text-anchor="middle" class="ir">%cc = icmp ne i32 %c, 0</text>
+  <text x="1548" y="635" text-anchor="middle" class="ir">br i1 %cc, %then, %else</text>
+
+  <path d="M1150 447C1080 474 1010 488 974 526" class="true" marker-end="url(#green)"/>
+  <text x="1055" y="480" class="edge" fill="#16a34a">True：计算 &amp;&amp; 右侧</text>
+  <path d="M1360 447C1430 474 1505 488 1535 526" class="false" marker-end="url(#orange)"/>
+  <text x="1445" y="480" class="edge" fill="#ea580c">False：跳过除法</text>
+
+  <rect x="865" y="776" width="360" height="117" rx="9" class="action"/>
+  <text x="1045" y="812" text-anchor="middle" class="node-title">then</text>
+  <text x="1045" y="849" text-anchor="middle" class="ir">call void @putint(i32 1)</text>
+  <text x="1045" y="878" text-anchor="middle" class="ir">br label %continue</text>
+
+  <rect x="1425" y="776" width="360" height="117" rx="9" class="action"/>
+  <text x="1605" y="812" text-anchor="middle" class="node-title">else</text>
+  <text x="1605" y="849" text-anchor="middle" class="ir">call void @putint(i32 0)</text>
+  <text x="1605" y="878" text-anchor="middle" class="ir">br label %continue</text>
+
+  <path d="M930 685C930 727 980 743 1025 776" class="true" marker-end="url(#green)"/>
+  <text x="846" y="729" class="edge" fill="#16a34a">True：跳过 c</text>
+  <path d="M1195 625C1250 625 1270 598 1320 598" class="false" marker-end="url(#orange)"/>
+  <text x="1220" y="582" class="edge" fill="#ea580c">False：检查 c</text>
+  <path d="M1488 669C1435 715 1200 727 1090 776" class="true" marker-end="url(#green)"/>
+  <text x="1318" y="724" class="edge" fill="#16a34a">True</text>
+  <path d="M1605 669V776" class="false" marker-end="url(#orange)"/>
+  <text x="1620" y="728" class="edge" fill="#ea580c">False</text>
+
+  <rect x="1165" y="935" width="250" height="56" rx="28" class="term"/>
+  <text x="1290" y="970" text-anchor="middle" class="node-title">continue</text>
+  <path d="M1045 893C1050 930 1120 950 1165 958" class="line" marker-end="url(#purple)"/>
+  <path d="M1605 893C1590 930 1470 950 1415 958" class="line" marker-end="url(#purple)"/>
+</svg>

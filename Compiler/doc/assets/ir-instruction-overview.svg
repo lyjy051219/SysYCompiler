@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <style>
+      .title { font: 700 44px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #111827; }
+      .subtitle { font: 400 22px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #64748b; }
+      .root { fill: #ede9fe; stroke: #8b5cf6; stroke-width: 2.2; }
+      .card { fill: #f8f7ff; stroke: #a78bfa; stroke-width: 2; }
+      .card-title { font: 700 25px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #4c1d95; }
+      .label { font: 600 19px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .inst { font: 500 20px "JetBrains Mono", "Consolas", monospace; fill: #1f2937; }
+      .inst-small { font: 500 18px "JetBrains Mono", "Consolas", monospace; fill: #1f2937; }
+      .hint { font: 400 16px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #7c3aed; }
+      .line { fill: none; stroke: #8b5cf6; stroke-width: 2; stroke-dasharray: 6 7; }
+      .divider { stroke: #ddd6fe; stroke-width: 1.5; }
+    </style>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 Z" fill="#8b5cf6"/>
+    </marker>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#ffffff"/>
+  <text x="96" y="82" class="title">LLVM 风格 IR 指令体系</text>
+  <text x="96" y="121" class="subtitle">前端生成核心指令 · 中端扩展 SSA、位运算、移位与向量指令</text>
+
+  <rect x="790" y="154" width="340" height="76" rx="8" class="root"/>
+  <text x="960" y="202" text-anchor="middle" class="card-title">Instruction</text>
+
+  <path d="M960 230 V268 H326 V304" class="line" marker-end="url(#arrow)"/>
+  <path d="M960 230 V268 H960 V304" class="line" marker-end="url(#arrow)"/>
+  <path d="M960 230 V268 H1594 V304" class="line" marker-end="url(#arrow)"/>
+  <path d="M960 230 V696 H326 V730" class="line" marker-end="url(#arrow)"/>
+  <path d="M960 230 V696 H960 V730" class="line" marker-end="url(#arrow)"/>
+  <path d="M960 230 V696 H1594 V730" class="line" marker-end="url(#arrow)"/>
+
+  <!-- Control-flow card -->
+  <rect x="76" y="304" width="500" height="342" rx="10" class="card"/>
+  <text x="326" y="351" text-anchor="middle" class="card-title">终止与控制流</text>
+  <line x1="106" y1="370" x2="546" y2="370" class="divider"/>
+  <text x="326" y="423" text-anchor="middle" class="inst">Ret</text>
+  <text x="326" y="477" text-anchor="middle" class="inst">Br</text>
+  <text x="326" y="531" text-anchor="middle" class="inst">Call</text>
+  <text x="326" y="599" text-anchor="middle" class="hint">返回 · 分支跳转 · 函数调用</text>
+
+  <!-- Binary card -->
+  <rect x="626" y="304" width="668" height="342" rx="10" class="card"/>
+  <text x="960" y="351" text-anchor="middle" class="card-title">二元运算与比较</text>
+  <line x1="656" y1="370" x2="1264" y2="370" class="divider"/>
+  <text x="666" y="414" class="label">算术</text>
+  <text x="764" y="414" class="inst-small">Add · Fadd · Sub · Fsub · Mul · Fmul</text>
+  <text x="764" y="451" class="inst-small">Sdiv · Fdiv · Udiv · Srem · Frem · Urem</text>
+  <text x="666" y="501" class="label">逻辑</text>
+  <text x="764" y="501" class="inst-small">And · Or · Xor</text>
+  <text x="1000" y="501" class="label">移位</text>
+  <text x="1084" y="501" class="inst-small">Shl · Lshr · Ashr</text>
+  <text x="666" y="551" class="label">比较</text>
+  <text x="764" y="551" class="inst-small">Icmp · Fcmp</text>
+  <text x="666" y="591" class="inst-small">Icmp: eq · ne · sgt · sge · slt · sle</text>
+  <text x="666" y="624" class="inst-small">Fcmp: oeq · une · ogt · oge · olt · ole</text>
+
+  <!-- Memory card -->
+  <rect x="1344" y="304" width="500" height="342" rx="10" class="card"/>
+  <text x="1594" y="351" text-anchor="middle" class="card-title">内存操作</text>
+  <line x1="1374" y1="370" x2="1814" y2="370" class="divider"/>
+  <text x="1594" y="417" text-anchor="middle" class="inst">Alloca</text>
+  <text x="1594" y="469" text-anchor="middle" class="inst">Store</text>
+  <text x="1594" y="521" text-anchor="middle" class="inst">Load</text>
+  <text x="1594" y="573" text-anchor="middle" class="inst">GetElementPtr (GEP)</text>
+  <text x="1594" y="612" text-anchor="middle" class="hint">对象分配 · 内存读写 · 类型化地址计算</text>
+
+  <!-- Cast card -->
+  <rect x="76" y="730" width="500" height="248" rx="10" class="card"/>
+  <text x="326" y="777" text-anchor="middle" class="card-title">类型转换</text>
+  <line x1="106" y1="796" x2="546" y2="796" class="divider"/>
+  <text x="326" y="843" text-anchor="middle" class="inst-small">FPTOSI · SITOFP</text>
+  <text x="326" y="890" text-anchor="middle" class="inst-small">Zext · Sext · Trunc</text>
+  <text x="326" y="937" text-anchor="middle" class="inst-small">BitCast</text>
+
+  <!-- SSA card -->
+  <rect x="710" y="730" width="500" height="248" rx="10" class="card"/>
+  <text x="960" y="777" text-anchor="middle" class="card-title">SSA 与选择</text>
+  <line x1="740" y1="796" x2="1180" y2="796" class="divider"/>
+  <text x="960" y="859" text-anchor="middle" class="inst">Phi</text>
+  <text x="960" y="913" text-anchor="middle" class="inst">Select</text>
+  <text x="960" y="953" text-anchor="middle" class="hint">控制流值合并 · 条件值选择</text>
+
+  <!-- Vector card -->
+  <rect x="1344" y="730" width="500" height="248" rx="10" class="card"/>
+  <text x="1594" y="777" text-anchor="middle" class="card-title">向量运算</text>
+  <line x1="1374" y1="796" x2="1814" y2="796" class="divider"/>
+  <text x="1594" y="843" text-anchor="middle" class="inst-small">extractelement</text>
+  <text x="1594" y="890" text-anchor="middle" class="inst-small">insertelement</text>
+  <text x="1594" y="937" text-anchor="middle" class="inst-small">shufflevector</text>
+</svg>

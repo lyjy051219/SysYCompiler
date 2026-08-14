@@ -1,0 +1,63 @@
+---
+config:
+  theme: base
+  flowchart:
+    htmlLabels: true
+    curve: basis
+    nodeSpacing: 48
+    rankSpacing: 58
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#f5f3ff"
+    primaryBorderColor: "#8b5cf6"
+    primaryTextColor: "#1f2937"
+    lineColor: "#7c3aed"
+    secondaryColor: "#ede9fe"
+    tertiaryColor: "#ffffff"
+    clusterBkg: "#fbfaff"
+    clusterBorder: "#c4b5fd"
+    fontFamily: "Noto Sans CJK SC, Microsoft YaHei, sans-serif"
+    fontSize: "19px"
+---
+flowchart LR
+    subgraph SOURCE["左：SysY 短路示例"]
+        direction TB
+        CODE["<div style='width:390px;text-align:left;font-family:Consolas,monospace;font-size:20px'><b>if ((a != 0 &amp;&amp; 10 / a &gt; 1) || c) {</b><br/>&nbsp;&nbsp;&nbsp;&nbsp;putint(1);<br/><b>} else {</b><br/>&nbsp;&nbsp;&nbsp;&nbsp;putint(0);<br/><b>}</b></div>"]
+        RULE["<div style='width:390px;text-align:left'><b>&amp;&amp;：</b>a == 0 时跳过 10 / a<br/><br/><b>||：</b>左侧为真时跳过 c</div>"]
+        CODE -. "短路语义" .-> RULE
+    end
+
+    subgraph CFG["右：IRGenerator 生成的 CFG"]
+        direction TB
+        ENTRY(["entry"])
+        A["<b>entry.cond</b><br/>%ca = icmp ne i32 %a, 0<br/>br %ca, %and.rhs, %or.rhs"]
+        AND["<b>and.rhs</b><br/>%div = sdiv i32 10, %a<br/>%cd = icmp sgt i32 %div, 1<br/>br %cd, %then, %or.rhs"]
+        OR["<b>or.rhs</b><br/>%cc = icmp ne i32 %c, 0<br/>br %cc, %then, %else"]
+        THEN["<b>then</b><br/>call @putint(1)<br/>br %continue"]
+        ELSE["<b>else</b><br/>call @putint(0)<br/>br %continue"]
+        CONT(["continue"])
+
+        ENTRY --> A
+        A -- "T" --> AND
+        A -- "F：跳过除法" --> OR
+        AND -- "T：跳过 c" --> THEN
+        AND -- "F" --> OR
+        OR -- "True" --> THEN
+        OR -- "False" --> ELSE
+        THEN --> CONT
+        ELSE --> CONT
+    end
+
+    SOURCE ~~~ CFG
+
+    classDef code fill:#ede9fe,stroke:#8b5cf6,stroke-width:2px,color:#1f2937;
+    classDef note fill:#ffffff,stroke:#a78bfa,stroke-width:1.7px,color:#4c1d95;
+    classDef cond fill:#f5f3ff,stroke:#8b5cf6,stroke-width:2px,color:#1f2937;
+    classDef action fill:#fafafa,stroke:#a78bfa,stroke-width:2px,color:#1f2937;
+    classDef terminal fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#4c1d95;
+
+    class CODE code;
+    class RULE1,RULE2 note;
+    class A,AND,OR cond;
+    class THEN,ELSE action;
+    class ENTRY,CONT terminal;

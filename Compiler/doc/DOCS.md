@@ -368,6 +368,34 @@ memset：从目标地址 dest 开始，将连续 len 个字节全部设置为同
 - 功能：主要用于IR生成阶段，便于建立中端Value与前端AST Ident映射的桥梁
   - 变量遮蔽：允许在内层作用域声明与外层同名的变量。在进入新作用域的时候能够及时屏蔽外层同名变量
 
+```c
+@.C.template = constant [3 x i32] [i32 1, i32 0, i32 3]
+
+define i32 @main() {
+entry:
+    %x.addr = alloca i32
+    %a = alloca [3 x i32]
+
+    %x.call = call i32 @getint()
+    store i32 %x.call, i32* %x.addr
+    %x.value = load i32, i32* %x.addr
+
+    call void @llvm.memcpy.p0.p0.i32(
+        [3 x i32]* %a,
+        [3 x i32]* @.C.template,
+        i32 12,
+        i1 false
+    )
+
+    %a1 = getelementptr [3 x i32],
+                        [3 x i32]* %a,
+                        i32 0, i32 1
+    store i32 %x.value, i32* %a1
+}
+```
+
+
+
 ### 中端
 
 #### IR

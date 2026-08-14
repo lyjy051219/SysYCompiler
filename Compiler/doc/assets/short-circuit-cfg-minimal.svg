@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <style>
+      .expr { font: 700 30px "JetBrains Mono", "Consolas", monospace; fill: #111827; }
+      .node { fill: #f1f5f9; stroke: #111827; stroke-width: 2.2; }
+      .terminal { fill: #eef2ff; stroke: #111827; stroke-width: 2.2; }
+      .node-text { font: 500 23px "JetBrains Mono", "Consolas", monospace; fill: #111827; }
+      .edge-text { font: 500 19px "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #111827; }
+      .edge { fill: none; stroke: #111827; stroke-width: 2.2; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#111827"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#ffffff"/>
+
+  <!-- expression -->
+  <rect x="405" y="38" width="790" height="66" rx="5" fill="#fef08a"/>
+  <text x="800" y="80" text-anchor="middle" class="expr">(a != 0 &amp;&amp; 10 / a &gt; 1) || c</text>
+
+  <!-- central CFG -->
+  <rect x="650" y="145" width="300" height="68" rx="7" class="node"/>
+  <text x="800" y="187" text-anchor="middle" class="node-text">entry</text>
+
+  <rect x="650" y="282" width="300" height="72" rx="7" class="node"/>
+  <text x="800" y="327" text-anchor="middle" class="node-text">a != 0</text>
+
+  <rect x="650" y="444" width="300" height="72" rx="7" class="node"/>
+  <text x="800" y="489" text-anchor="middle" class="node-text">10 / a &gt; 1</text>
+
+  <rect x="650" y="606" width="300" height="72" rx="7" class="node"/>
+  <text x="800" y="651" text-anchor="middle" class="node-text">c != 0</text>
+
+  <rect x="175" y="830" width="300" height="72" rx="7" class="terminal"/>
+  <text x="325" y="875" text-anchor="middle" class="node-text">true_block</text>
+
+  <rect x="1125" y="830" width="300" height="72" rx="7" class="terminal"/>
+  <text x="1275" y="875" text-anchor="middle" class="node-text">false_block</text>
+
+  <!-- entry -->
+  <path d="M800 213 V282" class="edge" marker-end="url(#arrow)"/>
+
+  <!-- a != 0 -->
+  <path d="M800 354 V444" class="edge" marker-end="url(#arrow)"/>
+  <text x="815" y="404" class="edge-text">true</text>
+  <path d="M950 318 H1040 Q1080 318 1080 358 V570 Q1080 642 950 642" class="edge" marker-end="url(#arrow)"/>
+  <text x="1098" y="478" class="edge-text">false</text>
+
+  <!-- 10 / a > 1 -->
+  <path d="M800 516 V606" class="edge" marker-end="url(#arrow)"/>
+  <text x="815" y="566" class="edge-text">false</text>
+  <path d="M650 480 H455 Q395 480 395 540 V770 Q395 820 325 830" class="edge" marker-end="url(#arrow)"/>
+  <text x="410" y="598" class="edge-text">true</text>
+
+  <!-- c != 0 -->
+  <path d="M650 642 H565 Q505 642 505 702 V756 Q505 800 445 830" class="edge" marker-end="url(#arrow)"/>
+  <text x="520" y="734" class="edge-text">true</text>
+  <path d="M950 642 H1035 Q1095 642 1095 702 V756 Q1095 800 1155 830" class="edge" marker-end="url(#arrow)"/>
+  <text x="1110" y="734" class="edge-text">false</text>
+</svg>

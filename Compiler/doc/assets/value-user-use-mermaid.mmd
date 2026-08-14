@@ -1,0 +1,22 @@
+---
+config:
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#f5f3ff"
+    primaryBorderColor: "#8b5cf6"
+    primaryTextColor: "#312e81"
+    lineColor: "#7c3aed"
+    fontFamily: "Noto Sans CJK SC, Microsoft YaHei, sans-serif"
+    fontSize: "22px"
+---
+classDiagram
+    direction LR
+
+    class Value
+    class User
+    class Use
+
+    Value <|-- User : 继承
+    User "1" *-- "0..*" Use : 拥有（user）
+    Use --> "1" Value : 引用（usee）
