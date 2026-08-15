@@ -35,6 +35,9 @@
 #include "ir/opt/BreakCriticalEdges.hpp"
 #include "ir/opt/IfConversion.hpp"
 #include "ir/opt/GVNPRE.hpp"
+#include "ir/opt/GuardedLoopCodeMotion.hpp"
+#include "ir/opt/IdempotentIterationCollapse.hpp"
+#include "ir/opt/InvariantPrivateStoreHoist.hpp"
 #include "ir/opt/ADCE.hpp"
 #include "ir/opt/RangeAwareSimplify.hpp"
 #include "ir/opt/ConstraintElimination.hpp"
@@ -190,10 +193,17 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(LoopDistributionPass());
     FPM.addPass(LoopInterchangePass());
     FPM.addPass(LoopFusionPass());
+    //在展开复制循环体之前识别完整覆盖形成的内存不动点；对象容量无法
+    //证明的输入由运行时安全门禁完整保留原回边。
+    FPM.addPass(IdempotentIterationCollapsePass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         UnrollAndJamPass(), 6));
     //3. Rotate 改变 header/latch 后立刻清 CFG、重建 LoopSimplify/LCSSA/IV，并运行 LICM。
     FPM.addPass(LoopRotatePass());
+    //两块头测循环不做整体旋转；为其昂贵且仅供循环使用的纯计算建立
+    //零次执行守卫，使计算只在循环确实进入时执行。
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        GuardedLoopCodeMotionPass(), 3));
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 8));
@@ -201,6 +211,15 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(IndVarSimplifyPass());
     FPM.addPass(LoopExitValueSimplifyPass());
     FPM.addPass(LICMPass());
+    //私有聚合上的不变条件写入前缀只执行首轮；后续回边直接进入共同
+    //后缀，再清理CFG并恢复循环规范形态供访存优化使用。
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        InvariantPrivateStoreHoistPass(), 4));
+    FPM.addPass(ADCEPass());
+    FPM.addPass(CFGSimplifyPass());
+    FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 4));
+    FPM.addPass(LCSSAPass());
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopLoadEliminationPass(), 4));
     //4. Unswitch克隆CFG后消费新产生的边约束，再次恢复LoopSimplify+LCSSA。
@@ -330,7 +349,12 @@ FunctionPassManager PassBuilder::buildLatePipeline() {
     LateFPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildLateControlFlowPipeline(), 3));
     LateFPM.addPass(DCEPass());
-    //2. 常量外提后统一函数出口，连续两次 PHI/CFG 清理消化新汇合结构。
+    //2. 晚期 CFG 清理可能重新形成多入口循环；先恢复专用预头与 LCSSA，
+    //让常量外提把值放在目标循环附近而不是拉长到函数入口。
+    LateFPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
+        LoopSimplifyPass(), 4));
+    LateFPM.addPass(LCSSAPass());
+    //3. 常量外提后统一函数出口，连续两次 PHI/CFG 清理消化新汇合结构。
     LateFPM.addPass(ConstantHoistPass());
     LateFPM.addPass(UnifyFuncExitsPass());
     LateFPM.addPass(LatePhiCleanupPass());
@@ -373,8 +397,18 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(DeadFunctionEliminationPass(FAM));
     MPM.addPass(createModuleFunctionBridge(
         buildLightCleanupPipeline(), FAM));
+    //普通内联清理后再给严格受限的线性自递归一次独立展开机会；
+    //该轮不扫描普通调用点，避免为无关函数重复执行完整内联工作。
+    MPM.addPass(createModuleFunctionBridge(
+        FuncInlinePass(LinearRecursiveInlineBudget{100, 16, 128}), FAM));
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildScalarCleanupPipeline(), FAM), 2));
+    //第二次清理后允许更大的线性递归体再成倍展开一次；仍由独立预算
+    //限制为单次阶段，避免固定点式指数膨胀。
+    MPM.addPass(createModuleFunctionBridge(
+        FuncInlinePass(LinearRecursiveInlineBudget{200, 32, 256}), FAM));
+    MPM.addPass(createModuleFunctionBridge(
+        buildScalarCleanupPipeline(), FAM));
     //5. 保守 Global2Local 把小全局放回 main 栈，紧接 CFG/Mem2Reg 让标量进入 SSA。
     MPM.addPass(createModuleFunctionBridge(Global2LocalPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));

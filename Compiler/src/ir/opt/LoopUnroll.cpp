@@ -2782,12 +2782,17 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
                     continue;
                 const int64_t CloneCount = Candidate +
                     *RI->ConstantRemainderCount;
+                //主展开段与常量尾段按控制流先后执行，寄存器压力取两个
+                //执行区域的峰值；代码大小和基本块预算仍按全部克隆总数计算。
+                const int PressureCopies = std::max(
+                    Candidate,
+                    static_cast<int>(*RI->ConstantRemainderCount));
                 const int64_t StaticCost =
                     static_cast<int64_t>(BodyCost) * CloneCount;
                 if (CloneCount >
                         Config.MaxClonedBlocks / LoopBlockCount ||
                     !fitsUnrollRegisterBudget(
-                        L, static_cast<int>(CloneCount), TargetCost) ||
+                        L, PressureCopies, TargetCost) ||
                     !withinThreshold(
                         StaticCost, Config.ConstantTailThreshold))
                     continue;

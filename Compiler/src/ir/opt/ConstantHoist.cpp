@@ -6,6 +6,7 @@
 #include "lib/IRUtils.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -46,6 +47,19 @@ BasicBlock *ConstantHoistPass::pickInsertionBlock(
     if (L->getLoopSimplifyForm(preHeader, latch) && preHeader)
         return preHeader;
     return entry;
+}
+//步骤 3.2b：浮点常量只提升到最内层可用预头，避免为了少量物化收益让
+//FPR 值跨越父循环或函数的大段控制流长期存活。
+BasicBlock *ConstantHoistPass::pickFloatInsertionBlock(
+    BasicBlock *Common, BasicBlock *Entry, const LoopInfo &LI) {
+    if (!Common) return Entry;
+    for (Loop *L = LI.getLoopFor(Common); L; L = L->getParentLoop()) {
+        BasicBlock *PreHeader = nullptr;
+        BasicBlock *Latch = nullptr;
+        if (L->getLoopSimplifyForm(PreHeader, Latch) && PreHeader)
+            return PreHeader;
+    }
+    return Common;
 }
 //步骤 1.1：判定操作数是否必须保留字面量形态。GEP 索引、调用参数、
 //select 操作数以及目标相关算术均不参与提升，避免遮蔽后续专用匹配。
@@ -89,10 +103,36 @@ bool ConstantHoistPass::isLiteralSensitiveUse(
     //当前仅明确允许 store 的值操作数；未知指令种类默认不改写。
     return User->instType != Instruction::STORE;
 }
+//步骤 1.1b：浮点常量没有目标立即数算术形式，但调用、select 和转换可能
+//依赖路径局部物化或前端折叠，首版只改写浮点算术/比较与 store 值。
+bool ConstantHoistPass::isFloatLiteralSensitiveUse(
+    const Instruction *User, size_t OperandIndex) {
+    if (!User || dynamic_cast<const CallInst *>(User) ||
+        dynamic_cast<const SelectInst *>(User) ||
+        dynamic_cast<const GetElementPtrInst *>(User) ||
+        dynamic_cast<const PhiInst *>(User)) {
+        return true;
+    }
+    if (dynamic_cast<const BinaryInst *>(User)) {
+        switch (User->instType) {
+        case Instruction::FADD:
+        case Instruction::FSUB:
+        case Instruction::FMUL:
+        case Instruction::FDIV:
+        case Instruction::FREM:
+        case Instruction::FCMP:
+            return false;
+        default:
+            return true;
+        }
+    }
+    if (dynamic_cast<const StoreInst *>(User)) return OperandIndex != 0;
+    return true;
+}
 //步骤 1.2：遍历全部非 PHI 操作数，按值为可提升的大 i32 常量建桶，同时
 //记录使用点和最大循环深度；这些信息分别服务支配性检查和动态收益估计。
 ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
-    Function &F, const LoopInfo &LI,
+    Function &F, const DominatorTree &DT, const LoopInfo &LI,
     const TargetCostInfo &TargetCost) {
     ConstantHoistCollectResult R;
     forEachInstruction(
@@ -124,6 +164,28 @@ ConstantHoistCollectResult ConstantHoistPass::collectCandidates(
                     C.value = val;
                     C.uses.push_back({u, I, BB, depth});
                     if (depth > C.maxDepth) C.maxDepth = depth;
+                    return;
+                }
+                if (auto *cf = dynamic_cast<ConstFloat *>(v)) {
+                    if (isFloatLiteralSensitiveUse(I, OperandIndex)) return;
+                    std::uint32_t Bits = 0;
+                    const float FloatValue = cf->getVal();
+                    static_assert(sizeof(Bits) == sizeof(FloatValue),
+                                  "单精度浮点位宽不符合预期");
+                    std::memcpy(&Bits, &FloatValue, sizeof(Bits));
+                    auto &C = R.floatBuckets[Bits];
+                    C.bitPattern = Bits;
+                    C.uses.push_back({u, I, BB, depth});
+                    if (depth > C.maxDepth) C.maxDepth = depth;
+                    if (Loop *UseLoop = LI.getLoopFor(BB)) {
+                        BasicBlock *UsePreHeader = nullptr;
+                        BasicBlock *UseLatch = nullptr;
+                        if (UseLoop->getLoopSimplifyForm(
+                                UsePreHeader, UseLatch) && UseLatch &&
+                            DT.dominates(BB, UseLatch)) {
+                            C.hasMustExecuteLoopUse = true;
+                        }
+                    }
                 }
             });
     });
@@ -219,6 +281,31 @@ bool ConstantHoistPass::materializeGroup(
     }
     return anyChange;
 }
+//步骤 4b：把 IEEE 位模式先驻留为 i32，再用已有 BitCast/ISel 接口生成
+//一次 FMV_W_X；所有使用共享同一个 FPR SSA 定义。
+bool ConstantHoistPass::materializeFloatCandidate(
+    ConstantHoistFloatCandidate &Candidate,
+    BasicBlock *InsertBB, Instruction *InsertAfter) {
+    if (!InsertBB || Candidate.uses.empty()) return false;
+    const std::int32_t SignedBits =
+        static_cast<std::int32_t>(Candidate.bitPattern);
+    auto *Materialized = new BitCastInst(
+        ConstInt::newConstInt(SignedBits), FLOATType::NewFloat());
+    const bool Inserted = InsertAfter
+        ? InsertAfter->insertAfter(Materialized)
+        : InsertBB->insertAfterPhiNodes(Materialized);
+    if (!Inserted) {
+        delete Materialized;
+        return false;
+    }
+    bool Changed = false;
+    for (ConstantHoistUseSite &Use : Candidate.uses) {
+        if (!Use.u || Use.u->getValue() == Materialized) continue;
+        Use.u->replaceUseeWith(Materialized);
+        Changed = true;
+    }
+    return Changed;
+}
 //收集、分组并物化函数中可共享的大整数常量。
 PreservationStatus ConstantHoistPass::run(Function &F,
                                           FunctionAnalysisPassManager &FAM) {
@@ -229,7 +316,8 @@ PreservationStatus ConstantHoistPass::run(Function &F,
     auto &LI = FAM.getResult<LoopAnalysis>(F);
     const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(F);
     //1.发现候选：过滤字面量敏感位置，并按大整数值汇总使用点。
-    ConstantHoistCollectResult R = collectCandidates(F, LI, TargetCost);
+    ConstantHoistCollectResult R = collectCandidates(
+        F, DT, LI, TargetCost);
     //2.合并候选：排序后按可编码偏移分组，剔除总使用次数不足的窗口。
     std::vector<ConstantHoistCandidate> intSorted;
     intSorted.reserve(R.intBuckets.size());
@@ -277,6 +365,69 @@ PreservationStatus ConstantHoistPass::run(Function &F,
         if (CrossesBarrier) continue;
         //4.IR 改写：生成公共基值、块内偏移值，并替换整组常量使用。
         changed |= materializeGroup(G, insertBB);
+    }
+    //5.浮点候选按循环深度和复用数排序，在同一物化块只占用目标 FPR
+    //预算的一小部分，防止外提过多常量反而造成长活跃区间与 spill。
+    std::vector<ConstantHoistFloatCandidate> FloatCandidates;
+    FloatCandidates.reserve(R.floatBuckets.size());
+    for (auto &Entry : R.floatBuckets)
+        FloatCandidates.push_back(std::move(Entry.second));
+    std::sort(
+        FloatCandidates.begin(), FloatCandidates.end(),
+        [](const ConstantHoistFloatCandidate &Left,
+           const ConstantHoistFloatCandidate &Right) {
+            if (Left.maxDepth != Right.maxDepth)
+                return Left.maxDepth > Right.maxDepth;
+            if (Left.uses.size() != Right.uses.size())
+                return Left.uses.size() > Right.uses.size();
+            return Left.bitPattern < Right.bitPattern;
+        });
+    const unsigned FloatHoistLimit = std::max(
+        1U, TargetCost.getActiveRegisterBudget(
+                TargetRegisterClass::FloatingPoint) / 4U);
+    std::unordered_map<BasicBlock *, unsigned> FloatHoistsPerBlock;
+    for (ConstantHoistFloatCandidate &Candidate : FloatCandidates) {
+        if (Candidate.uses.empty()) continue;
+        if (!Candidate.hasMustExecuteLoopUse &&
+            static_cast<int>(Candidate.uses.size()) <
+                StraightLineFloatUseThreshold) {
+            continue;
+        }
+        BasicBlock *Common = foldCommonDominator(DT, Candidate.uses);
+        BasicBlock *InsertBB = pickFloatInsertionBlock(Common, entry, LI);
+        if (!InsertBB) InsertBB = entry;
+        if (FloatHoistsPerBlock[InsertBB] >= FloatHoistLimit) continue;
+        //多入口循环可能只能提升到函数入口块；常量无操作数依赖，可以放在
+        //该块最后一个计时/IO顺序屏障之后，既支配使用又不改变计时边界。
+        Instruction *StartAfter = nullptr;
+        for (Instruction *I : *InsertBB) {
+            if (dynamic_cast<PhiInst *>(I)) {
+                StartAfter = I;
+                continue;
+            }
+            auto *Call = dynamic_cast<CallInst *>(I);
+            if (Call && getCallEffectSummary(Call, FAM).HasOrderingBarrier)
+                StartAfter = I;
+        }
+        bool CrossesBarrier = false;
+        for (const ConstantHoistUseSite &Use : Candidate.uses) {
+            //同块使用还必须真实位于插入锚点之后；仅靠 CFG 路径搜索无法
+            //把“终点在起点之前”识别成 use-before-def。
+            if (!Use.inst ||
+                (StartAfter && Use.block == InsertBB &&
+                 !Instruction::comesBefore(StartAfter, Use.inst)) ||
+                hasOrderingBarrierOnPath(
+                    F, InsertBB, StartAfter, Use.inst, FAM)) {
+                CrossesBarrier = true;
+                break;
+            }
+        }
+        if (CrossesBarrier) continue;
+        if (materializeFloatCandidate(
+                Candidate, InsertBB, StartAfter)) {
+            ++FloatHoistsPerBlock[InsertBB];
+            changed = true;
+        }
     }
     if (!changed) return PreservationStatus::all();
     //5.分析失效：仅改变 SSA 表达式，CFG、支配树和循环结构保持有效。

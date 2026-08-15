@@ -9,9 +9,13 @@
 #include <limits>
 #include <unordered_set>
 #include <vector>
-FuncInlinePass::FuncInlinePass(bool enableRecursiveInline, bool lateCleanupMode)
+FuncInlinePass::FuncInlinePass(bool enableRecursiveInline,
+	bool lateCleanupMode)
 	: EnableRecursiveInline(enableRecursiveInline),
 	  LateCleanupMode(lateCleanupMode) {}
+FuncInlinePass::FuncInlinePass(LinearRecursiveInlineBudget budget)
+	: EnableRecursiveInline(true), LateCleanupMode(false),
+	  LinearRecursiveOnly(true), LinearBudget(budget) {}
 //步骤2.2：计算Callee的收益模型
 CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	Function* Callee, FunctionAnalysisPassManager& FAM) {
@@ -31,6 +35,9 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	}
 	const auto &TargetCost = FAM.getResult<TargetCostAnalysis>(*Callee);
 	forEachInstruction(*Callee, [&](Instruction *I) {
+		if (P.InstructionCount < std::numeric_limits<int>::max())
+			++P.InstructionCount;
+		if (dynamic_cast<AllocaInst *>(I)) P.HasStackAllocation = true;
 		int LocalCodeSize = TargetCost.getInstructionCost(
 			I, TargetCostKind::CodeSize);
 		//未建模IR保持旧模型的一指令估价，不把成本查询变成合法性门禁。
@@ -72,6 +79,38 @@ CalleeInlineProfile FuncInlinePass::analyzeCallee(
 	P.SafeToMemoize = (!P.HasOtherCalls && P.SideEffectFreeLocalOnly && P.SelfRecursiveCallSites >= 2);
 	return P;
 }
+//判断一次自递归展开是否满足独立的线性、纯标量和规模门禁
+bool FuncInlinePass::isLinearRecursiveExpansionCandidate(
+	Function &Caller, CallInst *CI, Function *Callee, int BodyCost,
+	const CalleeInlineProfile &Profile,
+	const LinearRecursiveInlineBudget &Budget,
+	FunctionAnalysisPassManager &FAM) {
+	if (!CI || !Callee || Callee != &Caller) return false;
+	bool Allowed =
+		Profile.SelfRecursiveCallSites == 1 &&
+		!Profile.HasOtherCalls &&
+		!Profile.HasStackAllocation &&
+		Profile.SideEffectFreeLocalOnly &&
+		BodyCost <= Budget.MaxBodyCodeSizeCost &&
+		Profile.BasicBlockCount <= Budget.MaxBasicBlocks &&
+		Profile.InstructionCount <= Budget.MaxInstructions &&
+		Callee->hasOnlyDirectCallUses() &&
+		Callee->getIRType() && Callee->getIRType()->isScalar() &&
+		Profile.ReturnCodeSizeCost > 0;
+	for (unsigned Index = 0;
+		 Allowed && Index < Callee->getParamCount(); ++Index) {
+		Param *Parameter = Callee->getParam(Index);
+		Allowed = Parameter && Parameter->getIRType() &&
+			Parameter->getIRType()->isScalar();
+	}
+	if (!Allowed) return false;
+	const LoopInfo &Loops = FAM.getResult<LoopAnalysis>(Caller);
+	if (!CI->getParent() || Loops.getLoopFor(CI->getParent()) != nullptr)
+		return false;
+	std::unordered_set<BasicBlock *> Reachable;
+	Callee->collectReachableBlocks(Reachable);
+	return static_cast<int>(Reachable.size()) == Profile.BasicBlockCount;
+}
 //步骤2.1：判断Callee是否符合收益模型
 bool FuncInlinePass::isInlineSite(
 	Function& Caller,
@@ -80,7 +119,10 @@ bool FuncInlinePass::isInlineSite(
 	const std::unordered_map<Function*, int>& FreqCallee,
 	bool EnableRecursiveInline,
 	bool LateCleanupMode,
+	bool LinearRecursiveOnly,
+	bool HotLoopCall,
 	bool CalleeIsRecursive,
+	const LinearRecursiveInlineBudget &LinearBudget,
 	FunctionAnalysisPassManager& FAM,
 	CalleeInlineProfile& OutProfile)
 {
@@ -88,11 +130,12 @@ bool FuncInlinePass::isInlineSite(
     //普通内联函数调用点及指令支持
 	constexpr int kCallSitesThreshold = 3;
 	constexpr int kCodeSizeThreshold = 200;
-    //递归函数内联最大指令支持
+	//递归函数内联最大指令支持
 	constexpr int kRecursiveExpandMaxCost = 100;
 	//晚期模型只承担低增长机会，避免重新复制已经优化过的大函数体
 	constexpr int kLateSingleUseMaxCost = 96;
 	constexpr int kLateMultiUseMaxCost = 16;
+	constexpr int kLateHotLoopMultiUseMaxCost = 48;
 	constexpr int kLateModuleGrowthBudget = 48;
 	constexpr int kLateMaxDirectCallSites = 8;
 	OutProfile = analyzeCallee(Callee, FAM);
@@ -115,6 +158,7 @@ bool FuncInlinePass::isInlineSite(
 	const bool IsRecursiveFunc = CalleeIsRecursive ||
 		(OutProfile.SelfRecursiveCallSites > 0);
 	const bool IsSelfCall = (Callee == &Caller);
+	if (LinearRecursiveOnly && (!IsRecursiveFunc || !IsSelfCall)) return false;
 	if (LateCleanupMode) {
 		//晚期固定点不展开任何递归环，保证重复运行的代码规模单调受控。
 		if (IsRecursiveFunc || Callee == &Caller) return false;
@@ -126,8 +170,11 @@ bool FuncInlinePass::isInlineSite(
 		//单调用点内联后旧函数体会被删除，模块代码量不会增长。
 		if (DirectCallSites == 1)
 			return BodyCost <= kLateSingleUseMaxCost;
-		//多调用点只接受很小且全模块增长受限的函数体。
-		if (BodyCost > kLateMultiUseMaxCost) return false;
+		//循环内调用会动态重复执行，可在原有模块增长总预算内接受稍大的
+		//函数体；循环外仍沿用低增长阈值。
+		const int MultiUseMaxCost = HotLoopCall ?
+			kLateHotLoopMultiUseMaxCost : kLateMultiUseMaxCost;
+		if (BodyCost > MultiUseMaxCost) return false;
 		const std::int64_t ModuleGrowth =
 			static_cast<std::int64_t>(
 				std::max(0, BodyCost - CallCodeSizeCost)) * DirectCallSites;
@@ -137,8 +184,21 @@ bool FuncInlinePass::isInlineSite(
 		//递归函数只允许在自身调用点按更严格的总展开预算展开。
 		if (!IsSelfCall) return false;
 		if (!EnableRecursiveInline) return false;
-		if (static_cast<std::int64_t>(RegularBodyCost) * Freq >
-			kRecursiveExpandMaxCost) return false;
+		const bool ExistingBudgetAllows =
+			static_cast<std::int64_t>(RegularBodyCost) * Freq <=
+			kRecursiveExpandMaxCost;
+		const bool LinearExpansion =
+			isLinearRecursiveExpansionCandidate(
+				Caller, CI, Callee, RegularBodyCost, OutProfile,
+				LinearBudget, FAM);
+		if (LinearRecursiveOnly) {
+			if (!LinearExpansion) return false;
+		} else if (!ExistingBudgetAllows) {
+			//线性自递归只会在函数体内实际克隆一次；外部调用点数量不会
+			//放大这次函数级增长。仅对纯标量、单自调用且无栈对象的形态
+			//使用这一独立预算，保持非线性递归和有副作用递归的旧门禁。
+			if (!LinearExpansion) return false;
+		}
 	} else {
 		//普通函数在调用点较少时直接放行，否则限制“体积 × 调用次数”。
 		if (Freq >= kCallSitesThreshold &&
@@ -154,21 +214,30 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 	std::unordered_map<Function*, bool> RecursiveCallees;
 	std::unordered_map<CallInst*, int> SitePriority;
 	std::unordered_map<CallInst*, int> SiteOrder;
+	std::unordered_map<CallInst*, bool> SiteInLoop;
 	FunctionCallGraph CallGraph;
-	if (Module *M = Module::getActiveModule()) CallGraph = M->buildDirectCallGraph();
+	//严格线性递归阶段只处理当前函数的唯一自调用，不需要为普通调用
+	//重复构建全模块调用图。
+	if (!LinearRecursiveOnly) {
+		if (Module *M = Module::getActiveModule())
+			CallGraph = M->buildDirectCallGraph();
+	}
 	LoopInfo *LI = LateCleanupMode ? &FAM.getResult<LoopAnalysis>(F) : nullptr;
 	std::vector<CallInst*> OriginalCallSites;
 	for (CallInst *CI : collectInstructions<CallInst>(F)) {
 		auto* Callee = CI->getDirectCallee();
 		if (!Callee) continue;
-		FreqCallee[Callee] = std::max(
+		if (LinearRecursiveOnly && Callee != &F) continue;
+		FreqCallee[Callee] = LinearRecursiveOnly ? 1 : std::max(
 			1, static_cast<int>(Callee->getDirectCallSites().size()));
 		if (!RecursiveCallees.count(Callee)) {
-			RecursiveCallees[Callee] = !CallGraph.empty() &&
-				Module::isFunctionRecursive(Callee, CallGraph);
+			RecursiveCallees[Callee] = LinearRecursiveOnly ||
+				(!CallGraph.empty() &&
+				 Module::isFunctionRecursive(Callee, CallGraph));
 		}
 		if (LateCleanupMode) {
 			Loop *CallLoop = LI ? LI->getLoopFor(CI->getParent()) : nullptr;
+			SiteInLoop[CI] = CallLoop != nullptr;
 			int Priority = CallLoop ? static_cast<int>(CallLoop->getDepth()) * 16 : 0;
 			CalleeInlineProfile Profile = analyzeCallee(Callee, FAM);
 			for (unsigned Index = 0; Index < CI->getArgCount() &&
@@ -209,8 +278,10 @@ PreservationStatus FuncInlinePass::run(Function &F, FunctionAnalysisPassManager 
 递归函数：调用函数频次×单次函数指令数<=100
 非递归函数：调用函数频次<3 || 调用函数频次(>=3)×单次函数指令数<=200
 */
+		const bool HotLoopCall = LateCleanupMode && SiteInLoop[CI];
 		if (!isInlineSite(F, CI, Callee, FreqCallee, EnableRecursiveInline,
-			LateCleanupMode, RecursiveCallees[Callee], FAM, Profile)) {
+			LateCleanupMode, LinearRecursiveOnly, HotLoopCall,
+			RecursiveCallees[Callee], LinearBudget, FAM, Profile)) {
 			continue;
 		}
 		if (LateCleanupMode) {

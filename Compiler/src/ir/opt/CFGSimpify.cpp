@@ -1474,6 +1474,14 @@ bool CFGSimplifyPass::simplifyUncondBranch(Function &F, BasicBlock *BB) {
 	if (Preds.empty()) return false;
 
 	auto SuccPhis = Succ->collectPhiNodes();
+	//删除多前驱代理块会把后继的每个PHI复制到全部旧前驱。大幅增加
+	//incoming既膨胀IR和并行复制，也会让后端在每条冷边重复准备相同值；
+	//超过统一预算时保留这一条无条件汇合边。
+	constexpr std::size_t MaxPhiIncomingGrowth = 16;
+	if (!SuccPhis.empty() && Preds.size() > 1 &&
+		SuccPhis.size() >
+			MaxPhiIncomingGrowth / (Preds.size() - 1))
+		return false;
 	std::unordered_set<BasicBlock *> SuccPredSet;
 	for (BasicBlock *P : Succ->getPredecessors()) {
 		if (P) SuccPredSet.insert(P);

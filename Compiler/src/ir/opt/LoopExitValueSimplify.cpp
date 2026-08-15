@@ -149,10 +149,31 @@ bool LoopExitValueSimplifyPass::planCandidate(
 			!IRType::hasSameShape(OnExit->getIRType(), Phi->getIRType())) {
 			return false;
 		}
+		if (planSignedPowerOfTwoDivisionLiveOut(
+				L, Phi, OnExit, *Trip, SE, RI, DT, Candidate)) {
+			return true;
+		}
 		return planModuloLiveOut(
 			L, Phi, OnExit, *Trip, SE, RI, DT, Candidate);
 	}
 	if (!Trip->ConstantTripCount) return false;
+	//DivRec 尚不能由通用 SCEVExpander 物化；单一 i32 live-out 先交给
+	//专用的连续二次幂除法闭式，再尝试普通多项式递推。
+	auto ConstantExitPhis = Trip->ExitBlock->collectPhiNodes();
+	if (ConstantExitPhis.size() == 1) {
+		PhiInst *Phi = ConstantExitPhis.front();
+		if (Phi && Phi->getNumIncomingValues() == 1 &&
+			Phi->getIncomingBlock(0) == Trip->ExitingBlock) {
+			Value *OnExit = Phi->getIncomingValue(0);
+			if (OnExit && !valueMayDependOnUndef(OnExit) &&
+				IRType::hasSameShape(
+					OnExit->getIRType(), Phi->getIRType()) &&
+				planSignedPowerOfTwoDivisionLiveOut(
+					L, Phi, OnExit, *Trip, SE, RI, DT, Candidate)) {
+				return true;
+			}
+		}
+	}
 	const SCEVExpr *ExitIteration = getExitIteration(*Trip);
 	if (!ExitIteration) return false;
 	//3.逐个验证退出PHI；任一循环live-out无法综合就拒绝整个循环，避免遗留外部use。
@@ -204,6 +225,257 @@ bool LoopExitValueSimplifyPass::planCandidate(
 	Candidate.RemovableLoopCost = RemovableCost;
 	return true;
 }
+
+//识别连续除以正二次幂的 i32 递推，并建立精确、无超宽移位的闭式计划。
+bool LoopExitValueSimplifyPass::planSignedPowerOfTwoDivisionLiveOut(
+    Loop *L, PhiInst *ExitPhi, Value *OnExit,
+    const LoopTripCountInfo &Trip, SCEVResult &SE, RangeInfo &RI,
+    DominatorTree &DT, LoopExitValueCandidate &Candidate) {
+	if (!L || !ExitPhi || !OnExit || !Trip.PreHeader || !Trip.Header ||
+		!Trip.Latch || !Trip.ExitBlock || !Trip.ExitingBlock ||
+		!Trip.ExitCmp || !Trip.TripCount ||
+		valueMayDependOnUndef(Trip.ExitCmp, 256) ||
+		!hasNoObservableInstruction(L) ||
+		Trip.ExitBlock->collectPhiNodes().size() != 1 ||
+		!IRType::hasIntegerBitWidth(ExitPhi->getIRType(), 32) ||
+		!IRType::hasSameShape(OnExit->getIRType(), ExitPhi->getIRType())) {
+		return false;
+	}
+	//运行期闭式保留原循环，LoopSimplify 可能随后为慢路径再插入专用出口。
+	//若当前 LCSSA 值已经向外汇入多前驱 PHI，说明该循环已有一个闭式版本；
+	//再次包裹只会复制相同快路径。此门禁只观察 SSA 汇合，不依赖块名称。
+	std::vector<Instruction *> PhiWorkList{ExitPhi};
+	std::unordered_set<Instruction *> SeenExitPhis;
+	while (!PhiWorkList.empty() && SeenExitPhis.size() <= 8) {
+		Instruction *Current = PhiWorkList.back();
+		PhiWorkList.pop_back();
+		if (!Current || !SeenExitPhis.insert(Current).second) continue;
+		for (Instruction *User : Current->getInstructionUsers()) {
+			auto *UserPhi = dynamic_cast<PhiInst *>(User);
+			if (!UserPhi || !UserPhi->getParent() ||
+				L->contains(UserPhi->getParent())) {
+				continue;
+			}
+			if (UserPhi->getNumIncomingValues() > 1) return false;
+			PhiWorkList.push_back(UserPhi);
+		}
+	}
+	if (SeenExitPhis.size() > 8) return false;
+
+	PhiInst *Recurrence = dynamic_cast<PhiInst *>(OnExit);
+	Value *UpdateValue = Recurrence
+		? Recurrence->getIncomingFromPred(Trip.Latch) : OnExit;
+	std::vector<BinaryInst *> Divisions;
+	Value *Cursor = UpdateValue;
+	std::int64_t BitsPerIteration = 0;
+	while (auto *Division = dynamic_cast<BinaryInst *>(Cursor)) {
+		if (Division->getOp() != BinaryInst::DIV ||
+			!Division->getParent() || !L->contains(Division->getParent()) ||
+			!IRType::hasIntegerBitWidth(Division->getIRType(), 32) ||
+			!DT.dominates(Division->getParent(), Trip.Latch)) {
+			break;
+		}
+		Value *Dividend = Division->getOperand(0);
+		Value *DivisorValue = Division->getOperand(1);
+		std::int64_t Divisor = 0;
+		if (!Dividend || !DivisorValue ||
+			valueMayDependOnUndef(DivisorValue) ||
+			!DivisorValue->tryGetInt64Const(Divisor) || Divisor < 2 ||
+			Divisor > (static_cast<std::int64_t>(1) << 30) ||
+			(Divisor & (Divisor - 1)) != 0) {
+			break;
+		}
+		std::int64_t LocalBits = 0;
+		for (std::int64_t Value = Divisor; Value > 1; Value >>= 1)
+			++LocalBits;
+		BitsPerIteration = std::min<std::int64_t>(
+			32, BitsPerIteration + LocalBits);
+		Divisions.push_back(Division);
+		Cursor = Dividend;
+	}
+	if (Divisions.empty()) return false;
+	if (!Recurrence) Recurrence = dynamic_cast<PhiInst *>(Cursor);
+	if (!Recurrence || Cursor != Recurrence ||
+		Recurrence->getParent() != Trip.Header ||
+		Recurrence->getNumIncomingValues() != 2 ||
+		Recurrence->countIncomingFromPred(Trip.PreHeader) != 1 ||
+		Recurrence->countIncomingFromPred(Trip.Latch) != 1 ||
+		Recurrence->getIncomingFromPred(Trip.Latch) != UpdateValue ||
+		!IRType::hasIntegerBitWidth(Recurrence->getIRType(), 32)) {
+		return false;
+	}
+	if ((Trip.ExitingBlock == Trip.Header && OnExit != Recurrence) ||
+		(Trip.ExitingBlock == Trip.Latch && OnExit != UpdateValue) ||
+		(Trip.ExitingBlock != Trip.Header &&
+		 Trip.ExitingBlock != Trip.Latch)) {
+		return false;
+	}
+
+	//直接单除法递推还要与 SCEV 的 DivRec 结论一致；展开后形成的短链由
+	//上面的逐指令 SSA 通道完整证明，不要求通用 SCEV 合并嵌套 DivRec。
+	if (Divisions.size() == 1) {
+		const SCEVExpr *Evolution = SE.getSCEV(Recurrence);
+		if (!Evolution || Evolution->Kind != SCEVExprKind::DivRec ||
+			Evolution->RecLoop != L || Evolution->Operands.size() != 2) {
+			return false;
+		}
+	}
+
+	auto HasOnlyUsers = [](Instruction *Definition,
+		const std::vector<Instruction *> &Allowed) {
+		if (!Definition) return false;
+		for (Instruction *User : Definition->getInstructionUsers()) {
+			if (std::find(Allowed.begin(), Allowed.end(), User) ==
+				Allowed.end()) {
+				return false;
+			}
+		}
+		return true;
+	};
+	std::vector<Instruction *> RecurrenceUsers{Divisions.back()};
+	if (OnExit == Recurrence) RecurrenceUsers.push_back(ExitPhi);
+	if (!HasOnlyUsers(Recurrence, RecurrenceUsers)) return false;
+	for (std::size_t Index = Divisions.size(); Index-- > 0;) {
+		std::vector<Instruction *> Allowed;
+		if (Index == 0) {
+			Allowed.push_back(Recurrence);
+			if (OnExit == Divisions[Index]) Allowed.push_back(ExitPhi);
+		} else {
+			Allowed.push_back(Divisions[Index - 1]);
+		}
+		if (!HasOnlyUsers(Divisions[Index], Allowed)) return false;
+	}
+
+	Value *Start = Recurrence->getIncomingFromPred(Trip.PreHeader);
+	if (!Start || valueMayDependOnUndef(Start, 256)) return false;
+	if (auto *StartInstruction = dynamic_cast<Instruction *>(Start)) {
+		if (!StartInstruction->getParent()) return false;
+		if (StartInstruction->getParent() == Trip.PreHeader) {
+			if (!Instruction::comesBefore(
+					StartInstruction, Trip.PreHeader->getTerminator())) {
+				return false;
+			}
+		} else if (!DT.dominates(
+				   StartInstruction->getParent(), Trip.PreHeader)) {
+			return false;
+		}
+	}
+
+	const unsigned LoopCost = estimateRemovableLoopCost(L);
+	if (LoopCost == 0 || BitsPerIteration <= 0) return false;
+	if (Trip.ConstantTripCount) {
+		const std::int64_t Iterations = *Trip.ConstantTripCount;
+		if (Iterations <= 0) return false;
+		const __int128 TotalBits = static_cast<__int128>(Iterations) *
+			BitsPerIteration;
+		const std::int64_t ConstantShift =
+			TotalBits >= 32 ? 32 : static_cast<std::int64_t>(TotalBits);
+		const unsigned ExpansionCost = ConstantShift >= 32 ? 0u : 4u;
+		const __int128 SavedCost =
+			static_cast<__int128>(Iterations) * LoopCost;
+		if ((Iterations < 2 && ConstantShift < 32) ||
+			SavedCost <= ExpansionCost) {
+			return false;
+		}
+		LoopExitValuePlan Plan;
+		Plan.Phi = ExitPhi;
+		Plan.OriginalValue = OnExit;
+		Plan.ExpansionCost = static_cast<int>(ExpansionCost);
+		Plan.DivisionBase = Start;
+		Plan.DivisionBitsPerIteration = BitsPerIteration;
+		Plan.DivisionConstantShift = ConstantShift;
+		Candidate.L = L;
+		Candidate.PreHeader = Trip.PreHeader;
+		Candidate.Plans.push_back(Plan);
+		Candidate.TotalExpansionCost = ExpansionCost;
+		Candidate.RemovableLoopCost = LoopCost;
+		return true;
+	}
+	if (!Trip.IsRuntime || Trip.TripCount->mentionsLoop(L) ||
+		!IRType::hasIntegerBitWidth(Trip.TripCount->Ty, 32)) {
+		return false;
+	}
+
+	SCEVExpander Preflight(L, Trip.PreHeader, DT, MaxExpansionCost);
+	int TripExpansionCost = Preflight.estimateCost(Trip.TripCount);
+	Value *DirectTripCount = nullptr;
+	bool DirectTripNeedsClamp = false;
+	//复用规范“i=0; i<bound; ++i”形状，在复杂 SCEV 暂不能物化时直接
+	//使用现有边界；负边界在提交阶段恢复为零次执行。
+	if (TripExpansionCost < 0 && Trip.IndVar &&
+		Trip.ComparePhase == LoopExitComparePhase::HeaderPhi &&
+		Trip.ExitingBlock == Trip.Header) {
+		Value *IVStart = Trip.IndVar->getIncomingFromPred(Trip.PreHeader);
+		auto *StartConstant = dynamic_cast<ConstInt *>(IVStart);
+		BinaryInst::Operation Predicate = Trip.ContinueOnTrue
+			? Trip.ExitCmp->getOp()
+			: BinaryInst::negatePredicate(Trip.ExitCmp->getOp());
+		Value *LHS = Trip.ExitCmp->getOperand(0);
+		Value *RHS = Trip.ExitCmp->getOperand(1);
+		if (RHS == Trip.IndVar) {
+			std::swap(LHS, RHS);
+			Predicate = BinaryInst::reversePredicate(Predicate);
+		}
+		bool BoundAvailable = RHS &&
+			IRType::hasIntegerBitWidth(RHS->getIRType(), 32);
+		if (auto *BoundInstruction = dynamic_cast<Instruction *>(RHS)) {
+			if (!BoundInstruction->getParent()) {
+				BoundAvailable = false;
+			} else if (BoundInstruction->getParent() == Trip.PreHeader) {
+				BoundAvailable = Instruction::comesBefore(
+					BoundInstruction, Trip.PreHeader->getTerminator());
+			} else {
+				BoundAvailable = DT.dominates(
+					BoundInstruction->getParent(), Trip.PreHeader);
+			}
+		}
+		if (StartConstant && StartConstant->getVal() == 0 &&
+			LHS == Trip.IndVar && Predicate == BinaryInst::L &&
+			BoundAvailable && !valueMayDependOnUndef(RHS, 256)) {
+			DirectTripCount = RHS;
+			IntRange BoundRange = RI.query(RHS, Trip.PreHeader, DT);
+			DirectTripNeedsClamp = BoundRange.isBottom() ||
+				BoundRange.min < 0;
+			TripExpansionCost = DirectTripNeedsClamp ? 2 : 0;
+		}
+	}
+	constexpr unsigned ClosedFormInstructionCount = 12;
+	if (TripExpansionCost < 0 ||
+		static_cast<unsigned>(TripExpansionCost) >
+			MaxExpansionCost - ClosedFormInstructionCount) {
+		return false;
+	}
+	const std::int64_t ZeroThreshold =
+		(32 + BitsPerIteration - 1) / BitsPerIteration;
+	const unsigned ClosedFormCost =
+		9u + static_cast<unsigned>(TripExpansionCost);
+	const unsigned PerIterationSaving = std::max(
+		1u, static_cast<unsigned>(Divisions.size()) * 8u);
+	const std::int64_t CostThreshold = std::max<std::int64_t>(
+		2, static_cast<std::int64_t>(
+			(ClosedFormCost + PerIterationSaving - 1) /
+			PerIterationSaving) + 1);
+	const std::int64_t FastTripThreshold =
+		std::min(CostThreshold, ZeroThreshold);
+	LoopExitValuePlan Plan;
+	Plan.Phi = ExitPhi;
+	Plan.OriginalValue = OnExit;
+	Plan.ExpansionCost = TripExpansionCost +
+		static_cast<int>(ClosedFormInstructionCount);
+	Plan.DivisionBase = Start;
+	Plan.DivisionTripCount = DirectTripCount ? nullptr : Trip.TripCount;
+	Plan.DivisionTripCountValue = DirectTripCount;
+	Plan.DivisionTripCountNeedsClamp = DirectTripNeedsClamp;
+	Plan.DivisionBitsPerIteration = BitsPerIteration;
+	Plan.DivisionFastTripThreshold = FastTripThreshold;
+	Candidate.L = L;
+	Candidate.PreHeader = Trip.PreHeader;
+	Candidate.Plans.push_back(Plan);
+	Candidate.TotalExpansionCost = static_cast<unsigned>(Plan.ExpansionCost);
+	Candidate.RemovableLoopCost = LoopCost;
+	return true;
+}
+
 //识别并综合正常量步长、正常量模数的有界模递推。
 bool LoopExitValueSimplifyPass::planModuloLiveOut(
     Loop *L, PhiInst *ExitPhi, Value *OnExit,
@@ -816,12 +1088,187 @@ bool LoopExitValueSimplifyPass::planPreservedLoopCandidate(
 	}
 	return false;
 }
+
+//提交连续二次幂有符号除法闭式；常量次数直接替换，运行期建立快慢路径。
+bool LoopExitValueSimplifyPass::applySignedPowerOfTwoDivisionCandidate(
+    LoopExitValueCandidate &Candidate, DominatorTree &DT) {
+	if (!Candidate.L || !Candidate.PreHeader || Candidate.Plans.size() != 1)
+		return false;
+	LoopExitValuePlan &Plan = Candidate.Plans.front();
+	if (!Plan.Phi || !Plan.DivisionBase ||
+		Plan.DivisionBitsPerIteration <= 0 ||
+		Plan.DivisionBitsPerIteration > 32 ||
+		!IRType::hasIntegerBitWidth(Plan.Phi->getIRType(), 32) ||
+		!IRType::hasSameShape(
+			Plan.DivisionBase->getIRType(), Plan.Phi->getIRType())) {
+		return false;
+	}
+
+	if (Plan.DivisionConstantShift >= 0) {
+		Value *Replacement = nullptr;
+		if (Plan.DivisionConstantShift >= 32) {
+			Replacement = Value::makeIntegerLike(Plan.DivisionBase, 0);
+		} else if (Plan.DivisionConstantShift > 0) {
+			const std::int64_t ShiftAmount = Plan.DivisionConstantShift;
+			const std::uint64_t MaskBits =
+				(static_cast<std::uint64_t>(1) << ShiftAmount) - 1;
+			Value *ThirtyOne = Value::makeIntegerLike(Plan.DivisionBase, 31);
+			Value *Shift = Value::makeIntegerLike(
+				Plan.DivisionBase, ShiftAmount);
+			Value *Mask = Value::makeIntegerLike(
+				Plan.DivisionBase, static_cast<std::int64_t>(MaskBits));
+			if (!ThirtyOne || !Shift || !Mask) return false;
+			auto *Sign = new BinaryInst(
+				Plan.DivisionBase, BinaryInst::ASHR, ThirtyOne);
+			auto *Bias = new BinaryInst(Sign, BinaryInst::AND, Mask);
+			auto *Adjusted = new BinaryInst(
+				Plan.DivisionBase, BinaryInst::ADD, Bias);
+			auto *Quotient = new BinaryInst(
+				Adjusted, BinaryInst::ASHR, Shift);
+			for (Instruction *I : {
+					static_cast<Instruction *>(Sign),
+					static_cast<Instruction *>(Bias),
+					static_cast<Instruction *>(Adjusted),
+					static_cast<Instruction *>(Quotient)}) {
+				if (!Candidate.PreHeader->insertBeforeTerminator(I)) return false;
+			}
+			Replacement = Quotient;
+		}
+		if (!Replacement || !IRType::hasSameShape(
+				Replacement->getIRType(), Plan.Phi->getIRType())) {
+			return false;
+		}
+		Plan.Phi->replaceAllUsesWith(Replacement);
+		delete Plan.Phi;
+		return true;
+	}
+
+	BasicBlock *Header = Candidate.L->getHeader();
+	BasicBlock *Exit = Plan.Phi->getParent();
+	Function *F = Candidate.PreHeader->getParent();
+	BrInst *OldBranch = Candidate.PreHeader->getBranchTerminator();
+	if (!Header || !Exit || !F ||
+		(!Plan.DivisionTripCount && !Plan.DivisionTripCountValue) ||
+		Plan.DivisionFastTripThreshold < 1 || !OldBranch ||
+		OldBranch->isConditional() || OldBranch->getSuccessorCount() != 1 ||
+		OldBranch->getSuccessor(0) != Header) {
+		return false;
+	}
+	SCEVExpander Expander(
+		Candidate.L, Candidate.PreHeader, DT, MaxExpansionCost);
+	Value *TripCount = Plan.DivisionTripCountValue
+		? Plan.DivisionTripCountValue
+		: Expander.expand(Plan.DivisionTripCount);
+	if (TripCount && Plan.DivisionTripCountNeedsClamp) {
+		Value *Zero = Value::makeIntegerLike(TripCount, 0);
+		auto *Positive = new BinaryInst(TripCount, BinaryInst::G, Zero);
+		if (!Candidate.PreHeader->insertBeforeTerminator(Positive)) {
+			delete Positive;
+			return false;
+		}
+		auto *Clamped = new SelectInst(Positive, TripCount, Zero);
+		if (!Candidate.PreHeader->insertBeforeTerminator(Clamped)) {
+			delete Clamped;
+			return false;
+		}
+		TripCount = Clamped;
+	}
+	if (!TripCount ||
+		!IRType::hasIntegerBitWidth(TripCount->getIRType(), 32)) {
+		return false;
+	}
+	Value *Threshold = Value::makeIntegerLike(
+		TripCount, Plan.DivisionFastTripThreshold);
+	auto *FastEnough = new BinaryInst(
+		TripCount, BinaryInst::GE, Threshold);
+	if (!Candidate.PreHeader->insertBeforeTerminator(FastEnough)) {
+		delete FastEnough;
+		return false;
+	}
+
+	auto *SaturatedBlock = new BasicBlock();
+	SaturatedBlock->setIdent(F->makeUniqueBlockIdent(
+		Candidate.PreHeader->getIdent() + ".sdiv.closed.zero"));
+	F->pushBlock(SaturatedBlock);
+	SaturatedBlock->genUnCondInst(Exit);
+	Value *ZeroResult = Value::makeIntegerLike(Plan.DivisionBase, 0);
+	if (!ZeroResult) return false;
+	Plan.Phi->addIncoming(ZeroResult, SaturatedBlock);
+
+	BasicBlock *FastTarget = SaturatedBlock;
+	if (Plan.DivisionBitsPerIteration < 32) {
+		auto *DispatchBlock = new BasicBlock();
+		DispatchBlock->setIdent(F->makeUniqueBlockIdent(
+			Candidate.PreHeader->getIdent() + ".sdiv.closed.dispatch"));
+		F->pushBlock(DispatchBlock);
+		auto *FormulaBlock = new BasicBlock();
+		FormulaBlock->setIdent(F->makeUniqueBlockIdent(
+			Candidate.PreHeader->getIdent() + ".sdiv.closed.formula"));
+		F->pushBlock(FormulaBlock);
+		const std::int64_t ZeroThreshold =
+			(32 + Plan.DivisionBitsPerIteration - 1) /
+			Plan.DivisionBitsPerIteration;
+		Value *ZeroThresholdValue = Value::makeIntegerLike(
+			TripCount, ZeroThreshold);
+		auto *IsSaturated = new BinaryInst(
+			TripCount, BinaryInst::GE, ZeroThresholdValue);
+		DispatchBlock->pushBack(IsSaturated);
+		DispatchBlock->genCondInst(
+			IsSaturated, SaturatedBlock, FormulaBlock);
+
+		Value *Bits = Value::makeIntegerLike(
+			TripCount, Plan.DivisionBitsPerIteration);
+		Value *Shift = TripCount;
+		if (Plan.DivisionBitsPerIteration != 1) {
+			auto *Scaled = new BinaryInst(
+				TripCount, BinaryInst::MUL, Bits);
+			FormulaBlock->pushBack(Scaled);
+			Shift = Scaled;
+		}
+		Value *ThirtyOne = Value::makeIntegerLike(TripCount, 31);
+		auto *ReverseShift = new BinaryInst(
+			ThirtyOne, BinaryInst::SUB, Shift);
+		Value *IntMaximum = Value::makeIntegerLike(
+			Plan.DivisionBase, IntRange::I32_MAX);
+		auto *Mask = new BinaryInst(
+			IntMaximum, BinaryInst::LSHR, ReverseShift);
+		Value *SignShift = Value::makeIntegerLike(Plan.DivisionBase, 31);
+		auto *Sign = new BinaryInst(
+			Plan.DivisionBase, BinaryInst::ASHR, SignShift);
+		auto *Bias = new BinaryInst(Sign, BinaryInst::AND, Mask);
+		auto *Adjusted = new BinaryInst(
+			Plan.DivisionBase, BinaryInst::ADD, Bias);
+		auto *Quotient = new BinaryInst(
+			Adjusted, BinaryInst::ASHR, Shift);
+		for (Instruction *I : {
+				static_cast<Instruction *>(ReverseShift),
+				static_cast<Instruction *>(Mask),
+				static_cast<Instruction *>(Sign),
+				static_cast<Instruction *>(Bias),
+				static_cast<Instruction *>(Adjusted),
+				static_cast<Instruction *>(Quotient)}) {
+			FormulaBlock->pushBack(I);
+		}
+		FormulaBlock->genUnCondInst(Exit);
+		Plan.Phi->addIncoming(Quotient, FormulaBlock);
+		FastTarget = DispatchBlock;
+	}
+
+	delete OldBranch;
+	Candidate.PreHeader->genCondInst(FastEnough, FastTarget, Header);
+	return true;
+}
+
 //在预头物化表达式并替换已规划的退出PHI。
 bool LoopExitValueSimplifyPass::applyCandidate(
     LoopExitValueCandidate &Candidate, DominatorTree &DT) {
 	//3—4.全部表达式已经预检；先统一物化，再直接提交PHI替换，不建立额外回滚框架。
 	if (!Candidate.L || !Candidate.PreHeader || Candidate.Plans.empty())
 		return false;
+	if (Candidate.Plans.size() == 1 &&
+		Candidate.Plans.front().DivisionBase) {
+		return applySignedPowerOfTwoDivisionCandidate(Candidate, DT);
+	}
 	//运行期模递推建立“闭式快路径/原循环慢路径”版本。小次数、零次和一次
 	//仍执行原循环，既精确保留退出相位，也避免闭式固定成本造成负优化。
 	if (Candidate.Plans.size() == 1 &&

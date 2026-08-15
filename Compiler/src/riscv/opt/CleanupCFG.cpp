@@ -413,6 +413,20 @@ bool removeEmptyBlock(MachineFunction &mf) {
     const std::vector<std::string> predLabels = predecessorLabels(mf, i);
     const std::size_t targetBlockIndex = static_cast<std::size_t>(targetIndex);
     const bool targetHasPhi = blockHasPhi(mf.blocks[targetBlockIndex]);
+    if (targetHasPhi && predLabels.size() > 1) {
+      std::size_t phiCount = 0;
+      for (const MachineInstr &instr : mf.blocks[targetBlockIndex].instrs) {
+        if (instr.opcode == Opcode::PHI) {
+          ++phiCount;
+        }
+      }
+      //保留高扇入汇合代理，避免删除它后把每个PHI复制到全部关键边，
+      //继而产生大量边拆分块和并行复制；预算与中端CFG清理保持一致。
+      constexpr std::size_t maxPhiIncomingGrowth = 16;
+      if (phiCount > maxPhiIncomingGrowth / (predLabels.size() - 1)) {
+        continue;
+      }
+    }
     if (targetHasPhi &&
         !canRewritePhiTargetAfterEmptyBlockRemoval(
             mf.blocks[targetBlockIndex], oldLabel, predLabels)) {

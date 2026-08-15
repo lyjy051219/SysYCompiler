@@ -38,4 +38,6 @@ Compiler/.backendtest-riscv
 Compiler/tests
 Compiler/backendtest-artifacts
 Compiler/backendtest-artifacts_1
+Compiler/.llvm-o3-test
+Compiler/llvm-o3-test-artifacts
 Compiler/testcasesfinal25

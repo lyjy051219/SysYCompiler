@@ -44,6 +44,20 @@ struct LoopExitValuePlan {
 	std::int64_t ModuloUpdatesPerIteration = 1;
 	//进入闭式快路径所需的最小迭代次数，由统一指令成本推导。
 	std::int64_t ModuloFastTripThreshold = 0;
+	//连续二次幂有符号除法递推的循环外初值；非空时启用除法专用闭式。
+	Value *DivisionBase = nullptr;
+	//运行期除法递推的精确总迭代次数；可直接取现有边界时为空。
+	const SCEVExpr *DivisionTripCount = nullptr;
+	//SCEV无法物化时保存规范零起点单位归纳循环的边界 SSA 值。
+	Value *DivisionTripCountValue = nullptr;
+	//运行期边界可能为负时，在预头恢复 max(0,bound) 的精确次数。
+	bool DivisionTripCountNeedsClamp = false;
+	//一次循环迭代中全部正二次幂除数贡献的总右移位数，最大记为32。
+	std::int64_t DivisionBitsPerIteration = 0;
+	//常量次数计划的总右移位数；负数表示运行期计划，32表示结果恒为零。
+	std::int64_t DivisionConstantShift = -1;
+	//运行期进入除法闭式快路径的最小迭代次数。
+	std::int64_t DivisionFastTripThreshold = 0;
 };
 
 //LoopExitValueCandidate保存一次循环出口值综合计划。
@@ -100,6 +114,14 @@ private:
 		Loop *L, PhiInst *ExitPhi, Value *OnExit,
 		const LoopTripCountInfo &Trip, SCEVResult &SE, RangeInfo &RI,
 		DominatorTree &DT, LoopExitValueCandidate &Candidate);
+	//识别连续除以正二次幂的 i32 递推，并建立无超宽移位的精确闭式计划。
+	static bool planSignedPowerOfTwoDivisionLiveOut(
+		Loop *L, PhiInst *ExitPhi, Value *OnExit,
+		const LoopTripCountInfo &Trip, SCEVResult &SE, RangeInfo &RI,
+		DominatorTree &DT, LoopExitValueCandidate &Candidate);
+	//提交常量或运行期连续除法闭式；运行期保留小次数原循环作为慢路径。
+	static bool applySignedPowerOfTwoDivisionCandidate(
+		LoopExitValueCandidate &Candidate, DominatorTree &DT);
 	//在预头物化表达式并替换已规划的退出PHI。
 	static bool applyCandidate(
 		LoopExitValueCandidate &Candidate, DominatorTree &DT);
