@@ -33,7 +33,6 @@ namespace riscv {
 // 细粒度环境变量（默认值见各开关）：
 //   BACKEND_MACHINE_LICM_STATS=1           打印命中统计到 stderr
 //   BACKEND_MACHINE_LICM_NO_LOADS=1        关闭全部 load 外提
-//   BACKEND_MACHINE_LICM_SPECULATE_LOADS=1 开启 T1b 可推测 load（默认关）
 //   BACKEND_MACHINE_LICM_TRAP_OPS=1        开启除法规（需除数非零证明）
 //   BACKEND_MACHINE_LICM_ROUNDS=N          整 pass 重复轮数（默认 1）
 //   BACKEND_MACHINE_LICM_MAX_HOISTS=N      每函数外提上限（默认 64）
@@ -56,7 +55,6 @@ int envInt(const char *name, int defaultValue) {
 
 struct Options {
   bool loadsEnabled = true;
-  bool specLoads = false;
   bool trapOps = false;
   int rounds = 1;
   int maxHoists = 64;
@@ -70,7 +68,6 @@ struct Options {
 Options readOptions() {
   Options opts;
   opts.loadsEnabled = !envFlag("BACKEND_MACHINE_LICM_NO_LOADS");
-  opts.specLoads = envFlag("BACKEND_MACHINE_LICM_SPECULATE_LOADS");
   opts.trapOps = envFlag("BACKEND_MACHINE_LICM_TRAP_OPS");
   opts.rounds = envInt("BACKEND_MACHINE_LICM_ROUNDS", 1);
   opts.maxHoists = envInt("BACKEND_MACHINE_LICM_MAX_HOISTS", 64);
@@ -532,7 +529,7 @@ struct Candidate {
   uint64_t profit = 0;
   bool marked = false;   // 通过不变性 + 收益门槛（最终外提集）
   bool removed = false;  // Phase 2 实际从原块移除
-  int loadTier = 0;      // 0=非 load；1=T1a；2=T1b；3=T2
+  int loadTier = 0;      // 0=非 load；1=T1a；2=T2
   std::set<int> deps;    // 依赖的已标记候选（候选收集序下标）
 };
 
@@ -701,14 +698,11 @@ bool defDominatesUses(const FunctionSnapshot &snap,
 
 // load 的内存安全分层：
 //   T1a：循环无 store 无 call，地址可证在界（零 trip 安全）；
-//   T2 ：循环有 store，地址可证在界 + 与循环内每个 store 根不相交；
-//   T1b：循环无 store 无 call，地址不可证在界，但 load 块支配全部 latch
-//        （循环内无条件执行），接受零 trip 残余风险——默认关。
+//   T2 ：循环有 store，地址可证在界 + 与循环内每个 store 根不相交。
 // 循环内有 call/MEMCPY/MEMSET 一律阻断 load 外提。
+// 地址不可证在界的 load 一律不外提，不接受推测执行风险。
 int computeLoadTier(const MachineFunction &mf, const FunctionSnapshot &snap,
-                    const LoopData &loop, const DominatorSets &dominators,
-                    const MachineInstr &load, int loadBlock,
-                    const Options &opts, const std::vector<int> &latches) {
+                    const LoopData &loop, const MachineInstr &load) {
   if (loop.hasCall || loop.hasMemcpy) {
     return 0; // 循环内有 call/MEMCPY/MEMSET：一律阻断 load
   }
@@ -717,16 +711,6 @@ int computeLoadTier(const MachineFunction &mf, const FunctionSnapshot &snap,
   if (loop.stores.empty()) {
     if (inBounds) {
       return 1; // T1a
-    }
-    if (opts.specLoads && !latches.empty()) {
-      const bool dominatesAllLatches = std::all_of(
-          latches.begin(), latches.end(), [&](int latch) {
-            return dominators[static_cast<std::size_t>(latch)]
-                .count(loadBlock) != 0;
-          });
-      if (dominatesAllLatches) {
-        return 2; // T1b
-      }
     }
     return 0;
   }
@@ -763,14 +747,13 @@ int computeLoadTier(const MachineFunction &mf, const FunctionSnapshot &snap,
       return 0;
     }
   }
-  return 3; // T2
+  return 2; // T2
 }
 
 // 收集循环内全部候选（结构 + 白名单/trap 守卫 + 单赋值 + 支配 + load 分层）。
 void collectCandidates(const MachineFunction &mf, const FunctionSnapshot &snap,
                        const DominatorSets &dominators, LoopData &loop,
-                       const Options &opts, const std::vector<int> &latches,
-                       int &loadBlocked) {
+                       const Options &opts, int &loadBlocked) {
   //机器IR不携带中端的精细调用效果摘要。循环含调用时，纯算术外提也可能
   //越过SysY计时边界，因此统一停止候选收集，而不只阻断load。
   if (loop.hasCall || loop.hasMemcpy) {
@@ -836,8 +819,7 @@ void collectCandidates(const MachineFunction &mf, const FunctionSnapshot &snap,
       }
       int tier = 0;
       if (isLoad) {
-        tier = computeLoadTier(mf, snap, loop, dominators, instr, block, opts,
-                               latches);
+        tier = computeLoadTier(mf, snap, loop, instr);
         if (opts.debug) {
           const AddressRoot dbgRoot =
               resolveAddressRoot(mf, snap, instr.uses[0], 0);
@@ -1406,15 +1388,7 @@ bool runRound(MachineFunction &mf, MachineFunctionAnalysisManager &am,
       }
     }
     ++stats.loops;
-    // latch 列表（T1b 用）。
-    std::vector<int> latches;
-    for (const auto &[latch, target] : loops.backedges) {
-      if (target == header) {
-        latches.push_back(latch);
-      }
-    }
-    collectCandidates(mf, snap, dominators, loop, opts, latches,
-                      stats.loadBlocked);
+    collectCandidates(mf, snap, dominators, loop, opts, stats.loadBlocked);
     stats.candidates += static_cast<int>(loop.candidates.size());
     if (opts.debug) {
       std::cerr << "# licm-debug   header=" << header
