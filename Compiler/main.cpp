@@ -8,6 +8,8 @@
 #include <string>
 #include <memory>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 
 std::unique_ptr<CompUnit> ASTRoot = nullptr;
@@ -58,7 +60,19 @@ int main(int argc, const char *argv[]) {
     // 固定宽度自动向量化的唯一开关：
     // Disabled：关闭；SIMD64：VF2；SIMD128：VF4；
     // SIMD64And128：优先 VF4，并在合法时回退 VF2。
-    TargetInfo::get().setFixedSIMDMode(FixedSIMDMode::Disabled);
+    // 现场调试可用 BACKEND_FIXED_SIMD_MODE=SIMD64|SIMD128|SIMD64And128 覆盖，
+    // 默认保持 Disabled，与标量发布行为一致。
+    FixedSIMDMode SimdMode = FixedSIMDMode::Disabled;
+    if (const char *RawSimdMode = std::getenv("BACKEND_FIXED_SIMD_MODE")) {
+      if (std::strcmp(RawSimdMode, "SIMD64") == 0) {
+        SimdMode = FixedSIMDMode::SIMD64;
+      } else if (std::strcmp(RawSimdMode, "SIMD128") == 0) {
+        SimdMode = FixedSIMDMode::SIMD128;
+      } else if (std::strcmp(RawSimdMode, "SIMD64And128") == 0) {
+        SimdMode = FixedSIMDMode::SIMD64And128;
+      }
+    }
+    TargetInfo::get().setFixedSIMDMode(SimdMode);
 
     //读取源文件->词法分析->语法分析->生成AST
     yyin = fopen(inputPath.c_str(), "r");

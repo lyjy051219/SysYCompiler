@@ -301,6 +301,14 @@ bool isZeroInitializer(Value *value, const std::shared_ptr<IRType> &type) {
   if (auto boolValue = dynamic_cast<ConstBool *>(value)) {
     return !boolValue->getVal();
   }
+  if (auto vectorValue = dynamic_cast<ConstantVector *>(value)) {
+    for (ConstantSystem *element : vectorValue->getElements()) {
+      if (!element || !isZeroInitializer(element, element->getIRType())) {
+        return false;
+      }
+    }
+    return vectorValue->getNumElements() != 0;
+  }
 
   auto init = dynamic_cast<Initializer *>(value);
   if (!init) {
@@ -349,6 +357,16 @@ void emitZeroForType(std::ostream &out, const std::shared_ptr<IRType> &type) {
 // 浮点常量按 IEEE-754 位模式重解释为无符号整数发射 .word;其余情况补零。
 void emitDataValue(std::ostream &out, Value *value,
                    const std::shared_ptr<IRType> &type) {
+  if (auto vectorType = std::dynamic_pointer_cast<VECTORType>(type)) {
+    auto vectorValue = dynamic_cast<ConstantVector *>(value);
+    const std::size_t count = vectorType->getElementCount();
+    for (std::size_t lane = 0; lane < count; ++lane) {
+      emitDataValue(out, vectorValue ? vectorValue->getElement(lane) : nullptr,
+                    vectorType->getElementType());
+    }
+    return;
+  }
+
   if (auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type)) {
     auto init = dynamic_cast<Initializer *>(value);
     if (!init) {

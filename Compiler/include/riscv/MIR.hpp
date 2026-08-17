@@ -79,6 +79,8 @@ struct MachineOperand {
   std::string symbol;
   std::string blockLabel;
   Value *valueRef = nullptr;
+  // 向量 PHI 被标量化后，ValueRef 记录取第几个 lane；标量默认 -1。
+  int valueLane = -1;
 
   static MachineOperand reg(MachineReg reg);
   static MachineOperand imm(int64_t value);
@@ -147,6 +149,8 @@ struct MachineFunction {
   std::vector<MachineBasicBlock> blocks;
   std::vector<StackObject> stackObjects;
   std::unordered_map<Value *, MachineReg> valueRegs;
+  // VectorLegalize 把向量 SSA 值标量化后，Value -> lane 标量寄存器组。
+  std::unordered_map<Value *, std::vector<MachineReg>> valueVectorLanes;
   // GenericVector 虚拟寄存器的精确逻辑类型。标量寄存器不进入此表。
   std::unordered_map<uint32_t, MachineVectorType> vectorVRegTypes;
   std::unordered_map<Value *, int> valueStackObjects;

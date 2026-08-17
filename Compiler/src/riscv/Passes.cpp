@@ -274,8 +274,39 @@ MachineReg materializePointerValue(MachineFunction &mf,
 // 取 IR 值在当前块可用的寄存器:已在 valueRegs 中映射则直接返回;否则按类型
 // 现场物化(指针走指针物化,其余走常量物化)。物化产生的指令写入 instrs。
 MachineReg valueRegInBlock(MachineFunction &mf, MachineBasicBlock &block,
-                           std::vector<MachineInstr> &instrs, Value *value) {
+                           std::vector<MachineInstr> &instrs, Value *value,
+                           int vectorLane = -1) {
   (void)block;
+  if (vectorLane >= 0) {
+    auto mapped = mf.valueVectorLanes.find(value);
+    if (mapped != mf.valueVectorLanes.end()) {
+      if (static_cast<std::size_t>(vectorLane) < mapped->second.size()) {
+        return mapped->second[static_cast<std::size_t>(vectorLane)];
+      }
+      throw BackendError("vector PHI lane index out of range");
+    }
+    // 向量常量/undef 作为 PHI incoming 时，按 lane 物化标量值。
+    if (auto *Constant = dynamic_cast<ConstantVector *>(value)) {
+      return materializeConstant(
+          mf, instrs,
+          Constant->getElement(static_cast<std::size_t>(vectorLane)));
+    }
+    if (dynamic_cast<UndefValue *>(value)) {
+      const std::shared_ptr<IRType> ElementType =
+          value->getIRType() && IRType::asVector(value->getIRType())
+              ? IRType::asVector(value->getIRType())->getElementType()
+              : nullptr;
+      if (ElementType) {
+        return materializeConstant(
+            mf, instrs,
+            ElementType->getTypeSystem() == IR_FLOAT
+                ? static_cast<Value *>(ConstFloat::newConstFloat(0.0f))
+                : static_cast<Value *>(ConstInt::newConstInt(0)));
+      }
+    }
+    throw BackendError("unsupported vector PHI incoming value");
+  }
+
   auto mapped = mf.valueRegs.find(value);
   if (mapped != mf.valueRegs.end()) {
     return mapped->second;
@@ -718,7 +749,8 @@ std::vector<MachineInstr> buildPhiCopies(MachineFunction &mf,
         throw BackendError("malformed PHI incoming value");
       }
       MachineReg src =
-          valueRegInBlock(mf, insertionBlock, copies, value.valueRef);
+          valueRegInBlock(mf, insertionBlock, copies, value.valueRef,
+                          value.valueLane);
       pendingCopies.push_back({phi.defs.front().regValue, src});
     }
   }
