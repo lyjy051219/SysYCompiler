@@ -5,6 +5,7 @@
 #include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/SideEffect.hpp"
+#include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <cmath>
 //构造尚无可执行路径信息的Top格值
@@ -267,6 +268,12 @@ void SCCPSolver::visitInstruction(Instruction* I) {
         mergeInValue(I, LatticeValue::getBottom());
     } else if (I->instType == Instruction::SELECT) {
         visitSelectInst(I);
+    } else if (I->getIRType() && !I->getIRType()->isVoid()) {
+        // extractelement、insertelement、shufflevector 等尚未建立专用格传播
+        // 规则的纯值指令必须降为 Bottom。若让它们停留在 Top，经由
+        // extractelement 得到的标量条件可能使 SCCP 错把两个后继都判成不可达。
+        // 这里不猜测 lane 或运行时索引，保持对未来新增 SSA 指令的保守正确性。
+        mergeInValue(I, LatticeValue::getBottom());
     }
 }
 //求解步骤 2.1：PHI 只合并已证明可行的入边；遇到 Bottom 可提前停止，因为
@@ -298,7 +305,32 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     Value* lhsConst = LV_LHS.isConstant() ? LV_LHS.getConstantValue() : nullptr;
     Value* rhsConst = LV_RHS.isConstant() ? LV_RHS.getConstantValue() : nullptr;
     const auto op = BI->getOp();
-    const bool IsFloat = IRType::isFloat(BI->getIRType());
+    // 比较指令的结果可能是 i1 或 <N x i1>，数值语义必须由操作数的标量
+    // 元素类型决定；这样 <N x float> 不会误走整数的“乘零/模一”规则。
+    const auto ScalarOperandType =
+        IRType::getScalarElementType(LHS->getIRType());
+    const bool IsFloat =
+        ScalarOperandType && ScalarOperandType->isFloat();
+    const bool IsVector =
+        LHS->getIRType() && LHS->getIRType()->isVector();
+    // SCCP 的 Bottom 不区分普通运行时值与 poison 来源；额外沿 use-def
+    // 检查后，只禁止会把风险值硬化为常量的吸收/相消规则。单位元规则
+    // 原样传播原操作数，仍然可以安全使用。
+    int LHSRiskState = -1;
+    int RHSRiskState = -1;
+    auto lhsMayBeUndefined = [&]() {
+        if (LHSRiskState < 0)
+            LHSRiskState = valueMayDependOnUndefOrPoison(LHS) ? 1 : 0;
+        return LHSRiskState != 0;
+    };
+    auto rhsMayBeUndefined = [&]() {
+        if (RHSRiskState < 0)
+            RHSRiskState = valueMayDependOnUndefOrPoison(RHS) ? 1 : 0;
+        return RHSRiskState != 0;
+    };
+    auto mayHardenUndefinedValue = [&]() {
+        return lhsMayBeUndefined() || rhsMayBeUndefined();
+    };
     auto isNegativeFloatZero = [](Value *V) {
         float F = 0.0f;
         return V && Value::tryGetFloatConst(V, F) && F == 0.0f &&
@@ -333,9 +365,10 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         break;
     case BinaryInst::MUL:
         //仅整数乘零可直接归零；浮点零与 Inf/NaN 的组合不能这样折叠。
-        if (!IsFloat &&
+        if (!IsFloat && !IsVector &&
             ((lhsConst && lhsConst->isConstZero()) ||
-             (rhsConst && rhsConst->isConstZero()))) {
+             (rhsConst && rhsConst->isConstZero())) &&
+            !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
@@ -362,20 +395,24 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         break;
     case BinaryInst::MOD:
         //有符号整数模一恒为零；浮点余数不适用。
-        if (!IsFloat && rhsConst && rhsConst->isConstOne()) {
+        if (!IsFloat && !IsVector && rhsConst &&
+            rhsConst->isConstOne() && !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
         break;
     case BinaryInst::UREM:
-        if (rhsConst && rhsConst->isConstOne()) {
+        if (!IsVector && rhsConst && rhsConst->isConstOne() &&
+            !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
         break;
     case BinaryInst::AND:
-        if ((lhsConst && lhsConst->isConstZero()) ||
-            (rhsConst && rhsConst->isConstZero())) {
+        if (!IsVector &&
+            ((lhsConst && lhsConst->isConstZero()) ||
+             (rhsConst && rhsConst->isConstZero())) &&
+            !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }

@@ -41,7 +41,9 @@ enum class TargetStaticAddressKind {
     Unknown,
 };
 
-// TargetCostInfo是轻量、只读的 RV64GC 目标代价视图。
+// TargetCostInfo是轻量、只读的 RV64 目标代价视图；固定 SIMD 关闭时
+// 保持原 RV64GC 模型，开启时只为明确白名单中的 i32/float 向量操作
+// 提供保守成本。
 class TargetCostInfo {
 public:
     // InvalidCost表示当前目标无法直接合法化该IR操作。
@@ -86,6 +88,11 @@ public:
         TargetMemoryOperation Operation, const IRType *Type,
         std::size_t Alignment = 0, bool IsVolatile = false,
         TargetCostKind Kind = TargetCostKind::Throughput) const;
+    // 固定向量常量在循环外物化一次；非 splat 常量在常量池支持明确前
+    // 返回 InvalidCost。
+    int getVectorConstantCost(
+        const ConstantVector *Constant,
+        TargetCostKind Kind = TargetCostKind::Throughput) const;
 
     // 静态地址查询按地址来源建模；Value重载复用IR统一的底层对象接口。
     int getStaticAddressCost(
@@ -119,7 +126,7 @@ public:
         const CallInst *Call,
         TargetCostKind Kind = TargetCostKind::Throughput) const;
 
-    // RV64GC不含V扩展，因此固定向量IR在该模型下明确判为不合法。
+    // 固定向量合法性由 TargetInfo 的统一 SIMD 模式决定。
     bool isLegalVectorType(const IRType *Type) const;
     unsigned getNativeVectorBitWidth() const noexcept;
 
@@ -145,6 +152,10 @@ private:
     static bool isIntegerArithmeticOpcode(Instruction::InstType Opcode);
     static unsigned getScalarIntegerBitWidth(const IRType *Type);
     static TargetStaticAddressKind classifyStaticAddress(const Value *Base);
+    int getFixedVectorArithmeticCost(
+        Instruction::InstType Opcode, const IRType *Type,
+        TargetCostKind Kind) const;
+    unsigned getFixedVectorCostScale(const IRType *Type) const noexcept;
     int getRISCV64ImmediateCost(std::int64_t Value,
                                unsigned BitWidth) const;
 };

@@ -1,8 +1,11 @@
 #pragma once
+#include <cstddef>
+#include <list>
+#include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
-#include <list>
 
 //SysY类型
 enum Type{
@@ -29,6 +32,137 @@ enum Type{
 
     SY_ASSIGN
 };
+
+// AST 层的规范化源码类型。具体词法/文法无论采用 int4、float4、
+// vector<int, 4> 或其他拼写，均应在 parser action 中归一化为该类型。
+// 显式保存种类而不以 lanes == 1 推断标量，从而保留 <1 x T>。
+enum class ASTScalarKind {
+    Invalid,
+    Int32,
+    Float32,
+    Void,
+};
+
+enum class ASTTypeKind {
+    Invalid,
+    Scalar,
+    FixedVector,
+};
+
+class ASTType {
+private:
+    ASTTypeKind kind;
+    ASTScalarKind scalarKind;
+    std::size_t laneCount;
+
+    ASTType(ASTTypeKind typeKind, ASTScalarKind elementKind,
+            std::size_t lanes);
+
+public:
+    ASTType();
+    explicit ASTType(Type legacyType);
+
+    static ASTType makeScalar(ASTScalarKind scalarKind);
+    static ASTType makeFixedVector(ASTScalarKind elementKind,
+                                   std::size_t lanes);
+    static ASTType makeFixedVector(Type legacyElementType,
+                                   std::size_t lanes);
+
+    ASTTypeKind getKind() const;
+    ASTScalarKind getScalarKind() const;
+    std::size_t getLaneCount() const;
+    bool isValid() const;
+    bool isScalar() const;
+    bool isFixedVector() const;
+    bool isVoid() const;
+};
+
+inline ASTType::ASTType(ASTTypeKind typeKind,
+                        ASTScalarKind elementKind,
+                        std::size_t lanes)
+    : kind(typeKind), scalarKind(elementKind), laneCount(lanes) {}
+
+inline ASTType::ASTType()
+    : kind(ASTTypeKind::Invalid), scalarKind(ASTScalarKind::Invalid),
+      laneCount(0) {}
+
+inline ASTType::ASTType(Type legacyType) : ASTType() {
+    switch (legacyType) {
+    case SY_INT:
+        *this = makeScalar(ASTScalarKind::Int32);
+        break;
+    case SY_FLOAT:
+        *this = makeScalar(ASTScalarKind::Float32);
+        break;
+    case SY_VOID:
+        *this = makeScalar(ASTScalarKind::Void);
+        break;
+    default:
+        break;
+    }
+}
+
+inline ASTType ASTType::makeScalar(ASTScalarKind scalarKind) {
+    if (scalarKind != ASTScalarKind::Int32 &&
+        scalarKind != ASTScalarKind::Float32 &&
+        scalarKind != ASTScalarKind::Void) {
+        return ASTType();
+    }
+    return ASTType(ASTTypeKind::Scalar, scalarKind, 1);
+}
+
+inline ASTType ASTType::makeFixedVector(ASTScalarKind elementKind,
+                                        std::size_t lanes) {
+    if (lanes == 0 ||
+        lanes >
+            (std::numeric_limits<std::size_t>::max() - 7U) / 32U ||
+        (elementKind != ASTScalarKind::Int32 &&
+         elementKind != ASTScalarKind::Float32)) {
+        return ASTType();
+    }
+    return ASTType(ASTTypeKind::FixedVector, elementKind, lanes);
+}
+
+inline ASTType ASTType::makeFixedVector(Type legacyElementType,
+                                        std::size_t lanes) {
+    const ASTType scalar(legacyElementType);
+    if (!scalar.isScalar() || scalar.isVoid())
+        return ASTType();
+    return makeFixedVector(scalar.getScalarKind(), lanes);
+}
+
+inline ASTTypeKind ASTType::getKind() const { return kind; }
+
+inline ASTScalarKind ASTType::getScalarKind() const { return scalarKind; }
+
+inline std::size_t ASTType::getLaneCount() const { return laneCount; }
+
+inline bool ASTType::isValid() const {
+    if (kind == ASTTypeKind::Scalar)
+        return laneCount == 1 &&
+               (scalarKind == ASTScalarKind::Int32 ||
+                scalarKind == ASTScalarKind::Float32 ||
+                scalarKind == ASTScalarKind::Void);
+    if (kind == ASTTypeKind::FixedVector)
+        return laneCount != 0 &&
+               laneCount <=
+                   (std::numeric_limits<std::size_t>::max() - 7U) / 32U &&
+               (scalarKind == ASTScalarKind::Int32 ||
+                scalarKind == ASTScalarKind::Float32);
+    return false;
+}
+
+inline bool ASTType::isScalar() const {
+    return kind == ASTTypeKind::Scalar;
+}
+
+inline bool ASTType::isFixedVector() const {
+    return kind == ASTTypeKind::FixedVector;
+}
+
+inline bool ASTType::isVoid() const {
+    return isScalar() && scalarKind == ASTScalarKind::Void;
+}
 
 // 前向声明用于解除节点之间的声明顺序依赖。
 class ConstDefList;
@@ -138,23 +272,25 @@ public:
 // 常量声明可作为编译单元或块项。
 class ConstDecl : public BaseAST{
   private:
-    Type type;
+    ASTType type;
     std::unique_ptr<ConstDefList> defList;
   public:
-    ConstDecl(Type t,ConstDefList* d): type(t), defList(std::unique_ptr<ConstDefList>(d)) {}
+    ConstDecl(Type t,ConstDefList* d): ConstDecl(ASTType(t), d) {}
+    ConstDecl(ASTType t,ConstDefList* d): type(t), defList(std::unique_ptr<ConstDefList>(d)) {}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    Type getType() const {return type;}
+    const ASTType& getType() const {return type;}
     const std::unique_ptr<ConstDefList>& getConstDefList() const{ return defList; }
 };
 // 变量声明持有同一基础类型下的全部变量定义。
 class VarDecl : public BaseAST{
   private:
-    Type type;
+    ASTType type;
     std::unique_ptr<VarDefList>defList;
   public:
-    VarDecl(Type t,VarDefList* d): type(t), defList(std::unique_ptr<VarDefList>(d)) {}
+    VarDecl(Type t,VarDefList* d): VarDecl(ASTType(t), d) {}
+    VarDecl(ASTType t,VarDefList* d): type(t), defList(std::unique_ptr<VarDefList>(d)) {}
     void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
-    Type getType() const {return type;}
+    const ASTType& getType() const {return type;}
     const std::unique_ptr<VarDefList>& getVarDefList() const{ return defList; }
 
 };
@@ -215,15 +351,16 @@ public:
 // 函数定义独占形参列表和函数体；无形参时 params 为空。
 class FuncDef : public BaseAST{
   private:
-  Type type;
+  ASTType type;
   std::string ident;
   std::unique_ptr<FuncParamList> params;
   std::unique_ptr<Block> funcBody;
   public:
-  FuncDef(Type t,std::string id,FuncParamList* p,Block* b):type(t),ident(id),params(std::unique_ptr<FuncParamList>(p)),funcBody(std::unique_ptr<Block>(b)){}
+  FuncDef(Type t,std::string id,FuncParamList* p,Block* b):FuncDef(ASTType(t),std::move(id),p,b){}
+  FuncDef(ASTType t,std::string id,FuncParamList* p,Block* b):type(t),ident(std::move(id)),params(std::unique_ptr<FuncParamList>(p)),funcBody(std::unique_ptr<Block>(b)){}
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-   Type getType() const { return type; }
+   const ASTType& getType() const { return type; }
    const std::string& getIdent() const { return ident; }
    const std::unique_ptr<FuncParamList>& getParams() const { return params; }
    const std::unique_ptr<Block>& getFuncBody() const { return funcBody; }
@@ -231,27 +368,33 @@ class FuncDef : public BaseAST{
 // 函数形参记录首个空维度和后续显式维度，供数组形参类型降级使用。
 class FuncParam : public BaseAST{
 private:
-  Type type;
+  ASTType type;
   std::string ident;
   bool hasEmptyBracketsFlag;
   std::unique_ptr<ArrayList> dimensionList;
 public:
   // 普通标量形参：Type IDENT。
   FuncParam(Type t, std::string id):
-      type(t), ident(id), hasEmptyBracketsFlag(false), dimensionList(nullptr) {}
+      FuncParam(ASTType(t), std::move(id)) {}
+  FuncParam(ASTType t, std::string id):
+      type(t), ident(std::move(id)), hasEmptyBracketsFlag(false), dimensionList(nullptr) {}
 
   // 省略首维的数组形参：Type IDENT []。
   FuncParam(Type t, std::string id, bool hasEmptyBrackets):
-      type(t), ident(id), hasEmptyBracketsFlag(hasEmptyBrackets), dimensionList(nullptr) {}
+      FuncParam(ASTType(t), std::move(id), hasEmptyBrackets) {}
+  FuncParam(ASTType t, std::string id, bool hasEmptyBrackets):
+      type(t), ident(std::move(id)), hasEmptyBracketsFlag(hasEmptyBrackets), dimensionList(nullptr) {}
 
   // 带后续维度的数组形参：Type IDENT [][Exp]...。
   FuncParam(Type t, std::string id, bool hasEmptyBrackets, ArrayList* dimList):
-      type(t), ident(id), hasEmptyBracketsFlag(hasEmptyBrackets),
+      FuncParam(ASTType(t), std::move(id), hasEmptyBrackets, dimList) {}
+  FuncParam(ASTType t, std::string id, bool hasEmptyBrackets, ArrayList* dimList):
+      type(t), ident(std::move(id)), hasEmptyBracketsFlag(hasEmptyBrackets),
       dimensionList(std::unique_ptr<ArrayList>(dimList)) {}
 
   void accept(ASTVisitor &visitor) override { visitor.visit(*this); }
 
-  Type getType() const { return type; }
+  const ASTType& getType() const { return type; }
   const std::string& getIdent() const { return ident; }
   bool hasEmptyBrackets() const { return hasEmptyBracketsFlag; }
   bool hasDimension() const { return dimensionList != nullptr; }

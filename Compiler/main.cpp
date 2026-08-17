@@ -55,6 +55,11 @@ int main(int argc, const char *argv[]) {
     //默认中端优化等级为O1
     OptimizationLevel OptLevel = OptimizationLevel::O1;
 
+    // 固定宽度自动向量化的唯一开关：
+    // Disabled：关闭；SIMD64：VF2；SIMD128：VF4；
+    // SIMD64And128：优先 VF4，并在合法时回退 VF2。
+    TargetInfo::get().setFixedSIMDMode(FixedSIMDMode::Disabled);
+
     //读取源文件->词法分析->语法分析->生成AST
     yyin = fopen(inputPath.c_str(), "r");
     if (!yyin) {
@@ -96,4 +101,5 @@ int main(int argc, const char *argv[]) {
         return 1;
     }
     return 0;
+
 }

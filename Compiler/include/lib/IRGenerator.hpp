@@ -31,16 +31,22 @@ private:
         ArrayElement,
     };
 
-    // 左值解析后统一返回值或地址 + 源码对象类型
-    // isAddress 为 true 时，读取标量右值需要生成 load；数组地址则需要退化
+    // 左值解析后统一返回值或地址 + 源码对象类型。
+    // isAddress 为 true 时，读取 first-class value 需生成 load；
+    // 数组地址需要退化，向量 lane 则在整向量 load 后 extract。
     struct ResolvedLValue {
         Value* value = nullptr;
         std::shared_ptr<IRType> type;
         bool isAddress = false;
         bool isMutable = false;
+        Value* vectorIndex = nullptr;
+        std::shared_ptr<VECTORType> vectorType;
+
+        bool isVectorLane() const;
     };
 
-    TypeSystem lowerSourceType(Type type, bool allowVoid = false) const;
+    std::shared_ptr<IRType> lowerSourceType(
+        const ASTType& type, bool allowVoid = false) const;
     bool isConstantPrimary(const BaseAST& node) const;
     bool isConstantExpression(const UnaryExp& node) const;
     template <typename OperandT>
@@ -49,7 +55,8 @@ private:
 
     // 根据声明所处位置、常量属性和数组形状生成对象及其初始化指令。
     template <typename DefinitionT>
-    void lowerDefinition(DefinitionT& node, TypeSystem declaredType,
+    void lowerDefinition(DefinitionT& node,
+                         const std::shared_ptr<IRType>& declaredType,
                          bool isConstant);
     void lowerParameter(FuncParam& node);
     std::shared_ptr<IRType> lowerArrayType(
@@ -60,9 +67,12 @@ private:
                             const std::shared_ptr<IRType>& expectedType,
                             InitializerRole role =
                                 InitializerRole::CompleteObject);
-    Initializer* lowerInitializerList(
+    Value* lowerInitializerList(
         const InitValList& node,
         const std::shared_ptr<IRType>& expectedType);
+    Value* lowerVectorInitializerList(
+        const InitValList& node,
+        const std::shared_ptr<VECTORType>& expectedType);
     std::shared_ptr<IRType> initializerLeafType(
         std::shared_ptr<IRType> type) const;
     std::size_t initializerLeafCount(
@@ -81,6 +91,13 @@ private:
     Value* tryLowerConstantArrayElement(
         const SymbolTable::ObjectBinding& binding,
         const std::vector<Value*>& indices);
+    bool classifyIndexedAccess(
+        const std::shared_ptr<IRType>& rootType,
+        bool isArrayParameter,
+        const std::vector<Value*>& indices,
+        std::vector<Value*>& aggregateIndices,
+        std::shared_ptr<IRType>& selectedType,
+        Value*& vectorIndex) const;
 
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
     Value* lowerPrimary(const BaseAST& node);

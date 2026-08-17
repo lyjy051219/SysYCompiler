@@ -157,21 +157,59 @@ std::size_t DataLayout::getTypeAlign(const IRType *Type) const {
 }
 
 unsigned DataLayout::getNativeVectorBitWidth() const noexcept {
-    // 当前 RV64GC 不含 V 扩展。
+    switch (TargetInfo::get().getFixedSIMDMode()) {
+    case FixedSIMDMode::SIMD64:
+        return 64;
+    case FixedSIMDMode::SIMD128:
+    case FixedSIMDMode::SIMD64And128:
+        // 同时支持两种宽度时，以 128 位作为首选宽度，向量化器仍可
+        // 在合法性或循环次数要求下回退到 64 位。
+        return 128;
+    case FixedSIMDMode::Disabled:
+        return 0;
+    }
     return 0;
 }
 
 bool DataLayout::supportsNativeVectorType(const IRType *Type) const {
-    (void)Type;
-    return false;
+    const auto *Vector = dynamic_cast<const VECTORType *>(Type);
+    if (!Vector || !Vector->getElementType())
+        return false;
+
+    const FixedSIMDMode Mode = TargetInfo::get().getFixedSIMDMode();
+    const std::size_t Lanes = Vector->getElementCount();
+    const bool LegalLaneCount =
+        (Mode == FixedSIMDMode::SIMD64 && Lanes == 2) ||
+        (Mode == FixedSIMDMode::SIMD128 && Lanes == 4) ||
+        (Mode == FixedSIMDMode::SIMD64And128 &&
+         (Lanes == 2 || Lanes == 4));
+    if (!LegalLaneCount)
+        return false;
+
+    const auto &ElementType = Vector->getElementType();
+    // i1 只作为 compare/select 的内部 mask 合法；向量内存成本会另外拒绝
+    // mask load/store，避免把逻辑掩码误当作按位紧密存储的数据向量。
+    return ElementType->isFloat() ||
+           (ElementType->isInt() &&
+            (ElementType->hasIntegerBitWidth(1) ||
+             ElementType->hasIntegerBitWidth(32)));
 }
 
 TargetInfo::TargetInfo()
-    : Layout(DataLayout::forTarget()) {}
+    : Layout(DataLayout::forTarget()),
+      SIMDMode(FixedSIMDMode::Disabled) {}
 
 TargetInfo &TargetInfo::get() {
     static TargetInfo Instance;
     return Instance;
+}
+
+void TargetInfo::setFixedSIMDMode(FixedSIMDMode Mode) noexcept {
+    SIMDMode = Mode;
+}
+
+FixedSIMDMode TargetInfo::getFixedSIMDMode() const noexcept {
+    return SIMDMode;
 }
 
 TargetABI TargetInfo::getABI() const noexcept {

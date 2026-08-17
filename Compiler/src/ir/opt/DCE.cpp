@@ -162,6 +162,14 @@ bool valueMayDependOnUndef(
 		if (!Current || Value::isUndef(Current)) return true;
 		if (!Seen.insert(Current).second) continue;
 		if (Seen.size() > MaxVisitedValues) return true;
+		if (auto *Vector =
+				dynamic_cast<const ConstantVector *>(Current)) {
+			// ConstantVector 不通过 Use 保存 lane；显式检查每个元素，避免同一
+			// 含 undef 常量向量的自比较被误认为完全已定义。
+			for (ConstantSystem *Element : Vector->getElements())
+				if (!Element || Value::isUndef(Element)) return true;
+			continue;
+		}
 		auto *I = dynamic_cast<const Instruction *>(Current);
 		if (!I) continue;
 		for (std::size_t Index = 0;
@@ -185,6 +193,9 @@ bool dceInstructionMustBePreserved(Instruction *I) {
 		case Instruction::STORE:
 		case Instruction::LOAD:
 		case Instruction::GEP:
+		case Instruction::EXTRACTELEMENT:
+		case Instruction::INSERTELEMENT:
+		case Instruction::SHUFFLEVECTOR:
 		case Instruction::ADD:
 		case Instruction::FADD:
 		case Instruction::SUB:
@@ -226,6 +237,40 @@ bool instructionMayFaultOrProducePoison(const Instruction *I) {
 	if (!I) return true;
 	if (dynamic_cast<const LoadInst *>(I)) return true;
 	switch (I->instType) {
+		case Instruction::EXTRACTELEMENT:
+		case Instruction::INSERTELEMENT:
+		{
+			// 动态或越界 lane 索引可能产生 poison。竞赛模式不依赖这种
+			// 未定义行为删除计算，只放行已经证明位于固定向量范围内的索引。
+			Value *Vector = nullptr;
+			Value *Index = nullptr;
+			if (auto *Extract =
+					dynamic_cast<const ExtractElementInst *>(I)) {
+				Vector = Extract->getVectorOperand();
+				Index = Extract->getIndexOperand();
+			} else if (auto *Insert =
+					   dynamic_cast<const InsertElementInst *>(I)) {
+				Vector = Insert->getVectorOperand();
+				Index = Insert->getIndexOperand();
+			}
+			auto VectorType =
+				Vector ? IRType::asVector(Vector->getIRType()) : nullptr;
+			int64_t Lane = 0;
+			return !VectorType || !Index ||
+				!Index->tryGetInt64Const(Lane) || Lane < 0 ||
+				static_cast<std::size_t>(Lane) >=
+					VectorType->getElementCount();
+		}
+		case Instruction::SHUFFLEVECTOR:
+		{
+			// 构造器已经校验非负 mask 的范围；-1 表示 poison lane，只有
+			// mask 全部确定时才把无用户 shuffle 视作可安全删除的纯计算。
+			auto *Shuffle = dynamic_cast<const ShuffleVectorInst *>(I);
+			if (!Shuffle) return true;
+			for (int Lane : Shuffle->getMask())
+				if (Lane < 0) return true;
+			return false;
+		}
 		case Instruction::SDIV:
 		case Instruction::SREM:
 		case Instruction::UDIV:
@@ -261,6 +306,39 @@ bool instructionMayFaultOrProducePoison(const Instruction *I) {
 		default:
 			return false;
 	}
+}
+
+//有界反向检查值是否可能依赖 undef 或 poison；普通 load 的潜在故障由
+//DCE 单独保留，但它的结果本身不因此被当作 poison。
+bool valueMayDependOnUndefOrPoison(
+	const Value *V, std::size_t MaxVisitedValues) {
+	if (valueMayDependOnUndef(V, MaxVisitedValues)) return true;
+	if (!V || MaxVisitedValues == 0) return true;
+	std::vector<const Value *> WorkList{V};
+	std::unordered_set<const Value *> Seen;
+	while (!WorkList.empty()) {
+		const Value *Current = WorkList.back();
+		WorkList.pop_back();
+		if (!Current || !Seen.insert(Current).second) continue;
+		if (Seen.size() > MaxVisitedValues) return true;
+		auto *I = dynamic_cast<const Instruction *>(Current);
+		if (!I) continue;
+		// inbounds GEP 越出底层对象时产生 poison。这里把它作为值依赖风险，
+		// 但不改变 DCE 对无用户地址计算的既有删除策略。
+		if (auto *GEP = dynamic_cast<const GetElementPtrInst *>(I);
+			GEP && GEP->isInBounds())
+			return true;
+		if (!dynamic_cast<const LoadInst *>(I) &&
+			instructionMayFaultOrProducePoison(I))
+			return true;
+		for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
+			Value *Operand = I->getOperand(Index);
+			if (!Operand) return true;
+			if (dynamic_cast<Instruction *>(Operand))
+				WorkList.push_back(Operand);
+		}
+	}
+	return false;
 }
 //判断调用是否具有可观察副作用或无法证明必然返回。
 bool dceCallHasSideEffect(CallInst* CI, FunctionAnalysisPassManager& FAM) {

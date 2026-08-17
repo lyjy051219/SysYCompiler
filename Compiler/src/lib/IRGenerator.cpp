@@ -6,18 +6,35 @@
 
 extern std::unique_ptr<Module> ModuleIR;
 
-//核心接口1：SysY类型->IR类型
-TypeSystem IRGenerator::lowerSourceType(Type type, bool allowVoid) const {
-    switch (type) {
-    case SY_INT:
-        return IR_INT;
-    case SY_FLOAT:
-        return IR_FLOAT;
-    case SY_VOID:
-        return allowVoid ? IR_VOID : IR_UNDEF;
+bool IRGenerator::ResolvedLValue::isVectorLane() const {
+    return vectorIndex != nullptr && vectorType != nullptr;
+}
+
+//核心接口1：已归一化的 AST 类型 -> IR 类型。
+std::shared_ptr<IRType> IRGenerator::lowerSourceType(
+    const ASTType& type, bool allowVoid) const {
+    if (!type.isValid())
+        return nullptr;
+
+    std::shared_ptr<IRType> elementType;
+    switch (type.getScalarKind()) {
+    case ASTScalarKind::Int32:
+        elementType = INTType::getInt32Ty();
+        break;
+    case ASTScalarKind::Float32:
+        elementType = FLOATType::NewFloat();
+        break;
+    case ASTScalarKind::Void:
+        if (!type.isScalar() || !allowVoid)
+            return nullptr;
+        return VOIDType::NewVoid();
     default:
-        return IR_UNDEF;
+        return nullptr;
     }
+
+    if (type.isFixedVector())
+        return VECTORType::NewVector(elementType, type.getLaneCount());
+    return type.isScalar() ? elementType : nullptr;
 }
 
 bool IRGenerator::isConstantPrimary(const BaseAST& node) const {
@@ -41,22 +58,34 @@ bool IRGenerator::isConstantPrimary(const BaseAST& node) const {
     if (binding == nullptr)
         return false;
 
-    if (binding->kind == SymbolTable::ObjectKind::Constant)
-        return !lvalue->hasArray();
+    if (binding->kind == SymbolTable::ObjectKind::Constant) {
+        if (!lvalue->hasArray())
+            return true;
+        const auto vectorType = IRType::asVector(binding->type);
+        const auto& indices = lvalue->getArray()->getExpressions();
+        return vectorType != nullptr && indices.size() == 1 &&
+               isConstantExpression(*indices.front());
+    }
     if (binding->isMutable || binding->constantInitializer == nullptr ||
         binding->type == nullptr || !lvalue->hasArray()) {
         return false;
     }
 
-    std::size_t rank = 0;
+    std::size_t arrayRank = 0;
+    auto indexedType = binding->type;
     for (auto type = binding->type;
          type != nullptr && type->getTypeSystem() == IR_ARRAY;) {
-        ++rank;
+        ++arrayRank;
         type = std::dynamic_pointer_cast<ARRAYType>(type)->getElementType();
+        indexedType = type;
     }
+    const bool hasVectorLeaf =
+        indexedType != nullptr && indexedType->isVector();
     const auto& indices = lvalue->getArray()->getExpressions();
-    if (indices.size() != rank)
+    if (indices.size() != arrayRank &&
+        (!hasVectorLeaf || indices.size() != arrayRank + 1)) {
         return false;
+    }
     for (const auto& index : indices) {
         if (!isConstantExpression(*index))
             return false;
@@ -115,6 +144,8 @@ Value* IRGenerator::zeroValue(const std::shared_ptr<IRType>& type) const {
         return ConstPtr::newConstPtr(type);
     case IR_ARRAY:
         return new Initializer(type);
+    case IR_VECTOR:
+        return Value::makeZeroForType(type);
     default:
         return nullptr;
     }
@@ -125,6 +156,10 @@ Value* IRGenerator::toCondition(Value* value) {
         return nullptr;
     const auto type = value->getIRType();
     if (type == nullptr)
+        return nullptr;
+    // SysY2026 尚未定义向量条件是 any、all 还是禁止。
+    // 在规范公布前不将 <N x i1> 误传给标量 br。
+    if (type->isVector())
         return nullptr;
 
     if (auto integerType = std::dynamic_pointer_cast<INTType>(type);
@@ -192,13 +227,52 @@ Value* IRGenerator::emitBinary(Value* left,
     if (leftType == nullptr || rightType == nullptr)
         return nullptr;
 
-    if (operation == BinaryInst::MOD &&
-        (leftType->getTypeSystem() != IR_INT ||
-         rightType->getTypeSystem() != IR_INT)) {
-        return UndefValue::NewUndefValue(INTType::getInt32Ty());
-    }
+    if (leftType->isVector() || rightType->isVector()) {
+        const auto leftVector = IRType::asVector(leftType);
+        const auto rightVector = IRType::asVector(rightType);
+        if (leftVector == nullptr || rightVector == nullptr ||
+            leftVector->getElementCount() != rightVector->getElementCount()) {
+            return nullptr;
+        }
 
-    if (IRType::isScalar(leftType) && IRType::isScalar(rightType)) {
+        const auto leftElement = leftVector->getElementType();
+        const auto rightElement = rightVector->getElementType();
+        if (leftElement == nullptr || rightElement == nullptr)
+            return nullptr;
+
+        if (operation == BinaryInst::MOD &&
+            (!leftElement->isInt() || !rightElement->isInt())) {
+            return UndefValue::NewUndefValue(leftType);
+        }
+
+        const bool useFloatingPoint =
+            !BinaryInst::isIntegerOnlyOp(operation) &&
+            operation != BinaryInst::MOD &&
+            (leftElement->isFloat() || rightElement->isFloat());
+        std::shared_ptr<IRType> commonElementType;
+        if (useFloatingPoint) {
+            commonElementType = FLOATType::NewFloat();
+        } else {
+            const auto leftInteger =
+                std::dynamic_pointer_cast<INTType>(leftElement);
+            const auto rightInteger =
+                std::dynamic_pointer_cast<INTType>(rightElement);
+            if (leftInteger == nullptr || rightInteger == nullptr)
+                return nullptr;
+            commonElementType = INTType::get(std::max(
+                leftInteger->getBitWidth(), rightInteger->getBitWidth()));
+        }
+        const auto commonType = VECTORType::NewVector(
+            commonElementType, leftVector->getElementCount());
+        left = BasicBlock::coerceValueToTypeWithoutBitCast(
+            currentBlock, left, commonType);
+        right = BasicBlock::coerceValueToTypeWithoutBitCast(
+            currentBlock, right, commonType);
+    } else if (operation == BinaryInst::MOD &&
+               (leftType->getTypeSystem() != IR_INT ||
+                rightType->getTypeSystem() != IR_INT)) {
+        return UndefValue::NewUndefValue(INTType::getInt32Ty());
+    } else if (IRType::isScalar(leftType) && IRType::isScalar(rightType)) {
         const bool useFloatingPoint =
             !BinaryInst::isIntegerOnlyOp(operation) &&
             (leftType->getTypeSystem() == IR_FLOAT ||
@@ -518,7 +592,7 @@ void IRGenerator::lowerParameter(FuncParam& node) {
     }
 
     std::shared_ptr<IRType> parameterType =
-        IRType::NewTypeByTypeSystem(lowerSourceType(node.getType()));
+        lowerSourceType(node.getType());
     if (parameterType == nullptr)
         return;
 
@@ -619,8 +693,11 @@ Value* IRGenerator::lowerInitializer(
     return zeroValue(expectedType);
 }
 
-Initializer* IRGenerator::lowerInitializerList(
+Value* IRGenerator::lowerInitializerList(
     const InitValList& node, const std::shared_ptr<IRType>& expectedType) {
+    if (const auto vectorType = IRType::asVector(expectedType))
+        return lowerVectorInitializerList(node, vectorType);
+
     auto arrayType = std::dynamic_pointer_cast<ARRAYType>(expectedType);
     if (arrayType == nullptr)
         return nullptr;
@@ -713,6 +790,67 @@ Initializer* IRGenerator::lowerInitializerList(
     return result;
 }
 
+Value* IRGenerator::lowerVectorInitializerList(
+    const InitValList& node,
+    const std::shared_ptr<VECTORType>& expectedType) {
+    if (expectedType == nullptr || expectedType->getElementType() == nullptr)
+        return nullptr;
+    const auto& initializers = node.getInitVals();
+    if (initializers.size() > expectedType->getElementCount())
+        return nullptr;
+
+    std::vector<Value*> lanes;
+    lanes.reserve(expectedType->getElementCount());
+    for (const auto& initializer : initializers) {
+        if (initializer == nullptr ||
+            dynamic_cast<const InitValList*>(
+                initializer->getValue().get()) != nullptr) {
+            return nullptr;
+        }
+        Value* lane = lowerInitializer(
+            *initializer, expectedType->getElementType(),
+            InitializerRole::CompleteObject);
+        lane = BasicBlock::coerceValueToTypeWithoutBitCast(
+            currentBlock, lane, expectedType->getElementType());
+        if (lane == nullptr)
+            return nullptr;
+        lanes.push_back(lane);
+    }
+    while (lanes.size() < expectedType->getElementCount()) {
+        Value* lane = zeroValue(expectedType->getElementType());
+        if (lane == nullptr)
+            return nullptr;
+        lanes.push_back(lane);
+    }
+
+    std::vector<ConstantSystem*> constantLanes;
+    constantLanes.reserve(lanes.size());
+    for (Value* lane : lanes) {
+        auto* constant = dynamic_cast<ConstantSystem*>(lane);
+        if (constant == nullptr) {
+            constantLanes.clear();
+            break;
+        }
+        constantLanes.push_back(constant);
+    }
+    if (constantLanes.size() == lanes.size())
+        return ConstantVector::get(expectedType, constantLanes);
+    if (currentBlock == nullptr)
+        return nullptr;
+
+    Value* result = zeroValue(expectedType);
+    if (result == nullptr)
+        return nullptr;
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        result = currentBlock->genInsertElementInst(
+            result, lanes[index],
+            ConstInt::newConstInt(static_cast<std::int64_t>(index)));
+        if (result == nullptr)
+            return nullptr;
+    }
+    return result;
+}
+
 void IRGenerator::emitDynamicInitializerStores(
     Value* destination, Initializer& initializer, std::vector<int>& indices) {
     // 深度优先遍历聚合值，仅为非常量叶元素生成 GEP 和写内存指令。
@@ -772,25 +910,27 @@ void IRGenerator::emitLocalArrayInitialization(
     emitDynamicInitializerStores(destination, *aggregate, indices);
 }
 
-//核心IR生成逻辑函数1：全局/局部+标量常量/标量变量/数组常量/数组变量的IR生成（共8种情况）
+//核心IR生成逻辑函数1：全局/局部的标量、定长向量与数组对象生成。
 /*
-                  全局              局部
-标量常量       全局 constant       直接绑定常量值
-标量变量       global             alloca + 可选 store
-数组常量       constant array     alloca + 初始化
-数组变量       global array       alloca + 初始化
+                         全局                  局部
+first-class 常量       global constant       直接绑定常量值
+first-class 变量       global                alloca + 可选 store
+数组常量                constant array        alloca + 初始化
+数组变量                global array          alloca + 初始化
  */
 template <typename DefinitionT>
-void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
-                                  bool isConstant) {
+void IRGenerator::lowerDefinition(
+    DefinitionT& node, const std::shared_ptr<IRType>& declaredType,
+    bool isConstant) {
     //1.获得变量/常量名
     const std::string name = node.getIdent();
     //在创建存储前拒绝同层重定义
     if (name.empty() || symbols.containsObjectInCurrentScope(name))
         return;
 
-    //2.构造基础对象类型：标量直接使用scalarType，数组则调用lowerArrayType构造多维数组类型
-    const auto scalarType = IRType::NewTypeByTypeSystem(declaredType);
+    //2.构造基础对象类型：标量/向量直接使用声明类型，
+    // 数组则调用 lowerArrayType 逐层包装。
+    const auto scalarType = declaredType;
     if (scalarType == nullptr)
         return;
 
@@ -805,6 +945,16 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
     if (hasInitializer && (isConstant || currentFunction == nullptr) &&
         !isConstantInitializerSyntax(*node.getInitVal())) {
         hasInitializer = false;
+    }
+
+    // 向量是 first-class value，先完整验证并生成初值，再创建
+    // 存储和符号绑定，避免过长/非法 lane 列表留下半截 IR。
+    Value* preparedVectorInitializer = nullptr;
+    if (hasInitializer && objectType->isVector()) {
+        preparedVectorInitializer = lowerInitializer(
+            *node.getInitVal(), objectType);
+        if (preparedVectorInitializer == nullptr)
+            return;
     }
 
     if (objectType->getTypeSystem() == IR_ARRAY) {
@@ -867,7 +1017,10 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
 
     if (isConstant) {
         Value* initializer = hasInitializer
-                                 ? lowerInitializer(*node.getInitVal(), objectType)
+                                 ? (preparedVectorInitializer != nullptr
+                                        ? preparedVectorInitializer
+                                        : lowerInitializer(
+                                              *node.getInitVal(), objectType))
                                  : zeroValue(objectType);
         initializer = BasicBlock::coerceValueToTypeWithoutBitCast(
             currentBlock, initializer, objectType);
@@ -880,7 +1033,7 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             global->setIdent(".C." + name);
             global->addUse(initializer);
         }
-        // 标量常量按值绑定，后续表达式无需生成内存读取指令。
+        // first-class 常量按值绑定，后续表达式无需生成内存读取。
         (void)symbols.declareObject(
             name, SymbolTable::ObjectBinding{
                       SymbolTable::ObjectKind::Constant, initializer,
@@ -901,8 +1054,10 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             return;
         }
         if (hasInitializer) {
-            Value* initializer = lowerInitializer(
-                *node.getInitVal(), objectType);
+            Value* initializer = preparedVectorInitializer != nullptr
+                                     ? preparedVectorInitializer
+                                     : lowerInitializer(
+                                           *node.getInitVal(), objectType);
             Value* converted =
                 BasicBlock::coerceValueToTypeWithoutBitCast(
                     currentBlock, initializer, objectType);
@@ -918,8 +1073,10 @@ void IRGenerator::lowerDefinition(DefinitionT& node, TypeSystem declaredType,
             return;
         }
         if (hasInitializer) {
-            Value* initializer = lowerInitializer(
-                *node.getInitVal(), objectType);
+            Value* initializer = preparedVectorInitializer != nullptr
+                                     ? preparedVectorInitializer
+                                     : lowerInitializer(
+                                           *node.getInitVal(), objectType);
             Value* converted =
                 BasicBlock::coerceValueToTypeWithoutBitCast(
                     currentBlock, initializer, objectType);
@@ -977,6 +1134,46 @@ Value* IRGenerator::tryLowerConstantArrayElement(
         currentBlock, currentValue, currentType);
 }
 
+bool IRGenerator::classifyIndexedAccess(
+    const std::shared_ptr<IRType>& rootType,
+    bool isArrayParameter,
+    const std::vector<Value*>& indices,
+    std::vector<Value*>& aggregateIndices,
+    std::shared_ptr<IRType>& selectedType,
+    Value*& vectorIndex) const {
+    aggregateIndices.clear();
+    selectedType = rootType;
+    vectorIndex = nullptr;
+    if (selectedType == nullptr)
+        return false;
+
+    std::size_t indexPosition = 0;
+    // 数组形参已经是指向首元素的指针，第一个下标只在
+    // 该指针序列上移动，不剥离 binding 中保存的 pointee 类型。
+    if (isArrayParameter && indexPosition < indices.size()) {
+        aggregateIndices.push_back(indices[indexPosition]);
+        ++indexPosition;
+    }
+
+    while (indexPosition < indices.size()) {
+        if (const auto arrayType =
+                std::dynamic_pointer_cast<ARRAYType>(selectedType)) {
+            aggregateIndices.push_back(indices[indexPosition]);
+            selectedType = arrayType->getElementType();
+            ++indexPosition;
+            continue;
+        }
+        if (IRType::asVector(selectedType) != nullptr &&
+            vectorIndex == nullptr) {
+            vectorIndex = indices[indexPosition];
+            ++indexPosition;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 IRGenerator::ResolvedLValue IRGenerator::lowerLValue(const LVal& node) {
     // 第一阶段解析符号和所有下标，随后按绑定种类决定返回值还是构造元素地址。
     const SymbolTable::ObjectBinding* binding =
@@ -1005,25 +1202,52 @@ IRGenerator::ResolvedLValue IRGenerator::lowerLValue(const LVal& node) {
         }
     }
 
+    const bool isArrayParameter =
+        binding->kind == SymbolTable::ObjectKind::ArrayParameter;
+    std::vector<Value*> aggregateIndices;
+    std::shared_ptr<IRType> selectedType;
+    Value* vectorIndex = nullptr;
+    if (!classifyIndexedAccess(
+            binding->type, isArrayParameter, indices,
+            aggregateIndices, selectedType, vectorIndex)) {
+        return {};
+    }
+    const auto selectedVector = IRType::asVector(selectedType);
+    if (vectorIndex != nullptr && selectedVector == nullptr)
+        return {};
+
     if (binding->kind == SymbolTable::ObjectKind::Constant) {
-        if (!indices.empty())
+        if (!aggregateIndices.empty())
             return {};
+        if (vectorIndex != nullptr) {
+            return ResolvedLValue{
+                symbol, selectedVector->getElementType(), false, false,
+                vectorIndex, selectedVector};
+        }
         return ResolvedLValue{symbol, binding->type, false, false};
     }
 
-    if (Value* constant =
-            tryLowerConstantArrayElement(*binding, indices)) {
-        return ResolvedLValue{constant, constant->getIRType(), false, false};
+    if (!aggregateIndices.empty()) {
+        if (Value* constant = tryLowerConstantArrayElement(
+                *binding, aggregateIndices)) {
+            if (vectorIndex != nullptr) {
+                return ResolvedLValue{
+                    constant, selectedVector->getElementType(), false,
+                    false, vectorIndex, selectedVector};
+            }
+            return ResolvedLValue{
+                constant, selectedType, false, false};
+        }
     }
 
     // 数组形参保存为“指针的栈槽”，先读取源码层数组指针，再按下标构造元素地址。
-    if (binding->kind == SymbolTable::ObjectKind::ArrayParameter) {
+    if (isArrayParameter) {
         if (currentBlock == nullptr)
             return {};
         Value* parameterPointer = currentBlock->genLoadInst(symbol);
         if (parameterPointer == nullptr)
             return {};
-        if (indices.empty())
+        if (aggregateIndices.empty())
             return ResolvedLValue{
                 parameterPointer,
                 binding->type,
@@ -1035,16 +1259,21 @@ IRGenerator::ResolvedLValue IRGenerator::lowerLValue(const LVal& node) {
             currentBlock->genGepInst(parameterPointer));
         if (address == nullptr)
             return {};
-        for (Value* index : indices)
+        for (Value* index : aggregateIndices)
             address->addUse(index);
         address->updateType();
-        auto resultType =
+        const auto resultType =
             std::dynamic_pointer_cast<POINTERType>(address->getIRType());
-        if (resultType == nullptr)
+        if (resultType == nullptr || resultType->getPointerType() == nullptr)
             return {};
+        if (vectorIndex != nullptr) {
+            return ResolvedLValue{
+                address, selectedVector->getElementType(), true,
+                binding->isMutable, vectorIndex, selectedVector};
+        }
         return ResolvedLValue{
             address,
-            resultType->getPointerType(),
+            selectedType,
             true,
             binding->isMutable,
         };
@@ -1052,42 +1281,33 @@ IRGenerator::ResolvedLValue IRGenerator::lowerLValue(const LVal& node) {
 
     if (binding->kind != SymbolTable::ObjectKind::Address)
         return {};
-    if (binding->type->getTypeSystem() == IR_ARRAY) {
-        if (indices.empty())
-            return ResolvedLValue{
-                symbol,
-                binding->type,
-                true,
-                binding->isMutable,
-            };
-
+    Value* address = symbol;
+    if (!aggregateIndices.empty()) {
         if (currentBlock == nullptr)
             return {};
-        auto* address = dynamic_cast<GetElementPtrInst*>(
+        auto* aggregateAddress = dynamic_cast<GetElementPtrInst*>(
             currentBlock->genGepInst(symbol));
-        if (address == nullptr)
+        if (aggregateAddress == nullptr)
             return {};
-        address->addUse(ConstInt::newConstInt(0));
-        for (Value* index : indices)
-            address->addUse(index);
-        address->updateType();
-        auto resultType =
-            std::dynamic_pointer_cast<POINTERType>(address->getIRType());
-        if (resultType == nullptr)
+        aggregateAddress->addUse(ConstInt::newConstInt(0));
+        for (Value* index : aggregateIndices)
+            aggregateAddress->addUse(index);
+        aggregateAddress->updateType();
+        const auto resultType = std::dynamic_pointer_cast<POINTERType>(
+            aggregateAddress->getIRType());
+        if (resultType == nullptr || resultType->getPointerType() == nullptr)
             return {};
-        return ResolvedLValue{
-            address,
-            resultType->getPointerType(),
-            true,
-            binding->isMutable,
-        };
+        address = aggregateAddress;
     }
 
-    if (!indices.empty())
-        return {};
+    if (vectorIndex != nullptr) {
+        return ResolvedLValue{
+            address, selectedVector->getElementType(), true,
+            binding->isMutable, vectorIndex, selectedVector};
+    }
     return ResolvedLValue{
-        symbol,
-        binding->type,
+        address,
+        selectedType,
         true,
         binding->isMutable,
     };
@@ -1119,6 +1339,33 @@ Value* IRGenerator::lowerRValue(const LVal& node) {
     ResolvedLValue reference = lowerLValue(node);
     if (reference.value == nullptr || reference.type == nullptr)
         return nullptr;
+
+    if (reference.isVectorLane()) {
+        Value* vectorValue = reference.value;
+        if (reference.isAddress) {
+            if (currentBlock == nullptr)
+                return nullptr;
+            vectorValue = currentBlock->genLoadInst(reference.value);
+        }
+        if (vectorValue == nullptr)
+            return nullptr;
+
+        std::int32_t constantIndex = 0;
+        if (auto* constantVector =
+                dynamic_cast<ConstantVector*>(vectorValue);
+            constantVector != nullptr &&
+            reference.vectorIndex->tryGetIntConst(constantIndex) &&
+            constantIndex >= 0 &&
+            static_cast<std::size_t>(constantIndex) <
+                constantVector->getNumElements()) {
+            return constantVector->getElement(
+                static_cast<std::size_t>(constantIndex));
+        }
+        if (currentBlock == nullptr)
+            return nullptr;
+        return currentBlock->genExtractElementInst(
+            vectorValue, reference.vectorIndex);
+    }
 
     if (!reference.isAddress)
         return reference.value;
@@ -1218,7 +1465,9 @@ void IRGenerator::visit(CompUnit& node) {
 }
 //IR生成2：ConstDecl全局常量/局部常量
 void IRGenerator::visit(ConstDecl& node) {
-    const TypeSystem declaredType = lowerSourceType(node.getType());
+    const auto declaredType = lowerSourceType(node.getType());
+    if (declaredType == nullptr)
+        return;
     if (node.getConstDefList() == nullptr)
         return;
     for (const auto& definition : node.getConstDefList()->getDefs())
@@ -1226,7 +1475,9 @@ void IRGenerator::visit(ConstDecl& node) {
 }
 //IR生成3：VarDecl全局变量/局部变量
 void IRGenerator::visit(VarDecl& node) {
-    const TypeSystem declaredType = lowerSourceType(node.getType());
+    const auto declaredType = lowerSourceType(node.getType());
+    if (declaredType == nullptr)
+        return;
     if (node.getVarDefList() == nullptr)
         return;
     for (const auto& definition : node.getVarDefList()->getDefs())
@@ -1247,9 +1498,17 @@ void IRGenerator::visit(FuncDef& node) {
         return;
     }
     //2.获得函数返回类型并映射
-    const TypeSystem returnType = lowerSourceType(node.getType(), true);
-    if (returnType == IR_UNDEF)
+    const auto returnType = lowerSourceType(node.getType(), true);
+    if (returnType == nullptr)
         return;
+    if (node.getParams() != nullptr) {
+        for (const auto& parameter : node.getParams()->getParams()) {
+            if (parameter == nullptr ||
+                lowerSourceType(parameter->getType()) == nullptr) {
+                return;
+            }
+        }
+    }
 
     //3.创建函数IR
     Function& function = ModuleIR->newFunction(returnType, functionName);
@@ -1343,10 +1602,25 @@ void IRGenerator::visit(AssignStmt& node) {
     //2.生成左值表达式的IR
     ResolvedLValue left = lowerLValue(*node.getLVal());
     if (right == nullptr || left.value == nullptr || left.type == nullptr ||
-        !left.isAddress || !left.isMutable ||
-        left.type->getTypeSystem() == IR_ARRAY) {
+        !left.isAddress || !left.isMutable) {
         return;
     }
+
+    if (left.isVectorLane()) {
+        Value* convertedLane =
+            BasicBlock::coerceValueToTypeWithoutBitCast(
+                currentBlock, right, left.type);
+        Value* vectorValue = currentBlock->genLoadInst(left.value);
+        if (convertedLane == nullptr || vectorValue == nullptr)
+            return;
+        Value* updatedVector = currentBlock->genInsertElementInst(
+            vectorValue, convertedLane, left.vectorIndex);
+        if (updatedVector != nullptr)
+            currentBlock->genStoreInst(updatedVector, left.value);
+        return;
+    }
+    if (left.type->getTypeSystem() == IR_ARRAY)
+        return;
     //3.类型转换，保证右值类型与左值类型一致
     Value* converted =
         BasicBlock::coerceValueToTypeWithoutBitCast(

@@ -5,6 +5,7 @@
 
 #include "riscv/AsmPrinter.hpp"
 #include "riscv/ISel.hpp"
+#include "riscv/VectorLegalize.hpp"
 #include "riscv/opt/CodeGenPrepare.hpp"
 #include "riscv/opt/MachinePassBuilder.hpp"
 #include "riscv/opt/MachinePassManager.hpp"
@@ -23,6 +24,7 @@ void emitAssembly(Module &module, std::ostream &out,
   // 指令选择：中端 IR lower 为带虚拟寄存器的 MIR
   IRLowering lowering(module);
   MachineModule machine = lowering.lowerModule();
+  legalizeAndSelectGenericVectors(machine);
 
   // 建立分析管理器并注册所有后端分析
   MachineModuleAnalysisManager MMAM;
@@ -38,6 +40,27 @@ void emitAssembly(Module &module, std::ostream &out,
 
   // 汇编打印
   AsmPrinter(out).emitModule(machine);
+}
+
+void emitGenericMachineIR(Module &module, std::ostream &out) {
+  runCodeGenPrepare(module);
+
+  IRLowering Lowering(module);
+  MachineModule Machine = Lowering.lowerModule();
+  validateGenericVectorMIR(Machine);
+
+  out << "machine_module\n";
+  for (const GlobalObject &Global : Machine.globals) {
+    out << "global @" << Global.name << " size=" << Global.size
+        << " align=" << Global.align;
+    if (Global.requiresVectorLowering) {
+      out << " vector";
+    }
+    out << '\n';
+  }
+  for (const MachineFunction &Function : Machine.functions) {
+    dumpMachineFunction(Function, out);
+  }
 }
 
 } // namespace riscv

@@ -386,6 +386,90 @@ Value *BasicBlock::coerceValueToTypeWithoutBitCast(
 
   if (SourceType == TargetType)
     return Input;
+
+  const auto SourceVector = IRType::asVector(SourceType);
+  const auto TargetVector = IRType::asVector(TargetType);
+  if (SourceVector != nullptr || TargetVector != nullptr) {
+    if (SourceVector == nullptr || TargetVector == nullptr ||
+        SourceVector->getElementCount() !=
+            TargetVector->getElementCount()) {
+      return nullptr;
+    }
+    if (Input->isUndef())
+      return UndefValue::NewUndefValue(TargetType);
+    if (SourceType->hasSameShape(*TargetType))
+      return Input;
+
+    const auto SourceElement = SourceVector->getElementType();
+    const auto TargetElement = TargetVector->getElementType();
+    if (SourceElement == nullptr || TargetElement == nullptr)
+      return nullptr;
+
+    if (auto *Constant = dynamic_cast<ConstantVector *>(Input)) {
+      std::vector<ConstantSystem *> ConvertedElements;
+      ConvertedElements.reserve(Constant->getNumElements());
+      for (ConstantSystem *Element : Constant->getElements()) {
+        Value *Converted = coerceValueToTypeWithoutBitCast(
+            nullptr, Element, TargetElement);
+        auto *ConvertedConstant =
+            dynamic_cast<ConstantSystem *>(Converted);
+        if (ConvertedConstant == nullptr)
+          return nullptr;
+        ConvertedElements.push_back(ConvertedConstant);
+      }
+      return ConstantVector::get(TargetVector, ConvertedElements);
+    }
+    if (InsertionBlock == nullptr)
+      return nullptr;
+
+    if (TargetElement->isBool()) {
+      Value *Zero = Value::makeZeroForType(SourceType);
+      return Zero == nullptr
+                 ? nullptr
+                 : BasicBlock::genBinaryInst(
+                       InsertionBlock, Input, BinaryInst::NE, Zero);
+    }
+
+    if (TargetElement->isInt()) {
+      const auto TargetInteger =
+          std::dynamic_pointer_cast<INTType>(TargetElement);
+      if (TargetInteger == nullptr)
+        return nullptr;
+      if (SourceElement->isFloat())
+        return InsertionBlock->genFPTOSIInst(Input, TargetType);
+
+      const auto SourceInteger =
+          std::dynamic_pointer_cast<INTType>(SourceElement);
+      if (SourceInteger == nullptr)
+        return nullptr;
+      if (SourceInteger->getBitWidth() < TargetInteger->getBitWidth()) {
+        if (SourceInteger->getIsBool())
+          return InsertionBlock->genZextInst(Input, TargetType);
+        return InsertionBlock->genSextInst(Input, TargetType);
+      }
+      if (SourceInteger->getBitWidth() > TargetInteger->getBitWidth())
+        return InsertionBlock->genTruncInst(Input, TargetType);
+      return Input;
+    }
+
+    if (TargetElement->isFloat() && SourceElement->isInt()) {
+      const auto SourceInteger =
+          std::dynamic_pointer_cast<INTType>(SourceElement);
+      if (SourceInteger == nullptr)
+        return nullptr;
+      if (SourceInteger->getIsBool()) {
+        const auto ExtendedType = VECTORType::NewVector(
+            INTType::getInt32Ty(), SourceVector->getElementCount());
+        Input = InsertionBlock->genZextInst(Input, ExtendedType);
+        if (Input == nullptr)
+          return nullptr;
+      }
+      return InsertionBlock->genSITOFPInst(Input, TargetType);
+    }
+    if (TargetElement->isFloat() && SourceElement->isFloat())
+      return Input;
+    return nullptr;
+  }
   if (Input->isUndef())
     return UndefValue::NewUndefValue(TargetType);
 
@@ -1263,6 +1347,25 @@ Value* BasicBlock::genBinaryInst(BasicBlock* bb, Value* left,
   if (!left || !right) return nullptr;
   if ((left->getIRType() && left->getIRType()->isVector()) ||
       (right->getIRType() && right->getIRType()->isVector())) {
+    auto *LeftVector = dynamic_cast<ConstantVector *>(left);
+    auto *RightVector = dynamic_cast<ConstantVector *>(right);
+    if (LeftVector != nullptr && RightVector != nullptr &&
+        left->getIRType()->hasSameShape(*right->getIRType()) &&
+        LeftVector->getNumElements() == RightVector->getNumElements()) {
+      std::vector<ConstantSystem *> FoldedElements;
+      FoldedElements.reserve(LeftVector->getNumElements());
+      for (std::size_t Index = 0;
+           Index < LeftVector->getNumElements(); ++Index) {
+        Value *Folded = BinaryInst::foldConstants(
+            op, LeftVector->getElement(Index),
+            RightVector->getElement(Index), true);
+        auto *FoldedConstant = dynamic_cast<ConstantSystem *>(Folded);
+        if (FoldedConstant == nullptr)
+          return nullptr;
+        FoldedElements.push_back(FoldedConstant);
+      }
+      return ConstantVector::get(FoldedElements);
+    }
     return bb ? bb->genBinaryInst(left, op, right) : nullptr;
   }
   if (left->isConst() && right->isConst()) {

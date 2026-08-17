@@ -126,6 +126,17 @@ public:
     Value *getUniqueUnderlyingObject(Value *V) const;
     //返回指针相对底层对象的常量字节偏移
     std::optional<long long> getConstantByteOffset(Value *V) const;
+    //在指定程序点证明两个同对象指针只相差一个编译期常量字节偏移
+    std::optional<long long> getConstantByteOffsetDifferenceAt(
+        Value *Pointer, Value *Reference, Instruction *Context,
+        SCEVResult &SE, RangeInfo &RI,
+        const DominatorTree &DT) const;
+    //在指定程序点查询两个内存区间，允许消费已证明不回绕的共同动态地址项
+    AliasInfo aliasAt(const MemoryLocation &L1,
+                      const MemoryLocation &L2,
+                      Instruction *Context, const LoopInfo &LI,
+                      SCEVResult &SE, RangeInfo &RI,
+                      const DominatorTree &DT);
     //返回指针底层对象的已知字节数
     std::optional<std::size_t> getObjectSize(Value *V) const;
     //返回指针至少满足的已知字节对齐

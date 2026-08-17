@@ -113,6 +113,10 @@ bool isMemoryOrderInstruction(const MachineInstr &instr) {
 
 // 各操作码的近似执行延迟（周期数），是调度关键路径与就绪时间估算的基础。
 uint32_t opcodeLatency(Opcode opcode) {
+  if (isGenericVectorOpcode(opcode)) {
+    throw BackendError(
+        "generic vector pseudo reached the post-RA scheduler");
+  }
   switch (opcode) {
   case Opcode::NOP:
     return 0;
@@ -200,8 +204,9 @@ uint32_t opcodeLatency(Opcode opcode) {
     return 1;
   case Opcode::GEP:
     return 1;
+  default:
+    return 1;
   }
-  return 1;
 }
 
 // 从操作数容器收集去重后的寄存器键（忽略无效寄存器与 x0）。模板同时支持

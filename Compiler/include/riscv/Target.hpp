@@ -33,4 +33,8 @@ public:
 void emitAssembly(Module &module, std::ostream &out,
                   const BackendOptions &options = BackendOptions{});
 
+// 调试/适配入口：只生成并转储目标无关的 MIR，不进入物理寄存器分配或
+// AsmPrinter。最终 SIMD 文档发布前可用它验证 IR -> G_V* lowering。
+void emitGenericMachineIR(Module &module, std::ostream &out);
+
 } // namespace riscv

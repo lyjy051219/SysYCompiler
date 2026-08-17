@@ -1,5 +1,6 @@
 #include "riscv/Frame.hpp"
 
+#include "lib/Target.hpp"
 #include "lib/TypeSystem.hpp"
 
 #include <algorithm>
@@ -103,6 +104,9 @@ int64_t typeSizeBytes(const std::shared_ptr<IRType> &type) {
     return 4;
   case IR_POINTER:
     return 8;
+  case IR_VECTOR:
+    return static_cast<int64_t>(
+        TargetInfo::get().getDataLayout().getTypeAllocSize(type));
   case IR_ARRAY: {
     auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
     return static_cast<int64_t>(arrayType->getElementCount()) *
@@ -127,6 +131,9 @@ int64_t typeAlignBytes(const std::shared_ptr<IRType> &type) {
     return 4;
   case IR_POINTER:
     return 8;
+  case IR_VECTOR:
+    return static_cast<int64_t>(
+        TargetInfo::get().getDataLayout().getABITypeAlign(type));
   case IR_ARRAY: {
     auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
     return std::max<int64_t>(1, typeAlignBytes(arrayType->getElementType()));

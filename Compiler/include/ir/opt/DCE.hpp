@@ -59,6 +59,10 @@ bool hasDefinedConstantShiftAmount(const Instruction *I);
 bool valueMayDependOnUndef(
 	const Value *V, std::size_t MaxVisitedValues = 256);
 
+//有界检查值是否直接或间接依赖 undef 或可能产生 poison 的指令。
+bool valueMayDependOnUndefOrPoison(
+	const Value *V, std::size_t MaxVisitedValues = 256);
+
 //判断指令是否具有未知或不可丢弃的语义。
 bool dceInstructionMustBePreserved(Instruction *I);
 

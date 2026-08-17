@@ -150,6 +150,207 @@ std::optional<long long>
 BasicAAResult::getConstantByteOffset(Value *V) const {
     return getPointerProvenance(V).getExactByteOffset();
 }
+//在指定程序点证明Pointer-Reference为常量字节差
+std::optional<long long>
+BasicAAResult::getConstantByteOffsetDifferenceAt(
+    Value *Pointer, Value *Reference, Instruction *Context,
+    SCEVResult &SCEV, RangeInfo &RI,
+    const DominatorTree &DT) const {
+    if (!Pointer || !Reference || !Pointer->isPointerValue() ||
+        !Reference->isPointerValue()) {
+        return std::nullopt;
+    }
+    LinearGEP First = fillLinearGEP(Pointer);
+    LinearGEP Second = fillLinearGEP(Reference);
+    if (!First.Valid || !Second.Valid || !First.Base ||
+        First.Base != Second.Base) {
+        return std::nullopt;
+    }
+
+    auto SubtractVariables = [](const LinearGEP &Left,
+                                const LinearGEP &Right,
+                                std::unordered_map<Value *, long long> &Diff) {
+        Diff = Left.VariableOffsets;
+        for (const auto &Term : Right.VariableOffsets) {
+            long long Updated = 0;
+            if (!BasicAAResult::checkedSub(
+                    Diff[Term.first], Term.second, Updated)) {
+                return false;
+            }
+            Diff[Term.first] = Updated;
+        }
+        for (auto It = Diff.begin(); It != Diff.end();) {
+            if (It->second == 0)
+                It = Diff.erase(It);
+            else
+                ++It;
+        }
+        return true;
+    };
+
+    std::unordered_map<Value *, long long> DirectDifference;
+    if (!SubtractVariables(First, Second, DirectDifference))
+        return std::nullopt;
+    //完全相同的动态SSA项可以直接相消，不需要额外的值域假设。
+    if (DirectDifference.empty()) {
+        long long Difference = 0;
+        if (!checkedSub(First.ConstantOffset, Second.ConstantOffset,
+                        Difference)) {
+            return std::nullopt;
+        }
+        return Difference;
+    }
+    if (!Context || !Context->getParent()) return std::nullopt;
+
+    auto Normalize = [&](LinearGEP &Expression) {
+        std::unordered_map<Value *, long long> Normalized;
+        for (const auto &Term : Expression.VariableOffsets) {
+            Value *Index = Term.first;
+            const long long Coefficient = Term.second;
+            AdditiveDecomposition Decomposition =
+                decomposeAdditive(Index);
+            if (!Decomposition.Valid || !Decomposition.Base)
+                return false;
+
+            if (Decomposition.Base != Index) {
+                //i32加减在本IR中允许二补码回绕；只有Range/SCEV在真实
+                //插入点证明链上每一步均不回绕时，才能把(i+C)改写成i和C。
+                Value *Cursor = Index;
+                long long AccumulatedOffset = 0;
+                std::unordered_set<Value *> Seen;
+                while (Cursor != Decomposition.Base) {
+                    if (!Cursor || !Seen.insert(Cursor).second ||
+                        !IRType::hasIntegerBitWidth(
+                            Cursor->getIRType(), 32)) {
+                        return false;
+                    }
+                    auto *Binary = dynamic_cast<BinaryInst *>(Cursor);
+                    if (!Binary) return false;
+                    Value *LHS = Binary->getOperand(0);
+                    Value *RHS = Binary->getOperand(1);
+                    auto *LeftConstant = dynamic_cast<ConstInt *>(LHS);
+                    auto *RightConstant = dynamic_cast<ConstInt *>(RHS);
+                    Value *Next = nullptr;
+                    long long Step = 0;
+                    if (Binary->getOp() == BinaryInst::ADD &&
+                        RightConstant) {
+                        Next = LHS;
+                        Step = RightConstant->getVal();
+                    } else if (Binary->getOp() == BinaryInst::ADD &&
+                               LeftConstant) {
+                        Next = RHS;
+                        Step = LeftConstant->getVal();
+                    } else if (Binary->getOp() == BinaryInst::SUB &&
+                               RightConstant &&
+                               checkedSub(0, RightConstant->getVal(),
+                                          Step)) {
+                        Next = LHS;
+                    } else {
+                        return false;
+                    }
+                    if (!Next || !IRType::hasIntegerBitWidth(
+                                     Next->getIRType(), 32)) {
+                        return false;
+                    }
+                    IntRange Range = SCEV.evaluateValueRangeAt(
+                        Next, Context, RI, DT);
+                    if (Range.isBottom() || Range.isTop()) return false;
+                    const long long Minimum =
+                        static_cast<long long>(Range.min);
+                    const long long Maximum =
+                        static_cast<long long>(Range.max);
+                    long long ShiftedMinimum = 0;
+                    long long ShiftedMaximum = 0;
+                    if (!checkedAdd(Minimum, Step, ShiftedMinimum) ||
+                        !checkedAdd(Maximum, Step, ShiftedMaximum) ||
+                        ShiftedMinimum < IntRange::I32_MIN ||
+                        ShiftedMaximum > IntRange::I32_MAX ||
+                        !checkedAdd(AccumulatedOffset, Step,
+                                    AccumulatedOffset)) {
+                        return false;
+                    }
+                    Cursor = Next;
+                }
+                if (AccumulatedOffset != Decomposition.Offset)
+                    return false;
+            }
+
+            long long ConstantContribution = 0;
+            long long UpdatedConstant = 0;
+            long long UpdatedCoefficient = 0;
+            if (!checkedMul(Coefficient, Decomposition.Offset,
+                            ConstantContribution) ||
+                !checkedAdd(Expression.ConstantOffset,
+                            ConstantContribution, UpdatedConstant) ||
+                !checkedAdd(Normalized[Decomposition.Base], Coefficient,
+                            UpdatedCoefficient)) {
+                return false;
+            }
+            Expression.ConstantOffset = UpdatedConstant;
+            Normalized[Decomposition.Base] = UpdatedCoefficient;
+        }
+        for (auto It = Normalized.begin(); It != Normalized.end();) {
+            if (It->second == 0)
+                It = Normalized.erase(It);
+            else
+                ++It;
+        }
+        Expression.VariableOffsets = std::move(Normalized);
+        return true;
+    };
+
+    if (!Normalize(First) || !Normalize(Second))
+        return std::nullopt;
+    std::unordered_map<Value *, long long> NormalizedDifference;
+    if (!SubtractVariables(First, Second, NormalizedDifference) ||
+        !NormalizedDifference.empty()) {
+        return std::nullopt;
+    }
+    long long Difference = 0;
+    if (!checkedSub(First.ConstantOffset, Second.ConstantOffset,
+                    Difference)) {
+        return std::nullopt;
+    }
+    return Difference;
+}
+//在指定程序点查询两个带真实宽度的内存区间
+AliasInfo BasicAAResult::aliasAt(
+    const MemoryLocation &L1, const MemoryLocation &L2,
+    Instruction *Context, const LoopInfo &LI, SCEVResult &SCEV,
+    RangeInfo &RI, const DominatorTree &DT) {
+    AliasInfo Existing = aliasWithIndexRange(L1, L2, LI);
+    if (Existing != AliasInfo::MayAlias) return Existing;
+    if (!L1.Pointer || !L2.Pointer || !L1.Size || !L2.Size ||
+        *L1.Size == 0 || *L2.Size == 0) {
+        return AliasInfo::MayAlias;
+    }
+    auto Difference = getConstantByteOffsetDifferenceAt(
+        L1.Pointer, L2.Pointer, Context, SCEV, RI, DT);
+    if (!Difference) return AliasInfo::MayAlias;
+    //增强后的Must/NoAlias都不能依赖潜在越界地址；两侧完整访问必须先在
+    //真实程序点证明位于同一已知对象内。
+    if (!isLocationProvablyInBoundsAt(
+            L1, Context, SCEV, RI, DT) ||
+        !isLocationProvablyInBoundsAt(
+            L2, Context, SCEV, RI, DT)) {
+        return AliasInfo::MayAlias;
+    }
+    if (*Difference == 0) return AliasInfo::MustAlias;
+    if (*L1.Size > static_cast<std::size_t>(
+                       std::numeric_limits<long long>::max()) ||
+        *L2.Size > static_cast<std::size_t>(
+                       std::numeric_limits<long long>::max())) {
+        return AliasInfo::MayAlias;
+    }
+    const bool Disjoint =
+        (*Difference > 0 &&
+         *Difference >= static_cast<long long>(*L2.Size)) ||
+        (*Difference < 0 &&
+         *Difference != std::numeric_limits<long long>::min() &&
+         -*Difference >= static_cast<long long>(*L1.Size));
+    if (!Disjoint) return AliasInfo::MayAlias;
+    return AliasInfo::NoAlias;
+}
 //返回指针底层对象的已知字节数
 std::optional<std::size_t>
 BasicAAResult::getObjectSize(Value *V) const {
