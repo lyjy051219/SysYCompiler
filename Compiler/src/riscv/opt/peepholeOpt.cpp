@@ -16,6 +16,7 @@
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -214,6 +215,121 @@ bool isRedundantAddZero(const MachineInstr &instr) {
     return false;
   }
   return sameRegister(instr.defs.front().regValue, instr.uses.front().regValue);
+}
+
+// 两个物理寄存器编号是否相同(仅比较 phys;寄存器类差异在 FPR 中无影响)。
+bool samePhysReg(const MachineOperand &lhs, const MachineOperand &rhs) {
+  return lhs.kind == OperandKind::Reg && rhs.kind == OperandKind::Reg &&
+         lhs.regValue.physical && rhs.regValue.physical &&
+         lhs.regValue.phys == rhs.regValue.phys;
+}
+
+// FMA 融合默认关闭:它会改变浮点舍入(单次舍入 vs 先乘后加两次舍入),
+// 部分浮点功能用例会 WA。决赛若官方明确允许 FP contraction 或评测机允许
+// 使用 BOOM FMA,设置 BACKEND_ENABLE_FMA_FUSION=1 打开;默认流水线保持逐字节兼容。
+bool fmaFusionEnabled() {
+  static const bool enabled = std::getenv("BACKEND_ENABLE_FMA_FUSION") != nullptr;
+  return enabled;
+}
+
+// 统计 t 在 FMUL 之后、下一次被重定义之前的使用次数。由于 FMUL 与 FADD/FSUB
+// 紧邻,唯一允许的后续使用就是下一条 FADD/FSUB 对 t 的读取;若还有别的使用,
+// 删除 FMUL 会改变它们看到的值,因此拒绝融合。
+std::size_t countUsesBeforeNextDef(const MachineFunction &mf,
+                                   std::size_t blockIndex,
+                                   std::size_t mulIndex,
+                                   const MachineOperand &t) {
+  std::size_t uses = 0;
+  for (std::size_t bi = blockIndex; bi < mf.blocks.size(); ++bi) {
+    const MachineBasicBlock &block = mf.blocks[bi];
+    const std::size_t begin = (bi == blockIndex) ? mulIndex + 1 : 0;
+    for (std::size_t ii = begin; ii < block.instrs.size(); ++ii) {
+      const MachineInstr &instr = block.instrs[ii];
+      for (const MachineOperand &use : instr.uses) {
+        if (samePhysReg(use, t)) {
+          ++uses;
+        }
+      }
+      for (PhysReg use : instr.implicitUses) {
+        if (use == t.regValue.phys) {
+          ++uses;
+        }
+      }
+      for (const MachineOperand &def : instr.defs) {
+        if (samePhysReg(def, t)) {
+          return uses;
+        }
+      }
+      for (PhysReg def : instr.implicitDefs) {
+        if (def == t.regValue.phys) {
+          return uses;
+        }
+      }
+    }
+  }
+  return uses;
+}
+
+// 判断 t = fmul.s a, b; d = fadd/fsub t, c 的相邻模式能否融合成一条 FMA。
+// 允许 t 与 a/b 重叠(常见 x = x*y 累乘模式):FMUL 被删除后,旧 t 仍是
+// FMA 的源操作数,结果与先乘后加一致。t 与 c 重叠时不能删除 FMUL,因为
+// 原加法读到的是新 t,而 FMA 会读到旧 t。除此之外,要求 t 在 FMUL 后仅
+// 被下一条加法使用一次。
+bool matchPostRAFMA(const MachineFunction &mf, std::size_t blockIndex,
+                    std::size_t mulIndex, const MachineInstr &mul,
+                    const MachineInstr &add, MachineInstr &fma) {
+  if (mul.opcode != Opcode::FMUL_S || mul.sideEffects || mul.terminator ||
+      mul.implicitDefs.size() != 0 || mul.implicitUses.size() != 0 ||
+      mul.defs.size() != 1 || mul.uses.size() != 2) {
+    return false;
+  }
+  if (add.sideEffects || add.terminator || add.implicitDefs.size() != 0 ||
+      add.implicitUses.size() != 0 || add.defs.size() != 1 ||
+      add.uses.size() != 2) {
+    return false;
+  }
+  if (add.opcode != Opcode::FADD_S && add.opcode != Opcode::FSUB_S) {
+    return false;
+  }
+  const MachineOperand &t = mul.defs.front();
+  const MachineOperand &a = mul.uses[0];
+  const MachineOperand &b = mul.uses[1];
+  if (t.kind != OperandKind::Reg || !t.regValue.physical ||
+      t.regValue.phys == PhysReg::X0 || a.kind != OperandKind::Reg ||
+      b.kind != OperandKind::Reg || !a.regValue.physical ||
+      !b.regValue.physical) {
+    return false;
+  }
+
+  const bool addUsesMulFirst = samePhysReg(add.uses[0], t);
+  const bool addUsesMulSecond = samePhysReg(add.uses[1], t);
+  if (addUsesMulFirst == addUsesMulSecond) {
+    return false; // 必须是 t+c / t-c / c+t / c-t,不能两个操作数都是 t 或都不是 t
+  }
+  const MachineOperand &c =
+      addUsesMulFirst ? add.uses[1] : add.uses[0];
+  if (c.kind != OperandKind::Reg || !c.regValue.physical) {
+    return false;
+  }
+  if (samePhysReg(t, c)) {
+    return false;
+  }
+
+  if (countUsesBeforeNextDef(mf, blockIndex, mulIndex, t) != 1) {
+    return false;
+  }
+
+  fma.opcode = Opcode::FMADD_S;
+  if (add.opcode == Opcode::FSUB_S) {
+    // t - c -> fmsub.s a,b,c；c - t -> fnmsub.s a,b,c = -(a*b)+c
+    fma.opcode = addUsesMulFirst ? Opcode::FMSUB_S : Opcode::FNMSUB_S;
+  }
+  fma.defs = add.defs;
+  fma.uses.push_back(a);
+  fma.uses.push_back(b);
+  fma.uses.push_back(c);
+  fma.comment = add.comment;
+  return true;
 }
 
 // RA 后可直接删除的指令:无副作用的 NOP、自拷贝、自加零。
@@ -1682,6 +1798,30 @@ bool runPreRALocalCSE(MachineFunction &mf) {
 // 做折叠;折叠结果若又成了可删除指令则一并丢弃。返回是否有改动。
 bool runPostRAPeephole(MachineFunction &mf) {
   bool changed = false;
+
+  // 第一轮:FMA 融合。t = fmul.s a,b 与紧邻的 fadd/fsub 合成 BOOM 原生 FMA,
+  // 前提是 t 在 FMUL 之后只被下一条加法使用一次。逐块扫描,遇到相邻可融合
+  // 指令对时写出一条 FMA 并跳过被吸收的 FMUL/FADD。
+  if (fmaFusionEnabled()) for (std::size_t blockIndex = 0; blockIndex < mf.blocks.size(); ++blockIndex) {
+    MachineBasicBlock &block = mf.blocks[blockIndex];
+    std::vector<MachineInstr> fused;
+    fused.reserve(block.instrs.size());
+    for (std::size_t index = 0; index < block.instrs.size(); ++index) {
+      if (index + 1 < block.instrs.size()) {
+        MachineInstr fma;
+        if (matchPostRAFMA(mf, blockIndex, index, block.instrs[index],
+                           block.instrs[index + 1], fma)) {
+          fused.push_back(std::move(fma));
+          ++index;
+          changed = true;
+          continue;
+        }
+      }
+      fused.push_back(std::move(block.instrs[index]));
+    }
+    block.instrs = std::move(fused);
+  }
+
   for (MachineBasicBlock &block : mf.blocks) {
     std::vector<MachineInstr> rewritten;
     rewritten.reserve(block.instrs.size());
