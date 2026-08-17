@@ -486,6 +486,11 @@ uint64_t issueInstructionAt(const MachineInstr &instr,
   if (info.memoryOp) {
     state.memoryReady = completion;
   }
+  // 发射槽位按“占用 1 个 issue cycle”释放，而不是按执行延迟释放：
+  // 乘/除/访存/浮点虽然结果延迟较长，但它们并不把发射端口占住多个周期。
+  // 旧实现把 intPortReady/memPortReady/fpPortReady 设成 completion，会把
+  // 3 周期的 load、12 周期的除法后面的无关指令错误地堵在发射端口上，
+  // 严重低估 BOOM 的发射宽度。除法和 barrier 属于不可流水化的特例。
   switch (info.port) {
   case IssuePortClass::INT: {
     int chosenSlot = -1;
@@ -498,14 +503,16 @@ uint64_t issueInstructionAt(const MachineInstr &instr,
     if (chosenSlot < 0) {
       chosenSlot = state.intPortReady[0] <= state.intPortReady[1] ? 0 : 1;
     }
-    state.intPortReady[static_cast<std::size_t>(chosenSlot)] = completion;
+    state.intPortReady[static_cast<std::size_t>(chosenSlot)] = issue + 1;
     break;
   }
   case IssuePortClass::MEM:
-    state.memPortReady = completion;
+    state.memPortReady = issue + 1;
     break;
   case IssuePortClass::FP:
-    state.fpPortReady = completion;
+    // 浮点加减乘在 BOOM FPU 上按流水线工作，端口每周期可再次发射；
+    // fdiv 变延迟且不可完全流水化，保守按完成周期释放端口。
+    state.fpPortReady = instr.opcode == Opcode::FDIV_S ? completion : issue + 1;
     break;
   case IssuePortClass::BARRIER:
     state.intPortReady[0] = completion;
