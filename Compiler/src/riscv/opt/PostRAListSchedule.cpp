@@ -183,6 +183,11 @@ uint32_t opcodeLatency(Opcode opcode) {
   case Opcode::FSUB_S:
   case Opcode::FMUL_S:
     return 3;
+  case Opcode::FMADD_S:
+  case Opcode::FMSUB_S:
+  case Opcode::FNMADD_S:
+  case Opcode::FNMSUB_S:
+    return 4;
   case Opcode::DIV:
   case Opcode::DIVW:
   case Opcode::DIVUW:
@@ -238,6 +243,10 @@ IssuePortClass issuePortClass(Opcode opcode) {
   case Opcode::FADD_S:
   case Opcode::FSUB_S:
   case Opcode::FMUL_S:
+  case Opcode::FMADD_S:
+  case Opcode::FMSUB_S:
+  case Opcode::FNMADD_S:
+  case Opcode::FNMSUB_S:
   case Opcode::FDIV_S:
   case Opcode::FCVT_W_S:
   case Opcode::FCVT_S_W:

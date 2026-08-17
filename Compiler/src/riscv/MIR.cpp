@@ -111,6 +111,14 @@ const char *opcodeName(Opcode opcode) {
     return "FMUL_S";
   case Opcode::FDIV_S:
     return "FDIV_S";
+  case Opcode::FMADD_S:
+    return "FMADD_S";
+  case Opcode::FMSUB_S:
+    return "FMSUB_S";
+  case Opcode::FNMADD_S:
+    return "FNMADD_S";
+  case Opcode::FNMSUB_S:
+    return "FNMSUB_S";
   case Opcode::FCVT_W_S:
     return "FCVT_W_S";
   case Opcode::FCVT_S_W:

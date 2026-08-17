@@ -783,6 +783,39 @@ void AsmPrinter::emitInstr(const MachineInstr &instr) {
            << operandReg(instr.uses[1]) << '\n';
     }
     return;
+  // 浮点乘加/乘减类:形如 op rd, rs1, rs2, rs3。FMADD/FMSUB/FNMADD/FNMSUB
+  // 均由 BOOM FPU 原生支持,语义分别为 +/-rs1*rs2 +/- rs3。
+  case Opcode::FMADD_S:
+  case Opcode::FMSUB_S:
+  case Opcode::FNMADD_S:
+  case Opcode::FNMSUB_S:
+    if (instr.defs.empty() || instr.uses.size() < 3) {
+      throw BackendError("malformed fused multiply-add instruction");
+    }
+    {
+      const char *mnemonic = "";
+      switch (instr.opcode) {
+      case Opcode::FMADD_S:
+        mnemonic = "fmadd.s";
+        break;
+      case Opcode::FMSUB_S:
+        mnemonic = "fmsub.s";
+        break;
+      case Opcode::FNMADD_S:
+        mnemonic = "fnmadd.s";
+        break;
+      case Opcode::FNMSUB_S:
+        mnemonic = "fnmsub.s";
+        break;
+      default:
+        break;
+      }
+      out_ << "    " << mnemonic << ' ' << operandReg(instr.defs.front())
+           << ", " << operandReg(instr.uses[0]) << ", "
+           << operandReg(instr.uses[1]) << ", "
+           << operandReg(instr.uses[2]) << '\n';
+    }
+    return;
   // SEQZ/SNEZ:与零比较的伪指令,rd = (rs == 0) 或 (rs != 0)。
   case Opcode::SEQZ:
   case Opcode::SNEZ:
