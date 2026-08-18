@@ -972,8 +972,12 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
     }
     //2.交叉枚举访问对并分类，遇到未知关系或预算耗尽立即保守退出。
     std::size_t Examined = 0;
-    for (const LoopMemoryAccess *FirstAccess : A.Accesses) {
-        for (const LoopMemoryAccess *SecondAccess : B.Accesses) {
+    for (std::size_t FirstIndex = 0;
+         FirstIndex < A.Accesses.size(); ++FirstIndex) {
+        const LoopMemoryAccess *FirstAccess = A.Accesses[FirstIndex];
+        for (std::size_t SecondIndex = 0;
+             SecondIndex < B.Accesses.size(); ++SecondIndex) {
+            const LoopMemoryAccess *SecondAccess = B.Accesses[SecondIndex];
             if (!FirstAccess || !SecondAccess ||
                 !isWriteConflict(*FirstAccess, *SecondAccess)) {
                 continue;
@@ -982,8 +986,32 @@ LoopFusionAccessResult LoopAccessInfo::analyzeFusion(Loop *First,
                 Result.Unknown = true;
                 return Result;
             }
-            LoopAccessPairKind Kind = classifyPair(
-                First, First, *FirstAccess, Second, Second, *SecondAccess);
+            LoopAccessPairKind Kind = LoopAccessPairKind::Unknown;
+            const LoopAccessFootprint *FirstFootprint =
+                FirstIndex < A.Footprints.size()
+                    ? &A.Footprints[FirstIndex]
+                    : nullptr;
+            const LoopAccessFootprint *SecondFootprint =
+                SecondIndex < B.Footprints.size()
+                    ? &B.Footprints[SecondIndex]
+                    : nullptr;
+
+            // 不同底层对象的普通 Location 查询会因动态下标暂时缺少
+            // 对象内证明而退回 MayAlias；循环足迹已经独立证明完整边界时，
+            // 可以安全复用对象级 NoAlias，且不依赖越界未定义行为。
+            if (FirstAccess->Root != SecondAccess->Root &&
+                FirstFootprint != nullptr && SecondFootprint != nullptr &&
+                FirstFootprint->ObjectSize.has_value() &&
+                SecondFootprint->ObjectSize.has_value() &&
+                FirstFootprint->Exact && SecondFootprint->Exact && AA && LI &&
+                AA->alias(FirstAccess->Root, SecondAccess->Root, *LI) ==
+                    AliasInfo::NoAlias) {
+                Kind = LoopAccessPairKind::NoConflict;
+            } else {
+                Kind = classifyPair(
+                    First, First, *FirstAccess,
+                    Second, Second, *SecondAccess);
+            }
             if (Kind == LoopAccessPairKind::Unknown) {
                 Result.Unknown = true;
                 return Result;
