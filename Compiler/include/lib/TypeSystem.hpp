@@ -11,11 +11,10 @@
 //使用静态工厂形式+Shared_ptr设计：相同结构的类型结构会被缓存并复用，避免重复创建和内存浪费
 
 enum TypeSystem{
-    IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_VECTOR,IR_UNDEF
+    IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
 };
 
 class INTType;
-class VECTORType;
 
 /*
  * IR类型与对应的IR类型语法：
@@ -47,12 +46,6 @@ class VECTORType;
  *     [3 x [4 x i32]]       —— 3×4 的二维 i32 数组
  *     [2 x [3 x [4 x i32]]] —— 2×3×4 的三维 i32 数组
  *
- * IR_VECTOR：
- *   仿照LLVM的定长向量类型，语法为 <元素数量 x 元素类型>
- *   例如：
- *     <4 x i32>   —— 包含 4 个 i32 元素的整数向量
- *     <8 x float> —— 包含 8 个 float 元素的浮点向量
- *
  * IR_UNDEF：
  *   用于表示未定义值的 undef
  */
@@ -69,11 +62,11 @@ class IRType{
     virtual ~IRType()=default;
     //dumpIR接口
     virtual void toString() const = 0;
-    //返回复合类型嵌套层数；标量类型和向量类型返回0
+    //返回复合类型嵌套层数；标量类型返回0
     virtual int getScope();
     TypeSystem getTypeSystem() const {return ts;}
     //返回Size
-    //标量类型直接返回，目标平台相关类型(指针、数组、向量)通过TargetInfo::get().getDataLayout()计算
+    //标量类型直接返回，目标平台相关类型(指针、数组)通过TargetInfo::get().getDataLayout()计算
     size_t getSize() const;
     //如果当前类型是 INTType，返回实际位宽
     int getIntegerBitWidth(int DefaultBits = 32) const;
@@ -87,11 +80,8 @@ class IRType{
     bool isVoid() const;
     bool isPointer() const;
     bool isArray() const;
-    bool isVector() const;
     bool isScalar() const; //检查是否是标量（整数或浮点数）
-    //判断当前类型是否为元素类型是 i1 的固定长度向量
-    bool isBooleanVector() const;
-    //first-class value 类型仅包括标量、指针和固定长度向量，严格排除 void
+    //first-class value 类型仅包括标量和指针，严格排除 void 与聚合类型
     bool isFirstClassValueType() const;
     //静态类型判断接口：
     static bool isInt(const std::shared_ptr<IRType> &Ty);
@@ -99,24 +89,9 @@ class IRType{
     static bool isBool(const std::shared_ptr<IRType> &Ty);
     static bool isPointer(const std::shared_ptr<IRType> &Ty);
     static bool isArray(const std::shared_ptr<IRType> &Ty);
-    static bool isVector(const std::shared_ptr<IRType> &Ty);
     static bool isScalar(const std::shared_ptr<IRType> &Ty);
-    static bool isBooleanVector(const std::shared_ptr<IRType> &Ty);
     static bool isFirstClassValueType(const std::shared_ptr<IRType> &Ty);
-    //空指针安全地尝试向下转换为固定长度向量类型
-    static std::shared_ptr<VECTORType> asVector(
-        const std::shared_ptr<IRType> &Ty);
-    //标量保持原类型，固定长度向量返回其元素类型
-    static std::shared_ptr<IRType> getScalarElementType(
-        const std::shared_ptr<IRType> &Ty);
-    //尝试取得标量或固定长度向量的整数元素类型
-    static std::shared_ptr<INTType> getScalarIntegerType(
-        const std::shared_ptr<IRType> &Ty);
-    //根据源类型是标量还是向量，把调用者给出的目标类型整理成一个与源类型lane数保持一致的最终目标类型
-    static std::shared_ptr<IRType> deriveLanePreservingType(
-        const std::shared_ptr<IRType> &SourceType,
-        const std::shared_ptr<IRType> &RequestedType);
-    //取得整数、浮点或其固定长度向量的逻辑总位宽
+    //取得整数或浮点标量的逻辑位宽
     bool getLogicalBitWidth(std::size_t &BitWidth) const;
     static bool getLogicalBitWidth(const std::shared_ptr<IRType> &Ty,
                                    std::size_t &BitWidth);
@@ -168,7 +143,7 @@ class IRType{
                                     std::vector<int> &Path,
                                     std::shared_ptr<IRType> &ElementTy);
 
-    //仅创建无需结构参数的标量类型；指针、数组和向量返回空指针（这些无法只通过typesystem创建）
+    //仅创建无需结构参数的标量类型；指针和数组返回空指针（这些无法只通过typesystem创建）
     static std::shared_ptr<IRType> NewTypeByTypeSystem(TypeSystem type);
 };
 
@@ -263,28 +238,4 @@ class ARRAYType : public IRType{
     //返回最内层基础类型
     std::shared_ptr<IRType> getBaseType() const;
     int getScope()final;
-};
-
-//定长向量类型：等待决赛适配向量
-class VECTORType : public IRType {
-    //向量元素类型
-    std::shared_ptr<IRType> elementType;
-    //向量元素数量
-    std::size_t elementCount;
-
-    VECTORType(std::shared_ptr<IRType> elementType, std::size_t elementCount)
-        : IRType(IR_VECTOR), elementType(std::move(elementType)),
-          elementCount(elementCount) {
-        // 向量的存储与分配大小由 DataLayout 分别计算。
-        size = 0;
-    }
-
-    public:
-    static std::shared_ptr<VECTORType>
-    NewVector(std::shared_ptr<IRType> elementType,std::size_t elementCount);
-    void toString() const override;
-    std::shared_ptr<IRType> getElementType() const { return elementType; }
-    std::size_t getElementCount() const { return elementCount; }
-    //向量类型不被看作是嵌套类型
-    int getScope() override { return 0; }
 };

@@ -140,9 +140,6 @@ const std::vector<PhysReg> kFPRCalleeSaved{
     PhysReg::FS5, PhysReg::FS6, PhysReg::FS7, PhysReg::FS8, PhysReg::FS9,
     PhysReg::FS10, PhysReg::FS11};
 
-// GenericVector 只存在于目标选择前，没有可分配或 ABI 物理寄存器。
-const std::vector<PhysReg> kNoPhysicalVectorRegisters{};
-
 // 判断寄存器类是否为浮点类,用于在整型/浮点两套寄存器池之间选择。
 bool isFloatClass(RegClass rc) { return rc == RegClass::FPR32; }
 
@@ -160,7 +157,6 @@ bool isValidRegClass(RegClass rc) {
   case RegClass::GPR32:
   case RegClass::GPR64:
   case RegClass::FPR32:
-  case RegClass::GenericVector:
     return true;
   }
   return false;
@@ -177,25 +173,16 @@ const RegisterInfo &getRegisterInfo(PhysReg reg) {
 
 // 按寄存器类返回对应的可分配寄存器池。
 const std::vector<PhysReg> &allocatableRegs(RegClass rc) {
-  if (rc == RegClass::GenericVector) {
-    return kNoPhysicalVectorRegisters;
-  }
   return isFloatClass(rc) ? kFPRAllocatable : kGPRAllocatable;
 }
 
 // 按寄存器类返回对应的 caller-saved 集合。
 const std::vector<PhysReg> &callerSavedRegs(RegClass rc) {
-  if (rc == RegClass::GenericVector) {
-    return kNoPhysicalVectorRegisters;
-  }
   return isFloatClass(rc) ? kFPRCallerSaved : kGPRCallerSaved;
 }
 
 // 按寄存器类返回对应的 callee-saved 集合。
 const std::vector<PhysReg> &calleeSavedRegs(RegClass rc) {
-  if (rc == RegClass::GenericVector) {
-    return kNoPhysicalVectorRegisters;
-  }
   return isFloatClass(rc) ? kFPRCalleeSaved : kGPRCalleeSaved;
 }
 

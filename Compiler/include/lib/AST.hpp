@@ -1,7 +1,5 @@
 #pragma once
-#include <cstddef>
 #include <list>
-#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -18,6 +16,7 @@ enum Type{
     SY_MUL,
     SY_MOD,
     SY_DIV,
+    SY_GEMM,
 
     SY_GREAT,
     SY_GREATEQ,
@@ -33,9 +32,8 @@ enum Type{
     SY_ASSIGN
 };
 
-// AST 层的规范化源码类型。具体词法/文法无论采用 int4、float4、
-// vector<int, 4> 或其他拼写，均应在 parser action 中归一化为该类型。
-// 显式保存种类而不以 lanes == 1 推断标量，从而保留 <1 x T>。
+// AST 层的规范化源码类型。tensor 的完整形状由声明维度保存，
+// 类型节点只记录其元素类型。
 enum class ASTScalarKind {
     Invalid,
     Int32,
@@ -46,45 +44,37 @@ enum class ASTScalarKind {
 enum class ASTTypeKind {
     Invalid,
     Scalar,
-    FixedVector,
+    Tensor,
 };
 
 class ASTType {
 private:
     ASTTypeKind kind;
     ASTScalarKind scalarKind;
-    std::size_t laneCount;
 
-    ASTType(ASTTypeKind typeKind, ASTScalarKind elementKind,
-            std::size_t lanes);
+    ASTType(ASTTypeKind typeKind, ASTScalarKind elementKind);
 
 public:
     ASTType();
     explicit ASTType(Type legacyType);
 
     static ASTType makeScalar(ASTScalarKind scalarKind);
-    static ASTType makeFixedVector(ASTScalarKind elementKind,
-                                   std::size_t lanes);
-    static ASTType makeFixedVector(Type legacyElementType,
-                                   std::size_t lanes);
+    static ASTType makeTensor(ASTScalarKind elementKind);
 
     ASTTypeKind getKind() const;
     ASTScalarKind getScalarKind() const;
-    std::size_t getLaneCount() const;
     bool isValid() const;
     bool isScalar() const;
-    bool isFixedVector() const;
+    bool isTensor() const;
     bool isVoid() const;
 };
 
 inline ASTType::ASTType(ASTTypeKind typeKind,
-                        ASTScalarKind elementKind,
-                        std::size_t lanes)
-    : kind(typeKind), scalarKind(elementKind), laneCount(lanes) {}
+                        ASTScalarKind elementKind)
+    : kind(typeKind), scalarKind(elementKind) {}
 
 inline ASTType::ASTType()
-    : kind(ASTTypeKind::Invalid), scalarKind(ASTScalarKind::Invalid),
-      laneCount(0) {}
+    : kind(ASTTypeKind::Invalid), scalarKind(ASTScalarKind::Invalid) {}
 
 inline ASTType::ASTType(Type legacyType) : ASTType() {
     switch (legacyType) {
@@ -108,47 +98,28 @@ inline ASTType ASTType::makeScalar(ASTScalarKind scalarKind) {
         scalarKind != ASTScalarKind::Void) {
         return ASTType();
     }
-    return ASTType(ASTTypeKind::Scalar, scalarKind, 1);
+    return ASTType(ASTTypeKind::Scalar, scalarKind);
 }
 
-inline ASTType ASTType::makeFixedVector(ASTScalarKind elementKind,
-                                        std::size_t lanes) {
-    if (lanes == 0 ||
-        lanes >
-            (std::numeric_limits<std::size_t>::max() - 7U) / 32U ||
-        (elementKind != ASTScalarKind::Int32 &&
-         elementKind != ASTScalarKind::Float32)) {
+inline ASTType ASTType::makeTensor(ASTScalarKind elementKind) {
+    if (elementKind != ASTScalarKind::Int32 &&
+        elementKind != ASTScalarKind::Float32)
         return ASTType();
-    }
-    return ASTType(ASTTypeKind::FixedVector, elementKind, lanes);
-}
-
-inline ASTType ASTType::makeFixedVector(Type legacyElementType,
-                                        std::size_t lanes) {
-    const ASTType scalar(legacyElementType);
-    if (!scalar.isScalar() || scalar.isVoid())
-        return ASTType();
-    return makeFixedVector(scalar.getScalarKind(), lanes);
+    return ASTType(ASTTypeKind::Tensor, elementKind);
 }
 
 inline ASTTypeKind ASTType::getKind() const { return kind; }
 
 inline ASTScalarKind ASTType::getScalarKind() const { return scalarKind; }
 
-inline std::size_t ASTType::getLaneCount() const { return laneCount; }
-
 inline bool ASTType::isValid() const {
     if (kind == ASTTypeKind::Scalar)
-        return laneCount == 1 &&
-               (scalarKind == ASTScalarKind::Int32 ||
+        return scalarKind == ASTScalarKind::Int32 ||
                 scalarKind == ASTScalarKind::Float32 ||
-                scalarKind == ASTScalarKind::Void);
-    if (kind == ASTTypeKind::FixedVector)
-        return laneCount != 0 &&
-               laneCount <=
-                   (std::numeric_limits<std::size_t>::max() - 7U) / 32U &&
-               (scalarKind == ASTScalarKind::Int32 ||
-                scalarKind == ASTScalarKind::Float32);
+                scalarKind == ASTScalarKind::Void;
+    if (kind == ASTTypeKind::Tensor)
+        return scalarKind == ASTScalarKind::Int32 ||
+               scalarKind == ASTScalarKind::Float32;
     return false;
 }
 
@@ -156,8 +127,8 @@ inline bool ASTType::isScalar() const {
     return kind == ASTTypeKind::Scalar;
 }
 
-inline bool ASTType::isFixedVector() const {
-    return kind == ASTTypeKind::FixedVector;
+inline bool ASTType::isTensor() const {
+    return kind == ASTTypeKind::Tensor;
 }
 
 inline bool ASTType::isVoid() const {

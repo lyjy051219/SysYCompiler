@@ -1,13 +1,12 @@
 #include "lib/TypeSystem.hpp"
 #include "lib/Target.hpp"
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 
 // IR 类型通用查询与结构比较。
 int IRType::getScope(){ return 0; }
 size_t IRType::getSize() const {
-    if (isPointer() || isArray() || isVector())
+    if (isPointer() || isArray())
         return TargetInfo::get().getDataLayout().getTypeSize(this);
     return size;
 }
@@ -16,19 +15,13 @@ bool IRType::isFloat() const { return getTypeSystem() == IR_FLOAT; }
 bool IRType::isVoid() const { return getTypeSystem() == IR_VOID; }
 bool IRType::isPointer() const { return getTypeSystem() == IR_POINTER; }
 bool IRType::isArray() const { return getTypeSystem() == IR_ARRAY; }
-bool IRType::isVector() const { return getTypeSystem() == IR_VECTOR; }
 bool IRType::isBool() const {
     auto *IT = dynamic_cast<const INTType *>(this);
     return IT && IT->getIsBool();
 }
 bool IRType::isScalar() const { return isInt() || isFloat(); }
-bool IRType::isBooleanVector() const {
-    const auto *Vector = dynamic_cast<const VECTORType *>(this);
-    return Vector && Vector->getElementType() &&
-           Vector->getElementType()->isBool();
-}
 bool IRType::isFirstClassValueType() const {
-    return isScalar() || isPointer() || isVector();
+    return isScalar() || isPointer();
 }
 bool IRType::hasSameScalarType(const IRType &Other) const {
     if (!isScalar() || !Other.isScalar() || getTypeSystem() != Other.getTypeSystem())
@@ -53,17 +46,6 @@ bool IRType::hasSameShape(const IRType &Other) const {
     // 数组除总大小外还必须逐层匹配元素数量和子类型形状。
     if (getTypeSystem() != Other.getTypeSystem() || getSize() != Other.getSize())
         return false;
-    if (isVector()) {
-        auto *ThisVector = dynamic_cast<const VECTORType *>(this);
-        auto *OtherVector = dynamic_cast<const VECTORType *>(&Other);
-        return ThisVector && OtherVector &&
-               ThisVector->getElementCount() ==
-                   OtherVector->getElementCount() &&
-               ThisVector->getElementType() &&
-               OtherVector->getElementType() &&
-               ThisVector->getElementType()->hasSameShape(
-                   *OtherVector->getElementType());
-    }
     if (isPointer()) {
         auto *ThisPointer = dynamic_cast<const POINTERType *>(this);
         auto *OtherPointer = dynamic_cast<const POINTERType *>(&Other);
@@ -122,8 +104,6 @@ int IRType::countScalarElements(int Limit) const {
     // 自叶向外累计标量数量，并用除法提前拦截上限溢出。
     if (Limit < 1) return -1;
     if (isScalar()) return 1;
-    // 向量是单个 SSA 值，不参与数组初始化器的标量展平
-    if (isVector()) return -1;
     auto *ArrayTy = dynamic_cast<const ARRAYType *>(this);
     if (!ArrayTy || ArrayTy->getElementCount() < 0 ||
         !ArrayTy->getElementType())
@@ -210,74 +190,16 @@ bool IRType::isPointer(const std::shared_ptr<IRType> &Ty) {
 bool IRType::isArray(const std::shared_ptr<IRType> &Ty) {
     return Ty && Ty->isArray();
 }
-bool IRType::isVector(const std::shared_ptr<IRType> &Ty) {
-    return Ty && Ty->isVector();
-}
 bool IRType::isScalar(const std::shared_ptr<IRType> &Ty) {
     return Ty && Ty->isScalar();
 }
-bool IRType::isBooleanVector(const std::shared_ptr<IRType> &Ty) {
-    return Ty && Ty->isBooleanVector();
-}
 bool IRType::isFirstClassValueType(const std::shared_ptr<IRType> &Ty) {
     return Ty && Ty->isFirstClassValueType();
-}
-std::shared_ptr<VECTORType> IRType::asVector(
-    const std::shared_ptr<IRType> &Ty) {
-    return std::dynamic_pointer_cast<VECTORType>(Ty);
-}
-std::shared_ptr<IRType> IRType::getScalarElementType(
-    const std::shared_ptr<IRType> &Ty) {
-    if (auto Vector = asVector(Ty))
-        return Vector->getElementType();
-    return Ty;
-}
-std::shared_ptr<INTType> IRType::getScalarIntegerType(
-    const std::shared_ptr<IRType> &Ty) {
-    return std::dynamic_pointer_cast<INTType>(getScalarElementType(Ty));
-}
-std::shared_ptr<IRType> IRType::deriveLanePreservingType(
-    const std::shared_ptr<IRType> &SourceType,
-    const std::shared_ptr<IRType> &RequestedType) {
-    if (!SourceType || !RequestedType)
-        throw std::invalid_argument(
-            "向量转换要求有效的源值和目标类型");
-
-    auto SourceVector = asVector(SourceType);
-    auto DestinationVector = asVector(RequestedType);
-    if (!SourceVector) {
-        if (DestinationVector)
-            throw std::invalid_argument(
-                "标量转换的目标不能是向量类型");
-        return RequestedType;
-    }
-
-    if (DestinationVector) {
-        if (SourceVector->getElementCount() !=
-            DestinationVector->getElementCount())
-            throw std::invalid_argument(
-                "向量转换的源和目标必须具有相同 lane 数");
-        return RequestedType;
-    }
-
-    if (!RequestedType->isScalar())
-        throw std::invalid_argument(
-            "向量转换的目标元素必须是整数或浮点类型");
-    return VECTORType::NewVector(
-        RequestedType, SourceVector->getElementCount());
 }
 bool IRType::getLogicalBitWidth(std::size_t &BitWidth) const {
     BitWidth = 0;
 
     const IRType *ElementType = this;
-    std::size_t ElementCount = 1;
-    if (const auto *Vector =
-            dynamic_cast<const VECTORType *>(this)) {
-        if (!Vector->getElementType())
-            return false;
-        ElementType = Vector->getElementType().get();
-        ElementCount = Vector->getElementCount();
-    }
 
     std::size_t ElementBits = 0;
     if (const auto *Integer =
@@ -289,11 +211,9 @@ bool IRType::getLogicalBitWidth(std::size_t &BitWidth) const {
         return false;
     }
 
-    if (ElementBits == 0 ||
-        ElementCount >
-            std::numeric_limits<std::size_t>::max() / ElementBits)
+    if (ElementBits == 0)
         return false;
-    BitWidth = ElementBits * ElementCount;
+    BitWidth = ElementBits;
     return true;
 }
 bool IRType::getLogicalBitWidth(
@@ -351,7 +271,6 @@ std::shared_ptr<IRType> IRType::NewTypeByTypeSystem(TypeSystem type){
             return std::static_pointer_cast<IRType>(VOIDType::NewVoid());
         case IR_POINTER:
         case IR_ARRAY:
-        case IR_VECTOR:
         case IR_UNDEF:
             // 复合类型缺少结构信息，IR_UNDEF 只是前端失败哨兵。
             return nullptr;
@@ -438,39 +357,3 @@ std::shared_ptr<IRType> ARRAYType::getBaseType() const{
         return elementType;
 }
 int ARRAYType::getScope(){return scope;}
-
-std::shared_ptr<VECTORType>
-VECTORType::NewVector(std::shared_ptr<IRType> elementType,
-                      std::size_t elementCount) {
-    if (!elementType || elementCount == 0)
-        throw std::invalid_argument(
-            "vector type requires an element type and non-zero lane count");
-    if (!elementType->isInt() && !elementType->isFloat())
-        throw std::invalid_argument(
-            "vector element type must be integer or floating point");
-    const std::size_t ElementBits =
-        elementType->isInt()
-            ? static_cast<std::size_t>(
-                  std::dynamic_pointer_cast<INTType>(elementType)
-                      ->getBitWidth())
-            : 32U;
-    if (elementCount >
-        (std::numeric_limits<std::size_t>::max() - 7U) /
-            ElementBits)
-        throw std::overflow_error("vector type bit width overflow");
-
-    using Key = std::pair<std::shared_ptr<IRType>, std::size_t>;
-    static std::map<Key, std::shared_ptr<VECTORType>> Cache;
-    Key CacheKey{elementType, elementCount};
-    auto &Type = Cache[CacheKey];
-    if (!Type)
-        Type = std::shared_ptr<VECTORType>(
-            new VECTORType(std::move(elementType), elementCount));
-    return Type;
-}
-
-void VECTORType::toString() const {
-    std::cout << "<" << elementCount << " x ";
-    elementType->toString();
-    std::cout << ">";
-}

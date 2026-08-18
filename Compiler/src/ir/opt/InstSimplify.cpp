@@ -529,11 +529,7 @@ Value *InstSimplifier::simplifyDiv(
     //浮点除零不在此折叠。
     const auto Op = BI->getOp();
     const auto Ty = BI->getIRType();
-    // 固定向量的指令结果类型是 VECTORType，数值语义应由 lane 类型决定。
-    // 若只检查结果外层类型，<N x float> 会被误当成整数除法，把浮点除零
-    // 或 undef 分子错误折叠成整数式 undef/零向量。
-    const auto ScalarType = IRType::getScalarElementType(Ty);
-    const bool IsFloat = ScalarType && ScalarType->isFloat();
+    const bool IsFloat = Ty && Ty->isFloat();
     if (LHS->isConst() && RHS->isConst()) {
         return BinaryInst::foldConstants(Op, LHS, RHS);
     }
@@ -563,10 +559,7 @@ Value *InstSimplifier::simplifyRem(
     //3.5余数只在整数已定义情形使用零、±1、同值与相反数恒等式；浮点 frem
     //保留可能产生 NaN 的零除数和同值场景。
     const auto Ty = BI->getIRType();
-    // frem 的标量和固定向量形式共享 IEEE 浮点语义，不能根据外层
-    // VECTORType 落入整数余数的零除数与 undef 折叠路径。
-    const auto ScalarType = IRType::getScalarElementType(Ty);
-    const bool IsFloat = ScalarType && ScalarType->isFloat();
+    const bool IsFloat = Ty && Ty->isFloat();
     const bool IsIntArith = IRType::isInt(Ty) && !IRType::isBool(Ty);
     if (LHS->isConst() && RHS->isConst()) {
         return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
@@ -606,10 +599,6 @@ Value *InstSimplifier::simplifyAnd(
         return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
     }
     maybeSwapCommutative(BI, LHS, RHS, Changed);
-    if (BI->getIRType()->isVector()) {
-        if (LHS == RHS || Value::isConstMinusOne(RHS)) return LHS;
-        return nullptr;
-    }
     if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
         return Value::makeZeroForType(BI->getIRType());
     }
@@ -650,10 +639,6 @@ Value *InstSimplifier::simplifyOr(
         return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
     }
     maybeSwapCommutative(BI, LHS, RHS, Changed);
-    if (BI->getIRType()->isVector()) {
-        if (LHS == RHS || Value::isConstZero(RHS)) return LHS;
-        return nullptr;
-    }
     if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
         return Value::makeMinusOneForType(BI->getIRType());
     }
@@ -719,10 +704,6 @@ Value *InstSimplifier::simplifyXor(
         return BinaryInst::foldConstants(BI->getOp(), LHS, RHS);
     }
     maybeSwapCommutative(BI, LHS, RHS, Changed);
-    if (BI->getIRType()->isVector()) {
-        if (Value::isConstZero(RHS)) return LHS;
-        return nullptr;
-    }
     if (Value::isUndef(LHS) || Value::isUndef(RHS)) {
         return Value::makeUndefForType(BI->getIRType());
     }
@@ -747,8 +728,7 @@ Value *InstSimplifier::simplifyCmp(
     //2.规范布尔扩展与常量比较，只接受可精确解释的0或真假表示
     //3.识别整数min/max选择结构与二次幂余数模式，证明不足时保守回退
     //4.最后仅对非浮点同值比较应用自反恒等式，避免破坏NaN语义
-    //比较结果可能是 i1，也可能是 <N x i1>；所有已知真假值都按结果
-    //形状构造，防止用标量 ConstBool 替换向量比较。
+    // 已知真假值按比较结果类型构造。
     auto makeComparisonResult = [BI](bool Result) -> Value * {
         return Result ? Value::makeOneForType(BI->getIRType())
                       : Value::makeZeroForType(BI->getIRType());
@@ -884,13 +864,11 @@ Value *InstSimplifier::simplifyCmp(
         if (Value *R = tryModEqPow2(LHS, RHS)) return R;
         if (Value *R = tryModEqPow2(RHS, LHS)) return R;
     }
-    const auto ScalarOperandType =
-        IRType::getScalarElementType(LHS->getIRType());
     const bool IsFloatComparison =
-        ScalarOperandType && ScalarOperandType->isFloat();
+        LHS->getIRType() && LHS->getIRType()->isFloat();
     // 即使两侧是同一个 SSA 值，其定义仍可能直接或间接依赖 undef；此时每次
     // 使用允许选择不同值，不能借未定义行为推出自反比较结果。沿反向 def-use
-    // 做有界保守检查，同时覆盖 insertelement(undef, ...) 等向量构造链。
+    // 做有界保守检查。
     if (LHS == RHS && !IsFloatComparison) {
         if (valueMayDependOnUndefOrPoison(LHS)) return nullptr;
         switch (BI->getOp()) {
@@ -931,10 +909,8 @@ Value *InstSimplifier::simplifyBinary(BinaryInst *BI, bool &Changed) {
                 (!RHSMayBeUndefined || Candidate == OriginalRHS);
         };
         Value *Candidate = nullptr;
-        const auto ScalarType =
-            IRType::getScalarElementType(BI->getIRType());
         const bool IsIntegerValue =
-            ScalarType && ScalarType->isInt();
+            BI->getIRType() && BI->getIRType()->isInt();
         switch (BI->getOp()) {
         case BinaryInst::ADD:
             if (IsIntegerValue && Value::isConstZero(OriginalRHS))
@@ -1039,17 +1015,6 @@ Value *InstSimplifier::simplifySelect(SelectInst *SI) {
     Value *TV = SI->getTrueValue();
     Value *FV = SI->getFalseValue();
     if (!Cond || !TV || !FV) return nullptr;
-    const bool IsVectorSelect =
-        Cond->getIRType()->isVector() || SI->getIRType()->isVector();
-    // 对向量 select 不消去直接或间接的 poison/undef 来源；即使两臂相同，
-    // poison mask 也不能被猜成任意正常值。常量 mask 的逐 lane 折叠由
-    // VectorCombine 在每个 lane 都完全确定时完成。
-    if (IsVectorSelect &&
-        (TV == FV || Value::isUndef(Cond) || Value::isUndef(TV) ||
-         Value::isUndef(FV) || valueMayDependOnUndefOrPoison(Cond) ||
-         valueMayDependOnUndefOrPoison(TV) ||
-         valueMayDependOnUndefOrPoison(FV)))
-        return nullptr;
     if (TV == FV) return TV;
     if (Value::isUndef(TV)) return FV;
     if (Value::isUndef(FV)) return TV;
@@ -1102,10 +1067,8 @@ Value *InstSimplifier::simplifySelect(SelectInst *SI) {
         Value *CmpL = nullptr;
         Value *CmpR = nullptr;
         if (BinaryInst::getOperands(Cmp, CmpL, CmpR) && CmpL && CmpR) {
-            const auto CmpScalarType =
-                IRType::getScalarElementType(CmpL->getIRType());
             const bool IsFloatCmp =
-                CmpScalarType && CmpScalarType->isFloat();
+                CmpL->getIRType() && CmpL->getIRType()->isFloat();
             if (!IsFloatCmp && Cmp->getOp() == BinaryInst::E &&
                 ((CmpL == TV && CmpR == FV) || (CmpL == FV && CmpR == TV))) {
                 return FV;
@@ -1191,9 +1154,7 @@ bool InstSimplifier::run(Function &F) {
         if (!I || Erased.count(I) || !I->getParent()) continue;
         Value *V = simplifyInstruction(I, Changed);
         if (!V || V == I) continue;
-        // 所有局部化简都必须保持 SSA 结果的完整形状。该门禁不仅比较标量
-        // 种类，也比较向量 lane 数与元素类型，阻止未来规则把 <N x i1>
-        // 等向量结果误替换为标量常量。
+        // 所有局部化简都必须保持 SSA 结果的完整类型形状。
         if (!I->getIRType() || !V->getIRType() ||
             !IRType::hasSameShape(I->getIRType(), V->getIRType())) {
             if (auto *NewI = dynamic_cast<Instruction *>(V);

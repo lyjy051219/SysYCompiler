@@ -14,7 +14,6 @@
 // 本文件只做选择与本地折叠;跨块优化、寄存器分配、栈帧展开由后续 pass 完成。
 #include "riscv/ISel.hpp"
 
-#include "lib/Target.hpp"
 #include "riscv/Frame.hpp"
 #include "riscv/Target.hpp"
 
@@ -57,9 +56,6 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
     return 4;
   case IR_POINTER:
     return 8;
-  case IR_VECTOR:
-    return static_cast<int64_t>(
-        TargetInfo::get().getDataLayout().getTypeAllocSize(type));
   case IR_ARRAY: {
     auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
     return static_cast<int64_t>(arrayType->getElementCount()) *
@@ -83,9 +79,6 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
     return 4;
   case IR_POINTER:
     return 8;
-  case IR_VECTOR:
-    return static_cast<int64_t>(
-        TargetInfo::get().getDataLayout().getABITypeAlign(type));
   case IR_ARRAY: {
     auto arrayType = std::dynamic_pointer_cast<ARRAYType>(type);
     return std::max<int64_t>(1, alignOfType(arrayType->getElementType()));
@@ -103,57 +96,6 @@ bool isVoidType(const std::shared_ptr<IRType> &type) {
 // 是否为浮点类型。
 bool isFloatType(const std::shared_ptr<IRType> &type) {
   return type && type->getTypeSystem() == IR_FLOAT;
-}
-
-bool isVectorType(const std::shared_ptr<IRType> &type) {
-  return type && type->getTypeSystem() == IR_VECTOR;
-}
-
-bool containsVectorType(const std::shared_ptr<IRType> &type) {
-  if (!type) {
-    return false;
-  }
-  if (isVectorType(type)) {
-    return true;
-  }
-  if (auto Array = std::dynamic_pointer_cast<ARRAYType>(type)) {
-    return containsVectorType(Array->getElementType());
-  }
-  // 指针对象自身只占 64 位；它所指向的类型不属于该全局对象的存储布局。
-  return false;
-}
-
-MachineVectorType machineVectorTypeForIR(
-    const std::shared_ptr<IRType> &type) {
-  auto Vector = std::dynamic_pointer_cast<VECTORType>(type);
-  if (!Vector || !Vector->getElementType() ||
-      Vector->getElementCount() == 0 ||
-      Vector->getElementCount() > std::numeric_limits<uint16_t>::max()) {
-    throw BackendError("invalid fixed vector type during generic MIR lowering");
-  }
-  if (!TargetInfo::get().getDataLayout().supportsNativeVectorType(type.get())) {
-    throw BackendError(
-        "fixed vector type is disabled or unsupported by FixedSIMDMode");
-  }
-
-  MachineVectorType Result;
-  Result.lanes = static_cast<uint16_t>(Vector->getElementCount());
-  const std::shared_ptr<IRType> &Element = Vector->getElementType();
-  if (Element->isFloat()) {
-    Result.element = MachineVectorElementKind::F32;
-  } else if (Element->isInt() && Element->hasIntegerBitWidth(32)) {
-    Result.element = MachineVectorElementKind::I32;
-  } else if (Element->isInt() && Element->hasIntegerBitWidth(1)) {
-    Result.element = MachineVectorElementKind::I1;
-    Result.maskGranuleBits = 32;
-  } else {
-    throw BackendError(
-        "generic vector MIR currently accepts only i1/i32/f32 elements");
-  }
-  if (!Result.isValid()) {
-    throw BackendError("failed to derive MachineVectorType");
-  }
-  return Result;
 }
 
 // 是否为指针类型。
@@ -175,9 +117,6 @@ std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   if (type->getTypeSystem() == IR_POINTER) {
     return "pointer";
   }
-  if (type->getTypeSystem() == IR_VECTOR) {
-    return machineVectorTypeForIR(type).str();
-  }
   return "non-scalar";
 }
 
@@ -194,9 +133,6 @@ RegClass regClassForType(const std::shared_ptr<IRType> &type) {
     return RegClass::GPR64;
   case IR_INT:
     return RegClass::GPR32;
-  case IR_VECTOR:
-    (void)machineVectorTypeForIR(type);
-    return RegClass::GenericVector;
   default:
     throw BackendError("unsupported IR type for register class selection");
   }
@@ -580,11 +516,9 @@ void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
 
 // 追加一条寄存器拷贝:目标为浮点寄存器时用 F_COPY,否则用 COPY。
 void appendCopyInstr(MachineBasicBlock &mbb, MachineReg dst, MachineReg src) {
-  const Opcode CopyOpcode = dst.rc == RegClass::GenericVector
-                                ? Opcode::G_VCOPY
-                                : (dst.rc == RegClass::FPR32
-                                       ? Opcode::F_COPY
-                                       : Opcode::COPY);
+  const Opcode CopyOpcode = dst.rc == RegClass::FPR32
+                                ? Opcode::F_COPY
+                                : Opcode::COPY;
   appendRegInstr(mbb, CopyOpcode,
                  dst, {src});
 }
@@ -615,53 +549,6 @@ MachineReg materializeFloat(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg floatReg = mf.createVReg(RegClass::FPR32);
   appendRegInstr(mbb, Opcode::FMV_W_X, floatReg, {bitsReg});
   return floatReg;
-}
-
-MachineReg materializeVectorUndef(MachineFunction &mf,
-                                  MachineBasicBlock &mbb, Value *value) {
-  MachineReg Reg = mf.createVectorVReg(
-      machineVectorTypeForIR(value->getIRType()));
-  MachineInstr Pseudo;
-  Pseudo.opcode = Opcode::G_VUNDEF;
-  Pseudo.defs.push_back(MachineOperand::reg(Reg));
-  mbb.instrs.push_back(std::move(Pseudo));
-  mf.valueRegs[value] = Reg;
-  return Reg;
-}
-
-MachineReg materializeVectorConstant(MachineFunction &mf,
-                                     MachineBasicBlock &mbb,
-                                     ConstantVector *constant) {
-  if (!constant) {
-    throw BackendError("missing ConstantVector during generic MIR lowering");
-  }
-  MachineReg Reg = mf.createVectorVReg(
-      machineVectorTypeForIR(constant->getIRType()));
-  MachineInstr Pseudo;
-  Pseudo.opcode = Opcode::G_VCONST;
-  Pseudo.defs.push_back(MachineOperand::reg(Reg));
-  for (ConstantSystem *Element : constant->getElements()) {
-    if (!Element) {
-      throw BackendError("null lane in ConstantVector");
-    }
-    int64_t IntegerBits = 0;
-    if (Element->tryGetInt64Const(IntegerBits)) {
-      Pseudo.uses.push_back(MachineOperand::imm(IntegerBits));
-      continue;
-    }
-    float FloatValue = 0.0F;
-    if (Element->tryGetFloatConst(FloatValue)) {
-      uint32_t FloatBits = 0;
-      std::memcpy(&FloatBits, &FloatValue, sizeof(FloatBits));
-      Pseudo.uses.push_back(
-          MachineOperand::imm(static_cast<int64_t>(FloatBits)));
-      continue;
-    }
-    throw BackendError("unsupported ConstantVector lane during MIR lowering");
-  }
-  mbb.instrs.push_back(std::move(Pseudo));
-  mf.valueRegs[constant] = Reg;
-  return Reg;
 }
 
 MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
@@ -1088,10 +975,7 @@ MachineReg getOrCreateResultReg(MachineFunction &mf, Instruction &inst,
   if (existing != mf.valueRegs.end()) {
     return existing->second;
   }
-  MachineReg reg = rc == RegClass::GenericVector
-                       ? mf.createVectorVReg(
-                             machineVectorTypeForIR(inst.getIRType()))
-                       : mf.createVReg(rc);
+  MachineReg reg = mf.createVReg(rc);
   mf.valueRegs[&inst] = reg;
   return reg;
 }
@@ -1108,21 +992,6 @@ MachineReg valueReg(MachineFunction &mf, MachineBasicBlock &mbb,
   auto mapped = mf.valueRegs.find(value);
   if (mapped != mf.valueRegs.end()) {
     return mapped->second;
-  }
-
-  if (isVectorType(value->getIRType())) {
-    if (auto *Constant = dynamic_cast<ConstantVector *>(value)) {
-      return materializeVectorConstant(mf, mbb, Constant);
-    }
-    if (dynamic_cast<UndefValue *>(value)) {
-      return materializeVectorUndef(mf, mbb, value);
-    }
-    if (auto *InstructionValue = dynamic_cast<Instruction *>(value)) {
-      return getOrCreateResultReg(mf, *InstructionValue,
-                                  RegClass::GenericVector);
-    }
-    throw BackendError("unsupported vector operand while lowering function " +
-                       mf.name);
   }
 
   if (dynamic_cast<UndefValue *>(value)) {
@@ -1545,12 +1414,6 @@ const char *instTypeName(Instruction::InstType type) {
     return "SITOFP";
   case Instruction::BITCAST:
     return "BITCAST";
-  case Instruction::EXTRACTELEMENT:
-    return "EXTRACTELEMENT";
-  case Instruction::INSERTELEMENT:
-    return "INSERTELEMENT";
-  case Instruction::SHUFFLEVECTOR:
-    return "SHUFFLEVECTOR";
   }
   return "<unknown>";
 }
@@ -1669,85 +1532,6 @@ void lowerFloatCompare(MachineFunction &mf, MachineBasicBlock &mbb,
   mf.valueRegs[&inst] = dst;
 }
 
-Opcode genericVectorBinaryOpcode(BinaryInst::Operation Operation,
-                                 const MachineVectorType &OperandType) {
-  if (BinaryInst::isCompareOp(Operation)) {
-    return OperandType.element == MachineVectorElementKind::F32
-               ? Opcode::G_VFCMP
-               : Opcode::G_VICMP;
-  }
-  const bool IsFloat = OperandType.element == MachineVectorElementKind::F32;
-  if (IsFloat) {
-    switch (Operation) {
-    case BinaryInst::ADD:
-      return Opcode::G_VFADD;
-    case BinaryInst::SUB:
-      return Opcode::G_VFSUB;
-    case BinaryInst::MUL:
-      return Opcode::G_VFMUL;
-    case BinaryInst::DIV:
-      return Opcode::G_VFDIV;
-    case BinaryInst::MOD:
-      return Opcode::G_VFREM;
-    default:
-      throw BackendError("unsupported generic floating vector operation");
-    }
-  }
-  switch (Operation) {
-  case BinaryInst::ADD:
-    return Opcode::G_VADD;
-  case BinaryInst::SUB:
-    return Opcode::G_VSUB;
-  case BinaryInst::MUL:
-    return Opcode::G_VMUL;
-  case BinaryInst::DIV:
-    return Opcode::G_VDIV;
-  case BinaryInst::UDIV:
-    return Opcode::G_VUDIV;
-  case BinaryInst::MOD:
-    return Opcode::G_VREM;
-  case BinaryInst::UREM:
-    return Opcode::G_VUREM;
-  case BinaryInst::AND:
-    return Opcode::G_VAND;
-  case BinaryInst::OR:
-    return Opcode::G_VOR;
-  case BinaryInst::XOR:
-    return Opcode::G_VXOR;
-  case BinaryInst::SHL:
-    return Opcode::G_VSHL;
-  case BinaryInst::LSHR:
-    return Opcode::G_VLSHR;
-  case BinaryInst::ASHR:
-    return Opcode::G_VASHR;
-  default:
-    throw BackendError("unsupported generic integer vector operation");
-  }
-}
-
-void lowerVectorBinary(MachineFunction &mf, MachineBasicBlock &mbb,
-                       BinaryInst &inst, Value *lhs, Value *rhs) {
-  const MachineVectorType OperandType =
-      machineVectorTypeForIR(lhs->getIRType());
-  if (machineVectorTypeForIR(rhs->getIRType()) != OperandType) {
-    throw BackendError("vector binary operands have mismatched shapes");
-  }
-  const Opcode PseudoOpcode =
-      genericVectorBinaryOpcode(inst.getOp(), OperandType);
-  MachineReg Dst = getOrCreateResultReg(
-      mf, inst, RegClass::GenericVector);
-  MachineInstr Pseudo;
-  Pseudo.opcode = PseudoOpcode;
-  Pseudo.defs.push_back(MachineOperand::reg(Dst));
-  Pseudo.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, lhs)));
-  Pseudo.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, rhs)));
-  if (BinaryInst::isCompareOp(inst.getOp())) {
-    Pseudo.uses.push_back(
-        MachineOperand::imm(static_cast<int64_t>(inst.getOp())));
-  }
-  mbb.instrs.push_back(std::move(Pseudo));
-}
-
 // 二元指令 lowering 总入口。先判浮点/整数;比较走比较 lowering;整数则依次尝试立即数折叠、
 // 2 的幂强度削减、非幂正常量的 magic 除法,均不命中再落到通用寄存器-寄存器指令。
 // 浮点用 *_S 指令,整数算术用带 W 的字指令,逻辑/移位按操作码选择。
@@ -1755,14 +1539,6 @@ void lowerBinary(MachineFunction &mf, MachineBasicBlock &mbb,
                  LoweringState &state, BinaryInst &inst) {
   Value *lhs = requiredUseValue(inst, 0, "binary instruction");
   Value *rhs = requiredUseValue(inst, 1, "binary instruction");
-  if (isVectorType(lhs->getIRType()) || isVectorType(rhs->getIRType())) {
-    if (!isVectorType(lhs->getIRType()) ||
-        !isVectorType(rhs->getIRType())) {
-      throw BackendError("scalar/vector mixed binary reached backend");
-    }
-    lowerVectorBinary(mf, mbb, inst, lhs, rhs);
-    return;
-  }
   const bool floatOperands = lhs && isFloatType(lhs->getIRType());
   state.beginDivRemBlock(mbb.irBlock);
 
@@ -1864,10 +1640,6 @@ void lowerBinary(MachineFunction &mf, MachineBasicBlock &mbb,
 void lowerRet(MachineFunction &mf, MachineBasicBlock &mbb, RetInst &inst) {
   Value *retValue = useValue(inst, 0);
   if (retValue) {
-    if (isVectorType(retValue->getIRType())) {
-      throw BackendError(
-          "vector return ABI is not configured for function " + mf.name);
-    }
     MachineReg src = valueReg(mf, mbb, retValue);
     RegClass rc = regClassForType(retValue->getIRType());
     if (rc == RegClass::FPR32) {
@@ -1897,45 +1669,6 @@ void lowerCast(MachineFunction &mf, MachineBasicBlock &mbb, Instruction &inst) {
   Value *srcValue = useValue(inst, 0);
   if (!srcValue) {
     throw BackendError("missing operand while lowering cast instruction");
-  }
-  if (isVectorType(srcValue->getIRType()) ||
-      isVectorType(inst.getIRType())) {
-    if (!isVectorType(srcValue->getIRType()) ||
-        !isVectorType(inst.getIRType())) {
-      throw BackendError("scalar/vector cast must be legalized before backend");
-    }
-    const MachineVectorType SourceType =
-        machineVectorTypeForIR(srcValue->getIRType());
-    const MachineVectorType ResultType =
-        machineVectorTypeForIR(inst.getIRType());
-    if (SourceType.lanes != ResultType.lanes) {
-      throw BackendError("vector cast changes lane count");
-    }
-    Opcode PseudoOpcode = Opcode::NOP;
-    switch (inst.instType) {
-    case Instruction::TRUNC:
-      PseudoOpcode = Opcode::G_VTRUNC;
-      break;
-    case Instruction::ZEXT:
-      PseudoOpcode = Opcode::G_VZEXT;
-      break;
-    case Instruction::SEXT:
-      PseudoOpcode = Opcode::G_VSEXT;
-      break;
-    case Instruction::FPTOSI:
-      PseudoOpcode = Opcode::G_VFPTOSI;
-      break;
-    case Instruction::SITOFP:
-      PseudoOpcode = Opcode::G_VSITOFP;
-      break;
-    default:
-      throw BackendError("unsupported generic vector cast");
-    }
-    MachineReg Dst = getOrCreateResultReg(
-        mf, inst, RegClass::GenericVector);
-    appendRegInstr(mbb, PseudoOpcode, Dst,
-                   {valueReg(mf, mbb, srcValue)});
-    return;
   }
   MachineReg src = valueReg(mf, mbb, srcValue);
   MachineReg dst =
@@ -1983,27 +1716,6 @@ void lowerAlloca(MachineFunction &mf, LoweringState &state,
 void lowerLoad(MachineFunction &mf, MachineBasicBlock &mbb,
                LoweringState &state, LoadInst &inst) {
   Value *ptr = requiredUseValue(inst, 0, "load instruction");
-  if (isVectorType(inst.getIRType())) {
-    const MachineVectorType Type = machineVectorTypeForIR(inst.getIRType());
-    if (Type.isMask()) {
-      throw BackendError("mask vector load representation is target-dependent");
-    }
-    MachineReg Dst = getOrCreateResultReg(
-        mf, inst, RegClass::GenericVector);
-    const Address Memory =
-        addressForValue(mf, mbb, state, ptr, "vector load instruction");
-    MachineInstr Pseudo;
-    Pseudo.opcode = Opcode::G_VLOAD;
-    Pseudo.defs.push_back(MachineOperand::reg(Dst));
-    Pseudo.uses.push_back(addressBaseOperand(Memory));
-    Pseudo.uses.push_back(MachineOperand::imm(Memory.offset));
-    Pseudo.mayLoad = true;
-    Pseudo.memorySize = static_cast<uint32_t>(sizeOfType(inst.getIRType()));
-    Pseudo.memoryAlignment =
-        static_cast<uint32_t>(alignOfType(inst.getIRType()));
-    mbb.instrs.push_back(std::move(Pseudo));
-    return;
-  }
   MachineReg dst =
       getOrCreateResultReg(mf, inst, regClassForType(inst.getIRType()));
   appendLoad(mbb, loadOpcodeForType(inst.getIRType()), dst,
@@ -2015,27 +1727,6 @@ void lowerStore(MachineFunction &mf, MachineBasicBlock &mbb,
                 LoweringState &state, StoreInst &inst) {
   Value *value = requiredUseValue(inst, 0, "store instruction");
   Value *ptr = requiredUseValue(inst, 1, "store instruction");
-  if (isVectorType(value->getIRType())) {
-    const MachineVectorType Type = machineVectorTypeForIR(value->getIRType());
-    if (Type.isMask()) {
-      throw BackendError("mask vector store representation is target-dependent");
-    }
-    const Address Memory =
-        addressForValue(mf, mbb, state, ptr, "vector store instruction");
-    MachineInstr Pseudo;
-    Pseudo.opcode = Opcode::G_VSTORE;
-    Pseudo.uses.push_back(
-        MachineOperand::reg(valueReg(mf, mbb, value)));
-    Pseudo.uses.push_back(addressBaseOperand(Memory));
-    Pseudo.uses.push_back(MachineOperand::imm(Memory.offset));
-    Pseudo.sideEffects = true;
-    Pseudo.mayStore = true;
-    Pseudo.memorySize = static_cast<uint32_t>(sizeOfType(value->getIRType()));
-    Pseudo.memoryAlignment =
-        static_cast<uint32_t>(alignOfType(value->getIRType()));
-    mbb.instrs.push_back(std::move(Pseudo));
-    return;
-  }
   appendStore(mbb, storeOpcodeForType(value->getIRType()),
               valueReg(mf, mbb, value),
               addressForValue(mf, mbb, state, ptr, "store instruction"));
@@ -2056,19 +1747,6 @@ void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
     if (address.kind == Address::Kind::Reg && address.offset == 0) {
       mf.valueRegs[&inst] = address.reg;
     }
-    return;
-  }
-
-  if (isVectorType(srcType) || isVectorType(dstType)) {
-    if (!isVectorType(srcType) || !isVectorType(dstType) ||
-        sizeOfType(srcType) != sizeOfType(dstType)) {
-      throw BackendError(
-          "generic vector bitcast requires equal-width vector operands");
-    }
-    MachineReg Dst = getOrCreateResultReg(
-        mf, inst, RegClass::GenericVector);
-    appendRegInstr(mbb, Opcode::G_VBITCAST, Dst,
-                   {valueReg(mf, mbb, srcValue)});
     return;
   }
 
@@ -2709,17 +2387,6 @@ void lowerCall(MachineFunction &mf, MachineBasicBlock &mbb,
                LoweringState &state, CallInst &inst) {
   Value *callee = requiredUseValue(inst, 0, "call instruction");
 
-  if (isVectorType(inst.getIRType())) {
-    throw BackendError("vector call result ABI is not configured");
-  }
-  auto &CallUses = inst.getUserList();
-  for (std::size_t Index = 1; Index < CallUses.size(); ++Index) {
-    Value *Argument = CallUses[Index] ? CallUses[Index]->getValue() : nullptr;
-    if (Argument && isVectorType(Argument->getIRType())) {
-      throw BackendError("vector call argument ABI is not configured");
-    }
-  }
-
   std::string name = calleeName(callee);
   if (name == "llvm.memcpy.p0.p0.i32" ||
       name == "llvm.memcpy.p0i8.p0i8.i32") {
@@ -2884,11 +2551,6 @@ void lowerBranch(MachineFunction &mf, MachineBasicBlock &mbb,
   auto *trueBlock = dynamic_cast<BasicBlock *>(uses[1]->getValue());
   auto *falseBlock = dynamic_cast<BasicBlock *>(uses[2]->getValue());
 
-  if (isVectorType(cond->getIRType())) {
-    throw BackendError(
-        "vector mask cannot be used as a scalar branch condition");
-  }
-
   MachineInstr branch;
   branch.opcode = Opcode::BNEZ;
   branch.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, cond)));
@@ -2923,136 +2585,21 @@ void lowerPhi(MachineFunction &mf, MachineBasicBlock &mbb,
   mbb.instrs.push_back(std::move(phi));
 }
 
-// 标量结果使用原有 SELECT；向量结果使用独立 G_VSELECT。后者既可表示标量
-// i1 选择整个向量，也可表示 <N x i1> 逐 lane mask，绝不能交给标量分支展开。
+// 选择指令仅处理标量条件与标量结果。
 void lowerSelect(MachineFunction &mf, MachineBasicBlock &mbb, SelectInst &inst) {
   Value *cond = requiredUseValue(inst, 0, "select instruction");
   Value *trueValue = requiredUseValue(inst, 1, "select instruction");
   Value *falseValue = requiredUseValue(inst, 2, "select instruction");
 
-  const bool VectorResult = isVectorType(inst.getIRType());
-  if (VectorResult) {
-    if (!isVectorType(trueValue->getIRType()) ||
-        !isVectorType(falseValue->getIRType())) {
-      throw BackendError("vector select has scalar value operand");
-    }
-    const MachineVectorType ResultType =
-        machineVectorTypeForIR(inst.getIRType());
-    if (machineVectorTypeForIR(trueValue->getIRType()) != ResultType ||
-        machineVectorTypeForIR(falseValue->getIRType()) != ResultType) {
-      throw BackendError("vector select value shapes differ");
-    }
-    if (isVectorType(cond->getIRType())) {
-      const MachineVectorType MaskType =
-          machineVectorTypeForIR(cond->getIRType());
-      const unsigned ExpectedMaskGranule =
-          ResultType.isMask() ? ResultType.maskGranuleBits
-                              : ResultType.elementBits();
-      if (!MaskType.isMask() || MaskType.lanes != ResultType.lanes ||
-          MaskType.maskGranuleBits != ExpectedMaskGranule) {
-        throw BackendError("vector select mask shape mismatch");
-      }
-    } else if (!isBoolType(cond->getIRType())) {
-      throw BackendError("whole-vector select requires an i1 condition");
-    }
-  } else if (isVectorType(cond->getIRType()) ||
-             isVectorType(trueValue->getIRType()) ||
-             isVectorType(falseValue->getIRType())) {
-    throw BackendError("vector operand reached scalar select lowering");
-  }
-
   MachineReg dst =
       getOrCreateResultReg(mf, inst, regClassForType(inst.getIRType()));
   MachineInstr select;
-  select.opcode = VectorResult ? Opcode::G_VSELECT : Opcode::SELECT;
+  select.opcode = Opcode::SELECT;
   select.defs.push_back(MachineOperand::reg(dst));
   select.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, cond)));
   select.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, trueValue)));
   select.uses.push_back(MachineOperand::reg(valueReg(mf, mbb, falseValue)));
   mbb.instrs.push_back(std::move(select));
-}
-
-MachineOperand lowerVectorLaneIndex(MachineFunction &mf,
-                                    MachineBasicBlock &mbb, Value *index,
-                                    uint16_t lanes,
-                                    const std::string &context) {
-  int64_t ConstantIndex = 0;
-  if (intConstant(index, ConstantIndex)) {
-    if (ConstantIndex < 0 || ConstantIndex >= lanes) {
-      throw BackendError("out-of-range constant lane while lowering " +
-                         context);
-    }
-    return MachineOperand::imm(ConstantIndex);
-  }
-  MachineReg IndexReg = valueReg(mf, mbb, index);
-  if (IndexReg.rc != RegClass::GPR32) {
-    throw BackendError("dynamic vector lane index must be GPR32");
-  }
-  return MachineOperand::reg(IndexReg);
-}
-
-void lowerExtractElement(MachineFunction &mf, MachineBasicBlock &mbb,
-                         ExtractElementInst &inst) {
-  Value *Vector = inst.getVectorOperand();
-  Value *Index = inst.getIndexOperand();
-  const MachineVectorType Type = machineVectorTypeForIR(Vector->getIRType());
-  MachineReg Dst = getOrCreateResultReg(
-      mf, inst, regClassForType(inst.getIRType()));
-  MachineInstr Pseudo;
-  Pseudo.opcode = Opcode::G_VEXTRACT;
-  Pseudo.defs.push_back(MachineOperand::reg(Dst));
-  Pseudo.uses.push_back(
-      MachineOperand::reg(valueReg(mf, mbb, Vector)));
-  Pseudo.uses.push_back(lowerVectorLaneIndex(
-      mf, mbb, Index, Type.lanes, "extractelement"));
-  mbb.instrs.push_back(std::move(Pseudo));
-}
-
-void lowerInsertElement(MachineFunction &mf, MachineBasicBlock &mbb,
-                        InsertElementInst &inst) {
-  Value *Vector = inst.getVectorOperand();
-  Value *Element = inst.getElementOperand();
-  Value *Index = inst.getIndexOperand();
-  const MachineVectorType Type = machineVectorTypeForIR(Vector->getIRType());
-  MachineReg Dst = getOrCreateResultReg(
-      mf, inst, RegClass::GenericVector);
-  MachineInstr Pseudo;
-  Pseudo.opcode = Opcode::G_VINSERT;
-  Pseudo.defs.push_back(MachineOperand::reg(Dst));
-  Pseudo.uses.push_back(
-      MachineOperand::reg(valueReg(mf, mbb, Vector)));
-  Pseudo.uses.push_back(
-      MachineOperand::reg(valueReg(mf, mbb, Element)));
-  Pseudo.uses.push_back(lowerVectorLaneIndex(
-      mf, mbb, Index, Type.lanes, "insertelement"));
-  mbb.instrs.push_back(std::move(Pseudo));
-}
-
-void lowerShuffleVector(MachineFunction &mf, MachineBasicBlock &mbb,
-                        ShuffleVectorInst &inst) {
-  Value *First = inst.getFirstVectorOperand();
-  Value *Second = inst.getSecondVectorOperand();
-  const MachineVectorType InputType =
-      machineVectorTypeForIR(First->getIRType());
-  if (machineVectorTypeForIR(Second->getIRType()) != InputType) {
-    throw BackendError("shufflevector input shapes differ");
-  }
-  MachineReg Dst = getOrCreateResultReg(
-      mf, inst, RegClass::GenericVector);
-  MachineInstr Pseudo;
-  Pseudo.opcode = Opcode::G_VSHUFFLE;
-  Pseudo.defs.push_back(MachineOperand::reg(Dst));
-  Pseudo.uses.push_back(
-      MachineOperand::reg(valueReg(mf, mbb, First)));
-  Pseudo.uses.push_back(
-      MachineOperand::reg(valueReg(mf, mbb, Second)));
-  for (int Lane : inst.getMask()) {
-    if (Lane < -1 || Lane >= static_cast<int>(InputType.lanes) * 2) {
-      throw BackendError("invalid shufflevector mask during MIR lowering");
-    }
-    Pseudo.uses.push_back(MachineOperand::imm(Lane));
-  }
-  mbb.instrs.push_back(std::move(Pseudo));
 }
 
 // 遇到本后端不支持的 IR 指令时统一抛出后端错误。
@@ -3112,19 +2659,6 @@ void lowerInstruction(MachineFunction &mf, MachineBasicBlock &mbb,
     lowerSelect(mf, mbb, *select);
     return;
   }
-  if (auto *extract = dynamic_cast<ExtractElementInst *>(&inst)) {
-    lowerExtractElement(mf, mbb, *extract);
-    return;
-  }
-  if (auto *insert = dynamic_cast<InsertElementInst *>(&inst)) {
-    lowerInsertElement(mf, mbb, *insert);
-    return;
-  }
-  if (auto *shuffle = dynamic_cast<ShuffleVectorInst *>(&inst)) {
-    lowerShuffleVector(mf, mbb, *shuffle);
-    return;
-  }
-
   switch (inst.instType) {
   case Instruction::TRUNC:
   case Instruction::ZEXT:
@@ -3182,7 +2716,6 @@ void IRLowering::lowerGlobals(MachineModule &mm) {
     object.constant = (var->vartag == Variable::GlobalConstant);
     object.size = typeSizeBytes(objectType);
     object.align = typeAlignBytes(objectType);
-    object.requiresVectorLowering = containsVectorType(objectType);
     mm.globals.push_back(std::move(object));
   }
 }
@@ -3190,17 +2723,6 @@ void IRLowering::lowerGlobals(MachineModule &mm) {
 // lower 单个函数:建立机器基本块与标签、登记块标签映射、接入形参,再逐块逐指令
 // lowering;空函数体补一个只含 RET 的入口块。最后运行栈帧布局与帧对象展开。
 MachineFunction IRLowering::lowerFunction(Function &function) {
-  if (isVectorType(function.getIRType())) {
-    throw BackendError("vector return ABI is not configured for function " +
-                       function.getIdent());
-  }
-  for (const auto &Param : function.getParams()) {
-    if (Param && isVectorType(Param->getIRType())) {
-      throw BackendError("vector parameter ABI is not configured for function " +
-                         function.getIdent());
-    }
-  }
-
   MachineFunction mf;
   mf.name = function.getIdent();
   mf.irFunction = &function;

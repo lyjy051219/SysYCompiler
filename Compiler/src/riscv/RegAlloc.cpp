@@ -1734,13 +1734,6 @@ std::string allocationSignature(const MachineFunction &mf,
 // 兜底。stats 可选,记录轮数/合并数/溢出统计;am 可选,复用外部分析缓存。
 void allocateRegistersImpl(MachineFunction &mf, RegAllocStats *stats,
                            MachineFunctionAnalysisManager *am) {
-  if (containsGenericVectorMIR(mf)) {
-    throw BackendError(
-        "generic vector MIR reached register allocation in function " +
-        mf.name +
-        "; target vector registers and spill rules are not configured");
-  }
-
   std::set<uint32_t> generatedBySpill;
   std::string previousSignature;
   int repeatedSignature = 0;

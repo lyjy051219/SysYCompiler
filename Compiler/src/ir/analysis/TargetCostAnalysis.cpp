@@ -34,15 +34,7 @@ std::int64_t TargetCostInfo::signExtend12(std::uint64_t Value) {
 }
 
 bool TargetCostInfo::isFloatingType(const IRType *Type) {
-    if (!Type)
-        return false;
-    if (Type->isFloat())
-        return true;
-    if (!Type->isVector())
-        return false;
-    const VECTORType *Vector = dynamic_cast<const VECTORType *>(Type);
-    return Vector && Vector->getElementType() &&
-           Vector->getElementType()->isFloat();
+    return Type && Type->isFloat();
 }
 
 bool TargetCostInfo::isDirectScalarType(const IRType *Type) {
@@ -84,13 +76,6 @@ unsigned TargetCostInfo::getScalarIntegerBitWidth(const IRType *Type) {
         return 0;
     if (Type->isPointer())
         return 64;
-    if (Type->isVector()) {
-        const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-        return Vector && Vector->getElementType()
-                   ? getScalarIntegerBitWidth(
-                         Vector->getElementType().get())
-                   : 0;
-    }
     if (!Type->isInt() && !Type->isBool())
         return 0;
     const int Width = Type->getIntegerBitWidth(0);
@@ -164,104 +149,10 @@ int TargetCostInfo::getIntImmediateOperandCost(
     return getIntImmediateCost(Value, OperandBitWidth, Kind);
 }
 
-unsigned TargetCostInfo::getFixedVectorCostScale(
-    const IRType *Type) const noexcept {
-    const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-    if (!Vector || !Vector->getElementType())
-        return 0;
-    const auto &Element = Vector->getElementType();
-    if ((!Element->isFloat() && !Element->isInt()) ||
-        Vector->getElementCount() >
-            std::numeric_limits<unsigned>::max() / 32U)
-        return 0;
-    const unsigned VectorBits = static_cast<unsigned>(
-        Vector->getElementCount() * 32U);
-    if (VectorBits != 64 && VectorBits != 128)
-        return 0;
-    return VectorBits / 64U;
-}
-
-int TargetCostInfo::getFixedVectorArithmeticCost(
-    Instruction::InstType Opcode, const IRType *Type,
-    TargetCostKind Kind) const {
-    if (!isLegalVectorType(Type))
-        return InvalidCost;
-    const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-    if (!Vector || !Vector->getElementType())
-        return InvalidCost;
-
-    const unsigned Scale = getFixedVectorCostScale(Type);
-    if (Scale == 0)
-        return InvalidCost;
-    const auto &Element = Vector->getElementType();
-    const bool IsMask = Element->isInt() &&
-                        Element->hasIntegerBitWidth(1);
-    const bool IsInt32 = Element->isInt() &&
-                         Element->hasIntegerBitWidth(32);
-    const bool IsFloat32 = Element->isFloat();
-
-    if (Opcode == Instruction::BITCAST)
-        return 0;
-    if (Kind == TargetCostKind::CodeSize) {
-        // 白名单中的原生固定 SIMD 操作按一条未压缩指令计代码体积。
-        if ((IsMask && (Opcode == Instruction::AND ||
-                        Opcode == Instruction::OR ||
-                        Opcode == Instruction::XOR)) ||
-            (IsInt32 && (Opcode == Instruction::ADD ||
-                         Opcode == Instruction::SUB ||
-                         Opcode == Instruction::MUL ||
-                         Opcode == Instruction::AND ||
-                         Opcode == Instruction::OR ||
-                         Opcode == Instruction::XOR)) ||
-            (IsFloat32 && (Opcode == Instruction::FADD ||
-                           Opcode == Instruction::FSUB ||
-                           Opcode == Instruction::FMUL))) {
-            return 1;
-        }
-        return InvalidCost;
-    }
-
-    if (IsMask) {
-        if (Opcode == Instruction::AND || Opcode == Instruction::OR ||
-            Opcode == Instruction::XOR)
-            return static_cast<int>(Scale);
-        return InvalidCost;
-    }
-    if (IsInt32) {
-        switch (Opcode) {
-        case Instruction::ADD:
-        case Instruction::SUB:
-        case Instruction::AND:
-        case Instruction::OR:
-        case Instruction::XOR:
-            return static_cast<int>(Scale);
-        case Instruction::MUL:
-            return static_cast<int>(3U * Scale);
-        default:
-            return InvalidCost;
-        }
-    }
-    if (IsFloat32) {
-        switch (Opcode) {
-        case Instruction::FADD:
-        case Instruction::FSUB:
-        case Instruction::FMUL:
-            return static_cast<int>(3U * Scale);
-        default:
-            return InvalidCost;
-        }
-    }
-    return InvalidCost;
-}
-
 int TargetCostInfo::getArithmeticCost(Instruction::InstType Opcode,
                                       const IRType *Type,
                                       TargetCostKind Kind) const {
-    if (!Type)
-        return InvalidCost;
-    if (Type->isVector())
-        return getFixedVectorArithmeticCost(Opcode, Type, Kind);
-    if (!Type->isVector() && !isDirectScalarType(Type))
+    if (!isDirectScalarType(Type))
         return InvalidCost;
 
     const bool IsFloatOpcode = isFloatingArithmeticOpcode(Opcode);
@@ -292,9 +183,6 @@ int TargetCostInfo::getArithmeticCost(Instruction::InstType Opcode,
         IntegerWidth != 64)
         return InvalidCost;
     if (Opcode == Instruction::SITOFP && !IsFloatingValue)
-        return InvalidCost;
-    if (Opcode == Instruction::BITCAST && !Type->isVector() &&
-        !isDirectScalarType(Type))
         return InvalidCost;
     if (!IsFloatOpcode && !IsIntegerOpcode && !IsIntegerCast &&
         Opcode != Instruction::SITOFP && Opcode != Instruction::BITCAST)
@@ -348,23 +236,7 @@ int TargetCostInfo::getArithmeticCost(Instruction::InstType Opcode,
 
 int TargetCostInfo::getCompareCost(const IRType *Type,
                                    TargetCostKind Kind) const {
-    if (Type && Type->isVector()) {
-        if (!isLegalVectorType(Type))
-            return InvalidCost;
-        const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-        if (!Vector || !Vector->getElementType() ||
-            Vector->getElementType()->hasIntegerBitWidth(1))
-            return InvalidCost;
-        const unsigned Scale = getFixedVectorCostScale(Type);
-        if (Scale == 0)
-            return InvalidCost;
-        if (Kind == TargetCostKind::CodeSize)
-            return 1;
-        return Vector->getElementType()->isFloat()
-                   ? static_cast<int>(2U * Scale)
-                   : static_cast<int>(Scale);
-    }
-    if (Type && !Type->isVector() && !isDirectScalarType(Type))
+    if (!isDirectScalarType(Type))
         return InvalidCost;
     if (Kind == TargetCostKind::CodeSize)
         return 1;
@@ -386,28 +258,9 @@ int TargetCostInfo::getSelectCost(const IRType *Type,
 int TargetCostInfo::getSelectCost(const IRType *Type,
                                   TargetSelectShape Shape,
                                   TargetCostKind Kind) const {
-    if (!Type)
-        return InvalidCost;
-    if (Type->isVector()) {
-        if (!isLegalVectorType(Type) || Shape != TargetSelectShape::Generic)
-            return InvalidCost;
-        const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-        if (!Vector || !Vector->getElementType() ||
-            Vector->getElementType()->hasIntegerBitWidth(1))
-            return InvalidCost;
-        const unsigned Scale = getFixedVectorCostScale(Type);
-        if (Scale == 0)
-            return InvalidCost;
-        // 在缺少最终 mask 指令吞吐量前按“比较掩码 + 合并”保守估价。
-        return Kind == TargetCostKind::CodeSize
-                   ? 1
-                   : static_cast<int>(2U * Scale);
-    }
-    if (!Type->isVector() && !isDirectScalarType(Type))
+    if (!isDirectScalarType(Type))
         return InvalidCost;
     if (Shape != TargetSelectShape::Generic) {
-        if (Type->isVector())
-            return InvalidCost;
         const unsigned Width = getScalarIntegerBitWidth(Type);
         // 两种无分支白名单只适用于i32/i64 GPR；浮点严格语义始终走
         // Generic，不把NaN/有序比较错误当作整数min/max。
@@ -430,35 +283,7 @@ int TargetCostInfo::getMemoryCost(TargetMemoryOperation Operation,
                                   std::size_t Alignment,
                                   bool IsVolatile,
                                   TargetCostKind Kind) const {
-    if (!Type)
-        return InvalidCost;
-    if (Type->isVector()) {
-        if (!isLegalVectorType(Type))
-            return InvalidCost;
-        const auto *Vector = dynamic_cast<const VECTORType *>(Type);
-        if (!Vector || !Vector->getElementType() ||
-            Vector->getElementType()->hasIntegerBitWidth(1))
-            return InvalidCost;
-        const DataLayout Layout = DataLayout::forTarget();
-        const std::size_t NaturalAlignment =
-            Layout.getABITypeAlign(Type);
-        // 当前 Load/Store IR 没有显式较小 alignment；在正式建模非对齐
-        // 访存前，任何已知不足自然对齐的访问都必须保持非法。
-        if (Alignment != 0 && Alignment < NaturalAlignment)
-            return InvalidCost;
-        const unsigned Scale = getFixedVectorCostScale(Type);
-        if (Scale == 0)
-            return InvalidCost;
-        if (Kind == TargetCostKind::CodeSize)
-            return 1;
-        int VectorCost = Operation == TargetMemoryOperation::Load
-                             ? static_cast<int>(2U * Scale)
-                             : static_cast<int>(Scale);
-        if (IsVolatile)
-            ++VectorCost;
-        return VectorCost;
-    }
-    if (!Type->isVector() && !isDirectScalarType(Type))
+    if (!isDirectScalarType(Type))
         return InvalidCost;
 
     if (Kind == TargetCostKind::CodeSize)
@@ -472,40 +297,6 @@ int TargetCostInfo::getMemoryCost(TargetMemoryOperation Operation,
     if (IsVolatile)
         ++Cost;
     return Cost;
-}
-
-int TargetCostInfo::getVectorConstantCost(
-    const ConstantVector *Constant, TargetCostKind Kind) const {
-    if (!Constant || !isLegalVectorType(Constant->getIRType().get()))
-        return InvalidCost;
-    ConstantSystem *Splat = Constant->getSplatValue();
-    if (!Splat)
-        return InvalidCost;
-
-    const unsigned Scale = getFixedVectorCostScale(
-        Constant->getIRType().get());
-    if (Scale == 0)
-        return InvalidCost;
-    if (Kind == TargetCostKind::CodeSize)
-        return 1;
-
-    std::int64_t IntegerValue = 0;
-    if (Splat->tryGetInt64Const(IntegerValue)) {
-        if (IntegerValue == 0)
-            return static_cast<int>(Scale);
-        const int ScalarCost = getIntImmediateCost(
-            IntegerValue, 32, Kind);
-        if (ScalarCost >= InvalidCost)
-            return InvalidCost;
-        return ScalarCost + static_cast<int>(Scale);
-    }
-    float FloatValue = 0.0F;
-    if (Splat->tryGetFloatConst(FloatValue)) {
-        (void)FloatValue;
-        // 缺少专用浮点立即数信息时，按标量常量池读取加逐数据块广播估价。
-        return static_cast<int>(3U * Scale);
-    }
-    return InvalidCost;
 }
 
 int TargetCostInfo::getStaticAddressCost(
@@ -556,8 +347,6 @@ unsigned TargetCostInfo::getRegisterBitWidth(
     case TargetRegisterClass::FloatingPoint:
         // 当前IR和后端只暴露FPR32值，尽管D扩展物理寄存器可容纳64位。
         return 32;
-    case TargetRegisterClass::Vector:
-        return getNativeVectorBitWidth();
     }
     return 0;
 }
@@ -570,11 +359,6 @@ unsigned TargetCostInfo::getRegisterCount(
         return 25;
     case TargetRegisterClass::FloatingPoint:
         return 32;
-    case TargetRegisterClass::Vector:
-        // 位宽模式不能推出寄存器文件：64 位 packed SIMD 可能复用 GPR，
-        // 128 位实现也可能使用寄存器对或独立寄存器。正式文档公布前以
-        // 零表示未知，避免后续压力模型把猜测当成物理资源契约。
-        return 0;
     }
     return 0;
 }
@@ -592,8 +376,6 @@ unsigned TargetCostInfo::getArgumentRegisterCount(
     case TargetRegisterClass::GeneralPurpose:
     case TargetRegisterClass::FloatingPoint:
         return 8;
-    case TargetRegisterClass::Vector:
-        return 0;
     }
     return 0;
 }
@@ -643,31 +425,21 @@ int TargetCostInfo::getCallCost(const CallInst *Call,
             Argument ? Argument->getIRType() : nullptr;
         if (!Type)
             continue;
-        if (Type->isVector())
+        if (!isDirectScalarType(Type.get()))
             return InvalidCost;
         if (Type->isFloat())
             ++FloatingArguments;
         else
             ++IntegerArguments;
     }
-    if (Call->getIRType() && Call->getIRType()->isVector())
+    if (Call->getIRType() && !Call->getIRType()->isVoid() &&
+        !isDirectScalarType(Call->getIRType().get()))
         return InvalidCost;
     const bool IsIndirect =
         Call->getDirectCallee() == nullptr &&
         Call->getBuiltinCallee() == nullptr;
     return getCallCost(IntegerArguments, FloatingArguments,
                        IsIndirect, Kind);
-}
-
-bool TargetCostInfo::isLegalVectorType(const IRType *Type) const {
-    if (!Type || !Type->isVector())
-        return false;
-    const DataLayout Layout = DataLayout::forTarget();
-    return Layout.supportsNativeVectorType(Type);
-}
-
-unsigned TargetCostInfo::getNativeVectorBitWidth() const noexcept {
-    return DataLayout::forTarget().getNativeVectorBitWidth();
 }
 
 int TargetCostInfo::getInstructionCost(const Instruction *Inst,
@@ -781,15 +553,9 @@ int TargetCostInfo::getInstructionCost(const Instruction *Inst,
         Cost = AddressCost + DynamicCost;
         break;
     }
-    case Instruction::EXTRACTELEMENT:
-    case Instruction::INSERTELEMENT:
-    case Instruction::SHUFFLEVECTOR:
-        Cost = InvalidCost;
-        break;
     case Instruction::ICMP:
     case Instruction::FCMP: {
-        // 比较结果可能是 i1 或 <N x i1> 掩码；指令合法性与成本应按
-        // 被比较的数据类型判断，不能把掩码宽度误当作数据向量宽度。
+        // 比较成本按实际操作数类型计算，而不是按 i1 结果类型计算。
         const BinaryInst *Compare = dynamic_cast<const BinaryInst *>(Inst);
         Value *Left = nullptr;
         Value *Right = nullptr;

@@ -188,11 +188,7 @@ void User::addUse(Value *Operand) {
 }
 
 bool Value::isConstZero() const {
-    if (auto *Vector = dynamic_cast<const ConstantVector *>(this)) {
-        for (ConstantSystem *Element : Vector->getElements())
-            if (!Element->isConstZero()) return false;
-        return Vector->getNumElements() != 0;
-    } else if (auto numVal = dynamic_cast<const ConstInt*>(this))
+    if (auto numVal = dynamic_cast<const ConstInt*>(this))
         return numVal->getVal() == 0;
     else if (auto numVal = dynamic_cast<const ConstFloat*>(this))
         return numVal->getVal() == 0.0f;
@@ -208,11 +204,6 @@ bool Value::isConstIntZero() const {
 }
 
 bool Value::isConstOne() const {
-    if (auto *Vector = dynamic_cast<const ConstantVector *>(this)) {
-        for (ConstantSystem *Element : Vector->getElements())
-            if (!Element->isConstOne()) return false;
-        return Vector->getNumElements() != 0;
-    }
     if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == 1;
     if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == 1.0f;
     if (auto *CB = dynamic_cast<const ConstBool *>(this)) return CB->getVal();
@@ -220,11 +211,6 @@ bool Value::isConstOne() const {
 }
 
 bool Value::isConstMinusOne() const {
-    if (auto *Vector = dynamic_cast<const ConstantVector *>(this)) {
-        for (ConstantSystem *Element : Vector->getElements())
-            if (!Element->isConstMinusOne()) return false;
-        return Vector->getNumElements() != 0;
-    }
     if (auto *CI = dynamic_cast<const ConstInt *>(this)) return CI->getVal() == -1;
     if (auto *CF = dynamic_cast<const ConstFloat *>(this)) return CF->getVal() == -1.0f;
     return false;
@@ -474,16 +460,6 @@ bool Value::areEqualConstants(const Value *A, const Value *B) {
         auto *BB = dynamic_cast<const ConstBool *>(B);
         return BB && AB->getVal() == BB->getVal();
     }
-    if (auto *AV = dynamic_cast<const ConstantVector *>(A)) {
-        auto *BV = dynamic_cast<const ConstantVector *>(B);
-        if (!BV || AV->getNumElements() != BV->getNumElements())
-            return false;
-        for (std::size_t Index = 0; Index < AV->getNumElements(); ++Index)
-            if (!areEqualConstants(AV->getElement(Index),
-                                   BV->getElement(Index)))
-                return false;
-        return true;
-    }
     return false;
 }
 
@@ -517,10 +493,6 @@ Value *Value::makeZeroForType(const std::shared_ptr<IRType> &Ty) {
     if (Ty->isInt())
         return ConstInt::newConstIntForType(
             0, std::dynamic_pointer_cast<INTType>(Ty));
-    if (auto Vector = IRType::asVector(Ty))
-        return ConstantVector::getSplat(
-            Vector, static_cast<ConstantSystem *>(
-                        makeZeroForType(Vector->getElementType())));
     return ConstInt::newConstInt(0);
 }
 
@@ -531,10 +503,6 @@ Value *Value::makeOneForType(const std::shared_ptr<IRType> &Ty) {
     if (Ty->isInt())
         return ConstInt::newConstIntForType(
             1, std::dynamic_pointer_cast<INTType>(Ty));
-    if (auto Vector = IRType::asVector(Ty))
-        return ConstantVector::getSplat(
-            Vector, static_cast<ConstantSystem *>(
-                        makeOneForType(Vector->getElementType())));
     return ConstInt::newConstInt(1);
 }
 
@@ -545,10 +513,6 @@ Value *Value::makeMinusOneForType(const std::shared_ptr<IRType> &Ty) {
     if (Ty->isInt())
         return ConstInt::newConstIntForType(
             -1, std::dynamic_pointer_cast<INTType>(Ty));
-    if (auto Vector = IRType::asVector(Ty))
-        return ConstantVector::getSplat(
-            Vector, static_cast<ConstantSystem *>(
-                        makeMinusOneForType(Vector->getElementType())));
     return ConstInt::newConstInt(-1);
 }
 

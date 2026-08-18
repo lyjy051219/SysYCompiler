@@ -1,6 +1,5 @@
 #include "./include/yacc/Bison.hpp"
 #include "./include/lib/IRGenerator.hpp"
-#include "./include/lib/Target.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
 #include "./include/Common.hpp"
 #include "./include/riscv/Target.hpp"
@@ -9,6 +8,7 @@
 #include <memory>
 #include <cstdio>
 #include <fstream>
+#include <exception>
 
 std::unique_ptr<CompUnit> ASTRoot = nullptr;
 std::unique_ptr<Module> ModuleIR = std::make_unique<Module>();
@@ -55,24 +55,46 @@ int main(int argc, const char *argv[]) {
     //默认中端优化等级为O1
     OptimizationLevel OptLevel = OptimizationLevel::O1;
 
-    // 固定宽度自动向量化的唯一开关：
-    // Disabled：关闭；SIMD64：VF2；SIMD128：VF4；
-    // SIMD64And128：优先 VF4，并在合法时回退 VF2。
-    TargetInfo::get().setFixedSIMDMode(FixedSIMDMode::Disabled);
-
     //读取源文件->词法分析->语法分析->生成AST
     yyin = fopen(inputPath.c_str(), "r");
     if (!yyin) {
         std::cerr << "Error: cannot open input file " << inputPath << std::endl;
         return 1;
     }
-    yy::parser parser;
-    parser.parse();
+    int parseResult = 1;
+    try {
+        yy::parser parser;
+        parseResult = parser.parse();
+    } catch (const std::exception &error) {
+        fclose(yyin);
+        yyin = nullptr;
+        std::cerr << "词法或语法分析异常：" << error.what() << std::endl;
+        return 1;
+    } catch (...) {
+        fclose(yyin);
+        yyin = nullptr;
+        std::cerr << "词法或语法分析发生未知异常" << std::endl;
+        return 1;
+    }
     fclose(yyin);
+    yyin = nullptr;
+
+    if (parseResult != 0 || !ASTRoot) {
+        std::cerr << "编译失败：未能生成有效的语法树" << std::endl;
+        return 1;
+    }
 
     //IR生成
-    IRGenerator irGenerator;
-    irGenerator.visit(*ASTRoot);
+    try {
+        IRGenerator irGenerator;
+        irGenerator.visit(*ASTRoot);
+    } catch (const std::exception &error) {
+        std::cerr << "中端 IR 生成失败：" << error.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "中端 IR 生成发生未知异常" << std::endl;
+        return 1;
+    }
 
     //注册AnalysisPass
     ModuleAnalysisPassManager MAM;

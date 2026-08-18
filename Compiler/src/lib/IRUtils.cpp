@@ -232,12 +232,6 @@ std::string IRKey::type(const std::shared_ptr<IRType> &Ty) {
            << type(Array ? Array->getElementType() : nullptr) << ')';
         break;
     }
-    case IR_VECTOR: {
-        auto Vector = std::dynamic_pointer_cast<VECTORType>(Ty);
-        OS << "vec" << (Vector ? Vector->getElementCount() : 0) << '('
-           << type(Vector ? Vector->getElementType() : nullptr) << ')';
-        break;
-    }
     case IR_UNDEF:
         OS << "undef";
         break;

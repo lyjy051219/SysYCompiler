@@ -34,6 +34,7 @@ Float {DEC_FLOAT}|{HEX_FLOAT}
 "int"               { return yy::parser::make_INT(); }
 "float"             { return yy::parser::make_FLOAT();}
 "void"              { return yy::parser::make_VOID();}
+"tensor"            { return yy::parser::make_TENSOR();}
 "const"             { return yy::parser::make_CONST();}
 "return"            { return yy::parser::make_RETURN();}
 "if"                { return yy::parser::make_IF();}
@@ -65,6 +66,7 @@ Float {DEC_FLOAT}|{HEX_FLOAT}
 "/"                 { return yy::parser::make_DIV();}
 "%"                 { return yy::parser::make_MOD();}
 "="                 { return yy::parser::make_ASSIGN();}
+"@"                 { return yy::parser::make_GEMM();}
 
 {Identifier}        {return yy::parser::make_IDENT(LocatedIdentifier{std::string(yytext), yylineno});}
 {Float}             {return yy::parser::make_FLOATCONST(std::stof(yytext));}

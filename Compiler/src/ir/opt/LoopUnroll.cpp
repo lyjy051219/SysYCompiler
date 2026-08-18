@@ -669,11 +669,6 @@ UnrollRegisterPressure LoopUnrollPass::estimateUnrollRegisterPressure(
         if (!V || !V->getIRType() || V->isConst() ||
             dynamic_cast<BasicBlock *>(V))
             return;
-        if (V->getIRType()->isVector()) {
-            Pressure.GeneralPurpose = std::numeric_limits<unsigned>::max();
-            Pressure.FloatingPoint = std::numeric_limits<unsigned>::max();
-            return;
-        }
         unsigned &Count = V->getIRType()->isFloat()
             ? Pressure.FloatingPoint : Pressure.GeneralPurpose;
         if (Count > std::numeric_limits<unsigned>::max() - Multiplier)
@@ -2584,23 +2579,6 @@ UnrollDecision LoopUnrollPass::computeUnrollDecision(
     const TargetCostInfo &TargetCost) const {
     if (!L || !TCI.Valid || BodyCost <= 0) {
         return makeNoUnrollDecision();
-    }
-    // 普通循环展开的寄存器与代码体积模型只覆盖标量值。向量化后
-    // 的循环必须交给向量寄存器压力模型决定是否再展开；在该模型
-    // 尚未建立前保守跳过，避免把InvalidCost当作廉价指令进行复制。
-    for (BasicBlock *Block : L->getBlocksIncludingSubLoops()) {
-        if (!Block) return makeNoUnrollDecision();
-        for (Instruction *I : *Block) {
-            if (!I) return makeNoUnrollDecision();
-            if (I->getIRType() && I->getIRType()->isVector())
-                return makeNoUnrollDecision();
-            for (std::size_t Index = 0; Index < I->getNumOperands(); ++Index) {
-                Value *Operand = I->getOperand(Index);
-                if (Operand && Operand->getIRType() &&
-                    Operand->getIRType()->isVector())
-                    return makeNoUnrollDecision();
-            }
-        }
     }
     //3. 决策器按固定优先级返回首个合法且资源受控的方案；调用和嵌套循环会限制后续部分/runtime 路径。
     bool HasCall = containsCall(L, LI);

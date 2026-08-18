@@ -7,10 +7,7 @@
 
 namespace riscv {
 
-// GenericVector 只表示尚未映射到具体 ISA 的逻辑向量寄存器类。
-// 在决赛寄存器文件、mask 表示和别名规则公布前，它没有任何物理寄存器池，
-// 也不得进入寄存器分配。
-enum class RegClass { GPR32, GPR64, FPR32, GenericVector };
+enum class RegClass { GPR32, GPR64, FPR32 };
 
 enum class PhysReg : uint16_t {
   NoReg = 0,

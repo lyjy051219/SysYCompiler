@@ -58,9 +58,6 @@
 #include "ir/opt/LoopDistribution.hpp"
 #include "ir/opt/LoopFusion.hpp"
 #include "ir/opt/UnrollAndJam.hpp"
-#include "ir/opt/VectorCombine.hpp"
-#include "ir/opt/LoopVectorize.hpp"
-#include "ir/opt/SLPVectorize.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -254,8 +251,6 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         LoopSimplifyPass(), 8));
     FPM.addPass(LCSSAPass());
-//向量化应用点1：
-    FPM.addPass(LoopVectorizePass());
     //8. 最后展开剩余适合循环，并对展开结果运行最多两轮专用清理。
     UnrollConfig LoopUnrollConfig;
     //竞赛O1就是完整优化级别；通用runtime主段和尾副本使用完整RV64预算。
@@ -263,9 +258,6 @@ FunctionPassManager PassBuilder::buildLoopPipeline() {
     FPM.addPass(LoopUnrollPass(LoopUnrollConfig));
     FPM.addPass(createFixedPointPass<Function, FunctionAnalysisPassManager>(
         buildPostUnrollCleanupPipeline(), 2));
-//向量化应用点2,3：
-    FPM.addPass(SLPVectorizePass());
-    FPM.addPass(VectorCombinePass(VectorCombineStage::Late));
     FPM.addPass(CFGSimplifyPass());
     FPM.addPass(DCEPass());
     return FPM;
@@ -383,9 +375,6 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
     MPM.addPass(GlobalInitializerFoldPass());
     MPM.addPass(createFixedPointPass<Module, ModuleAnalysisPassManager>(
         createModuleFunctionBridge(buildLightCleanupPipeline(), FAM), 2));
-//向量化应用点4：
-    MPM.addPass(createModuleFunctionBridge(
-        VectorCombinePass(VectorCombineStage::Early), FAM));
     //3. 大栈对象全局化后再次折叠其初始化，并删除只写全局与无用索引写。
     MPM.addPass(Local2GlobalPass());
     MPM.addPass(GlobalInitializerFoldPass());
@@ -502,9 +491,6 @@ ModulePassManager PassBuilder::buildModulePipeline(OptimizationLevel Level, Func
 	MPM.addPass(createModuleFunctionBridge(StoreMergePass(), FAM));
     MPM.addPass(createModuleFunctionBridge(LoadEliminationPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(DSEPass(), FAM));
-//向量化应用点5：
-    MPM.addPass(createModuleFunctionBridge(
-        VectorCombinePass(VectorCombineStage::Late), FAM));
     MPM.addPass(createModuleFunctionBridge(DCEPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(CFGSimplifyPass(), FAM));
     MPM.addPass(createModuleFunctionBridge(buildLatePipeline(), FAM));

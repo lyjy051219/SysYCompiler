@@ -467,7 +467,7 @@ extern int yylex (void);
 #undef yyTABLES_NAME
 #endif
 
-#line 86 "src/yacc/sysy.l"
+#line 88 "src/yacc/sysy.l"
 
 
 #line 474 "include/yacc/Flex.hpp"

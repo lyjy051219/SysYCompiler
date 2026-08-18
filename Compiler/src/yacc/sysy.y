@@ -25,11 +25,11 @@
 %code{
 extern yy::parser::symbol_type yylex();
 extern std::unique_ptr<CompUnit> ASTRoot;
-namespace yy {
-    void parser::error(const std::string &err)
-    {
-        std::cerr << "Bison error: " << err << '\n';
-    }
+extern int yylineno;
+
+void yy::parser::error(const std::string &err)
+{
+    std::cerr << "语法错误：第 " << yylineno << " 行：" << err << '\n';
 }
 }
 
@@ -41,6 +41,8 @@ namespace yy {
 %token INT
 %token FLOAT
 %token VOID
+%token TENSOR
+%token GEMM
 %token OR
 %token AND
 %token NOT
@@ -108,7 +110,7 @@ namespace yy {
 %nterm <RelExp*> RelExp
 %nterm <EqExp*> EqExp
 %nterm <LAndExp*> LAndExp
-%nterm <Type> Type
+%nterm <ASTType> Type
 
 %start Start
 
@@ -274,6 +276,7 @@ MulExp
  | MulExp MUL UnaryExp { $$ = $1; $$->pushBack(SY_MUL); $$->pushBack($3); }
  | MulExp DIV UnaryExp { $$ = $1; $$->pushBack(SY_DIV); $$->pushBack($3); }
  | MulExp MOD UnaryExp { $$ = $1; $$->pushBack(SY_MOD); $$->pushBack($3); }
+ | MulExp GEMM UnaryExp { $$ = $1; $$->pushBack(SY_GEMM); $$->pushBack($3); }
  ;
 
 AddExp
@@ -308,9 +311,11 @@ LOrExp
 
 
 Type
- : VOID{$$=SY_VOID;}
- | INT {$$=SY_INT;}
- | FLOAT {$$=SY_FLOAT;}
+ : VOID { $$ = ASTType::makeScalar(ASTScalarKind::Void); }
+ | INT { $$ = ASTType::makeScalar(ASTScalarKind::Int32); }
+ | FLOAT { $$ = ASTType::makeScalar(ASTScalarKind::Float32); }
+ | TENSOR INT { $$ = ASTType::makeTensor(ASTScalarKind::Int32); }
+ | TENSOR FLOAT { $$ = ASTType::makeTensor(ASTScalarKind::Float32); }
  ;
 
 %%

@@ -113,10 +113,6 @@ bool isMemoryOrderInstruction(const MachineInstr &instr) {
 
 // 各操作码的近似执行延迟（周期数），是调度关键路径与就绪时间估算的基础。
 uint32_t opcodeLatency(Opcode opcode) {
-  if (isGenericVectorOpcode(opcode)) {
-    throw BackendError(
-        "generic vector pseudo reached the post-RA scheduler");
-  }
   switch (opcode) {
   case Opcode::NOP:
     return 0;

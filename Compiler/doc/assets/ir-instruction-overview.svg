@@ -20,7 +20,7 @@
 
   <rect width="1920" height="1080" fill="#ffffff"/>
   <text x="96" y="82" class="title">LLVM 风格 IR 指令体系</text>
-  <text x="96" y="121" class="subtitle">前端生成核心指令 · 中端扩展 SSA、位运算、移位与向量指令</text>
+  <text x="96" y="121" class="subtitle">前端生成核心指令 · 中端扩展 SSA、位运算、移位与类型转换</text>
 
   <rect x="790" y="154" width="340" height="76" rx="8" class="root"/>
   <text x="960" y="202" text-anchor="middle" class="card-title">Instruction</text>
@@ -30,7 +30,6 @@
   <path d="M960 230 V268 H1594 V304" class="line" marker-end="url(#arrow)"/>
   <path d="M960 230 V696 H326 V730" class="line" marker-end="url(#arrow)"/>
   <path d="M960 230 V696 H960 V730" class="line" marker-end="url(#arrow)"/>
-  <path d="M960 230 V696 H1594 V730" class="line" marker-end="url(#arrow)"/>
 
   <!-- Control-flow card -->
   <rect x="76" y="304" width="500" height="342" rx="10" class="card"/>
@@ -83,11 +82,4 @@
   <text x="960" y="913" text-anchor="middle" class="inst">Select</text>
   <text x="960" y="953" text-anchor="middle" class="hint">控制流值合并 · 条件值选择</text>
 
-  <!-- Vector card -->
-  <rect x="1344" y="730" width="500" height="248" rx="10" class="card"/>
-  <text x="1594" y="777" text-anchor="middle" class="card-title">向量运算</text>
-  <line x1="1374" y1="796" x2="1814" y2="796" class="divider"/>
-  <text x="1594" y="843" text-anchor="middle" class="inst-small">extractelement</text>
-  <text x="1594" y="890" text-anchor="middle" class="inst-small">insertelement</text>
-  <text x="1594" y="937" text-anchor="middle" class="inst-small">shufflevector</text>
 </svg>

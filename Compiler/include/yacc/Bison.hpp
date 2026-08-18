@@ -388,80 +388,80 @@ namespace yy {
     /// An auxiliary type to compute the largest semantic type.
     union union_type
     {
+      // Type
+      char dummy1[sizeof (ASTType)];
+
       // AddExp
-      char dummy1[sizeof (AddExp*)];
+      char dummy2[sizeof (AddExp*)];
 
       // ConstExpList
       // ExpList
-      char dummy2[sizeof (ArrayList*)];
+      char dummy3[sizeof (ArrayList*)];
 
       // Decl
       // BlockItem
       // Stmt
       // PrimaryExp
-      char dummy3[sizeof (BaseAST*)];
+      char dummy4[sizeof (BaseAST*)];
 
       // Block
-      char dummy4[sizeof (Block*)];
+      char dummy5[sizeof (Block*)];
 
       // BlockItemList
-      char dummy5[sizeof (BlockItemList*)];
+      char dummy6[sizeof (BlockItemList*)];
 
       // CompUnit
-      char dummy6[sizeof (CompUnit*)];
+      char dummy7[sizeof (CompUnit*)];
 
       // ConstDecl
-      char dummy7[sizeof (ConstDecl*)];
+      char dummy8[sizeof (ConstDecl*)];
 
       // ConstDef
-      char dummy8[sizeof (ConstDef*)];
+      char dummy9[sizeof (ConstDef*)];
 
       // ConstDefList
-      char dummy9[sizeof (ConstDefList*)];
+      char dummy10[sizeof (ConstDefList*)];
 
       // EqExp
-      char dummy10[sizeof (EqExp*)];
+      char dummy11[sizeof (EqExp*)];
 
       // FuncDef
-      char dummy11[sizeof (FuncDef*)];
+      char dummy12[sizeof (FuncDef*)];
 
       // FuncFParam
-      char dummy12[sizeof (FuncParam*)];
+      char dummy13[sizeof (FuncParam*)];
 
       // FuncFParamList
-      char dummy13[sizeof (FuncParamList*)];
+      char dummy14[sizeof (FuncParamList*)];
 
       // FuncRParamList
-      char dummy14[sizeof (FuncRParamList*)];
+      char dummy15[sizeof (FuncRParamList*)];
 
       // ConstInitVal
       // InitVal
-      char dummy15[sizeof (InitVal*)];
+      char dummy16[sizeof (InitVal*)];
 
       // ConstInitValList
       // InitValList
-      char dummy16[sizeof (InitValList*)];
+      char dummy17[sizeof (InitValList*)];
 
       // LAndExp
-      char dummy17[sizeof (LAndExp*)];
+      char dummy18[sizeof (LAndExp*)];
 
       // LOrExp
-      char dummy18[sizeof (LOrExp*)];
+      char dummy19[sizeof (LOrExp*)];
 
       // LVal
-      char dummy19[sizeof (LVal*)];
+      char dummy20[sizeof (LVal*)];
 
       // IDENT
-      char dummy20[sizeof (LocatedIdentifier)];
+      char dummy21[sizeof (LocatedIdentifier)];
 
       // MulExp
-      char dummy21[sizeof (MulExp*)];
+      char dummy22[sizeof (MulExp*)];
 
       // RelExp
-      char dummy22[sizeof (RelExp*)];
-
-      // Type
-      char dummy23[sizeof (Type)];
+      char dummy23[sizeof (RelExp*)];
 
       // UnaryExp
       char dummy24[sizeof (UnaryExp*)];
@@ -530,36 +530,38 @@ namespace yy {
     INT = 262,                     // INT
     FLOAT = 263,                   // FLOAT
     VOID = 264,                    // VOID
-    OR = 265,                      // OR
-    AND = 266,                     // AND
-    NOT = 267,                     // NOT
-    EQ = 268,                      // EQ
-    NOTEQ = 269,                   // NOTEQ
-    LESS = 270,                    // LESS
-    GREAT = 271,                   // GREAT
-    LESSEQ = 272,                  // LESSEQ
-    GREATEQ = 273,                 // GREATEQ
-    ADD = 274,                     // ADD
-    SUB = 275,                     // SUB
-    MUL = 276,                     // MUL
-    DIV = 277,                     // DIV
-    MOD = 278,                     // MOD
-    ASSIGN = 279,                  // ASSIGN
-    RETURN = 280,                  // RETURN
-    IF = 281,                      // IF
-    ELSE = 282,                    // ELSE
-    WHILE = 283,                   // WHILE
-    BREAK = 284,                   // BREAK
-    CONTINUE = 285,                // CONTINUE
-    L_SMALL_BRACKET = 286,         // L_SMALL_BRACKET
-    R_SMALL_BRACKET = 287,         // R_SMALL_BRACKET
-    L_MIDDLE_BRACKET = 288,        // L_MIDDLE_BRACKET
-    R_MIDDLE_BRACKET = 289,        // R_MIDDLE_BRACKET
-    L_BIG_BRACKET = 290,           // L_BIG_BRACKET
-    R_BIG_BRACKET = 291,           // R_BIG_BRACKET
-    SEMICOLON = 292,               // SEMICOLON
-    COMMA = 293,                   // COMMA
-    END = 294                      // END
+    TENSOR = 265,                  // TENSOR
+    GEMM = 266,                    // GEMM
+    OR = 267,                      // OR
+    AND = 268,                     // AND
+    NOT = 269,                     // NOT
+    EQ = 270,                      // EQ
+    NOTEQ = 271,                   // NOTEQ
+    LESS = 272,                    // LESS
+    GREAT = 273,                   // GREAT
+    LESSEQ = 274,                  // LESSEQ
+    GREATEQ = 275,                 // GREATEQ
+    ADD = 276,                     // ADD
+    SUB = 277,                     // SUB
+    MUL = 278,                     // MUL
+    DIV = 279,                     // DIV
+    MOD = 280,                     // MOD
+    ASSIGN = 281,                  // ASSIGN
+    RETURN = 282,                  // RETURN
+    IF = 283,                      // IF
+    ELSE = 284,                    // ELSE
+    WHILE = 285,                   // WHILE
+    BREAK = 286,                   // BREAK
+    CONTINUE = 287,                // CONTINUE
+    L_SMALL_BRACKET = 288,         // L_SMALL_BRACKET
+    R_SMALL_BRACKET = 289,         // R_SMALL_BRACKET
+    L_MIDDLE_BRACKET = 290,        // L_MIDDLE_BRACKET
+    R_MIDDLE_BRACKET = 291,        // R_MIDDLE_BRACKET
+    L_BIG_BRACKET = 292,           // L_BIG_BRACKET
+    R_BIG_BRACKET = 293,           // R_BIG_BRACKET
+    SEMICOLON = 294,               // SEMICOLON
+    COMMA = 295,                   // COMMA
+    END = 296                      // END
       };
       /// Backward compatibility alias (Bison 3.6).
       typedef token_kind_type yytokentype;
@@ -576,7 +578,7 @@ namespace yy {
     {
       enum symbol_kind_type
       {
-        YYNTOKENS = 40, ///< Number of tokens.
+        YYNTOKENS = 42, ///< Number of tokens.
         S_YYEMPTY = -2,
         S_YYEOF = 0,                             // "end of file"
         S_YYerror = 1,                           // error
@@ -588,70 +590,72 @@ namespace yy {
         S_INT = 7,                               // INT
         S_FLOAT = 8,                             // FLOAT
         S_VOID = 9,                              // VOID
-        S_OR = 10,                               // OR
-        S_AND = 11,                              // AND
-        S_NOT = 12,                              // NOT
-        S_EQ = 13,                               // EQ
-        S_NOTEQ = 14,                            // NOTEQ
-        S_LESS = 15,                             // LESS
-        S_GREAT = 16,                            // GREAT
-        S_LESSEQ = 17,                           // LESSEQ
-        S_GREATEQ = 18,                          // GREATEQ
-        S_ADD = 19,                              // ADD
-        S_SUB = 20,                              // SUB
-        S_MUL = 21,                              // MUL
-        S_DIV = 22,                              // DIV
-        S_MOD = 23,                              // MOD
-        S_ASSIGN = 24,                           // ASSIGN
-        S_RETURN = 25,                           // RETURN
-        S_IF = 26,                               // IF
-        S_ELSE = 27,                             // ELSE
-        S_WHILE = 28,                            // WHILE
-        S_BREAK = 29,                            // BREAK
-        S_CONTINUE = 30,                         // CONTINUE
-        S_L_SMALL_BRACKET = 31,                  // L_SMALL_BRACKET
-        S_R_SMALL_BRACKET = 32,                  // R_SMALL_BRACKET
-        S_L_MIDDLE_BRACKET = 33,                 // L_MIDDLE_BRACKET
-        S_R_MIDDLE_BRACKET = 34,                 // R_MIDDLE_BRACKET
-        S_L_BIG_BRACKET = 35,                    // L_BIG_BRACKET
-        S_R_BIG_BRACKET = 36,                    // R_BIG_BRACKET
-        S_SEMICOLON = 37,                        // SEMICOLON
-        S_COMMA = 38,                            // COMMA
-        S_END = 39,                              // END
-        S_YYACCEPT = 40,                         // $accept
-        S_Start = 41,                            // Start
-        S_CompUnit = 42,                         // CompUnit
-        S_Decl = 43,                             // Decl
-        S_ConstDecl = 44,                        // ConstDecl
-        S_ConstDefList = 45,                     // ConstDefList
-        S_ConstDef = 46,                         // ConstDef
-        S_ConstExpList = 47,                     // ConstExpList
-        S_ConstInitVal = 48,                     // ConstInitVal
-        S_ConstInitValList = 49,                 // ConstInitValList
-        S_VarDecl = 50,                          // VarDecl
-        S_VarDefList = 51,                       // VarDefList
-        S_VarDef = 52,                           // VarDef
-        S_InitVal = 53,                          // InitVal
-        S_InitValList = 54,                      // InitValList
-        S_FuncDef = 55,                          // FuncDef
-        S_FuncFParamList = 56,                   // FuncFParamList
-        S_FuncFParam = 57,                       // FuncFParam
-        S_Block = 58,                            // Block
-        S_BlockItemList = 59,                    // BlockItemList
-        S_BlockItem = 60,                        // BlockItem
-        S_Stmt = 61,                             // Stmt
-        S_LVal = 62,                             // LVal
-        S_ExpList = 63,                          // ExpList
-        S_PrimaryExp = 64,                       // PrimaryExp
-        S_UnaryExp = 65,                         // UnaryExp
-        S_FuncRParamList = 66,                   // FuncRParamList
-        S_MulExp = 67,                           // MulExp
-        S_AddExp = 68,                           // AddExp
-        S_RelExp = 69,                           // RelExp
-        S_EqExp = 70,                            // EqExp
-        S_LAndExp = 71,                          // LAndExp
-        S_LOrExp = 72,                           // LOrExp
-        S_Type = 73                              // Type
+        S_TENSOR = 10,                           // TENSOR
+        S_GEMM = 11,                             // GEMM
+        S_OR = 12,                               // OR
+        S_AND = 13,                              // AND
+        S_NOT = 14,                              // NOT
+        S_EQ = 15,                               // EQ
+        S_NOTEQ = 16,                            // NOTEQ
+        S_LESS = 17,                             // LESS
+        S_GREAT = 18,                            // GREAT
+        S_LESSEQ = 19,                           // LESSEQ
+        S_GREATEQ = 20,                          // GREATEQ
+        S_ADD = 21,                              // ADD
+        S_SUB = 22,                              // SUB
+        S_MUL = 23,                              // MUL
+        S_DIV = 24,                              // DIV
+        S_MOD = 25,                              // MOD
+        S_ASSIGN = 26,                           // ASSIGN
+        S_RETURN = 27,                           // RETURN
+        S_IF = 28,                               // IF
+        S_ELSE = 29,                             // ELSE
+        S_WHILE = 30,                            // WHILE
+        S_BREAK = 31,                            // BREAK
+        S_CONTINUE = 32,                         // CONTINUE
+        S_L_SMALL_BRACKET = 33,                  // L_SMALL_BRACKET
+        S_R_SMALL_BRACKET = 34,                  // R_SMALL_BRACKET
+        S_L_MIDDLE_BRACKET = 35,                 // L_MIDDLE_BRACKET
+        S_R_MIDDLE_BRACKET = 36,                 // R_MIDDLE_BRACKET
+        S_L_BIG_BRACKET = 37,                    // L_BIG_BRACKET
+        S_R_BIG_BRACKET = 38,                    // R_BIG_BRACKET
+        S_SEMICOLON = 39,                        // SEMICOLON
+        S_COMMA = 40,                            // COMMA
+        S_END = 41,                              // END
+        S_YYACCEPT = 42,                         // $accept
+        S_Start = 43,                            // Start
+        S_CompUnit = 44,                         // CompUnit
+        S_Decl = 45,                             // Decl
+        S_ConstDecl = 46,                        // ConstDecl
+        S_ConstDefList = 47,                     // ConstDefList
+        S_ConstDef = 48,                         // ConstDef
+        S_ConstExpList = 49,                     // ConstExpList
+        S_ConstInitVal = 50,                     // ConstInitVal
+        S_ConstInitValList = 51,                 // ConstInitValList
+        S_VarDecl = 52,                          // VarDecl
+        S_VarDefList = 53,                       // VarDefList
+        S_VarDef = 54,                           // VarDef
+        S_InitVal = 55,                          // InitVal
+        S_InitValList = 56,                      // InitValList
+        S_FuncDef = 57,                          // FuncDef
+        S_FuncFParamList = 58,                   // FuncFParamList
+        S_FuncFParam = 59,                       // FuncFParam
+        S_Block = 60,                            // Block
+        S_BlockItemList = 61,                    // BlockItemList
+        S_BlockItem = 62,                        // BlockItem
+        S_Stmt = 63,                             // Stmt
+        S_LVal = 64,                             // LVal
+        S_ExpList = 65,                          // ExpList
+        S_PrimaryExp = 66,                       // PrimaryExp
+        S_UnaryExp = 67,                         // UnaryExp
+        S_FuncRParamList = 68,                   // FuncRParamList
+        S_MulExp = 69,                           // MulExp
+        S_AddExp = 70,                           // AddExp
+        S_RelExp = 71,                           // RelExp
+        S_EqExp = 72,                            // EqExp
+        S_LAndExp = 73,                          // LAndExp
+        S_LOrExp = 74,                           // LOrExp
+        S_Type = 75                              // Type
       };
     };
 
@@ -686,6 +690,10 @@ namespace yy {
       {
         switch (this->kind ())
     {
+      case symbol_kind::S_Type: // Type
+        value.move< ASTType > (std::move (that.value));
+        break;
+
       case symbol_kind::S_AddExp: // AddExp
         value.move< AddExp* > (std::move (that.value));
         break;
@@ -780,10 +788,6 @@ namespace yy {
         value.move< RelExp* > (std::move (that.value));
         break;
 
-      case symbol_kind::S_Type: // Type
-        value.move< Type > (std::move (that.value));
-        break;
-
       case symbol_kind::S_UnaryExp: // UnaryExp
         value.move< UnaryExp* > (std::move (that.value));
         break;
@@ -826,6 +830,18 @@ namespace yy {
 #else
       basic_symbol (typename Base::kind_type t)
         : Base (t)
+      {}
+#endif
+
+#if 201103L <= YY_CPLUSPLUS
+      basic_symbol (typename Base::kind_type t, ASTType&& v)
+        : Base (t)
+        , value (std::move (v))
+      {}
+#else
+      basic_symbol (typename Base::kind_type t, const ASTType& v)
+        : Base (t)
+        , value (v)
       {}
 #endif
 
@@ -1094,18 +1110,6 @@ namespace yy {
 #endif
 
 #if 201103L <= YY_CPLUSPLUS
-      basic_symbol (typename Base::kind_type t, Type&& v)
-        : Base (t)
-        , value (std::move (v))
-      {}
-#else
-      basic_symbol (typename Base::kind_type t, const Type& v)
-        : Base (t)
-        , value (v)
-      {}
-#endif
-
-#if 201103L <= YY_CPLUSPLUS
       basic_symbol (typename Base::kind_type t, UnaryExp*&& v)
         : Base (t)
         , value (std::move (v))
@@ -1201,6 +1205,10 @@ namespace yy {
         // Value type destructor.
 switch (yykind)
     {
+      case symbol_kind::S_Type: // Type
+        value.template destroy< ASTType > ();
+        break;
+
       case symbol_kind::S_AddExp: // AddExp
         value.template destroy< AddExp* > ();
         break;
@@ -1293,10 +1301,6 @@ switch (yykind)
 
       case symbol_kind::S_RelExp: // RelExp
         value.template destroy< RelExp* > ();
-        break;
-
-      case symbol_kind::S_Type: // Type
-        value.template destroy< Type > ();
         break;
 
       case symbol_kind::S_UnaryExp: // UnaryExp
@@ -1641,6 +1645,36 @@ switch (yykind)
       make_VOID ()
       {
         return symbol_type (token::VOID);
+      }
+#endif
+#if 201103L <= YY_CPLUSPLUS
+      static
+      symbol_type
+      make_TENSOR ()
+      {
+        return symbol_type (token::TENSOR);
+      }
+#else
+      static
+      symbol_type
+      make_TENSOR ()
+      {
+        return symbol_type (token::TENSOR);
+      }
+#endif
+#if 201103L <= YY_CPLUSPLUS
+      static
+      symbol_type
+      make_GEMM ()
+      {
+        return symbol_type (token::GEMM);
+      }
+#else
+      static
+      symbol_type
+      make_GEMM ()
+      {
+        return symbol_type (token::GEMM);
       }
 #endif
 #if 201103L <= YY_CPLUSPLUS
@@ -2397,9 +2431,9 @@ switch (yykind)
     /// Constants.
     enum
     {
-      yylast_ = 309,     ///< Last index in yytable_.
+      yylast_ = 294,     ///< Last index in yytable_.
       yynnts_ = 34,  ///< Number of nonterminal symbols.
-      yyfinal_ = 13 ///< Termination state number.
+      yyfinal_ = 16 ///< Termination state number.
     };
 
 
@@ -2445,10 +2479,10 @@ switch (yykind)
        5,     6,     7,     8,     9,    10,    11,    12,    13,    14,
       15,    16,    17,    18,    19,    20,    21,    22,    23,    24,
       25,    26,    27,    28,    29,    30,    31,    32,    33,    34,
-      35,    36,    37,    38,    39
+      35,    36,    37,    38,    39,    40,    41
     };
     // Last valid token kind.
-    const int code_max = 294;
+    const int code_max = 296;
 
     if (t <= 0)
       return symbol_kind::S_YYEOF;
@@ -2466,6 +2500,10 @@ switch (yykind)
   {
     switch (this->kind ())
     {
+      case symbol_kind::S_Type: // Type
+        value.copy< ASTType > (YY_MOVE (that.value));
+        break;
+
       case symbol_kind::S_AddExp: // AddExp
         value.copy< AddExp* > (YY_MOVE (that.value));
         break;
@@ -2560,10 +2598,6 @@ switch (yykind)
         value.copy< RelExp* > (YY_MOVE (that.value));
         break;
 
-      case symbol_kind::S_Type: // Type
-        value.copy< Type > (YY_MOVE (that.value));
-        break;
-
       case symbol_kind::S_UnaryExp: // UnaryExp
         value.copy< UnaryExp* > (YY_MOVE (that.value));
         break;
@@ -2619,6 +2653,10 @@ switch (yykind)
     super_type::move (s);
     switch (this->kind ())
     {
+      case symbol_kind::S_Type: // Type
+        value.move< ASTType > (YY_MOVE (s.value));
+        break;
+
       case symbol_kind::S_AddExp: // AddExp
         value.move< AddExp* > (YY_MOVE (s.value));
         break;
@@ -2713,10 +2751,6 @@ switch (yykind)
         value.move< RelExp* > (YY_MOVE (s.value));
         break;
 
-      case symbol_kind::S_Type: // Type
-        value.move< Type > (YY_MOVE (s.value));
-        break;
-
       case symbol_kind::S_UnaryExp: // UnaryExp
         value.move< UnaryExp* > (YY_MOVE (s.value));
         break;
@@ -2806,7 +2840,7 @@ switch (yykind)
 
 
 } // yy
-#line 2810 "include/yacc/Bison.hpp"
+#line 2844 "include/yacc/Bison.hpp"
 
 
 

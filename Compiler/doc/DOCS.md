@@ -372,11 +372,9 @@ memset：从目标地址 dest 开始，将连续 len 个字节全部设置为同
 
 #### IR
 
-> 为方便决赛拓展向量优化，IR提前拓展向量指令
-
 采用与LLVM IR兼容的IR，便于使用LLVM工具链LLI/LLC进行测试
 
-##### 支持指令：为LLVM IR的子集，目前一共38条指令
+##### 支持指令：为LLVM IR的子集，目前一共35条指令
 
 ```
 终止与控制流指令：
@@ -427,10 +425,6 @@ BitCast将指针解释成另一种类型指针 -- 中端优化引入
 Phi    -- 中端优化引入
 Select -- 中端优化引入
 
-向量运算指令：
-extractelement 从固定长度向量中提取一个标量元素
-insertelement  把一个标量元素插入到固定长度向量
-shufflevector  按照常量mask将两个输入向量进行重排
 ```
 
 > IR格式：
@@ -504,12 +498,6 @@ shufflevector  按照常量mask将两个输入向量进行重排
 > phi：`%result = phi i32 [ %value1, %block1 ], [ %value2, %block2 ]`
 >
 > select：`%result = select i1 %condition, i32 %true_value, i32 %false_value`
->
-> extractelement：`%x = extractelement <4 x i32> %v, i32 %index`
->
-> insertelement：`%r = insertelement <4 x i32> %v, i32 %x, i32 %index`
->
-> shufflevector：`%result = shufflevector <4 x i32> %v1,<4 x i32> %v2,<4 x i32> <i32 0, i32 4, i32 1, i32 5>`
 
 ##### Value/User/Use
 
@@ -559,8 +547,6 @@ graph TD
 
 ##### TypeSystem类型系统
 
-> 为了便于决赛向量优化，IR类型系统提前支持向量类型
-
 设计模式：采用单例static设计模式，并且使用shared_ptr包装裸指针进行内存管理
 
 
@@ -570,7 +556,7 @@ graph TD
 
   ```c++
   enum TypeSystem{
-      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_VECTOR,IR_UNDEF
+      IR_INT,IR_FLOAT,IR_VOID,IR_POINTER,IR_ARRAY,IR_UNDEF
   };
   ```
 
@@ -589,8 +575,6 @@ graph TD
   	N14[POINTERType] --> N15[pointerType]
   	N1[IRType] --> N16[ARRAYType]
   	N16[ARRAYType] --> N17[elementType]
-  	N1[IRType] --> N18[VECTORType]
-  	N18[VECTORType] --> N19[elementType]
   ```
 
 ##### CFG

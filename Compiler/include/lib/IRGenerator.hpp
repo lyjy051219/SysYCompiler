@@ -4,8 +4,10 @@
 #include "SymbolTable.hpp"
 #include "TypeSystem.hpp"
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // IRGenerator将AST降低为非SSA IR
@@ -33,32 +35,82 @@ private:
 
     // 左值解析后统一返回值或地址 + 源码对象类型。
     // isAddress 为 true 时，读取 first-class value 需生成 load；
-    // 数组地址需要退化，向量 lane 则在整向量 load 后 extract。
+    // 数组地址需要退化，tensor 子对象额外保留剩余形状。
     struct ResolvedLValue {
         Value* value = nullptr;
         std::shared_ptr<IRType> type;
         bool isAddress = false;
         bool isMutable = false;
-        Value* vectorIndex = nullptr;
-        std::shared_ptr<VECTORType> vectorType;
-
-        bool isVectorLane() const;
+        bool isTensor = false;
+        std::vector<std::size_t> tensorShape;
+        bool hasFlatTensorAddress = false;
     };
+
+    // 源码 tensor 是带形状的内存值。
+    struct SourceValueType {
+        bool valid = false;
+        bool isTensor = false;
+        bool isVoid = false;
+        ASTScalarKind elementKind = ASTScalarKind::Invalid;
+        std::vector<std::size_t> shape;
+    };
+
+    struct TensorValue {
+        Value* address = nullptr;
+        std::shared_ptr<IRType> elementType;
+        ASTScalarKind elementKind = ASTScalarKind::Invalid;
+        std::vector<std::size_t> shape;
+        bool hasFlatAddress = false;
+    };
+
+    struct FunctionSpecialization {
+        const FuncDef* source = nullptr;
+        Function* function = nullptr;
+        std::string irName;
+        std::vector<SourceValueType> parameterTypes;
+        SourceValueType returnType;
+        bool isLowering = false;
+        bool isComplete = false;
+    };
+
+    std::unordered_map<const Value*, TensorValue> tensorValues;
+    std::map<std::string, const FuncDef*> sourceFunctions;
+    std::map<std::string, FunctionSpecialization> functionSpecializations;
+    FunctionSpecialization* currentSpecialization = nullptr;
+    std::vector<SourceValueType> currentParameterTypes;
+    AllocaInst* currentTensorReturnSlot = nullptr;
+    ASTScalarKind currentTensorReturnElement = ASTScalarKind::Invalid;
+    bool strictTensorInitializer = false;
 
     std::shared_ptr<IRType> lowerSourceType(
         const ASTType& type, bool allowVoid = false) const;
+    std::shared_ptr<IRType> lowerScalarKind(ASTScalarKind kind) const;
+    std::shared_ptr<IRType> makeTensorStorageType(
+        const std::shared_ptr<IRType>& elementType,
+        const std::vector<std::size_t>& shape) const;
+    bool lowerStaticShape(const ArrayList& dimensions,
+                          std::vector<std::size_t>& shape);
+    std::size_t tensorElementCount(
+        const std::vector<std::size_t>& shape) const;
+    ASTScalarKind sourceScalarKind(
+        const std::shared_ptr<IRType>& type) const;
+    [[noreturn]] void reportTensorError(const std::string& message) const;
     bool isConstantPrimary(const BaseAST& node) const;
     bool isConstantExpression(const UnaryExp& node) const;
     template <typename OperandT>
     bool isConstantExpression(const BaseExp<OperandT>& node) const;
     bool isConstantInitializerSyntax(const InitVal& node) const;
+    std::size_t countInitializerLeaves(const InitVal& node) const;
 
     // 根据声明所处位置、常量属性和数组形状生成对象及其初始化指令。
     template <typename DefinitionT>
     void lowerDefinition(DefinitionT& node,
                          const std::shared_ptr<IRType>& declaredType,
-                         bool isConstant);
-    void lowerParameter(FuncParam& node);
+                         bool isConstant,
+                         const std::vector<std::size_t>* tensorShape =
+                             nullptr);
+    void lowerParameter(FuncParam& node,
+                        const SourceValueType* concreteType = nullptr);
     std::shared_ptr<IRType> lowerArrayType(
         const ArrayList& dimensions,
         std::shared_ptr<IRType> elementType);
@@ -70,9 +122,6 @@ private:
     Value* lowerInitializerList(
         const InitValList& node,
         const std::shared_ptr<IRType>& expectedType);
-    Value* lowerVectorInitializerList(
-        const InitValList& node,
-        const std::shared_ptr<VECTORType>& expectedType);
     std::shared_ptr<IRType> initializerLeafType(
         std::shared_ptr<IRType> type) const;
     std::size_t initializerLeafCount(
@@ -96,8 +145,7 @@ private:
         bool isArrayParameter,
         const std::vector<Value*>& indices,
         std::vector<Value*>& aggregateIndices,
-        std::shared_ptr<IRType>& selectedType,
-        Value*& vectorIndex) const;
+        std::shared_ptr<IRType>& selectedType) const;
 
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
     Value* lowerPrimary(const BaseAST& node);
@@ -109,6 +157,39 @@ private:
     BinaryInst::Operation lowerBinaryOperator(Type type) const;
     Value* emitBinary(Value* left, BinaryInst::Operation operation,
                       Value* right);
+    Value* emitTensorBinary(Value* left,
+                            BinaryInst::Operation operation,
+                            Value* right);
+    Value* emitTensorUnaryMinus(Value* value);
+    Value* emitMatrixMultiply(Value* left, Value* right);
+    Value* allocateTensor(ASTScalarKind elementKind,
+                          const std::vector<std::size_t>& shape);
+    Value* tensorElementAddress(const TensorValue& value,
+                                std::size_t flatIndex);
+    Value* tensorIndexedAddress(const TensorValue& value,
+                                const std::vector<Value*>& indices,
+                                std::size_t consumedDimensions);
+    Value* tensorFlatAddress(const TensorValue& value);
+    Value* registerTensor(Value* address, ASTScalarKind elementKind,
+                          const std::vector<std::size_t>& shape,
+                          bool hasFlatAddress);
+    const TensorValue* lookupTensor(Value* value) const;
+    bool copyTensor(const TensorValue& destination,
+                    const TensorValue& source);
+
+    SourceValueType sourceTypeOfValue(Value* value) const;
+    std::string makeSpecializationKey(
+        const FuncDef& node,
+        const std::vector<SourceValueType>& argumentTypes) const;
+    FunctionSpecialization* getOrCreateFunctionSpecialization(
+        const FuncDef& node,
+        const std::vector<SourceValueType>& argumentTypes);
+    void lowerFunctionSpecialization(FunctionSpecialization& specialization);
+    Value* lowerSourceFunctionCall(
+        const FuncCall& node, const FuncDef& function,
+        std::vector<Value*> arguments);
+    bool validateTensorParameter(const FuncParam& parameter,
+                                 const SourceValueType& actualType);
 
     // 分别按用户函数签名和 SysY 运行库约定检查、转换调用实参。
     bool coerceCallArguments(const std::string& callee,

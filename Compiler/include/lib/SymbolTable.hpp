@@ -28,12 +28,25 @@ public:
         std::shared_ptr<IRType> type;
         bool isMutable = true;
         Initializer* constantInitializer = nullptr;
+        // 源码 tensor 使用数组内存表示，完整形状必须独立于 IRType 保留。
+        bool isTensor = false;
+        std::vector<std::size_t> tensorShape;
+        // 数组对象为 false；函数形参等已经是标量首元素指针时为 true。
+        bool hasFlatTensorAddress = false;
     };
 
     // 构造时保留全局对象层；后续退出作用域不会弹出这一层
     SymbolTable() : objectScopes(1) {}
-    SymbolTable(const SymbolTable&) = delete;
-    SymbolTable& operator=(const SymbolTable&) = delete;
+    SymbolTable(const SymbolTable&) = default;
+    SymbolTable& operator=(const SymbolTable&) = default;
+    SymbolTable(SymbolTable&&) noexcept = default;
+    SymbolTable& operator=(SymbolTable&&) noexcept = default;
+
+    // 延迟生成被调函数时只继承全局对象，不能看见调用者的局部绑定。
+    void keepGlobalScopeOnly() {
+        if (objectScopes.size() > 1)
+            objectScopes.resize(1);
+    }
 
     // IRGenerator 的函数体和 Block 都按现有规则显式进入、退出作用域。
     void enterScope() { objectScopes.emplace_back(); }

@@ -269,10 +269,8 @@ void SCCPSolver::visitInstruction(Instruction* I) {
     } else if (I->instType == Instruction::SELECT) {
         visitSelectInst(I);
     } else if (I->getIRType() && !I->getIRType()->isVoid()) {
-        // extractelement、insertelement、shufflevector 等尚未建立专用格传播
-        // 规则的纯值指令必须降为 Bottom。若让它们停留在 Top，经由
-        // extractelement 得到的标量条件可能使 SCCP 错把两个后继都判成不可达。
-        // 这里不猜测 lane 或运行时索引，保持对未来新增 SSA 指令的保守正确性。
+        // 尚未建立专用格传播规则的纯值指令必须降为 Bottom，避免其结果停留
+        // 在 Top 并错误影响可达性判断。
         mergeInValue(I, LatticeValue::getBottom());
     }
 }
@@ -305,14 +303,8 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
     Value* lhsConst = LV_LHS.isConstant() ? LV_LHS.getConstantValue() : nullptr;
     Value* rhsConst = LV_RHS.isConstant() ? LV_RHS.getConstantValue() : nullptr;
     const auto op = BI->getOp();
-    // 比较指令的结果可能是 i1 或 <N x i1>，数值语义必须由操作数的标量
-    // 元素类型决定；这样 <N x float> 不会误走整数的“乘零/模一”规则。
-    const auto ScalarOperandType =
-        IRType::getScalarElementType(LHS->getIRType());
     const bool IsFloat =
-        ScalarOperandType && ScalarOperandType->isFloat();
-    const bool IsVector =
-        LHS->getIRType() && LHS->getIRType()->isVector();
+        LHS->getIRType() && LHS->getIRType()->isFloat();
     // SCCP 的 Bottom 不区分普通运行时值与 poison 来源；额外沿 use-def
     // 检查后，只禁止会把风险值硬化为常量的吸收/相消规则。单位元规则
     // 原样传播原操作数，仍然可以安全使用。
@@ -365,7 +357,7 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         break;
     case BinaryInst::MUL:
         //仅整数乘零可直接归零；浮点零与 Inf/NaN 的组合不能这样折叠。
-        if (!IsFloat && !IsVector &&
+        if (!IsFloat &&
             ((lhsConst && lhsConst->isConstZero()) ||
              (rhsConst && rhsConst->isConstZero())) &&
             !mayHardenUndefinedValue()) {
@@ -395,22 +387,21 @@ void SCCPSolver::visitBinaryInst(BinaryInst* BI) {
         break;
     case BinaryInst::MOD:
         //有符号整数模一恒为零；浮点余数不适用。
-        if (!IsFloat && !IsVector && rhsConst &&
+        if (!IsFloat && rhsConst &&
             rhsConst->isConstOne() && !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
         break;
     case BinaryInst::UREM:
-        if (!IsVector && rhsConst && rhsConst->isConstOne() &&
+        if (rhsConst && rhsConst->isConstOne() &&
             !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));
             return;
         }
         break;
     case BinaryInst::AND:
-        if (!IsVector &&
-            ((lhsConst && lhsConst->isConstZero()) ||
+        if (((lhsConst && lhsConst->isConstZero()) ||
              (rhsConst && rhsConst->isConstZero())) &&
             !mayHardenUndefinedValue()) {
             mergeInValue(BI, LatticeValue::getConstant(Value::makeZeroForType(BI->getIRType())));

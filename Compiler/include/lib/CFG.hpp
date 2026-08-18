@@ -33,7 +33,6 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
     enum InstType{
         RET,BR,
         ALLOCA,STORE,LOAD,GEP,
-        EXTRACTELEMENT,INSERTELEMENT,SHUFFLEVECTOR,
         ADD,FADD,SUB,FSUB,MUL,FMUL,SDIV,UDIV,FDIV,SREM,UREM,FREM,
         AND,OR,XOR,
         BinaryUnknown,
@@ -85,7 +84,7 @@ class Instruction : public User,public ChainNode<BasicBlock,Instruction>{
 };
 
 // 二元指令
-// IR 结构：%r = add i32 %a, %b；%v = fadd <4 x float> %x, %y。
+// IR 结构：%r = add i32 %a, %b。
 class BinaryInst : public Instruction{
     public:
     enum Operation{
@@ -365,19 +364,12 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
     // 创建仅含基指针的 GEP：%1 = getelementptr inbounds [10 x i32], [10 x i32]* %arr
     //缺少后面的索引：, i32 0, i32 3
     Value* genGepInst(Value* ptr);
-    // 生成ExtractElement指令：%lane = extractelement <4 x i32> %vec, i32 2
-    Value* genExtractElementInst(Value* vector, Value* index);
-    // 生成InsertElement指令：%vec = insertelement <4 x i32> %vec, i32 %element, i32 2
-    Value* genInsertElementInst(Value* vector, Value* element, Value* index);
-    // 生成ShuffleVector指令：%shuf = shufflevector <4 x i32> %vec1, <4 x i32> %vec2, <4 x i32> <i32 0, i32 5, i32 2, i32 7>
-    Value* genShuffleVectorInst(Value* first, Value* second,
-                                const std::vector<int>& mask);
     // 生成二元指令
     Value* genBinaryInst(Value* A,BinaryInst::Operation op,Value* B);
-    // 标量操作数全为常量时直接折叠；向量及非常量路径插入给定基本块。
+    // 标量操作数全为常量时直接折叠；非常量路径插入给定基本块。
     static Value* genBinaryInst(BasicBlock*,Value*,BinaryInst::Operation,Value*);
 
-    // 生成标量或固定长度向量转换、函数调用和选择指令。
+    // 生成标量转换、函数调用和选择指令。
     Value* genSITOFPInst(Value* x);
     Value* genSITOFPInst(Value* x, std::shared_ptr<IRType> targetType);
     Value* genFPTOSIInst(Value* x);
@@ -414,7 +406,7 @@ class BasicBlock : public Value, public ChainList<BasicBlock,Instruction>, publi
 };
 
 // 返回指令
-// IR 结构：ret i32 %val；ret <4 x i32> %vec；ret void。
+// IR 结构：ret i32 %val；ret void。
 class RetInst : public Instruction{
     private:
     static std::shared_ptr<IRType>
@@ -451,7 +443,7 @@ class BrInst : public Instruction{
 };
 
 // 栈分配指令
-// IR 结构：%a = alloca i32；%v = alloca <4 x i32>。
+// IR 结构：%a = alloca i32。
 class AllocaInst : public Instruction{
     private:
     // AllocaInst 的公开构造参数统一表示被分配对象类型。
@@ -472,7 +464,7 @@ class AllocaInst : public Instruction{
 };
 
 // 内存写入指令
-// IR 结构：store i32 3, i32* %a；store <4 x i32> %v, <4 x i32>* %p。
+// IR 结构：store i32 3, i32* %a。
 class StoreInst : public Instruction{
     private:
     static void validateOperands(Value *StoredValue, Value *Pointer);
@@ -490,7 +482,7 @@ class StoreInst : public Instruction{
 };
 
 // 内存读取指令。
-// IR 结构：%x = load i32, i32* %a；%v = load <4 x i32>, <4 x i32>* %p。
+// IR 结构：%x = load i32, i32* %a。
 class LoadInst : public Instruction{
     private:
     static std::shared_ptr<IRType>
@@ -557,60 +549,8 @@ class GetElementPtrInst : public Instruction{
     Instruction* clone(const std::unordered_map<Value*, Value*>& VMap) override;
 };
 
-// 从固定长度向量中提取一个标量元素
-// IR 结构：%x = extractelement <4 x i32> %v, i32 %index。
-class ExtractElementInst : public Instruction {
-private:
-    static std::shared_ptr<IRType>
-    validateAndGetResultType(Value *Vector, Value *Index);
-
-public:
-    ExtractElementInst(Value* vector, Value* index);
-    Value* getVectorOperand() const;
-    Value* getIndexOperand() const;
-    void dumpIR() override;
-    Instruction* clone(
-        const std::unordered_map<Value*, Value*>& VMap) override;
-};
-
-// 把标量元素插入固定长度向量，并产生一个新的向量 SSA 值
-// IR 结构：%r = insertelement <4 x i32> %v, i32 %x, i32 %index。
-class InsertElementInst : public Instruction {
-private:
-    static std::shared_ptr<IRType> validateAndGetResultType(
-        Value *Vector, Value *Element, Value *Index);
-
-public:
-    InsertElementInst(Value* vector, Value* element, Value* index);
-    Value* getVectorOperand() const;
-    Value* getElementOperand() const;
-    Value* getIndexOperand() const;
-    void dumpIR() override;
-    Instruction* clone(
-        const std::unordered_map<Value*, Value*>& VMap) override;
-};
-
-// 按编译期常量 mask 从两个同类型向量中选择并重排元素
-//%result = shufflevector <4 x i32> %v1,<4 x i32> %v2,<4 x i32> <i32 0, i32 4, i32 1, i32 5>
-class ShuffleVectorInst : public Instruction {
-private:
-    std::vector<int> mask;
-    static std::shared_ptr<IRType> validateAndGetResultType(
-        Value *First, Value *Second, const std::vector<int> &Mask);
-
-public:
-    ShuffleVectorInst(Value* first, Value* second,
-                      std::vector<int> mask);
-    Value* getFirstVectorOperand() const;
-    Value* getSecondVectorOperand() const;
-    const std::vector<int>& getMask() const { return mask; }
-    void dumpIR() override;
-    Instruction* clone(
-        const std::unordered_map<Value*, Value*>& VMap) override;
-};
-
 // 函数调用指令
-// IR 结构：%r = call <4 x i32> @foo(<4 x i32> %v)。
+// IR 结构：%r = call i32 @foo(i32 %v)。
 class CallInst : public Instruction{
     private:
     bool tailCall = false;
@@ -647,8 +587,7 @@ class CallInst : public Instruction{
 };
 
 // 浮点转有符号整数指令
-// IR 结构：%i = fptosi float %f to i32；
-//          %iv = fptosi <4 x float> %fv to <4 x i32>。
+// IR 结构：%i = fptosi float %f to i32。
 class FPTOSIInst : public Instruction{
     public:
     FPTOSIInst(Value* v);
@@ -659,8 +598,7 @@ class FPTOSIInst : public Instruction{
 };
 
 // 有符号整数转浮点指令
-// IR 结构：%f = sitofp i32 %i to float；
-//          %fv = sitofp <4 x i32> %iv to <4 x float>。
+// IR 结构：%f = sitofp i32 %i to float。
 class SITOFPInst : public Instruction{
     public:
     SITOFPInst(Value* v);
@@ -672,8 +610,7 @@ class SITOFPInst : public Instruction{
 
 
 // 零扩展指令
-// IR 结构：%x32 = zext i1 %b to i32；
-//          %v32 = zext <4 x i8> %v8 to <4 x i32>。
+// IR 结构：%x32 = zext i1 %b to i32。
 class ZextInst : public Instruction{
     public:
     ZextInst(Value* v);
@@ -684,8 +621,7 @@ class ZextInst : public Instruction{
 };
 
 // 整数截断指令
-// IR 结构：%b = trunc i32 %x to i1；
-//          %v8 = trunc <4 x i32> %v32 to <4 x i8>。
+// IR 结构：%b = trunc i32 %x to i1。
 class TruncInst : public Instruction{
     public:
     TruncInst(Value* v);
@@ -696,8 +632,7 @@ class TruncInst : public Instruction{
 };
 
 // 符号扩展指令
-// IR 结构：%x32 = sext i1 %b to i32；
-//          %v32 = sext <4 x i8> %v8 to <4 x i32>。
+// IR 结构：%x32 = sext i1 %b to i32。
 class SextInst : public Instruction{
     public:
     SextInst(Value* v);
@@ -764,8 +699,7 @@ class PhiInst : public Instruction{
 };
 
 // 位转换指令
-// IR 结构：%q = bitcast i32* %p to float*；
-//          %v = bitcast <4 x i32> %x to <2 x i64>。
+// IR 结构：%q = bitcast i32* %p to float*。
 class BitCastInst : public Instruction {
 private:
     static std::shared_ptr<IRType> validateAndGetResultType(
@@ -784,52 +718,6 @@ class ConstantSystem : public Value{
     ConstantSystem(std::shared_ptr<IRType> irtype);
     virtual bool isConst(){return true;}
 };
-
-// 固定长度向量常量
-//支持普通常量以及Splat常量（所有lane常量都相同）
-class ConstantVector : public ConstantSystem {
-private:
-    std::vector<ConstantSystem *> elements;
-    //检查向量常量是否合法
-    static std::shared_ptr<VECTORType> validateAndGetType(
-        const std::shared_ptr<VECTORType> &type,
-        const std::vector<ConstantSystem *> &elements);
-    //生成向量常量的IR表示
-    static std::string buildIdent(
-        const std::vector<ConstantSystem *> &elements);
-    ConstantVector(std::shared_ptr<VECTORType> type,
-                   std::vector<ConstantSystem *> elements);
-
-public:
-    // 从元素列表推导 <elements.size() x element-type>。
-    static ConstantVector *get(
-        const std::vector<ConstantSystem *> &elements);
-    // 使用显式向量类型创建常量，并校验 lane 数和每个元素的类型。
-    static ConstantVector *get(
-        const std::shared_ptr<VECTORType> &type,
-        const std::vector<ConstantSystem *> &elements);
-
-    // 创建所有 lane 都等于 element 的 splat 常量。
-    static ConstantVector *getSplat(std::size_t elementCount,
-                                    ConstantSystem *element);
-    static ConstantVector *getSplat(
-        const std::shared_ptr<VECTORType> &type,
-        ConstantSystem *element);
-
-    std::size_t getNumElements() const { return elements.size(); }
-    ConstantSystem *getElement(std::size_t index) const;
-    ConstantSystem *operator[](std::size_t index) const {
-        return getElement(index);
-    }
-    const std::vector<ConstantSystem *> &getElements() const {
-        return elements;
-    }
-
-    bool isSplat() const;
-    // 非 splat 常量返回 nullptr。
-    ConstantSystem *getSplatValue() const;
-};
-
 
 class ConstBool : public ConstantSystem{
     private:
