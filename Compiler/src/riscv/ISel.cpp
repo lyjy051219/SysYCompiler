@@ -1741,8 +1741,25 @@ void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
   const std::shared_ptr<IRType> srcType = srcValue->getIRType();
   const std::shared_ptr<IRType> dstType = inst.getIRType();
   if (isPointerType(srcType) && isPointerType(dstType)) {
+    MachineReg existingDst;
+    if (auto found = mf.valueRegs.find(&inst);
+        found != mf.valueRegs.end()) {
+      existingDst = found->second;
+    }
     Address address =
         addressForValue(mf, mbb, state, srcValue, "bitcast instruction");
+    // 某些合法 CFG 的基本块存储顺序不是支配顺序，使用点可能已经为
+    // bitcast 预分配结果寄存器；必须在定义块物化真实地址并补上定义。
+    if (existingDst.isValid()) {
+      MachineReg materialized = materializeAddress(mf, mbb, address);
+      if (materialized.id != existingDst.id ||
+          materialized.physical != existingDst.physical ||
+          materialized.phys != existingDst.phys) {
+        appendRegInstr(mbb, Opcode::COPY, existingDst, {materialized});
+      }
+      state.addresses[&inst] = Address::regBase(existingDst);
+      return;
+    }
     state.addresses[&inst] = address;
     if (address.kind == Address::Kind::Reg && address.offset == 0) {
       mf.valueRegs[&inst] = address.reg;
@@ -1786,7 +1803,11 @@ void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
 void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
               LoweringState &state, GetElementPtrInst &inst) {
   Value *base = requiredUseValue(inst, 0, "getelementptr instruction");
-  auto existingDst = mf.valueRegs.find(&inst);
+  MachineReg existingDst;
+  if (auto found = mf.valueRegs.find(&inst);
+      found != mf.valueRegs.end()) {
+    existingDst = found->second;
+  }
   Address baseAddress =
       addressForValue(mf, mbb, state, base, "getelementptr instruction");
   int64_t constOffset = baseAddress.offset;
@@ -1814,13 +1835,13 @@ void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
   if (!dynamicOffset.isValid()) {
     baseAddress.offset = constOffset;
     MachineReg materialized = materializeAddress(mf, mbb, baseAddress);
-    if (existingDst != mf.valueRegs.end()) {
-      if (materialized.id != existingDst->second.id ||
-          materialized.physical != existingDst->second.physical ||
-          materialized.phys != existingDst->second.phys) {
-        appendRegInstr(mbb, Opcode::COPY, existingDst->second, {materialized});
+    if (existingDst.isValid()) {
+      if (materialized.id != existingDst.id ||
+          materialized.physical != existingDst.physical ||
+          materialized.phys != existingDst.phys) {
+        appendRegInstr(mbb, Opcode::COPY, existingDst, {materialized});
       }
-      state.addresses[&inst] = Address::regBase(existingDst->second);
+      state.addresses[&inst] = Address::regBase(existingDst);
       return;
     }
     mf.valueRegs[&inst] = materialized;
@@ -1830,8 +1851,8 @@ void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
 
   baseAddress.offset = constOffset;
   MachineReg baseReg = materializeAddress(mf, mbb, baseAddress);
-  MachineReg dst = existingDst != mf.valueRegs.end()
-                       ? existingDst->second
+  MachineReg dst = existingDst.isValid()
+                       ? existingDst
                        : mf.createVReg(RegClass::GPR64);
   appendRegInstr(mbb, Opcode::ADD, dst, {baseReg, dynamicOffset});
   mf.valueRegs[&inst] = dst;
