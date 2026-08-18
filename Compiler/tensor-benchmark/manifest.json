@@ -1,0 +1,66 @@
+[
+  {
+    "name": "01_elementwise_int_n64",
+    "category": "elementwise",
+    "element_type": "int",
+    "shape": [64],
+    "rounds": 240000,
+    "description": "同形 tensor 加法、右标量广播减法和整体赋值"
+  },
+  {
+    "name": "02_broadcast_float_n64",
+    "category": "broadcast",
+    "element_type": "float",
+    "shape": [64],
+    "rounds": 30000,
+    "description": "标量在左右两侧参与浮点 tensor 逐元素运算"
+  },
+  {
+    "name": "03_copy_return_int_n64",
+    "category": "copy-return",
+    "element_type": "int",
+    "shape": [64],
+    "rounds": 250000,
+    "description": "tensor 形参、tensor 返回值、隐藏返回地址和整体复制"
+  },
+  {
+    "name": "04_dot_int_k64",
+    "category": "dot",
+    "element_type": "int",
+    "shape": [64],
+    "rounds": 200000,
+    "description": "一维 tensor 点积以及每轮输入更新"
+  },
+  {
+    "name": "05_gemv_int_8x16",
+    "category": "gemv",
+    "element_type": "int",
+    "shape": [8, 16],
+    "rounds": 200000,
+    "description": "8x16 矩阵乘 16 元向量，包含非恒定输入"
+  },
+  {
+    "name": "06_vecmat_float_16x8",
+    "category": "vecmat",
+    "element_type": "float",
+    "shape": [16, 8],
+    "rounds": 30000,
+    "description": "16 元浮点向量乘 16x8 浮点矩阵"
+  },
+  {
+    "name": "07_gemm_int_6x6x6",
+    "category": "gemm",
+    "element_type": "int",
+    "shape": [6, 6, 6],
+    "rounds": 120000,
+    "description": "6x6 整型方阵乘法，覆盖通用 GEMM 主路径"
+  },
+  {
+    "name": "08_batch_gemm_int_2x3x6x3",
+    "category": "batch-gemm",
+    "element_type": "int",
+    "shape": [2, 3, 6, 3],
+    "rounds": 180000,
+    "description": "左侧两个 batch 与右侧单 batch 的 equal-or-one 广播矩阵乘法"
+  }
+]

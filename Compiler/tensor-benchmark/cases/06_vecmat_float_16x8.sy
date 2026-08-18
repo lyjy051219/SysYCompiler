@@ -1,0 +1,33 @@
+int main() {
+  tensor float row[16];
+  tensor float matrix[16][8];
+  tensor float answer[8];
+  int seed = getint();
+  int rounds = getint();
+  int i = 0;
+  while (i < 16) {
+    row[i] = i % 5 + seed;
+    int j = 0;
+    while (j < 8) {
+      matrix[i][j] = (i + j * 2) % 3 - 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  starttime();
+  int round = 0;
+  float checksum = 0.0;
+  while (round < rounds) {
+    int changed = round % 16;
+    row[changed] = row[changed] + 1.0;
+    answer = row @ matrix;
+    checksum = checksum + answer[round % 8];
+    round = round + 1;
+  }
+  stoptime();
+
+  putint(checksum);
+  putch(10);
+  return 0;
+}

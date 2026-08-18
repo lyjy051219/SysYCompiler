@@ -1,0 +1,27 @@
+int main() {
+  tensor int left[64];
+  tensor int right[64];
+  int seed = getint();
+  int rounds = getint();
+  int i = 0;
+  while (i < 64) {
+    left[i] = i % 7 + seed;
+    right[i] = (i % 2) * 2 - 1;
+    i = i + 1;
+  }
+
+  starttime();
+  int round = 0;
+  int checksum = 0;
+  while (round < rounds) {
+    int changed = round % 64;
+    left[changed] = left[changed] + 1;
+    checksum = checksum + left @ right;
+    round = round + 1;
+  }
+  stoptime();
+
+  putint(checksum);
+  putch(10);
+  return 0;
+}

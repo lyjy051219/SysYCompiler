@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-08-18T13:21:21.445174+00:00",
+  "label": "tensor-loop-final",
+  "configuration": {
+    "compiler": "/home/lyjy/Compiler/Compiler/build-riscv-release/compiler",
+    "compiler_sha256": "f704f72572968d5a0e32052230cf22bb926b7293ac75fc8856280b871170b1ae",
+    "optimization_level": "O1",
+    "warmup": 2,
+    "repeat": 11,
+    "riscv_march": "rv64gc",
+    "riscv_abi": "lp64d",
+    "qemu_cpu": "rv64"
+  },
+  "environment": {
+    "git_commit": "ef3fb21c4f56d1b1cb51180fd8a6ac4cc3ef0b7c",
+    "git_branch": "riscv-tensor",
+    "git_dirty": true,
+    "gcc_version": "riscv64-linux-gnu-gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0",
+    "qemu_version": "qemu-riscv64 version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.30)",
+    "python_version": "3.10.12 (main, Jun 22 2026, 18:55:27) [GCC 11.4.0]"
+  },
+  "cases": [
+    {
+      "name": "01_elementwise_int_n64",
+      "status": "PASS",
+      "metadata": {
+        "name": "01_elementwise_int_n64",
+        "category": "elementwise",
+        "element_type": "int",
+        "shape": [
+          64
+        ],
+        "rounds": 240000,
+        "description": "同形 tensor 加法、右标量广播减法和整体赋值"
+      },
+      "compile_seconds": 0.47501002500030154,
+      "assemble_seconds": 0.005252503000519937,
+      "link_seconds": 0.10190133700052684,
+      "assembly_bytes": 4170,
+      "assembly_lines": 220,
+      "object_bytes": 2720,
+      "executable_bytes": 565776,
+      "ir_bytes": 4918,
+      "target_samples_seconds": [
+        0.030434,
+        0.0294,
+        0.029428,
+        0.030221,
+        0.030031,
+        0.02977,
+        0.032907,
+        0.036755,
+        0.036712,
+        0.032721,
+        0.030912
+      ],
+      "target_median_seconds": 0.030434,
+      "target_min_seconds": 0.0294,
+      "target_max_seconds": 0.036755,
+      "wall_samples_seconds": [
+        0.04649672099913005,
+        0.04520344900083728,
+        0.044509975999972085,
+        0.04762422199928551,
+        0.044857369999590446,
+        0.045562208999399445,
+        0.05147847599982924,
+        0.05674967300001299,
+        0.05368109400114918,
+        0.0497690150004928,
+        0.048130930999832344
+      ],
+      "wall_median_seconds": 0.04762422199928551,
+      "target_relative_stdev": 0.08969345510775814
+    },
+    {
+      "name": "02_broadcast_float_n64",
+      "status": "PASS",
+      "metadata": {
+        "name": "02_broadcast_float_n64",
+        "category": "broadcast",
+        "element_type": "float",
+        "shape": [
+          64
+        ],
+        "rounds": 30000,
+        "description": "标量在左右两侧参与浮点 tensor 逐元素运算"
+      },
+      "compile_seconds": 0.3349713370007521,
+      "assemble_seconds": 0.0053951990012137685,
+      "link_seconds": 0.08992308100096125,
+      "assembly_bytes": 3485,
+      "assembly_lines": 178,
+      "object_bytes": 2608,
+      "executable_bytes": 565776,
+      "ir_bytes": 5641,
+      "target_samples_seconds": [
+        0.067823,
+        0.065659,
+        0.075311,
+        0.08766,
+        0.077369,
+        0.073187,
+        0.06955,
+        0.07034,
+        0.068826,
+        0.067031,
+        0.063909
+      ],
+      "target_median_seconds": 0.06955,
+      "target_min_seconds": 0.063909,
+      "target_max_seconds": 0.08766,
+      "wall_samples_seconds": [
+        0.08366068199939036,
+        0.07942714799901296,
+        0.08919493400026113,
+        0.10464755300017714,
+        0.09295132399893191,
+        0.08664985900031752,
+        0.08673675299905881,
+        0.08649234000040451,
+        0.08322206899902085,
+        0.08089581499916676,
+        0.07767634199990425
+      ],
+      "wall_median_seconds": 0.08649234000040451,
+      "target_relative_stdev": 0.09650394325481994
+    },
+    {
+      "name": "03_copy_return_int_n64",
+      "status": "PASS",
+      "metadata": {
+        "name": "03_copy_return_int_n64",
+        "category": "copy-return",
+        "element_type": "int",
+        "shape": [
+          64
+        ],
+        "rounds": 250000,
+        "description": "tensor 形参、tensor 返回值、隐藏返回地址和整体复制"
+      },
+      "compile_seconds": 0.32838496699878306,
+      "assemble_seconds": 0.004928484999254579,
+      "link_seconds": 0.08604876699973829,
+      "assembly_bytes": 3419,
+      "assembly_lines": 184,
+      "object_bytes": 2592,
+      "executable_bytes": 565776,
+      "ir_bytes": 3725,
+      "target_samples_seconds": [
+        0.01482,
+        0.014831,
+        0.015343,
+        0.014042,
+        0.01401,
+        0.014185,
+        0.013367,
+        0.013316,
+        0.013234,
+        0.015512,
+        0.015028
+      ],
+      "target_median_seconds": 0.014185,
+      "target_min_seconds": 0.013234,
+      "target_max_seconds": 0.015512,
+      "wall_samples_seconds": [
+        0.02912563300014881,
+        0.030665030999443843,
+        0.029450889000145253,
+        0.028656865000812104,
+        0.026894677999734995,
+        0.027543473999685375,
+        0.025955957999030943,
+        0.02552979899883212,
+        0.02666603100078646,
+        0.028309586999966996,
+        0.028019653998853755
+      ],
+      "wall_median_seconds": 0.028019653998853755,
+      "target_relative_stdev": 0.057981127234653713
+    },
+    {
+      "name": "04_dot_int_k64",
+      "status": "PASS",
+      "metadata": {
+        "name": "04_dot_int_k64",
+        "category": "dot",
+        "element_type": "int",
+        "shape": [
+          64
+        ],
+        "rounds": 200000,
+        "description": "一维 tensor 点积以及每轮输入更新"
+      },
+      "compile_seconds": 0.244806629998493,
+      "assemble_seconds": 0.004592639999827952,
+      "link_seconds": 0.08203341300031752,
+      "assembly_bytes": 2966,
+      "assembly_lines": 157,
+      "object_bytes": 2296,
+      "executable_bytes": 565776,
+      "ir_bytes": 4049,
+      "target_samples_seconds": [
+        0.014185,
+        0.014625,
+        0.014141,
+        0.014362,
+        0.014246,
+        0.013816,
+        0.015811,
+        0.014013,
+        0.014049,
+        0.015552,
+        0.013854
+      ],
+      "target_median_seconds": 0.014185,
+      "target_min_seconds": 0.013816,
+      "target_max_seconds": 0.015811,
+      "wall_samples_seconds": [
+        0.02736064999953669,
+        0.027395525001338683,
+        0.027618893000180833,
+        0.029214706999482587,
+        0.027246136000030674,
+        0.026841973998671165,
+        0.03270862700082944,
+        0.02786481399925833,
+        0.027297513001030893,
+        0.029567706998932408,
+        0.027088622999144718
+      ],
+      "wall_median_seconds": 0.027395525001338683,
+      "target_relative_stdev": 0.046833536801791066
+    },
+    {
+      "name": "05_gemv_int_8x16",
+      "status": "PASS",
+      "metadata": {
+        "name": "05_gemv_int_8x16",
+        "category": "gemv",
+        "element_type": "int",
+        "shape": [
+          8,
+          16
+        ],
+        "rounds": 200000,
+        "description": "8x16 矩阵乘 16 元向量，包含非恒定输入"
+      },
+      "compile_seconds": 0.5523364079999737,
+      "assemble_seconds": 0.005363729000237072,
+      "link_seconds": 0.08658687300157908,
+      "assembly_bytes": 4397,
+      "assembly_lines": 227,
+      "object_bytes": 2928,
+      "executable_bytes": 565776,
+      "ir_bytes": 5719,
+      "target_samples_seconds": [
+        0.03876,
+        0.032647,
+        0.032542,
+        0.032702,
+        0.032754,
+        0.034035,
+        0.035617,
+        0.036291,
+        0.036768,
+        0.036943,
+        0.035742
+      ],
+      "target_median_seconds": 0.035617,
+      "target_min_seconds": 0.032542,
+      "target_max_seconds": 0.03876,
+      "wall_samples_seconds": [
+        0.05368289000034565,
+        0.04777171299974725,
+        0.045521768000980956,
+        0.04598851099945023,
+        0.04627367399916693,
+        0.049337152999214595,
+        0.05062115499822539,
+        0.05066308499954175,
+        0.050513276999481604,
+        0.055754854998667724,
+        0.04975758799992036
+      ],
+      "wall_median_seconds": 0.04975758799992036,
+      "target_relative_stdev": 0.06052284059931751
+    },
+    {
+      "name": "06_vecmat_float_16x8",
+      "status": "PASS",
+      "metadata": {
+        "name": "06_vecmat_float_16x8",
+        "category": "vecmat",
+        "element_type": "float",
+        "shape": [
+          16,
+          8
+        ],
+        "rounds": 30000,
+        "description": "16 元浮点向量乘 16x8 浮点矩阵"
+      },
+      "compile_seconds": 0.32367775100101426,
+      "assemble_seconds": 0.00477437300105521,
+      "link_seconds": 0.08828910199918028,
+      "assembly_bytes": 3110,
+      "assembly_lines": 163,
+      "object_bytes": 2416,
+      "executable_bytes": 565776,
+      "ir_bytes": 4725,
+      "target_samples_seconds": [
+        0.083408,
+        0.087506,
+        0.107385,
+        0.116609,
+        0.121435,
+        0.119919,
+        0.113237,
+        0.091296,
+        0.085131,
+        0.084145,
+        0.086116
+      ],
+      "target_median_seconds": 0.091296,
+      "target_min_seconds": 0.083408,
+      "target_max_seconds": 0.121435,
+      "wall_samples_seconds": [
+        0.09658734199911123,
+        0.1039388709996274,
+        0.12407802500092657,
+        0.13464787699922454,
+        0.14144915900033084,
+        0.13981451600011496,
+        0.13339095800074574,
+        0.10829492800075968,
+        0.10188014300001669,
+        0.09843646799890848,
+        0.10289644899967243
+      ],
+      "wall_median_seconds": 0.10829492800075968,
+      "target_relative_stdev": 0.17432428003846287
+    },
+    {
+      "name": "07_gemm_int_6x6x6",
+      "status": "PASS",
+      "metadata": {
+        "name": "07_gemm_int_6x6x6",
+        "category": "gemm",
+        "element_type": "int",
+        "shape": [
+          6,
+          6,
+          6
+        ],
+        "rounds": 120000,
+        "description": "6x6 整型方阵乘法，覆盖通用 GEMM 主路径"
+      },
+      "compile_seconds": 0.369192333000683,
+      "assemble_seconds": 0.005134689999977127,
+      "link_seconds": 0.10590895700079273,
+      "assembly_bytes": 4662,
+      "assembly_lines": 246,
+      "object_bytes": 2816,
+      "executable_bytes": 565776,
+      "ir_bytes": 6442,
+      "target_samples_seconds": [
+        0.033406,
+        0.031236,
+        0.032066,
+        0.031237,
+        0.031358,
+        0.03449,
+        0.039368,
+        0.040588,
+        0.035443,
+        0.033723,
+        0.032572
+      ],
+      "target_median_seconds": 0.033406,
+      "target_min_seconds": 0.031236,
+      "target_max_seconds": 0.040588,
+      "wall_samples_seconds": [
+        0.048741194999820436,
+        0.047051459001522744,
+        0.046819922999929986,
+        0.046046819999901345,
+        0.0460436959983781,
+        0.050506749999840395,
+        0.05724820100112993,
+        0.060416038999392185,
+        0.052135914000245975,
+        0.048595531001410563,
+        0.046934833999330294
+      ],
+      "wall_median_seconds": 0.048595531001410563,
+      "target_relative_stdev": 0.09597884856981097
+    },
+    {
+      "name": "08_batch_gemm_int_2x3x6x3",
+      "status": "PASS",
+      "metadata": {
+        "name": "08_batch_gemm_int_2x3x6x3",
+        "category": "batch-gemm",
+        "element_type": "int",
+        "shape": [
+          2,
+          3,
+          6,
+          3
+        ],
+        "rounds": 180000,
+        "description": "左侧两个 batch 与右侧单 batch 的 equal-or-one 广播矩阵乘法"
+      },
+      "compile_seconds": 0.6669393819993275,
+      "assemble_seconds": 0.005372853998778737,
+      "link_seconds": 0.0887228800002049,
+      "assembly_bytes": 5302,
+      "assembly_lines": 282,
+      "object_bytes": 3208,
+      "executable_bytes": 565776,
+      "ir_bytes": 6932,
+      "target_samples_seconds": [
+        0.030992,
+        0.029043,
+        0.03007,
+        0.030167,
+        0.031535,
+        0.036158,
+        0.042345,
+        0.035041,
+        0.032978,
+        0.032492,
+        0.031221
+      ],
+      "target_median_seconds": 0.031535,
+      "target_min_seconds": 0.029043,
+      "target_max_seconds": 0.042345,
+      "wall_samples_seconds": [
+        0.04508246700061136,
+        0.0424850930012326,
+        0.04650624600071751,
+        0.04345929200098908,
+        0.04806905799887318,
+        0.05199798900139285,
+        0.05857627200020943,
+        0.05119942500095931,
+        0.04811744499966153,
+        0.046803743000054965,
+        0.04495593100000406
+      ],
+      "wall_median_seconds": 0.046803743000054965,
+      "target_relative_stdev": 0.1200221442764638
+    }
+  ],
+  "comparison": {
+    "reference_json": "/home/lyjy/Compiler/Compiler/tensor-benchmark/results/baseline-release-full-expand-ef3fb21.json",
+    "speedup_by_case": {
+      "01_elementwise_int_n64": 1.5030229348754682,
+      "02_broadcast_float_n64": 1.07627606038821,
+      "03_copy_return_int_n64": 1.609446598519563,
+      "04_dot_int_k64": 1.2670426506873458,
+      "05_gemv_int_8x16": 0.9923631973495802,
+      "06_vecmat_float_16x8": 1.0679657378198388,
+      "07_gemm_int_6x6x6": 0.9204933245524757,
+      "08_batch_gemm_int_2x3x6x3": 1.1043285238623752
+    },
+    "geometric_mean_speedup": 1.1717581949596405
+  }
+}

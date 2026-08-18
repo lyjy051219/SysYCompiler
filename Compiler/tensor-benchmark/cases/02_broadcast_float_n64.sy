@@ -1,0 +1,31 @@
+int main() {
+  tensor float a[64];
+  tensor float b[64];
+  int seed = getint();
+  int rounds = getint();
+  float bias = seed;
+  int i = 0;
+  while (i < 64) {
+    a[i] = i % 11 + seed;
+    i = i + 1;
+  }
+
+  starttime();
+  int round = 0;
+  while (round < rounds) {
+    b = bias - a;
+    a = bias - b + 1.0;
+    round = round + 1;
+  }
+  stoptime();
+
+  int checksum = 0;
+  i = 0;
+  while (i < 64) {
+    checksum = checksum + a[i];
+    i = i + 1;
+  }
+  putint(checksum);
+  putch(10);
+  return 0;
+}

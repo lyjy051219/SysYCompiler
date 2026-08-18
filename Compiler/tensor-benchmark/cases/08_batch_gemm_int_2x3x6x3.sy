@@ -1,0 +1,49 @@
+int main() {
+  tensor int left[2][3][6];
+  tensor int right[1][6][3];
+  tensor int answer[2][3][3];
+  int seed = getint();
+  int rounds = getint();
+  int batch = 0;
+  while (batch < 2) {
+    int i = 0;
+    while (i < 3) {
+      int j = 0;
+      while (j < 6) {
+        left[batch][i][j] = (batch + i + j) % 5 + seed;
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+    batch = batch + 1;
+  }
+  int i = 0;
+  while (i < 6) {
+    int j = 0;
+    while (j < 3) {
+      right[0][i][j] = (i * 3 + j) % 4 - 1;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  starttime();
+  int round = 0;
+  int checksum = 0;
+  while (round < rounds) {
+    int changed_batch = round % 2;
+    int changed_row = (round / 2) % 3;
+    int changed_column = (round / 6) % 6;
+    left[changed_batch][changed_row][changed_column] =
+        left[changed_batch][changed_row][changed_column] + 1;
+    answer = left @ right;
+    checksum = checksum
+        + answer[changed_batch][changed_row][(round / 36) % 3];
+    round = round + 1;
+  }
+  stoptime();
+
+  putint(checksum);
+  putch(10);
+  return 0;
+}
