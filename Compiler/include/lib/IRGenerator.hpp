@@ -4,6 +4,7 @@
 #include "SymbolTable.hpp"
 #include "TypeSystem.hpp"
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -61,6 +62,19 @@ private:
         ASTScalarKind elementKind = ASTScalarKind::Invalid;
         std::vector<std::size_t> shape;
         bool hasFlatAddress = false;
+        bool isTemporary = false;
+    };
+
+    // tensor 循环使用正的静态迭代次数，循环体至少执行一次。
+    struct TensorCountedLoop {
+        BasicBlock* preheader = nullptr;
+        BasicBlock* header = nullptr;
+        BasicBlock* body = nullptr;
+        BasicBlock* exit = nullptr;
+        PhiInst* index = nullptr;
+        std::size_t tripCount = 0;
+        std::string label;
+        bool headerTested = true;
     };
 
     struct FunctionSpecialization {
@@ -148,31 +162,65 @@ private:
         std::shared_ptr<IRType>& selectedType) const;
 
     // 递归生成各优先级表达式，并对同级二元操作链执行类型统一。
-    Value* lowerPrimary(const BaseAST& node);
-    Value* lowerExpression(const UnaryExp& node);
+    Value* lowerPrimary(const BaseAST& node,
+                        TensorValue* destination = nullptr);
+    Value* lowerExpression(const UnaryExp& node,
+                           TensorValue* destination = nullptr);
     template <typename OperandT>
-    Value* lowerExpression(const BaseExp<OperandT>& node);
-    Value* lowerExpression(const FuncCall& node);
+    Value* lowerExpression(const BaseExp<OperandT>& node,
+                           TensorValue* destination = nullptr);
+    Value* lowerExpression(const FuncCall& node,
+                           TensorValue* destination = nullptr);
 
     BinaryInst::Operation lowerBinaryOperator(Type type) const;
     Value* emitBinary(Value* left, BinaryInst::Operation operation,
-                      Value* right);
+                      Value* right, TensorValue* destination = nullptr);
     Value* emitTensorBinary(Value* left,
                             BinaryInst::Operation operation,
-                            Value* right);
-    Value* emitTensorUnaryMinus(Value* value);
-    Value* emitMatrixMultiply(Value* left, Value* right);
+                            Value* right,
+                            TensorValue* destination = nullptr);
+    Value* emitTensorUnaryMinus(Value* value,
+                                TensorValue* destination = nullptr);
+    Value* emitMatrixMultiply(Value* left, Value* right,
+                              TensorValue* destination = nullptr);
     Value* allocateTensor(ASTScalarKind elementKind,
                           const std::vector<std::size_t>& shape);
     Value* tensorElementAddress(const TensorValue& value,
                                 std::size_t flatIndex);
+    Value* tensorElementAddress(const TensorValue& value,
+                                Value* flatIndex);
     Value* tensorIndexedAddress(const TensorValue& value,
                                 const std::vector<Value*>& indices,
                                 std::size_t consumedDimensions);
     Value* tensorFlatAddress(const TensorValue& value);
+    TensorValue makeFlatTensorValue(const TensorValue& value);
+    Value* tensorStorageRoot(Value* address) const;
+    bool canWriteTensorResultDirectly(
+        const TensorValue& destination,
+        const std::vector<TensorValue>& inputs,
+        bool allowExactInPlace) const;
+    Value* selectTensorResult(
+        TensorValue* destination,
+        ASTScalarKind elementKind,
+        const std::vector<std::size_t>& shape,
+        const std::vector<TensorValue>& inputs,
+        bool allowExactInPlace);
+    Value* materializeTensorResult(
+        Value* source, TensorValue* destination);
+    TensorCountedLoop beginTensorCountedLoop(
+        std::size_t tripCount, const std::string& label,
+        bool headerTested = true);
+    void endTensorCountedLoop(const TensorCountedLoop& loop);
+    void emitTensorLoopNest(
+        const std::vector<std::size_t>& shape,
+        std::size_t depth,
+        std::vector<Value*>& coordinates,
+        const std::string& label,
+        const std::function<void(const std::vector<Value*>&)>& body);
     Value* registerTensor(Value* address, ASTScalarKind elementKind,
                           const std::vector<std::size_t>& shape,
-                          bool hasFlatAddress);
+                          bool hasFlatAddress,
+                          bool isTemporary = false);
     const TensorValue* lookupTensor(Value* value) const;
     bool copyTensor(const TensorValue& destination,
                     const TensorValue& source);
@@ -187,7 +235,8 @@ private:
     void lowerFunctionSpecialization(FunctionSpecialization& specialization);
     Value* lowerSourceFunctionCall(
         const FuncCall& node, const FuncDef& function,
-        std::vector<Value*> arguments);
+        std::vector<Value*> arguments,
+        TensorValue* destination = nullptr);
     bool validateTensorParameter(const FuncParam& parameter,
                                  const SourceValueType& actualType);
 

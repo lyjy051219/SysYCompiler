@@ -1,6 +1,7 @@
 #include "../../include/lib/IRGenerator.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -124,14 +125,16 @@ std::shared_ptr<IRType> IRGenerator::lowerSourceType(
 
 Value* IRGenerator::registerTensor(
     Value* address, ASTScalarKind elementKind,
-    const std::vector<std::size_t>& shape, bool hasFlatAddress) {
+    const std::vector<std::size_t>& shape, bool hasFlatAddress,
+    bool isTemporary) {
     if (address == nullptr || shape.empty())
         return nullptr;
     const auto elementType = lowerScalarKind(elementKind);
     if (elementType == nullptr || elementType->isVoid())
         return nullptr;
     tensorValues[address] = TensorValue{
-        address, elementType, elementKind, shape, hasFlatAddress};
+        address, elementType, elementKind, shape, hasFlatAddress,
+        isTemporary};
     return address;
 }
 
@@ -152,7 +155,7 @@ Value* IRGenerator::allocateTensor(
     Value* storage = currentBlock->genAllocaInst(storageType);
     if (storage == nullptr)
         reportTensorError("无法为 tensor 临时值分配存储");
-    return registerTensor(storage, elementKind, shape, false);
+    return registerTensor(storage, elementKind, shape, false, true);
 }
 
 Value* IRGenerator::tensorElementAddress(
@@ -196,6 +199,31 @@ Value* IRGenerator::tensorElementAddress(
     return address;
 }
 
+Value* IRGenerator::tensorElementAddress(
+    const TensorValue& value, Value* flatIndex) {
+    if (currentBlock == nullptr || value.address == nullptr ||
+        flatIndex == nullptr || !value.hasFlatAddress ||
+        flatIndex->getIRType() == nullptr ||
+        !flatIndex->getIRType()->isInt()) {
+        return nullptr;
+    }
+
+    auto* address = dynamic_cast<GetElementPtrInst*>(
+        currentBlock->genGepInst(value.address));
+    if (address == nullptr)
+        return nullptr;
+    address->addUse(flatIndex);
+    address->updateType();
+    const auto pointerType = std::dynamic_pointer_cast<POINTERType>(
+        address->getIRType());
+    if (pointerType == nullptr ||
+        !IRType::hasSameShape(pointerType->getPointerType(),
+                              value.elementType)) {
+        return nullptr;
+    }
+    return address;
+}
+
 Value* IRGenerator::tensorIndexedAddress(
     const TensorValue& value, const std::vector<Value*>& indices,
     std::size_t consumedDimensions) {
@@ -207,12 +235,11 @@ Value* IRGenerator::tensorIndexedAddress(
     if (consumedDimensions == 0)
         return value.address;
 
-    auto* address = dynamic_cast<GetElementPtrInst*>(
-        currentBlock->genGepInst(value.address));
-    if (address == nullptr)
-        return nullptr;
-
     if (!value.hasFlatAddress) {
+        auto* address = dynamic_cast<GetElementPtrInst*>(
+            currentBlock->genGepInst(value.address));
+        if (address == nullptr)
+            return nullptr;
         address->addUse(ConstInt::newConstInt(0));
         for (std::size_t index = 0; index < consumedDimensions; ++index)
             address->addUse(indices[index]);
@@ -237,6 +264,10 @@ Value* IRGenerator::tensorIndexedAddress(
         if (offset == nullptr)
             return nullptr;
     }
+    auto* address = dynamic_cast<GetElementPtrInst*>(
+        currentBlock->genGepInst(value.address));
+    if (address == nullptr)
+        return nullptr;
     address->addUse(offset);
     address->updateType();
     return address;
@@ -266,6 +297,261 @@ Value* IRGenerator::tensorFlatAddress(
     return address;
 }
 
+IRGenerator::TensorValue IRGenerator::makeFlatTensorValue(
+    const TensorValue& value) {
+    TensorValue result = value;
+    result.address = tensorFlatAddress(value);
+    result.hasFlatAddress = result.address != nullptr;
+    return result;
+}
+
+Value* IRGenerator::tensorStorageRoot(Value* address) const {
+    Value* current = address;
+    while (current != nullptr) {
+        if (auto* gep = dynamic_cast<GetElementPtrInst*>(current)) {
+            if (gep->getUserList().empty())
+                return current;
+            current = gep->getUserList().front()->getValue();
+            continue;
+        }
+        if (auto* bitcast = dynamic_cast<BitCastInst*>(current)) {
+            if (bitcast->getUserList().empty())
+                return current;
+            current = bitcast->getUserList().front()->getValue();
+            continue;
+        }
+        return current;
+    }
+    return nullptr;
+}
+
+bool IRGenerator::canWriteTensorResultDirectly(
+    const TensorValue& destination,
+    const std::vector<TensorValue>& inputs,
+    bool allowExactInPlace) const {
+    if (destination.address == nullptr)
+        return false;
+
+    // 临时对象和编译器隐藏返回槽由调用约定保证不与输入重叠。
+    if (destination.isTemporary)
+        return true;
+
+    Value* destinationRoot = tensorStorageRoot(destination.address);
+    const bool destinationIsLocal =
+        dynamic_cast<AllocaInst*>(destinationRoot) != nullptr;
+    const bool destinationIsGlobal =
+        dynamic_cast<Variable*>(destinationRoot) != nullptr;
+    if (!destinationIsLocal && !destinationIsGlobal)
+        return false;
+
+    for (const TensorValue& input : inputs) {
+        if (input.address == nullptr)
+            return false;
+        if (input.address == destination.address) {
+            if (allowExactInPlace)
+                continue;
+            return false;
+        }
+
+        Value* inputRoot = tensorStorageRoot(input.address);
+        if (inputRoot == destinationRoot)
+            return false;
+
+        // 当前函数的局部 alloca 不可能与形参、全局对象或另一个 alloca
+        // 指向同一存储；全局目标遇到未知来源指针时仍保持保守。
+        if (destinationIsLocal)
+            continue;
+        if (dynamic_cast<AllocaInst*>(inputRoot) == nullptr &&
+            dynamic_cast<Variable*>(inputRoot) == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Value* IRGenerator::selectTensorResult(
+    TensorValue* destination,
+    ASTScalarKind elementKind,
+    const std::vector<std::size_t>& shape,
+    const std::vector<TensorValue>& inputs,
+    bool allowExactInPlace) {
+    const auto elementType = lowerScalarKind(elementKind);
+    const bool shapeMatches =
+        destination != nullptr &&
+        (destination->shape.empty() || destination->shape == shape);
+    const bool typeMatches =
+        destination != nullptr &&
+        (destination->elementKind == ASTScalarKind::Invalid ||
+         destination->elementKind == elementKind);
+
+    if (destination != nullptr && destination->address != nullptr &&
+        shapeMatches && typeMatches &&
+        canWriteTensorResultDirectly(
+            *destination, inputs, allowExactInPlace)) {
+        destination->elementType = elementType;
+        destination->elementKind = elementKind;
+        destination->shape = shape;
+        if (registerTensor(
+                destination->address, elementKind, shape,
+                destination->hasFlatAddress,
+                destination->isTemporary) == nullptr) {
+            reportTensorError("无法登记 tensor 目的存储");
+        }
+        return destination->address;
+    }
+    return allocateTensor(elementKind, shape);
+}
+
+Value* IRGenerator::materializeTensorResult(
+    Value* source, TensorValue* destination) {
+    if (destination == nullptr)
+        return source;
+    const TensorValue* sourceLookup = lookupTensor(source);
+    if (sourceLookup == nullptr)
+        return source;
+    const TensorValue sourceValue = *sourceLookup;
+    if (destination->address == nullptr)
+        reportTensorError("tensor 目的地址无效");
+    if (destination->elementKind != ASTScalarKind::Invalid &&
+        destination->elementKind != sourceValue.elementKind) {
+        reportTensorError("tensor 目的元素类型与表达式不匹配");
+    }
+    if (!destination->shape.empty() &&
+        destination->shape != sourceValue.shape) {
+        reportTensorError("tensor 目的形状与表达式不匹配");
+    }
+
+    destination->elementType = sourceValue.elementType;
+    destination->elementKind = sourceValue.elementKind;
+    destination->shape = sourceValue.shape;
+    if (registerTensor(
+            destination->address, destination->elementKind,
+            destination->shape, destination->hasFlatAddress,
+            destination->isTemporary) == nullptr) {
+        reportTensorError("无法登记 tensor 表达式目的存储");
+    }
+    const TensorValue destinationValue = *lookupTensor(
+        destination->address);
+    if (!copyTensor(destinationValue, sourceValue))
+        reportTensorError("tensor 表达式写入目的存储失败");
+    return destination->address;
+}
+
+IRGenerator::TensorCountedLoop IRGenerator::beginTensorCountedLoop(
+    std::size_t tripCount, const std::string& label,
+    bool headerTested) {
+    if (currentBlock == nullptr || tripCount == 0 ||
+        tripCount > static_cast<std::size_t>(
+                        std::numeric_limits<std::int64_t>::max()))
+        reportTensorError("tensor 循环的静态迭代次数无法用 i64 表示");
+
+    TensorCountedLoop loop;
+    loop.preheader = currentBlock;
+    loop.headerTested = headerTested;
+    loop.tripCount = tripCount;
+    loop.label = label;
+
+    const std::shared_ptr<INTType> indexType =
+        tripCount <= static_cast<std::size_t>(
+                         std::numeric_limits<std::int32_t>::max())
+            ? INTType::getInt32Ty()
+            : INTType::getInt64Ty();
+    loop.index = new PhiInst(indexType);
+
+    if (!headerTested) {
+        loop.body = currentBlock->genBlock(label + ".body");
+        loop.header = loop.body;
+        if (loop.body == nullptr)
+            reportTensorError("无法创建 tensor 尾测循环基本块");
+        loop.body->pushFront(loop.index);
+        loop.index->addIncoming(
+            ConstInt::newConstIntForType(0, indexType), loop.preheader);
+        loop.preheader->genUnCondInst(loop.body);
+        currentBlock = loop.body;
+        return loop;
+    }
+
+    loop.header = currentBlock->genBlock(label + ".header");
+    loop.body = currentBlock->genBlock(label + ".body");
+    loop.exit = currentBlock->genBlock(label + ".exit");
+    if (loop.header == nullptr || loop.body == nullptr ||
+        loop.exit == nullptr) {
+        reportTensorError("无法创建 tensor 规范循环基本块");
+    }
+    loop.header->pushFront(loop.index);
+    loop.index->addIncoming(
+        ConstInt::newConstIntForType(0, indexType), loop.preheader);
+    loop.preheader->genUnCondInst(loop.header);
+
+    currentBlock = loop.header;
+    Value* enterLoop = emitBinary(
+        loop.index, BinaryInst::L,
+        ConstInt::newConstIntForType(
+            static_cast<std::int64_t>(loop.tripCount), indexType));
+    if (enterLoop == nullptr)
+        reportTensorError("tensor 规范循环的入口条件生成失败");
+    loop.header->genCondInst(enterLoop, loop.body, loop.exit);
+    currentBlock = loop.body;
+    return loop;
+}
+
+void IRGenerator::endTensorCountedLoop(
+    const TensorCountedLoop& loop) {
+    BasicBlock* latch = currentBlock;
+    if (latch == nullptr || loop.header == nullptr || loop.body == nullptr ||
+        loop.index == nullptr || latch->hasTerminator() ||
+        (loop.headerTested && loop.exit == nullptr)) {
+        reportTensorError("tensor 规范循环的回边不合法");
+    }
+    const auto indexType = std::dynamic_pointer_cast<INTType>(
+        loop.index->getIRType());
+    if (indexType == nullptr)
+        reportTensorError("tensor 规范循环的归纳变量类型无效");
+
+    Value* next = emitBinary(
+        loop.index, BinaryInst::ADD,
+        ConstInt::newConstIntForType(1, indexType));
+    if (next == nullptr)
+        reportTensorError("tensor 规范循环的归纳变量生成失败");
+    loop.index->addIncoming(next, latch);
+    if (loop.headerTested) {
+        latch->genUnCondInst(loop.header);
+        currentBlock = loop.exit;
+        return;
+    }
+
+    BasicBlock* exit = latch->genBlock(loop.label + ".exit");
+    Value* continueLoop = emitBinary(
+        next, BinaryInst::L,
+        ConstInt::newConstIntForType(
+            static_cast<std::int64_t>(loop.tripCount), indexType));
+    if (exit == nullptr || continueLoop == nullptr)
+        reportTensorError("tensor 尾测循环的出口生成失败");
+    latch->genCondInst(continueLoop, loop.body, exit);
+    currentBlock = exit;
+}
+
+void IRGenerator::emitTensorLoopNest(
+    const std::vector<std::size_t>& shape,
+    std::size_t depth,
+    std::vector<Value*>& coordinates,
+    const std::string& label,
+    const std::function<void(const std::vector<Value*>&)>& body) {
+    if (depth == shape.size()) {
+        body(coordinates);
+        return;
+    }
+    if (depth > shape.size() || body == nullptr)
+        reportTensorError("tensor 循环嵌套参数无效");
+
+    TensorCountedLoop loop = beginTensorCountedLoop(
+        shape[depth], label + ".axis" + std::to_string(depth));
+    coordinates.push_back(loop.index);
+    emitTensorLoopNest(shape, depth + 1, coordinates, label, body);
+    coordinates.pop_back();
+    endTensorCountedLoop(loop);
+}
+
 bool IRGenerator::copyTensor(
     const TensorValue& destination,
     const TensorValue& source) {
@@ -273,24 +559,60 @@ bool IRGenerator::copyTensor(
         destination.shape != source.shape || currentBlock == nullptr) {
         return false;
     }
+    if (destination.address == source.address)
+        return true;
+
     const std::size_t count = tensorElementCount(source.shape);
-    std::vector<Value*> values;
-    values.reserve(count);
-    for (std::size_t index = 0; index < count; ++index) {
-        Value* address = tensorElementAddress(source, index);
-        if (address == nullptr)
+    const bool distinctDirectStorage =
+        ((dynamic_cast<AllocaInst*>(destination.address) != nullptr ||
+          dynamic_cast<Variable*>(destination.address) != nullptr) &&
+         (dynamic_cast<AllocaInst*>(source.address) != nullptr ||
+          dynamic_cast<Variable*>(source.address) != nullptr));
+    const bool cannotOverlap = source.isTemporary || destination.isTemporary ||
+                               distinctDirectStorage;
+
+    // 形参和子 tensor 可能来自同一底层对象；无法证明不重叠时交给 memmove。
+    if (!cannotOverlap) {
+        TensorValue flatDestination = makeFlatTensorValue(destination);
+        TensorValue flatSource = makeFlatTensorValue(source);
+        if (flatDestination.address == nullptr || flatSource.address == nullptr)
             return false;
-        Value* loaded = currentBlock->genLoadInst(address);
-        if (loaded == nullptr)
+        const std::size_t elementBytes = source.elementType->getSize();
+        if (elementBytes == 0 ||
+            count > static_cast<std::size_t>(
+                        std::numeric_limits<std::int32_t>::max()) /
+                        elementBytes) {
+            reportTensorError("tensor 复制的字节数无法用 i32 表示");
+        }
+        std::vector<Value*> arguments{
+            flatDestination.address,
+            flatSource.address,
+            ConstInt::newConstInt(static_cast<std::int64_t>(
+                count * elementBytes)),
+            ConstBool::newConstBool(false)};
+        if (currentBlock->genCallInst(
+                BuildInFunction::getDefaultMemmoveName(), arguments) ==
+            nullptr) {
             return false;
-        values.push_back(loaded);
+        }
+        return true;
     }
-    for (std::size_t index = 0; index < count; ++index) {
-        Value* address = tensorElementAddress(destination, index);
-        if (address == nullptr)
-            return false;
-        currentBlock->genStoreInst(values[index], address);
-    }
+
+    std::vector<Value*> coordinates;
+    emitTensorLoopNest(
+        source.shape, 0, coordinates, "tensor.copy",
+        [&](const std::vector<Value*>& indices) {
+            Value* sourceAddress = tensorIndexedAddress(
+                source, indices, indices.size());
+            Value* destinationAddress = tensorIndexedAddress(
+                destination, indices, indices.size());
+            Value* loaded = sourceAddress == nullptr
+                                ? nullptr
+                                : currentBlock->genLoadInst(sourceAddress);
+            if (loaded == nullptr || destinationAddress == nullptr)
+                reportTensorError("tensor 复制循环的元素寻址失败");
+            currentBlock->genStoreInst(loaded, destinationAddress);
+        });
     return true;
 }
 
@@ -478,7 +800,8 @@ BinaryInst::Operation IRGenerator::lowerBinaryOperator(Type type) const {
 }
 
 Value* IRGenerator::emitTensorBinary(
-    Value* left, BinaryInst::Operation operation, Value* right) {
+    Value* left, BinaryInst::Operation operation, Value* right,
+    TensorValue* destination) {
     const TensorValue* leftLookup = lookupTensor(left);
     const TensorValue* rightLookup = lookupTensor(right);
     if (leftLookup == nullptr && rightLookup == nullptr)
@@ -536,61 +859,88 @@ Value* IRGenerator::emitTensorBinary(
     prepareScalar(scalarLeft);
     prepareScalar(scalarRight);
 
-    Value* result = allocateTensor(
-        resultModel.elementKind, resultModel.shape);
+    std::vector<TensorValue> inputs;
+    if (hasLeftTensor)
+        inputs.push_back(leftValue);
+    if (hasRightTensor)
+        inputs.push_back(rightValue);
+    Value* result = selectTensorResult(
+        destination, resultModel.elementKind, resultModel.shape,
+        inputs, true);
     const TensorValue* resultTensor = lookupTensor(result);
     if (resultTensor == nullptr)
         reportTensorError("无法创建逐元素运算结果");
 
     const std::size_t count = tensorElementCount(resultModel.shape);
-    for (std::size_t index = 0; index < count; ++index) {
-        Value* lhs = scalarLeft;
-        Value* rhs = scalarRight;
-        if (hasLeftTensor) {
-            Value* address = tensorElementAddress(leftValue, index);
-            lhs = address == nullptr ? nullptr
-                                     : currentBlock->genLoadInst(address);
-        }
-        if (hasRightTensor) {
-            Value* address = tensorElementAddress(rightValue, index);
-            rhs = address == nullptr ? nullptr
-                                     : currentBlock->genLoadInst(address);
-        }
-        Value* element = emitBinary(lhs, operation, rhs);
-        Value* destination = tensorElementAddress(*resultTensor, index);
-        if (element == nullptr || destination == nullptr)
-            reportTensorError("逐元素运算生成失败");
-        currentBlock->genStoreInst(element, destination);
-    }
+    if (count == 0)
+        reportTensorError("逐元素运算的元素总数无效");
+    std::vector<Value*> coordinates;
+    emitTensorLoopNest(
+        resultModel.shape, 0, coordinates, "tensor.elementwise",
+        [&](const std::vector<Value*>& indices) {
+            Value* lhs = scalarLeft;
+            Value* rhs = scalarRight;
+            if (hasLeftTensor) {
+                Value* address = tensorIndexedAddress(
+                    leftValue, indices, indices.size());
+                lhs = address == nullptr
+                          ? nullptr
+                          : currentBlock->genLoadInst(address);
+            }
+            if (hasRightTensor) {
+                Value* address = tensorIndexedAddress(
+                    rightValue, indices, indices.size());
+                rhs = address == nullptr
+                          ? nullptr
+                          : currentBlock->genLoadInst(address);
+            }
+            Value* element = emitBinary(lhs, operation, rhs);
+            Value* destinationAddress = tensorIndexedAddress(
+                *resultTensor, indices, indices.size());
+            if (element == nullptr || destinationAddress == nullptr)
+                reportTensorError("逐元素运算生成失败");
+            currentBlock->genStoreInst(element, destinationAddress);
+        });
     return result;
 }
 
-Value* IRGenerator::emitTensorUnaryMinus(Value* value) {
+Value* IRGenerator::emitTensorUnaryMinus(
+    Value* value, TensorValue* requestedDestination) {
     const TensorValue* sourceLookup = lookupTensor(value);
     if (sourceLookup == nullptr)
         return nullptr;
     const TensorValue source = *sourceLookup;
-    Value* result = allocateTensor(source.elementKind, source.shape);
+    Value* result = selectTensorResult(
+        requestedDestination, source.elementKind, source.shape,
+        std::vector<TensorValue>{source}, true);
     const TensorValue* destination = lookupTensor(result);
     if (destination == nullptr)
         reportTensorError("无法创建一元取反结果");
     const std::size_t count = tensorElementCount(source.shape);
-    for (std::size_t index = 0; index < count; ++index) {
-        Value* sourceAddress = tensorElementAddress(source, index);
-        Value* resultAddress = tensorElementAddress(*destination, index);
-        Value* element = sourceAddress == nullptr
-                             ? nullptr
-                             : currentBlock->genLoadInst(sourceAddress);
-        Value* negated = emitBinary(
-            zeroValue(source.elementType), BinaryInst::SUB, element);
-        if (negated == nullptr || resultAddress == nullptr)
-            reportTensorError("tensor 一元取反生成失败");
-        currentBlock->genStoreInst(negated, resultAddress);
-    }
+    if (count == 0)
+        reportTensorError("tensor 一元取反的元素总数无效");
+    std::vector<Value*> coordinates;
+    emitTensorLoopNest(
+        source.shape, 0, coordinates, "tensor.negate",
+        [&](const std::vector<Value*>& indices) {
+            Value* sourceAddress = tensorIndexedAddress(
+                source, indices, indices.size());
+            Value* resultAddress = tensorIndexedAddress(
+                *destination, indices, indices.size());
+            Value* element = sourceAddress == nullptr
+                                 ? nullptr
+                                 : currentBlock->genLoadInst(sourceAddress);
+            Value* negated = emitBinary(
+                zeroValue(source.elementType), BinaryInst::SUB, element);
+            if (negated == nullptr || resultAddress == nullptr)
+                reportTensorError("tensor 一元取反生成失败");
+            currentBlock->genStoreInst(negated, resultAddress);
+        });
     return result;
 }
 
-Value* IRGenerator::emitMatrixMultiply(Value* left, Value* right) {
+Value* IRGenerator::emitMatrixMultiply(
+    Value* left, Value* right, TensorValue* destination) {
     const TensorValue* leftLookup = lookupTensor(left);
     const TensorValue* rightLookup = lookupTensor(right);
     if (leftLookup == nullptr || rightLookup == nullptr)
@@ -647,115 +997,111 @@ Value* IRGenerator::emitMatrixMultiply(Value* left, Value* right) {
         resultShape.push_back(leftM);
     if (!rightOneDimensional)
         resultShape.push_back(rightN);
-
-    std::size_t batchCount = 1;
-    for (std::size_t dimension : batchShape)
-        batchCount *= dimension;
+    if (!resultShape.empty() && tensorElementCount(resultShape) == 0)
+        reportTensorError("@ 的结果元素总数溢出");
 
     Value* result = nullptr;
     const TensorValue* resultTensor = nullptr;
     if (!resultShape.empty()) {
-        result = allocateTensor(leftTensor.elementKind, resultShape);
+        result = selectTensorResult(
+            destination, leftTensor.elementKind, resultShape,
+            std::vector<TensorValue>{leftTensor, rightTensor}, false);
         resultTensor = lookupTensor(result);
         if (resultTensor == nullptr)
             reportTensorError("无法创建 @ 的结果存储");
     }
 
-    auto decode = [](std::size_t flat,
-                     const std::vector<std::size_t>& shape) {
-        std::vector<std::size_t> coordinates(shape.size(), 0);
-        for (std::size_t index = shape.size(); index > 0; --index) {
-            coordinates[index - 1] = flat % shape[index - 1];
-            flat /= shape[index - 1];
-        }
-        return coordinates;
-    };
-    auto flatten = [](const std::vector<std::size_t>& coordinates,
-                      const std::vector<std::size_t>& shape) {
-        std::size_t flat = 0;
-        for (std::size_t index = 0; index < shape.size(); ++index)
-            flat = flat * shape[index] + coordinates[index];
-        return flat;
-    };
-
     Value* scalarResult = nullptr;
-    for (std::size_t batch = 0; batch < batchCount; ++batch) {
-        const std::vector<std::size_t> batchCoordinates =
-            decode(batch, batchShape);
-        for (std::size_t row = 0; row < leftM; ++row) {
-            for (std::size_t column = 0; column < rightN; ++column) {
-                Value* accumulator = zeroValue(leftTensor.elementType);
-                for (std::size_t contracted = 0; contracted < leftK;
-                     ++contracted) {
-                    std::vector<std::size_t> leftCoordinates;
-                    for (std::size_t index = 0; index < leftBatchRank;
-                         ++index) {
-                        const std::size_t outputIndex =
-                            batchRank - leftBatchRank + index;
-                        leftCoordinates.push_back(
-                            leftTensor.shape[index] == 1
-                                ? 0
-                                : batchCoordinates[outputIndex]);
-                    }
-                    if (!leftOneDimensional)
-                        leftCoordinates.push_back(row);
-                    leftCoordinates.push_back(contracted);
 
-                    std::vector<std::size_t> rightCoordinates;
-                    for (std::size_t index = 0; index < rightBatchRank;
-                         ++index) {
-                        const std::size_t outputIndex =
-                            batchRank - rightBatchRank + index;
-                        rightCoordinates.push_back(
-                            rightTensor.shape[index] == 1
-                                ? 0
-                                : batchCoordinates[outputIndex]);
-                    }
-                    rightCoordinates.push_back(contracted);
-                    if (!rightOneDimensional)
-                        rightCoordinates.push_back(column);
-
-                    Value* leftAddress = tensorElementAddress(
-                        leftTensor,
-                        flatten(leftCoordinates, leftTensor.shape));
-                    Value* rightAddress = tensorElementAddress(
-                        rightTensor,
-                        flatten(rightCoordinates, rightTensor.shape));
-                    Value* leftElement = leftAddress == nullptr
-                                             ? nullptr
-                                             : currentBlock->genLoadInst(
-                                                   leftAddress);
-                    Value* rightElement = rightAddress == nullptr
-                                              ? nullptr
-                                              : currentBlock->genLoadInst(
-                                                    rightAddress);
-                    Value* product = emitBinary(
-                        leftElement, BinaryInst::MUL, rightElement);
-                    accumulator = emitBinary(
-                        accumulator, BinaryInst::ADD, product);
-                    if (accumulator == nullptr)
-                        reportTensorError("@ 的乘加生成失败");
-                }
-
-                if (resultShape.empty()) {
-                    scalarResult = accumulator;
-                    continue;
-                }
-                std::vector<std::size_t> outputCoordinates =
-                    batchCoordinates;
-                if (!leftOneDimensional)
-                    outputCoordinates.push_back(row);
-                if (!rightOneDimensional)
-                    outputCoordinates.push_back(column);
-                Value* destination = tensorElementAddress(
-                    *resultTensor,
-                    flatten(outputCoordinates, resultShape));
-                if (destination == nullptr)
-                    reportTensorError("@ 的结果寻址失败");
-                currentBlock->genStoreInst(accumulator, destination);
-            }
+    // 按静态 rank 建立 batch、行、列循环；归约循环保持 k 从零递增。
+    std::vector<Value*> outputCoordinates;
+    std::function<void(std::size_t)> emitOutputLoopNest;
+    emitOutputLoopNest = [&](std::size_t depth) {
+        if (depth < resultShape.size()) {
+            TensorCountedLoop loop = beginTensorCountedLoop(
+                resultShape[depth],
+                "tensor.gemm.axis" + std::to_string(depth), false);
+            outputCoordinates.push_back(loop.index);
+            emitOutputLoopNest(depth + 1);
+            outputCoordinates.pop_back();
+            endTensorCountedLoop(loop);
+            return;
         }
-    }
+
+        TensorCountedLoop contractedLoop = beginTensorCountedLoop(
+            leftK, "tensor.gemm.contract", false);
+        auto* accumulator = new PhiInst(leftTensor.elementType);
+        contractedLoop.header->pushFront(accumulator);
+        accumulator->addIncoming(
+            zeroValue(leftTensor.elementType),
+            contractedLoop.preheader);
+
+        std::vector<Value*> leftCoordinates;
+        leftCoordinates.reserve(leftTensor.shape.size());
+        for (std::size_t index = 0; index < leftBatchRank; ++index) {
+            const std::size_t outputIndex =
+                batchRank - leftBatchRank + index;
+            leftCoordinates.push_back(
+                leftTensor.shape[index] == 1
+                    ? static_cast<Value*>(ConstInt::newConstInt(0))
+                    : outputCoordinates[outputIndex]);
+        }
+        if (!leftOneDimensional)
+            leftCoordinates.push_back(outputCoordinates[batchRank]);
+        leftCoordinates.push_back(contractedLoop.index);
+
+        std::vector<Value*> rightCoordinates;
+        rightCoordinates.reserve(rightTensor.shape.size());
+        for (std::size_t index = 0; index < rightBatchRank; ++index) {
+            const std::size_t outputIndex =
+                batchRank - rightBatchRank + index;
+            rightCoordinates.push_back(
+                rightTensor.shape[index] == 1
+                    ? static_cast<Value*>(ConstInt::newConstInt(0))
+                    : outputCoordinates[outputIndex]);
+        }
+        rightCoordinates.push_back(contractedLoop.index);
+        if (!rightOneDimensional) {
+            const std::size_t columnIndex =
+                batchRank + (leftOneDimensional ? 0 : 1);
+            rightCoordinates.push_back(
+                outputCoordinates[columnIndex]);
+        }
+
+        Value* leftAddress = tensorIndexedAddress(
+            leftTensor, leftCoordinates, leftCoordinates.size());
+        Value* rightAddress = tensorIndexedAddress(
+            rightTensor, rightCoordinates, rightCoordinates.size());
+        Value* leftElement = leftAddress == nullptr
+                                 ? nullptr
+                                 : currentBlock->genLoadInst(leftAddress);
+        Value* rightElement = rightAddress == nullptr
+                                  ? nullptr
+                                  : currentBlock->genLoadInst(rightAddress);
+        Value* product = emitBinary(
+            leftElement, BinaryInst::MUL, rightElement);
+        Value* nextAccumulator = emitBinary(
+            accumulator, BinaryInst::ADD, product);
+        if (nextAccumulator == nullptr)
+            reportTensorError("@ 的乘加生成失败");
+        accumulator->addIncoming(nextAccumulator, currentBlock);
+        endTensorCountedLoop(contractedLoop);
+        Value* reducedValue = contractedLoop.headerTested
+                                  ? static_cast<Value*>(accumulator)
+                                  : nextAccumulator;
+
+        if (resultShape.empty()) {
+            scalarResult = reducedValue;
+            return;
+        }
+        Value* destination = tensorIndexedAddress(
+            *resultTensor, outputCoordinates,
+            outputCoordinates.size());
+        if (destination == nullptr)
+            reportTensorError("@ 的结果寻址失败");
+        currentBlock->genStoreInst(reducedValue, destination);
+    };
+    emitOutputLoopNest(0);
     return resultShape.empty() ? scalarResult : result;
 }
 
@@ -973,7 +1319,7 @@ void IRGenerator::lowerFunctionSpecialization(
 
 Value* IRGenerator::lowerSourceFunctionCall(
     const FuncCall& node, const FuncDef& function,
-    std::vector<Value*> arguments) {
+    std::vector<Value*> arguments, TensorValue* destination) {
     const std::size_t formalCount =
         function.getParams() == nullptr
             ? 0
@@ -984,8 +1330,13 @@ Value* IRGenerator::lowerSourceFunctionCall(
 
     std::vector<SourceValueType> argumentTypes;
     argumentTypes.reserve(arguments.size());
-    for (Value* argument : arguments)
+    std::vector<TensorValue> tensorInputs;
+    for (Value* argument : arguments) {
         argumentTypes.push_back(sourceTypeOfValue(argument));
+        const TensorValue* tensor = lookupTensor(argument);
+        if (tensor != nullptr)
+            tensorInputs.push_back(*tensor);
+    }
 
     FunctionSpecialization* specialization =
         getOrCreateFunctionSpecialization(function, argumentTypes);
@@ -1002,9 +1353,24 @@ Value* IRGenerator::lowerSourceFunctionCall(
             reportTensorError(
                 "递归 tensor 返回调用尚未得到可用的结果形状");
         }
-        result = allocateTensor(
+
+        // 只有编译器新建的临时对象或当前函数的局部对象才能直接作为
+        // 任意被调函数的隐藏返回槽。全局对象可能同时被被调函数读取，
+        // 未知来源地址也可能与未显式传入的存储重叠，二者均保守回退。
+        TensorValue* directDestination = nullptr;
+        if (destination != nullptr && destination->address != nullptr) {
+            Value* destinationRoot = tensorStorageRoot(
+                destination->address);
+            if (destination->isTemporary ||
+                dynamic_cast<AllocaInst*>(destinationRoot) != nullptr) {
+                directDestination = destination;
+            }
+        }
+        result = selectTensorResult(
+            directDestination,
             specialization->returnType.elementKind,
-            specialization->returnType.shape);
+            specialization->returnType.shape,
+            tensorInputs, false);
         const TensorValue* resultInfo = lookupTensor(result);
         if (resultInfo == nullptr)
             reportTensorError("tensor 调用结果分配失败");
@@ -1073,13 +1439,14 @@ Value* IRGenerator::lowerSourceFunctionCall(
 
 Value* IRGenerator::emitBinary(Value* left,
                                BinaryInst::Operation operation,
-                               Value* right) {
+                               Value* right,
+                               TensorValue* destination) {
     // 先执行 SysY 常用算术转换，再交给基本块统一完成常量折叠或指令生成。
     if (left == nullptr || right == nullptr)
         return nullptr;
     if (lookupTensor(left) != nullptr ||
         lookupTensor(right) != nullptr) {
-        return emitTensorBinary(left, operation, right);
+        return emitTensorBinary(left, operation, right, destination);
     }
     const auto leftType = left->getIRType();
     const auto rightType = right->getIRType();
@@ -1129,7 +1496,8 @@ Value* IRGenerator::emitBinary(Value* left,
 }
 
 template <typename OperandT>
-Value* IRGenerator::lowerExpression(const BaseExp<OperandT>& node) {
+Value* IRGenerator::lowerExpression(
+    const BaseExp<OperandT>& node, TensorValue* destination) {
     // 同一优先级的二元表达式按源码顺序从左向右生成，
     // 每一步都复用 emitBinary 完成类型提升、常量折叠和指令插入。
     const auto& operands = node.getOperands();
@@ -1138,26 +1506,40 @@ Value* IRGenerator::lowerExpression(const BaseExp<OperandT>& node) {
         return nullptr;
 
     auto operand = operands.begin();
-    Value* result = lowerExpression(*operand->get());
-    for (Type sourceOperator : operators) {
+    if (operators.empty())
+        return lowerExpression(*operand->get(), destination);
+
+    Value* result = lowerExpression(*operand->get(), nullptr);
+    auto sourceOperator = operators.begin();
+    for (; sourceOperator != operators.end(); ++sourceOperator) {
         ++operand;
-        Value* right = lowerExpression(*operand->get());
-        if (sourceOperator == SY_GEMM)
-            result = emitMatrixMultiply(result, right);
+        Value* right = lowerExpression(*operand->get(), nullptr);
+        TensorValue* operationDestination =
+            std::next(sourceOperator) == operators.end()
+                ? destination
+                : nullptr;
+        if (*sourceOperator == SY_GEMM)
+            result = emitMatrixMultiply(
+                result, right, operationDestination);
         else
             result = emitBinary(
-                result, lowerBinaryOperator(sourceOperator), right);
+                result, lowerBinaryOperator(*sourceOperator), right,
+                operationDestination);
     }
-    return result;
+    return materializeTensorResult(result, destination);
 }
 
-Value* IRGenerator::lowerPrimary(const BaseAST& node) {
+Value* IRGenerator::lowerPrimary(
+    const BaseAST& node, TensorValue* destination) {
     if (auto expression = dynamic_cast<const AddExp*>(&node))
-        return lowerExpression(*expression);
+        return lowerExpression(*expression, destination);
     if (auto lvalue = dynamic_cast<const LVal*>(&node))
-        return lowerRValue(*lvalue);
-    if (auto call = dynamic_cast<const FuncCall*>(&node))
-        return lowerExpression(*call);
+        return materializeTensorResult(
+            lowerRValue(*lvalue), destination);
+    if (auto call = dynamic_cast<const FuncCall*>(&node)) {
+        return materializeTensorResult(
+            lowerExpression(*call, destination), destination);
+    }
     if (auto integer = dynamic_cast<const ConValue<int>*>(&node))
         return ConstInt::newConstInt(integer->getValue());
     if (auto floating = dynamic_cast<const ConValue<float>*>(&node))
@@ -1166,22 +1548,33 @@ Value* IRGenerator::lowerPrimary(const BaseAST& node) {
     return nullptr;
 }
 
-Value* IRGenerator::lowerExpression(const UnaryExp& node) {
+Value* IRGenerator::lowerExpression(
+    const UnaryExp& node, TensorValue* destination) {
     if (node.getOperandCount() != 1)
         return nullptr;
-    Value* result = lowerPrimary(*node.getOperands().front());
+    if (node.getOps().empty())
+        return lowerPrimary(
+            *node.getOperands().front(), destination);
+
+    Value* result = lowerPrimary(
+        *node.getOperands().front(), nullptr);
     if (result == nullptr)
         return nullptr;
 
     // 语法分析器把外层一元操作头插保存，因此逆序应用即可按由内到外求值。
     for (auto operation = node.getOps().rbegin();
          operation != node.getOps().rend(); ++operation) {
+        TensorValue* operationDestination =
+            std::next(operation) == node.getOps().rend()
+                ? destination
+                : nullptr;
         switch (*operation) {
         case SY_ADD:
             break;
         case SY_SUB: {
             if (lookupTensor(result) != nullptr) {
-                result = emitTensorUnaryMinus(result);
+                result = emitTensorUnaryMinus(
+                    result, operationDestination);
                 break;
             }
             if (IRType::isBool(result->getIRType()))
@@ -1202,7 +1595,7 @@ Value* IRGenerator::lowerExpression(const UnaryExp& node) {
         if (result == nullptr)
             return nullptr;
     }
-    return result;
+    return materializeTensorResult(result, destination);
 }
 
 bool IRGenerator::coerceCallArguments(const std::string& callee,
@@ -1347,7 +1740,8 @@ bool IRGenerator::coerceCallArguments(const std::string& callee,
     return true;
 }
 
-Value* IRGenerator::lowerExpression(const FuncCall& node) {
+Value* IRGenerator::lowerExpression(
+    const FuncCall& node, TensorValue* destination) {
     // 调用表达式在一个函数内完整处理：先按源码顺序生成实参，
     // 再按调用约定转换类型，最后解析被调函数并插入 CallInst。
     std::vector<Value*> arguments;
@@ -1367,7 +1761,8 @@ Value* IRGenerator::lowerExpression(const FuncCall& node) {
         if (sourceFunction->second == nullptr)
             throw std::runtime_error("函数定义为空");
         return lowerSourceFunctionCall(
-            node, *sourceFunction->second, std::move(arguments));
+            node, *sourceFunction->second, std::move(arguments),
+            destination);
     }
 
     if (!coerceCallArguments(node.getIdent(), arguments))
@@ -1808,16 +2203,17 @@ void IRGenerator::lowerDefinition(
                 if (currentFunction == nullptr)
                     reportTensorError(
                         "全局 tensor 只能使用数组式常量初始化列表");
-                Value* sourceValue = lowerExpression(*expression);
+                TensorValue destination{
+                    storage, scalarType, sourceScalarKind(scalarType),
+                    *tensorShape, false};
+                Value* sourceValue = lowerExpression(
+                    *expression, &destination);
                 const TensorValue* source =
                     lookupTensor(sourceValue);
                 if (source == nullptr)
                     reportTensorError(
                         "tensor 表达式初始化要求右侧也是 tensor");
                 const TensorValue sourceCopy = *source;
-                TensorValue destination{
-                    storage, scalarType, sourceScalarKind(scalarType),
-                    *tensorShape, false};
                 if (destination.elementKind != sourceCopy.elementKind ||
                     destination.shape != sourceCopy.shape) {
                     reportTensorError(
@@ -2479,10 +2875,34 @@ void IRGenerator::visit(AssignStmt& node) {
         node.getLVal() == nullptr) {
         return;
     }
-    //1.生成右值表达式的IR
-    Value* right = lowerExpression(*node.getExp());
-    //2.生成左值表达式的IR
-    ResolvedLValue left = lowerLValue(*node.getLVal());
+    Value* right = nullptr;
+    ResolvedLValue left;
+
+    // 无下标的完整 tensor 左值不含求值副作用，可以先取得其地址，让右侧
+    // 最终运算在别名安全时直接写入目标；子 tensor 仍维持先右后左的顺序。
+    const SymbolTable::ObjectBinding* directBinding =
+        node.getLVal()->hasArray()
+            ? nullptr
+            : symbols.lookupObject(node.getLVal()->getIdent());
+    if (directBinding != nullptr && directBinding->isTensor) {
+        left = lowerLValue(*node.getLVal());
+        if (left.value != nullptr && left.type != nullptr &&
+            left.isAddress && left.isMutable && left.isTensor) {
+            const TensorValue* destinationLookup = lookupTensor(left.value);
+            if (destinationLookup == nullptr)
+                reportTensorError("tensor 左值的形状信息丢失");
+            TensorValue destination = *destinationLookup;
+            right = lowerExpression(*node.getExp(), &destination);
+        } else {
+            // 非法或只读左值不能成为写入目标，仍生成右侧以维持原有
+            // 诊断路径，但绝不提前改写左侧存储。
+            right = lowerExpression(*node.getExp());
+        }
+    } else {
+        // 普通赋值和带下标赋值保持原有的右值优先求值顺序。
+        right = lowerExpression(*node.getExp());
+        left = lowerLValue(*node.getLVal());
+    }
     if (right == nullptr || left.value == nullptr || left.type == nullptr ||
         !left.isAddress || !left.isMutable) {
         return;
@@ -2668,7 +3088,17 @@ void IRGenerator::visit(ReturnStmt& node) {
     if (currentTensorReturnSlot != nullptr) {
         if (!node.hasReturnValue())
             reportTensorError("tensor 返回函数必须返回 tensor 表达式");
-        Value* value = lowerExpression(*node.getReturnValue());
+        Value* destinationAddress =
+            currentBlock->genLoadInst(currentTensorReturnSlot);
+        TensorValue destination{
+            destinationAddress,
+            lowerScalarKind(currentTensorReturnElement),
+            currentTensorReturnElement,
+            {},
+            true,
+            true};
+        Value* value = lowerExpression(
+            *node.getReturnValue(), &destination);
         const TensorValue* sourceLookup = lookupTensor(value);
         if (sourceLookup == nullptr)
             reportTensorError("tensor 返回函数不能返回标量");
@@ -2688,14 +3118,6 @@ void IRGenerator::visit(ReturnStmt& node) {
             reportTensorError(
                 "同一函数的所有 tensor 返回路径必须具有相同类型和形状");
         }
-        Value* destinationAddress =
-            currentBlock->genLoadInst(currentTensorReturnSlot);
-        TensorValue destination{
-            destinationAddress,
-            source.elementType,
-            source.elementKind,
-            source.shape,
-            true};
         if (!copyTensor(destination, source))
             reportTensorError("tensor 返回值复制失败");
         currentBlock->genRetInst();
