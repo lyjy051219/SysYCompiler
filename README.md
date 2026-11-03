@@ -45,7 +45,7 @@ SysY / tensor 源程序
 
 ### 构建完整编译器
 
-以下命令均在本 README 所在目录执行，即仓库根目录下的 `Compiler/`：
+本 README 位于仓库根目录。先执行一次 `cd Compiler` 进入编译器工程；后续构建、编译、运行与测试命令均在该目录执行，命令中的相对路径也以该目录为基准：
 
 ```bash
 # 从仓库根目录进入编译器工程
@@ -130,7 +130,7 @@ python3 tensor-benchmark/run.py \
   --warmup 1 --repeat 5 --label baseline
 ```
 
-脚本检查程序输出与返回码，生成 JSON/CSV 报告；默认工作目录为 `tensor-benchmark/_work/`，报告目录为 `tensor-benchmark/results/`。更多选项见 [tensor 基准说明](tensor-benchmark/README.md)。QEMU 计时适合同环境下的相对比较，不代表比赛目标板的实际性能。
+脚本检查程序输出与返回码，生成 JSON/CSV 报告；默认工作目录为 `tensor-benchmark/_work/`，报告目录为 `tensor-benchmark/results/`。更多选项见 [tensor 基准说明](Compiler/tensor-benchmark/README.md)。QEMU 计时适合同环境下的相对比较，不代表比赛目标板的实际性能。
 
 `backendtest.py`、`backendtest.ipynb` 和 `performance_score.py` 保留了后端测试与评分流程，依赖本地工具链及额外测试集，并非克隆仓库后即可完整复现比赛评测。`performance_score.py` 的 LLVM IR 基线还依赖 IR 输出；当前主程序不生成 `.ll`，使用前需适配这一接口及测试集路径。它们的结果不等同于官方比赛成绩。
 
@@ -156,12 +156,12 @@ BACKEND_DISABLE_PASSES=post-ra-peephole \
 
 ```text
 仓库根目录/
+├── README.md                        # 项目说明（本文件）
 ├── LICENSE                          # MIT 协议全文
 ├── .gitignore
-└── Compiler/                        # CMake 工程与本 README 所在目录
+└── Compiler/                        # CMake 工程与源码目录
     ├── CMakeLists.txt
     ├── main.cpp                     # 命令行入口与完整编译流程
-    ├── README.md
     ├── include/
     │   ├── Common.hpp
     │   ├── yacc/                    # 生成的词法器、语法解析器接口
@@ -198,22 +198,22 @@ BACKEND_DISABLE_PASSES=post-ra-peephole \
 
 ### 语言参考
 
-`doc/language/` 收录语言参考资料，便于对照前端语法和 tensor 扩展：
+`Compiler/doc/language/` 收录语言参考资料，便于对照前端语法和 tensor 扩展：
 
-- [SysY 2022 语言定义（V1）](doc/language/SysY2022语言定义-V1.pdf)：基础类型、数组、函数、语句及表达式等语言规则。
-- [SysY 2026 语言参考](doc/language/SYSY2026.pdf)：包含 `tensor int`、`tensor float` 及 tensor 函数参数与返回类型的语法和语言说明。
+- [SysY 2022 语言定义（V1）](Compiler/doc/language/SysY2022语言定义-V1.pdf)：基础类型、数组、函数、语句及表达式等语言规则。
+- [SysY 2026 语言参考](Compiler/doc/language/SYSY2026.pdf)：包含 `tensor int`、`tensor float` 及 tensor 函数参数与返回类型的语法和语言说明。
 
-这些文档用于查阅语言规则，不表示当前编译器已通过全部规范符合性验证；具体实现可对照 `src/yacc/sysy.l`、`src/yacc/sysy.y` 和 `src/lib/IRGenerator.cpp`。
+这些文档用于查阅语言规则，不表示当前编译器已通过全部规范符合性验证；具体实现可对照 `Compiler/src/yacc/sysy.l`、`Compiler/src/yacc/sysy.y` 和 `Compiler/src/lib/IRGenerator.cpp`。
 
 ### 设计与测试文档
 
-- [前中端设计文档](doc/DOCS.md)
-- [后端设计文档](doc/BACKEND.md)
-- [设计文档 PDF](doc/DOCS.pdf)
-- [Tensor 基准说明](tensor-benchmark/README.md)
+- [前中端设计文档](Compiler/doc/DOCS.md)
+- [后端设计文档](Compiler/doc/BACKEND.md)
+- [设计文档 PDF](Compiler/doc/DOCS.pdf)
+- [Tensor 基准说明](Compiler/tensor-benchmark/README.md)
 
 设计文档及历史基准记录可能描述开发阶段的实现；当前行为以源码和构建配置为准。
 
 ## 开源协议
 
-本项目自有代码采用 [MIT License](../LICENSE)，源码中的 `SPDX-License-Identifier: MIT` 与根目录协议对应。生成代码及外部来源文件保留其原有版权、许可声明和适用例外。
+本项目自有代码采用 [MIT License](LICENSE)，源码中的 `SPDX-License-Identifier: MIT` 与根目录协议对应。生成代码及外部来源文件保留其原有版权、许可声明和适用例外。
