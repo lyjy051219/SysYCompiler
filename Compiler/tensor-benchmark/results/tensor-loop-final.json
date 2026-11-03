@@ -3,7 +3,7 @@
   "generated_at_utc": "2026-08-18T13:21:21.445174+00:00",
   "label": "tensor-loop-final",
   "configuration": {
-    "compiler": "/home/lyjy/Compiler/Compiler/build-riscv-release/compiler",
+    "compiler": "build-riscv-release/compiler",
     "compiler_sha256": "f704f72572968d5a0e32052230cf22bb926b7293ac75fc8856280b871170b1ae",
     "optimization_level": "O1",
     "warmup": 2,
@@ -454,7 +454,7 @@
     }
   ],
   "comparison": {
-    "reference_json": "/home/lyjy/Compiler/Compiler/tensor-benchmark/results/baseline-release-full-expand-ef3fb21.json",
+    "reference_json": "tensor-benchmark/results/baseline-release-full-expand-ef3fb21.json",
     "speedup_by_case": {
       "01_elementwise_int_n64": 1.5030229348754682,
       "02_broadcast_float_n64": 1.07627606038821,

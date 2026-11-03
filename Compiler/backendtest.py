@@ -43,10 +43,10 @@ if (NOTEBOOK_CWD / 'CMakeLists.txt').exists() and (NOTEBOOK_CWD / 'runtime').exi
 elif (NOTEBOOK_CWD / 'Compiler' / 'CMakeLists.txt').exists():
     # PROJECT 指向仓库根目录下的 Compiler 子目录。
     PROJECT = NOTEBOOK_CWD / 'Compiler'
-# 如果前两种都不是，就使用当前机器上的默认项目位置。
+# 如果从其他目录启动，使用脚本自身的位置。
 else:
-    # PROJECT 使用绝对路径兜底，避免 notebook 从别的目录启动时找不到项目。
-    PROJECT = Path('/home/lyjy/Compiler/Compiler').resolve()
+    # PROJECT 不依赖开发者机器上的固定目录。
+    PROJECT = Path(__file__).resolve().parent
 # WORKSPACE 是仓库根目录，也就是 Compiler 项目的父目录。
 WORKSPACE = PROJECT.parent
 # BUILD_DIR 是完整编译器的 CMake 构建目录。
@@ -176,7 +176,7 @@ def detect_riscv_prefix():
     if env_prefix and shutil.which(env_prefix + 'gcc'):
         return env_prefix
     # 常见工具链前缀列表，包含当前机器可用的 riscv64-linux-gnu-。
-    candidates = ['riscv64-linux-gnu-', 'riscv64-unknown-linux-gnu-', '/home/r1c0/riscv/bin/riscv64-unknown-linux-gnu-']
+    candidates = ['riscv64-linux-gnu-', 'riscv64-unknown-linux-gnu-']
     # 逐个检查候选前缀。
     for prefix in candidates:
         # gcc 存在就认为该工具链可用。

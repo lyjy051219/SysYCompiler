@@ -77,7 +77,7 @@ def discover_project() -> Path:
     script_dir = Path(__file__).resolve().parent
     if (script_dir / "CMakeLists.txt").exists():
         return script_dir
-    return Path("/home/lyjy/Compiler/Compiler").resolve()
+    raise RuntimeError("Cannot find compiler project; run from the repository or Compiler directory")
 
 
 PROJECT = discover_project()
@@ -360,7 +360,6 @@ def detect_riscv_prefix() -> str:
     candidates = [
         "riscv64-linux-gnu-",
         "riscv64-unknown-linux-gnu-",
-        "/home/r1c0/riscv/bin/riscv64-unknown-linux-gnu-",
     ]
     for prefix in candidates:
         if shutil.which(prefix + "gcc"):

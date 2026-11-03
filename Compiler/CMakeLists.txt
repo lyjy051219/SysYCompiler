@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
  
 # === 构建选项 ===
 #如果需要使用哪个版本进行编译就去找相关的指令即可
-option(BUILD_MIDDLE_END "构建中端(IR)用于调试" ON)
+option(BUILD_MIDDLE_END "构建中端(IR)用于调试" OFF)
 option(BUILD_MIDDLE_END_RELEASE "构建中端(IR)的Release版本(-O2)" OFF)
 option(BUILD_RISCV_BACKEND_RELEASE "构建RISC-V后端的Release版本(-O2)" OFF)
 

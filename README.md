@@ -75,7 +75,7 @@ cmake -S . -B build-riscv \
 cmake --build build-riscv --target compiler -j 4
 ```
 
-`BUILD_MIDDLE_END` 默认开启，且其分支优先于 RISC-V Release 分支，因此构建完整编译器时必须显式关闭。现有中端专用目标未链接 Backend，但共享的 `main.cpp` 会调用后端，不应将这些目标作为当前版本的独立 IR 输出入口。
+默认配置构建完整 RISC-V 编译器（目标名为 `compiler`），可直接执行 `cmake -S . -B build` 和 `cmake --build build -j 4`。上述命令显式关闭中端选项，以避免已有构建目录中的缓存设置影响目标选择。现有中端专用目标未链接 Backend，但共享的 `main.cpp` 会调用后端，不应将这些目标作为当前版本的独立 IR 输出入口。
 
 ## Command 格式
 
@@ -216,4 +216,4 @@ BACKEND_DISABLE_PASSES=post-ra-peephole \
 
 ## 开源协议
 
-本项目自有代码采用 [MIT License](LICENSE)，源码中的 `SPDX-License-Identifier: MIT` 与根目录协议对应。生成代码及外部来源文件保留其原有版权、许可声明和适用例外。
+本项目自有代码采用 [MIT License](LICENSE)，源码中的 `SPDX-License-Identifier: MIT` 与根目录协议对应。生成代码及外部来源文件保留其原有版权、许可声明和适用例外。`Compiler/runtime/` 的运行库、`Compiler/doc/language/` 的语言参考 PDF 及非原创插图的来源与再分发授权尚需维护者确认，不能仅依据本项目 MIT 声明认定这些材料均可按 MIT 再分发。
