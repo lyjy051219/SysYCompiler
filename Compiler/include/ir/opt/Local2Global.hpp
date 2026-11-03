@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -11,3 +14,4 @@ private:
 	//阈值
 	static constexpr size_t Threshold = 1024;
 };
+ 

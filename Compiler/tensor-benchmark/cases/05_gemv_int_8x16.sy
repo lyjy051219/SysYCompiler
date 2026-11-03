@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 int main() {
   tensor int matrix[8][16];
   tensor int column[16];

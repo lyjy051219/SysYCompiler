@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopDistribution.hpp"
 #include "ir/analysis/LoopDependence.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -14,7 +17,7 @@
 #include <utility>
 #include <vector>
 //步骤 1.1：循环克隆不复制 call、alloca、ret 或未知二元语义；这些指令即使
-//带只读属性也可能表达输入或其他可观察行为。
+//带只读属性也可能表达输入或其他可观察行为
 bool LoopDistributionPass::hasUnsupportedInstruction(Instruction *I) {
     if (!I) return true;
     if (dynamic_cast<CallInst *>(I) || dynamic_cast<AllocaInst *>(I) ||

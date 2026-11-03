@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/analysis/LoopDependence.hpp"
 #include "ir/opt/NewPassManager.hpp"
@@ -8,7 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 //BasicAAResult提供底层对象和内存位置别名关系
 class BasicAAResult;
 //DominatorTree提供迭代路径上的支配关系

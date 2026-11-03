@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/BreakCriticalEdges.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -12,7 +15,7 @@ bool BreakCriticalEdgesPass::isCriticalEdge(
     //关键边不能跨函数
 	if (!From || !To || From->getParent() != &F || To->getParent() != &F) {
 		return false;
-	}
+	} 
     // 前驱块必须有两个不同的后继块，后继块必须有多个不同的前驱块
 	auto Successors = From->getSuccessors();
 	if (Successors.size() != 2 || Successors[0] == Successors[1]) {

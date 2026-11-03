@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -16,7 +19,7 @@ class IndVarSimplifyPass : public PassDescriptor<IndVarSimplifyPass> {
 public:
     //合并重复归纳递推或规范化一次循环退出比较。
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
     //服务步骤 1：精确比较入边、更新操作码、类型和递推 PHI 的对应关系；
     //SCEV 数学等价只用于分桶，不能单独作为合并依据。

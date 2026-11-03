@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/TailRecursionElimination.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -13,7 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-//判断调用是否直接调用当前函数
+//判断调用是否直接调用当前函数 
 bool TailRecursionEliminationPass::isSelfCall(CallInst *CI, Function &F) {
     return CI && CI->getCallee() == &F;
 }

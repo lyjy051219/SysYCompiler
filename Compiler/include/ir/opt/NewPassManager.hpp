@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include <set>
 #include <memory>
@@ -321,7 +324,7 @@ public:
         ResultCache.emplace(
             Key, std::make_unique<WrapperT>(std::move(Result)));
     }
-
+ 
     //注册一种分析Pass并记录其跨IR单元失效属性
     template <typename PassBuilderT>
     bool registerPass(PassBuilderT &&PassBuilder) {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "riscv/opt/MachinePassManager.hpp"
@@ -136,7 +139,7 @@ struct MachineVerifyPass {
   MachinePreservationStatus run(MachineFunction &mf,
                                 MachineFunctionAnalysisManager &am);
 };
-
+ 
 // 调试打印 pass：设置环境变量 BACKEND_DUMP_MIR 后把当前 MIR 打到标准错误
 // tag 用来区分打印位置
 struct MachineDumpPass {

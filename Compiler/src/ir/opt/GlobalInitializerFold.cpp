@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/GlobalInitializerFold.hpp"
 #include <cstdint>
 #include <limits>
@@ -21,7 +24,7 @@ Variable *GlobalInitializerFoldPass::getWholeObjectGlobal(Value *Pointer) {
             Pointer = GEP->getBasePointer();
             continue;
         }
-        break;
+        break; 
     }
     return dynamic_cast<Variable *>(Pointer);
 }

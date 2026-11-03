@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -7,7 +10,7 @@
 #include <unordered_set>
 #include <memory>
 class LoopInfo;
-
+ 
 //Loop表示一个自然循环
 class Loop {
     friend class LoopInfo;

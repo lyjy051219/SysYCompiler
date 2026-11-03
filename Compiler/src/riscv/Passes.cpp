@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/Passes.hpp"
 
 #include "lib/CFG.hpp"
@@ -24,7 +27,7 @@ namespace {
 // 前置声明:文件内相互调用的辅助函数。
 void appendJump(MachineBasicBlock &block, const std::string &label);
 void retargetPhiIncomingPreds(MachineFunction &mf, const std::string &oldLabel,
-                              const std::string &newLabel);
+                               const std::string &newLabel);
 int findBlockIndex(const MachineFunction &mf, const std::string &label);
 
 // 判断操作码是否为终结指令(返回、条件分支、无条件跳转)。

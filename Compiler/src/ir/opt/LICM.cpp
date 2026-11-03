@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LICM.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/MemorySSA.hpp"
@@ -24,7 +27,7 @@ std::size_t ExitValueKeyHash::operator()(const ExitValueKey &K) const {
 	auto A = reinterpret_cast<std::uintptr_t>(K.first);
 	auto B = reinterpret_cast<std::uintptr_t>(K.second);
 	return A ^ (B + 0x9e3779b97f4a7c15ULL + (A << 6) + (A >> 2));
-}
+} 
 //判断候选之前的块内前缀是否可安全提前执行
 bool LICMPass::hasSafeExecutionPrefix(const Instruction *Candidate) {
 	//2.1 从块首到候选之间不得有写入、调用或可能陷阱/poison 的操作；这证明把原本

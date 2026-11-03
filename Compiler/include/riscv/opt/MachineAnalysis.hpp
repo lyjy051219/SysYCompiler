@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "riscv/MIR.hpp"
@@ -22,7 +25,7 @@ class MachineInstrStatsAnalysis
     : public MachineAnalysisDescriptor<MachineInstrStatsAnalysis> {
 public:
   static MachinePassID Key;
-
+ 
   struct Result {
     std::size_t blockCount = 0;
     std::size_t instrCount = 0;

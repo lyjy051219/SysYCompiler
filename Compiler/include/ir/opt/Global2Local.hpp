@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -18,7 +21,7 @@ class Global2LocalPass : public PassDescriptor<Global2LocalPass> {
 public:
 	explicit Global2LocalPass(bool RelaxScalarUses = false);
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
 	//阈值
 	static constexpr size_t Threshold = 32;

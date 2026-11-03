@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LCSSA.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -22,7 +25,7 @@ bool LCSSAPass::isLCSSAForm(Loop *L) {
 				BasicBlock *UseBlock = nullptr;
 				if (UserPhi) {
 					auto OpIdx = U->getOperandIndex();
-					if (!OpIdx || (*OpIdx % 2) != 0) continue;
+ 					if (!OpIdx || (*OpIdx % 2) != 0) continue;
 					UseBlock = UserPhi->getIncomingBlock(
 						static_cast<unsigned>(*OpIdx / 2));
 				} else {

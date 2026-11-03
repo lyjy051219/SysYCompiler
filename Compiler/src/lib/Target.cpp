@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "lib/Target.hpp"
 
 #include "lib/TypeSystem.hpp"
@@ -16,7 +19,7 @@ std::size_t nextPowerOfTwo(std::size_t Value) {
         Result <<= 1U;
     return std::min<std::size_t>(Result, 16);
 }
-
+ 
 std::size_t alignTo(std::size_t Value, std::size_t Alignment) {
     if (Alignment <= 1)
         return Value;

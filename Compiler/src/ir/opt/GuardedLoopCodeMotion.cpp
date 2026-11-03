@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/GuardedLoopCodeMotion.hpp"
 
 #include "ir/analysis/Dominant.hpp"
@@ -12,7 +15,7 @@
 
 #include <algorithm>
 
-//判断一条指令是否可以从无用户路径中安全删除，并能按 SSA 映射复制。
+//判断一条指令是否可以从无用户路径中安全删除，并能按 SSA 映射复制
 bool GuardedLoopCodeMotionPass::isSafeScalarInstruction(Instruction *I) {
     if (!I || !I->getParent() || !I->getIRType() ||
         !I->getIRType()->isScalar() || dceInstructionMustBePreserved(I) ||

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/Local2Global.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
@@ -26,7 +29,7 @@ PreservationStatus Local2GlobalPass::run(Module &M, ModuleAnalysisPassManager &M
 		if (ElemTy->getSize() > Threshold) {
 			WorkList.emplace_back(AI, ElemTy);
 		}
-	}
+	} 
 	if (WorkList.empty()) return PreservationStatus::all();
 	//3.alloca->全局变量
 	for (auto &Entry : WorkList) {

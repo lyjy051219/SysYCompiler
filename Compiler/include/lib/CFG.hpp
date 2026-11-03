@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 // IRUtils 同时承载 CFG 所需的侵入式链表和依赖完整 CFG 的遍历工具
@@ -5,7 +8,7 @@
 #define COMPILER_LIB_IRUTILS_BASE_ONLY
 #include "IRUtils.hpp"
 #undef COMPILER_LIB_IRUTILS_BASE_ONLY
-
+ 
 #include <memory>
 #include <vector>
 #include <string>

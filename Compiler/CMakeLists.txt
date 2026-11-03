@@ -1,9 +1,12 @@
+# Copyright (c) 2026 Compiler contributors
+# SPDX-License-Identifier: MIT
+
 cmake_minimum_required(VERSION 3.13)
 project(compiler LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+ 
 # === 构建选项 ===
 #如果需要使用哪个版本进行编译就去找相关的指令即可
 option(BUILD_MIDDLE_END "构建中端(IR)用于调试" ON)
@@ -25,7 +28,7 @@ if(BUILD_MIDDLE_END_RELEASE)
     )
 
     target_link_libraries(compiler_middle_end_release Lib Yacc Opt Analysis)
-
+ 
     # 保留调试符号，便于调试经过优化的代码。
     target_compile_options(compiler_middle_end_release PRIVATE
         -O2

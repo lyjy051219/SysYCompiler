@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -11,7 +14,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
+ 
 // 死参数消除 (Dead Argument Elimination)
 // 跨函数分析参数是否仅被“转发调用”使用，并进行函数签名收缩重写。
 class DAEPass : public PassDescriptor<DAEPass> {

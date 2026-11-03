@@ -1,6 +1,10 @@
+/* Copyright (c) 2026 Compiler contributors
+ * SPDX-License-Identifier: MIT
+ */
+
 %header "include/yacc/Bison.hpp"
 %output "src/yacc/Bison.cpp"
-// 生成文件路径相对于项目根目录。
+// 生成文件路径相对于项目根目录
 %language "c++"
 // 令牌由 yy::parser::make_* 构造函数创建。
 %define api.token.constructor
@@ -26,7 +30,7 @@
 extern yy::parser::symbol_type yylex();
 extern std::unique_ptr<CompUnit> ASTRoot;
 extern int yylineno;
-
+ 
 void yy::parser::error(const std::string &err)
 {
     std::cerr << "语法错误：第 " << yylineno << " 行：" << err << '\n';
@@ -117,7 +121,7 @@ void yy::parser::error(const std::string &err)
 %%
 Start: CompUnit { ASTRoot = std::unique_ptr<CompUnit>($1); }
 
-// 编译单元使用左递归产生式，并按源码顺序在列表尾部追加节点。
+//编译单元使用左递归，并按源码顺序在列表尾部追加节点
 CompUnit
   : CompUnit Decl{$$ = $1; $$->pushBack($2);}
   | CompUnit FuncDef{$$ = $1; $$->pushBack($2);}
@@ -125,13 +129,13 @@ CompUnit
   | FuncDef {$$ = new CompUnit($1);}
   ;
 
-// 常量声明与变量声明统一转换为 AST 节点。
+//常量声明与变量声明
 Decl
   : ConstDecl { $$ = $1; }
   | VarDecl { $$ = $1; }
   ;
 
-// 常量声明由基础类型和同类型定义列表组成。
+//常量声明由基础类型和同类型定义列表组成
 ConstDecl
   : CONST Type ConstDefList SEMICOLON{ $$ = new ConstDecl($2,$3); }
   ;
@@ -221,7 +225,7 @@ BlockItem
  | Stmt{ $$ = $1; }
   ;
 
-// 语句产生式覆盖赋值、分支、循环、跳转和返回。
+// 语句产生式覆盖赋值、分支、循环、跳转和返回
 Stmt
  : LVal ASSIGN AddExp SEMICOLON{ $$ = new AssignStmt($1,$3); }
  | SEMICOLON { $$ = new ExpStmt(nullptr); }
@@ -278,6 +282,7 @@ MulExp
  | MulExp MOD UnaryExp { $$ = $1; $$->pushBack(SY_MOD); $$->pushBack($3); }
  | MulExp GEMM UnaryExp { $$ = $1; $$->pushBack(SY_GEMM); $$->pushBack($3); }
  ;
+ //决赛GEMM类型，@运算符，标注方便查错
 
 AddExp
  : MulExp{ $$ = new AddExp($1); }
@@ -309,7 +314,7 @@ LOrExp
  | LOrExp OR LAndExp{ $$ = $1; $$->pushBack(SY_OR); $$->pushBack($3); }
  ;
 
-
+//决赛Tensor类型
 Type
  : VOID { $$ = ASTType::makeScalar(ASTScalarKind::Void); }
  | INT { $$ = ASTType::makeScalar(ASTScalarKind::Int32); }

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -8,7 +11,7 @@
 class DominatorNode;
 class DominatorTree;
 class RangeInfo;
-
+ 
 //规范约束表示 val op (bound + boundOffset)，常量边界同时缓存在 boundVal 中。
 struct ConstraintElimConstraint {
     //记录规范约束左侧被限制的值。

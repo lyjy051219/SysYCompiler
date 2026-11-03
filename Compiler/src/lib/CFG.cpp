@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "../../include/lib/CFG.hpp"
 #include "../../include/lib/BaseManager.hpp"
 #include "lib/CFG.hpp"
@@ -18,7 +21,7 @@ extern std::unique_ptr<Module> ModuleIR;
 
 std::shared_ptr<IRType> RetInst::validateAndGetResultType(
     Value *ReturnValue) {
-  if (!ReturnValue ||
+  if (!ReturnValue || 
       !IRType::isFirstClassValueType(ReturnValue->getIRType()))
     throw std::invalid_argument(
         "ret 返回值必须是标量或指针");

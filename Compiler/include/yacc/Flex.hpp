@@ -25,7 +25,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
-
+ 
 /* end standard C headers. */
 
 /* flex integer type definitions */
@@ -58,7 +58,7 @@ typedef int flex_int32_t;
 typedef unsigned char flex_uint8_t; 
 typedef unsigned short int flex_uint16_t;
 typedef unsigned int flex_uint32_t;
-
+     
 /* Limits of integral types. */
 #ifndef INT8_MIN
 #define INT8_MIN               (-128)

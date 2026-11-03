@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineAnalysis.hpp"
 
 #include "riscv/Target.hpp"
@@ -18,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace riscv {
+namespace riscv { 
 // Machine Analysis 的实现：统计信息、控制流图(CFG)、活跃变量、自然循环
 // 与循环深度、以及块执行频率估计。这些分析被寄存器分配、机器 DCE、CFG 清理
 // 等 RISC-V 机器 pass 通过分析管理器按需取用并缓存。

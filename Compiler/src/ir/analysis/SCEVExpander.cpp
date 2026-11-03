@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/SCEVExpander.hpp"
 #include "lib/IRUtils.hpp"
 #include <limits>
@@ -13,7 +16,7 @@ const std::vector<Instruction *> &SCEVExpander::createdInstructions() const {
 int SCEVExpander::estimateCost(const SCEVExpr *E) const {
     std::unordered_set<const SCEVExpr *> Active;
     return estimateCostImpl(E, Active);
-}
+} 
 //判断给定表达式是否能够在当前插入点和剩余预算内展开
 bool SCEVExpander::canExpand(const SCEVExpr *E) const {
     int Cost = estimateCost(E);

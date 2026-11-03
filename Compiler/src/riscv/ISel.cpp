@@ -1,17 +1,14 @@
-// ISel.cpp - RISC-V 指令选择与 IR 到 MIR 的 lowering。
-//
-// 本文件把中端的线性 SSA IR 逐条翻译为目标相关的机器指令(MIR)。核心职责:
-//   - 为每个 IR Value 分配虚拟寄存器,并选择正确的寄存器类(GPR32/GPR64/FPR32);
-//   - 把 IR 二元/比较/类型转换/访存/GEP/调用/分支/PHI/SELECT 等指令 lower 为
-//     RISC-V 指令,尽量在选择期完成立即数折叠、常量除法强度削减等本地优化;
-//   - 处理函数参数按 RV 调用约定的入参落位,以及 memcpy/memset 等内建的展开。
-//
-// 命名与位宽约定:SysY 的整数类型是 i32,算术使用带 W 后缀的 word 指令
-// (ADDW/SUBW/MULW/DIVW 等),它们对结果做 32 位符号扩展写回 64 位寄存器,
-// 保证高 32 位与 i32 语义一致;指针是 64 位,使用不带 W 的整型指令。浮点为
-// f32,使用 *_S 系列单精度指令。带 I 后缀的是立即数形式(ADDI/SLLIW 等)。
-//
-// 本文件只做选择与本地折叠;跨块优化、寄存器分配、栈帧展开由后续 pass 完成。
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
+//IR -> MIR 
+// 为每个 IR Value 分配虚拟寄存器,并选择正确的寄存器类(GPR32/GPR64/FPR32)
+// 把 IR 二元/比较/类型转换/访存/GEP/调用/分支/PHI/SELECT 等指令 lower 为RISC-V 指令
+// 在选择期完成立即数折叠、常量除法强度削减等本地优化
+// 按 RV 调用约定处理函数参数,以及 memcpy/memset 等内建的展开
+// SysY 的整数类型是 i32,算术使用带 W 后缀的 word 指令(ADDW/SUBW/MULW/DIVW 等),它们对结果做 32 位符号扩展写回 64 位寄存器
+// 保证高 32 位与 i32 语义一致;指针是 64 位,使用不带 W 的整型指令
+// 浮点为f32,使用 *_S 系列单精度指令。带 I 后缀的是立即数形式(ADDI/SLLIW 等)
 #include "riscv/ISel.hpp"
 
 #include "riscv/Frame.hpp"
@@ -30,20 +27,22 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-
+ 
 namespace riscv {
 namespace {
 
 const char *instTypeName(Instruction::InstType type);
 
-// 判断是否为布尔类型(i1),布尔在本后端占 1 字节、用 LBU/SB 访存。
+// 判断是否为布尔类型(i1),布尔在本后端占 1 字节用 LBU/SB 访存
 bool isBoolType(const std::shared_ptr<IRType> &type) {
   auto intType = std::dynamic_pointer_cast<INTType>(type);
   return intType && intType->getIsBool();
 }
 
-// 返回类型在内存中的字节大小。标量按固定宽度(bool 1、int 4、float 4、指针 8),
-// 数组递归为元素数乘元素大小；其余类型回退到类型自身报告的 getSize。
+// 返回类型在内存中的字节大小
+//标量按固定宽度(bool 1、int 4、float 4、指针 8),
+// 数组递归为元素数乘元素大小
+// 其余类型用类型自身报告的 getSize
 int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return 0;
@@ -66,7 +65,8 @@ int64_t sizeOfType(const std::shared_ptr<IRType> &type) {
   }
 }
 
-// 返回类型的自然对齐字节数。数组的对齐取元素对齐,标量对齐等于其宽度。
+// 返回类型的对齐字节数
+// 数组的对齐取元素对齐,标量对齐等于其宽度
 int64_t alignOfType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return 1;
@@ -88,22 +88,20 @@ int64_t alignOfType(const std::shared_ptr<IRType> &type) {
   }
 }
 
-// 空指针或 IR_VOID 都视为 void(用于判断调用/返回是否产生结果值)。
+// 空指针或 IR_VOID 都视为 void(用于判断调用/返回是否产生结果值)
 bool isVoidType(const std::shared_ptr<IRType> &type) {
   return !type || type->getTypeSystem() == IR_VOID;
 }
 
-// 是否为浮点类型。
 bool isFloatType(const std::shared_ptr<IRType> &type) {
   return type && type->getTypeSystem() == IR_FLOAT;
 }
 
-// 是否为指针类型。
 bool isPointerType(const std::shared_ptr<IRType> &type) {
   return type && type->getTypeSystem() == IR_POINTER;
 }
 
-// 生成类型的简短可读名,仅用于错误信息(如 f32/i32/pointer)。
+// 错误信息生成类型的简短可读名(如 f32/i32/pointer)
 std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   if (!type) {
     return "<missing>";
@@ -120,8 +118,7 @@ std::string scalarTypeName(const std::shared_ptr<IRType> &type) {
   return "non-scalar";
 }
 
-// 为 IR 类型选择机器寄存器类:浮点用 FPR32,指针用 GPR64,整数用 GPR32。
-// 这是决定后续所有指令位宽(W/非 W)与拷贝操作码的关键。
+// reg类型：浮点用 FPR32,指针用 GPR64,整数用 GPR32
 RegClass regClassForType(const std::shared_ptr<IRType> &type) {
   if (!type) {
     throw BackendError("missing IR type for register class selection");
@@ -138,12 +135,13 @@ RegClass regClassForType(const std::shared_ptr<IRType> &type) {
   }
 }
 
-// 立即数是否落在 RISC-V I 型指令的有符号 12 位范围 [-2048, 2047]。
-// 决定能否使用 ADDI/ANDI 等立即数形式而无需先 LI 到寄存器。
+// 立即数是否落在 RISC-V I 型指令的有符号 12 位范围 [-2048, 2047]
+// 决定能否使用 ADDI/ANDI 等立即数形式而无需先 LI 到寄存器
 bool fitsSigned12(int64_t value) { return value >= -2048 && value <= 2047; }
 
-// 表示一个可用于访存/取地址的地址:要么是寄存器基址加偏移(Reg),要么是
-// 尚未展开的栈帧对象加偏移(FrameIndex,栈布局 pass 之后才变成实际的 sp 偏移)。
+// 表示一个可用于访存/取地址的地址
+//1.寄存器基址加偏移(Reg)
+//2.尚未展开的栈帧对象加偏移(FrameIndex,栈布局 pass 之后才变成实际的 sp 偏移)。
 struct Address {
   enum class Kind { Reg, FrameIndex };
 
@@ -169,8 +167,8 @@ struct Address {
   }
 };
 
-// 常量除法/取模复用的键:同一基本块内、同一被除数 lhs、同一除数 divisor 的
-// 除法商可被后续同参取模复用,避免重复展开 magic 乘法序列。
+// 常量除法/取模复用的key
+// 同一基本块内、同一被除数 、同一除数的除法商可被后续同参取模复用
 struct DivRemKey {
   Value *lhs = nullptr;
   int64_t divisor = 0;
@@ -182,7 +180,7 @@ struct DivRemKey {
   }
 };
 
-// DivRemKey 的哈希:混合 lhs/divisor/block 三个字段(boost 风格的 hash_combine)。
+// DivRemKey 的哈希:混合 lhs/divisor/block 三个字段(boost 风格的 hash_combine)
 struct DivRemKeyHash {
   std::size_t operator()(const DivRemKey &key) const {
     std::size_t hash = std::hash<Value *>{}(key.lhs);
@@ -194,8 +192,8 @@ struct DivRemKeyHash {
   }
 };
 
-// lowering 过程中跨指令共享的状态:各 Value 的地址、各 IR 块的标签、以及
-// 当前块内的除法商复用表。除法复用只在块内有效,因此进入新块要清表。
+// lowering 过程中跨指令共享的状态
+//各 Value 的地址、各 IR 块的标签、以及当前块内的除法商复用表。除法复用只在块内有效,因此进入新块要清表
 struct LoweringState {
   std::unordered_map<Value *, Address> addresses;
   std::unordered_map<BasicBlock *, std::string> blockLabels;
@@ -212,7 +210,7 @@ struct LoweringState {
   }
 };
 
-// 把标识符里非字母数字下划线的字符替换为下划线,得到可用作汇编标签的片段。
+// 把标识符里非字母数字下划线的字符替换为下划线,得到可用作汇编标签的片段
 std::string sanitizeLabelPart(const std::string &name) {
   std::string result;
   result.reserve(name.size());
@@ -223,8 +221,8 @@ std::string sanitizeLabelPart(const std::string &name) {
   return result.empty() ? "fn" : result;
 }
 
-// 生成基本块的汇编标签:入口块(index 0)直接用函数名作为符号,其余块用
-// 本地标签 .L<函数名>.bb<编号>,保证不同函数间不冲突。
+// 生成基本块的汇编标签
+// 入口块(index 0)直接用函数名作为符号,其余块用本地标签 .L<函数名>.bb<编号>
 std::string blockLabel(Function &function, int index) {
   if (index == 0) {
     return function.getIdent();
@@ -233,7 +231,7 @@ std::string blockLabel(Function &function, int index) {
          std::to_string(index);
 }
 
-// 取用户指令的第 index 个操作数,越界返回 nullptr。
+// 取用户指令的第 index 个操作数,越界返回 nullptr
 Value *useValue(User &user, std::size_t index) {
   auto &uses = user.getUserList();
   if (index >= uses.size()) {
@@ -242,7 +240,7 @@ Value *useValue(User &user, std::size_t index) {
   return uses[index]->getValue();
 }
 
-// 同 useValue,但操作数缺失时抛出后端错误(用于必须存在的操作数)。
+// 同 useValue,但操作数缺失时抛出后端错误(用于必须存在的操作数)
 Value *requiredUseValue(User &user, std::size_t index,
                         const std::string &context) {
   Value *value = useValue(user, index);
@@ -252,10 +250,9 @@ Value *requiredUseValue(User &user, std::size_t index,
   return value;
 }
 
-// 尝试把一个 Value 求值为编译期整数常量,写入 out。除直接的整数/布尔/空指针/
-// undef 常量外,还会有限深度(depth<4)地折叠形如 add i32 0, 65535 这类被中端
-// 物化为普通整数指令的常量表达式。这样指令选择仍能用上立即数折叠与常量除法。
-// 注意:该函数只“观察”表达式,不改动 IR,原指令仍会被正常 lower。
+// 尝试把一个 Value 求值为编译期整数常量,写入 out
+// 有限深度(depth<4)形如 add i32 0, 65535 这类被中端处理成普通整数指令的常量表达式仍能用上立即数折叠与常量除法
+// 该函数不改动 IR,原指令仍会被正常 lower
 bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
   if (auto *intValue = dynamic_cast<ConstInt *>(value)) {
     out = intValue->getVal();
@@ -276,11 +273,6 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     return true;
   }
 
-  // Some middle-end transformations materialize a constant as an otherwise
-  // ordinary integer instruction (for example, add i32 0, 65535).  Look
-  // through a small, acyclic expression tree so the instruction selector can
-  // still use immediate and constant-divisor lowering.  The original
-  // instruction is still lowered normally; this helper only observes it.
   auto *binary = dynamic_cast<BinaryInst *>(value);
   if (!binary || depth >= 4 || !value->getIRType() ||
       value->getIRType()->getTypeSystem() != IR_INT) {
@@ -299,9 +291,6 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     return false;
   }
 
-  // Integer instructions in this backend operate on i32 values.  Normalize
-  // operands before folding so signed division/remainder and shifts follow
-  // the same width as the eventual machine instruction.
   const int64_t lhs = static_cast<int32_t>(lhsValue);
   const int64_t rhs = static_cast<int32_t>(rhsValue);
   const uint32_t lhsBits = static_cast<uint32_t>(lhs);
@@ -322,7 +311,7 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     out = static_cast<int32_t>(lhs * rhs);
     return true;
   case BinaryInst::DIV:
-    // 有符号除法:除数为 0 或 INT_MIN/-1(会溢出)时拒绝折叠,交给运行期。
+    // 有符号除法:除数为 0 或 INT_MIN/-1(会溢出)时拒绝折叠,交给运行期
     if (rhs == 0 ||
         (lhs == std::numeric_limits<int32_t>::min() && rhs == -1)) {
       return false;
@@ -330,14 +319,14 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     out = lhs / rhs;
     return true;
   case BinaryInst::UDIV:
-    // 无符号除法:除数为 0 拒绝折叠。
+    // 无符号除法:除数为 0 拒绝折叠
     if (rhsBits == 0) {
       return false;
     }
     out = asI32(lhsBits / rhsBits);
     return true;
   case BinaryInst::MOD:
-    // 有符号取模:同样排除除零与 INT_MIN/-1 的情况。
+    // 有符号取模:排除除零与 INT_MIN/-1 的情况
     if (rhs == 0 ||
         (lhs == std::numeric_limits<int32_t>::min() && rhs == -1)) {
       return false;
@@ -360,21 +349,21 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
     out = asI32(lhsBits ^ rhsBits);
     return true;
   case BinaryInst::SHL:
-    // 移位量必须在 [0, 32) 内,否则是未定义行为,拒绝折叠。
+    // 移位量必须在 [0, 32) 内,否则是未定义行为,拒绝折叠
     if (rhs < 0 || rhs >= 32) {
       return false;
     }
     out = asI32(lhsBits << static_cast<unsigned>(rhs));
     return true;
   case BinaryInst::LSHR:
-    // 逻辑右移:对无符号位模式移位。
+    // 逻辑右移:对无符号位模式移位
     if (rhs < 0 || rhs >= 32) {
       return false;
     }
     out = asI32(lhsBits >> static_cast<unsigned>(rhs));
     return true;
   case BinaryInst::ASHR:
-    // 算术右移:对有符号值移位以保留符号位。
+    // 算术右移:对有符号值移位以保留符号位
     if (rhs < 0 || rhs >= 32) {
       return false;
     }
@@ -403,13 +392,12 @@ bool intConstantImpl(Value *value, int64_t &out, unsigned depth) {
   return false;
 }
 
-// intConstantImpl 的对外入口,从 depth 0 开始求值。
+// intConstantImpl 的对外入口,从 depth 0 开始求值
 bool intConstant(Value *value, int64_t &out) {
   return intConstantImpl(value, out, 0);
 }
 
-// 判断有限常量表达式是否依赖 undef。常量除数 lowering 必须拒绝这类值，
-// 不能把后端为普通 undef 选取的占位位模式当成可证明的数学除数。
+// 判断有限常量表达式是否依赖 undef
 bool constantDivisorMayDependOnUndef(Value *value, unsigned depth) {
   if (!value || Value::isUndef(value)) {
     return true;
@@ -435,12 +423,12 @@ bool constantDivisorMayDependOnUndef(Value *value, unsigned depth) {
   return false;
 }
 
-// 判断是否为正的 2 的幂(用于乘/除/取模的移位强度削减)。
+// 判断是否为正的 2 的幂(用于乘/除/取模的移位强度削减)
 bool positivePowerOfTwo(int64_t value) {
   return value > 0 && (value & (value - 1)) == 0;
 }
 
-// 计算 2 的幂的以 2 为底的对数,即移位量。
+// 计算 2 的幂的以 2 为底的对数,即移位量
 int log2PowerOfTwo(int64_t value) {
   int shift = 0;
   while (value > 1) {
@@ -450,18 +438,18 @@ int log2PowerOfTwo(int64_t value) {
   return shift;
 }
 
-// 有符号常量除法的“魔数”参数:被除数乘以 multiplier 取高位,再右移 shift 位;
-// addDividend 为真时需在移位前把被除数加回(处理 multiplier 为负的溢出补偿)。
+// 有符号常量除法被除数乘以 multiplier 取高位,再右移 shift 位;
+// addDividend 为真时需在移位前把被除数加回(处理 multiplier 为负的溢出补偿)
 struct SignedDivMagic {
   int64_t multiplier = 0;
   int shift = 0;
   bool addDividend = false;
 };
 
-// 按 Granlund-Montgomery 算法为正除数计算 32 位有符号除法魔数常量。
+// 按 Granlund-Montgomery 算法为正除数计算 32 位有符号除法魔数常量
 // 迭代寻找满足精度的最小移位 p,使得 floor(2^p / d) 的舍入乘子能用高位乘法
 // 精确复现 x/d(向零取整)。magicBits 取 32 位并按需转为负乘子(此时 addDividend
-// 为真,需要把被除数加回以补偿有符号高位乘法的偏差)。shift 返回 p-32。
+// 为真,需要把被除数加回以补偿有符号高位乘法的偏差)。shift 返回 p-32
 SignedDivMagic signedDivMagicForPositiveDivisor(int64_t divisor) {
   const uint64_t ad = static_cast<uint64_t>(divisor);
   const uint64_t two31 = 1ULL << 31;
@@ -500,7 +488,7 @@ SignedDivMagic signedDivMagicForPositiveDivisor(int64_t divisor) {
   return SignedDivMagic{multiplier, p - 32, multiplier < 0};
 }
 
-// 追加一条“寄存器-寄存器”形式的机器指令:def 有效时作为定义,uses 为源寄存器。
+// 加一条寄存器-寄存器形式的机器指令:def 有效时作为定义,uses 为源寄存器
 void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
                     std::initializer_list<MachineReg> uses) {
   MachineInstr instr;
@@ -514,7 +502,7 @@ void appendRegInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
   mbb.instrs.push_back(std::move(instr));
 }
 
-// 追加一条寄存器拷贝:目标为浮点寄存器时用 F_COPY,否则用 COPY。
+// 加一条寄存器拷贝:目标为浮点寄存器时用 F_COPY,否则用 COPY
 void appendCopyInstr(MachineBasicBlock &mbb, MachineReg dst, MachineReg src) {
   const Opcode CopyOpcode = dst.rc == RegClass::FPR32
                                 ? Opcode::F_COPY
@@ -523,7 +511,7 @@ void appendCopyInstr(MachineBasicBlock &mbb, MachineReg dst, MachineReg src) {
                  dst, {src});
 }
 
-// 把整数常量物化到寄存器。0 直接复用零寄存器 x0(免一条 LI),否则发一条 LI。
+// 把整数常量物化到寄存器。0 直接复用零寄存器 x0(免一条 LI),否则发一条 LI
 MachineReg materializeInt(MachineFunction &mf, MachineBasicBlock &mbb,
                           int64_t value, RegClass rc) {
   if (value == 0) {
@@ -539,7 +527,7 @@ MachineReg materializeInt(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 // 把 float 常量物化到浮点寄存器:先把其位模式作为整数 LI 到 GPR,再用 FMV_W_X
-// 按位搬入 FPR32(避免依赖浮点常量池)。
+// 按位搬入 FPR32(避免依赖浮点常量池)
 MachineReg materializeFloat(MachineFunction &mf, MachineBasicBlock &mbb,
                             float value) {
   uint32_t bits = 0;
@@ -562,7 +550,7 @@ void appendImmInstr(MachineBasicBlock &mbb, Opcode opcode, MachineReg def,
 // 加上 (2^shift - 1) 的偏置,使算术右移得到向零(而非向下)取整的商。
 //   divisor==2 时偏置就是符号位本身(SRLIW 31),直接取最高位;
 //   否则先算术右移 31 得到全 0 或全 1 的符号掩码,再逻辑右移 32-shift 得到
-//   低 shift 位为符号的偏置量,加到被除数上。
+//   低 shift 位为符号的偏置量,加到被除数上
 MachineReg buildSignedPowerOfTwoAdjusted(MachineFunction &mf,
                                          MachineBasicBlock &mbb,
                                          MachineReg lhs, int64_t divisor) {
@@ -582,7 +570,7 @@ MachineReg buildSignedPowerOfTwoAdjusted(MachineFunction &mf,
   return adjusted;
 }
 
-// 有符号 除以 2 的幂:除以 1 只需拷贝;否则对偏置后的被除数算术右移 log2(divisor)。
+// 有符号 除以 2 的幂:除以 1 只需拷贝;否则对偏置后的被除数算术右移 log2(divisor)
 void lowerSignedDivByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
                                 MachineReg dst, MachineReg lhs,
                                 int64_t divisor) {
@@ -598,7 +586,7 @@ void lowerSignedDivByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 // 已知商时求有符号 2 的幂取模:rem = lhs - (quotient << log2(divisor))。
-// 除以 1 时余数恒为 0。
+// 除以 1 时余数恒为 0
 void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
                                 MachineReg dst, MachineReg lhs,
                                 int64_t divisor, MachineReg quotient) {
@@ -615,7 +603,7 @@ void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
 
 // 无预备商时求有符号 2 的幂取模。若 -divisor 能放进 12 位立即数,可用更短的
 // 序列:对偏置后被除数 ANDI -divisor 得到向下对齐的倍数,再从 lhs 减去;这里
-// 利用 -divisor 恰是清除低 shift 位的掩码。否则退化为先算商再算余数。
+// 利用 -divisor 恰是清除低 shift 位的掩码。否则退化为先算商再算余数
 void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
                                 MachineReg dst, MachineReg lhs,
                                 int64_t divisor) {
@@ -639,7 +627,7 @@ void lowerSignedRemByPowerOfTwo(MachineFunction &mf, MachineBasicBlock &mbb,
 }
 
 // 判断同一被除数 lhs 在同一块内是否还存在一个除数相同的有符号除法(排除当前
-// 取模指令 remainder)。用于lower 取模时判定是否值得预先算出并缓存商供复用。
+// 取模指令 remainder)。用于lower 取模时判定是否值得预先算出并缓存商供复用
 bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
                              const BinaryInst *remainder) {
   if (!lhs || !block)
@@ -666,7 +654,7 @@ bool hasMatchingSignedDivUse(Value *lhs, int64_t divisor, BasicBlock *block,
 // 有符号 除以正常量(非 2 的幂)的 magic 序列:
 //   product = lhs * magic(64 位乘法),high = product >> 32(取高 32 位),
 //   若 magic 为负则 high += lhs(补偿),再算术右移 shift 位,最后减去被除数
-//   的符号位(SRAIW 31,负数得 -1)得到向零取整的商。
+//   的符号位(SRAIW 31,负数得 -1)得到向零取整的商
 void lowerSignedDivByPositiveConstant(MachineFunction &mf,
                                       MachineBasicBlock &mbb, MachineReg dst,
                                       MachineReg lhs, int64_t divisor) {
@@ -698,7 +686,7 @@ void lowerSignedDivByPositiveConstant(MachineFunction &mf,
   appendRegInstr(mbb, Opcode::SUBW, dst, {quotient, sign});
 }
 
-// 已知商时求除以正常量的取模:rem = lhs - quotient * divisor。
+// 已知商时求除以正常量的取模:rem = lhs - quotient * divisor
 void lowerSignedRemByPositiveConstant(MachineFunction &mf,
                                       MachineBasicBlock &mbb, MachineReg dst,
                                       MachineReg lhs, int64_t divisor,
@@ -709,7 +697,7 @@ void lowerSignedRemByPositiveConstant(MachineFunction &mf,
   appendRegInstr(mbb, Opcode::SUBW, dst, {lhs, scaled});
 }
 
-// 无预备商时求除以正常量的取模:先算商再据此算余数。
+// 无预备商时求除以正常量的取模:先算商再据此算余数
 void lowerSignedRemByPositiveConstant(MachineFunction &mf,
                                       MachineBasicBlock &mbb, MachineReg dst,
                                       MachineReg lhs, int64_t divisor) {
@@ -718,7 +706,7 @@ void lowerSignedRemByPositiveConstant(MachineFunction &mf,
   lowerSignedRemByPositiveConstant(mf, mbb, dst, lhs, divisor, quotient);
 }
 
-// 在块内除法商复用表里查 (lhs, divisor, block) 对应的商寄存器。
+// 在块内除法商复用表里查 (lhs, divisor, block) 对应的商寄存器
 bool findDivRemQuotient(LoweringState &state, Value *lhs, int64_t divisor,
                         BasicBlock *block, MachineReg &quotient) {
   auto found = state.divRemQuotients.find(DivRemKey{lhs, divisor, block});
@@ -729,7 +717,7 @@ bool findDivRemQuotient(LoweringState &state, Value *lhs, int64_t divisor,
   return true;
 }
 
-// 把新算出的商登记进复用表,供同块内相同 (lhs, divisor) 的除法/取模复用。
+// 把新算出的商登记进复用表,供同块内相同 (lhs, divisor) 的除法/取模复用
 void rememberDivRemQuotient(LoweringState &state, Value *lhs,
                             int64_t divisor, BasicBlock *block,
                             MachineReg quotient) {
@@ -738,7 +726,7 @@ void rememberDivRemQuotient(LoweringState &state, Value *lhs,
 
 // 当右操作数是正的 2 的幂常量时,把乘/除/取模强度削减为移位或掩码操作。
 // 返回 true 表示已处理该指令。乘法用左移,无符号除用逻辑右移,无符号取模用
-// AND (divisor-1) 掩码;有符号除/取模走前述带偏置的序列,并在可行时复用商。
+// AND (divisor-1) 掩码;有符号除/取模走前述带偏置的序列,并在可行时复用商
 bool lowerIntegerPowerOfTwoOp(MachineFunction &mf, MachineBasicBlock &mbb,
                               LoweringState &state, BinaryInst &inst,
                               Value *lhs, Value *rhs) {
@@ -1441,10 +1429,7 @@ void lowerIntCompare(MachineFunction &mf, MachineBasicBlock &mbb,
   MachineReg left = valueReg(mf, mbb, lhs);
   MachineReg dst = getOrCreateResultReg(mf, inst, RegClass::GPR32);
   MachineReg tmp;
-  // Equality/inequality compares reduce to XOR followed by a zero test.  The
-  // XOR temporary must stay in the same GPR class as the compared values:
-  // pointers are GPR64 while ordinary SysY integers are GPR32.  The compare
-  // result itself remains a boolean GPR32 regardless of operand width.
+
   const RegClass compareClass = left.rc;
 
   int64_t rhsValue = 0;
@@ -1797,8 +1782,8 @@ void lowerBitCast(MachineFunction &mf, MachineBasicBlock &mbb,
 
 // lower getelementptr。从基址地址出发,逐个索引累加偏移:常量索引折进常量偏移
 // constOffset,动态索引乘步长后累加到 dynamicOffset 寄存器。
-//   - 全为常量索引:直接把 constOffset 折进基址并物化最终地址;
-//   - 有动态索引:先物化(基址+常量偏移),再 ADD 动态偏移。
+//  全为常量索引:直接把 constOffset 折进基址并物化最终地址;
+//  有动态索引:先物化(基址+常量偏移),再 ADD 动态偏移。
 // existingDst 处理该 GEP 结果寄存器已被 PHI 等预分配的情形,保持定义寄存器不变。
 void lowerGep(MachineFunction &mf, MachineBasicBlock &mbb,
               LoweringState &state, GetElementPtrInst &inst) {
@@ -1950,7 +1935,7 @@ bool addScaledOffset(int64_t index, int64_t scale, int64_t &offset) {
 
 // 顺着 bitcast/常量索引的 GEP 链回溯一个指针,判断它是否恒等于“某个全局常量
 // base 加编译期常量 offset”。全为常量索引才能追踪;有限深度(depth<16)防环。
-// 用于把从常量对象的 memcpy 识别为可静态判定内容(如全零)的拷贝。
+// 用于把从常量对象的 memcpy 识别为可静态判定内容(如全零)的拷贝
 bool traceConstantPointer(Value *value, Variable *&base, int64_t &offset,
                           unsigned depth = 0) {
   if (!value || depth >= 16) {
@@ -2046,8 +2031,6 @@ bool prepareZeroMemcpyDestination(MachineFunction &mf, const Address &address,
     return false;
   }
 
-  // Frame layout has not run yet, so strengthening this object's requested
-  // alignment makes every subsequently selected natural-width store safe.
   const int64_t requiredAlign = size >= 8 ? 8 : (size >= 4 ? 4 : 1);
   const int64_t currentAlign = std::max<int64_t>(1, object.align);
   if ((currentAlign <= requiredAlign && requiredAlign % currentAlign != 0) ||
@@ -2059,7 +2042,7 @@ bool prepareZeroMemcpyDestination(MachineFunction &mf, const Address &address,
 }
 
 // 把对目标区间的清零展开为一串把 x0 写入的 store:按当前绝对偏移的对齐情况
-// 贪心选择 8/4/1 字节宽度(SD/SW/SB),逐段前进直到写满 size 字节。
+// 贪心选择 8/4/1 字节宽度(SD/SW/SB),逐段前进直到写满 size 字节
 void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
                             int64_t size) {
   const MachineReg zero64 = MachineReg::preg(PhysReg::X0, RegClass::GPR64);
@@ -2088,7 +2071,7 @@ void appendZeroMemcpyStores(MachineBasicBlock &mbb, const Address &dstAddress,
   }
 }
 
-// 计算两个对齐字节数的最大公约数(负数按绝对值处理,结果至少为 1)。
+// 计算两个对齐字节数的最大公约数(负数按绝对值处理,结果至少为 1)
 int64_t gcdAlignment(int64_t a, int64_t b) {
   auto magnitude = [](int64_t v) -> uint64_t {
     return v < 0 ? static_cast<uint64_t>(-(v + 1)) + 1u
@@ -2099,13 +2082,13 @@ int64_t gcdAlignment(int64_t a, int64_t b) {
 
 // 静态证明一个指针值的最小对齐字节数。返回 1 表示只能证明字节对齐,展开
 // memcpy/memset 时不得使用 lw/sw 等自然宽度访存。证明来源(按强度递减):
-//   - alloca/全局对象:对象类型自然对齐(栈帧/数据段布局保证);
-//   - GEP:基址对齐与常量偏移、动态索引步长的最大公约数(动态索引取任意整数,
-//     index*scale 必为 scale 的倍数,故参与 gcd 是安全下界);
-//   - bitcast(指针→指针):物理地址不变,沿用源指针对齐;
-//   - 其余指针来源(形参、load/PHI/SELECT 结果等):按指针所指类型的 ABI 自然
-//     对齐。本 IR 没有 inttoptr/任意地址算术,类型契约即对齐契约;
-//   - 非常规来源(空指针、undef、深度超限)一律保守返回 1。
+// alloca/全局对象:对象类型自然对齐(栈帧/数据段布局保证);
+// GEP:基址对齐与常量偏移、动态索引步长的最大公约数(动态索引取任意整数,
+// index*scale 必为 scale 的倍数,故参与 gcd 是安全下界);
+// bitcast(指针→指针):物理地址不变,沿用源指针对齐;
+// 其余指针来源(形参、load/PHI/SELECT 结果等):按指针所指类型的 ABI 自然
+// 对齐。本 IR 没有 inttoptr/任意地址算术,类型契约即对齐契约;
+// 非常规来源(空指针、undef、深度超限)一律保守返回 1。
 int64_t provenPointerAlignment(Value *value, unsigned depth = 0) {
   if (!value || !isPointerType(value->getIRType()) || depth >= 16) {
     return 1;
@@ -2187,9 +2170,7 @@ void lowerLibcMemoryCall(MachineFunction &mf, MachineBasicBlock &mbb,
                        "; expected three memory arguments");
   }
 
-  // Materialize every source before writing any ABI register.  This preserves
-  // parallel-copy semantics when register allocation gives a source one of
-  // a0-a2.
+
   std::vector<MachineReg> argumentRegs;
   argumentRegs.reserve(arguments.size());
   std::size_t argumentIndex = 0;
@@ -2255,10 +2236,10 @@ void requireNonVolatileMemoryIntrinsic(CallInst &inst,
 }
 
 // lower memcpy。按大小分三档:
-//   - 大小非常量:退化为 libc memcpy 调用;
-//   - 常量且不超过阈值、源为全零常量、目标可安全清零:直接展开为清零 store;
-//   - 超过阈值(256 字节):发一条内联循环 MEMCPY_INLINE 伪指令;
-//   - 否则按 4 字节字循环加尾部字节复制,内联展开。
+//   大小非常量:退化为 libc memcpy 调用;
+//   常量且不超过阈值、源为全零常量、目标可安全清零:直接展开为清零 store;
+//   超过阈值(256 字节):发一条内联循环 MEMCPY_INLINE 伪指令;
+//   否则按 4 字节字循环加尾部字节复制,内联展开。
 void lowerMemcpy(MachineFunction &mf, MachineBasicBlock &mbb,
                  LoweringState &state, CallInst &inst,
                  const std::string &name) {

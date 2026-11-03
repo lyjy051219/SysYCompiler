@@ -1,9 +1,13 @@
+/* Copyright (c) 2026 Compiler contributors
+ * SPDX-License-Identifier: MIT
+ */
+
 %option outfile="src/yacc/Flex.cpp" header-file="include/yacc/Flex.hpp"
 %option yylineno
 
 %{
 #include "yacc/Bison.hpp"
-// Flex 生成的扫描器向 Bison 返回强类型令牌。
+// Flex 生成的扫描器向 Bison 返回强类型令牌
 #define YY_DECL yy::parser::symbol_type yylex(void)
 %}
 
@@ -26,7 +30,7 @@ DEC_FLOAT_FORM3 {DECIMALNUM}+\.
 
 HEX_FLOAT {HEX_FLOAT_FORM1}|{HEX_FLOAT_FORM2}|{HEX_FLOAT_FORM3}
 DEC_FLOAT {DEC_FLOAT_FORM1}|{DEC_FLOAT_FORM2}|{DEC_FLOAT_FORM3}
-
+ 
 Float {DEC_FLOAT}|{HEX_FLOAT}
 %x COMMENT
 

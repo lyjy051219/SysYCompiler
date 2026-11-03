@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -17,3 +20,4 @@ private:
     //把源全局的显式或零初始化内容复制到目标全局初始化器
     static void copyInitializer(Variable *Destination, Variable *Source);
 };
+ 

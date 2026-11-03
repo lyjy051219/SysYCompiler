@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -10,7 +13,7 @@
 #include <vector>
 
 class ReassociateEngine;
-
+ 
 //ReassociatePass对整数可重结合表达式执行确定性的代数规范化
 class ReassociatePass : public PassDescriptor<ReassociatePass> {
 public:

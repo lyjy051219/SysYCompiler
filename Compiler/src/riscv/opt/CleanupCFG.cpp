@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include "riscv/Passes.hpp"
@@ -16,7 +19,7 @@ namespace riscv {
 // 同步维护 PHI 的前驱来源和分支目标,保持语义不变。位于 RISC-V 后端优化流水线中,
 // 依赖并会重建 CFG(rebuildCFG)。
 
-namespace {
+namespace { 
 
 // 前置声明:清理过程中相互调用的若干辅助函数。
 void appendJump(MachineBasicBlock &block, const std::string &label);

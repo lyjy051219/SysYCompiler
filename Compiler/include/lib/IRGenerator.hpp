@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "AST.hpp"
 #include "CFG.hpp"
@@ -171,7 +174,7 @@ private:
                            TensorValue* destination = nullptr);
     Value* lowerExpression(const FuncCall& node,
                            TensorValue* destination = nullptr);
-
+ 
     BinaryInst::Operation lowerBinaryOperator(Type type) const;
     Value* emitBinary(Value* left, BinaryInst::Operation operation,
                       Value* right, TensorValue* destination = nullptr);

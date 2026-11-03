@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -15,10 +18,9 @@ class SCEVResult;
 class TargetCostInfo;
 struct InductionDescriptor;
 struct LoopTripCountInfo;
-
+ 
 //GuardedLoopCodeMotionPass 为可能零次执行的头测循环建立显式入口守卫，
-//再把仅供循环使用的昂贵纯计算移入受保护预头。该变换只依据 CFG、SSA、
-//安全性与目标成本，不识别函数名、测试路径或运行期输入模式。
+//再把仅供循环使用的昂贵纯计算移入受保护预头。
 class GuardedLoopCodeMotionPass
     : public PassDescriptor<GuardedLoopCodeMotionPass> {
 public:

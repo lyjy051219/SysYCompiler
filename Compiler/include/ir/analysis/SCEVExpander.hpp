@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/Dominant.hpp"
@@ -8,7 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 //SCEVExpander将循环不变的可支持SCEV表达式物化到指定基本块中
 class SCEVExpander {
 public:

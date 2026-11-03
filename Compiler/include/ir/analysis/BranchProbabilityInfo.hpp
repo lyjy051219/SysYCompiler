@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include <cstddef>
@@ -12,7 +15,7 @@ class Loop;
 class LoopInfo;
 class PostDominatorTree;
 class SCEVResult;
-
+ 
 //BranchProbabilityInfo：保存与BasicBlock::getSuccessors()顺序严格对齐的定点边概率
 class BranchProbabilityInfo {
     friend class BranchProbabilityAnalysis;

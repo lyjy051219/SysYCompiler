@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // 本文件分为不依赖完整 CFG 的基础部分和遍历工具部分。
 // CFG.hpp 通过 COMPILER_LIB_IRUTILS_BASE_ONLY 只引入前者，以打破
 // ChainList/ChainNode 与 CFG 遍历模板之间的循环包含。
@@ -19,7 +22,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
+ 
 class BasicBlock;
 class Function;
 class Instruction;

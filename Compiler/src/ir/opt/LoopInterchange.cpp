@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopInterchange.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -17,7 +20,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <vector>
+#include <vector> 
 namespace {
 //2.2/3.1 递归检查循环域控制切片：规范 PHI 是回边边界，其起点、更新和退出比较仍须逐项排除 undef。
 bool controlSliceContainsUndef(

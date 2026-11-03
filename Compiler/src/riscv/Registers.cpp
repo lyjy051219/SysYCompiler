@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // Registers.cpp —— RISC-V 物理寄存器枚举到汇编名与 ABI 角色的映射表。
 // 这里集中描述每个物理寄存器的汇编名(如 x10 写作 a0)、是否可参与寄存器分配、
 // 是否 caller-saved(临时寄存器,调用会破坏)、是否 callee-saved(被调用者需保存)、
@@ -30,7 +33,7 @@ constexpr std::array<RegisterInfo, kNumRegs> kRegisterInfos{{
     {PhysReg::SP, "sp", false, false, false, false},
     {PhysReg::GP, "gp", false, false, false, false},
     {PhysReg::TP, "tp", false, false, false, false},
-    {PhysReg::T0, "t0", true, true, false, false},
+    {PhysReg::T0, "t0", true, true, false, false}, 
     {PhysReg::T1, "t1", true, true, false, false},
     {PhysReg::T2, "t2", true, true, false, false},
     {PhysReg::S0, "s0", false, false, true, false},

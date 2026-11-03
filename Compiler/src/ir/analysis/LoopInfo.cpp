@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/LoopInfo.hpp"
 #include <stack>
 #include <queue>
@@ -16,7 +19,7 @@ void LoopInfo::clear() {
     Loops.clear();
     TopLevelLoops.clear();
     BBToLoop.clear();
-}
+} 
 //从当前循环开始，沿着父循环向上计算深度（表层循环深度为1）
 unsigned Loop::getDepth() const {
     unsigned Depth = 1;

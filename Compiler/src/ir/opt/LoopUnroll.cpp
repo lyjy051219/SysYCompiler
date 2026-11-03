@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopUnroll.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/opt/LCSSA.hpp"
@@ -10,7 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-//使用给定配置构造循环展开Pass
+//使用给定配置构造循环展开Pass 
 LoopUnrollPass::LoopUnrollPass(UnrollConfig ConfigValue)
     : Config(std::move(ConfigValue)) {}
 //返回当前循环展开Pass使用的配置

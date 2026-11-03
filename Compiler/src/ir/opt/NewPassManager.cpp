@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/NewPassManager.hpp"
 //构造不保留任何分析的状态
 PreservationStatus PreservationStatus::none() {
@@ -19,7 +22,7 @@ void PreservationStatus::discard(PassID *ID) {
     PreservedIDs.erase(ID);
     AbandonedIDs.insert(ID);
 }
-//判断当前状态是否无条件保留全部分析
+//判断当前状态是否无条件保留全部分析 
 bool PreservationStatus::areAllKept() const {
     return PreservedAll && AbandonedIDs.empty();
 }

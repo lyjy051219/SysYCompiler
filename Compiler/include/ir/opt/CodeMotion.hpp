@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -6,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-
+ 
 class BasicAAResult;
 class BlockFrequencyInfo;
 class DominatorTree;

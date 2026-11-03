@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/UnifyFuncExits.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -15,7 +18,7 @@ PreservationStatus UnifyFuncExitsPass::run(Function &F, FunctionAnalysisPassMana
 	forEachInstruction<RetInst>(
 		F, [&](BasicBlock *BB, RetInst *RI) {
 			if (BB->back() == RI) retSites.emplace_back(BB, RI);
-		});
+		}); 
 
 	if (retSites.size() <= 1) {
 		return PreservationStatus::all();

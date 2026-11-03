@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -13,7 +16,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
+ 
 //DominatorTree表示函数级支配关系分析结果
 class DominatorTree;
 //Loop表示一个自然循环

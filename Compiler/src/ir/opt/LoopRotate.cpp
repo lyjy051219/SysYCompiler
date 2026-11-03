@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopRotate.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/PostDominant.hpp"
@@ -16,7 +19,7 @@ Instruction *LoopRotatePass::cloneInstructionWithMap(
     const std::unordered_map<Value *, Value *> &VMap) {
     if (!I) return nullptr;
     return I->clone(VMap);
-}
+} 
 //完成单个头测循环的结构预检、Header克隆、SSA转发和CFG旋转。
 bool LoopRotatePass::runLoopRotate(
     Function &F, Loop &L, const DominatorTree &DT,

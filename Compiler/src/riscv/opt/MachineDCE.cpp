@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include <algorithm>
@@ -19,7 +22,7 @@ using LiveSet = MachineLivenessAnalysis::RegSet;
 bool isVirtualRegOperand(const MachineOperand &operand) {
   return operand.kind == OperandKind::Reg && !operand.regValue.physical;
 }
-
+ 
 // 判断指令是否含 DCE 无法安全处理的操作数:定义端出现非寄存器操作数,
 // 或使用端出现块标签/值引用(说明涉及控制流或未降级的 IR 值)。命中即不可删。
 bool hasUnsupportedOperandKind(const MachineInstr &instr) {

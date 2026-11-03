@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/SCCP.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -8,7 +11,7 @@
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <cmath>
-//构造尚无可执行路径信息的Top格值
+//构造尚无可执行路径信息的Top格值 
 LatticeValue::LatticeValue() : state(Top), constVal(nullptr) {}
 //创建Top格值
 LatticeValue LatticeValue::getTop() {

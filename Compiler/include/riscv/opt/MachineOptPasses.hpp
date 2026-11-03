@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "riscv/MIR.hpp"
@@ -15,7 +18,7 @@ bool runPreRACopyPropagation(MachineFunction &mf,
                              MachineFunctionAnalysisManager &am);
 bool runPreRALocalCSE(MachineFunction &mf);
 bool runPreRAGuardedLoopPreheader(MachineFunction &mf,
-                                  MachineFunctionAnalysisManager &am);
+                                   MachineFunctionAnalysisManager &am);
 bool runPreRAMachineLICM(MachineFunction &mf,
                          MachineFunctionAnalysisManager &am);
 bool runPreRAMachineDCE(MachineFunction &mf,

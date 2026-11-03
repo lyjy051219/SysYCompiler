@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/IfConversion.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -8,7 +11,7 @@
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <vector>
-//判断指令被无条件执行时是否无副作用、陷阱和poison风险。
+//判断指令被无条件执行时是否无副作用、陷阱和poison风险
 bool IfConversionPass::isSafeToSpeculativelyExecute(const Instruction *I) {
 	//2.1 白名单只接纳无副作用且不会新增陷阱/毒值的指令；移位还需常量位数合法。
 	if (!I) return false;

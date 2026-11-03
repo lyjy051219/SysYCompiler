@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -60,3 +63,4 @@ private:
 							const std::unordered_set<BasicBlock *> &Reachable,
 							InstructionWorkList &WorkList);
 };
+ 

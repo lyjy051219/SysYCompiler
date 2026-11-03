@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "MIR.hpp"
@@ -46,3 +49,4 @@ private:
 };
 
 } // namespace riscv
+ 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include "riscv/Passes.hpp"
@@ -13,7 +16,7 @@
 
 namespace riscv {
 // Guarded Loop Preheader pass 的 RISC-V 实现。
-//
+// 
 // 作用：针对可能零次执行（zero-trip）的循环，避免在“循环体一次都不进”时白白
 // 执行预头里那些较昂贵但可推测的计算。做法是把预头拆成两部分：计算循环 guard
 // 条件所需的指令切片留在原预头，其余昂贵计算移入一个新插入的 compute 块；然后

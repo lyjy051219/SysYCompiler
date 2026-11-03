@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoadElimination.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -22,7 +25,7 @@ LoadElimQueryResult LoadElimQueryResult::known(Value *V) {
 //构造已被相关内存写破坏的查询结果
 LoadElimQueryResult LoadElimQueryResult::clobbered() {
     return {CLOBBERED, nullptr, {}};
-}
+} 
 //构造因预算或未知语义而无法证明的查询结果
 LoadElimQueryResult LoadElimQueryResult::unknown() {
     return {UNKNOWN, nullptr, {}};

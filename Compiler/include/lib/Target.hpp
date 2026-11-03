@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include <cstddef>
@@ -14,7 +17,7 @@ enum class TargetABI {
 enum class TargetCodeModel {
     MediumAny,
 };
-
+ 
 // 所有依赖目标的 IR 布局决策统一放在此处。
 // 类型驻留层只负责类型身份；指针的存储大小和对齐由 DataLayout 决定。
 class DataLayout final {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -22,7 +25,7 @@ class LoopAccessInfo;
 class RangeInfo;
 //SCEVResult提供规范归纳变量和循环次数
 class SCEVResult;
-//LoopTripCountInfo描述规范循环的退出阶段和次数
+//LoopTripCountInfo描述规范循环的退出阶段和次数 
 struct LoopTripCountInfo;
 //InductionDescriptor描述Header归纳PHI及其入口值
 struct InductionDescriptor;

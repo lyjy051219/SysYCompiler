@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/UnrollAndJam.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopAccessAnalysis.hpp"
@@ -18,7 +21,7 @@
 
 //证明同根标量访问按类型化单位坐标带分lane时，不同lane只能落在不同元素。
 //所有其他动态坐标也必须是同次数的零起点单位递推；动态边界由提交阶段
-//用布局容量守卫，超界时完整执行原形循环，避免依赖越界或地址回绕语义。
+//用布局容量守卫，超界时完整执行原形循环，避免依赖越界或地址回绕语义
 std::optional<std::int64_t>
 UnrollAndJamPass::proveTypedLaneBandIndependent(
     const LoopMemoryAccess &First, const LoopMemoryAccess &Second,

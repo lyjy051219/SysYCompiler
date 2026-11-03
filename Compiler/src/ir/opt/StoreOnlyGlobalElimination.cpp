@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/StoreOnlyGlobalElimination.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -7,7 +10,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-//绑定模块变换期间复用的函数级分析管理器。
+//绑定模块变换期间复用的函数级分析管理器
 StoreOnlyGlobalEliminationPass::StoreOnlyGlobalEliminationPass(
     FunctionAnalysisPassManager &FAM)
     : FAM(FAM) {}

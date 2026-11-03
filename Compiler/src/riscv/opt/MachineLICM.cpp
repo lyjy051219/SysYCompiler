@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include "riscv/Passes.hpp"
@@ -17,7 +20,7 @@
 
 namespace riscv {
 // Machine LICM（机器层循环不变量外提）pass 的 RISC-V 实现。
-//
+// 
 // 作用：把循环内"每轮迭代计算值相同"且可安全推测执行的机器指令移动到循环
 // 入口之前的 preheader，使这些计算每轮循环只执行一次。中端 IR LICM 已处理
 // 值级与内存证明级的外提；本 pass 处理机器形态残余：LI/LA 逐 use 物化、机器层

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -11,7 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 //SCEVExprKind枚举SCEV表达式支持的所有符号节点种类
 enum class SCEVExprKind {
     //整数常量表达式

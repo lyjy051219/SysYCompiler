@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/DeadFunctionElimination.hpp"
 
 #include <unordered_set>
@@ -12,7 +15,7 @@ PreservationStatus DeadFunctionEliminationPass::run(
 	ModuleAnalysisPassManager &MAM)
 {
 	(void)MAM;
-
+ 
 	auto &Functions = M.getFunctions();
 	if (Functions.empty()) return PreservationStatus::all();
     //1.Live集合：存活函数集合，WorkList：待处理函数队列

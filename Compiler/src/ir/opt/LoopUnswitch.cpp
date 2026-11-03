@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopUnswitch.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -17,7 +20,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-//判断给定值是否为非常量布尔值
+//判断给定值是否为非常量布尔值 
 bool LoopUnswitchPass::isBooleanNonConstant(Value *V) {
     if (!V || Value::isUndef(V) || V->isConst() || !V->getIRType())
         return false;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include "riscv/Registers.hpp"
@@ -13,7 +16,7 @@
 
 namespace riscv {
 // Post-RA List Scheduling pass 的 RISC-V 实现。
-//
+// 
 // 作用：在寄存器分配之后，对每个基本块内部按依赖与指令延迟重排指令，尽量让长
 // 延迟指令（乘除、访存、浮点、调用）的结果在被使用前有时间就绪，从而隐藏流水线
 // 延迟、缩短块的完成周期。调度以一个简单的按周期推进的表调度启发式进行：把块按

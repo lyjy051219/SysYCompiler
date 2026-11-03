@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/CodeMotion.hpp"
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -33,7 +36,7 @@ bool CodeMotionPass::isProvablySafeGEP(GetElementPtrInst *GEP,
         static_cast<unsigned long long>(*Info.ObjectSize);
 }
 
-//筛出可以安全减少执行次数的纯SSA表达式。
+//筛出可以安全减少执行次数的纯SSA表达式
 bool CodeMotionPass::isSafeCandidate(Instruction *I,
                                      BasicAAResult &AA) {
     if (!I || !I->getParent() || !I->hasUses() ||

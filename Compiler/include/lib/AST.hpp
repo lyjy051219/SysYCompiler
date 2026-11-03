@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include <list>
 #include <memory>
@@ -32,8 +35,7 @@ enum Type{
     SY_ASSIGN
 };
 
-// AST 层的规范化源码类型。tensor 的完整形状由声明维度保存，
-// 类型节点只记录其元素类型。
+
 enum class ASTScalarKind {
     Invalid,
     Int32,
@@ -107,7 +109,7 @@ inline ASTType ASTType::makeTensor(ASTScalarKind elementKind) {
         return ASTType();
     return ASTType(ASTTypeKind::Tensor, elementKind);
 }
-
+ 
 inline ASTTypeKind ASTType::getKind() const { return kind; }
 
 inline ASTScalarKind ASTType::getScalarKind() const { return scalarKind; }
@@ -172,7 +174,7 @@ class LAndExp;
 class LOrExp;
 
 
-// 所有语法树访问器共用的动态分派接口。
+//ASTVisitor设计模式
 class ASTVisitor {
 public:
     virtual ~ASTVisitor() = default;
@@ -221,7 +223,7 @@ public:
 };
 
 
-// 所有语法树节点的基类。
+// 所有语法树节点的基类
 class BaseAST{
 public:
     virtual ~BaseAST() = default;

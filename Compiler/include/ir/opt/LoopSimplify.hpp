@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/opt/NewPassManager.hpp"
@@ -16,7 +19,7 @@ public:
     //把多条前驱边的PHI输入经合并块汇成一条并重建目标块PHI
     static bool rewritePhisForMergedPreds(BasicBlock *Target,
 										  const std::unordered_set<BasicBlock *> &FromPreds,
-										  BasicBlock *MergeBlock);
+		 								  BasicBlock *MergeBlock);
 private:
 	//为循环的全部外部入口插入或确认唯一预头块
 	bool insertPreHeader(Function &F, Loop &L);

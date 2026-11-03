@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "lib/TypeSystem.hpp"
 #include "lib/Target.hpp"
 #include <iostream>
@@ -18,7 +21,7 @@ bool IRType::isArray() const { return getTypeSystem() == IR_ARRAY; }
 bool IRType::isBool() const {
     auto *IT = dynamic_cast<const INTType *>(this);
     return IT && IT->getIsBool();
-}
+} 
 bool IRType::isScalar() const { return isInt() || isFloat(); }
 bool IRType::isFirstClassValueType() const {
     return isScalar() || isPointer();

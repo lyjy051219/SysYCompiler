@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/BranchProbabilityInfo.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -17,7 +20,7 @@ uint32_t BranchProbabilityInfo::getEdgeProbability(
     if (It == EdgeProbabilities.end() ||
         SuccessorIndex >= It->second.size()) return 0;
     return It->second[SuccessorIndex];
-}
+} 
 uint32_t BranchProbabilityInfo::getEdgeProbabilityTo(
     BasicBlock *From, BasicBlock *To) const {
     if (!From || !To) return 0;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -8,7 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 //BasicBlock表示控制流图中的基本块
 class BasicBlock;
 //BrInst表示条件或无条件分支指令

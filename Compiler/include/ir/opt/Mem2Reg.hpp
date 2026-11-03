@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -11,7 +14,7 @@
 #include <unordered_map>
 class BlockInfo;
 struct AllocaInfo;
-
+ 
 //显式支配树 DFS frame：记录下一个子节点及本块为每个 alloca 压入值栈的次数。
 struct Mem2RegRenameFrame {
     //记录当前正在遍历的支配树节点。

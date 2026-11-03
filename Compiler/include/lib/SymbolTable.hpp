@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include <memory>
 #include <string>
@@ -8,7 +11,7 @@ class Function;
 class Initializer;
 class IRType;
 class Value;
-
+ 
 // SymbolTable 只保存源码名称到 IR 对象的非拥有绑定，生命周期仅覆盖 IR 生成阶段
 class SymbolTable final {
 public:

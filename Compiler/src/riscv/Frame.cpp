@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/Frame.hpp"
 
 #include "lib/TypeSystem.hpp"
@@ -20,7 +23,7 @@ int64_t alignTo(int64_t value, int64_t align) {
   align = std::max<int64_t>(1, align);
   return ((value + align - 1) / align) * align;
 }
-
+ 
 // 判断 IR 类型是否为布尔:整型且带有 isBool 标记。布尔在内存中占 1 字节。
 bool isBoolType(const std::shared_ptr<IRType> &type) {
   auto intType = std::dynamic_pointer_cast<INTType>(type);

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/DSE.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -8,7 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <queue>
+#include <queue> 
 //判断两条store是否写入完全相同宽度的类型。
 bool DSEPass::storesHaveIdenticalCoverage(const StoreInst *First,
                                           const StoreInst *Second) {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/BranchProbabilityInfo.hpp"
@@ -6,7 +9,7 @@
 #include <limits>
 #include <unordered_map>
 #include <vector>
-
+ 
 class BasicBlock;
 class Function;
 

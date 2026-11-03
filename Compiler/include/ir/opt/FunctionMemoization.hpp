@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -10,7 +13,7 @@
 #include <vector>
 
 struct SideEffectInfo;
-
+ 
 //候选快照保存目标、自递归调用点和所有返回点，使模块扫描与 CFG 提交阶段分离。
 struct FunctionMemoizationCandidate {
     //记录通过全部纯度和签名检查的递归目标函数。

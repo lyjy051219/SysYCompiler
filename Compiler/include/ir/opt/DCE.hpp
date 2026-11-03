@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -12,7 +15,7 @@ public:
     //沿def-use链删除函数中无用户且无可观察语义的指令。
     PassResult run(Function &F, FunctionAnalysisPassManager &FAM);
 private:
-
+ 
 	//ReturnProofState记录递归函数证明的三色状态。
 	enum class ReturnProofState {
 		//表示当前函数正在递归证明栈中。

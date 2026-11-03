@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -86,7 +89,7 @@ class LocalAggregateSimplifyPass
 public:
     //运行局部聚合化简并返回分析保留状态
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
     //MaxSynthArrayElements限制允许综合的常量表元素数量
     static constexpr int MaxSynthArrayElements = 32;

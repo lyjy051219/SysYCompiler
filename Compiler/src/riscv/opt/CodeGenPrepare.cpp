@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/CodeGenPrepare.hpp"
 
 #include "ir/analysis/Dominant.hpp"
@@ -14,7 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 namespace riscv {
 // CodeGenPrepare pass 的 RISC-V 实现。
 //

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/SideEffect.hpp"
@@ -39,7 +42,7 @@ struct LinearRecursiveInlineBudget {
 	int MaxBasicBlocks = 16;
 	int MaxInstructions = 128;
 };
-
+ 
 class FuncInlinePass : public PassDescriptor<FuncInlinePass> {
 public:
 	explicit FuncInlinePass(bool enableRecursiveInline = true,

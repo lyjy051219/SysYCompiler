@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LateStrengthReduce.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -35,7 +38,7 @@ bool LateStrengthReducePass::insertSignedDivPow2Sequence(
         delete Biased;
         delete Q;
         return false;
-    }
+    } 
     Quotient = Q;
     return true;
 }

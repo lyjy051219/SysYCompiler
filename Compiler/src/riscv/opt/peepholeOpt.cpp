@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // peepholeOpt.cpp - RISC-V MIR 层的窥孔优化与本地(块内)清理 pass 集合。
 //
 // 本文件实现若干在寄存器分配前后运行的机器级优化,均以基本块为作用域:
@@ -21,7 +24,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-
+ 
 namespace riscv {
 namespace {
 

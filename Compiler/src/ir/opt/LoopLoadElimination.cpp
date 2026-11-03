@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopLoadElimination.hpp"
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -19,7 +22,7 @@
 #include <limits>
 #include <unordered_set>
 #include <vector>
-
+ 
 //判断两个load是否产生完全相同形状的标量值
 bool LoopLoadEliminationPass::isTypeCompatible(
     LoadInst *First, LoadInst *Second) {

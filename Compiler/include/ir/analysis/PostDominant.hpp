@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -10,7 +13,7 @@
 #include <algorithm>
 class PostDominatorTree;
 class PostDominatorNode;
-
+ 
 //PostSemiNCAInfo：后支配树Build类，使用Semi-NCA算法构建
 class PostSemiNCAInfo {
 public:

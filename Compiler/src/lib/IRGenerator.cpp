@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "../../include/lib/IRGenerator.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -15,7 +18,7 @@ std::shared_ptr<IRType> IRGenerator::lowerScalarKind(
     switch (kind) {
     case ASTScalarKind::Int32:
         return INTType::getInt32Ty();
-    case ASTScalarKind::Float32:
+    case ASTScalarKind::Float32: 
         return FLOATType::NewFloat();
     case ASTScalarKind::Void:
         return VOIDType::NewVoid();

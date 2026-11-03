@@ -16,7 +16,7 @@
 
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
+  
 // As a special exception, you may create a larger work that contains
 // part or all of the Bison parser skeleton and distribute that work
 // under terms of your choice, so long as that work isn't itself a
@@ -26,7 +26,7 @@
 // special exception, which will cause the skeleton and the resulting
 // Bison output files to be licensed under the GNU General Public
 // License without this special exception.
-
+ 
 // This special exception was added by the Free Software Foundation in
 // version 2.2 of Bison.
 

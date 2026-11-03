@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/SCEV.hpp"
@@ -10,7 +13,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
+ 
 class BasicBlock;
 class BinaryInst;
 class BrInst;

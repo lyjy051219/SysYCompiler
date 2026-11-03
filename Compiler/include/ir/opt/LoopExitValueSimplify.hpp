@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -15,7 +18,7 @@ struct SCEVExpr;
 class SCEVResult;
 class Value;
 struct LoopTripCountInfo;
-
+ 
 //LoopExitValuePlan记录一个退出PHI及其可在循环外物化的精确SCEV表达式。
 struct LoopExitValuePlan {
 	//需要消除的LCSSA退出PHI。

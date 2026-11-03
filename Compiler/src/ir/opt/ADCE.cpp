@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/ADCE.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -7,7 +10,7 @@
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <vector>
-//接口1：ADCE一开始就活跃的根指令
+//接口1：ADCE一开始就活跃的根指令 
 bool ADCEPass::isRootLive(
     Instruction *I, PostDominatorTree &PDT,
     FunctionAnalysisPassManager &FAM) {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -24,7 +27,7 @@ struct InvariantPrivateStorePredicateEdge {
     //TakeTrue标记路径是否经过该分支的true边
     bool TakeTrue = true;
 };
-
+ 
 //InvariantPrivateStoreCandidate保存一条反复写入及其精确执行谓词
 struct InvariantPrivateStoreCandidate {
     //Store指向循环内原始写入

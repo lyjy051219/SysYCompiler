@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 tensor int add_bias(tensor int source[], int bias) {
   return source + bias;
 }

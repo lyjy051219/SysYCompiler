@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -7,7 +10,7 @@
 class DominatorTree;
 class LoopInfo;
 class TargetCostInfo;
-
+ 
 //ConstantHoistUseSite描述一处可由公共基值重写的大整数常量使用。
 struct ConstantHoistUseSite {
     //记录待替换的具体Use对象。

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/FunctionMemoization.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include "ir/opt/DCE.hpp"
@@ -12,7 +15,7 @@ FunctionMemoizationPass::FunctionMemoizationPass(
     : FAM(FAM),
       CacheEntries(isPowerOfTwo(CacheEntries) && CacheEntries >= 16
                        ? CacheEntries
-                       : DefaultCacheEntries) {}
+                       : DefaultCacheEntries) {} 
 //判断无符号整数是否为非零二次幂。
 bool FunctionMemoizationPass::isPowerOfTwo(unsigned Value) {
     return Value != 0 && (Value & (Value - 1)) == 0;

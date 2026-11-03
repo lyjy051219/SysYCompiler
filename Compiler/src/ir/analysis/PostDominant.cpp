@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/PostDominant.hpp"
 PostDominatorTree::PostDominatorTree() = default;
 PostDominatorTree::PostDominatorTree(PostDominatorTree &&other) noexcept = default;
@@ -21,7 +24,7 @@ PostDominatorNode* PostDominatorTree::getNode(BasicBlock* BB) const {
     auto it = BlockToNode.find(BB);
     if (it == BlockToNode.end()) return nullptr;
     return const_cast<PostDominatorNode*>(&Nodes[it->second]);
-}
+} 
 //判断基本块A是否后支配基本块B，其中nullptr表示虚拟根
 bool PostDominatorTree::postDominates(BasicBlock* A, BasicBlock* B) const {
     if (A == B) return true;

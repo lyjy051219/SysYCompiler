@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -12,7 +15,7 @@ class BasicAAResult;
 class LoopInfo;
 //MemorySSAResult提供每条控制流路径上的首个内存写定义
 class MemorySSAResult;
-
+ 
 //LatticeValue表示SCCP沿Top、Constant、Bottom单调下降的值格
 class LatticeValue {
 public:

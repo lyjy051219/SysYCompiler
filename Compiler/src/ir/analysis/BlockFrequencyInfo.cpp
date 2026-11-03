@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/BlockFrequencyInfo.hpp"
 #include "lib/CFG.hpp"
 #include <algorithm>
@@ -16,7 +19,7 @@ uint64_t BlockFrequencyAnalysis::scaleFrequency(
                ? MaxTrackedFrequency
                : static_cast<uint64_t>(Scaled);
 }
-
+ 
 uint64_t BlockFrequencyAnalysis::addFrequency(
     uint64_t LHS, uint64_t RHS, bool &Saturated) {
     if (RHS > MaxTrackedFrequency - LHS) {

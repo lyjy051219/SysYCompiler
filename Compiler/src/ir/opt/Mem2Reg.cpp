@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/Mem2Reg.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -15,7 +18,7 @@ void AllocaInfo::clean() {
     OnlyStore = nullptr;
     OnlyUsedOneBlock = true;
 }
-//按需编号并返回alloca访问指令在所属基本块中的相对位置。
+//按需编号并返回alloca访问指令在所属基本块中的相对位置
 unsigned BlockInfo::getInstIndex(const Instruction* I){
     auto it = InstNum.find(I);
     if(it != InstNum.end()) return it->second;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -14,3 +17,4 @@ private:
 	//交替执行死PHI删除和安全替换直到函数达到不动点
 	static bool cleanupFunction(Function &F, DominatorTree &DT);
 };
+ 

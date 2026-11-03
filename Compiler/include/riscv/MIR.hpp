@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "Registers.hpp"
@@ -66,13 +69,9 @@ struct MachineInstr {
   std::vector<PhysReg> implicitUses;
   bool sideEffects = false;
   bool terminator = false;
-  // Set on COPYs emitted while lowering PHI incoming values.  Register
-  // allocation uses this provenance to distinguish loop-carried transfers
-  // from ordinary copies and from mutually exclusive diamond edges.
+//区分phi copy标志
   bool phiCopy = false;
-  // Some COPY instructions are ordering barriers rather than ordinary value
-  // transfers.  In particular, the temporary and rotations used to serialize
-  // a cyclic PHI bundle must not be undone by register coalescing.
+//寄存器合并标志
   bool copyCoalescingBarrier = false;
   std::string comment;
 };
@@ -111,9 +110,7 @@ struct MachineFunction {
   std::vector<StackObject> stackObjects;
   std::unordered_map<Value *, MachineReg> valueRegs;
   std::unordered_map<Value *, int> valueStackObjects;
-  // 模块级全局对象快照（符号名 -> 尺寸/常量性），lowerModule 时按
-  // MachineModule::globals 填充，std::map 保证确定性遍历序。
-  // 供机器层 pass（如 machineLICM 的 load 在界/常量性查询）使用，避免依赖 IR 层。
+  //module中的对象，供后续pass查询，避免依赖ir
   std::map<std::string, GlobalObject> globals;
   std::vector<PhysReg> usedCalleeSaved;
   int64_t maxOutgoingArgs = 0;
@@ -132,5 +129,6 @@ struct MachineModule {
 
 void dumpMachineFunction(const MachineFunction &mf, std::ostream &out);
 void validateNoInvalidVRegs(const MachineFunction &mf);
-
+ 
 } // namespace riscv
+ 

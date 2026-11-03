@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // MachinePassBuilder.cpp —— 后端代码生成流水线的装配中心。
 // 负责注册各类机器分析,并按固定顺序把代码生成与优化 pass 串成流水线:
 // 指令选择后整理 CFG，再依次执行伪指令 lowering、分配前优化、寄存器分配与frame lowering、分配后优化。
@@ -19,7 +22,7 @@
 
 namespace riscv {
 namespace {
-
+ 
 // 环境变量开关：BACKEND_VERIFY_MIR 打开后在关键阶段之间插入校验
 bool verifyEnabled() { return std::getenv("BACKEND_VERIFY_MIR") != nullptr; }
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -10,7 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <algorithm>
-
+ 
 //Loop表示RangeAnalysis引用的自然循环
 class Loop;
 //SCEVResult提供归纳变量及其循环范围提示

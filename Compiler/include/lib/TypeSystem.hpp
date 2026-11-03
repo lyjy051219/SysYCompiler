@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include <memory>
 #include <vector>
@@ -15,7 +18,7 @@ enum TypeSystem{
 };
 
 class INTType;
-
+ 
 /*
  * IR类型与对应的IR类型语法：
  * IR_INT：

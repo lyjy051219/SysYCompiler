@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/InvariantPrivateStoreHoist.hpp"
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -17,7 +20,7 @@
 #include <map>
 #include <set>
 #include <utility>
-
+ 
 //只依据已注册内建memset的语义、volatile标记和对象类型判断完整清零
 bool InvariantPrivateStoreHoistPass::isWholeZeroMemset(
     CallInst *CI, AllocaInst *AI) {

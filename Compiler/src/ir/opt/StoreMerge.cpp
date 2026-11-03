@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/StoreMerge.hpp"
 #include "lib/IRUtils.hpp"
 #include <vector>
@@ -13,7 +16,7 @@ StoreInst *StoreMergePass::getTailStore(BasicBlock *Pred,
 	}
 	return dynamic_cast<StoreInst *>(Terminator->getPrev());
 }
-//验证候选store的值与指针类型能够由同一组PHI合流。
+//验证候选store的值与指针类型能够由同一组PHI合流
 bool StoreMergePass::haveCompatibleTypes(
     const std::vector<StoreInst *> &Stores) {
 	//2.地址和值允许在不同路径上取不同SSA值，但所有路径的类型形状必须一致。

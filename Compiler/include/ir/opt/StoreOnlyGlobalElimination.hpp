@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -17,7 +20,7 @@ struct StoreOnlyGlobalTraceResult {
     //标记地址生成链是否包含无法保守解析的节点。
     bool unresolved = false;
 };
-
+ 
 //每个全局的读取摘要：精确第一维索引集合，或“任意索引可能被读”的保守状态。
 struct StoreOnlyGlobalReadInfo {
     //标记该全局任意索引位置都可能被读取。

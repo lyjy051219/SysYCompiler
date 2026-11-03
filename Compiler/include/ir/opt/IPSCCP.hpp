@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -23,7 +26,7 @@ private:
     private:
         std::size_t VisitedNodes = 0;
     };
-
+ 
     static Value *meetCallArgumentConstants(
         Function *F, unsigned ParameterIndex,
         const std::vector<CallInst *> &Calls,

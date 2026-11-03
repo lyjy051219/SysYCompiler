@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/ConstraintElimination.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -17,7 +20,7 @@ bool ConstraintEliminationPass::isKnownNoWrapAddSub(
         inst->getOp() != BinaryInst::SUB)
         return false;
     Value *lhs = nullptr;
-    Value *rhs = nullptr;
+    Value *rhs = nullptr; 
     if (!inst->getOperands(lhs, rhs) || !lhs || !rhs) return false;
     if (!IRType::hasIntegerBitWidth(lhs->getIRType(), 32) ||
         !IRType::hasIntegerBitWidth(rhs->getIRType(), 32))

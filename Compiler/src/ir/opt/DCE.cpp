@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/DCE.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -11,7 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
-//递归证明函数自身CFG和全部直接用户函数调用均必然有限返回。
+//递归证明函数自身CFG和全部直接用户函数调用均必然有限返回 
 bool DCEPass::isGuaranteedReturningFunction(
 	Function &F,
 	std::unordered_map<Function *, ReturnProofState> &Memo) {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -12,7 +15,7 @@ class TailRecursionEliminationPass : public PassDescriptor<TailRecursionEliminat
 public:
     //处理函数中的普通尾调用和全部可消除自尾递归站点
     PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
     //把共享返回块的PHI或BitCast返回值解析为指定前驱可用的SSA值
     static Value *resolveRetValueForPred(

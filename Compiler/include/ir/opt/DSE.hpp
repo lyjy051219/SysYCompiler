@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -16,7 +19,7 @@ enum class DSEBlockColor {
     //表示扫描区间内没有发生与目标位置相关的内存事件。
     Transparent,
 };
-
+ 
 //流程：1. MemorySSA 正向证明所有路径覆盖写；2. 重建内存图后删除重复值写入；
 //3. 块内逆扫和有界CFG遍历作为保守后备，继续处理不可观察栈对象等特殊情况。
 class DSEPass : public PassDescriptor<DSEPass> {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -9,7 +12,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
-
+ 
 //BasicAAResult提供内存位置、底层对象和对象边界证明
 class BasicAAResult;
 //DominatorTree提供候选load与循环预头之间的支配证明

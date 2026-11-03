@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -11,3 +14,4 @@ private:
     //验证全局的每条use都是直接store地址并收集这些死写
     static bool collectDeadStoresForGlobal(Variable *G, std::vector<StoreInst *> &Stores);
 };
+ 

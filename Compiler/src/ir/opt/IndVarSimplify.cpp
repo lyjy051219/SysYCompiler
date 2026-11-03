@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/IndVarSimplify.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -10,7 +13,7 @@
 #include <unordered_set>
 #include <vector>
 //步骤 1.1：比较递推更新的操作数时，仅允许两个递推 PHI 互相对应，其他值
-//必须是同一个 SSA 定义。
+//必须是同一个 SSA 定义
 bool IndVarSimplifyPass::correspondingRecurrenceValue(
     Value *A, Value *B, PhiInst *APhi, PhiInst *BPhi) {
     if (A == APhi || B == BPhi) return A == APhi && B == BPhi;

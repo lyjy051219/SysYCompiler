@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/TargetCostAnalysis.hpp"
 #include "lib/Target.hpp"
 #include <algorithm>
@@ -13,7 +16,7 @@ bool TargetCostInfo::fitsSignedBits(std::int64_t Value, unsigned Bits) {
     const std::int64_t Max = (std::int64_t{1} << (Bits - 1)) - 1;
     return Value >= Min && Value <= Max;
 }
-
+ 
 std::int64_t TargetCostInfo::normalizeImmediate(std::int64_t Value,
                                                 unsigned BitWidth) {
     if (BitWidth == 0 || BitWidth >= 64)

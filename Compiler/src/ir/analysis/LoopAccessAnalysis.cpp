@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/LoopAccessAnalysis.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -15,7 +18,7 @@ LoopAccessInfo::LoopAccessInfo() = default;
 //使用函数及各项基础分析构造循环访问查询器
 LoopAccessInfo::LoopAccessInfo(Function *F, LoopInfo *LoopInfoPtr,
                                SCEVResult *SCEV,
-                               BasicAAResult *AliasAnalysis,
+                                BasicAAResult *AliasAnalysis,
                                LoopDependenceInfo *Dependence,
                                RangeInfo *RangeAnalysis,
                                DominatorTree *DomTree)

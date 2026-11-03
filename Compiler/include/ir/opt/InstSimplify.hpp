@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -22,7 +25,7 @@ public:
 
     //运行局部指令化简工作表直到达到固定点
     bool run(Function &F);
-
+ 
 private:
 
     //ExtremumKind枚举比较选择结构能够表示的极值种类

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "lib/IRUtils.hpp"
 #include "lib/CFG.hpp"
 #include "lib/TypeSystem.hpp"
@@ -18,7 +21,7 @@ static void rollbackClonedBlocks(
             if (I) I->clearOperands();
         }
     }
-
+ 
     for (BasicBlock *BB : Blocks) {
         if (BB) BB->clear();
     }

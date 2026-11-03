@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // CodegenPasses.cpp —— 代码生成各 pass 的 run 入口薄封装。
 // 每个 pass 把实际变换委托给对应的 runXxx/eliminateXxx 等实现函数,
 // 并返回 MachinePreservationStatus 告诉 pass 管理器哪些分析结果仍然有效:
@@ -15,7 +18,7 @@
 #include <iostream>
 
 namespace riscv {
-
+ 
 namespace {
 
 // 一个常用的保留集合:CFG 结构未变时,保留 CFG、循环、块频率三项分析。

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/LoopInfo.hpp"
@@ -19,7 +22,7 @@ struct IndexComponent {
     //Expr记录Raw按SCEV归一化后的符号表达式
     const SCEVExpr *Expr = nullptr;
 };
-
+ 
 //LSRCandidate描述一条可尝试改写为指针归纳变量的GEP
 struct LSRCandidate {
     //OldGEP指向待替换的原始循环内GEP

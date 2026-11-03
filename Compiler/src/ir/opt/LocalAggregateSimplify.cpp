@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LocalAggregateSimplify.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -27,7 +30,7 @@ bool LocalAggregateSimplifyPass::isWholeProgramReadOnlyVariable(
     Variable *Source) {
     if (!Source || (Source->vartag != Variable::GlobalConstant &&
                     Source->vartag != Variable::GlobalVariable))
-        return false;
+        return false; 
     std::vector<Value *> Worklist{Source};
     std::unordered_set<Value *> Seen;
     while (!Worklist.empty()) {

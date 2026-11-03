@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -11,7 +14,7 @@ public:
 	explicit DeadFunctionEliminationPass(FunctionAnalysisPassManager &FAM);
 
 	PreservationStatus run(Module &M, ModuleAnalysisPassManager &MAM);
-
+ 
 private:
 	FunctionAnalysisPassManager &FAM;
 };

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/MemorySSA.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -25,7 +28,7 @@ const std::vector<std::pair<BasicBlock *, MemoryAccess *>> &
 MemoryAccess::getIncomingAccesses() const {return IncomingAccesses;}
 const std::vector<MemoryAccess *> &MemoryAccess::getUsers() const {
     return Users;
-}
+} 
 //MemorySSAResult一些基本接口
 MemorySSAResult::MemorySSAResult() = default;
 MemorySSAResult::MemorySSAResult(MemorySSAResult &&) noexcept = default;

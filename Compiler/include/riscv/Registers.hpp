@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include <array>
@@ -25,7 +28,7 @@ struct RegisterInfo {
   bool callerSaved;
   bool calleeSaved;
   bool isFloat;
-};
+}; 
 
 const RegisterInfo &getRegisterInfo(PhysReg reg);
 const std::vector<PhysReg> &allocatableRegs(RegClass rc);

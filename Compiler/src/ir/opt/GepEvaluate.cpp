@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/GepEvaluate.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -24,7 +27,7 @@ bool GepEvaluatePass::evaluateGEP(Function &F) {
             delete GEP;
             changed = true;
             continue;
-        }
+        } 
         //4.对含多个非零索引的复杂地址，在第二个非零索引处分段：前段计算
         //中间基址，后段以规范零索引重新进入该对象。索引只按原顺序重新分组，
         //不执行索引算术，因而不会引入新的整数溢出。

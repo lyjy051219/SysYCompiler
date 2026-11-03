@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -6,7 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 // CFGSimplifyPass:
 // 1) 消除死块
 // 2) 分支终结指令常量折叠

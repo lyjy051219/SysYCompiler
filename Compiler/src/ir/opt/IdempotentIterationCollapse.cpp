@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/IdempotentIterationCollapse.hpp"
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -15,7 +18,7 @@
 #include <limits>
 #include <map>
 #include <unordered_set>
-
+ 
 //把分段 typed GEP 链归一化为按字节步长降序排列的坐标带。
 bool IdempotentIterationCollapsePass::normalizeTypedAddress(
     const LoopMemoryAccess &Access, BasicAAResult &AA,

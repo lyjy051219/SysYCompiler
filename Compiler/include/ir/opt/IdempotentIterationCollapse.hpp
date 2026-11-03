@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -79,7 +82,7 @@ public:
     //每次运行至多提交一个候选，使所有分析在下一轮重新建立。
     PreservationStatus run(
         Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
     //限制单个候选扫描的访存和指令数量，预算耗尽按未知拒绝。
     static constexpr std::size_t MaxMemoryAccesses = 192;

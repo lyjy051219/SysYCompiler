@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/DAE.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
@@ -18,7 +21,7 @@ bool DAEPass::collectPointerRecipe(
 			IRKey::type(Global->getIRType());
 		return true;
 	}
-
+ 
 	if (auto *GEP = dynamic_cast<GetElementPtrInst *>(V)) {
 		if (!GEP->hasOnlyConstantIndices() ||
 			!collectPointerRecipe(GEP->getBasePointer(), Result, Depth + 1)) {

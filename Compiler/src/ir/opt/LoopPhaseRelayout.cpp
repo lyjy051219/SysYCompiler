@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopPhaseRelayout.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopAccessAnalysis.hpp"
@@ -13,7 +16,7 @@
 #include <limits>
 #include <queue>
 #include <unordered_set>
-
+ 
 //绑定模块变换期间查询与失效函数级分析所需的分析管理器
 LoopPhaseRelayoutPass::LoopPhaseRelayoutPass(
     FunctionAnalysisPassManager &AnalysisManager)

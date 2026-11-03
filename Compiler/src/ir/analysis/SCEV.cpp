@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/SCEV.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
@@ -14,7 +17,7 @@ getSCEVIntegerBitWidth(const std::shared_ptr<IRType> &Ty) {
     const int Bits = Ty->getIntegerBitWidth(0);
     if (Bits <= 0 || Bits > 64) return std::nullopt;
     return static_cast<unsigned>(Bits);
-}
+} 
 //判断给定数学整数是否能够由目标IR整数类型精确表示
 static bool isSCEVSignedValueRepresentable(
     __int128 Value, const std::shared_ptr<IRType> &Ty) {

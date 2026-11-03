@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -15,7 +18,7 @@
 #include <vector>
 
 class PostDominatorTree;
-
+ 
 //InstRecord保存同一值号对应的一条候选定义记录
 struct InstRecord {
 	//Num记录候选定义所属的全局值号

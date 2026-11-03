@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Compiler contributors
+# SPDX-License-Identifier: MIT
+
 # 由 backendtest.ipynb 提取的独立后端测试脚本，配置可用环境变量 TEST_ROOT MAX_CASES SINGLE_CASES SKIP_BUILD 覆盖。
 # 后端专用测试脚本：完整编译器 -> RISC-V 汇编 -> 静态链接 -> qemu-riscv64 运行 -> 对比 .out。
 # 这一版放在一个单元格里，日志格式尽量和 test.ipynb 保持一致。

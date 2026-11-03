@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -7,7 +10,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
-
+ 
 /*
 BaseAddressInfo:描述基址信息
 SideEffectInfo:描述callee的副作用信息

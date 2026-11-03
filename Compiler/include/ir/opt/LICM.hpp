@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -59,7 +62,7 @@ enum class LICMMode {
     Full,
     //AddressOnly只移动循环不变GEP，不改写任何内存访问或控制流
     AddressOnly,
-};
+}; 
 
 //LICMPass提升或下沉经过支配、内存和可执行性证明的循环不变量
 class LICMPass : public PassDescriptor<LICMPass> {

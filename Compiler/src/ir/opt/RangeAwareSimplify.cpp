@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/RangeAwareSimplify.hpp"
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -25,7 +28,7 @@ bool RangeAwareSimplifyPass::isPureIntExprOp(BinaryInst::Operation op) {
             return true;
         default:
             return false;
-    }
+    } 
 }
 //在深度和环检测预算内递归求解同块整数表达式区间
 IntRange RangeAwareSimplifyPass::queryIntExprImpl(

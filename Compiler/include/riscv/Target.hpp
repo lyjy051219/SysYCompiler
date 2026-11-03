@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "../lib/CFG.hpp"
@@ -17,14 +20,16 @@ enum class CodegenOptLevel {
 struct BackendOptions {
   bool emitMetrics = false;
   CodegenOptLevel optLevel = CodegenOptLevel::O1;
-  // 可选机器层 pass 禁用列表。名字由 MachinePassBuilder 统一定义，
-  // 例如 cleanup-cfg、post-ra-peephole；填 all 可禁用全部可选 pass。
+  // 可选机器层 pass 禁用列表
+  //名字由 MachinePassBuilder 定义
+  // 如 cleanup-cfg post-ra-peephole
+  //填 all 可禁用全部可选 pass。
   std::vector<std::string> disabledMachinePasses;
 };
 
 class BackendError {
   std::string message_;
-
+ 
 public:
   explicit BackendError(std::string message) : message_(std::move(message)) {}
   const std::string &message() const { return message_; }

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/LoopDependence.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -13,7 +16,7 @@ LoopDependenceInfo::LoopDependenceInfo() = default;
 LoopDependenceInfo::LoopDependenceInfo(Function *F, LoopInfo *LoopInfoPtr,
                                        SCEVResult *SCEV,
                                        BasicAAResult *AliasAnalysis,
-                                       FunctionAnalysisPassManager *AnalysisManager)
+                                        FunctionAnalysisPassManager *AnalysisManager)
     : Func(F), LI(LoopInfoPtr), SE(SCEV), AA(AliasAnalysis),
       FAM(AnalysisManager) {}
 //销毁循环依赖查询器及其惰性缓存

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/Global2Local.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -8,7 +11,7 @@
 #include <algorithm>
 #include <utility>
 Global2LocalPass::Global2LocalPass(bool RelaxScalarUses): RelaxScalarUses(RelaxScalarUses) {}
-//检查标量全局在main中的use是否为安全的直接load或store地址。
+//检查标量全局在main中的use是否为安全的直接load或store地址
 bool Global2LocalPass::isSafeScalarUseInMain(Use *U, Variable *GV) {
 	//2.1 标量全局只允许作为直接 load/store 地址，不能把地址本身存出或参与其他运算。
 	if (!U || !GV) return false;

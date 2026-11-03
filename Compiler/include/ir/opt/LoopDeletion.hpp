@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -21,7 +24,7 @@ class LoopDeletionPass : public PassDescriptor<LoopDeletionPass> {
 public:
 	//删除能够证明有限且无可观察行为的循环并修复外部SSA使用。
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
 	//PhiReplacementMap记录退出PHI及删除循环后使用的循环外替代值。
 	using PhiReplacementMap = std::unordered_map<PhiInst *, Value *>;

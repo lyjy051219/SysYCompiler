@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -16,7 +19,7 @@
 #include <vector>
 
 class TargetCostInfo;
-
+ 
 //UnrollKind表示循环展开决策选用的具体变换方式
 enum class UnrollKind {
     //None表示保留原循环而不执行展开

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -8,7 +11,7 @@
 class BasicBlock;
 class StoreInst;
 class Value;
-
+ 
 //StoreMergeCandidate记录一个汇合块及其所有前驱末尾能够合并的store。
 struct StoreMergeCandidate {
 	//接收合并后唯一store的汇合块。

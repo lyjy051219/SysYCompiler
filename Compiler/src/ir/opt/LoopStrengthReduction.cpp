@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopStrengthReduction.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -20,7 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-//构造常规地址LSR或仅执行RV64跨基址原子组的最终模式。
+//构造常规地址LSR或仅执行RV64跨基址原子组的最终模式。 
 LoopStrengthReductionPass::LoopStrengthReductionPass(bool EnableCrossBase)
     : EnableCrossBase(EnableCrossBase) {}
 //步骤 3 的分组辅助：优先使用 SCEV 的稳定结构键，缺失时才以表达式对象标识

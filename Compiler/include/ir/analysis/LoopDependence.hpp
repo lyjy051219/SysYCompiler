@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -10,7 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+ 
 //BasicAAResult前向声明用于访存区间别名查询
 class BasicAAResult;
 //Loop前向声明用于描述循环轴和分析范围

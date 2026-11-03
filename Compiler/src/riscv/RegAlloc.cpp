@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/RegAlloc.hpp"
 
 #include "riscv/Registers.hpp"
@@ -19,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace riscv {
+namespace riscv { 
 // 本文件实现基于图着色的寄存器分配(Iterated Register Coalescing 风格)。
 // 流程:分析程序(收集虚拟寄存器类、热度、可重物化定义、循环回边)->为整型与
 // 浮点两个寄存器体各自构建干涉图(依赖活跃分析)->运行简化/合并/冻结/溢出选择

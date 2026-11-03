@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -17,7 +20,7 @@ class SCEVResult;
 class StoreInst;
 class Value;
 struct ClonedBlockRegion;
-
+ 
 //按连续 store 序列的反向切片保守分布循环：
 //1. 选择有限、LCSSA、单出口且无 live-out/内存相关控制的规范循环；
 //2. 为每个 store 建立循环内反向切片，枚举保持原 store 次序的连续切分点；

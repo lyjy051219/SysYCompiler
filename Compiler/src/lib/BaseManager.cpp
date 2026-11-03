@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "lib/BaseManager.hpp"
 #include "lib/CFG.hpp"
 #include "lib/IRUtils.hpp"
@@ -17,7 +20,7 @@ Use::Use(User *UserValue, Value *UsedValue)
 }
 
 Use::~Use() {
-    removeFromUseList();
+    removeFromUseList(); 
 }
 
 User *Use::getUser() const {

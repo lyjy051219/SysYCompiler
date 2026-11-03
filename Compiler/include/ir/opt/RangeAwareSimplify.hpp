@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -10,7 +13,7 @@ struct IntRange;
 class DominatorTree;
 //RangeInfo提供整数、浮点和已知位的程序点事实
 class RangeInfo;
-
+ 
 //RangeAwareSimplifyPass依据范围和已知位证明化简整数及浮点表达式
 class RangeAwareSimplifyPass : public PassDescriptor<RangeAwareSimplifyPass> {
 public:

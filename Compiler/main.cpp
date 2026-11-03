@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "./include/yacc/Bison.hpp"
 #include "./include/lib/IRGenerator.hpp"
 #include "./include/ir/opt/PassBuilder.hpp"
@@ -104,13 +107,13 @@ int main(int argc, const char *argv[]) {
     //构建优化流水线并运行
     ModulePassManager MPM = PB.buildModulePipeline(OptLevel, FAM);
     MPM.run(*ModuleIR, MAM);
-//======临时检查
+/*生成中端IR，便于调试以及静态分析优化水平
     std::string llvmOutputPath = outputPath.substr(0, outputPath.find_last_of('.')) + ".ll";
     std::ofstream llvmOut(llvmOutputPath);
     std::streambuf *oldBuffer = std::cout.rdbuf(llvmOut.rdbuf());
     ModuleIR->dumpIR();
     std::cout.rdbuf(oldBuffer);
-//======临时检查
+*/
     try {
         std::ofstream asmOut(outputPath);
         if (!asmOut.is_open()) {

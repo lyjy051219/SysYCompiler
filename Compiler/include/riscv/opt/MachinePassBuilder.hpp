@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "riscv/Target.hpp"
@@ -18,7 +21,7 @@ public:
   void registerFunctionAnalyses(MachineFunctionAnalysisManager &MFAM);
   // 注册所有模块级分析，当前为空位
   void registerModuleAnalyses(MachineModuleAnalysisManager &MMAM);
-
+ 
   // 寄存器分配前的优化流水线，此时 MIR 仍是虚拟寄存器形式
   MachineFunctionPassManager
   buildPreRAOptPipeline(const BackendOptions &Options);

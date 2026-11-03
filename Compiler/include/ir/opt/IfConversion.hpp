@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -25,7 +28,7 @@ struct IfConvMatch {
 	//记录条件为真是否进入TrueBB以恢复select两臂方向。
 	bool CondTrueToTrueBB = false;
 };
-
+ 
 //流程：1. 匹配单块 triangle/diamond；2. 验证推测安全、SSA 用户与成本预算；
 //3. 上提两臂计算；4. 以 select 替换汇合 PHI并删除臂块；5. 迭代到无候选。
 class IfConversionPass : public PassDescriptor<IfConversionPass> {

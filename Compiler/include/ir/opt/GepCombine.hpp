@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -12,7 +15,7 @@ bool pointerIsProvablyWithinKnownObject(
 //证明指定GEP的结果始终位于已知对象边界内
 bool gepIsProvablyWithinKnownObject(
     GetElementPtrInst *GEP, RangeInfo &RI, const DominatorTree &DT);
-
+ 
 //GepCombineGroup保存除末索引外操作数完全相同的一组GEP
 struct GepCombineGroup {
     //Geps按基本块内程序顺序保存同组GEP

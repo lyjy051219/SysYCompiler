@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -9,7 +12,7 @@ enum class TargetCostKind {
     Throughput,
     CodeSize,
 };
-
+ 
 // TargetRegisterClass描述中端真正能够使用的目标寄存器类别。
 enum class TargetRegisterClass {
     GeneralPurpose,

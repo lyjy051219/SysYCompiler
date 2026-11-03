@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/opt/NewPassManager.hpp"
@@ -174,7 +177,7 @@ private:
     static bool applyConsistentShadowCandidate(
         Module &M, LoopPhaseConsistentShadowCandidate &Candidate,
         unsigned Ordinal);
-
+ 
     //FAM提供函数级循环、范围、支配与访问分析并负责精确失效
     FunctionAnalysisPassManager &FAM;
     //CreatedShadowBytes记录本Pass实例已经提交的静态镜像内存

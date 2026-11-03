@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/ConstantHoist.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -32,7 +35,7 @@ BasicBlock *ConstantHoistPass::foldCommonDominator(
             accAncestors.clear();
             for (BasicBlock *p = acc; p; p = DT.getIDom(p)) accAncestors.insert(p);
         }
-    }
+    } 
     return acc;
 }
 //步骤 3.2：公共块位于循环内时，把一次性物化移到最外层规范循环的预头；

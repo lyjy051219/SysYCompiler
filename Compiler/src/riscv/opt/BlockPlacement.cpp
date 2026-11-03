@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include "riscv/Passes.hpp"
@@ -15,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace riscv {
+namespace riscv { 
 // Block Placement pass 的 RISC-V 实现。
 //
 // 作用：在保持逻辑 CFG 完全不变的前提下，按分支频率与 fallthrough 收益重排

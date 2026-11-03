@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LatePhiCleanup.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -13,7 +16,7 @@ Value *LatePhiCleanupPass::safeReplacement(PhiInst *Phi, const DominatorTree &DT
 	const unsigned N = Phi->getNumIncomingValues();
 	if (N == 0) {
 		return UndefValue::NewUndefValue(Phi->getIRType());
-	}
+	} 
 	Value *Common = nullptr;
 	bool SawUndef = false;
 	std::unordered_set<BasicBlock *> Preds;

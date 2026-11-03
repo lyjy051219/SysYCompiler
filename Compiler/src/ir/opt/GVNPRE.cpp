@@ -1,10 +1,13 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/GVNPRE.hpp"
 #include "ir/analysis/PostDominant.hpp"
 #include "ir/opt/DCE.hpp"
 #include "lib/IRUtils.hpp"
 #include <algorithm>
 #include <tuple>
-#include <utility>
+#include <utility> 
 //构造并设置是否启用部分冗余消除和保守路径下沉
 GVNPREPass::GVNPREPass(bool EnablePRE, bool EnableCodeSink)
     : EnablePRE(EnablePRE), EnableCodeSink(EnableCodeSink) {}

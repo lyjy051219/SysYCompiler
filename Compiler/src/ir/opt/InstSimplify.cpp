@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/InstSimplify.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -18,7 +21,7 @@ bool InstSimplifyPass::getBinaryOperandsForOp(
     if (!BI || BI->getOp() != Op) return false;
     return BI->getOperands(L, R);
 }
-//匹配零减某值表示的算术取负
+//匹配零减某值表示的算术取负 
 bool InstSimplifyPass::matchNegation(Value *V, Value *&Y) {
     //2.1统一识别整数 0-Y；浮点负号受 NaN 与有符号零约束，不进入整数恒等式匹配。
     if (!V || !IRType::isInt(V->getIRType())) return false;

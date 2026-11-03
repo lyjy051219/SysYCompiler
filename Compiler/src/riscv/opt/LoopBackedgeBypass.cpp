@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/MachineOptPasses.hpp"
 
 #include <algorithm>
@@ -18,7 +21,7 @@ namespace riscv {
 //
 // 流水线位置：寄存器分配之后（Post-RA），因此只处理物理寄存器、需要保持已定的
 // 寄存器约定。变换只追加/改写 latch 末尾指令，header 保留，保证语义等价。
-namespace {
+namespace { 
 
 // 是否是条件分支操作码。
 bool isConditionalBranch(Opcode OpcodeValue) {

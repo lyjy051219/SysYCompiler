@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopDeletion.hpp"
 #include "ir/analysis/LoopInfo.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -10,7 +13,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-//判断零次迭代路径是否能够安全跳过给定循环头指令。
+//判断零次迭代路径是否能够安全跳过给定循环头指令 
 bool LoopDeletionPass::isSafeToSkipOnZeroTrip(Instruction *I) {
     //2.1 零次循环只能跳过控制流和无副作用纯计算；未知指令及 DCE 白名单外语义保留。
     if (!I) return false;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopSimplify.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -11,7 +14,7 @@
 #include <string>
 //CFG 合并步骤的公共 PHI 修复：把 Preds 对 Target 的多条输入先汇入
 //MergeBlock，再让 Target 只接收一条来自 MergeBlock 的输入。新建 PHI 始终
-//放在块首，保持“PHI 先于普通指令”的结构不变量。
+//放在块首，保持“PHI 先于普通指令”的结构不变量。 
 bool LoopSimplifyPass::rewritePhisForMergedPreds(
     BasicBlock *Target,
     const std::unordered_set<BasicBlock *> &Preds,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 // AsmPrinter.cpp —— 把已完成寄存器分配与frame lowering的 MIR 发射为 RV64GC 汇编文本。
 // 主要职责:
 //   - 发射模块头、全局数据段(.bss/.rodata/.data 及初值)与文本段。
@@ -20,7 +23,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
-
+ 
 namespace riscv {
 namespace {
 

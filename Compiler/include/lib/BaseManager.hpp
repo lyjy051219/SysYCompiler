@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include <vector>
 #include <memory>
@@ -8,7 +11,7 @@
 
 
 //仿照LLVM实现Value/User/Use
-
+ 
 class IRType;
 class VOIDType;
 class ConstInt;

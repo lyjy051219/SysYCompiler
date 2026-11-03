@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -7,7 +10,7 @@
 #include <unordered_set>
 #include <cstdint>
 #include <vector>
-
+ 
 //LoopInfo提供循环归属和循环不变量查询
 class LoopInfo;
 //Loop表示单个自然循环

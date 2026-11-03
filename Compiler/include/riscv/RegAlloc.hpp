@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "MIR.hpp"
@@ -20,3 +23,4 @@ void allocateRegisters(MachineFunction &mf, MachineFunctionAnalysisManager &am);
 void allocateRegisters(MachineFunction &mf, RegAllocStats *stats);
 
 } // namespace riscv
+ 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/DeadGlobalCleanup.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -6,7 +9,7 @@
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/SideEffect.hpp"
 #include <unordered_set>
-#include <vector>
+#include <vector> 
 //验证全局的每条use都是直接store地址并收集这些死写。
 bool DeadGlobalCleanupPass::collectDeadStoresForGlobal(
     Variable *G, std::vector<StoreInst *> &Stores) {

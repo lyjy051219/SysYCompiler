@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "ir/analysis/Dominant.hpp"
@@ -19,7 +22,7 @@ class LoopRotatePass : public PassDescriptor<LoopRotatePass> {
 public:
 	//在函数内反复把合法的头部测试循环旋转为尾部测试形态。
 	PreservationStatus run(Function &F, FunctionAnalysisPassManager &FAM);
-
+ 
 private:
 	//2-5. 完成单循环的预检、Header 克隆、SSA 转发和 CFG 旋转。
 	bool runLoopRotate(

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/FuncInline.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -8,7 +11,7 @@
 #include <algorithm>
 #include <limits>
 #include <unordered_set>
-#include <vector>
+#include <vector> 
 FuncInlinePass::FuncInlinePass(bool enableRecursiveInline,
 	bool lateCleanupMode)
 	: EnableRecursiveInline(enableRecursiveInline),

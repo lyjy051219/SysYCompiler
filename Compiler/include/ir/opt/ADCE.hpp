@@ -1,10 +1,13 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
 #include <deque>
 #include <unordered_set>
 class PostDominatorTree;
-
+ 
 //ADCEContext：用于保存一次执行过程中的状态
 struct ADCEContext {
     //所有已经证明必须保留的指令

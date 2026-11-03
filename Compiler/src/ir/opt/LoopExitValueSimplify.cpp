@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopExitValueSimplify.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -14,7 +17,7 @@
 #include <limits>
 #include <unordered_set>
 #include <vector>
-//判断单条循环指令能否在删除整个有限循环时无观察地丢弃。
+//判断单条循环指令能否在删除整个有限循环时无观察地丢弃
 bool LoopExitValueSimplifyPass::isSafePureInstruction(Instruction *I) {
 	//1.1 控制流与PHI本身无副作用；访存、调用、分配、返回和未知指令一律拒绝。
 	if (!I) return false;

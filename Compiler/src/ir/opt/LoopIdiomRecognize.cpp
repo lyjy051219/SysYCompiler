@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopIdiomRecognize.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -12,7 +15,7 @@
 #include <limits>
 #include <memory>
 #include <unordered_set>
-//剥离地址转换并返回可用于不相交证明的对象根
+//剥离地址转换并返回可用于不相交证明的对象根 
 Value *LoopIdiomRecognizePass::getDisjointObjectRoot(Value *V) {
     //1.2 剥离 GEP/bitcast 后只承认不同的全局或 alloca 根为确定不相交对象。
     std::unordered_set<Value *> Seen;

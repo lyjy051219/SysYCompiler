@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 
 #include "lib/CFG.hpp"
@@ -9,3 +12,4 @@ namespace riscv {
 bool runCodeGenPrepare(Module &module);
 
 } // namespace riscv
+ 

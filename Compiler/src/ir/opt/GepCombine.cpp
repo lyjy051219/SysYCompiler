@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/GepCombine.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -10,7 +13,7 @@
 #include <limits>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
+#include <unordered_set> 
 //沿地址链证明指针的每级索引都落在已知栈或全局对象范围内
 bool pointerIsProvablyWithinKnownObject(
     Value *Pointer, RangeInfo &RI, const DominatorTree &DT) {

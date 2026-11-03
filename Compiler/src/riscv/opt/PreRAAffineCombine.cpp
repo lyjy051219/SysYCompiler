@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "riscv/opt/CodegenPasses.hpp"
 #include "riscv/opt/MachineAnalysis.hpp"
 #include "riscv/opt/MachineOptPasses.hpp"
@@ -14,7 +17,7 @@
 
 namespace riscv {
 // Pre-RA Affine Combine pass 的 RISC-V 实现。
-//
+// 
 // 本 pass 有两大部分：
 // 1. 带符号 2 的幂除法 bias 序列的折叠：指令选择为 "有符号数除以 2 的幂" 生成的
 //    是一段规范的 "算术右移取符号 + 逻辑右移取偏置 + 加偏置 + 算术右移" 序列。

@@ -1,8 +1,12 @@
-// MIR.cpp —— 机器 IR(MIR)的核心数据结构实现。
-// 定义机器寄存器 MachineReg(虚拟/物理)、机器操作数 MachineOperand(寄存器/
-// 立即数/栈帧下标/全局符号/基本块/值引用)、机器函数的虚寄存器与栈对象工厂,
-// 以及调试用的文本转储和虚寄存器有效性校验。这层是纯文本可读的调试打印,
-// 与最终 RISC-V 汇编发射(AsmPrinter)不同,只用于开发期观察 MIR。
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
+// MIR的核心数据结构实现。
+// 定义:
+// MachineReg(虚拟/物理)
+// MachineOperand(寄存器/立即数/栈帧下标/全局符号/基本块/值引用)
+// Mfunc的虚寄存器与栈对象
+// 以及调试用的部分MIR打印
 #include "riscv/MIR.hpp"
 
 #include "riscv/Target.hpp"
@@ -16,11 +20,11 @@ namespace riscv {
 
 namespace {
 
-// 把 MIR 操作码枚举转成可读名字,仅供调试转储使用(非最终汇编助记符)。
+// 把 MIR 操作码枚举转成可读名字,仅供调试使用
 const char *opcodeName(Opcode opcode) {
   switch (opcode) {
   case Opcode::NOP:
-    return "NOP";
+    return "NOP"; 
   case Opcode::COPY:
     return "COPY";
   case Opcode::F_COPY:
@@ -167,7 +171,8 @@ const char *opcodeName(Opcode opcode) {
   return "<unknown>";
 }
 
-// 转储单个操作数到文本流。不同种类采用不同前缀便于辨认:
+// 单个操作数打印
+//不同种类采用不同前缀便于辨认
 // 寄存器直接打印名字,立即数打印数值,栈帧下标写作 fi#N,
 // 全局符号加 @ 前缀,基本块标签加 % 前缀,值引用写作 value@指针。
 void dumpOperand(const MachineOperand &operand, std::ostream &out) {
@@ -193,8 +198,8 @@ void dumpOperand(const MachineOperand &operand, std::ostream &out) {
   }
 }
 
-// 校验寄存器类操作数:非寄存器操作数直接跳过,寄存器则要求其内容有效,
-// 否则抛出 BackendError 并带上所在机器函数名。
+// 校验寄存器类operand:非寄存器直接跳过,寄存器则要求其内容有效,
+// 否则抛出 BackendError 并带上mf名
 void validateOperand(const MachineOperand &operand, const MachineFunction &mf) {
   if (operand.kind != OperandKind::Reg) {
     return;
@@ -206,7 +211,7 @@ void validateOperand(const MachineOperand &operand, const MachineFunction &mf) {
   }
 }
 
-// 校验隐式物理寄存器(指令的 implicit def/use):必须是有效的具体物理寄存器。
+// 保证是有效的具体物理寄存器，排除隐式物理寄存器(指令的 implicit def/use)
 void validateImplicitPhysReg(PhysReg reg, const MachineFunction &mf) {
   if (reg == PhysReg::NoReg || !isValidPhysReg(reg)) {
     throw BackendError("invalid implicit physical register in machine function " +
@@ -216,7 +221,8 @@ void validateImplicitPhysReg(PhysReg reg, const MachineFunction &mf) {
 
 } // namespace
 
-// 构造一个虚拟寄存器:physical=false,由自增 id 和寄存器类标识,尚未绑定物理寄存器。
+// 构造虚拟寄存器
+//physical=false,带自增 id 和寄存器类标识,尚未绑定物理寄存器
 MachineReg MachineReg::vreg(uint32_t id, RegClass rc) {
   MachineReg reg;
   reg.physical = false;
@@ -226,7 +232,8 @@ MachineReg MachineReg::vreg(uint32_t id, RegClass rc) {
   return reg;
 }
 
-// 构造一个物理寄存器:physical=true,直接绑定具体 PhysReg,id 置零。
+// 构造物理寄存器
+// physical=true,直接绑定具体 PhysReg,id 置零
 MachineReg MachineReg::preg(PhysReg reg, RegClass rc) {
   MachineReg machineReg;
   machineReg.physical = true;
@@ -236,8 +243,8 @@ MachineReg MachineReg::preg(PhysReg reg, RegClass rc) {
   return machineReg;
 }
 
-// 判断机器寄存器是否有效:寄存器类合法,且物理寄存器需为具体有效寄存器、
-// 虚拟寄存器需 id 非零。
+// 寄存器类须合法,且物理寄存器需为具体有效寄存器
+// 虚拟寄存器需 id 非零
 bool MachineReg::isValid() const {
   if (!isValidRegClass(rc)) {
     return false;
@@ -245,7 +252,7 @@ bool MachineReg::isValid() const {
   return physical ? phys != PhysReg::NoReg && isValidPhysReg(phys) : id != 0;
 }
 
-// 机器寄存器的文本形式:物理寄存器输出 ABI 名(如 a0),
+// 物理寄存器输出 ABI 名(如 a0),
 // 虚拟寄存器输出 %v<id>,id 为零视为非法输出 %invalid。
 std::string MachineReg::str() const {
   if (physical) {
@@ -257,8 +264,8 @@ std::string MachineReg::str() const {
   return "%v" + std::to_string(id);
 }
 
-// 以下六个静态工厂按操作数种类分别构造 MachineOperand。
-// 寄存器操作数。
+// 按操作数种类分别构造 MachineOperand，寄存器/立即数/栈帧下标/全局符号/基本块标签
+// 寄存器operand
 MachineOperand MachineOperand::reg(MachineReg reg) {
   MachineOperand operand{};
   operand.kind = OperandKind::Reg;
@@ -266,7 +273,7 @@ MachineOperand MachineOperand::reg(MachineReg reg) {
   return operand;
 }
 
-// 立即数操作数。
+// 立即数operand
 MachineOperand MachineOperand::imm(int64_t value) {
   MachineOperand operand{};
   operand.kind = OperandKind::Imm;
@@ -274,7 +281,7 @@ MachineOperand MachineOperand::imm(int64_t value) {
   return operand;
 }
 
-// 栈帧下标操作数(引用某个栈对象,后续在frame lowering时替换成 sp 相对偏移)。
+// 栈帧下标operand(引用某个栈对象,后续在frame lowering时替换成 sp 相对偏移)
 MachineOperand MachineOperand::frameIndex(int index) {
   MachineOperand operand{};
   operand.kind = OperandKind::FrameIndex;
@@ -282,7 +289,7 @@ MachineOperand MachineOperand::frameIndex(int index) {
   return operand;
 }
 
-// 全局符号操作数(全局变量/函数名)。
+// 全局符号operand(全局变量/函数名)。
 MachineOperand MachineOperand::global(std::string symbol) {
   MachineOperand operand{};
   operand.kind = OperandKind::Global;
@@ -290,7 +297,7 @@ MachineOperand MachineOperand::global(std::string symbol) {
   return operand;
 }
 
-// 基本块标签操作数(分支目标)。
+// 基本块标签operand(分支目标)
 MachineOperand MachineOperand::block(std::string label) {
   MachineOperand operand{};
   operand.kind = OperandKind::Block;
@@ -298,7 +305,7 @@ MachineOperand MachineOperand::block(std::string label) {
   return operand;
 }
 
-// 中端值引用操作数(lowering 过程中用于回指原 IR Value)。
+// 中端值引用操作数(lowering 过程中用于回指原IR Value)
 MachineOperand MachineOperand::value(Value *value) {
   MachineOperand operand{};
   operand.kind = OperandKind::ValueRef;
@@ -306,7 +313,7 @@ MachineOperand MachineOperand::value(Value *value) {
   return operand;
 }
 
-// 为机器函数分配一个新虚拟寄存器,id 由 nextVReg 自增保证唯一。
+// 为mf分配一个新虚拟寄存器,id 由 nextVReg 自增
 MachineReg MachineFunction::createVReg(RegClass rc) {
   return MachineReg::vreg(nextVReg++, rc);
 }
@@ -316,8 +323,8 @@ MachineReg MachineFunction::createVRegLike(
   return createVReg(prototype.rc);
 }
 
-// 在机器函数中登记一个栈对象(局部变量/溢出槽),记录大小/对齐/名字,
-// 返回其在 stackObjects 中的下标,该下标即 FrameIndex 操作数所引用的编号。
+// 在mf中记录一个栈对象(局部变量/溢出槽),记录大小/对齐/名字,
+// 返回其在 stackObjects 中的下标,该下标即 FrameIndex 操作数用的编号
 int MachineFunction::createStackObject(int64_t size, int64_t align,
                                        std::string name) {
   const int index = static_cast<int>(stackObjects.size());
@@ -330,8 +337,8 @@ int MachineFunction::createStackObject(int64_t size, int64_t align,
   return index;
 }
 
-// 将整个机器函数转储为可读文本(调试用)。逐块打印标签,
-// 逐指令打印操作码,再依次列出 defs: 和 uses: 操作数,末尾附带注释(# ...)。
+// (调试用)mf打印，逐块打印标签,
+// 逐指令打印操作码,再依次列出 defs: 和 uses: 操作数,末尾附带注释(# ...)
 void dumpMachineFunction(const MachineFunction &mf, std::ostream &out) {
   out << "machine-function " << mf.name << '\n';
   for (const MachineBasicBlock &block : mf.blocks) {
@@ -361,7 +368,7 @@ void dumpMachineFunction(const MachineFunction &mf, std::ostream &out) {
 }
 
 // 遍历机器函数的所有指令,校验其 def/use 寄存器操作数与隐式物理寄存器均有效,
-// 常在关键 pass 之间作为完整性检查(见 MachineVerifyPass)。
+// 用于 pass 之间做检查(见 MachineVerifyPass)。
 void validateNoInvalidVRegs(const MachineFunction &mf) {
   for (const MachineBasicBlock &block : mf.blocks) {
     for (const MachineInstr &instr : block.instrs) {

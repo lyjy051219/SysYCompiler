@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/Reassociate.hpp"
 #include "ir/opt/DCE.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
@@ -12,7 +15,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-//构造Pass并选择是否保留参与地址计算的整数表达式
+//构造Pass并选择是否保留参与地址计算的整数表达式 
 ReassociatePass::ReassociatePass(bool PreserveAddressArithmetic)
 	: PreserveAddressArithmetic(PreserveAddressArithmetic) {}
 //清理判定服务主流程扫描：无使用的纯计算无需再规范化；终结、PHI、store、

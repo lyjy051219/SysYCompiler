@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/LoopFusion.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopAccessAnalysis.hpp"
@@ -11,7 +14,7 @@
 #include <cstring>
 #include <utility>
 //步骤 2 的迭代域比较只接受非空且完全相同的 SCEV 结构键，不以指针身份或
-//局部形状猜测数学等价。
+//局部形状猜测数学等价
 bool LoopFusionPass::expressionKeysEqual(const SCEVExpr *A,
                                          const SCEVExpr *B) {
     return A && B && !A->Key.empty() && A->Key == B->Key;

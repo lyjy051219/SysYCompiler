@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/RangeAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/SCEV.hpp"
@@ -15,7 +18,7 @@ int IntRange::trailingZerosOf(int64_t v) {
     int n = 0;
     while (n < 31 && ((u >> n) & 1ULL) == 0) n++;
     return n;
-}
+} 
 //构造覆盖整个i32有符号值域的Top区间
 IntRange::IntRange()
     : min(I32_MIN), max(I32_MAX), knownTrailingZeros(0) {}

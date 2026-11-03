@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/opt/CFGSimpify.hpp"
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
@@ -27,7 +30,7 @@ CFGSimplifyPass::buildPredecessorMap(Function &F) {
 	}
 	return Result;
 }
-
+ 
 const std::vector<BasicBlock *> &CFGSimplifyPass::predecessorsOf(
 	BasicBlock *BB, const PredecessorMap &Preds) {
 	static const std::vector<BasicBlock *> Empty;

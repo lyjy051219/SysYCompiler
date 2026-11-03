@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #pragma once
 #include "ir/opt/NewPassManager.hpp"
 #include "lib/CFG.hpp"
@@ -25,3 +28,4 @@ private:
     //快照并降低函数中全部满足语义门禁的常量二次幂除余。
     static bool reduceFunction(Function &F);
 };
+ 

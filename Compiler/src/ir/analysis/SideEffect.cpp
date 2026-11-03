@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/SideEffect.hpp"
 #include "lib/IRUtils.hpp"
 #include <cstdint>
@@ -17,7 +20,7 @@ bool SideEffectInfo::invalidate(Function &F, const PreservationStatus &PA) {
     return true;
 }
 //将另一份指针来源信息合并到当前对象
-/*
+/* 
 bases     = bases ∪ Other.bases
 untracked = untracked || Other.untracked
 */

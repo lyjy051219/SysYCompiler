@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/BasicAliasAnalysis.hpp"
 #include "ir/analysis/Dominant.hpp"
 #include "ir/analysis/LoopInfo.hpp"
@@ -12,7 +15,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
-#include <stdexcept>
+#include <stdexcept> 
 //构造空内存位置
 MemoryLocation::MemoryLocation() = default;
 //使用给定指针和访问字节数构造内存位置

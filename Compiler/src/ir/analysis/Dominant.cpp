@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #include "ir/analysis/Dominant.hpp"
 #include <queue>
 bool DominatorNode::isLeaf() const {return FirstChild == nullptr;}
@@ -8,7 +11,7 @@ void DominatorTree::clear() {
     Nodes.clear();
     BlockToNode.clear();
     Root = nullptr;
-}
+} 
 //返回给定基本块的直接支配者基本块
 BasicBlock* DominatorTree::getIDom(BasicBlock* BB) const {
     auto it = BlockToNode.find(BB);

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Compiler contributors
+// SPDX-License-Identifier: MIT
+
 #ifndef FUNCTION_ANALYSIS
 #define FUNCTION_ANALYSIS(NAME, CREATE_PASS)
 #endif
@@ -15,3 +18,4 @@ FUNCTION_ANALYSIS("BlockFrequencyInfo", BlockFrequencyAnalysis())
 FUNCTION_ANALYSIS("LoopDependence", LoopDependenceAnalysis())
 FUNCTION_ANALYSIS("LoopAccess", LoopAccessAnalysis())
 FUNCTION_ANALYSIS("TargetCost", TargetCostAnalysis())
+ 
